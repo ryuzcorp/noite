@@ -251,3 +251,34 @@ async fn git(dir: &std::path::Path, args: &[&str]) -> String {
     .await
     .unwrap_or_else(|e| panic!("git {args:?}: {e:#}"))
 }
+
+/// The automatic-deploy pause never gates an explicit action: an operator
+/// rollback still prepares and queues its row while production is exhausted.
+#[tokio::test]
+async fn a_rollback_works_while_automatic_deploys_are_paused() {
+    let h = Harness::new().await;
+    let app = h.seed_app("paused-rollback").await;
+    seed(&h, &app.id, DeployStatus::Success, "aaa1111").await;
+    seed(&h, &app.id, DeployStatus::Failed, "bbb2222").await;
+    seed(&h, &app.id, DeployStatus::Failed, "bbb2222").await;
+
+    let state = crate::host::auto_deploy::for_target(&h.state.pool, &app.id, None)
+        .await
+        .expect("auto deploy");
+    assert!(
+        state.blocks("bbb2222"),
+        "the failed sha is paused: {state:?}"
+    );
+
+    let prepared = crate::service::deploys::prepare_rollback(&h.state, &app.id, "aaa1111", None)
+        .await
+        .expect("an explicit rollback is never gated by the automatic budget");
+    let row = crate::db::get_deploy(&h.state.pool, &app.id, &prepared.deploy_id)
+        .await
+        .expect("read deploy")
+        .expect("deploy row");
+    assert_eq!(row.intent, DeployIntent::Rollback);
+    drop(prepared);
+
+    h.finish().await;
+}

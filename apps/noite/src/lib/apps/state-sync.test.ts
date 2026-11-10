@@ -7,6 +7,7 @@ import { staleKeys } from "./state-sync";
 
 const app = (patch: Partial<RunnerApp> = {}): RunnerApp => ({
   asleepSince: null,
+  autoDeploy: { state: "eligible" },
   createdAt: "2026-10-20T00:00:00Z",
   desiredState: "running",
   fleetBucket: "noite",
@@ -31,6 +32,7 @@ const env = (patch: Partial<RunnerEnvironment> = {}): RunnerEnvironment => ({
   appId: "app_1",
   appSlug: "demo",
   asleepSince: null,
+  autoDeploy: { state: "eligible" },
   createdAt: "2026-10-20T00:00:00Z",
   createdBy: "u_1",
   desiredState: "running",

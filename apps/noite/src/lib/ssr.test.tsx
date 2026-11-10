@@ -49,6 +49,7 @@ beforeEach(() => {
   writeSwr(keys.appDetail(APP_ID), {
     app: {
       asleepSince: null,
+      autoDeploy: { state: "eligible" },
       createdAt: "",
       desiredState: "running",
       fleetBucket: "",

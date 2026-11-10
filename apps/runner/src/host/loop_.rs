@@ -566,6 +566,16 @@ async fn drain_tip(
     if busy {
         return;
     }
+    // A push of a sha whose automatic budget is spent (force-push of the same
+    // commit) must not restart it; a push of a new sha is a new start.
+    if let Ok(auto) =
+        crate::host::auto_deploy::for_target(pool, &app.id, target.environment_id()).await
+    {
+        if auto.blocks(&notify.tip.sha) {
+            tracing::info!(slug = %app.slug, sha = %&notify.tip.sha[..12.min(notify.tip.sha.len())], "automatic deploy paused");
+            return;
+        }
+    }
     tracing::info!(slug = %app.slug, git_ref = %notify.git_ref, sha = %&notify.tip.sha[..12.min(notify.tip.sha.len())], "push notified tip");
     spawn_tip_deploy(pool, cfg, procs, logs, deploying, app, target, notify.tip);
 }
@@ -587,6 +597,13 @@ async fn sweep_needs_tip(
 ) -> sqlx::Result<bool> {
     let live = target.last_deploy_sha(app);
     if live.as_deref().is_some_and(|s| sha_same(s, tip_sha)) {
+        return Ok(false);
+    }
+    // The automatic-deploy budget (owner rule, 2026-11-10): two consecutive
+    // failures of this sha pause the sweep until a new sha or an explicit
+    // deploy. A stop counts too — it must not be retried behind the operator.
+    let auto = crate::host::auto_deploy::for_target(pool, &app.id, target.environment_id()).await?;
+    if auto.blocks(tip_sha) {
         return Ok(false);
     }
 
@@ -917,6 +934,99 @@ mod tests {
         assert!(!sweep_needs_tip(&pool, &fresh, &preview, "sha2")
             .await
             .unwrap());
+        pool.close().await;
+    }
+
+    /// The owner rule (2026-11-10): two consecutive failed deploys of the same
+    /// sha pause the fallback sweep, a new sha is a new budget, a cancel keeps
+    /// the sweep off too, and an explicit deploy still works.
+    #[tokio::test]
+    async fn sweep_pauses_automatic_deploys_after_two_failures() {
+        let cfg = crate::config::config_for_tests();
+        let pool = db::connect("sqlite::memory:").await.expect("memory db");
+        let app = db::create_app(
+            &pool,
+            &cfg,
+            db::NewApp {
+                name: "paused",
+                slug: "paused",
+                user_id: "local",
+                subdomain: "paused.localhost",
+                listen: 30360,
+                internal: 30361,
+            },
+        )
+        .await
+        .expect("app");
+        let production = deploy::DeployTarget::Production;
+        let fail = |sha: &'static str| {
+            let pool = pool.clone();
+            let app_id = app.id.clone();
+            async move {
+                db::upsert_deploy(
+                    &pool,
+                    None,
+                    &app_id,
+                    None,
+                    DeployStatus::Failed,
+                    Some(sha),
+                    "boom",
+                )
+                .await
+                .expect("failed deploy");
+            }
+        };
+        fail("sha1").await;
+        assert!(
+            sweep_needs_tip(&pool, &app, &production, "sha1")
+                .await
+                .unwrap(),
+            "one failure is still retryable"
+        );
+        fail("sha1").await;
+        assert!(
+            !sweep_needs_tip(&pool, &app, &production, "sha1")
+                .await
+                .unwrap(),
+            "the second consecutive failure pauses the sha"
+        );
+        assert!(
+            sweep_needs_tip(&pool, &app, &production, "sha2")
+                .await
+                .unwrap(),
+            "a new sha starts a new budget"
+        );
+
+        // A cancel is an operator stop: it never counts as a failure, but the
+        // sweep must not retry the sha behind the operator's back.
+        db::upsert_deploy(
+            &pool,
+            None,
+            &app.id,
+            None,
+            DeployStatus::Cancelled,
+            Some("sha3"),
+            "stopped",
+        )
+        .await
+        .expect("cancelled deploy");
+        assert!(
+            !sweep_needs_tip(&pool, &app, &production, "sha3")
+                .await
+                .unwrap(),
+            "a stopped sha is not retried automatically"
+        );
+
+        // The state is derived from the rows, so it survives a restart: the
+        // same rows through a fresh handle still pause the sweep.
+        let state = crate::host::auto_deploy::for_target(&pool, &app.id, None)
+            .await
+            .expect("auto deploy");
+        assert_eq!(
+            state,
+            crate::models::AutoDeploy::Stopped { sha: "sha3".into() }
+        );
+
         pool.close().await;
     }
 }

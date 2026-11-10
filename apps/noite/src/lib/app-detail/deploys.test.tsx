@@ -13,6 +13,7 @@ const LIVE = "63a16014442f15e80e87c77e1b39f43eef4a2804";
 const detail = (lastDeploySha: string | null): AppDetail => ({
   app: {
     asleepSince: null,
+    autoDeploy: { state: "eligible" },
     createdAt: "2026-11-10T13:27:02.395Z",
     desiredState: "running",
     fleetBucket: "s3://noite-e2e/fleets/rollback",

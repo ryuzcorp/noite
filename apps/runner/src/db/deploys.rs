@@ -99,6 +99,34 @@ pub async fn latest_deploy_status_for_env(
 /// and its single parameter.
 const TARGET_CLAUSE: &str = "environment_id IS ?";
 
+/// How many of a target's newest rows the automatic-deploy budget reads. The
+/// rule only needs the trailing failure streak (and the row that ended it),
+/// so a bounded window is enough; a push/rollback older than this cannot
+/// still be the reason a tip is blocked.
+const AUTO_DEPLOY_ROWS: i64 = 50;
+
+/// The newest deploy rows of one target, oldest first: the input of
+/// [`crate::host::auto_deploy::evaluate`]. Only the three columns the rule
+/// reads are selected — never the build logs.
+pub async fn auto_deploy_rows(
+    pool: &SqlitePool,
+    app_id: &str,
+    environment_id: Option<&str>,
+) -> sqlx::Result<Vec<(Option<String>, DeployStatus, DeployIntent)>> {
+    let sql = format!(
+        "SELECT sha, status, intent FROM (SELECT sha, status, intent, created_at, rowid AS seq \
+         FROM deploy WHERE app_id = ? AND {TARGET_CLAUSE} \
+         ORDER BY created_at DESC, rowid DESC LIMIT ?) \
+         ORDER BY created_at ASC, seq ASC"
+    );
+    sqlx::query_as(sqlx::AssertSqlSafe(sql))
+        .bind(app_id)
+        .bind(environment_id)
+        .bind(AUTO_DEPLOY_ROWS)
+        .fetch_all(pool)
+        .await
+}
+
 /// Deploy history for the live stream (T1.7): same rows as `list_deploys`
 /// but without build-log text, except the newest row when it is still in
 /// flight (its live log is what the panel shows). Finished rows' logs come

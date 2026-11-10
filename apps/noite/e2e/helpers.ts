@@ -63,6 +63,12 @@ interface RunnerApp {
   slug: string;
   status: string;
   listenPort: number | null;
+  /** The runner's automatic-deploy budget, derived from the deploy rows. */
+  autoDeploy: {
+    state: "eligible" | "failing" | "exhausted" | "stopped";
+    sha?: string;
+    failures?: number;
+  };
 }
 
 interface RunnerDeploy {

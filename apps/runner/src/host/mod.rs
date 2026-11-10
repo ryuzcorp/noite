@@ -1,4 +1,5 @@
 pub mod accesslog;
+pub mod auto_deploy;
 pub mod build_output;
 pub mod caddy;
 pub mod cancel;

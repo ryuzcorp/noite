@@ -54,9 +54,22 @@ pub async fn list(
 ) -> Result<Vec<Environment>, ApiError> {
     require(role, "view")?;
     let app = app_or_404(state, id).await?;
-    db::list_environments(&state.pool, &app.id)
+    let mut envs = db::list_environments(&state.pool, &app.id)
         .await
-        .map_err(|e| ApiError::internal(e.to_string()))
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+    annotate_auto_deploy(state, &mut envs).await;
+    Ok(envs)
+}
+
+/// Fill each environment's automatic-deploy state from its own deploy rows.
+/// A preview's budget is its own: production's failures never pause it.
+async fn annotate_auto_deploy(state: &AppState, envs: &mut [Environment]) {
+    for env in envs {
+        match crate::host::auto_deploy::for_target(&state.pool, &env.app_id, Some(&env.id)).await {
+            Ok(auto) => env.auto_deploy = auto,
+            Err(e) => tracing::warn!(env_id = %env.id, error = %e, "auto deploy state"),
+        }
+    }
 }
 
 /// Load one environment of one app, or 404.
@@ -194,6 +207,9 @@ pub async fn create(
         tracing::warn!(error = %format!("{e:#}"), "caddy rewrite after environment create");
     }
     spawn_deploy(state, &app, env.clone(), &sha).await?;
+    let mut envs = [env];
+    annotate_auto_deploy(state, &mut envs).await;
+    let [env] = envs;
     Ok(env)
 }
 
@@ -252,6 +268,9 @@ pub async fn update(
     if let Err(e) = crate::host::edge_table::push_routes(&state.pool, &state.config).await {
         tracing::warn!(error = %format!("{e:#}"), "caddy rewrite after environment update");
     }
+    let mut envs = [env];
+    annotate_auto_deploy(state, &mut envs).await;
+    let [env] = envs;
     Ok(env)
 }
 
