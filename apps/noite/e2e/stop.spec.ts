@@ -47,9 +47,10 @@ const deployFor = async (
   return (res.body as DeployRow[]).find((row) => row.sha === sha);
 };
 
-// The Deployments tab's Stop closes an in-flight row as failed without
-// touching the serving release, and the app's next push still deploys: the
-// claim the stopped run held is released, so nothing wedges.
+// The Deployments tab's Stop closes an in-flight row as `cancelled` (read as
+// "Stopped") without touching the serving release, and the app's next push
+// still deploys: the claim the stopped run held is released, so nothing
+// wedges.
 test(
   "stopping a deploy closes its row and the app keeps deploying",
   { tag: "@fast" },
@@ -99,7 +100,7 @@ test(
     if (cancel.status === 200) {
       const stopped = await waitForDeploy(request, appId, 8 * 60_000, second);
 
-      expect(stopped.status, stopped.log).toBe("failed");
+      expect(stopped.status, stopped.log).toBe("cancelled");
       expect(stopped.log).toContain("cancelled by the operator");
     } else {
       expect(cancel.status).toBe(409);

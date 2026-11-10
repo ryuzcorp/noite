@@ -184,6 +184,14 @@ const DEPLOY_FACTS = {
     label: "building",
     succeeded: false,
   },
+  // The operator's stop: a finished row that is not a failure. It keeps its
+  // wire status, and reads as "Stopped".
+  cancelled: {
+    finished: true,
+    inFlight: false,
+    label: "Stopped",
+    succeeded: false,
+  },
   deploying: {
     finished: false,
     inFlight: true,
@@ -200,6 +208,14 @@ const DEPLOY_FACTS = {
     finished: false,
     inFlight: true,
     label: "queued",
+    succeeded: false,
+  },
+  // The sweep closed a row nothing reported on: a timeout, not a build
+  // error.
+  stalled: {
+    finished: true,
+    inFlight: false,
+    label: "Timed out",
     succeeded: false,
   },
   success: {
@@ -221,7 +237,7 @@ const UNKNOWN_DEPLOY: DeployStatusFacts = {
 };
 
 export const deployStatusFacts = (raw: string): DeployStatusFacts =>
-  isDeployStatus(raw) ? DEPLOY_FACTS[raw] : UNKNOWN_DEPLOY;
+  isDeployStatus(raw) ? DEPLOY_FACTS[raw] : { ...UNKNOWN_DEPLOY, label: raw };
 
 /** Production deploy rows carry `null` (the runner stores NULL); older
  * frames and fixtures may say `""`. Either is production. */

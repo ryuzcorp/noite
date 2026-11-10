@@ -204,6 +204,23 @@ export const appListenPort = async (
  * one row, so a short interval only trims the wait after a deploy ends. */
 export const DEPLOY_POLL_MS = 500;
 
+/** Every status a deploy row can hold once it stopped moving: a success, a
+ * failure, the operator's stop, or the sweep's timeout. */
+export const TERMINAL_DEPLOY_STATUSES: ReadonlySet<string> = new Set([
+  "success",
+  "failed",
+  "cancelled",
+  "stalled",
+]);
+
+/** `expect.poll(...).toMatch` over [`TERMINAL_DEPLOY_STATUSES`]. */
+export const TERMINAL_DEPLOY_PATTERN =
+  /^(?<terminal>success|failed|cancelled|stalled)$/u;
+
+/** Whether a deploy row is done, whatever ended it. */
+export const isTerminalDeploy = (status: string): boolean =>
+  TERMINAL_DEPLOY_STATUSES.has(status);
+
 /** Poll deploys until the tip reaches a terminal status. Push fast-path
  * spawns within seconds; the reconcile tip poll is the fallback. `sha`
  * waits for that revision's own row: without it a second push (or a
@@ -230,7 +247,7 @@ export const waitForDeploy = async (
 
         if (
           latest &&
-          (latest.status === "success" || latest.status === "failed") &&
+          TERMINAL_DEPLOY_STATUSES.has(latest.status) &&
           (sha === undefined || latest.sha === sha)
         ) {
           return latest.status;
@@ -240,7 +257,7 @@ export const waitForDeploy = async (
       },
       { intervals: [DEPLOY_POLL_MS], timeout: timeoutMs }
     )
-    .toMatch(/^(?<terminal>success|failed)$/u);
+    .toMatch(TERMINAL_DEPLOY_PATTERN);
 
   if (latest === undefined) {
     throw new Error(`deploy for ${appId} did not finish in ${timeoutMs}ms`);

@@ -37,10 +37,11 @@ pub async fn log(state: &AppState, id: &str, deploy_id: &str) -> Result<String, 
 }
 
 /// Stop an in-flight deploy of `app_id`. A live run is signalled and records
-/// its own failure (`ERROR: cancelled by the operator`); a row whose run is
-/// already gone (finished between the read and the call, or the runner
+/// its own `cancelled` row (`ERROR: cancelled by the operator`); a row whose
+/// run is already gone (finished between the read and the call, or the runner
 /// restarted mid-build) is closed here so the UI never keeps a "building" row
-/// that nothing is building.
+/// that nothing is building. Either way the row is `cancelled`, not `failed`:
+/// nothing failed, the operator stopped it.
 pub async fn cancel(state: &AppState, id: &str, deploy_id: &str) -> Result<(), ApiError> {
     let app = app_or_404(state, id).await?;
     let deploy_id = deploy_id.trim();

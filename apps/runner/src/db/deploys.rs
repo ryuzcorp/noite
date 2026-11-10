@@ -16,14 +16,21 @@
 //!   Building --> Deploying: stage/activate phase
 //!   Building --> Success: deploy live
 //!   Deploying --> Success: deploy live
-//!   Queued --> Failed: claim timeout, operator stop
-//!   Building --> Failed: step failure, stall, operator stop
-//!   Deploying --> Failed: step failure, stall, operator stop
+//!   Queued --> Failed: claim timeout, step failure
+//!   Building --> Failed: step failure
+//!   Deploying --> Failed: step failure
+//!   Queued --> Cancelled: operator stop (`mark_deploy_cancelled`)
+//!   Building --> Cancelled: operator stop
+//!   Deploying --> Cancelled: operator stop
+//!   Queued --> Stalled: the sweep (`fail_stuck_deploys`) found the row dead
+//!   Building --> Stalled: the sweep found the row dead
+//!   Deploying --> Stalled: the sweep found the row dead
 //! ```
 //!
-//! `success` and `failed` are terminal: `upsert_deploy` carries the table as
-//! `status IN (…)`, so a late log line, a stalled-sweep or a second stop is
-//! refused instead of rewriting a finished row.
+//! `success`, `failed`, `cancelled` and `stalled` are terminal:
+//! `upsert_deploy` carries the table as `status IN (…)`, so a late log line, a
+//! stalled-sweep or a second stop is refused instead of rewriting a finished
+//! row.
 
 use std::collections::HashSet;
 
@@ -38,6 +45,9 @@ use super::environments::{mark_environment_deployed, write_environment_status};
 
 /// Columns every `deploy` query selects, in [`Deploy`] order.
 const DEPLOY_COLS: &str = "id, app_id, environment_id, sha, status, log, created_at, updated_at";
+
+/// The target's `last_error` when the sweep, not the run, closed a deploy.
+const STALLED_SUMMARY: &str = "deploy stalled (host interrupted or timed out)";
 
 /// The only states a running deploy can be closed from (the terminal writers:
 /// stop endpoint, stall sweep, the run itself).
@@ -147,9 +157,10 @@ pub async fn get_deploy(
         .await
 }
 
-/// Close an in-flight row with the operator's line. `false` = the row was not
-/// in flight (it finished between the read and this update), so nothing was
-/// stopped.
+/// Close an in-flight row with the operator's line, as `cancelled` (not
+/// `failed`: the run did not fail, the operator stopped it). `false` = the row
+/// was not in flight (it finished between the read and this update), so
+/// nothing was stopped.
 pub async fn mark_deploy_cancelled(
     pool: &SqlitePool,
     app_id: &str,
@@ -160,7 +171,7 @@ pub async fn mark_deploy_cancelled(
          WHERE id = ? AND app_id = ? AND status IN ({})",
         status_list(IN_FLIGHT),
     )))
-    .bind(DeployStatus::Failed.as_str())
+    .bind(DeployStatus::Cancelled.as_str())
     .bind(format!("ERROR: {}\n", crate::host::cancel::CANCELLED))
     .bind(now_iso())
     .bind(deploy_id)
@@ -382,6 +393,29 @@ async fn apply_status(
             )
             .await
         }
+        // A stopped run and a stalled one close the deploy as their own
+        // status, but the target's chip is `failed` either way: nothing is
+        // building for it and the previous release is what still serves.
+        DeployStatus::Cancelled => {
+            write_target_status(
+                pool,
+                app_id,
+                environment_id,
+                AppStatus::Failed,
+                Some(crate::host::cancel::CANCELLED),
+            )
+            .await
+        }
+        DeployStatus::Stalled => {
+            write_target_status(
+                pool,
+                app_id,
+                environment_id,
+                AppStatus::Failed,
+                Some(STALLED_SUMMARY),
+            )
+            .await
+        }
         // A queued deploy is work in flight for the target: the chip says
         // building, exactly as the run that holds the claim does.
         DeployStatus::Queued | DeployStatus::Building => {
@@ -411,8 +445,10 @@ async fn write_target_status(
     }
 }
 
-/// Sweep deploys whose row has not moved since `older_than_ms`, marking them
-/// failed. A preview row marks its environment, never the app. The row write
+/// Sweep deploys whose row has not moved since `older_than_ms`, closing them
+/// as `stalled` (not `failed`: nothing in the run reported an error — the host
+/// interrupted it or the step timed out). A preview row marks its
+/// environment, never the app. The row write
 /// is guarded by the transition table, so a row that another writer closed
 /// between the read and the update is left alone (and does not touch the
 /// target's status).
@@ -447,17 +483,14 @@ pub async fn fail_stuck_deploys(
         if updated > utc_cutoff(limit) {
             continue;
         }
-        let log = format!(
-            "{}ERROR: deploy stalled (host interrupted or timed out)\n",
-            row.log
-        );
+        let log = format!("{}ERROR: {STALLED_SUMMARY}\n", row.log);
         let sql = format!(
             "UPDATE deploy SET status = ?, log = ?, updated_at = ? \
              WHERE id = ? AND status IN ({})",
             status_list(IN_FLIGHT),
         );
         let closed = sqlx::query(sqlx::AssertSqlSafe(sql))
-            .bind(DeployStatus::Failed.as_str())
+            .bind(DeployStatus::Stalled.as_str())
             .bind(&log)
             .bind(now_iso())
             .bind(&row.id)
@@ -473,7 +506,7 @@ pub async fn fail_stuck_deploys(
             &row.app_id,
             row.environment_id.as_deref(),
             AppStatus::Failed,
-            Some("deploy stalled (host interrupted or timed out)"),
+            Some(STALLED_SUMMARY),
         )
         .await?;
         n += 1;
@@ -516,7 +549,8 @@ mod tests {
     /// A terminal row is final: the late log line, the stall sweep and the
     /// second stop are refused instead of rewriting a finished deploy — the
     /// bug that let a run resurrect a `failed` row as `building` (only the
-    /// "live run owns the token" invariant stood in its way).
+    /// "live run owns the token" invariant stood in its way). A stop closes
+    /// the row as `cancelled`, not `failed`.
     #[tokio::test]
     async fn a_terminal_deploy_row_never_moves_again() {
         let pool = crate::db::connect("sqlite::memory:").await.expect("db");
@@ -547,15 +581,20 @@ mod tests {
         .expect("building");
         assert!(built.outcome.is_applied(), "queued -> building is legal");
 
-        // The stop endpoint (no live token) closes the row.
+        // The stop endpoint (no live token) closes the row as `cancelled`.
         assert!(mark_deploy_cancelled(&pool, &app.id, &queued.id)
             .await
             .expect("cancel"));
-        let failed = get_deploy(&pool, &app.id, &queued.id)
+        let stopped = get_deploy(&pool, &app.id, &queued.id)
             .await
             .expect("read")
             .expect("row");
-        assert_eq!(failed.status, DeployStatus::Failed);
+        assert_eq!(stopped.status, DeployStatus::Cancelled);
+        assert!(
+            stopped.log.contains("ERROR: cancelled by the operator"),
+            "{}",
+            stopped.log
+        );
 
         // A late step log now loses: nothing rewrites the row.
         let late = upsert_deploy(
@@ -572,14 +611,14 @@ mod tests {
         assert_eq!(
             late.outcome,
             DeployWrite::Refused {
-                current: DeployStatus::Failed
+                current: DeployStatus::Cancelled
             }
         );
         let after = get_deploy(&pool, &app.id, &queued.id)
             .await
             .expect("read")
             .expect("row");
-        assert_eq!(after.status, DeployStatus::Failed);
+        assert_eq!(after.status, DeployStatus::Cancelled);
         assert!(!after.log.contains("late line"), "{}", after.log);
         assert!(
             !mark_deploy_cancelled(&pool, &app.id, &queued.id)
@@ -663,5 +702,89 @@ mod tests {
             fresh.log
         );
         assert!(!fresh.log.contains("stalled"), "{}", fresh.log);
+    }
+
+    /// The sweep closes a dead row as `stalled` — the host interrupted it or a
+    /// step timed out, which is not the same story as a step that failed. The
+    /// target's chip still reads `failed` (nothing is building for it) with
+    /// the stall as its one-line summary, and the row is terminal from then
+    /// on.
+    #[tokio::test]
+    async fn the_stall_sweep_closes_a_dead_row_as_stalled() {
+        let pool = crate::db::connect("sqlite::memory:").await.expect("db");
+        let app = seed_app(&pool, "timeout").await;
+        let row = upsert_deploy(
+            &pool,
+            None,
+            &app.id,
+            None,
+            DeployStatus::Building,
+            Some("abc1234"),
+            "▸ build: bun run build\n",
+        )
+        .await
+        .expect("row");
+        let old = (chrono::Utc::now() - chrono::Duration::hours(2))
+            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        sqlx::query("UPDATE deploy SET updated_at = ? WHERE id = ?")
+            .bind(&old)
+            .bind(&row.id)
+            .execute(&pool)
+            .await
+            .expect("age");
+
+        assert_eq!(
+            fail_stuck_deploys(&pool, 60_000, &HashSet::new())
+                .await
+                .expect("sweep"),
+            1
+        );
+
+        let stale = get_deploy(&pool, &app.id, &row.id)
+            .await
+            .expect("read")
+            .expect("row");
+        assert_eq!(stale.status, DeployStatus::Stalled);
+        assert!(
+            stale
+                .log
+                .contains("ERROR: deploy stalled (host interrupted or timed out)"),
+            "{}",
+            stale.log
+        );
+        let swept_app = crate::db::get_app(&pool, &app.id)
+            .await
+            .expect("read app")
+            .expect("app row");
+        assert_eq!(swept_app.status, AppStatus::Failed);
+        assert_eq!(
+            swept_app.last_error.as_deref(),
+            Some("deploy stalled (host interrupted or timed out)")
+        );
+
+        // Terminal: neither a late line nor the sweep itself moves it again.
+        let late = upsert_deploy(
+            &pool,
+            Some(&row.id),
+            &app.id,
+            None,
+            DeployStatus::Deploying,
+            Some("abc1234"),
+            "▸ late line\n",
+        )
+        .await
+        .expect("late write");
+        assert_eq!(
+            late.outcome,
+            DeployWrite::Refused {
+                current: DeployStatus::Stalled
+            }
+        );
+        assert_eq!(
+            fail_stuck_deploys(&pool, 60_000, &HashSet::new())
+                .await
+                .expect("second sweep"),
+            0
+        );
     }
 }

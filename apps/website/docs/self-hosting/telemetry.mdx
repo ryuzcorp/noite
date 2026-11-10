@@ -22,7 +22,7 @@ One event per install per day, `instance_heartbeat`, built by the runner from it
 | `apps_running` | `3` | Apps desired running and awake |
 | `apps_sleeping` | `1` | Apps asleep ([Limits](/reference/limits)) |
 | `deploys_24h` | `7` | Deploy rows created in the last 24 hours |
-| `deploys_failed_24h` | `1` | Of those, failed |
+| `deploys_failed_24h` | `1` | Of those, did not land: failed, stopped (`cancelled`) or timed out (`stalled`) |
 | `users` | `2-5` | Bucket of the account count: `1`, `2-5`, `6-20`, `21+`, or `unknown` when the control worker cannot be reached |
 | `install_age_days` | `12` | Whole days since the install was first created |
 | `uptime_hours` | `813` | Whole hours since the runner started |
