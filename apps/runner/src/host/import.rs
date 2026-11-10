@@ -324,12 +324,6 @@ impl Drop for Fin {
     }
 }
 
-/// Take the attempt's task handle, for a test that awaits it directly.
-#[cfg(test)]
-fn take_task_for_test(app_id: &str) -> Option<tokio::task::JoinHandle<()>> {
-    imports().remove(app_id).map(|run| run.task)
-}
-
 /// Release this attempt's reservation and its stop token. The slot goes only
 /// while it is this attempt's (a newer attempt may have replaced it); the
 /// token is released unconditionally through `release_if`, which is itself
@@ -917,13 +911,16 @@ mod tests {
         let cancel = crate::host::cancel::CANCELS.register(&key);
         let token = cancel.clone();
         let (started, wait) = tokio::sync::oneshot::channel::<()>();
-        let task = tokio::spawn(async move {
+        // The real attempt's task is awaited through the test's own handle, so
+        // the slot is never removed by the test itself: what disappears below
+        // is the guard's doing.
+        let attempt = tokio::spawn(async move {
             let _fin = Fin {
                 app_id: app_id.to_string(),
                 token,
             };
-            // Deterministic: the panic happens only after `spawn` has
-            // registered the attempt, exactly as the real task would.
+            // Deterministic: the panic happens only after the slot below is
+            // registered, exactly as the real task would.
             wait.await.expect("start");
             panic!("the import panicked");
         });
@@ -931,13 +928,13 @@ mod tests {
             app_id.to_string(),
             ImportRun {
                 cancel: cancel.clone(),
-                task,
+                task: tokio::spawn(async {}),
             },
         );
-        started.send(()).expect("release the task");
-        // Await the panicking task directly (a delete would remove the slot
-        // first, which is the path under test here).
-        let joined = take_task_for_test(app_id).expect("task").await;
+        assert!(imports().contains_key(app_id), "the slot is registered");
+        started.send(()).expect("release the attempt");
+
+        let joined = attempt.await;
         assert!(joined.is_err(), "the attempt panicked");
         assert!(
             !imports().contains_key(app_id),

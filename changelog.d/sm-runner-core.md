@@ -5,6 +5,7 @@
 - **"Retry import" no longer breaks a healthy app.** Retrying an import used to set the app's status back to `importing` even while it was running, deploying or building, leaving the badge wrong until the next deploy. Retry is now refused with a 409 for an app that is deployed or busy.
 - **An interrupted import can no longer block its own retry.** A panic inside an import task left the in-process "an import is running" claim behind forever, so every later retry answered "an import is already running" until the runner restarted. The claim is released on every exit path.
 - **A failed import is stored as `error` rather than a status the API types did not know**, so a failed import no longer surfaces as an unknown badge value.
+- **Deleting an app stops its running import first.** A background import that finished after the purge could publish `main` (and its bundles) under the slug the delete had just freed, so a later app created with that slug inherited the imported tree. The delete now stops the import, waits for it to end, and a ref move re-checks that the app still owns the slug; retry/patch/rename on an app being deleted answer 409 instead of writing into a freed slug.
 
 ### Changed
 
