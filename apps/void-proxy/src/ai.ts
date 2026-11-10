@@ -76,15 +76,18 @@ type SerializedFileInput = Readonly<{
   type?: string;
 }>;
 
+/**
+ * The serializer's envelope, tagged by `type`. Payload fields stay `unknown`:
+ * the pre-machine code forwarded them straight to `fetch`/`Headers`/`FormData`,
+ * whose WebIDL conversion is the coercion contract, so decoding must not
+ * pre-coerce or reject them.
+ */
 type SerializedProviderBody = Readonly<
   | { type: "none" }
   | { type: "json"; value: unknown }
-  | { type: "text"; data: string; contentType?: string }
-  | { type: "base64"; data: string; contentType?: string }
-  | {
-      type: "form";
-      entries: { name: string; value: string | SerializedFileInput }[];
-    }
+  | { type: "text"; data: unknown; contentType?: unknown }
+  | { type: "base64"; data: unknown; contentType?: unknown }
+  | { type: "form"; entries: unknown }
 >;
 
 class BadRequestError extends Error {
@@ -112,11 +115,13 @@ const isSerializedFileInput = (
   );
 };
 
-const base64ToBytes = (base64: string): Uint8Array => {
+const base64ToBytes = (base64: unknown): Uint8Array => {
   let binary: string;
 
   try {
-    binary = atob(base64);
+    // SAFETY: `atob` applies the same WebIDL string coercion the old cast
+    // relied on; an unusable value still becomes BadRequestError below.
+    binary = atob(base64 as string);
   } catch {
     throw new BadRequestError("invalid file data");
   }
@@ -176,51 +181,27 @@ const isUnsafeProviderPath = (path: string): boolean => {
  *     [*] --> Form: type=form
  * ```
  *
- * A known tag with an unusable payload is refused where the old code threw:
- * a non-string `text.data` or a non-array `form.entries` becomes the handler's
- * 502, and bad file data stays the 400 it always was.
+ * Payload fields are forwarded unchanged and coerced by the same sinks as
+ * before (`fetch` body, `Headers.set`, `FormData.append`), so every input
+ * produces the old upstream request: `{type:"text",data:5}` still sends "5",
+ * a truthy non-string `contentType` is stringified, and form `name`/`value`
+ * are coerced. A non-iterable `entries` or a null entry still throws here
+ * (mapped to 502), and bad file data stays the 400 it always was.
  */
-const decodeFormEntry = (
-  entry: unknown
-): { name: string; value: string | SerializedFileInput } => {
-  const record = asRecord(entry);
-  const name = asString(record.name);
-
-  if (name === null) {
-    throw new Error("invalid form entry");
-  }
-
-  const { value } = record;
-
-  if (typeof value === "string" || isSerializedFileInput(value)) {
-    return { name, value };
-  }
-
-  throw new Error("invalid form entry");
-};
-
 const providerBody = (value: unknown): SerializedProviderBody => {
   const record = asRecord(value);
 
   switch (asString(record.type)) {
     case "base64": {
-      if (typeof record.data !== "string") {
-        throw new BadRequestError("invalid file data");
-      }
-
       return {
-        contentType: asString(record.contentType) ?? undefined,
+        contentType: record.contentType,
         data: record.data,
         type: "base64",
       };
     }
 
     case "form": {
-      if (!Array.isArray(record.entries)) {
-        throw new TypeError("invalid form envelope");
-      }
-
-      return { entries: record.entries.map(decodeFormEntry), type: "form" };
+      return { entries: record.entries, type: "form" };
     }
 
     case "json": {
@@ -228,12 +209,8 @@ const providerBody = (value: unknown): SerializedProviderBody => {
     }
 
     case "text": {
-      if (typeof record.data !== "string") {
-        throw new TypeError("invalid text envelope");
-      }
-
       return {
-        contentType: asString(record.contentType) ?? undefined,
+        contentType: record.contentType,
         data: record.data,
         type: "text",
       };
@@ -247,8 +224,8 @@ const providerBody = (value: unknown): SerializedProviderBody => {
 
 const appendSerializedFormValue = (
   form: FormData,
-  name: string,
-  value: string | SerializedFileInput
+  name: unknown,
+  value: unknown
 ): void => {
   if (isSerializedFileInput(value)) {
     const bytes = base64ToBytes(value.data);
@@ -258,19 +235,22 @@ const appendSerializedFormValue = (
       type: value.type ?? "application/octet-stream",
     });
 
-    form.append(name, blob, value.name ?? name);
+    // SAFETY: `FormData.append` applies the same WebIDL string coercion to the
+    // field name and filename that the old raw cast relied on.
+    form.append(name as string, blob, (value.name ?? name) as string);
 
     return;
   }
 
-  form.append(name, value);
+  // SAFETY: `FormData.append` coerces name and value to strings, as before.
+  form.append(name as string, value as string);
 };
 
 const providerRequestBody = (
   body: SerializedProviderBody
 ): {
-  body?: BodyInit;
-  contentType?: string;
+  body?: BodyInit | null;
+  contentType?: unknown;
 } => {
   if (body.type === "none") {
     return {};
@@ -284,7 +264,12 @@ const providerRequestBody = (
   }
 
   if (body.type === "text") {
-    return { body: body.data, contentType: body.contentType };
+    // SAFETY: `fetch` coerces the body exactly as the old cast did (String for
+    // primitives, no body for null/undefined).
+    return {
+      body: body.data as BodyInit | null | undefined,
+      contentType: body.contentType,
+    };
   }
 
   if (body.type === "base64") {
@@ -296,8 +281,14 @@ const providerRequestBody = (
 
   const form = new FormData();
 
-  for (const entry of body.entries) {
-    appendSerializedFormValue(form, entry.name, entry.value);
+  // SAFETY: `entries` is the serializer's array; a non-iterable value throws
+  // here exactly as the old `for…of` did (the handler maps that to 502).
+  for (const entry of body.entries as readonly unknown[]) {
+    // SAFETY: raw property access reproduces the old coercion: a primitive
+    // entry yields undefined fields, null/undefined entries throw (502).
+    const { name, value } = entry as { name?: unknown; value?: unknown };
+
+    appendSerializedFormValue(form, name, value);
   }
 
   return { body: form };
@@ -339,7 +330,7 @@ const applyProviderHeaders = ({
   providerKey: string;
   apiKeyHeader?: string | null;
   apiKeyPrefix?: string | null;
-  contentType?: string;
+  contentType?: unknown;
 }): Headers => {
   const defaults = providerAuthDefaults(provider);
   const keyHeader = apiKeyHeader ?? defaults.header;
@@ -348,7 +339,9 @@ const applyProviderHeaders = ({
   headers.set(keyHeader, `${keyPrefix}${providerKey}`);
 
   if (contentType && !headers.has("content-type")) {
-    headers.set("content-type", contentType);
+    // SAFETY: `Headers.set` applies the same WebIDL string coercion the old
+    // raw `contentType` relied on.
+    headers.set("content-type", contentType as string);
   }
 
   return headers;
