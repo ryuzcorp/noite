@@ -186,9 +186,11 @@ func (l *Limiter) Allow(zone string, rpm uint32, key string) (bool, time.Duratio
 // A zero-RPM or empty-key limit is absent, so either or both arguments may be
 // the zero value.
 func (l *Limiter) AllowRequest(client, app RateLimit) Decision {
-	now := l.nanos()
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	// Sample under the lock: the stamp log is ascending, and a time read
+	// before the lock could be appended after a later one.
+	now := l.nanos()
 
 	limits := [2]RateLimit{client, app}
 	var fits [2]fit
@@ -211,7 +213,7 @@ func (l *Limiter) AllowRequest(client, app RateLimit) Decision {
 		return decision
 	}
 	for i, lim := range limits {
-		if fits[i] == fitAdmit {
+		if lim.enabled() && fits[i] == fitAdmit {
 			l.commitLocked(lim, now)
 		}
 	}
@@ -241,7 +243,7 @@ func (l *Limiter) fitLocked(lim RateLimit, now int64) (fit, time.Duration) {
 		if now < z.noRoomUntil {
 			return fitUnrecorded, 0
 		}
-		if !l.makeRoomLocked(z, now) {
+		if !l.makeRoomLocked(z, now, window) {
 			z.noRoomUntil = now + int64(RateWindow)
 			return fitUnrecorded, 0
 		}
@@ -284,19 +286,20 @@ func (l *Limiter) commitLocked(lim RateLimit, now int64) {
 }
 
 // makeRoomLocked evicts the least-recently-seen quarter of keys that are no
-// longer inside their window, and reports whether it freed a slot. A key
-// with even one live stamp is never evicted: a client that floods a zone with
-// fresh keys could otherwise cycle them to flush its own (or another
-// client's) budget and carry on before its window ends. O(n log n), and only
-// while a zone is full.
-func (l *Limiter) makeRoomLocked(z *zoneState, now int64) bool {
+// longer inside their window, and reports whether it freed a slot. window is
+// the window of the limit asking for room, so a rate lowered since the key
+// last ran still protects it. A key with even one live stamp is never
+// evicted: a client that floods a zone with fresh keys could otherwise cycle
+// them to flush its own (or another client's) budget and carry on before its
+// window ends. O(n log n), and only while a zone is full.
+func (l *Limiter) makeRoomLocked(z *zoneState, now int64, window time.Duration) bool {
 	type kv struct {
 		k string
 		t int64
 	}
 	all := make([]kv, 0, len(z.keys)/4+1)
 	for k, ks := range z.keys {
-		if live(ks, now) > 0 {
+		if live(ks, now, window) > 0 {
 			continue
 		}
 		all = append(all, kv{k, ks.lastSeen})
@@ -316,12 +319,18 @@ func (l *Limiter) makeRoomLocked(z *zoneState, now int64) bool {
 }
 
 // live returns how many of ks's stamps are still inside the window they were
-// counted against.
-func live(ks *keyState, now int64) int {
-	if ks.window == 0 {
+// counted against, widened to floor: the caller's current window, or a
+// minute where it does not know the zone's rate (Sweep), since a rate lowered
+// after the key last ran must not make its budget look expired.
+func live(ks *keyState, now int64, floor time.Duration) int {
+	window := ks.window
+	if w := int64(floor); w > window {
+		window = w
+	}
+	if window == 0 {
 		return 0
 	}
-	cutoff := now - ks.window
+	cutoff := now - window
 	return len(ks.stamps) - sort.Search(len(ks.stamps), func(i int) bool { return ks.stamps[i] > cutoff })
 }
 
@@ -339,16 +348,18 @@ func ceilSeconds(wait time.Duration) time.Duration {
 // window keeps its budget regardless of idle, so a sweep never resets a live
 // throttle.
 func (l *Limiter) Sweep(keep map[string]bool, idle time.Duration) {
-	now := l.nanos()
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	now := l.nanos()
 	for name, z := range l.zones {
 		if !keep[name] {
 			delete(l.zones, name)
 			continue
 		}
 		for k, ks := range z.keys {
-			if time.Duration(now-ks.lastSeen) <= idle || live(ks, now) > 0 {
+			// A minute is the widest window a key can be charged, so Sweep
+			// never drops a key any live rate still counts.
+			if time.Duration(now-ks.lastSeen) <= idle || live(ks, now, time.Minute) > 0 {
 				continue
 			}
 			delete(z.keys, k)

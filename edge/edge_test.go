@@ -297,6 +297,23 @@ func TestRetryAfterCountsEveryStampALoweredRateMustExpire(t *testing.T) {
 	}
 }
 
+// TestAllowRequestSkipsAbsentZones pins the zero value: an absent zone
+// records nothing, so a route with only one limit cannot create a phantom
+// zone or a stamp.
+func TestAllowRequestSkipsAbsentZones(t *testing.T) {
+	var clock atomic.Int64
+	l := NewLimiter(func() time.Time { return time.Unix(0, clock.Load()) })
+	if d := l.AllowRequest(RateLimit{}, RateLimit{Zone: "app", RPM: 60, Key: "all"}); !d.Allowed {
+		t.Fatalf("app-only request refused: %v", d.RetryAfter)
+	}
+	if got := l.Zones(); len(got) != 1 || got[0] != "app" {
+		t.Fatalf("zones = %v, want only the app zone", got)
+	}
+	if got := stampCount(l, "app", "all"); got != 1 {
+		t.Fatalf("app zone kept %d stamps, want 1", got)
+	}
+}
+
 // TestAllowRequestSpendsNoBudgetOnRefusal checks the two-zone decision: when the
 // app zone refuses, the client zone must not keep its stamp, and Retry-After
 // reports the app zone's remaining window.
@@ -389,13 +406,68 @@ func TestMakeRoomRefusesWhileEveryKeyIsLive(t *testing.T) {
 		}
 	}
 	l.mu.Lock()
-	room := l.makeRoomLocked(l.zones["z"], 0)
+	room := l.makeRoomLocked(l.zones["z"], l.nanos(), RateWindow)
 	l.mu.Unlock()
 	if room {
 		t.Fatalf("evicted a key with a live budget")
 	}
 	if got := zoneKeys(l, "z"); got != 2 {
 		t.Fatalf("zone holds %d keys, want 2", got)
+	}
+}
+
+// TestMakeRoomKeepsAKeyThrottledUnderTheCurrentRate covers a rate lowered
+// after the key last ran: its stored window is short, but the current one
+// still charges its stamps, so eviction must not drop it.
+func TestMakeRoomKeepsAKeyThrottledUnderTheCurrentRate(t *testing.T) {
+	var clock atomic.Int64
+	l := NewLimiter(func() time.Time { return time.Unix(0, clock.Load()) })
+	for range 10 {
+		if ok, _ := l.Allow("z", 60, "k"); !ok {
+			t.Fatalf("denied inside budget")
+		}
+	}
+	clock.Store(int64(15 * time.Second))
+	l.mu.Lock()
+	room := l.makeRoomLocked(l.zones["z"], l.nanos(), time.Minute)
+	l.mu.Unlock()
+	if room {
+		t.Fatalf("evicted a key the current rate still throttles")
+	}
+	if ok, retry := l.Allow("z", 1, "k"); ok || retry <= 0 {
+		t.Fatalf("lowered rate not enforced: allowed=%v retry=%v", ok, retry)
+	}
+}
+
+// TestConcurrentStampsStayAscending keeps the invariant the window searches
+// rely on under contention: a stamp log is appended under the same lock the
+// clock is read in, so it stays ordered.
+func TestConcurrentStampsStayAscending(t *testing.T) {
+	l := NewLimiter(time.Now)
+	var wg sync.WaitGroup
+	for range 8 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for range 200 {
+				if ok, _ := l.Allow("z", 1<<30, "k"); !ok {
+					t.Errorf("denied inside a huge budget")
+					return
+				}
+			}
+		}()
+	}
+	wg.Wait()
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	stamps := l.zones["z"].keys["k"].stamps
+	if len(stamps) != 1600 {
+		t.Fatalf("key holds %d stamps, want 1600", len(stamps))
+	}
+	for i := 1; i < len(stamps); i++ {
+		if stamps[i] < stamps[i-1] {
+			t.Fatalf("stamp %d at index %d is before its predecessor", stamps[i], i)
+		}
 	}
 }
 
@@ -448,8 +520,8 @@ func TestSweepKeepsLiveThrottle(t *testing.T) {
 	if got := stampCount(l, "z", "k"); got != 10 {
 		t.Fatalf("sweep dropped a live key: %d stamps left, want 10", got)
 	}
-	// Once the window has passed, the same key is idle and may go.
-	clock.Store(int64(RateWindow + time.Second))
+	// Once the widest window has passed, the same key is idle and may go.
+	clock.Store(int64(time.Minute + time.Second))
 	l.Sweep(keep, time.Second)
 	if got := stampCount(l, "z", "k"); got != 0 {
 		t.Fatalf("sweep kept an idle key: %d stamps left", got)
