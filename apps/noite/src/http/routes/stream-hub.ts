@@ -161,10 +161,14 @@ export const matchTopic = (
  * bounds the handlers one request can start. */
 export const MAX_TOPICS = 24;
 
-/** Most bytes one SSE frame may buffer (its line plus accumulated `data`):
- * frames are JSON of rows, so a megabyte is already far beyond any real one,
- * and a line with no terminator must not grow the control worker's heap. */
-export const MAX_FRAME_BYTES = 1_048_576;
+/** Most bytes one SSE frame may buffer (its line plus accumulated `data`).
+ * 8 MiB: the logs topic re-sends the runner's 500-line ring, so an app
+ * logging ~2 KB JSON lines reaches ~1 MiB — a 1 MiB cap would refuse a
+ * legitimate frame, and the refusal is terminal, so that app's Logs tab
+ * would die permanently. 8 MiB leaves 8x headroom over that worst case and
+ * is still far under the control worker's heap; an unbounded line cannot
+ * grow it. */
+export const MAX_FRAME_BYTES = 8 * 1024 * 1024;
 
 /** A frame that exceeded {@link MAX_FRAME_BYTES}. The relay treats it as a
  * terminal refusal of that topic (`~502`): retrying would re-read the same
