@@ -292,14 +292,13 @@ impl FleetState {
             (S::CrashHeld { until, .. } | S::OomHeld { until, .. }, E::Parked) => {
                 S::Asleep { until: Some(until) }
             }
-            (
-                S::Absent
-                | S::Spawning { .. }
-                | S::Probing { .. }
-                | S::Healthy { .. }
-                | S::Waking { .. },
-                E::Parked,
-            ) => S::Asleep { until: None },
+            // A park inside the window of a hold a wake carried keeps it: the
+            // fleet is parked *and* still backing off, exactly as a
+            // crash-then-park rests.
+            (S::Waking { until, .. }, E::Parked) => S::Asleep { until },
+            (S::Absent | S::Spawning { .. } | S::Probing { .. } | S::Healthy { .. }, E::Parked) => {
+                S::Asleep { until: None }
+            }
 
             // A stop wins over every state: the caller then tears the child
             // down and the fleet stays `Stopped` until a spawn restarts it.
@@ -646,8 +645,10 @@ pub async fn stop_fleet(procs: &ProcMap, slug: &str, grace: StopGrace) {
                 debug_assert_eq!(entry.state, FleetState::Stopped);
                 (entry.child.take(), entry.epoch)
             }
-            // No entry: epoch 0 can never match a real one, and the cleanup
-            // below only runs when the key is still unowned.
+            // No entry: no claim ever owned this key, so the cleanup below
+            // runs on nobody's behalf (an epoch-0 park/wake ghost can match,
+            // and it holds no child or scaffolding of its own, so cleaning is
+            // what the stop wants).
             None => (None, 0),
         }
     };
@@ -1704,8 +1705,10 @@ pub async fn stop_all(procs: &ProcMap, budget: Duration) {
         }
     }
     for slug in &slugs {
-        // The map is drained above, so no generation holds the key: epoch 0
-        // can never match a real one and the cleanup runs on nobody's behalf.
+        // The map is drained above, so no claim holds the key: epoch 0 stands
+        // for "nobody", and an epoch-0 park/wake ghost that raced the drain
+        // owns no child or scaffolding either, so cleaning is what shutdown
+        // wants.
         fleet_gone_cleanup(procs, slug, 0).await;
     }
 }
@@ -2027,6 +2030,14 @@ mod tests {
             waking_held.on(E::Spawned { at: at(30) }),
             S::Spawning { since, crashes: 0 } if since == at(30)
         ));
+        // A park that lands inside the carried hold keeps it, like a park of a
+        // crash-held fleet: the fleet rests asleep and still backs off.
+        assert_eq!(
+            waking_held.on(E::Parked),
+            S::Asleep {
+                until: Some(at(30))
+            }
+        );
         // A wake from `Absent` (the first one after a runner restart) has no
         // hold to carry.
         assert_eq!(
