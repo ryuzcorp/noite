@@ -317,6 +317,13 @@ export const createAppForUser = async (input: {
       );
 
       if (!existing) {
+        // The runner runs create detached: a row can still land after the
+        // recovery budget, un-granted and therefore invisible in every list.
+        // Nothing in-band can fix that; leave an operator signal.
+        console.error(
+          "[apps] detached create may have landed un-granted for slug",
+          input.slug
+        );
         throw error;
       }
 

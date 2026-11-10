@@ -16,7 +16,7 @@ import type {
   RunnerInsight,
   RunnerApp,
 } from "./runner";
-import { readSwr, writeSwr } from "./swr-store";
+import { readSwr, swrEpoch, writeSwr } from "./swr-store";
 
 /** One stream's connection state, shared by the EventSource manager and the
  * hub's per-topic view. One closed type; {@link nextConn} is the only
@@ -276,6 +276,9 @@ export const connectStream = (
 
   let conn: Conn = ConnTypes.Idle();
   let source: EventSource | undefined;
+  /** Listeners on `source`; removed before it is closed, so a task the
+   * browser queued before `close()` cannot deliver a stale account's frame. */
+  let listeners: { fn: (event: Event) => void; type: string }[] = [];
   // Pending-reopen generation: scheduling bumps it and each timer only fires
   // for its own generation, so a stale timer can never open a second source.
   let pending = 0;
@@ -330,23 +333,36 @@ export const connectStream = (
     emit({ kind: "connect" });
     const next = new Source(url);
     source = next;
-    next.addEventListener("open", () => {
+
+    const onOpen = (): void => {
+      if (source !== next) {
+        return;
+      }
+
       attempts = 0;
       emit({ kind: "opened" });
-    });
-    next.addEventListener("error", () => {
+    };
+
+    const onError = (): void => {
+      if (source !== next) {
+        return;
+      }
+
       if (next.readyState === SOURCE_CLOSED) {
-        if (source === next) {
-          source = undefined;
-        }
+        source = undefined;
 
         emit({ kind: "source-dead" });
         schedule();
       } else {
         emit({ kind: "transport-lost" });
       }
-    });
-    next.addEventListener("message", (event) => {
+    };
+
+    const onMessage = (event: MessageEvent<string>): void => {
+      if (source !== next) {
+        return;
+      }
+
       // A frame proves the stream is open even when the browser has not
       // dispatched `open` yet: dropping that distinction made a frame that
       // landed before `open` paint as "connecting" (not loaded) while its
@@ -356,12 +372,37 @@ export const connectStream = (
       }
 
       hooks.onMessage(event.data);
-    });
+    };
+
+    // SAFETY: `addEventListener` accepts a listener typed for the event it is
+    // registered for; these narrow it back to their own event type inside.
+    const onErrorEvent = onError as (event: Event) => void;
+    // SAFETY: same as above — the "message" listener receives a MessageEvent.
+    const onMessageEvent = onMessage as (event: Event) => void;
+
+    listeners = [
+      { fn: onErrorEvent, type: "error" },
+      { fn: onMessageEvent, type: "message" },
+      { fn: onOpen, type: "open" },
+    ];
+
+    for (const { fn, type } of listeners) {
+      next.addEventListener(type, fn);
+    }
   };
 
   const close = (): void => {
     clearTimer();
-    source?.close();
+
+    if (source !== undefined) {
+      for (const { fn, type } of listeners) {
+        source.removeEventListener(type, fn);
+      }
+
+      source.close();
+    }
+
+    listeners = [];
     source = undefined;
   };
 
@@ -699,6 +740,11 @@ export const paintInitial = async <T>(
     return;
   }
 
+  // Capture the account epoch before fetching: an auth change while the
+  // fetch is in flight makes its result the previous account's, and the feed
+  // keys carry no account id.
+  const startedAt = swrEpoch();
+
   let pending = initialInflight.get(key);
 
   if (pending === undefined) {
@@ -731,7 +777,11 @@ export const paintInitial = async <T>(
 
   const frame = await pending;
 
-  if (frame !== undefined && feedValue(sink.current()) === undefined) {
+  if (
+    frame !== undefined &&
+    startedAt === swrEpoch() &&
+    feedValue(sink.current()) === undefined
+  ) {
     writeSwr(key, frame, opts);
     // SAFETY: one key carries one T (see `writeSwr`); an empty fetch is a failure, never a frame.
     sink.apply({ kind: "snapshot", value: frame as T });

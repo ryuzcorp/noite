@@ -21,7 +21,7 @@ import * as Atom from "effect/reactivity/Atom";
 import { atom, watch } from "ilha";
 import type { AtomHandle } from "ilha";
 
-import { readSwr, writeSwr } from "./swr-store";
+import { readSwr, swrEpoch, writeSwr } from "./swr-store";
 
 /** What one resource reader paints: one closed type, no parallel
  * `data`/`error`/`loading` atoms.
@@ -149,17 +149,26 @@ const generations = new Map<string, number>();
 const memoryOnly = new Set<string>();
 const subs = new Map<string, Set<KeySub>>();
 
+/** The Effect cache key for a resource key: the account epoch plus the key,
+ * so a lookup that started before an auth change lands in a namespace no
+ * reader asks for after the reset (the keys carry no account id). */
+const cacheKey = (key: string): string => `${swrEpoch()}:${key}`;
+
+/** The resource key behind an Effect cache key. */
+const bareKey = (key: string): string => key.slice(key.indexOf(":") + 1);
+
 /** One cache for every resource key: concurrent reads share one lookup,
  * later reads hit the entry until `invalidate` drops it. No TTL — entries
  * live until invalidated, like ilha 0.15's per-key cells. */
 const cache = Effect.runSync(
   Cache.make({
     capacity: 1000,
-    lookup: (key: string) =>
+    lookup: (effectKey: string) =>
       Effect.tryPromise({
         // oxlint-disable-next-line anti-slop/no-unknown-returns -- the cache is type-erased across keys; each key's readers own T and narrow on settle.
         catch: (cause: unknown): unknown => cause,
         try: async (signal: AbortSignal) => {
+          const key = bareKey(effectKey);
           const run = fetchers.get(key);
 
           const value: unknown =
@@ -218,10 +227,10 @@ const reload = async (key: string): Promise<unknown> => {
     }
   }
 
-  await Effect.runPromise(Cache.invalidate(cache, key));
+  await Effect.runPromise(Cache.invalidate(cache, cacheKey(key)));
 
   try {
-    const value = await Effect.runPromise(Cache.get(cache, key));
+    const value = await Effect.runPromise(Cache.get(cache, cacheKey(key)));
     settleKey(key, generation, { ok: true, value });
 
     return value;
@@ -237,13 +246,13 @@ const reload = async (key: string): Promise<unknown> => {
  * an explicit refetch) starts a fresh lookup instead of re-serving it. */
 const settleGet = async (key: string, generation: number): Promise<void> => {
   try {
-    const value = await Effect.runPromise(Cache.get(cache, key));
+    const value = await Effect.runPromise(Cache.get(cache, cacheKey(key)));
     settleKey(key, generation, { ok: true, value });
   } catch (error) {
     settleKey(key, generation, { error, ok: false });
 
     if (generations.get(key) === generation) {
-      await Effect.runPromise(Cache.invalidate(cache, key));
+      await Effect.runPromise(Cache.invalidate(cache, cacheKey(key)));
     }
   }
 };
@@ -264,7 +273,7 @@ export const invalidate = (key: string): void => {
   const readers = subs.get(key);
 
   if (readers === undefined || readers.size === 0) {
-    void Effect.runPromise(Cache.invalidate(cache, key));
+    void Effect.runPromise(Cache.invalidate(cache, cacheKey(key)));
 
     return;
   }

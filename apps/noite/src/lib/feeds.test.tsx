@@ -46,6 +46,13 @@ class FakeSource {
     this.listeners.set(type, list);
   }
 
+  removeEventListener(type: string, listener: Listener): void {
+    this.listeners.set(
+      type,
+      (this.listeners.get(type) ?? []).filter((live) => live !== listener)
+    );
+  }
+
   close(): void {
     this.closed = true;
     this.readyState = 2;

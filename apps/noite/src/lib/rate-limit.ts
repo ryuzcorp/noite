@@ -197,5 +197,11 @@ export const limitedClass = (pathname: string): string | null => {
     return "envelope";
   }
 
+  if (pathname === "/api/streams") {
+    // The hub opens one connection per page but up to MAX_TOPICS handlers,
+    // each with a D1 session read; one per-IP bucket per connection bounds it.
+    return "stream";
+  }
+
   return pathname.startsWith("/api/auth") ? "auth" : null;
 };

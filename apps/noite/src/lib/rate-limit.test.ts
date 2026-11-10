@@ -129,6 +129,7 @@ describe("limitedClass", () => {
     expect(limitedClass("/internal/recovery")).toBe("recovery");
     expect(limitedClass("/api/42/envelope")).toBe("envelope");
     expect(limitedClass("/api/42/envelope/")).toBe("envelope");
+    expect(limitedClass("/api/streams")).toBe("stream");
     expect(limitedClass("/api/apps/stream")).toBeNull();
     expect(limitedClass("/api/apps/envelope")).toBeNull();
   });
