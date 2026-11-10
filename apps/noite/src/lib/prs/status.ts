@@ -2,12 +2,9 @@
 //! `state`, the derived `merge_state`, the review verdict and the actions
 //! each one permits.
 //!
-//! The runner owns these values (PR #219 turns them into ts-rs literal
-//! unions in `lib/runner-types/{PrState,MergeState,ReviewState}`). Until that
-//! lands the wire fields are still `string`, so this module declares the same
-//! unions locally and decodes at the boundary; when the bindings arrive, the
-//! local aliases are deleted and the decoders keep working unchanged (a union
-//! is assignable to `string`).
+//! The unions are the runner's own ts-rs bindings (`lib/runner-types`), so a
+//! new runner state fails this module's compile until it is given a badge, a
+//! label and a capability: the tables below are `satisfies Record<…>`.
 //!
 //! The UI used to re-implement the runner's policy in three places — the
 //! header's `canClose`/`canMerge`, the dropdown's `mergeState === "mergeable"`
@@ -135,12 +132,9 @@ export const prStateFacts = (state: PrState): PrStateFacts =>
 export const mergeStateFacts = (state: MergeState): MergeStateFacts =>
   MERGE_STATE_FACTS[state];
 
-/** The badge/label for a review verdict; null for an unknown wire value. */
-export const reviewStateFacts = (state: string): ReviewStateFacts | null => {
-  const known = toReviewState(state);
-
-  return known === null ? null : REVIEW_STATE_FACTS[known];
-};
+/** The badge/label for a review verdict. */
+export const reviewStateFacts = (state: ReviewState): ReviewStateFacts =>
+  REVIEW_STATE_FACTS[state];
 
 /** What this viewer may do with this pull request. Every control reads this
  * value, so a button can never be enabled for a transition the runner will
@@ -162,8 +156,7 @@ export const prCapabilities = ({
   viewerId: string;
 }): PrCapabilities => {
   const { pullRequest } = detail;
-  const state = toPrState(pullRequest.state);
-  const mergeState = toMergeState(detail.mergeState);
+  const { state } = pullRequest;
   const canPush = role === "push" || role === "admin";
   const signedIn = viewerId !== "";
   const isAuthor = signedIn && pullRequest.authorId === viewerId;
@@ -174,7 +167,7 @@ export const prCapabilities = ({
     canClose: owns && open,
     // Merge needs the merge state to say yes: the dropdown already gated on
     // it, and the header must not offer a merge the runner would 409.
-    canMerge: canPush && open && mergeState === "mergeable",
+    canMerge: canPush && open && detail.mergeState === "mergeable",
     // Reopen needs a live head branch: the runner refuses it otherwise, and
     // `compare === null` is exactly "the head branch is gone".
     canReopen: owns && state === "closed" && detail.compare !== null,

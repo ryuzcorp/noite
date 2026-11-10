@@ -8,9 +8,6 @@ import {
   prStateFacts,
   reviewStateFacts,
   switchStateAction,
-  toMergeState,
-  toPrState,
-  toReviewState,
 } from "./status";
 
 const review = (over: Partial<PrReview> = {}): PrReview => ({
@@ -65,25 +62,16 @@ const detail = (over: Partial<PrDetail> = {}): PrDetail => ({
   ...over,
 });
 
-describe("wire decoding", () => {
-  test("known states keep their identity", () => {
-    expect(toPrState("open")).toBe("open");
-    expect(toPrState("merged")).toBe("merged");
-    expect(toReviewState("changes_requested")).toBe("changes_requested");
-    expect(toMergeState("blocked_approvals")).toBe("blocked_approvals");
-  });
-
-  test("an unknown state is inert, never mergeable", () => {
-    // Fail-before: the header treated any state but "merged" as closable and
-    // the badge rendered the raw string.
-    expect(toPrState("archived")).toBe("closed");
-    expect(toMergeState("archived")).toBe("conflicts");
-    expect(toReviewState("archived")).toBeNull();
-    expect(prStateFacts(toPrState("archived"))).toEqual(prStateFacts("closed"));
-    expect(mergeStateFacts(toMergeState("archived")).label).toBe(
-      "Merge conflicts"
+describe("state facts", () => {
+  test("every union member has a badge and a label", () => {
+    expect(prStateFacts("open").label).toBe("Open");
+    expect(mergeStateFacts("blocked_approvals").label).toBe(
+      "Waiting for approvals"
     );
-    expect(reviewStateFacts("archived")).toBeNull();
+    expect(prStateFacts("merged").terminal).toBe(true);
+    expect(reviewStateFacts("changes_requested").label).toBe(
+      "Changes requested"
+    );
   });
 });
 

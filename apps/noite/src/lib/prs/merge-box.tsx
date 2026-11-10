@@ -28,8 +28,6 @@ import {
   myVerdict,
   prCapabilities,
   switchStateAction,
-  toMergeState,
-  toPrState,
 } from "./status";
 
 /** Run one PR mutation through the shared machine: refused while another is
@@ -65,7 +63,7 @@ const runMutation = async (
 /** The merge state for the header: the approval count when approvals gate the
  * merge (never a bare "0/0"), then what it means. */
 export const PrMergeState = ({ detail }: { detail: PrDetail }) => {
-  const facts = mergeStateFacts(toMergeState(detail.mergeState));
+  const facts = mergeStateFacts(detail.mergeState);
 
   const approvals =
     facts.gated && detail.requiredApprovals > 0
@@ -105,7 +103,7 @@ const MergeDropdown = ({
   const open = atom(false);
   const box = atom.lazy(() => newLiveRef<HTMLElement>())();
   const trigger = atom.lazy(() => newLiveRef<HTMLButtonElement>())();
-  const reason = mergeStateFacts(toMergeState(detail.mergeState)).label;
+  const reason = mergeStateFacts(detail.mergeState).label;
 
   // The head branch's own environment, when it has one: deleting the branch
   // deletes the environment and everything it stored.
@@ -292,8 +290,7 @@ export const PrHeaderActions = ({
 }) => {
   const { pullRequest } = detail;
   const capabilities = prCapabilities({ detail, role, viewerId });
-  const state = toPrState(pullRequest.state);
-  const switchAction = switchStateAction(state, capabilities);
+  const switchAction = switchStateAction(pullRequest.state, capabilities);
   const busy = mutationRunning(mutation());
   const notice = mutationProblem(mutation(), ["close", "reopen"]);
 
@@ -453,7 +450,7 @@ export const PrReviewBox = ({
   const busy = mutationRunning(mutation());
   const notice = mutationProblem(mutation(), ["review"]);
   const conflicts = detail.compare?.conflicts ?? [];
-  const ended = toPrState(pullRequest.state) !== "open";
+  const ended = pullRequest.state !== "open";
   const verdict = myVerdict(detail, viewerId);
 
   if (!(capabilities.canReview || conflicts.length > 0 || ended)) {

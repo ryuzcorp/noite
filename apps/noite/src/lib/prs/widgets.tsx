@@ -7,13 +7,14 @@ import { formatAgo } from "../dates";
 import { errorMessage } from "../errors";
 import type { AppRole } from "../roles";
 import type { PrComment, PrReview } from "../runner";
+import type { PrState } from "../runner-types/PrState";
 import { Avatar } from "../ui/avatar";
 import { Comment, commentDraft, commentEditing, nextComment } from "./composer";
 import type { CommentEvent, CommentState } from "./composer";
 import { lineAnchor } from "./data";
 import type { DiffSide, LineAnchor } from "./data";
 import { invalidatePr } from "./resources";
-import { prStateFacts, reviewStateFacts, toPrState } from "./status";
+import { prStateFacts, reviewStateFacts } from "./status";
 
 /** A user id's display name, or "Former user" when the account is gone. */
 export const nameFor = (
@@ -21,8 +22,8 @@ export const nameFor = (
   id: string
 ): string => names?.[id] ?? "Former user";
 
-export const PrStateBadge = ({ state }: { state: string }) => {
-  const facts = prStateFacts(toPrState(state));
+export const PrStateBadge = ({ state }: { state: PrState }) => {
+  const facts = prStateFacts(state);
 
   return <span class={`badge badge-sm ${facts.badge}`}>{facts.label}</span>;
 };
@@ -407,9 +408,7 @@ export const ReviewCard = ({
       <div class="min-w-0 flex-1">
         <div class="flex flex-wrap items-center gap-x-2 gap-y-1 text-sm">
           <span class="font-medium">{nameFor(names, review.reviewerId)}</span>
-          <span class={`badge badge-sm ${facts?.badge ?? "badge-ghost"}`}>
-            {facts?.label ?? review.state}
-          </span>
+          <span class={`badge badge-sm ${facts.badge}`}>{facts.label}</span>
           {review.dismissedAt ? (
             <span class="badge badge-sm badge-ghost">Dismissed</span>
           ) : null}

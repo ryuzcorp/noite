@@ -27,7 +27,6 @@ import { PrHeaderActions, PrMergeState, PrReviewBox } from "./merge-box";
 import { Mutation } from "./mutation";
 import type { PrMutation } from "./mutation";
 import { prDetail, prNames, prViewer } from "./resources";
-import { toPrState } from "./status";
 import { nameFor, PrStateBadge } from "./widgets";
 
 /** Every user id a pull request's page names. */
@@ -297,7 +296,7 @@ export const PrDetailView = ({
           />
         </div>
         <div class="flex flex-wrap items-center gap-x-2 gap-y-1 text-sm">
-          {toPrState(pullRequest.state) === "open" ? (
+          {pullRequest.state === "open" ? (
             <PrMergeState detail={detail} />
           ) : null}
           <span class="text-base-content/70">

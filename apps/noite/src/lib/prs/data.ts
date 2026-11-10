@@ -2,7 +2,6 @@
  * the patch splitter the Files tab renders per file. Kept free of ilha and
  * runner imports so `data.test.ts` can exercise it directly. */
 import type { PrComment, PrReview } from "../runner";
-import { toReviewState } from "./status";
 
 // ---- Conversation timeline ----
 
@@ -275,8 +274,7 @@ export const pendingChangeRequests = (
 ): PrReview[] =>
   latestReviews(reviews).filter(
     (review) =>
-      toReviewState(review.state) === "changes_requested" &&
-      review.dismissedAt === null
+      review.state === "changes_requested" && review.dismissedAt === null
   );
 
 // ---- Large diffs ----
