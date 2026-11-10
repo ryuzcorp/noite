@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 
 import type { D1Cell, D1Column } from "../../runner";
 import {
+  keyFromRowKey,
   nextSelection,
   rowKey,
   selectedKeys,
@@ -48,6 +49,14 @@ describe("rowKey", () => {
     expect(after).toEqual([before[1], before[0]]);
     // The same record keeps its key across a reordering.
     expect(after[0]).toBe(before[1]);
+  });
+});
+
+describe("rowKey round trip", () => {
+  test("a selection key parses back to the wire key object", () => {
+    expect(keyFromRowKey(rowKey(COLUMNS, row("a", "Ada")))).toEqual({
+      id: "a",
+    });
   });
 });
 

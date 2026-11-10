@@ -23,6 +23,7 @@ import { ChevronLeft, ChevronRight, Key } from "../../ui/icons";
 import { isTimestampColumn } from "../d1-values";
 import { CellValue } from "./cells";
 import {
+  keyFromRowKey,
   nextSelection,
   rowKey,
   Selection,
@@ -215,7 +216,9 @@ const deleteRows = ({
       api<{ deleted: number; ok: boolean }>("/api/storage/d1DeleteRows", {
         appId,
         databaseId,
-        keys,
+        // Selection keys are the serialized `keyFor` identity: the wire wants
+        // the key object back.
+        keys: keys.map(keyFromRowKey),
         table,
       }),
   }).pipe(
