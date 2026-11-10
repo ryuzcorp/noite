@@ -32,10 +32,15 @@ import (
 	"time"
 )
 
-// RateWindow is the sliding window the edge counts requests over. Limits are
-// configured per minute; a whole event budget per window must not exceed that
-// rate, so the budget rounds down (see limitFor).
+// RateWindow is the sliding window the edge counts requests over. It must
+// divide a minute: the budget is a whole number of events per window, so an
+// exact number of windows in a minute is what makes it a per-minute ceiling.
+// Limits are configured per minute and the budget rounds down (see limitFor).
 const RateWindow = 10 * time.Second
+
+// The window must divide a minute, or the per-window budget stops being a
+// per-minute ceiling; a bad RateWindow fails the build here.
+var _ = [1]struct{}{}[time.Minute%RateWindow]
 
 // maxKeys bounds memory under a wide flood: one entry per client address.
 const maxKeys = 65536
