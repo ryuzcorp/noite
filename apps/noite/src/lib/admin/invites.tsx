@@ -4,6 +4,7 @@ import { atom } from "ilha";
 import type { View } from "ilha";
 
 import { api } from "../api";
+import type { InviteLifecycleWire } from "../api-types";
 import { errorMessage } from "../errors";
 import { resourceValue, resourceError } from "../resource";
 import { adminListInvites } from "../resources";
@@ -28,24 +29,48 @@ interface AdminInvite {
   createdByEmail: string;
   id: string;
   revoked: boolean;
+  /** The server's derived state (lib/server/invites.server): the only field
+   * this panel branches on. A code whose redeemer was deleted reads `used`,
+   * never `available`. */
+  state: InviteLifecycleWire;
   usedAt: string;
   usedByEmail: string;
 }
 
+/** One label per state; a used code names its redeemer, or says the account
+ * was deleted since (the join yields no email in that case). */
 const inviteState = (row: AdminInvite): string => {
-  if (row.usedByEmail) {
-    return `used by ${row.usedByEmail}`;
-  }
+  switch (row.state) {
+    case "used": {
+      return row.usedByEmail
+        ? `used by ${row.usedByEmail}`
+        : "used (account deleted)";
+    }
 
-  return row.revoked ? "revoked" : "available";
+    case "revoked": {
+      return "revoked";
+    }
+
+    default: {
+      return "available";
+    }
+  }
 };
 
 const inviteTone = (row: AdminInvite): string => {
-  if (row.usedByEmail) {
-    return "status-neutral";
-  }
+  switch (row.state) {
+    case "used": {
+      return "status-neutral";
+    }
 
-  return row.revoked ? "status-error" : "status-success";
+    case "revoked": {
+      return "status-error";
+    }
+
+    default: {
+      return "status-success";
+    }
+  }
 };
 
 const InviteRow = (props: {
@@ -54,7 +79,7 @@ const InviteRow = (props: {
   onRevoke: (id: string) => void;
 }) => {
   const { inv } = props;
-  const open = !(inv.usedByEmail || inv.revoked);
+  const open = inv.state === "available";
 
   return (
     <AdminRow

@@ -1,25 +1,15 @@
 import { atom } from "ilha";
-import type { AtomHandle } from "ilha";
 
 import { api } from "../api";
+import { mayAdministerInstance, overviewAuthority } from "../authority";
 import { formatDateTime } from "../dates";
 import { errorMessage } from "../errors";
-import { resourceValue, resourceError } from "../resource";
-import {
-  adminStatus,
-  invalidate,
-  keys,
-  session,
-  telemetry,
-} from "../resources";
+import { resourceError, resourceValue } from "../resource";
+import { adminStatus, invalidate, keys, telemetry } from "../resources";
 import type { RunnerTelemetryStatus } from "../runner";
-import { LoadError } from "../ui/load-error";
-import { SectionSkeleton } from "../ui/skeletons";
-
-/** "Disabled by NOITE_TELEMETRY=0" — the operator's kill switch. */
-const LockNotice = ({ reason }: { reason: string | null }) => (
-  <p class="m-0 text-sm opacity-70">Disabled by {reason ?? "the operator"}</p>
-);
+import { SettingsSection } from "./settings-section";
+import { Evt, Settings, syncStatus, transition } from "./settings.machine";
+import type { SettingsState } from "./settings.machine";
 
 /** The payload the runner would POST right now, minus the write-only PostHog
  * key (public-safe, but it has no place on the page). */
@@ -40,135 +30,97 @@ const PayloadDisclosure = ({
   </details>
 );
 
-/** The card body, given a status (so the checkbox and lock are always real). */
-const TelemetrySettings = ({
-  status,
-  saved,
-}: {
-  status: RunnerTelemetryStatus;
-  saved: AtomHandle<boolean>;
-}) => {
-  const busy = atom(false);
-  const error = atom("");
-  // Unsaved checkbox edit; null = untouched, so the box follows the runner
-  // (including after the refetch below). Controlled input, reset via atom.
-  const draft = atom<boolean | null>(null);
-
-  const { locked } = status;
-  // Locked means effective is off, whatever the stored preference says.
-  const enabled = locked ? false : (draft() ?? status.enabled);
-
-  const save = async () => {
-    busy.set(true);
-    error.set("");
-
-    try {
-      await api<{ ok: true }>("/api/telemetry/setTelemetry", { enabled });
-      draft.set(null);
-      saved.set(true);
-      // Detail rows (last sent, payload, effective state) come from the
-      // runner; the live card refetches behind the confirmation.
-      invalidate(keys.telemetry);
-    } catch (saveError) {
-      error.set(errorMessage(saveError));
-    } finally {
-      busy.set(false);
-    }
-  };
-
-  return (
-    <section class="border-base-300 bg-base-100 dark:bg-base-200 rounded-box flex flex-col gap-4 border p-4 shadow-md">
-      <h2 class="m-0 text-lg font-semibold">Telemetry</h2>
-      <div class="flex flex-col gap-1">
-        <p class="m-0 text-sm font-medium">Anonymous usage telemetry</p>
-        <label class="flex cursor-pointer items-center gap-2 text-sm">
-          <input
-            id="telemetry-enabled"
-            type="checkbox"
-            class="checkbox checkbox-sm"
-            checked={enabled}
-            disabled={locked || busy()}
-            onchange={(event) => {
-              draft.set(event.currentTarget.checked);
-              saved.set(false);
-            }}
-          />
-          Share anonymous instance telemetry
-        </label>
-        {locked ? <LockNotice reason={status.lockReason} /> : null}
-      </div>
-      <p class="m-0 text-sm opacity-80">
-        Once a day this instance sends Noite's maintainers a count-only summary
-        (version, platform, number of apps, deploys and users). No domains,
-        names, emails or IPs.{" "}
-        <a
-          class="link"
-          href="https://noite.now/self-hosting/telemetry"
-          target="_blank"
-          rel="noopener"
-        >
-          What's sent
-        </a>
-      </p>
-      {status.lastSentAt ? (
-        <p class="m-0 text-sm opacity-70">
-          Last sent {formatDateTime(status.lastSentAt)}
-        </p>
-      ) : null}
-      <PayloadDisclosure preview={status.preview} />
-      {error() ? <p class="text-error m-0 text-sm">{error()}</p> : null}
-      {saved() ? (
-        <p class="text-success m-0 text-sm">Telemetry setting saved.</p>
-      ) : null}
-      <div>
-        <button
-          type="button"
-          class="btn btn-sm btn-neutral"
-          disabled={busy() || locked}
-          onclick={() => {
-            void save();
-          }}
-        >
-          {busy() ? "Saving…" : "Save"}
-        </button>
-      </div>
-    </section>
-  );
-};
-
-/** The `/account` Admin tab's card: the anonymous instance-telemetry opt-out. */
+/** The `/account` Admin tab's card: the anonymous instance-telemetry
+ * opt-out. State machine: `./settings.machine.ts`; renderer:
+ * `./settings-section.tsx` (shared with the release check). */
 export const TelemetryCard = () => {
   const res = telemetry();
   const status = resourceValue(res.state());
-  // Lives here, not in the body: the invalidate below blanks `status` for a
-  // beat and remounts the body, which must keep the save confirmation.
-  const saved = atom(false);
+  const machine = atom<SettingsState>(Settings.Loading());
+  const model = syncStatus(machine(), status, resourceError(res.state()));
 
-  if (res.state()._tag === "Loading") {
-    return <SectionSkeleton lines={3} />;
-  }
+  const save = (value: boolean) => {
+    machine.set(transition(model, Evt.SaveStarted()));
 
-  if (status === undefined) {
-    return (
-      <section class="border-base-300 bg-base-100 dark:bg-base-200 rounded-box flex flex-col gap-4 border p-4 shadow-md">
-        <h2 class="m-0 text-lg font-semibold">Telemetry</h2>
-        <LoadError
-          error={resourceError(res.state())}
-          label="Failed to load telemetry settings"
-        />
-      </section>
-    );
-  }
+    void (async () => {
+      try {
+        const reply = await api<RunnerTelemetryStatus>(
+          "/api/telemetry/setTelemetry",
+          { enabled: value }
+        );
 
-  return <TelemetrySettings saved={saved} status={status} />;
+        machine.set(
+          transition(
+            machine(),
+            Evt.SaveSucceeded({
+              checking: false,
+              status: reply,
+              value,
+            })
+          )
+        );
+        // Detail rows (last sent, payload, effective state) come from the
+        // runner; the card refetches behind the confirmation.
+        invalidate(keys.telemetry);
+      } catch (error) {
+        machine.set(
+          transition(
+            machine(),
+            Evt.SaveFailed({ message: errorMessage(error) })
+          )
+        );
+      }
+    })();
+  };
+
+  return (
+    <SettingsSection
+      description={
+        <p class="m-0 text-sm opacity-80">
+          Once a day this instance sends Noite's maintainers a count-only
+          summary (version, platform, number of apps, deploys and users). No
+          domains, names, emails or IPs.{" "}
+          <a
+            class="link"
+            href="https://noite.now/self-hosting/telemetry"
+            target="_blank"
+            rel="noopener"
+          >
+            What's sent
+          </a>
+        </p>
+      }
+      extra={
+        status ? (
+          <>
+            {status.lastSentAt ? (
+              <p class="m-0 text-sm opacity-70">
+                Last sent {formatDateTime(status.lastSentAt)}
+              </p>
+            ) : null}
+            <PayloadDisclosure preview={status.preview} />
+          </>
+        ) : null
+      }
+      id="telemetry-enabled"
+      label="Share anonymous instance telemetry"
+      onSave={save}
+      savedMessage="Telemetry setting saved."
+      onToggle={(value) => {
+        machine.set(transition(model, Evt.Toggled({ value })));
+      }}
+      state={model}
+      title="Telemetry"
+    />
+  );
 };
 
-/** A real (non-impersonating) instance admin, once both resources load. Gates
- * the `/account` Admin tab; the actions behind it re-check the same gate
- * server-side, so hiding the tab is presentation, not security. */
-export const isInstanceAdmin = (): boolean => {
-  const admin = resourceValue(adminStatus().state());
-  const sess = resourceValue(session().state());
-
-  return (admin?.isAdmin ?? false) && sess?.session.impersonatedBy === null;
-};
+/** May this session administer the instance? One shared predicate
+ * (`mayAdministerInstance` over the overview's authority), the same one the
+ * side bar, the control page and every server gate ask. Gates the `/account`
+ * Admin tab; the actions behind it re-check server-side, so hiding the tab is
+ * presentation, not security. */
+export const isInstanceAdmin = (): boolean =>
+  mayAdministerInstance(
+    overviewAuthority(resourceValue(adminStatus().state()))
+  );

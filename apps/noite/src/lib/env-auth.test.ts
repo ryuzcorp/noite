@@ -24,6 +24,14 @@ describe("sameOriginPath", () => {
   test("refuses a backslash (browsers normalize it to /)", () => {
     expect(sameOriginPath("/\\evil.example")).toBeNull();
   });
+
+  test("refuses control characters that the URL parser strips", () => {
+    // `"/\n//evil.example"` parses as `https://evil.example/` once the parser
+    // drops the newline: an open redirect through `?return=`.
+    expect(sameOriginPath("/\n//evil.example")).toBeNull();
+    expect(sameOriginPath("/\t//evil.example")).toBeNull();
+    expect(sameOriginPath("/ok\u0000")).toBeNull();
+  });
 });
 
 describe("environmentHost", () => {

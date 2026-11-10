@@ -143,7 +143,7 @@ export const createTreeUploads = (host: TreeUploadsHost): TreeUploads => {
           title: `Replace ${path}?`,
         });
 
-        if (!replace || host.aborted()) {
+        if (replace !== "confirm" || host.aborted()) {
           continue;
         }
       }

@@ -6,6 +6,7 @@
  * may gain a runtime import — server modules and browser code both import
  * this module.
  */
+import type { AppRuntimeWire } from "./admin/runtime";
 import type { AppRole } from "./roles";
 import type { RunnerApp } from "./runner";
 
@@ -36,7 +37,13 @@ export interface EnvVarView {
  * write-only rule as `EnvVarView`). */
 export type EnvironmentVarView = EnvVarView;
 
-/** One account row on the admin home's Users tab. */
+/** The invite-code lifecycle as the admin list sends it (the tag of
+ * `InviteLifecycle` in lib/server/invites.server). */
+export type InviteLifecycleWire = "available" | "revoked" | "used";
+
+/** One account row on the admin home's Users tab. The actions a row offers
+ * are decided by the server (`self`), not by comparing emails in the browser:
+ * the gate compares ids, so the panel must too. */
 export interface AdminUserRow {
   banned: boolean;
   createdAt: string;
@@ -44,15 +51,24 @@ export interface AdminUserRow {
   id: string;
   name: string;
   role: string;
+  /** False when the stored role was neither `admin` nor `user`: the row shows
+   * it instead of pretending the account is a regular user. */
+  roleKnown: boolean;
+  /** This row is the signed-in admin's own account. */
+  self: boolean;
 }
 
-/** One app row on the admin home's Apps tab. */
+/** One app row on the admin home's Apps tab. `runtime` is the server's
+ * derived state (lib/admin/runtime) and `next` the action it permits, so the
+ * panel never guesses from the raw status strings. */
 export interface AdminAppRow {
   desiredState: string;
   id: string;
   name: string;
+  next: "start" | "stop" | null;
   ownerEmail: string;
   ownerId: string;
+  runtime: AppRuntimeWire;
   slug: string;
   status: string;
 }

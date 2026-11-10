@@ -127,6 +127,21 @@ describe("POST /mcp", () => {
     }
   });
 
+  test("a valid key whose owner is banned is refused", async () => {
+    // `banUser` revokes sessions but not API keys, and the plugin never checks
+    // the owner's ban flag: the endpoint has to, or a ban leaves /mcp (and git
+    // push) working as the banned account.
+    const key = await mintKey("banned-owner");
+    db.raw.run(`UPDATE "user" SET banned = 1 WHERE id = 'banned-owner'`);
+
+    const response = await call(`{"id":1,"method":"ping"}`, {
+      headers: bearer(key),
+    });
+
+    expect(response?.status).toBe(401);
+    expect(response?.headers.get("www-authenticate")).toBe("Bearer");
+  });
+
   test("rejects a browser origin that is not this control site", async () => {
     const key = await mintKey("u-origin");
 

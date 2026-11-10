@@ -1,15 +1,22 @@
 /** The app's confirmation dialog: a native `<dialog>` in daisyUI's `modal`
  * dress (the look of `./dialog.tsx`), opened imperatively so any handler can
- * `await` an answer, the way it would `window.confirm`. Esc, the backdrop and
- * Cancel answer false; the confirm button answers true and has the focus, so
- * Enter confirms. */
+ * `await` an answer, the way it would `window.confirm`. The confirm button has
+ * the focus, so Enter confirms.
+ *
+ * The answer is a reason, not a boolean: "the user said no" (`cancel`), "the
+ * pane went away" (`abort`) and "the user said yes" (`confirm`) are three
+ * different things, and a caller that tears down on abort must not treat it as
+ * consent. Callers compare `=== "confirm"`. */
+
+/** Why the dialog closed. */
+export type ConfirmReason = "abort" | "cancel" | "confirm";
 
 export interface ConfirmOptions {
   /** The confirm button's label ("Delete", "Roll back"). */
   confirmLabel: string;
   /** What happens if the user confirms; omit when the title says it all. */
   message?: string;
-  /** Answers false and closes the dialog when aborted (a torn-down pane). */
+  /** Answers `abort` and closes the dialog when aborted (a torn-down pane). */
   signal?: AbortSignal;
   /** The question ("Delete util.ts?"). */
   title: string;
@@ -32,11 +39,11 @@ export const confirmDialog = ({
   signal,
   title,
   tone = "danger",
-}: ConfirmOptions): Promise<boolean> => {
-  const answered = Promise.withResolvers<boolean>();
+}: ConfirmOptions): Promise<ConfirmReason> => {
+  const answered = Promise.withResolvers<ConfirmReason>();
 
   if (signal?.aborted) {
-    answered.resolve(false);
+    answered.resolve("abort");
 
     return answered.promise;
   }
@@ -80,23 +87,24 @@ export const confirmDialog = ({
   backdrop.append(dismiss);
   dialog.append(box, backdrop);
 
-  let confirmed = false;
+  let reason: ConfirmReason = "cancel";
 
   const onAbort = () => {
+    reason = "abort";
     dialog.close();
   };
 
   dialog.addEventListener("close", () => {
     signal?.removeEventListener("abort", onAbort);
     dialog.remove();
-    answered.resolve(confirmed);
+    answered.resolve(reason);
   });
   signal?.addEventListener("abort", onAbort, { once: true });
   cancel.addEventListener("click", () => {
     dialog.close();
   });
   confirm.addEventListener("click", () => {
-    confirmed = true;
+    reason = "confirm";
     dialog.close();
   });
   document.body.append(dialog);

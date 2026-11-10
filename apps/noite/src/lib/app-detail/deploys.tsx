@@ -201,7 +201,7 @@ const DropdownApp = defineApp({
                       title: `Roll back to ${sha.slice(0, 12)}?`,
                     });
 
-                    if (!ok) {
+                    if (ok !== "confirm") {
                       return;
                     }
 
@@ -399,7 +399,7 @@ const RowApp = defineApp({
                   title: "Stop this deploy?",
                 });
 
-                if (!ok) {
+                if (ok !== "confirm") {
                   return;
                 }
 
@@ -431,7 +431,7 @@ const RowApp = defineApp({
                   title: `Roll back to ${sha.slice(0, 12)}?`,
                 });
 
-                if (!ok) {
+                if (ok !== "confirm") {
                   return;
                 }
 

@@ -1,8 +1,13 @@
 import { and, asc, desc, eq, sql } from "void/db";
 
-import { appCollaboratorTable, collaboratorInviteTable } from "../db/schema";
+import {
+  appCollaboratorTable,
+  collaboratorInviteTable,
+  userTable,
+} from "../db/schema";
 import { resolveAdminEmail, UnauthorizedError } from "./auth";
 import { getDb, withDb } from "./db";
+import { decideAccept } from "./membership";
 import { parseAppRole, roleAtLeast } from "./roles";
 import type { AppRole } from "./roles";
 import { runnerGetApp, runnerGetAppBySlug, runnerListApps } from "./runner";
@@ -29,16 +34,35 @@ const findApp = async (
   }
 };
 
-export const grantCollaborator = (
+/** What one grant write did. `last-admin` is the invariant refusing a
+ * demotion that would leave the app with nobody to manage it. */
+export type GrantWrite = "applied" | "last-admin" | "missing";
+
+/** Write one account's role. The last-admin invariant lives *inside* the
+ * statement — `UPDATE … WHERE role <> 'admin' OR <another admin exists>` — so
+ * two concurrent demotions cannot both pass a count check and strand the app,
+ * and the re-read names the outcome. An account with no grant gets an INSERT
+ * (adding a grant can never remove the last admin). */
+export const writeGrant = (
   appId: string,
   userId: string,
   role: AppRole
-): Promise<void> =>
+): Promise<GrantWrite> =>
   withDb(async () => {
     const db = getDb();
 
-    const existing = await db
-      .select({ id: appCollaboratorTable.id, role: appCollaboratorTable.role })
+    await db.run(sql`
+      UPDATE app_collaborator SET role = ${role}
+       WHERE appId = ${appId} AND userId = ${userId}
+         AND (
+           ${role} = 'admin' OR role <> 'admin'
+           OR (SELECT count(*) FROM app_collaborator o
+                WHERE o.appId = ${appId} AND o.role = 'admin') > 1
+         )
+    `);
+
+    const rows = await db
+      .select({ role: appCollaboratorTable.role })
       .from(appCollaboratorTable)
       .where(
         and(
@@ -48,17 +72,10 @@ export const grantCollaborator = (
       )
       .limit(1);
 
-    const [found] = existing;
+    const [found] = rows;
 
     if (found) {
-      if (found.role !== role) {
-        await db
-          .update(appCollaboratorTable)
-          .set({ role })
-          .where(eq(appCollaboratorTable.id, found.id));
-      }
-
-      return;
+      return found.role === role ? "applied" : "last-admin";
     }
 
     await db.insert(appCollaboratorTable).values({
@@ -67,6 +84,48 @@ export const grantCollaborator = (
       role,
       userId,
     });
+
+    return "applied";
+  });
+
+/** Grant a role, keeping the last-admin invariant (see `writeGrant`). Callers
+ * that can be refused branch on the result. */
+export const grantCollaborator = (
+  appId: string,
+  userId: string,
+  role: AppRole
+): Promise<GrantWrite> => writeGrant(appId, userId, role);
+
+/** Remove one grant, refusing the app's last admin in the same statement. */
+export const removeGrant = (
+  appId: string,
+  userId: string
+): Promise<"applied" | "last-admin"> =>
+  withDb(async () => {
+    const db = getDb();
+
+    await db.run(sql`
+      DELETE FROM app_collaborator
+       WHERE appId = ${appId} AND userId = ${userId}
+         AND (
+           role <> 'admin'
+           OR (SELECT count(*) FROM app_collaborator o
+                WHERE o.appId = ${appId} AND o.role = 'admin') > 1
+         )
+    `);
+
+    const rows = await db
+      .select({ id: appCollaboratorTable.id })
+      .from(appCollaboratorTable)
+      .where(
+        and(
+          eq(appCollaboratorTable.appId, appId),
+          eq(appCollaboratorTable.userId, userId)
+        )
+      )
+      .limit(1);
+
+    return rows[0] ? "last-admin" : "applied";
   });
 
 /** Drop every grant and pending invitation for an app (the runner owns the
@@ -452,21 +511,39 @@ export const revokePendingInvite = (
       );
   });
 
-/** Accept an invitation addressed to `email`: grant the role, then consume
- * the invitation. Returns the app it was for, or null when no such invitation
- * exists for that address (so an id alone never grants access). If the
- * account already holds a grant, the invitation's role replaces it: it is the
- * newest word from an admin. */
+/** Accept an invitation addressed to `email`. The role is decided by
+ * `decideAccept` (lib/membership): no grant -> the invited role; a grant that
+ * already at least matches -> unchanged; an invitation issued after the grant
+ * -> applied (a stale invite never downgrades a newer grant); a downgrade that
+ * would strand the app -> refused, invitation kept. */
+export type AcceptOutcome =
+  | {
+      readonly _tag: "Accepted";
+      readonly appId: string;
+      readonly role: AppRole;
+    }
+  | { readonly _tag: "NotFound" }
+  | { readonly _tag: "Refused"; readonly reason: "last-admin" };
+
+const asStamp = (value: string | Date | null): string =>
+  value instanceof Date ? value.toISOString() : String(value ?? "");
+
 export const acceptPendingInvite = async (
   inviteId: string,
   email: string,
   userId: string
-): Promise<{ appId: string } | null> => {
+): Promise<AcceptOutcome> => {
   const target = normalizeEmail(email);
 
-  const invite = await withDb(async () => {
-    const rows = await getDb()
-      .select()
+  const snapshot = await withDb(async () => {
+    const db = getDb();
+
+    const invites = await db
+      .select({
+        appId: collaboratorInviteTable.appId,
+        createdAt: collaboratorInviteTable.createdAt,
+        role: collaboratorInviteTable.role,
+      })
       .from(collaboratorInviteTable)
       .where(
         and(
@@ -476,38 +553,109 @@ export const acceptPendingInvite = async (
       )
       .limit(1);
 
-    return rows[0] ?? null;
+    const [row] = invites;
+
+    if (!row) {
+      return null;
+    }
+
+    const grants = await db
+      .select({
+        createdAt: appCollaboratorTable.createdAt,
+        role: appCollaboratorTable.role,
+      })
+      .from(appCollaboratorTable)
+      .where(
+        and(
+          eq(appCollaboratorTable.appId, row.appId),
+          eq(appCollaboratorTable.userId, userId)
+        )
+      )
+      .limit(1);
+
+    const admins = await db
+      .select({ id: appCollaboratorTable.id })
+      .from(appCollaboratorTable)
+      .where(
+        and(
+          eq(appCollaboratorTable.appId, row.appId),
+          eq(appCollaboratorTable.role, "admin")
+        )
+      );
+
+    const [found] = grants;
+    const grantRole = found ? parseAppRole(found.role) : null;
+
+    return {
+      adminCount: admins.length,
+      appId: row.appId,
+      grant: grantRole
+        ? { createdAt: asStamp(found?.createdAt ?? null), role: grantRole }
+        : null,
+      invite: {
+        createdAt: asStamp(row.createdAt),
+        role: parseAppRole(row.role) ?? "view",
+      },
+    };
   });
 
-  if (!invite) {
-    return null;
+  if (!snapshot) {
+    return { _tag: "NotFound" };
   }
 
-  await withDb(async () => {
+  const decision = decideAccept(snapshot);
+
+  if (decision._tag === "Refused") {
+    return { _tag: "Refused", reason: decision.reason };
+  }
+
+  if (decision._tag === "Applies") {
+    const write = await writeGrant(snapshot.appId, userId, decision.role);
+
+    if (write === "last-admin") {
+      return { _tag: "Refused", reason: "last-admin" };
+    }
+  }
+
+  await withDb(() =>
+    getDb()
+      .delete(collaboratorInviteTable)
+      .where(eq(collaboratorInviteTable.id, inviteId))
+  );
+
+  return { _tag: "Accepted", appId: snapshot.appId, role: decision.role };
+};
+
+/** Drop the pending invitations addressed to a removed member's email: an
+ * invitation left behind would silently re-grant the role on accept. */
+export const revokeMemberInvites = (
+  appId: string,
+  userId: string
+): Promise<void> =>
+  withDb(async () => {
     const db = getDb();
 
-    await db.batch([
-      db
-        .insert(appCollaboratorTable)
-        .values({
-          appId: invite.appId,
-          createdAt: new Date().toISOString(),
-          id: crypto.randomUUID(),
-          role: invite.role,
-          userId,
-        })
-        .onConflictDoUpdate({
-          set: { role: invite.role },
-          target: [appCollaboratorTable.appId, appCollaboratorTable.userId],
-        }),
-      db
-        .delete(collaboratorInviteTable)
-        .where(eq(collaboratorInviteTable.id, invite.id)),
-    ]);
-  });
+    const rows = await db
+      .select({ email: userTable.email })
+      .from(userTable)
+      .where(eq(userTable.id, userId))
+      .limit(1);
 
-  return { appId: invite.appId };
-};
+    const [account] = rows;
+
+    if (!account) {
+      return;
+    }
+
+    await db
+      .delete(collaboratorInviteTable)
+      .where(
+        and(
+          eq(collaboratorInviteTable.appId, appId),
+          eq(collaboratorInviteTable.email, normalizeEmail(account.email))
+        )
+      );
+  });
 
 /** Decline: delete the invitation, but only one addressed to `email`. */
 export const declinePendingInvite = (

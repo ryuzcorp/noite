@@ -5,11 +5,17 @@
 //! drops the cached session so the tour cannot come back on a later SPA
 //! navigation. The tour has no navigating links: steps 1 and 2 spotlight the
 //! sidebar item they describe (`data-tour` in pages/+layout.tsx) instead.
+//!
+//! The open/step/save state is one value — `./onboarding.machine.ts` — whose
+//! transitions are pure and tested. A failed save now keeps the dialog up with
+//! the error and a "Skip" that closes it locally, instead of vanishing and
+//! silently reappearing on the next reload.
 import * as Atom from "effect/reactivity/Atom";
 import { atom, watch } from "ilha";
 import type { View } from "ilha";
 
 import { api } from "../api";
+import { errorMessage } from "../errors";
 import { resourceValue } from "../resource";
 import type { ResourceState } from "../resource";
 import { session } from "../resources";
@@ -25,13 +31,25 @@ import {
   Star,
   X,
 } from "../ui/icons";
+import {
+  TOUR_STEPS,
+  Tour,
+  TourEvt,
+  tourIndex,
+  tourOpen,
+  tourTransition,
+} from "./onboarding.machine";
+import type {
+  TourEvent as TourEventHandle,
+  TourState,
+} from "./onboarding.machine";
 import { invalidateSession } from "./session";
 
 const GITHUB_URL = "https://github.com/ryuzcorp/noite";
 const DISCORD_URL = "https://discord.gg/WnVTMCTz74";
 const SPONSOR_URL = "https://github.com/sponsors/ryuzdev";
 
-const STEP_COUNT = 3;
+const STEP_COUNT = TOUR_STEPS;
 const LAST_STEP = STEP_COUNT - 1;
 
 /** `data-tour` target each step spotlights in the sidebar (none on the last).
@@ -107,9 +125,28 @@ export const Onboarding = () => {
     })(res.state.atom)
   );
 
-  const open = atom(show());
-  const step = atom(0);
-  const closed = atom(false);
+  // One value, one transition (./onboarding.machine).
+  const state = atom<TourState>(Tour.Hidden());
+
+  const dispatch = (event: TourEventHandle): void => {
+    state.set(tourTransition(state(), event));
+  };
+
+  const open = atom(
+    Atom.map((value: TourState) => tourOpen(value))(state.atom)
+  );
+
+  const step = atom(
+    Atom.map((value: TourState) => tourIndex(value))(state.atom)
+  );
+
+  /** The save failure to show (only `Showing` carries one). */
+  const saveError = atom(
+    Atom.map((value: TourState) =>
+      value._tag === "Showing" ? value.error : null
+    )(state.atom)
+  );
+
   // Viewport rect of the sidebar item the current step points at, or null
   // when the step has none or it isn't on screen (mobile: the sidebar is in
   // the closed drawer).
@@ -176,33 +213,31 @@ export const Onboarding = () => {
     });
   });
 
-  // Once the user has dismissed the tour this mount, never reopen it — even
-  // while the stale session snapshot still says onboardedAt is NULL.
+  // The session decides whether the tour is open; `Done` (marked this mount)
+  // wins, so a stale snapshot can never reopen it.
   watch(show, (value) => {
-    if (!closed()) {
-      open.set(value);
-    }
+    dispatch(TourEvt.Session({ show: value }));
   });
 
+  /** Mark the account onboarded. The dialog stays up while the write runs, and
+   * a failure reopens the same step with the reason. */
   const finish = async (): Promise<void> => {
-    if (closed()) {
+    if (state()._tag !== "Showing") {
       return;
     }
 
-    closed.set(true);
+    dispatch(TourEvt.Dismiss());
 
     try {
       await api<{ ok: true }>("/api/account/completeOnboarding", {});
-    } catch {
-      // A failed write must not trap the user in the modal; worst case the
-      // tour shows again on the next load.
+      // The session snapshot still says onboardedAt is NULL. Drop every
+      // user-scoped cache so the next read sees the marked account and the
+      // modal never reopens on an SPA navigation.
+      invalidateSession();
+      dispatch(TourEvt.Saved());
+    } catch (error) {
+      dispatch(TourEvt.SaveFailed({ message: errorMessage(error) }));
     }
-
-    open.set(false);
-    // The session snapshot still says onboardedAt is NULL. Drop every
-    // user-scoped cache so the next read sees the marked account and the
-    // modal never reopens on an SPA navigation.
-    invalidateSession();
   };
 
   return (
@@ -210,8 +245,12 @@ export const Onboarding = () => {
       open={open}
       class={`modal modal-bottom sm:modal-middle ${spot() ? "onboarding-spotlit" : ""}`}
       labelledBy="onboarding-title"
-      onClose={() => {
-        void finish();
+      onClose={(reason) => {
+        // Only a user dismissal marks the tour; the programmatic close that
+        // follows `Saved` must not re-run the write.
+        if (reason !== "programmatic") {
+          void finish();
+        }
       }}
     >
       {spot() ? (
@@ -226,9 +265,9 @@ export const Onboarding = () => {
         onkeydown={(event: KeyboardEvent) => {
           // Arrow keys page through the tour, like stories.
           if (event.key === "ArrowRight" && step() < LAST_STEP) {
-            step.set(step() + 1);
+            dispatch(TourEvt.Next());
           } else if (event.key === "ArrowLeft" && step() > 0) {
-            step.set(step() - 1);
+            dispatch(TourEvt.Back());
           }
         }}
       >
@@ -252,6 +291,7 @@ export const Onboarding = () => {
             type="button"
             class="btn btn-ghost btn-sm btn-circle -mr-2"
             aria-label="Skip tour"
+            disabled={state()._tag === "Saving"}
             onclick={() => {
               void finish();
             }}
@@ -259,6 +299,23 @@ export const Onboarding = () => {
             <X />
           </button>
         </div>
+
+        {saveError() ? (
+          <div class="border-error/40 bg-error/10 rounded-xl border p-3">
+            <p class="m-0 text-sm">
+              Couldn't save the tour progress: {saveError()}
+            </p>
+            <button
+              type="button"
+              class="link link-hover mt-1 text-sm"
+              onclick={() => {
+                dispatch(TourEvt.CloseAnyway());
+              }}
+            >
+              Skip anyway
+            </button>
+          </div>
+        ) : null}
 
         {/* Fixed minimum height (the tallest step) so the footer doesn't
             jump as the tour advances. */}
@@ -360,8 +417,9 @@ export const Onboarding = () => {
               id="onboarding-back"
               type="button"
               class="btn btn-ghost"
+              disabled={state()._tag === "Saving"}
               onclick={() => {
-                step.set(step() - 1);
+                dispatch(TourEvt.Back());
               }}
             >
               <ArrowLeft />
@@ -376,8 +434,9 @@ export const Onboarding = () => {
               autofocus
               type="button"
               class="btn btn-neutral min-w-28"
+              disabled={state()._tag === "Saving"}
               onclick={() => {
-                step.set(step() + 1);
+                dispatch(TourEvt.Next());
               }}
             >
               Next
@@ -388,6 +447,7 @@ export const Onboarding = () => {
               autofocus
               type="button"
               class="btn btn-neutral min-w-28"
+              disabled={state()._tag === "Saving"}
               onclick={() => {
                 void finish();
               }}

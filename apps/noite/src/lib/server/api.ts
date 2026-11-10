@@ -12,6 +12,9 @@
  *   paint it without knowing the action.
  * - signed out / misconfigured auth (`UnauthorizedError`,
  *   `MissingAuthSecretError`) → 401 `{error: message}`.
+ * - the session store could not answer (`SessionStoreUnavailableError`) → 503
+ *   `{error: message}`: an outage is retryable and must never read as "signed
+ *   out" (401) nor as a bug (500).
  * - anything else (a bug, an unmapped throw) → 500 `{error: "Internal
  *   error"}`: a plain throw never leaks an implementation message to the
  *   browser (the old Oxide masking, kept).
@@ -52,6 +55,16 @@ export const actionErrorResponse = (error: unknown): Response => {
 
   if (tag === "UnauthorizedError" || tag === "MissingAuthSecretError") {
     return Response.json({ error: errorMessage(error) }, { status: 401 });
+  }
+
+  if (tag === "SessionStoreUnavailableError") {
+    return Response.json(
+      { error: errorMessage(error) },
+      {
+        headers: { "retry-after": "5" },
+        status: 503,
+      }
+    );
   }
 
   if (error instanceof ActionFailure) {

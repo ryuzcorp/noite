@@ -6,8 +6,10 @@ import type {
   EnvironmentVarView,
   EnvVarView,
   InviteCode,
+  InviteLifecycleWire,
 } from "./api-types";
 import { authClient } from "./auth-client";
+import type { AuthorityWire } from "./authority";
 import type { CollaboratorRow, PendingInvite } from "./collaborators";
 import { resetStreamHub } from "./feeds";
 //! Shared async data: every resource key and fetcher in one module so
@@ -313,8 +315,11 @@ export const session = () =>
   });
 
 /** What the admin shell gates on: the probe resolves instead of throwing,
- * so the panel renders for non-admins too. */
+ * so the panel renders for non-admins too. `authority` is the one predicate
+ * every admin surface reads (lib/authority); `isAdmin` stays for the wire's
+ * older consumers and always equals `authority === "instance-admin"`. */
 export interface AdminOverview {
+  authority: AuthorityWire;
   controlFleet: boolean;
   email: string;
   isAdmin: boolean;
@@ -472,6 +477,8 @@ export interface AdminInviteView {
   createdByEmail: string;
   id: string;
   revoked: boolean;
+  /** The derived lifecycle state (lib/server/invites.server). */
+  state: InviteLifecycleWire;
   usedAt: string;
   usedByEmail: string;
 }

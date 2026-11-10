@@ -66,13 +66,19 @@ export const resolveEnv = (): KitEnv => ({ ...controlEnv }) as KitEnv;
 export const getAuthDb = () =>
   drizzleAdapter(getDb(), { provider: "sqlite", schema });
 
+/** The anchored address already promoted *in this isolate*, or undefined.
+ * Isolate-scoped and never request-scoped: the promotion is a one-time write
+ * per process, and every request used to redo the SELECT for an address that
+ * was already an admin. A process restart simply re-reads once. */
+let promotedAdminEmail: string | undefined;
+
 /** The setup pass itself: the instance-admin bootstrap below. Schema
  * migrations are the runner's job (the Void migration endpoint), so a boot
  * only has to promote `NOITE_ADMIN_EMAIL` once it has registered. */
 const runDbSetup = async (): Promise<void> => {
   const adminEmail = resolveEnv().NOITE_ADMIN_EMAIL?.trim().toLowerCase();
 
-  if (!adminEmail) {
+  if (!adminEmail || promotedAdminEmail === adminEmail) {
     return;
   }
 
@@ -86,18 +92,27 @@ const runDbSetup = async (): Promise<void> => {
 
   const [user] = existing;
 
-  if (user && user.role !== "admin") {
+  if (!user) {
+    // Not registered yet: the next pass promotes it. Caching now would lose
+    // the promotion for an account created later in this isolate.
+    return;
+  }
+
+  if (user.role !== "admin") {
     await db
       .update(userTable)
       .set({ role: "admin" })
       .where(eq(userTable.id, user.id));
   }
+
+  promotedAdminEmail = adminEmail;
 };
 
-/** The admin bootstrap, run per request: one indexed lookup (a write only
- * when `NOITE_ADMIN_EMAIL` names a registered non-admin). Nothing is cached
- * across requests, so a pass can never outlive its request or pin the
- * isolate to a stale binding. */
+/** The admin bootstrap, run per request: once per isolate it does one indexed
+ * lookup (and a write only when `NOITE_ADMIN_EMAIL` names a registered
+ * non-admin), then answers from the isolate's record. Nothing is cached across
+ * requests, so a pass can never outlive its request or pin the isolate to a
+ * stale binding; only the "already promoted" fact is remembered. */
 export const ensureDb = async (): Promise<void> => {
   await runDbSetup();
 };

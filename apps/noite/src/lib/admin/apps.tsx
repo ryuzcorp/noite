@@ -1,7 +1,7 @@
 //! Admin tab: every app on the instance, whichever account owns it.
 
 import { Link } from "@ilha/void";
-import { atom } from "ilha";
+import { atom, watch } from "ilha";
 import type { View } from "ilha";
 
 import { api } from "../api";
@@ -12,6 +12,7 @@ import { listAllApps } from "../resources";
 import { searchParam } from "../search-param";
 import { Avatar } from "../ui/avatar";
 import { confirmDialog } from "../ui/confirm";
+import { actionDesiredState } from "./runtime";
 import {
   ACTION,
   AdminRow,
@@ -24,6 +25,15 @@ import {
   W_SM,
   mutatePanel,
 } from "./shared";
+
+/** The button label for the runtime's action (`null`: nothing to do). */
+const toggleLabel = (next: AdminAppRow["next"]): string => {
+  if (next === "stop") {
+    return "Stop";
+  }
+
+  return next === "start" ? "Start" : "—";
+};
 
 interface AdminAppRowProps {
   busy: boolean;
@@ -51,12 +61,15 @@ const AdminAppRowItem = ({
         <button
           type="button"
           class={`${ACTION} ${W_SM}`}
-          disabled={busy}
+          // `next` is the server's derived action (lib/admin/runtime): an
+          // unsettled or unknown runtime offers none, so the panel can never
+          // send a start to an app that is already running.
+          disabled={busy || row.next === null}
           onclick={() => {
             onToggle(row);
           }}
         >
-          {row.desiredState === "running" ? "Stop" : "Start"}
+          {toggleLabel(row.next)}
         </button>
         <button
           type="button"
@@ -92,6 +105,11 @@ const AdminAppRowItem = ({
 /** Every app on the instance, whichever account owns it: filter by name,
  * slug or owner; start, stop or delete any of them. The search lives in the
  * URL (`?aq=`) and narrows the loaded list in the browser. */
+/** How often the panel re-reads while a row is transitional (start/stop is
+ * asynchronous runner-side; one-shot refetch caught a mid-flight row and then
+ * froze, so a "Start" click could leave a dead row). */
+const TRANSITION_POLL_MS = 2000;
+
 export const AdminAppsPanel = () => {
   const res = listAllApps();
   const search = searchParam("aq", { default: "" });
@@ -100,6 +118,36 @@ export const AdminAppsPanel = () => {
   const apps = resourceValue(res.state()) ?? [];
   const loadError = resourceError(res.state());
   const needle = search().trim().toLowerCase();
+
+  // Track transitional rows until they settle: the mutation already refetched
+  // once, but the runner may still be moving.
+  watch.once(({ signal }) => {
+    if (typeof window === "undefined") {
+      return;
+    }
+
+    const timer = window.setInterval(() => {
+      if (signal.aborted) {
+        return;
+      }
+
+      const rows = resourceValue(res.state()) ?? [];
+
+      if (rows.some((row) => row.runtime === "transitioning")) {
+        void (async () => {
+          try {
+            await res.refetch();
+          } catch {
+            // The next tick retries; the panel's own error line stays as is.
+          }
+        })();
+      }
+    }, TRANSITION_POLL_MS);
+
+    return () => {
+      window.clearInterval(timer);
+    };
+  });
 
   const shown = needle
     ? apps.filter((app) =>
@@ -133,10 +181,15 @@ export const AdminAppsPanel = () => {
             row={row}
             busy={busy()}
             onToggle={(app) => {
+              const { next } = app;
+
+              if (next === null) {
+                return;
+              }
+
               void mutate(() =>
                 api<{ ok: true }>("/api/admin/adminSetAppState", {
-                  desiredState:
-                    app.desiredState === "running" ? "stopped" : "running",
+                  desiredState: actionDesiredState(next),
                   id: app.id,
                 })
               );
@@ -150,7 +203,7 @@ export const AdminAppsPanel = () => {
                   title: `Delete ${app.name} (${app.slug})?`,
                 });
 
-                if (!ok) {
+                if (ok !== "confirm") {
                   return;
                 }
 

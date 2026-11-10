@@ -533,7 +533,7 @@ export const ChangesPanel = ({
         "Discard"
       );
 
-      if (ok) {
+      if (ok === "confirm") {
         discard(file.path);
       }
     })();
@@ -547,7 +547,7 @@ export const ChangesPanel = ({
         "Discard all"
       );
 
-      if (ok) {
+      if (ok === "confirm") {
         discardAll();
       }
     })();

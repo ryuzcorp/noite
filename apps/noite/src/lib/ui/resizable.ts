@@ -545,9 +545,16 @@ export const createPaneGroup = (options: PaneGroupOptions): PaneGroup => {
     settling = false;
   };
 
-  /** Bring the binding in step with the group's DOM and the size it is at. */
+  /** Bring the binding in step with the group's DOM and the size it is at.
+   * A drag owns the layout: rebinding mid-gesture (the terminal panel
+   * remounting under the pointer) drops the library's drag state, so the
+   * sync is deferred to the drag's end, which calls it again. */
   const sync = (): void => {
     const el = root;
+
+    if (dragging) {
+      return;
+    }
 
     if (el === null || media === null || !media.matches) {
       unbind();
@@ -602,8 +609,10 @@ export const createPaneGroup = (options: PaneGroupOptions): PaneGroup => {
     document.documentElement.classList.toggle(DRAGGING, now);
 
     if (!now) {
-      // The drag is over: what it landed on is what to keep, now.
+      // The drag is over: what it landed on is what to keep, now, and any
+      // sync the drag deferred (a DOM change mid-gesture) runs here.
       save();
+      sync();
     }
   };
 

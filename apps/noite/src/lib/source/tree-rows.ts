@@ -268,7 +268,7 @@ export const createTreeRows = (host: TreeRowsHost): TreeRows => {
           : `Delete ${targets.length} items?`,
     });
 
-    if (!ok || host.aborted()) {
+    if (ok !== "confirm" || host.aborted()) {
       return;
     }
 

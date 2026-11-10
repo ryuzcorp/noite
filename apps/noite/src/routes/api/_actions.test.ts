@@ -1,6 +1,7 @@
 /* oxlint-disable eslint/require-await, anti-slop/no-unknown-returns, anti-slop/no-chained-type-assertions, anti-slop/require-safety-comment-for-type-assertion -- test doubles: stub handlers, a minimal KitEnv and a stubbed fetch stand in for the platform; assertions read JSON bodies back as their wire shapes */
 import { afterEach, beforeAll, describe, expect, test } from "bun:test";
 
+import { SessionStoreUnavailableError } from "$lib/server/session.server";
 import * as Schema from "effect/Schema";
 import type { CloudContext } from "void";
 
@@ -95,6 +96,20 @@ describe("actionErrorResponse", () => {
 
     expect(misconfigured.status).toBe(401);
     expect(await misconfigured.json()).toEqual({ error: "no secret" });
+  });
+
+  test("a session-store outage is a retryable 503, never 401 or 500", async () => {
+    const response = actionErrorResponse(
+      new SessionStoreUnavailableError({
+        message: "The session store did not answer — retry in a moment.",
+      })
+    );
+
+    expect(response.status).toBe(503);
+    expect(response.headers.get("retry-after")).toBe("5");
+    expect(await response.json()).toEqual({
+      error: "The session store did not answer — retry in a moment.",
+    });
   });
 
   test("anything else is masked as 500 Internal error", async () => {
