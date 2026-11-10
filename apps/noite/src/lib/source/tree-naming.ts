@@ -1,22 +1,27 @@
 //! The source tree's inline naming: the placeholder row an add parks while
 //! pierre's own inline input names it, and the name rules this pane holds in
 //! front of the commit. The tree wiring owns the rows and the pod, so this
-//! module reaches them through the same host and keeps only the add it is
-//! naming.
+//! module reaches them through the same host; the naming lifecycle itself is
+//! `./naming-state`, which refuses a callback that lands after the placeholder
+//! was taken back (that used to arrive as a pod rename of a path that never
+//! existed).
 
 import { errorMessage } from "../errors";
+import {
+  clearNaming,
+  finishNaming,
+  newNamingMachine,
+  refuseNaming,
+  settleNaming,
+  startNaming,
+} from "./naming-state";
+import type { NamingMachine, PendingAdd } from "./naming-state";
 import type { TreeRenameEvent } from "./pierre";
 import { parentDir, renameInput, withoutSlash } from "./tree-menu";
 import type { Toaster } from "./tree-menu";
 import type { WorkspaceChange } from "./workspace/types";
 
-/** The placeholder row an add parked in the tree while pierre's inline input
- * names it. An untouched name is no rename to pierre, so the row keeps this
- * path — and `isFolder` says which draft it becomes. */
-export interface PendingAdd {
-  isFolder: boolean;
-  path: string;
-}
+export type { PendingAdd } from "./naming-state";
 
 /** What the naming flow needs from the tree wiring: the rows it stands for, the
  * add it lands and the pod it names against. */
@@ -57,7 +62,7 @@ export interface TreeNaming {
 }
 
 /** Why `leaf` cannot name a new entry, or null when it can. pierre refuses an
- * empty name and any "/" itself, and knows the paths its store holds; these are
+ * empty name and any "/" in it, and knows the paths its store holds; these are
  * the rest of the contract: a name no path may carry, or one a staged deletion
  * still claims — a push cannot both write and delete a path. */
 const nameError = (
@@ -76,8 +81,7 @@ const nameError = (
 };
 
 export const createTreeNaming = (host: TreeNamingHost): TreeNaming => {
-  /** The add the inline input is naming, if any (see `PendingAdd`). */
-  let pendingAdd: PendingAdd | null = null;
+  let machine: NamingMachine = newNamingMachine();
 
   /** A free leaf in `dir` ("" or "a/b/") for the row the inline input names:
    * pierre's rename refuses to land on a path the tree already holds, and a
@@ -106,14 +110,11 @@ export const createTreeNaming = (host: TreeNamingHost): TreeNaming => {
    * after the removal, and landing there would leave a row the pod never got. */
   const settleAdd = (add: PendingAdd) => {
     queueMicrotask(() => {
-      if (pendingAdd !== add) {
-        return;
-      }
+      const decision = settleNaming(machine, add, host.hasRow(add.path));
+      ({ machine } = decision);
 
-      pendingAdd = null;
-
-      if (host.hasRow(add.path)) {
-        host.landAdd(add);
+      if (decision.land !== null) {
+        host.landAdd(decision.land);
       }
     });
   };
@@ -121,7 +122,8 @@ export const createTreeNaming = (host: TreeNamingHost): TreeNaming => {
   /** A New File / New Folder pick: the row goes in, pierre turns it into its
    * inline input (`removeIfCanceled` takes the row back out when the input is
    * abandoned), and the name it lands on becomes the file or folder the pod
-   * gets. */
+   * gets. A second pick while one is being named is refused: it would orphan
+   * the first placeholder's input. */
   const startAdd = (dir: string, isFolder: boolean) => {
     if (!host.editable() || !host.treeReady()) {
       return;
@@ -131,6 +133,13 @@ export const createTreeNaming = (host: TreeNamingHost): TreeNaming => {
     const stem = isFolder ? "new-folder" : "untitled";
     const path = `${prefix}${uniqueLeaf(prefix, stem)}`;
     const row = isFolder ? `${path}/` : path;
+    const started = startNaming(machine, { isFolder, path });
+
+    if (!started.accepted) {
+      return;
+    }
+
+    ({ machine } = started);
 
     try {
       host.rowAdd(row);
@@ -140,10 +149,8 @@ export const createTreeNaming = (host: TreeNamingHost): TreeNaming => {
       return;
     }
 
-    pendingAdd = { isFolder, path };
-
     if (!host.startRenaming(path)) {
-      pendingAdd = null;
+      machine = clearNaming(machine);
       host.dropRow(row);
       host.toaster.notify("This tree cannot be changed.");
     }
@@ -153,7 +160,7 @@ export const createTreeNaming = (host: TreeNamingHost): TreeNaming => {
    * and move the row, so a refused one is stopped while the input still has
    * it. A name pierre takes but reports as unchanged is settled here. */
   const guardNameKey = (event: KeyboardEvent) => {
-    const add = pendingAdd;
+    const add = machine.state._tag === "Naming" ? machine.state.add : null;
 
     if (event.key !== "Enter" || add === null) {
       return;
@@ -187,7 +194,7 @@ export const createTreeNaming = (host: TreeNamingHost): TreeNaming => {
    * placeholder is settled either way: a reported rename clears it, an
    * untouched one lands here. */
   const onNameBlur = (event: FocusEvent) => {
-    const add = pendingAdd;
+    const add = machine.state._tag === "Naming" ? machine.state.add : null;
 
     if (add === null || renameInput(event) === null) {
       return;
@@ -200,60 +207,78 @@ export const createTreeNaming = (host: TreeNamingHost): TreeNaming => {
    * already holds): the input closes but the placeholder row stays, so the
    * pane takes it back out and says what happened. */
   const nameRefused = (error: string) => {
-    const add = pendingAdd;
-    pendingAdd = null;
+    const decision = refuseNaming(machine, error);
+    ({ machine } = decision);
 
-    if (add !== null) {
-      host.dropRow(add.isFolder ? `${add.path}/` : add.path);
+    if (decision.refused) {
+      return;
     }
 
-    host.toaster.notify(error);
+    if (decision.drop !== null) {
+      host.dropRow(decision.drop);
+    }
+
+    if (decision.notify !== null) {
+      host.toaster.notify(decision.notify);
+    }
   };
 
   /** pierre's inline input landed on a name: the placeholder becomes the file
    * the pod gets, or the empty folder it stood for. */
   const finishAdd = (event: TreeRenameEvent) => {
-    const add = pendingAdd;
-    pendingAdd = null;
-
-    // Anything but the placeholder this browser parked is a row the checkout
-    // or the browser already held: pierre renamed it, so it is a move.
-    if (add === null || event.sourcePath !== add.path) {
-      host.onRenamed(event);
-
-      return;
-    }
-
     const dest = withoutSlash(event.destinationPath);
+    const naming = machine.state._tag === "Naming" ? machine.state.add : null;
 
-    const error = nameError(
-      dest.slice(dest.lastIndexOf("/") + 1),
-      host.changeAt(dest)
-    );
+    // A name our rules refuse is dropped once pierre has finished moving the
+    // row; the machine forgets the placeholder first, so the blur that follows
+    // cannot land it.
+    if (naming !== null && event.sourcePath === naming.path) {
+      const error = nameError(
+        dest.slice(dest.lastIndexOf("/") + 1),
+        host.changeAt(dest)
+      );
 
-    if (error !== null) {
-      // pierre moves the row after this callback returns: drop it then.
-      const row = event.isFolder ? `${dest}/` : dest;
-      queueMicrotask(() => {
-        host.dropRow(row);
-      });
-      host.toaster.notify(error);
+      if (error !== null) {
+        const row = event.isFolder ? `${dest}/` : dest;
+        machine = clearNaming(machine);
+        queueMicrotask(() => {
+          host.dropRow(row);
+        });
+        host.toaster.notify(error);
+
+        return;
+      }
+    }
+
+    const decision = finishNaming(machine, {
+      destinationPath: dest,
+      isFolder: event.isFolder,
+      sourcePath: event.sourcePath,
+    });
+
+    ({ machine } = decision);
+
+    if (decision.land !== null) {
+      host.landAdd(decision.land);
 
       return;
     }
 
-    host.landAdd({ isFolder: event.isFolder, path: dest });
+    if (decision.rename !== null) {
+      host.onRenamed(decision.rename);
+    }
   };
 
   return {
     clearPending: () => {
-      pendingAdd = null;
+      machine = clearNaming(machine);
     },
     finishAdd,
     guardNameKey,
     nameRefused,
     onNameBlur,
-    pendingPath: () => pendingAdd?.path,
+    pendingPath: () =>
+      machine.state._tag === "Naming" ? machine.state.add.path : undefined,
     startAdd,
   };
 };

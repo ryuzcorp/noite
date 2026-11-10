@@ -21,6 +21,16 @@ import {
 import { branchNameError } from "./branch-name";
 import { forgeRefs, invalidateForge } from "./data";
 import { divergeLabel, shortSha } from "./format";
+import {
+  failAction,
+  pickerBusy,
+  pickerError,
+  PickerStates,
+  reopenPicker,
+  settleAction,
+  startAction,
+} from "./picker-state";
+import type { PickerAction, PickerState } from "./picker-state";
 
 const SHA_RE = /^[0-9a-f]{7,40}$/u;
 
@@ -303,8 +313,10 @@ export const BranchPicker = ({
   // Without it an ancestor's repaint — the source page repaints on every draft
   // report and every switch — closed a dropdown the user had just opened, and
   // a render-held copy of the state reopened one `pick` had just closed.
-  const busy = atom(false);
-  const failure = atom("");
+  /** The picker's one action slot (see `./picker-state`): the failure it
+   * shows belongs to the gesture that made it, and a second click cannot
+   * stack a second confirm. */
+  const picker = atom<PickerState>(PickerStates.Idle());
   const branches = refs?.branches ?? [];
   const defaultBranch = refs?.defaultBranch ?? "main";
   const deployed = refs?.deployedSha ?? null;
@@ -320,25 +332,36 @@ export const BranchPicker = ({
       element.open = false;
     }
 
+    picker.set(reopenPicker(picker()));
     onChange(ref);
   };
 
-  const run = async (action: () => Promise<void>): Promise<boolean> => {
-    busy.set(true);
-    failure.set("");
-    let done = true;
+  /** Run one mutation, refused while another (or its confirm) is running. */
+  const run = async (
+    action: PickerAction,
+    ref: string,
+    work: () => Promise<void>
+  ): Promise<boolean> => {
+    const before = picker();
 
-    try {
-      await action();
-      invalidateForge(appId);
-    } catch (error) {
-      done = false;
-      failure.set(errorMessage(error));
+    if (before._tag === "Busy") {
+      return false;
     }
 
-    busy.set(false);
+    picker.set(startAction(before, action, ref));
 
-    return done;
+    try {
+      await work();
+      invalidateForge(appId);
+    } catch (error) {
+      picker.set(failAction(picker(), errorMessage(error)));
+
+      return false;
+    }
+
+    picker.set(settleAction(picker()));
+
+    return true;
   };
 
   return (
@@ -347,6 +370,11 @@ export const BranchPicker = ({
       data-morph-preserve="open"
       ref={(el) => {
         collectRef(details, el);
+      }}
+      ontoggle={(event) => {
+        if (event.currentTarget.open) {
+          picker.set(reopenPicker(picker()));
+        }
       }}
     >
       <summary
@@ -391,7 +419,7 @@ export const BranchPicker = ({
               appId={appId}
               branch={branch}
               browsed={value}
-              busy={busy()}
+              busy={pickerBusy(picker())}
               canDelete={role === "admin"}
               canEnv={role === "push" || role === "admin"}
               current={branch.name === value}
@@ -405,7 +433,7 @@ export const BranchPicker = ({
               }
               onPick={pick}
               onEnvironment={(target) => {
-                void run(async () => {
+                void run("environment", target, async () => {
                   const env = await api<RunnerEnvironment | null>(
                     "/api/environments/createEnvironment",
                     {
@@ -424,6 +452,12 @@ export const BranchPicker = ({
               }}
               onDelete={(target) => {
                 void (async () => {
+                  if (picker()._tag === "Busy") {
+                    return;
+                  }
+
+                  picker.set(startAction(picker(), "delete-confirm", target));
+
                   const tracked = envs.find(
                     (env) =>
                       env.kind === "branch" &&
@@ -449,10 +483,12 @@ export const BranchPicker = ({
                   });
 
                   if (!ok) {
+                    picker.set(settleAction(picker()));
+
                     return;
                   }
 
-                  await run(async () => {
+                  await run("delete", target, async () => {
                     await api<{ ok: true }>("/api/forge/gitBranchDelete", {
                       appId,
                       name: target,
@@ -486,17 +522,19 @@ export const BranchPicker = ({
             </button>
           </p>
         )}
-        {failure() ? <p class="text-error m-0 text-xs">{failure()}</p> : null}
+        {pickerError(picker()) === "" ? null : (
+          <p class="text-error m-0 text-xs">{pickerError(picker())}</p>
+        )}
         {role === "push" || role === "admin" ? (
           <BranchCreator
-            busy={busy()}
+            busy={pickerBusy(picker())}
             onCreate={(name) => {
               void (async () => {
                 // The switch waits for `run`, and with it for the invalidation:
                 // whether the new ref opens editable is read off the refs list
                 // (see `canEditRef` in the source page), and only the next read
                 // of that list holds the branch this just created.
-                const created = await run(async () => {
+                const created = await run("create", name, async () => {
                   await api<{ ok: true }>("/api/forge/gitBranchCreate", {
                     appId,
                     from: value,

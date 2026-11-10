@@ -9,6 +9,17 @@ import type {
   ThemedToken,
 } from "@pierre/highlights";
 
+import {
+  hoverEnter,
+  hoverExpired,
+  hoverHide,
+  hoverLeave,
+  hoverPainted,
+  hoverRest,
+  newHoverMachine,
+} from "./hover-state";
+import type { HoverMachine, HoverState } from "./hover-state";
+
 /** The pointer rests on a token this long before its hover tip opens, the
  * same delay pierre uses for its diagnostic popovers. */
 export const HOVER_DELAY = 300;
@@ -37,18 +48,36 @@ export interface TipContent {
 
 /** The hover tip: quick info, or the declaration lines of a definition the
  * pane cannot open. TypeScript output only ever becomes text nodes; the
- * highlighting is per-token spans, never HTML. */
+ * highlighting is per-token spans, never HTML.
+ *
+ * Tokens are named by the caller (`enter`), and every later step carries that
+ * name back: a tip whose answer arrives after the pointer left, or after the
+ * file changed, is refused by the machine (see `./hover-state`) and `paint`
+ * answers false. */
 export interface HoverTip {
   /** Take the tip's node out of the pane: the shadow root (and the pane in
    * it) outlives this wiring, so a mount that does not remove its tip leaves
    * one behind for the next one to stack on. */
   dispose: () => void;
+  /** The pointer entered `token`: the delay starts here. */
+  enter: (token: string) => void;
   /** Close it now: the file changed or the editor closed. */
   hide: () => void;
   /** The pointer left the token: close it unless the pointer reaches the
    * tip within `HIDE_GRACE`. */
   leave: () => void;
-  show: (content: TipContent, anchor: HTMLElement) => Promise<void>;
+  /** The answer is in: paint it under `epoch`, and answer whether it opened. */
+  paint: (
+    token: string,
+    epoch: number,
+    content: TipContent,
+    anchor: HTMLElement
+  ) => Promise<boolean>;
+  /** The pointer rested on `token`: the epoch to paint under, or null when it
+   * already left. */
+  rest: (token: string) => number | null;
+  /** The current state, for the pane's own tests and the diagnostics layer. */
+  state: () => HoverState;
 }
 
 /** The slice of `@pierre/highlights` the tip uses, with Pierre's two themes. */
@@ -126,9 +155,9 @@ export const createHoverTip = (pane: HTMLElement): HoverTip => {
   // `pane` is the pane itself, not the container a paint wipes: the tip
   // outlives every placeholder, note and open error (see `pane.ts`).
   pane.append(tip);
-  // Every show/hide bumps this; a show still highlighting when a newer call
-  // lands must not open.
-  let generation = 0;
+  /** One machine, one epoch: every enter/leave/hide bumps it, so an answer
+   * still highlighting under an older epoch cannot open. */
+  let machine: HoverMachine = newHoverMachine();
   let hideTimer: number | undefined;
 
   const cancelHide = () => {
@@ -138,18 +167,36 @@ export const createHoverTip = (pane: HTMLElement): HoverTip => {
 
   const hide = () => {
     cancelHide();
-    generation += 1;
+    machine = hoverHide(machine);
     tip.hidden = true;
   };
 
+  /** The grace period elapsed: close only the tip that armed it. */
+  const expire = (epoch: number) => {
+    hideTimer = undefined;
+
+    const expired = hoverExpired(machine, epoch);
+    ({ machine } = expired);
+
+    if (expired.close) {
+      tip.hidden = true;
+    }
+  };
+
   const leave = () => {
-    // A show still highlighting for the token just left must not open.
-    generation += 1;
+    const left = hoverLeave(machine);
+    ({ machine } = left);
     cancelHide();
 
-    if (!tip.hidden) {
-      hideTimer = window.setTimeout(hide, HIDE_GRACE);
+    if (!left.linger) {
+      return;
     }
+
+    const epoch = machine.state._tag === "Lingering" ? machine.state.epoch : 0;
+
+    hideTimer = window.setTimeout(() => {
+      expire(epoch);
+    }, HIDE_GRACE);
   };
 
   tip.addEventListener("pointerenter", cancelHide);
@@ -162,12 +209,14 @@ export const createHoverTip = (pane: HTMLElement): HoverTip => {
       hide();
       tip.remove();
     },
+    enter: (token) => {
+      cancelHide();
+      machine = hoverEnter(machine, token);
+    },
     hide,
     leave,
-    show: async (content, anchor) => {
+    paint: async (token, epoch, content, anchor) => {
       cancelHide();
-      generation += 1;
-      const mine = generation;
       const body = document.createElement("div");
 
       if (content.header) {
@@ -198,8 +247,11 @@ export const createHoverTip = (pane: HTMLElement): HoverTip => {
         body.append(errors);
       }
 
-      if (mine !== generation || !anchor.isConnected) {
-        return;
+      const painted = hoverPainted(machine, epoch);
+      ({ machine } = painted);
+
+      if (!painted.open || !anchor.isConnected) {
+        return false;
       }
 
       tip.replaceChildren(...body.childNodes);
@@ -218,6 +270,15 @@ export const createHoverTip = (pane: HTMLElement): HoverTip => {
 
       tip.style.left = `${left}px`;
       tip.style.top = `${anchorBox.bottom - paneBox.top + 4}px`;
+
+      return true;
     },
+    rest: (token) => {
+      const rested = hoverRest(machine, token);
+      ({ machine } = rested);
+
+      return rested.epoch;
+    },
+    state: () => machine.state,
   };
 };

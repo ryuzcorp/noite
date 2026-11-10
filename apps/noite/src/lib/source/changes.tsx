@@ -7,20 +7,30 @@ import { atom, watch } from "ilha";
 import type { AtomHandle } from "ilha";
 
 import { formatBytes } from "../bytes";
-import { branchNameError } from "../forge/branch-name";
 import { DraftDiffView } from "../forge/diff";
 import type { GitBranch } from "../runner";
 import { confirmDialog } from "../ui/confirm";
 import { X } from "../ui/icons";
+import {
+  choiceOf,
+  CommitChoices,
+  NEW_BRANCH,
+  planNotice,
+  planTarget,
+  selectValue,
+} from "./commit-target";
+import type { CommitChoice } from "./commit-target";
 import type { CommitDrafts, PushRequest, SourceBrowserState } from "./drafts";
+import {
+  rowBadge,
+  rowBytes,
+  rowDiffed,
+  rowDiscardable,
+  rowLabel,
+  rowUndoable,
+  rowView,
+} from "./row-view";
 import type { ChangeKind, WorkspaceChange } from "./workspace/types";
-
-/** The target select's entry for a new branch. A space is illegal in a git
- * branch name, so the sentinel can never collide with one — as the option's
- * value or as its key (an unkeyed option is matched by position, and a
- * repaint that inserts a branch above it would leave the branch's `<option>`
- * with this one's value). */
-const NEW_BRANCH = " new";
 
 /** The commit targets, in the select's order: the browsed ref first (the
  * default target), then the default branch, then every other branch
@@ -185,16 +195,13 @@ const PushOutcome = ({
   );
 };
 
-/** The commit target the user chose, and a new branch's name, with the ref they
- * were chosen on. This form's fiber survives a ref switch (the Changes tab
- * keeps what it holds), so the ref is part of the state: a target left over
- * from the branch the user came from would commit to *that* branch. */
-interface CommitChoice {
+/** The choice the user made, with the ref it was made on. This form's fiber
+ * survives a ref switch (the Changes tab keeps what it holds), so the ref is
+ * part of the state: a target left over from the branch the user came from
+ * would commit to *that* branch. */
+interface HeldChoice {
   branch: string;
-  /** A new branch's name, while the target is `NEW_BRANCH`. */
-  name: string;
-  /** A branch name, or `NEW_BRANCH`. */
-  target: string;
+  choice: CommitChoice;
 }
 
 /** Message, target branch and Push. */
@@ -221,9 +228,13 @@ const CommitForm = ({
   state: AtomHandle<SourceBrowserState>;
 }) => {
   const message = atom("");
-  /** The commit target: a branch name, or `NEW_BRANCH` for a new branch off the
-   * browsed ref's tip. It starts on the browsed branch. */
-  const choice = atom<CommitChoice>({ branch, name: "", target: branch });
+
+  /** What the user picked, and on which ref (see `HeldChoice`). */
+  const choice = atom<HeldChoice>({
+    branch,
+    choice: CommitChoices.Browsed(),
+  });
+
   // The title the pull-request shortcut prefills: the last pushed message.
   const lastMessage = atom("");
   const current = state();
@@ -231,24 +242,25 @@ const CommitForm = ({
 
   // What the form shows: the choice made on this ref, or the fresh one a switch
   // to another ref starts from (the browsed branch itself).
-  const mine =
-    held.branch === branch ? held : { branch, name: "", target: branch };
+  const mine: CommitChoice =
+    held.branch === branch ? held.choice : CommitChoices.Browsed();
 
-  const { name: newBranch, target } = mine;
   const targets = commitTargets(branches, branch, defaultBranch);
-  // A protected branch only takes commits through a pull.
-  const into = isProtected(target) ? NEW_BRANCH : target;
-  const branchName = newBranch.trim();
 
-  const nameError =
-    into === NEW_BRANCH && branchName !== ""
-      ? branchNameError(branchName)
-      : null;
+  // What the push would do: protection re-targets the browsed branch to a new
+  // one, and the name rules decide whether that can go (see `./commit-target`).
+  const plan = planTarget(mine, branch, isProtected, current.files.length > 0);
 
-  const blocked =
-    current.files.length === 0 ||
-    current.pushing ||
-    (into === NEW_BRANCH && (branchName === "" || nameError !== null));
+  const notice = planNotice(mine, plan);
+
+  // The select's value: the browsed branch itself for the default choice (so
+  // the first option stays selected), and the sentinel/target otherwise.
+  const into =
+    plan.choice._tag === "Browsed" ? branch : selectValue(plan.choice);
+
+  const blocked = plan.blocked || current.pushing;
+
+  const newName = plan.choice._tag === "New" ? plan.choice.name : "";
 
   return (
     <form
@@ -263,14 +275,12 @@ const CommitForm = ({
         const text = message().trim() || defaultMessage(current);
         const request: PushRequest = { message: text };
 
-        // Naming the browsed branch is the same as naming none — the commit
-        // lands there either way. A new branch names itself, and the runner
-        // creates it at the browsed tip; any other target names its branch,
-        // which the runner grows from its own tip.
-        if (into === NEW_BRANCH) {
-          request.branch = branchName;
-        } else if (into !== branch) {
-          request.branch = into;
+        // `Browsed` names no branch (the runner's default is the one being
+        // browsed); a new branch names itself and the runner creates it at the
+        // browsed tip; any other target names its branch, which the runner
+        // grows from its own tip.
+        if (plan.branch !== undefined) {
+          request.branch = plan.branch;
         }
 
         lastMessage.set(text);
@@ -280,10 +290,17 @@ const CommitForm = ({
           // switch mid-push has its own.
           if (await commit(request)) {
             message.set("");
-            const now = choice();
 
-            if (now.branch === branch) {
-              choice.set({ ...now, name: "" });
+            if (held.branch === branch) {
+              // A landed push empties the new branch's name for the next
+              // commit; the target itself stays where the user put it.
+              choice.set({
+                branch,
+                choice:
+                  plan.choice._tag === "New"
+                    ? CommitChoices.New({ name: "" })
+                    : plan.choice,
+              });
             }
           }
         })();
@@ -306,23 +323,27 @@ const CommitForm = ({
           aria-label="Commit to"
           value={into}
           onchange={(event) => {
-            choice.set({ ...mine, target: event.currentTarget.value });
+            const { value } = event.currentTarget;
+            // Picking "New branch…" again keeps the name already typed.
+            choice.set({
+              branch,
+              choice:
+                value === NEW_BRANCH && mine._tag === "New"
+                  ? mine
+                  : choiceOf(value, branch),
+            });
           }}
         >
-          {targets.map((name) => {
-            const locked = isProtected(name);
-
-            return (
-              <option
-                key={name}
-                value={name}
-                selected={into === name}
-                disabled={locked}
-              >
-                {locked ? `${name} (protected)` : name}
-              </option>
-            );
-          })}
+          {targets.map((name) => (
+            <option
+              key={name}
+              value={name}
+              selected={into === name}
+              disabled={isProtected(name)}
+            >
+              {isProtected(name) ? `${name} (protected)` : name}
+            </option>
+          ))}
           <option
             key={NEW_BRANCH}
             value={NEW_BRANCH}
@@ -335,21 +356,29 @@ const CommitForm = ({
           {current.pushing ? "Pushing…" : "Push"}
         </button>
       </div>
-      {into === NEW_BRANCH ? (
+      {notice === "" ? null : (
+        <p class="m-0 text-xs opacity-70" role="status">
+          {notice}
+        </p>
+      )}
+      {plan.choice._tag === "New" ? (
         <>
           <input
             class="input input-sm w-full font-mono"
             aria-label="New branch name"
-            aria-invalid={nameError === null ? undefined : "true"}
+            aria-invalid={plan.reason === "" ? undefined : "true"}
             placeholder="my-change"
-            value={newBranch}
+            value={newName}
             oninput={(event) => {
-              choice.set({ ...mine, name: event.currentTarget.value });
+              choice.set({
+                branch,
+                choice: CommitChoices.New({ name: event.currentTarget.value }),
+              });
             }}
           />
-          {nameError === null ? null : (
+          {plan.reason === "" ? null : (
             <p class="text-error m-0 text-xs" role="alert">
-              {nameError}
+              {plan.reason}
             </p>
           )}
         </>
@@ -390,42 +419,6 @@ export interface ChangesPanelProps {
   state: AtomHandle<SourceBrowserState>;
 }
 
-/** What a row reads as: a move shows both paths. */
-const rowLabel = (file: WorkspaceChange): string =>
-  file.kind === "moved" && file.movedFrom !== undefined
-    ? `${file.movedFrom} → ${file.path}`
-    : file.path;
-
-/** Whether the row has an edit to throw away: a pure move and a staged
- * deletion have nothing but the move or the deletion to undo. */
-const hasEdit = (file: WorkspaceChange): boolean =>
-  file.binary !== undefined || file.after !== file.before;
-
-/** The badge a row shows: what the change is, and the daisyUI tone for it. */
-interface RowBadge {
-  class: string;
-  label: string;
-}
-
-/** The little daisyUI badge that says what a row is. Added, modified and
- * binary stay neutral (the app's own tone); the two destructive shapes carry
- * their colour. */
-const rowBadge = (file: WorkspaceChange): RowBadge => {
-  if (file.binary !== undefined) {
-    return { class: "badge-neutral", label: "binary" };
-  }
-
-  if (file.kind === "deleted") {
-    return { class: "badge-error", label: "deleted" };
-  }
-
-  if (file.kind === "moved") {
-    return { class: "badge-warning", label: "moved" };
-  }
-
-  return { class: "badge-neutral", label: file.kind };
-};
-
 /** One change: what it is, where it sits, and what can be done with it. An
  * upload shows its size where a diff would be — there is no text to compare.
  * `last` drops the divider (passed, not `last:`: a component's root sits in
@@ -441,8 +434,9 @@ const ChangeRow = ({
   onDiscard: (file: WorkspaceChange) => void;
   restore: (path: string) => void;
 }) => {
-  const badge = rowBadge(file);
-  const undoing = file.kind === "deleted" || file.kind === "moved";
+  const row = rowView(file);
+  const badge = rowBadge(row);
+  const bytes = rowBytes(row);
 
   return (
     <li
@@ -450,17 +444,16 @@ const ChangeRow = ({
     >
       <span class={`badge badge-sm ${badge.class}`}>{badge.label}</span>
       <span class="min-w-0 flex-1 truncate font-mono text-xs">
-        {rowLabel(file)}
-        {file.binary === undefined ? null : ` · ${formatBytes(file.binary)}`}
+        {rowLabel(row)}
+        {bytes === null ? null : ` · ${formatBytes(bytes)}`}
       </span>
-      {file.loading ? (
+      {row._tag === "Loading" ? (
         <span
           class="loading loading-xs"
           title="Reading the committed copy"
         ></span>
       ) : null}
-      {file.kind === "deleted" ||
-      (file.kind === "moved" && !hasEdit(file)) ? null : (
+      {rowDiscardable(row) ? (
         <button
           type="button"
           class="btn btn-xs btn-ghost hover:bg-error/10 hover:text-error"
@@ -471,8 +464,8 @@ const ChangeRow = ({
         >
           Discard
         </button>
-      )}
-      {undoing ? (
+      ) : null}
+      {rowUndoable(row) ? (
         <button
           type="button"
           class="btn btn-xs btn-neutral"
@@ -522,13 +515,7 @@ export const ChangesPanel = ({
   // Text changes carry a diff; an upload has no text to compare, a pure move
   // or a staged deletion has none either, and a row whose committed text is
   // still being read has nothing to compare against yet.
-  const diffed = files.filter(
-    (file) =>
-      !file.loading &&
-      file.binary === undefined &&
-      file.kind !== "deleted" &&
-      (file.kind !== "moved" || hasEdit(file))
-  );
+  const diffed = files.filter((file) => rowDiffed(rowView(file)));
 
   const ask = (title: string, message: string, confirmLabel: string) =>
     confirmDialog({
@@ -574,8 +561,12 @@ export const ChangesPanel = ({
           role="status"
         >
           Based on an older commit:{" "}
-          <span class="font-mono">{stale.slice(0, 7)}</span>; pushing may
-          conflict.
+          <span class="font-mono">{stale.baseSha.slice(0, 7)}</span>; pushing
+          may conflict with{" "}
+          <span class="font-mono" title={stale.tipSha}>
+            {stale.tipSha.slice(0, 7)}
+          </span>
+          .
         </p>
       )}
       <div class="min-h-0 flex-1 overflow-auto">
