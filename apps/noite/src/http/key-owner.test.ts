@@ -256,4 +256,35 @@ describe("the ban endpoint", () => {
     expect(response.status).toBe(403);
     expect(keyCount("survivor")).toBe(0);
   });
+
+  test("a failed or unauthorized unban does not delete an account's keys", async () => {
+    const key = await mintKey("dos-target");
+    const auth = authFromEnv(ENV as unknown as KitEnv, ENV.BETTER_AUTH_URL);
+
+    const unbanRequest = (headers: Record<string, string>) =>
+      new Request(`${ENV.BETTER_AUTH_URL}/api/auth/admin/unban-user`, {
+        body: JSON.stringify({ userId: "dos-target" }),
+        headers: { "content-type": "application/json", ...headers },
+        method: "POST",
+      });
+
+    // Better-auth runs after hooks even when the endpoint refuses, so the
+    // sweep must be gated on the success payload: an anonymous caller cannot
+    // use a failed unban to delete someone else's keys.
+    const anonymous = await auth.handler(unbanRequest({}));
+
+    expect(anonymous.status).toBe(401);
+    expect(keyCount("dos-target")).toBe(1);
+
+    db.raw.run(
+      `INSERT INTO "user" (id, name, email, emailVerified) VALUES ('plain-1', 'Plain', 'plain@example.com', 1)`
+    );
+
+    const cookie = await signInCookie("plain@example.com");
+    const forbidden = await auth.handler(unbanRequest({ cookie }));
+
+    expect(forbidden.status).toBe(403);
+    expect(keyCount("dos-target")).toBe(1);
+    expect(key.length).toBeGreaterThan(0);
+  });
 });

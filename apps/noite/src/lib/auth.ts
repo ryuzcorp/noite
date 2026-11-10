@@ -7,6 +7,7 @@ import {
   APIError,
   createAuthMiddleware,
   getSessionFromCtx,
+  isAPIError,
 } from "better-auth/api";
 import { admin } from "better-auth/plugins";
 import { emailOTP } from "better-auth/plugins/email-otp";
@@ -146,8 +147,15 @@ const requireRegistration = (context: string | null | undefined) => {
   }
 };
 
-/** The admin plugin's unban body, decoded at the hook boundary. */
-const UnbanBody = Schema.Struct({ userId: Schema.String });
+/** The admin plugin's request bodies/results, decoded at the hook boundary. */
+const AdminUpdateBody = Schema.Struct({
+  data: Schema.Struct({ banned: Schema.optional(Schema.Boolean) }),
+  userId: Schema.String,
+});
+
+const AdminUserResult = Schema.Struct({
+  user: Schema.Struct({ id: Schema.String }),
+});
 
 /** Deliver a sign-in OTP: POST to the configured webhook (Workers have no
  * SMTP sockets), dev-console fallback on localhost, loud refusal otherwise
@@ -272,22 +280,46 @@ export const createAuth = (env: KitEnv, baseURL: string) =>
     },
     // The plugin's own HTTP endpoints are not covered by the app action's
     // checks. Key creation refuses a banned owner even if a session survived
-    // the ban (the crash window), and unban sweeps keys a create raced in
-    // during the ban — revoked stays revoked.
+    // the ban (the crash window), and an unban sweeps keys a create raced in
+    // during the ban — revoked stays revoked. The sweep reads the *success
+    // payload*, never the request: better-auth runs after hooks even when the
+    // endpoint refused, so decoding the body would let any caller delete a
+    // victim's keys with a failed unban request.
     hooks: {
       after: createAuthMiddleware(async (ctx) => {
-        if (ctx.path !== "/admin/unban-user") {
+        if (
+          ctx.path !== "/admin/unban-user" &&
+          ctx.path !== "/admin/update-user"
+        ) {
           return;
         }
 
-        const parsed = Schema.decodeUnknownResult(UnbanBody)(ctx.body);
+        if (isAPIError(ctx.context.returned)) {
+          return;
+        }
 
-        if (parsed._tag !== "Success") {
+        // `/admin/update-user` doubles as an unban only when it says so.
+        if (ctx.path === "/admin/update-user") {
+          const update = Schema.decodeUnknownResult(AdminUpdateBody)(ctx.body);
+
+          if (
+            update._tag !== "Success" ||
+            update.success.data.banned !== false
+          ) {
+            return;
+          }
+        }
+
+        const result = Schema.decodeUnknownResult(AdminUserResult)(
+          ctx.context.returned
+        );
+
+        if (result._tag !== "Success") {
           return;
         }
 
         try {
-          await revokeApiKeysForUser(parsed.success.userId);
+          await revokeApiKeysForUser(result.success.user.id);
         } catch (error) {
           console.error("[auth] unban key sweep failed", error);
         }
