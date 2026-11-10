@@ -1,9 +1,11 @@
 /**
- * Stamp the Worker D1 binding, then ensure the schema before routes / pages.
- * Runs on every request (`src/middleware/` = Void global middleware, in
- * numeric order after the timeout and pod-host gates). Also stamps the
- * runner credentials for the plain-route fetch path (what `handleHttp` did
- * before the Void routes slice).
+ * Stamp the Worker D1 binding, then run the admin bootstrap before routes /
+ * pages. Runs on every request that reaches the Worker (`src/middleware/` =
+ * Void global middleware, in numeric order after the timeout and pod-host
+ * gates) — static bundles do not: celld serves `/assets/*` itself, see
+ * `RUN_WORKER_FIRST` in `void.config.ts`. Also stamps the runner credentials
+ * for the plain-route fetch path (what `handleHttp` did before the Void
+ * routes slice).
  */
 
 import type { D1Database } from "@cloudflare/workers-types";
@@ -22,10 +24,11 @@ export default defineMiddleware(async (c, next) => {
     setD1Binding(d1);
   }
 
-  // Every request traverses this middleware — actions and `/assets/*` alike
-  // (`run_worker_first: true`) — so every request shares the isolate's one
-  // admin-bootstrap pass. Schema migrations are the runner's job (Void's
-  // migration endpoint), never a request's.
+  // Per request, never shared: a client abort or a fast answer drops the
+  // starter's pending work, so a pass cached across requests would leave its
+  // waiters on an orphan (see `docker/check-worker-rules.ts`). Schema
+  // migrations are the runner's job (Void's migration endpoint), never a
+  // request's.
   await ensureDb();
 
   return next();

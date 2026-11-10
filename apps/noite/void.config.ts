@@ -5,7 +5,7 @@
 // derives the deploy-root `dist/wrangler.json` the runner deploys with celld.
 //
 // Serving contract (runner `ensure_deployed`, celld `CELLD_KEYS`): name
-// `noite-control`, compat date `2026-09-01`, worker-first assets with
+// `noite-control`, compat date `2026-09-01`, worker-first routing with
 // `not_found_handling "none"` (a missing hashed chunk 404s instead of
 // serving the document), the D1 `DB` keyed by name (no `database_id`), the
 // `ASSETS` binding declared (celld does not inject it), and `vars` defaults
@@ -14,16 +14,33 @@
 // `routing.headers` to assets, SSR pages and API responses.
 import { defineConfig } from "void/config";
 
+/** Which paths start the Worker. `/assets/*` is served by the platform.
+ *
+ * Void's pages fallback answers a router miss (`/assets/*` never matches a
+ * route) by fetching `env.ASSETS` *inside* the Hono app — so a worker-bound
+ * asset request runs the whole middleware chain (better-auth, the per-request
+ * D1 `ensureDb` read, the rate limit) and, crucially, sits inside
+ * `src/middleware/01-timeout.ts`'s 15 s action bound. An asset read that
+ * outlives the bound is answered with that middleware's JSON 504 instead of
+ * the file, which is a hydration failure with no retry: the island bundle
+ * never executes. Excluding the fingerprinted bundle from worker-first makes
+ * celld serve it from its own asset resolver (same `_headers` policy: the
+ * `/assets/*` immutable cache rule and the isolation headers) without
+ * invoking the Worker at all, so no action timeout, session read or D1 read
+ * can ever stand between the browser and its chunks. A *missing* file still
+ * falls through to the Worker (celld answers only hits at the edge of this
+ * rule), so the app's 404 handling is unchanged.
+ *
+ * `vite.config.ts` (`emitCelldConfig`) writes this same list into the deploy
+ * config; Void's own build rewrites `dist/ssr/wrangler.json` to `["/**"]`. */
+export const RUN_WORKER_FIRST: string[] = ["/**", "!/assets/*"];
+
 export default defineConfig({
   cloudflare: {
     assets: {
       binding: "ASSETS",
       not_found_handling: "none",
-      // Boolean `true`: the same form `cloudflare.config.ts` used on main
-      // (the lane-green shape). Void's own build normalizes this to `["/**"]`
-      // when routing rules exist anyway; `emitCelldConfig` in `vite.config.ts`
-      // carries the boolean through to celld's copy.
-      run_worker_first: true,
+      run_worker_first: RUN_WORKER_FIRST,
     },
     d1_databases: [{ binding: "DB", database_name: "noite-control" }],
     name: "noite-control",
