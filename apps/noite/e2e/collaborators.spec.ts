@@ -50,7 +50,27 @@ test("removing a collaborator asks first; Esc and Cancel keep the grant", async 
     await expect(invitee.page).toHaveURL(new RegExp(`/apps/${appId}`, "u"));
 
     await page.goto(`/apps/${appId}?panel=settings`);
-    const row = page.locator("li", { hasText: email });
+
+    // The panel paints its last sessionStorage snapshot while it refetches
+    // (lib/resource.ts), so an accepted invitation can still be on screen
+    // for the first frames after the navigation. Wait for the fresh pending
+    // list to drop it; accepting consumes the invitation server-side (see
+    // collaborators.test.ts), so this is the refetch landing, not a grant
+    // that the UI forgot to remove.
+    const pendingRow = page
+      .locator("li")
+      .filter({ has: page.getByRole("button", { name: "Revoke" }) });
+
+    await expect(pendingRow).toBeHidden();
+
+    // The member row is the one that offers Remove; the pending invitation
+    // (while any snapshot still paints it) offers Revoke and would make a
+    // hasText-only locator resolve to two elements.
+    const row = page
+      .locator("li")
+      .filter({ has: page.getByRole("button", { name: "Remove" }) })
+      .filter({ hasText: email });
+
     await expect(row).toBeVisible();
 
     const remove = row.getByRole("button", { name: "Remove" });

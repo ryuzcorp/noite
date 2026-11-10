@@ -15,7 +15,7 @@ import {
   tracked,
 } from "./resource";
 import type { Resource, ResourceState } from "./resource";
-import { clearSwrStore, readSwr } from "./swr-store";
+import { clearSwrStore, readSwr, writeSwr } from "./swr-store";
 
 class FakeNode {
   children: FakeNode[] = [];
@@ -439,6 +439,39 @@ describe("tracked mount failures", () => {
         expect(capturedState()._tag).not.toBe("Loading");
       } finally {
         second.unmount();
+      }
+    } finally {
+      resetSignals();
+      restoreDom();
+    }
+  });
+
+  test("a reader seeded from a stale snapshot repaints the fresh fetch", async () => {
+    const restoreDom = installDomFixture();
+
+    try {
+      const key = nextKey();
+      // What a reload paints first: the previous document's last-good value
+      // (an invitation the other browser has since accepted).
+      writeSwr(key, ["accepted-invite"]);
+      probeKey = key;
+      probeFetch = () => Promise.resolve([]);
+
+      const fresh = Promise.withResolvers<string[]>();
+      signalPainted = (value) => {
+        if (value.length === 0) {
+          fresh.resolve(value);
+        }
+      };
+
+      const ui = render(ResourceProbe);
+
+      try {
+        await ui.settled();
+        expect(await fresh.promise).toEqual([]);
+        expect(readSwr<string[]>(key)).toEqual([]);
+      } finally {
+        ui.unmount();
       }
     } finally {
       resetSignals();
