@@ -38,7 +38,8 @@ Platform hostnames are refused. Several apps may hold a pending claim for one
 hostname, but the first to verify wins: a hostname another app already
 verified answers 409, and verifying drops rival pending claims. In `single`
 tenancy (one trusted operator) a claim verifies immediately, with no TXT
-step. Removing a hostname releases it.
+step. Removing a hostname asks first, then releases it: the edge drops the
+route and the hostname's certificate.
 
 ## Rate limits
 
@@ -54,7 +55,9 @@ Settings → Collaborators. Roles, weakest first:
 | `push` | Everything above, plus push code (create + fast-forward only) |
 | `admin` | Everything above, plus settings, env vars, domains, any push, collaborator management |
 
-Instance admins (the [operator track](/self-hosting/install)) manage every app without a grant.
+Removing a collaborator asks first, then drops the grant and any invitation
+addressed to them: the account loses access immediately. Instance admins (the
+[operator track](/self-hosting/install)) manage every app without a grant.
 
 ## Source browser and web commits
 

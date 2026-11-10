@@ -8,6 +8,7 @@ import { resourceValue, resourceError } from "../../resource";
 import { collaborators, pendingInvitations } from "../../resources";
 import { parseAppRole } from "../../roles";
 import type { AppRole } from "../../roles";
+import { confirmDialog } from "../../ui/confirm";
 import { Dialog } from "../../ui/dialog";
 import { LoadError } from "../../ui/load-error";
 import { ListSkeleton } from "../../ui/skeletons";
@@ -167,6 +168,16 @@ export const CollaboratorsPanel = ({
                 type="button"
                 class="btn btn-sm"
                 onclick={async () => {
+                  const reason = await confirmDialog({
+                    confirmLabel: "Remove",
+                    message: `${c.email || c.name || c.userId} loses access to this app immediately.`,
+                    title: `Remove ${c.email || c.name || c.userId}?`,
+                  });
+
+                  if (reason !== "confirm") {
+                    return;
+                  }
+
                   try {
                     await api<{ ok: true }>(
                       "/api/collaborators/removeCollaborator",

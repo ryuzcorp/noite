@@ -11,6 +11,7 @@ import { islandProps } from "../../island";
 import { resourceValue, resourceError } from "../../resource";
 import { domains } from "../../resources";
 import type { AppRole } from "../../roles";
+import { confirmDialog } from "../../ui/confirm";
 import { CopyButton } from "../../ui/copy-button";
 import { LoadError } from "../../ui/load-error";
 import { SectionSkeleton } from "../../ui/skeletons";
@@ -140,7 +141,17 @@ const DomainsApp = defineApp({
                         type="button"
                         class="btn btn-sm btn-ghost"
                         disabled={busy}
-                        onclick={() => {
+                        onclick={async () => {
+                          const reason = await confirmDialog({
+                            confirmLabel: "Remove",
+                            message: `${row.hostname} stops serving this app: the edge drops its route and certificate.`,
+                            title: `Remove ${row.hostname}?`,
+                          });
+
+                          if (reason !== "confirm") {
+                            return;
+                          }
+
                           dispatch(
                             DomainsMsg.RemoveRequested({
                               hostname: row.hostname,

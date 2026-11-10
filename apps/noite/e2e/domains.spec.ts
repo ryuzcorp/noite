@@ -43,7 +43,25 @@ test(
         await expect(row.getByText("Verified")).toBeVisible();
       }
 
-      await row.getByRole("button", { name: "Remove" }).click();
+      // Removal is destructive: the dialog names the hostname and the
+      // consequence, and Esc or Cancel leaves the claim in place.
+      const remove = row.getByRole("button", { name: "Remove" });
+      const prompt = page.getByRole("alertdialog");
+
+      await remove.click();
+      await expect(prompt).toContainText(HOST);
+      await expect(prompt).toContainText("stops serving this app");
+      await page.keyboard.press("Escape");
+      await expect(prompt).toBeHidden();
+      await expect(row).toBeVisible();
+
+      await remove.click();
+      await prompt.getByRole("button", { exact: true, name: "Cancel" }).click();
+      await expect(prompt).toBeHidden();
+      await expect(row).toBeVisible();
+
+      await remove.click();
+      await prompt.getByRole("button", { exact: true, name: "Remove" }).click();
       await expect(page.getByText("No custom hostnames yet.")).toBeVisible();
     } finally {
       await deleteApp(request, SLUG);
