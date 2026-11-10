@@ -446,7 +446,7 @@ func (e *EdgeRoutes) ServeHTTP(w http.ResponseWriter, r *http.Request, next cadd
 	route, ok := snap.tab.Lookup(r.Host)
 	if !ok {
 		// No route with a loaded table: 404, as Caddy did for unmatched
-		// hosts. The 503 above is only for the boot gap.
+		// hosts. The 503 above is only for the phases that have no table.
 		http.Error(w, "not found", http.StatusNotFound)
 		return nil
 	}
