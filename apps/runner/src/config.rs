@@ -2259,6 +2259,14 @@ mod tests {
     /// parallel `from_env` elsewhere never observes the mutation.
     fn with_env(set: &[(&str, &str)], f: impl FnOnce()) {
         let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        with_env_locked(set, f);
+    }
+
+    /// [`with_env`]'s body for a caller that already holds [`ENV_LOCK`]: a
+    /// test that has to read, mutate and restore the same variable across
+    /// several `with_env` calls keeps the lock for its whole run instead of
+    /// handing another test the window between them.
+    fn with_env_locked(set: &[(&str, &str)], f: impl FnOnce()) {
         let mut saved: Vec<(&str, Option<String>)> = Vec::new();
         for key in STRICT_NUMERIC_VARS
             .iter()
@@ -2356,17 +2364,20 @@ mod tests {
     #[test]
     fn with_env_seals_noite_tenancy_both_ways() {
         // A caller-shell value must not leak in, and a test-set value must
-        // not leak out (NOITE_TENANCY sits outside STRICT_NUMERIC_VARS).
+        // not leak out (NOITE_TENANCY sits outside STRICT_NUMERIC_VARS). The
+        // whole test — the value it reads first, every `with_env` call, and
+        // the restore — is one critical section: saving the initial value
+        // outside `ENV_LOCK` let a parallel test's restore delete the value
+        // this test had just set (`left: Err(NotPresent)` on a good day, a
+        // tenancy leak into another test's `from_env` on a bad one).
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let initial = env::var("NOITE_TENANCY").ok();
-        {
-            let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-            env::set_var("NOITE_TENANCY", "single");
-        }
-        with_env(&[], || {
+        env::set_var("NOITE_TENANCY", "single");
+        with_env_locked(&[], || {
             assert!(env::var("NOITE_TENANCY").is_err());
         });
         assert_eq!(env::var("NOITE_TENANCY").as_deref(), Ok("single"));
-        with_env(&[("NOITE_TENANCY", "multi")], || {
+        with_env_locked(&[("NOITE_TENANCY", "multi")], || {
             assert_eq!(env::var("NOITE_TENANCY").as_deref(), Ok("multi"));
         });
         assert_eq!(env::var("NOITE_TENANCY").as_deref(), Ok("single"));

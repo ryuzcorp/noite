@@ -18,10 +18,16 @@
 //! stateDiagram-v2
 //!     Awake --> Parking: sweep / operator sleep / pressure
 //!     Parking --> Asleep: routes wake-enabled, fleet stopped
-//!     Asleep --> Waking: held request (lock, slot, spawn)
+//!     Asleep --> Waking: held request / deploy (lock, slot, spawn)
 //!     Waking --> Awake: health gate 200 -> running, wake hop dropped
 //!     Waking --> Asleep: any failure (row and route untouched)
 //!     Awake --> Awake: request / deploy (activity)
+//!
+//! A parked fleet can carry a crash/OOM hold (`supervisor::FleetState::Asleep
+//! { until }`). Every wake moves it into `Waking { until }` — the hold is the
+//! fleet's, not the wake's — and nothing spawns through it: a request answers
+//! the wake-failure status, and a deploy's fleet starts once the backoff has
+//! lapsed instead of on the next reconcile tick.
 //! ```
 //!
 //! `status = 'sleeping'` and `asleep_since` are written together (both db
@@ -953,7 +959,8 @@ pub async fn wake_environment_for_deploy(pool: &SqlitePool, procs: &ProcMap, env
     let _held = lock.lock().await;
     // The in-memory half has to wake too: leaving the entry `Asleep` makes the
     // deploy's own `ensure_environment_fleet` see a parked fleet and refuse to
-    // spawn it.
+    // spawn it. `Woke` keeps the hold a parked fleet inherited — a deploy is
+    // why the fleet may spawn, not a reason to drop its crash/OOM backoff.
     supervisor::note_event(
         procs,
         &supervisor::env_fleet_key(&env.app_slug, &env.label),
@@ -980,7 +987,8 @@ pub async fn wake_for_deploy(pool: &SqlitePool, procs: &ProcMap, app: &App) {
     let lock = lock_for(&app.id);
     let _held = lock.lock().await;
     // Same as the environment: a deploy needs the fleet to spawn, so the
-    // state machine must not still say `Asleep`.
+    // state machine must not still say `Asleep`. The wake carries any hold
+    // the park inherited, so the spawn still waits it out.
     supervisor::note_event(
         procs,
         &app.slug,
@@ -1397,6 +1405,51 @@ mod tests {
                 supervisor::FleetState::Waking { .. }
             ),
             "the state machine woke with the row"
+        );
+    }
+
+    /// A deploy wake keeps the hold a parked fleet inherited. Dropping it made
+    /// `Waking` look like a cold start that owes a spawn: the very next
+    /// reconcile tick spawned a crash-looping fleet through its backoff (and
+    /// reset the chain), and the next request no longer failed fast.
+    #[tokio::test]
+    async fn a_deploy_wake_keeps_the_parked_hold() {
+        let pool = crate::db::connect("sqlite::memory:")
+            .await
+            .expect("memory db");
+        let cfg = crate::config::config_for_tests();
+        let app = seed_confirm_app(&pool, &cfg, "deploywakehold").await;
+        park_row(&pool, &app.id).await;
+        let app = crate::db::get_app(&pool, &app.id)
+            .await
+            .expect("get")
+            .expect("row");
+        let procs = supervisor::new_procs();
+        // The state a fleet that crashed and was then parked rests in: the
+        // crash hold is the park's memory of the backoff.
+        crash_the_child(&procs, &app.slug).await;
+        supervisor::note_event(&procs, &app.slug, supervisor::FleetEvent::Parked).await;
+        let hold = supervisor::hold_until(&procs, &app.slug)
+            .await
+            .expect("the park carries the crash hold");
+
+        wake_for_deploy(&pool, &procs, &app).await;
+
+        assert!(
+            matches!(
+                supervisor::state_of(&procs, &app.slug).await,
+                supervisor::FleetState::Waking {
+                    until: Some(until),
+                    ..
+                } if until == hold
+            ),
+            "the wake carries the hold: {:?}",
+            supervisor::state_of(&procs, &app.slug).await
+        );
+        assert_eq!(
+            supervisor::hold_until(&procs, &app.slug).await,
+            Some(hold),
+            "and the fleet still has to wait it out"
         );
     }
 
