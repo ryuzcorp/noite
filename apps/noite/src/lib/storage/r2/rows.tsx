@@ -35,16 +35,20 @@ export const R2ListRows = ({
   appId: string;
   bucket: string;
   canWrite: boolean;
-  checked: Set<string>;
+  checked: ReadonlySet<string>;
   files: R2Object[];
   folders: R2Preview["folders"];
   onOpen: (key: string) => void;
   onToggle: (key: string, on: boolean) => void;
-  onToggleAll: (on: boolean) => void;
+  onToggleAll: () => void;
   selected: string | null;
 }) => {
   const allChecked =
     files.length > 0 && files.every((object) => checked.has(object.key));
+
+  // Partially checked is a state of its own: the old header box rendered
+  // unchecked for a partial selection, so it lied about what Delete would do.
+  const someChecked = files.some((object) => checked.has(object.key));
 
   return (
     <div class="min-h-0 flex-1 overflow-auto">
@@ -58,8 +62,13 @@ export const R2ListRows = ({
                   type="checkbox"
                   aria-label="Select all files on this page"
                   checked={allChecked}
-                  onchange={(event) => {
-                    onToggleAll(event.currentTarget.checked);
+                  ref={(el) => {
+                    if (el) {
+                      el.indeterminate = someChecked && !allChecked;
+                    }
+                  }}
+                  onchange={() => {
+                    onToggleAll();
                   }}
                 />
               </th>
@@ -153,7 +162,7 @@ export const R2ColumnRows = ({
   appId: string;
   bucket: string;
   canWrite: boolean;
-  checked: Set<string>;
+  checked: ReadonlySet<string>;
   files: R2Object[];
   folders: R2Preview["folders"];
   onOpen: (key: string) => void;

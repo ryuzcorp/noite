@@ -1,11 +1,14 @@
 //! R2 writes: the streamed put helper and the toolbar controls that use it
-//! (upload files, create a folder marker).
+//! (upload files, create a folder marker). The new-folder form classifies its
+//! name with the shared `folderNameOf` machine (./state) and closes only after
+//! the create settles.
 
 import { atom } from "ilha";
 
 import { collectRef, liveEl, newLiveRef } from "../../live-ref";
 import { r2UploadUrl } from "../../runner";
 import { CloudUpload, Folder } from "../../ui/icons";
+import { folderNameOf } from "./state";
 
 /** Stream one object through the UI's upload proxy (the runner spools it and
  * calls `celld r2 put`); throws the server's message when it refuses. */
@@ -39,9 +42,12 @@ export const NewFolderButton = ({
 }: {
   busy: boolean;
   disabled: boolean;
-  onCreate: (name: string) => void;
+  /** Resolves true when the folder was created; the form keeps the typed name
+   * and stays open otherwise. */
+  onCreate: (name: string) => Promise<boolean>;
 }) => {
   const name = atom("");
+  const failure = atom("");
   const details = atom.lazy(newLiveRef<HTMLDetailsElement>)();
 
   const close = () => {
@@ -52,13 +58,7 @@ export const NewFolderButton = ({
     }
   };
 
-  const cleaned = name().trim();
-
-  const invalid =
-    cleaned !== "" &&
-    (cleaned.includes("/") || cleaned === ".." || cleaned === ".");
-
-  const valid = cleaned !== "" && !invalid;
+  const parsed = folderNameOf(name());
 
   return (
     <details
@@ -89,11 +89,14 @@ export const NewFolderButton = ({
             }}
           />
         </label>
-        {invalid ? (
-          <p class="text-error m-0 mt-1 text-xs">
-            A folder name cannot contain a slash.
-          </p>
+        {parsed._tag === "Invalid" ? (
+          <p class="text-error m-0 mt-1 text-xs">{parsed.reason}</p>
         ) : null}
+        {failure() === "" ? null : (
+          <p class="text-error m-0 mt-1 text-xs" role="alert">
+            {failure()}
+          </p>
+        )}
         <div class="mt-3 flex justify-end gap-2">
           <button type="button" class="btn btn-sm btn-ghost" onclick={close}>
             Cancel
@@ -101,18 +104,25 @@ export const NewFolderButton = ({
           <button
             type="button"
             class="btn btn-sm btn-neutral"
-            disabled={busy || disabled || !valid}
-            onclick={() => {
-              if (!valid) {
+            disabled={busy || disabled || parsed._tag !== "Valid"}
+            onclick={async () => {
+              if (parsed._tag !== "Valid") {
                 return;
               }
 
-              onCreate(cleaned);
-              name.set("");
-              close();
+              failure.set("");
+
+              if (await onCreate(parsed.name)) {
+                name.set("");
+                close();
+              } else {
+                // Keep the name so the user can retry; the page's write
+                // banner carries the reason.
+                failure.set("The folder was not created.");
+              }
             }}
           >
-            Create
+            {busy ? "Creating…" : "Create"}
           </button>
         </div>
       </div>

@@ -21,14 +21,13 @@ export const R2Browser = ({
   bucket: string;
   canWrite: boolean;
 }) => {
+  const { notify, toasts } = useToasts();
   const prefix = searchParam("p", { default: "" });
 
   const viewParam = searchParam<R2View>("v", {
     default: "list",
     parse: toR2View,
   });
-
-  const { notify, toasts } = useToasts();
 
   return (
     <div class="flex h-full min-h-0 w-full flex-col overflow-hidden">

@@ -1,14 +1,17 @@
 //! R2 object preview: bounded text/JSON body from the runner's preview route.
+//!
+//! The body is one value (./body): loading, JSON, text, no text, or a reload
+//! failure that keeps the last good body visible. Keyed by the object key in
+//! the panel, so the resource stays bound to one file for the life of the
+//! fiber.
 
-import { errorMessage } from "../../errors";
-import { resourceValue, resourceError } from "../../resource";
+import type { View } from "ilha";
+
 import { r2File } from "../../resources";
 import type { R2Object } from "../../runner";
 import { prettyJson } from "../shared";
+import { bodyText, r2BodyOf } from "./body";
 
-/** Bounded text/JSON preview of one object (the runner sends at most 256 KiB
- * and null for a binary body). Keyed by the object key in the panel, so the
- * resource stays bound to one file for the life of the fiber. */
 export const R2TextPreview = ({
   appId,
   bucket,
@@ -18,42 +21,49 @@ export const R2TextPreview = ({
   bucket: string;
   object: R2Object;
 }) => {
-  const res = r2File(appId, bucket, object.key);
-  const data = resourceValue(res.state());
-  const loadError = resourceError(res.state());
+  const { body, notice } = r2BodyOf(
+    r2File(appId, bucket, object.key).state(),
+    object
+  );
 
-  if (loadError && data === undefined) {
-    return <p class="text-error m-0 text-sm">{errorMessage(loadError)}</p>;
-  }
+  const text = bodyText(body);
 
-  if (!data) {
-    return <span class="skeleton h-24 w-full" />;
-  }
+  let placeholder: View = null;
 
-  if (data.text === null) {
-    return (
+  if (body._tag === "Loading") {
+    placeholder = <span class="skeleton h-24 w-full" />;
+  } else if (body._tag === "NotText") {
+    placeholder = (
       <p class="m-0 text-sm opacity-60">
         This object is not UTF-8 text, so there is nothing to preview.
       </p>
     );
   }
 
-  const isJson =
-    (object.contentType ?? "").includes("json") ||
-    (data.contentType ?? "").includes("json");
+  let truncated: View = null;
 
-  const body = isJson ? prettyJson(data.text) : data.text;
+  if (body._tag === "Json" || body._tag === "Text") {
+    truncated = body.truncated ? (
+      <p class="m-0 text-xs opacity-60">
+        Preview truncated — download the file for the whole body.
+      </p>
+    ) : null;
+  }
 
   return (
     <div class="flex flex-col gap-1">
-      <pre class="bg-base-200 dark:bg-base-300/50 m-0 max-h-64 overflow-auto rounded-lg p-2 text-xs whitespace-pre-wrap">
-        {body}
-      </pre>
-      {data.truncated ? (
-        <p class="m-0 text-xs opacity-60">
-          Preview truncated — download the file for the whole body.
+      {notice === null ? null : (
+        <p class="text-error m-0 text-xs" role="alert">
+          {notice}
         </p>
-      ) : null}
+      )}
+      {placeholder}
+      {text === null ? null : (
+        <pre class="bg-base-200 dark:bg-base-300/50 m-0 max-h-64 overflow-auto rounded-lg p-2 text-xs whitespace-pre-wrap">
+          {body._tag === "Json" ? prettyJson(text) : text}
+        </pre>
+      )}
+      {truncated}
     </div>
   );
 };

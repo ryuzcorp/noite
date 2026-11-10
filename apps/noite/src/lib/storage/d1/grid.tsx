@@ -2,19 +2,33 @@
 //! column with a bulk-delete bar, truncated cells (see ./cells) and the
 //! pager footer. Rows come from the server for exactly the URL query handed
 //! in, so this component is mounted per query (`key` in ./panel).
+//!
+//! The selection is an `@ilha/model` island (./selection): row keys, not row
+//! indices, so a reload or a reordering cannot remap the selection onto other
+//! records; the armed confirmation is part of the same value, so the delete
+//! payload is always the set the user confirmed.
 
+import { defineApp } from "@ilha/model";
 import { Link } from "@ilha/void";
-import { atom } from "ilha";
+import { Data } from "effect";
+import * as Effect from "effect/Effect";
 import type { View } from "ilha";
 
 import { api } from "../../api";
 import { errorMessage } from "../../errors";
-import { resourceValue, resourceError } from "../../resource";
-import { d1Rows } from "../../resources";
-import type { D1Cell, D1RowsQuery, D1TableSchema } from "../../runner";
+import { islandProps } from "../../island";
+import { d1Rows, invalidateD1 } from "../../resources";
+import type { D1Cell, D1Rows, D1RowsQuery, D1TableSchema } from "../../runner";
 import { ChevronLeft, ChevronRight, Key } from "../../ui/icons";
-import { isTimestampColumn, keyFor } from "../d1-values";
+import { isTimestampColumn } from "../d1-values";
 import { CellValue } from "./cells";
+import {
+  nextSelection,
+  rowKey,
+  Selection,
+  visibleSelection,
+} from "./selection";
+import type { GridSelection } from "./selection";
 import { DEFAULT_PAGE_SIZE, PAGE_SIZES, pageCount } from "./state";
 
 const rowRecord = (columns: string[], cells: D1Cell[]) => {
@@ -146,10 +160,355 @@ const Pager = ({
   );
 };
 
+/** The grid island's inputs: the listing the parent already holds, the row
+ * actions, and the pager writes. The parent keeps the resource (and the
+ * skeleton/error paint); the island owns only the selection machine. */
+interface GridInputs {
+  appId: string;
+  databaseId: string;
+  data: D1Rows;
+  onOpenRow: (row: Record<string, D1Cell>) => void;
+  onPage: (page: number) => void;
+  onSize: (size: number) => void;
+  onSort: (column: string) => void;
+  onToast: (text: string) => void;
+  query: D1RowsQuery;
+  schema: D1TableSchema;
+  viewSlot: View;
+}
+
+const Props = islandProps<GridInputs>("D1 grid");
+
+type Message = Data.TaggedEnum<{
+  Toggled: { readonly key: string };
+  ToggledAll: { readonly keys: readonly string[] };
+  Cleared: Record<never, never>;
+  Armed: Record<never, never>;
+  Cancelled: Record<never, never>;
+  DeleteRequested: {
+    readonly appId: string;
+    readonly databaseId: string;
+    readonly keys: readonly string[];
+    readonly notify: (text: string) => void;
+    readonly table: string;
+  };
+  Deleted: { readonly count: number };
+  Failed: { readonly error: string };
+}>;
+
+const Msg = Data.taggedEnum<Message>();
+
+/** Whether two key sets are the same selection (order-insensitive). */
+const sameKeys = (a: readonly string[], b: readonly string[]): boolean =>
+  a.length === b.length && a.every((key) => b.includes(key));
+
+const deleteRows = ({
+  appId,
+  databaseId,
+  keys,
+  notify,
+  table,
+}: Extract<Message, { _tag: "DeleteRequested" }>) =>
+  Effect.tryPromise({
+    catch: (error) => errorMessage(error),
+    try: () =>
+      api<{ deleted: number; ok: boolean }>("/api/storage/d1DeleteRows", {
+        appId,
+        databaseId,
+        keys,
+        table,
+      }),
+  }).pipe(
+    Effect.match({
+      onFailure: (error) => Msg.Failed({ error }),
+      onSuccess: (result) => {
+        const deleted = result?.deleted ?? keys.length;
+        invalidateD1(appId, databaseId);
+        notify(`${deleted} row${deleted === 1 ? "" : "s"} deleted`);
+
+        return Msg.Deleted({ count: deleted });
+      },
+    })
+  );
+
+const GridIsland = defineApp({
+  init: () => ({ model: Selection.Idle() }),
+  name: "D1Grid",
+  update: (model: GridSelection, message: Message) =>
+    Msg.$match(message, {
+      Armed: () => ({ model: nextSelection(model, { kind: "arm" }) }),
+      Cancelled: () => ({ model: nextSelection(model, { kind: "cancel" }) }),
+      Cleared: () => ({ model: nextSelection(model, { kind: "clear" }) }),
+      DeleteRequested: (input) => {
+        // The payload must be exactly the set the confirmation was armed for;
+        // a listing change between arming and clicking sends nothing.
+        const armed =
+          model._tag === "Confirm" && sameKeys(model.keys, input.keys);
+
+        const confirmed = nextSelection(model, { kind: "confirm" });
+
+        if (!(armed && confirmed._tag === "Deleting")) {
+          return { model: nextSelection(model, { kind: "cancel" }) };
+        }
+
+        return { cmd: deleteRows(input), model: confirmed };
+      },
+      Deleted: () => ({ model: nextSelection(model, { kind: "deleted" }) }),
+      Failed: ({ error }) => ({
+        model: nextSelection(model, { error, kind: "failed" }),
+      }),
+      Toggled: ({ key }) => ({
+        model: nextSelection(model, { key, kind: "toggle" }),
+      }),
+      ToggledAll: ({ keys }) => ({
+        model: nextSelection(model, { keys, kind: "toggleAll" }),
+      }),
+    }),
+  view: (model: GridSelection, dispatch) => {
+    const {
+      appId,
+      databaseId,
+      data,
+      onOpenRow,
+      onPage,
+      onSize,
+      onSort,
+      onToast,
+      query,
+      schema,
+      viewSlot,
+    } = Props.read();
+
+    const schemaColumn = (name: string) =>
+      schema.columns.find((column) => column.name === name);
+
+    const selectable = schema.caps.delete;
+
+    const keys = data.rows.map((cells) =>
+      rowKey(schema.columns, rowRecord(data.columns, cells))
+    );
+
+    const selected = visibleSelection(model, keys);
+    const allSelected = keys.length > 0 && selected.length === keys.length;
+
+    // The confirmation belongs to the key set it was armed for: a listing
+    // change (or a toggle) shows the plain Delete button again.
+    const armed =
+      (model._tag === "Confirm" || model._tag === "Deleting") &&
+      sameKeys(model.keys, selected);
+
+    return (
+      <div class="flex min-h-0 flex-1 flex-col">
+        {selected.length > 0 ? (
+          <div class="bg-base-200 dark:bg-base-300/50 flex flex-wrap items-center gap-2 px-3 py-1.5 text-sm">
+            <span class="font-medium">{selected.length} selected</span>
+            {armed ? (
+              <>
+                <span class="text-error">
+                  Delete {selected.length} row(s)? This cannot be undone.
+                </span>
+                <button
+                  type="button"
+                  class="btn btn-sm btn-error"
+                  disabled={model._tag === "Deleting"}
+                  onclick={() => {
+                    dispatch(
+                      Msg.DeleteRequested({
+                        appId,
+                        databaseId,
+                        keys: selected,
+                        notify: onToast,
+                        table: data.table,
+                      })
+                    );
+                  }}
+                >
+                  {model._tag === "Deleting" ? "Deleting…" : "Delete"}
+                </button>
+                <button
+                  type="button"
+                  class="btn btn-sm btn-ghost"
+                  disabled={model._tag === "Deleting"}
+                  onclick={() => {
+                    dispatch(Msg.Cancelled());
+                  }}
+                >
+                  Cancel
+                </button>
+              </>
+            ) : (
+              <button
+                type="button"
+                class="btn btn-sm btn-ghost"
+                onclick={() => {
+                  dispatch(Msg.Armed());
+                }}
+              >
+                Delete
+              </button>
+            )}
+            <button
+              type="button"
+              class="btn btn-sm btn-ghost ml-auto"
+              disabled={model._tag === "Deleting"}
+              onclick={() => {
+                dispatch(Msg.Cleared());
+              }}
+            >
+              Clear
+            </button>
+          </div>
+        ) : null}
+        {model._tag === "Failed" ? (
+          <p class="text-error m-0 px-3 py-1 text-sm">{model.error}</p>
+        ) : null}
+        <div class="min-h-0 flex-1 overflow-auto">
+          {data.rows.length === 0 ? (
+            <p class="m-0 p-4 text-sm opacity-60">
+              {data.total === 0
+                ? "This table has no rows."
+                : "No rows match the current filters."}
+            </p>
+          ) : (
+            <table class="table-sm table-pin-rows table w-full">
+              <thead>
+                <tr>
+                  {selectable ? (
+                    <th class="w-10">
+                      <input
+                        class="checkbox checkbox-sm"
+                        type="checkbox"
+                        aria-label="Select all rows on this page"
+                        checked={allSelected}
+                        onchange={() => {
+                          dispatch(Msg.ToggledAll({ keys }));
+                        }}
+                      />
+                    </th>
+                  ) : null}
+                  {data.columns.map((name) => {
+                    const column = schemaColumn(name);
+                    const mark = sortMark(query.sort, name);
+
+                    return (
+                      <th key={name} class="whitespace-nowrap">
+                        <button
+                          type="button"
+                          class="inline-flex items-center gap-1 font-semibold"
+                          title={`Sort by ${name}`}
+                          onclick={() => {
+                            onSort(name);
+                          }}
+                        >
+                          {column !== undefined && column.pk > 0 ? (
+                            <Key class="h-3.5 w-3.5 opacity-60" />
+                          ) : null}
+                          {name}
+                          <span class="text-xs font-normal opacity-50">
+                            {column?.type ?? ""}
+                          </span>
+                          {mark === null ? null : (
+                            <span aria-hidden="true">{mark}</span>
+                          )}
+                        </button>
+                      </th>
+                    );
+                  })}
+                  {schema.rowAction === null ? null : <th class="w-32" />}
+                </tr>
+              </thead>
+              <tbody>
+                {data.rows.map((cells, index) => {
+                  const record = rowRecord(data.columns, cells);
+                  const key = keys[index] ?? "";
+
+                  return (
+                    <tr
+                      key={String(index)}
+                      class="hover cursor-pointer"
+                      onclick={() => {
+                        onOpenRow(record);
+                      }}
+                    >
+                      {selectable ? (
+                        <td
+                          onclick={(event) => {
+                            event.stopPropagation();
+                          }}
+                        >
+                          <input
+                            class="checkbox checkbox-sm"
+                            type="checkbox"
+                            aria-label={`Select row ${index + 1}`}
+                            checked={selected.includes(key)}
+                            onchange={(event) => {
+                              if (event.currentTarget.checked) {
+                                dispatch(Msg.Toggled({ key }));
+
+                                return;
+                              }
+
+                              dispatch(Msg.Toggled({ key }));
+                            }}
+                          />
+                        </td>
+                      ) : null}
+                      {data.columns.map((name, columnIndex) => {
+                        const column = schemaColumn(name);
+
+                        return (
+                          <td key={name} class="align-middle">
+                            <CellValue
+                              cell={cells[columnIndex] ?? null}
+                              columnName={name}
+                              columnType={column?.type ?? ""}
+                              redacted={schema.redacted.includes(name)}
+                              timestamp={isTimestampColumn(
+                                name,
+                                column?.type ?? ""
+                              )}
+                            />
+                          </td>
+                        );
+                      })}
+                      {schema.rowAction === null ? null : (
+                        <td class="whitespace-nowrap">
+                          <RowActionLink
+                            appId={appId}
+                            action={schema.rowAction}
+                            record={record}
+                          />
+                        </td>
+                      )}
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          )}
+        </div>
+        <div class="border-base-300 flex flex-wrap items-center justify-between gap-2 border-t px-3 py-2">
+          <Pager
+            onPage={onPage}
+            onSize={onSize}
+            page={data.page}
+            pageSize={data.pageSize}
+            total={data.total}
+          />
+          {viewSlot}
+        </div>
+      </div>
+    );
+  },
+});
+
+const Island = Props.wrap(GridIsland);
+
+/** The grid body: reads the listing resource (one `ResourceState`) and mounts
+ * the selection island once there is something to show. */
 export const RowsGrid = ({
   appId,
   databaseId,
-  onChanged,
   onOpenRow,
   onPage,
   onSize,
@@ -161,7 +520,6 @@ export const RowsGrid = ({
 }: {
   appId: string;
   databaseId: string;
-  onChanged: () => void;
   onOpenRow: (row: Record<string, D1Cell>) => void;
   onPage: (page: number) => void;
   onSize: (size: number) => void;
@@ -173,19 +531,16 @@ export const RowsGrid = ({
 }) => {
   // Mounted per query (`key` in ./panel): the resource key must be fixed for
   // the life of a fiber, so a new page/sort/filter remounts this component.
-  const resource = d1Rows(appId, databaseId, query);
-  const selected = atom<Record<string, true>>({});
-  const confirming = atom(false);
-  const busy = atom(false);
-  const failure = atom("");
-  const data = resourceValue(resource.state());
-  const loadError = resourceError(resource.state());
+  const state = d1Rows(appId, databaseId, query).state();
+  const data = state._tag === "Loading" ? undefined : state.value;
 
-  if (loadError && data === undefined) {
-    return <p class="text-error m-0 p-4 text-sm">{errorMessage(loadError)}</p>;
-  }
+  if (data === undefined) {
+    if (state._tag === "Failed") {
+      return (
+        <p class="text-error m-0 p-4 text-sm">{errorMessage(state.error)}</p>
+      );
+    }
 
-  if (!data) {
     return (
       <div class="flex flex-col gap-2 p-4">
         <span class="skeleton h-8 w-full" />
@@ -195,261 +550,26 @@ export const RowsGrid = ({
     );
   }
 
-  const schemaColumn = (name: string) =>
-    schema.columns.find((column) => column.name === name);
-
-  const selectable = schema.caps.delete;
-  const selectedIndexes = Object.keys(selected());
-
-  const allSelected =
-    data.rows.length > 0 && selectedIndexes.length === data.rows.length;
-
-  const bulkDelete = async () => {
-    if (busy()) {
-      return;
-    }
-
-    busy.set(true);
-
-    try {
-      const keys = selectedIndexes.map((index) =>
-        keyFor(
-          schema.columns,
-          rowRecord(data.columns, data.rows[Number(index)] ?? [])
-        )
-      );
-
-      const result = await api<{ deleted: number; ok: boolean }>(
-        "/api/storage/d1DeleteRows",
-        {
-          appId,
-          databaseId,
-          keys,
-          table: data.table,
-        }
-      );
-
-      const deleted = result?.deleted ?? keys.length;
-      failure.set("");
-      selected.set({});
-      confirming.set(false);
-      onToast(`${deleted} row${deleted === 1 ? "" : "s"} deleted`);
-      onChanged();
-    } catch (error) {
-      failure.set(errorMessage(error));
-    } finally {
-      busy.set(false);
-    }
-  };
-
   return (
-    <div class="flex min-h-0 flex-1 flex-col">
-      {selectedIndexes.length > 0 ? (
-        <div class="bg-base-200 dark:bg-base-300/50 flex flex-wrap items-center gap-2 px-3 py-1.5 text-sm">
-          <span class="font-medium">{selectedIndexes.length} selected</span>
-          {confirming() ? (
-            <>
-              <span class="text-error">
-                Delete {selectedIndexes.length} row(s)? This cannot be undone.
-              </span>
-              <button
-                type="button"
-                class="btn btn-sm btn-error"
-                disabled={busy()}
-                onclick={() => {
-                  void bulkDelete();
-                }}
-              >
-                {busy() ? "Deleting…" : "Delete"}
-              </button>
-              <button
-                type="button"
-                class="btn btn-sm btn-ghost"
-                disabled={busy()}
-                onclick={() => {
-                  confirming.set(false);
-                }}
-              >
-                Cancel
-              </button>
-            </>
-          ) : (
-            <button
-              type="button"
-              class="btn btn-sm btn-ghost"
-              onclick={() => {
-                confirming.set(true);
-              }}
-            >
-              Delete
-            </button>
-          )}
-          <button
-            type="button"
-            class="btn btn-sm btn-ghost ml-auto"
-            onclick={() => {
-              selected.set({});
-            }}
-          >
-            Clear
-          </button>
-        </div>
+    <>
+      {state._tag === "Failed" ? (
+        <p class="text-error m-0 px-3 py-1 text-sm" role="alert">
+          {errorMessage(state.error)} — showing the last loaded rows.
+        </p>
       ) : null}
-      {failure() ? (
-        <p class="text-error m-0 px-3 py-1 text-sm">{failure()}</p>
-      ) : null}
-      <div class="min-h-0 flex-1 overflow-auto">
-        {data.rows.length === 0 ? (
-          <p class="m-0 p-4 text-sm opacity-60">
-            {data.total === 0
-              ? "This table has no rows."
-              : "No rows match the current filters."}
-          </p>
-        ) : (
-          <table class="table-sm table-pin-rows table w-full">
-            <thead>
-              <tr>
-                {selectable ? (
-                  <th class="w-10">
-                    <input
-                      class="checkbox checkbox-sm"
-                      type="checkbox"
-                      aria-label="Select all rows on this page"
-                      checked={allSelected}
-                      onchange={() => {
-                        if (allSelected) {
-                          selected.set({});
-
-                          return;
-                        }
-
-                        const next: Record<string, true> = {};
-
-                        for (const [index] of data.rows.entries()) {
-                          next[String(index)] = true;
-                        }
-
-                        selected.set(next);
-                      }}
-                    />
-                  </th>
-                ) : null}
-                {data.columns.map((name) => {
-                  const column = schemaColumn(name);
-                  const mark = sortMark(query.sort, name);
-
-                  return (
-                    <th key={name} class="whitespace-nowrap">
-                      <button
-                        type="button"
-                        class="inline-flex items-center gap-1 font-semibold"
-                        title={`Sort by ${name}`}
-                        onclick={() => {
-                          onSort(name);
-                        }}
-                      >
-                        {column !== undefined && column.pk > 0 ? (
-                          <Key class="h-3.5 w-3.5 opacity-60" />
-                        ) : null}
-                        {name}
-                        <span class="text-xs font-normal opacity-50">
-                          {column?.type ?? ""}
-                        </span>
-                        {mark === null ? null : (
-                          <span aria-hidden="true">{mark}</span>
-                        )}
-                      </button>
-                    </th>
-                  );
-                })}
-                {schema.rowAction === null ? null : <th class="w-32" />}
-              </tr>
-            </thead>
-            <tbody>
-              {data.rows.map((cells, index) => {
-                const record = rowRecord(data.columns, cells);
-
-                return (
-                  <tr
-                    key={String(index)}
-                    class="hover cursor-pointer"
-                    onclick={() => {
-                      onOpenRow(record);
-                    }}
-                  >
-                    {selectable ? (
-                      <td
-                        onclick={(event) => {
-                          event.stopPropagation();
-                        }}
-                      >
-                        <input
-                          class="checkbox checkbox-sm"
-                          type="checkbox"
-                          aria-label={`Select row ${index + 1}`}
-                          checked={selected()[String(index)] === true}
-                          onchange={(event) => {
-                            const next: Record<string, true> = {};
-
-                            for (const [key] of Object.entries(selected())) {
-                              if (key !== String(index)) {
-                                next[key] = true;
-                              }
-                            }
-
-                            if (event.currentTarget.checked) {
-                              next[String(index)] = true;
-                            }
-
-                            selected.set(next);
-                          }}
-                        />
-                      </td>
-                    ) : null}
-                    {data.columns.map((name, columnIndex) => {
-                      const column = schemaColumn(name);
-
-                      return (
-                        <td key={name} class="align-middle">
-                          <CellValue
-                            cell={cells[columnIndex] ?? null}
-                            columnName={name}
-                            columnType={column?.type ?? ""}
-                            redacted={schema.redacted.includes(name)}
-                            timestamp={isTimestampColumn(
-                              name,
-                              column?.type ?? ""
-                            )}
-                          />
-                        </td>
-                      );
-                    })}
-                    {schema.rowAction === null ? null : (
-                      <td class="whitespace-nowrap">
-                        <RowActionLink
-                          appId={appId}
-                          action={schema.rowAction}
-                          record={record}
-                        />
-                      </td>
-                    )}
-                  </tr>
-                );
-              })}
-            </tbody>
-          </table>
-        )}
-      </div>
-      <div class="border-base-300 flex flex-wrap items-center justify-between gap-2 border-t px-3 py-2">
-        <Pager
-          onPage={onPage}
-          onSize={onSize}
-          page={data.page}
-          pageSize={data.pageSize}
-          total={data.total}
-        />
-        {viewSlot}
-      </div>
-    </div>
+      <Island
+        appId={appId}
+        data={data}
+        databaseId={databaseId}
+        onOpenRow={onOpenRow}
+        onPage={onPage}
+        onSize={onSize}
+        onSort={onSort}
+        onToast={onToast}
+        query={query}
+        schema={schema}
+        viewSlot={viewSlot}
+      />
+    </>
   );
 };

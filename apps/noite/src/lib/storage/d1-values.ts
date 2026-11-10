@@ -9,35 +9,70 @@
 
 import type { D1Cell, D1Column, D1Key } from "../runner";
 
-/** One editable field's draft: raw text plus an explicit SQL NULL flag.
+/** One editable field's draft, as a closed union: a field is either SQL
+ * NULL or it holds text — never both. (The old `{ isNull, text }` pair let
+ * "typed text hidden behind the NULL toggle" exist, so un-toggling NULL
+ * restored an edit the user had discarded.)
+ *
  * `touched` records whether the user changed anything — INSERT needs it,
  * because an untouched field must be omitted rather than sent as "". */
-export interface FieldDraft {
-  isNull: boolean;
-  text: string;
-  touched: boolean;
-}
+export type FieldDraft =
+  | { readonly kind: "null"; readonly touched: boolean }
+  | { readonly kind: "text"; readonly text: string; readonly touched: boolean };
 
 /** Drafts keyed by column name. */
 export type FieldDrafts = Record<string, FieldDraft>;
 
-/** Seed a field from one cell. NULL becomes an empty, NULL-flagged draft;
- * a string (including "") becomes an untouched text draft. */
-export const draftFromCell = (cell: D1Cell): FieldDraft => ({
-  isNull: cell === null,
-  text: cell ?? "",
-  touched: false,
+/** A field the user marked SQL NULL. */
+export const nullDraft = (): FieldDraft => ({ kind: "null", touched: false });
+
+/** A text field, optionally already touched. */
+export const textDraft = (text: string, touched = false): FieldDraft => ({
+  kind: "text",
+  text,
+  touched,
 });
+
+/** Seed a field from one cell. NULL becomes a NULL draft; a string
+ * (including "") becomes an untouched text draft. */
+export const draftFromCell = (cell: D1Cell): FieldDraft =>
+  cell === null ? nullDraft() : textDraft(cell);
 
 /** The value a draft writes: SQL NULL, or the text exactly as typed. */
 export const cellFromDraft = (draft: FieldDraft): D1Cell =>
-  draft.isNull ? null : draft.text;
+  draft.kind === "null" ? null : draft.text;
+
+/** Whether the draft renders as SQL NULL (drives the disabled input). */
+export const draftIsNull = (draft: FieldDraft): boolean =>
+  draft.kind === "null";
+
+/** The draft's text (empty for a NULL draft — NULL has no hidden value). */
+export const draftText = (draft: FieldDraft): string =>
+  draft.kind === "text" ? draft.text : "";
+
+/** The user typed `text` into the field. */
+export const typedText = (text: string): FieldDraft => ({
+  kind: "text",
+  text,
+  touched: true,
+});
+
+/** The user set the field to SQL NULL. */
+export const markedNull = (): FieldDraft => ({ kind: "null", touched: true });
 
 /** Whether a draft differs from the cell it was seeded from. `null` and `""`
  * are different values and must be distinguishable here (the old editor's
  * "empty means NULL" rule is exactly what this replaces). */
 export const draftDiffers = (draft: FieldDraft, original: D1Cell): boolean =>
-  draft.isNull !== (original === null) || draft.text !== (original ?? "");
+  draft.kind === "null" ? original !== null : original !== draft.text;
+
+/** Whether one field would be written: a changed value on UPDATE, a touched
+ * field on INSERT. */
+export const fieldDirty = (
+  draft: FieldDraft,
+  original: D1Cell,
+  isEdit: boolean
+): boolean => (isEdit ? draftDiffers(draft, original) : draft.touched);
 
 /** Row identity per the contract: the PK columns' current values, or every
  * column's value when the table has no PK. NULL-aware. */
@@ -88,11 +123,7 @@ export const writtenColumns = (scope: WriteScope): string[] => {
     const original = scope.original[column.name] ?? null;
     const draft = scope.drafts[column.name] ?? draftFromCell(original);
 
-    if (scope.isEdit) {
-      if (draftDiffers(draft, original)) {
-        names.push(column.name);
-      }
-    } else if (draft.touched) {
+    if (fieldDirty(draft, original, scope.isEdit)) {
       names.push(column.name);
     }
   }

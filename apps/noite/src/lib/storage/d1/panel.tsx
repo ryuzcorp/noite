@@ -8,12 +8,15 @@ import { atom } from "ilha";
 import { errorMessage } from "../../errors";
 import { resourceValue, resourceError } from "../../resource";
 import { d1Schema, d1Tables, invalidateD1 } from "../../resources";
-import type { D1Cell, D1Filter, D1RowsQuery } from "../../runner";
+import type { D1Cell, D1Column, D1Filter, D1RowsQuery } from "../../runner";
 import { searchParam } from "../../search-param";
 import { Toaster, useToasts } from "../shared";
 import { TableDefinition } from "./definition";
 import { RowsGrid } from "./grid";
+import { nextEditorQuery } from "./query";
+import type { EditorQuery, EditorQueryEvent } from "./query";
 import { RowEditor } from "./row-editor";
+import { rowKey } from "./selection";
 import { TableSelect, TableSidebar } from "./sidebar";
 import {
   DEFAULT_PAGE_SIZE,
@@ -32,15 +35,8 @@ import {
 import type { D1View } from "./state";
 import { TableToolbar } from "./toolbar";
 
-/** The editor's URL-backed state, read once per render in D1Editor. */
-interface UrlState {
-  filters: D1Filter[];
-  page: number;
-  pageSize: number;
-  search: string;
-  sort: D1RowsQuery["sort"];
-  view: D1View;
-}
+/** The editor's URL-backed state (one value, see ./query). */
+type UrlState = EditorQuery;
 
 /** Writes for that state. */
 interface UrlSetters {
@@ -52,8 +48,9 @@ interface UrlSetters {
   setView: (view: D1View) => void;
 }
 
-/** Remount key for the row editor: a different row must get fresh drafts. */
-const editorKey = (
+/** The row editor's remount key: closed, insert, or the record's own key. */
+const editorKeyOf = (
+  columns: D1Column[],
   open: null | { row: Record<string, D1Cell> | null }
 ): string => {
   if (open === null) {
@@ -64,7 +61,7 @@ const editorKey = (
     return "insert";
   }
 
-  return `edit:${JSON.stringify(open.row)}`;
+  return `edit:${rowKey(columns, open.row)}`;
 };
 
 const ViewSwitch = ({
@@ -141,7 +138,7 @@ const TableWorkspace = ({
   const sort = validSort(state.sort, schema);
 
   const query: D1RowsQuery = {
-    filters: validFilters(state.filters, schema),
+    filters: validFilters([...state.filters], schema),
     page: state.page,
     pageSize: state.pageSize,
     search: state.search,
@@ -165,7 +162,11 @@ const TableWorkspace = ({
 
   const viewSlot = <ViewSwitch onPick={setters.setView} view={state.view} />;
   const open = editor();
-  const openKey = editorKey(open);
+
+  // Remount key for the row editor: a different *record* must get fresh
+  // drafts. Keyed by the row's own key (never the whole row's text, which
+  // makes two distinct rows with equal values collide).
+  const openKey = editorKeyOf(schema.columns, open);
 
   return (
     <div class="flex min-h-0 flex-1 flex-col">
@@ -192,7 +193,6 @@ const TableWorkspace = ({
           key={JSON.stringify(query)}
           appId={appId}
           databaseId={databaseId}
-          onChanged={refresh}
           onOpenRow={(row) => {
             editor.set({ row });
           }}
@@ -254,8 +254,9 @@ export const D1Editor = ({
 
   const { notify: onToast, toasts } = useToasts();
 
-  const tablesData = resourceValue(tablesRes.state());
-  const loadError = resourceError(tablesRes.state());
+  const tablesState = tablesRes.state();
+  const tablesData = resourceValue(tablesState);
+  const loadError = resourceError(tablesState);
   const tables = tablesData?.tables ?? [];
 
   const current =
@@ -270,28 +271,37 @@ export const D1Editor = ({
     view: view(),
   };
 
+  /** The one writer for the URL query: every transition goes through
+   * `nextEditorQuery`, so the cross-param invariants (page reset, table
+   * clearing, FK jump) have a single definition. */
+  const apply = (event: EditorQueryEvent) => {
+    const next = nextEditorQuery(state, event);
+    filtersRaw.set(encodeFilters([...next.filters]));
+    page.set(next.page);
+    size.set(next.pageSize);
+    search.set(next.search);
+    sortRaw.set(encodeSort(next.sort));
+    view.set(next.view);
+  };
+
   const setters: UrlSetters = {
-    setFilters: (next) => {
-      filtersRaw.set(encodeFilters(next));
-      page.set(0);
+    setFilters: (filters) => {
+      apply({ filters, kind: "filters" });
     },
     setPage: (next) => {
-      page.set(Math.max(next, 0));
+      apply({ kind: "page", page: next });
     },
     setSearch: (needle) => {
-      search.set(needle);
-      page.set(0);
+      apply({ kind: "search", search: needle });
     },
     setSize: (next) => {
-      size.set(next);
-      page.set(0);
+      apply({ kind: "size", size: next });
     },
-    setSort: (next) => {
-      sortRaw.set(encodeSort(next));
-      page.set(0);
+    setSort: (sort) => {
+      apply({ kind: "sort", sort });
     },
     setView: (next) => {
-      view.set(next);
+      apply({ kind: "view", view: next });
     },
   };
 
@@ -303,24 +313,16 @@ export const D1Editor = ({
       value: D1Cell;
     }) => {
       tableParam.set(target.table);
-      filtersRaw.set(
-        target.value === null
-          ? ""
-          : encodeFilters([
-              { column: target.column, op: "eq", value: target.value },
-            ])
-      );
-      sortRaw.set("");
-      search.set("");
-      page.set(0);
-      view.set("data");
+      apply({
+        column: target.column,
+        kind: "fkJump",
+        table: target.table,
+        value: target.value,
+      });
     },
     switchTable: (next: string) => {
       tableParam.set(next);
-      filtersRaw.set("");
-      sortRaw.set("");
-      search.set("");
-      page.set(0);
+      apply({ kind: "table" });
     },
   };
 

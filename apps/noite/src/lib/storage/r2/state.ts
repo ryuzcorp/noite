@@ -1,7 +1,9 @@
 //! URL state and pure helpers for the R2 browser: the view toggle, the
-//! breadcrumb path into a folder, and the selection map the multi-select
-//! bar reads. Everything here is free of DOM and store access so it can be
-//! unit-tested (see ./state.test).
+//! breadcrumb path into a folder, and the new-folder name. Everything here is
+//! free of DOM and store access so it can be unit-tested (see ./state.test).
+//! The cursor stack and the selection live in ./folder.
+
+import { Data } from "effect";
 
 import type { Crumb } from "../shared";
 
@@ -54,19 +56,36 @@ export const r2Crumbs = (
   return crumbs;
 };
 
-/** Flip one key in a selection map without mutating the caller's copy. */
-export const toggledKey = (
-  selection: ReadonlySet<string>,
-  key: string,
-  on: boolean
-): Set<string> => {
-  const next = new Set(selection);
+/** The new-folder form's name, as one value: empty, refused, or valid.
+ * The old popover derived three booleans from one string and reported only
+ * `/`, `..` and `.`, so an all-whitespace name disabled Create with no
+ * explanation. */
+export type FolderName = Data.TaggedEnum<{
+  Empty: Record<never, never>;
+  Invalid: { readonly reason: string };
+  Valid: { readonly name: string };
+}>;
 
-  if (on) {
-    next.add(key);
-  } else {
-    next.delete(key);
+export const FolderNameState = Data.taggedEnum<FolderName>();
+
+/** Classify a typed folder name (trimmed; the stored marker uses the
+ * trimmed form). */
+export const folderNameOf = (raw: string): FolderName => {
+  const name = raw.trim();
+
+  if (name === "") {
+    return FolderNameState.Empty();
   }
 
-  return next;
+  if (name.includes("/")) {
+    return FolderNameState.Invalid({
+      reason: "A folder name cannot contain “/”.",
+    });
+  }
+
+  if (name === "." || name === "..") {
+    return FolderNameState.Invalid({ reason: "Pick a real folder name." });
+  }
+
+  return FolderNameState.Valid({ name });
 };

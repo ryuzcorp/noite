@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 
-import { r2Crumbs, r2Href, toR2View, toggledKey } from "./state";
+import { folderNameOf, r2Crumbs, r2Href, toR2View } from "./state";
 
 describe("view", () => {
   test("defaults to the list and only accepts columns", () => {
@@ -55,14 +55,17 @@ describe("crumbs", () => {
   });
 });
 
-describe("selection", () => {
-  test("adds, removes and never mutates the input", () => {
-    const before = new Set(["a"]);
-    const added = toggledKey(before, "b", true);
-    expect([...added]).toEqual(["a", "b"]);
-    expect(before.has("b")).toBe(false);
-    const removed = toggledKey(added, "a", false);
-    expect([...removed]).toEqual(["b"]);
-    expect(added.has("a")).toBe(true);
+describe("folder name", () => {
+  test("classifies empty, invalid and valid names", () => {
+    expect(folderNameOf("  ")._tag).toBe("Empty");
+    expect(folderNameOf("a/b")._tag).toBe("Invalid");
+    expect(folderNameOf("..")).toEqual({
+      _tag: "Invalid",
+      reason: "Pick a real folder name.",
+    });
+    expect(folderNameOf(" photos ")).toEqual({
+      _tag: "Valid",
+      name: "photos",
+    });
   });
 });

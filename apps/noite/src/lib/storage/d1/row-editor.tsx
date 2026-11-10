@@ -14,6 +14,7 @@ import type {
   D1Cell,
   D1Column,
   D1ForeignKey,
+  D1Key,
   D1TableSchema,
   D1WriteBody,
 } from "../../runner";
@@ -21,26 +22,36 @@ import { Dialog } from "../../ui/dialog";
 import { X } from "../../ui/icons";
 import {
   cellFromDraft,
-  draftDiffers,
   draftFromCell,
+  draftIsNull,
+  draftText,
+  fieldDirty,
   formatJson,
   isBlobText,
   isBoolType,
   isTimestampColumn,
   jsonValid,
-  keyFor,
+  markedNull,
   nowValue,
   parseTimestamp,
   prefersTextarea,
   timestampKind,
-  writeValues,
+  typedText,
 } from "../d1-values";
 import type { FieldDraft, FieldDrafts } from "../d1-values";
-
-/** A guard pending the user's discard decision. */
-type Pending =
-  | { kind: "close" }
-  | { column: string; kind: "fk"; table: string; value: D1Cell };
+import {
+  changesOf,
+  draftsOf,
+  keyLabel,
+  nextEditor,
+  Phase,
+} from "./editor-machine";
+import type {
+  EditorContext,
+  EditorEvent,
+  EditorPhase,
+  PendingAction,
+} from "./editor-machine";
 
 /** Fresh drafts for one open row. INSERT starts every field empty and
  * untouched (omitted from the write, so the DDL default applies); a NULL
@@ -87,17 +98,17 @@ const editorTitle = (isEdit: boolean, canUpdate: boolean): string => {
 const DeleteControl = ({
   busy,
   confirming,
-  keyLabel,
   onCancel,
   onDelete,
   onRequest,
+  rowLabel,
 }: {
   busy: boolean;
   confirming: boolean;
-  keyLabel: string;
   onCancel: () => void;
   onDelete: () => void;
   onRequest: () => void;
+  rowLabel: string;
 }) => {
   if (!confirming) {
     return (
@@ -113,7 +124,7 @@ const DeleteControl = ({
 
   return (
     <div class="flex flex-wrap items-center gap-2 text-sm">
-      <span class="text-error">Delete row where {keyLabel}?</span>
+      <span class="text-error">Delete row where {rowLabel}?</span>
       <button
         type="button"
         class="btn btn-sm btn-error"
@@ -201,7 +212,7 @@ const FieldLegend = ({
         <input
           class="checkbox checkbox-sm"
           type="checkbox"
-          checked={draft.isNull}
+          checked={draftIsNull(draft)}
           onchange={(event) => {
             onToggleNull(event.currentTarget.checked);
           }}
@@ -229,13 +240,13 @@ const FieldValue = ({
   disabled: boolean;
   draft: FieldDraft;
   inputId: string;
-  onChange: (patch: Partial<FieldDraft>) => void;
+  onChange: (draft: FieldDraft) => void;
 }) => {
-  const value = draft.text;
-  const fieldDisabled = disabled || draft.isNull;
+  const value = draftText(draft);
+  const fieldDisabled = disabled || draftIsNull(draft);
 
   const setText = (text: string) => {
-    onChange({ text, touched: true });
+    onChange(typedText(text));
   };
 
   if (isBoolType(column.type) && !disabled) {
@@ -245,10 +256,12 @@ const FieldValue = ({
           <button
             key={digit}
             type="button"
-            class={`btn btn-sm join-item flex-1 ${!draft.isNull && value === digit ? "btn-active" : ""}`}
-            aria-pressed={!draft.isNull && value === digit ? "true" : "false"}
+            class={`btn btn-sm join-item flex-1 ${!draftIsNull(draft) && value === digit ? "btn-active" : ""}`}
+            aria-pressed={
+              !draftIsNull(draft) && value === digit ? "true" : "false"
+            }
             onclick={() => {
-              onChange({ isNull: false, text: digit, touched: true });
+              onChange(typedText(digit));
             }}
           >
             {digit}
@@ -258,7 +271,7 @@ const FieldValue = ({
     );
   }
 
-  if (!draft.isNull && prefersTextarea(value)) {
+  if (!draftIsNull(draft) && prefersTextarea(value)) {
     return (
       <textarea
         id={inputId}
@@ -279,7 +292,7 @@ const FieldValue = ({
       class="input input-sm w-full font-mono text-xs disabled:opacity-60"
       type="text"
       disabled={fieldDisabled}
-      placeholder={draft.isNull ? "NULL" : undefined}
+      placeholder={draftIsNull(draft) ? "NULL" : undefined}
       value={value}
       oninput={(event) => {
         setText(event.currentTarget.value);
@@ -305,13 +318,13 @@ const FieldHelpers = ({
   disabled: boolean;
   draft: FieldDraft;
   fk: D1ForeignKey | undefined;
-  onChange: (patch: Partial<FieldDraft>) => void;
+  onChange: (draft: FieldDraft) => void;
   onOpenFk: (() => void) | null;
   original: D1Cell;
 }) => {
-  const value = draft.text;
-  const date = draft.isNull ? null : parseTimestamp(value);
-  const json = draft.isNull || disabled ? null : jsonValid(value);
+  const value = draftText(draft);
+  const date = draftIsNull(draft) ? null : parseTimestamp(value);
+  const json = draftIsNull(draft) || disabled ? null : jsonValid(value);
   const showNow = !disabled && isTimestampColumn(column.name, column.type);
 
   return (
@@ -322,11 +335,7 @@ const FieldHelpers = ({
           class="btn btn-sm btn-ghost"
           title="Set to now, in this field's existing format"
           onclick={() => {
-            onChange({
-              isNull: false,
-              text: nowValue(timestampKind(original)),
-              touched: true,
-            });
+            onChange(typedText(nowValue(timestampKind(original))));
           }}
         >
           Now
@@ -340,7 +349,7 @@ const FieldHelpers = ({
             const pretty = formatJson(value);
 
             if (pretty !== null) {
-              onChange({ text: pretty, touched: true });
+              onChange(typedText(pretty));
             }
           }}
         >
@@ -384,7 +393,7 @@ const FieldRow = ({
   fk: D1ForeignKey | undefined;
   inputId: string;
   note: string | null;
-  onChange: (patch: Partial<FieldDraft>) => void;
+  onChange: (draft: FieldDraft) => void;
   onOpenFk: (() => void) | null;
   onToggleNull: (isNull: boolean) => void;
   /** The stored cell, so `Now` keeps the field's existing format. */
@@ -446,11 +455,11 @@ export const RowEditor = ({
   const isEdit = row !== null;
   const original = row ?? {};
   const open = atom(true);
-  const busy = atom(false);
-  const confirmingDelete = atom(false);
-  const failure = atom("");
-  const pending = atom<Pending | null>(null);
-  const drafts = atom<FieldDrafts>(initialDrafts(schema.columns, row));
+
+  const phase = atom<EditorPhase>(
+    Phase.Editing({ drafts: initialDrafts(schema.columns, row) })
+  );
+
   const box = atom.lazy(newLiveRef<HTMLDivElement>)();
   const focused = atom.lazy(() => ({ done: false }))();
 
@@ -484,48 +493,32 @@ export const RowEditor = ({
     requestAnimationFrame(attempt);
   };
 
-  const lockedColumns = [...Object.keys(schema.locked), ...schema.redacted];
-
-  const scope = {
+  const context: EditorContext = {
     columns: schema.columns,
-    drafts: drafts(),
     isEdit,
-    locked: lockedColumns,
+    locked: [...Object.keys(schema.locked), ...schema.redacted],
     original,
+    schema,
   };
 
-  const values = writeValues(scope);
-  const changeCount = Object.keys(values).length;
-  const dirty = changeCount > 0;
   const canUpdate = schema.caps.update || !isEdit;
   const pkCount = schema.columns.filter((column) => column.pk > 0).length;
+  const drafts = draftsOf(phase()) ?? {};
+  const changeCount = changesOf(phase(), context).length;
 
-  const patch = (name: string, next: Partial<FieldDraft>) => {
-    const current = drafts();
-    const existing = current[name] ?? draftFromCell(original[name] ?? null);
-    drafts.set({ ...current, [name]: { ...existing, ...next } });
+  /** Record a completion event (no effect: `saved`/`deleted`/`failed` only
+   * move the state) and close when the machine says so. */
+  const settle = (event: EditorEvent) => {
+    const step = nextEditor(phase(), event, context);
+    phase.set(step.state);
+
+    if (step.state._tag === "Closed") {
+      onClose();
+    }
   };
 
-  const save = async () => {
-    if (busy() || !dirty || !canUpdate) {
-      return;
-    }
-
-    busy.set(true);
-
+  const saveRow = async (body: D1WriteBody) => {
     try {
-      // An INSERT omits `key` entirely: the action transport encodes args as
-      // JSON, where an explicit `undefined` is not a JSON value.
-      const body: D1WriteBody = {
-        op: isEdit ? "update" : "insert",
-        table: schema.table,
-        values,
-      };
-
-      if (isEdit) {
-        body.key = keyFor(schema.columns, original);
-      }
-
       await api<{ ok: true }>("/api/storage/d1Write", {
         appId,
         databaseId,
@@ -533,49 +526,73 @@ export const RowEditor = ({
       });
       onToast(isEdit ? "Row updated" : "Row created");
       onSaved();
-      onClose();
+      settle({ kind: "saved" });
     } catch (error) {
-      failure.set(errorMessage(error));
-    } finally {
-      busy.set(false);
+      settle({ kind: "failed", message: errorMessage(error) });
     }
   };
 
-  const remove = async () => {
-    if (busy()) {
-      return;
-    }
-
-    busy.set(true);
-
+  const deleteRow = async (key: D1Key) => {
     try {
       await api<{ ok: true }>("/api/storage/d1Write", {
         appId,
         databaseId,
-        key: keyFor(schema.columns, original),
+        key,
         op: "delete",
         table: schema.table,
         values: {},
       });
       onToast("Row deleted");
       onSaved();
-      onClose();
+      settle({ kind: "deleted" });
     } catch (error) {
-      failure.set(errorMessage(error));
-    } finally {
-      busy.set(false);
+      settle({ kind: "failed", message: errorMessage(error) });
     }
   };
 
-  const requestClose = () => {
-    if (dirty) {
-      pending.set({ kind: "close" });
-      open.set(true);
+  /** The one dispatcher: every state change goes through the machine, and the
+   * effect it returns is the only side effect performed. */
+  const apply = (event: EditorEvent) => {
+    const step = nextEditor(phase(), event, context);
+    phase.set(step.state);
 
-      return;
+    if (step.state._tag === "Guarded") {
+      // Esc/backdrop closed the native dialog; the guard is a state, so the
+      // dialog re-opens on it rather than the prompt being lost.
+      open.set(true);
     }
 
-    onClose();
+    switch (step.effect.kind) {
+      case "navigate": {
+        onOpenFk({
+          column: step.effect.target.column,
+          table: step.effect.target.table,
+          value: step.effect.target.value,
+        });
+
+        break;
+      }
+
+      case "save": {
+        void saveRow(step.effect.body);
+
+        break;
+      }
+
+      case "delete": {
+        void deleteRow(step.effect.key);
+
+        break;
+      }
+
+      default: {
+        break;
+      }
+    }
+
+    if (step.state._tag === "Closed") {
+      onClose();
+    }
   };
 
   const openFk = (column: D1Column) => {
@@ -585,55 +602,46 @@ export const RowEditor = ({
       return;
     }
 
-    const draft = drafts()[column.name] ?? draftFromCell(null);
+    const draft = drafts[column.name] ?? draftFromCell(null);
 
-    const target: Pending = {
+    const target: PendingAction & { kind: "fk" } = {
       column: fk.to,
       kind: "fk",
       table: fk.table,
       value: cellFromDraft(draft),
     };
 
-    if (dirty) {
-      pending.set(target);
-      open.set(true);
-
-      return;
-    }
-
-    onOpenFk(target);
-  };
-
-  const keyLabel = (): string => {
-    const key = keyFor(schema.columns, original);
-
-    return Object.entries(key)
-      .map(([name, value]) => `${name} = ${value === null ? "NULL" : value}`)
-      .join(", ");
+    apply({ kind: "fkRequest", target });
   };
 
   const changeLabel = (): string => {
-    if (dirty) {
+    if (changeCount > 0) {
       return `${changeCount} change${changeCount === 1 ? "" : "s"}`;
     }
 
-    if (isEdit) {
-      return "No changes";
-    }
-
-    return "Untouched fields use their DDL default";
+    return isEdit ? "No changes" : "Untouched fields use their DDL default";
   };
 
   const titleId = `d1-editor-title-${schema.table}`;
-  const activePending = pending();
   const title = editorTitle(isEdit, canUpdate);
+  const current = phase();
+
+  if (current._tag === "Closed") {
+    return null;
+  }
+
+  const armed = current._tag === "DeleteConfirm" || current._tag === "Deleting";
+  const action = current._tag === "Guarded" ? current.action : null;
+  const failure = current._tag === "Failed" ? current.message : "";
 
   return (
     <Dialog
       open={open}
       class="modal modal-end"
       labelledBy={titleId}
-      onClose={requestClose}
+      onClose={() => {
+        apply({ kind: "closeRequest" });
+      }}
     >
       <div
         class="modal-box bg-base-100 dark:bg-base-200 flex max-h-[calc(100dvh-2rem)] w-full max-w-xl flex-col overflow-hidden p-0"
@@ -647,7 +655,7 @@ export const RowEditor = ({
         onkeydown={(event) => {
           if ((event.ctrlKey || event.metaKey) && event.key === "Enter") {
             event.preventDefault();
-            void save();
+            apply({ kind: "save" });
           }
         }}
       >
@@ -664,16 +672,18 @@ export const RowEditor = ({
             type="button"
             class="btn btn-square btn-ghost btn-sm ml-auto"
             aria-label="Close editor"
-            onclick={requestClose}
+            onclick={() => {
+              apply({ kind: "closeRequest" });
+            }}
           >
             <X />
           </button>
         </header>
         <div class="flex min-h-0 flex-1 flex-col gap-2 overflow-y-auto px-4 py-3">
-          {activePending === null ? null : (
+          {action === null ? null : (
             <div class="alert alert-warning alert-soft flex-wrap text-sm">
               <span>
-                {activePending.kind === "close"
+                {action.kind === "close"
                   ? `You have ${changeCount} unsaved change${changeCount === 1 ? "" : "s"}.`
                   : "This field links elsewhere — leave without saving?"}
               </span>
@@ -681,15 +691,7 @@ export const RowEditor = ({
                 type="button"
                 class="btn btn-sm btn-neutral"
                 onclick={() => {
-                  pending.set(null);
-
-                  if (activePending.kind === "close") {
-                    onClose();
-
-                    return;
-                  }
-
-                  onOpenFk(activePending);
+                  apply({ kind: "guardDiscard" });
                 }}
               >
                 Discard
@@ -698,19 +700,21 @@ export const RowEditor = ({
                 type="button"
                 class="btn btn-sm btn-ghost"
                 onclick={() => {
-                  pending.set(null);
+                  apply({ kind: "guardCancel" });
                 }}
               >
                 Keep editing
               </button>
             </div>
           )}
-          {failure() === "" ? null : (
-            <p class="text-error m-0 text-sm">{failure()}</p>
+          {failure === "" ? null : (
+            <p class="text-error m-0 text-sm" role="alert">
+              {failure}
+            </p>
           )}
           {schema.columns.map((column) => {
             const draft =
-              drafts()[column.name] ??
+              drafts[column.name] ??
               draftFromCell(original[column.name] ?? null);
 
             const fk = schema.foreignKeys.find(
@@ -723,11 +727,7 @@ export const RowEditor = ({
               <FieldRow
                 key={column.name}
                 column={column}
-                dirty={
-                  isEdit
-                    ? draftDiffers(draft, original[column.name] ?? null)
-                    : draft.touched
-                }
+                dirty={fieldDirty(draft, original[column.name] ?? null, isEdit)}
                 disabled={
                   !canUpdate || note !== null || (isEdit && column.pk > 0)
                 }
@@ -736,7 +736,7 @@ export const RowEditor = ({
                 inputId={`d1-field-${schema.table}-${column.name}`}
                 note={note}
                 onChange={(next) => {
-                  patch(column.name, next);
+                  apply({ draft: next, kind: "patch", name: column.name });
                 }}
                 onOpenFk={
                   fk === undefined
@@ -746,7 +746,11 @@ export const RowEditor = ({
                       }
                 }
                 onToggleNull={(isNull) => {
-                  patch(column.name, { isNull, touched: true });
+                  apply({
+                    draft: isNull ? markedNull() : typedText(""),
+                    kind: "patch",
+                    name: column.name,
+                  });
                 }}
                 original={original[column.name] ?? null}
                 pkBadge={pkBadgeFor(column, pkCount)}
@@ -757,17 +761,17 @@ export const RowEditor = ({
         <footer class="border-base-300 flex flex-wrap items-center gap-2 border-t px-4 py-3">
           {isEdit && schema.caps.delete ? (
             <DeleteControl
-              busy={busy()}
-              confirming={confirmingDelete()}
-              keyLabel={keyLabel()}
+              busy={current._tag === "Deleting"}
+              confirming={armed}
+              rowLabel={keyLabel(schema.columns, original)}
               onCancel={() => {
-                confirmingDelete.set(false);
+                apply({ kind: "deleteCancel" });
               }}
               onDelete={() => {
-                void remove();
+                apply({ kind: "deleteConfirm" });
               }}
               onRequest={() => {
-                confirmingDelete.set(true);
+                apply({ kind: "deleteRequest" });
               }}
             />
           ) : null}
@@ -775,8 +779,10 @@ export const RowEditor = ({
           <button
             type="button"
             class="btn btn-sm btn-ghost"
-            disabled={busy()}
-            onclick={requestClose}
+            disabled={current._tag === "Saving" || current._tag === "Deleting"}
+            onclick={() => {
+              apply({ kind: "closeRequest" });
+            }}
           >
             {canUpdate ? "Cancel" : "Close"}
           </button>
@@ -784,12 +790,16 @@ export const RowEditor = ({
             <button
               type="button"
               class="btn btn-sm btn-neutral"
-              disabled={busy() || !dirty}
+              disabled={
+                changeCount === 0 ||
+                current._tag === "Saving" ||
+                current._tag === "Deleting"
+              }
               onclick={() => {
-                void save();
+                apply({ kind: "save" });
               }}
             >
-              {busy() ? "Saving…" : "Save"}
+              {current._tag === "Saving" ? "Saving…" : "Save"}
             </button>
           ) : null}
         </footer>

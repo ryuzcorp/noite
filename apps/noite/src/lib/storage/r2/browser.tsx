@@ -1,21 +1,47 @@
 //! One R2 folder: the page (toolbar, listing, pager, detail) and the cursor
 //! stack that walks the store.
+//!
+//! The pager's cursor stack and the selection are explicit values (./folder);
+//! upload, folder creation and delete share one write lifecycle (./write)
+//! that knows which control is busy, and a partial upload is a state rather
+//! than an error string. The selection is only ever resolved against the
+//! *visible* listing, so a bulk delete can never remove an object the search
+//! filtered away.
 
 import { atom } from "ilha";
 
 import { api } from "../../api";
 import { formatBytes } from "../../bytes";
 import { errorMessage } from "../../errors";
-import { resourceValue, resourceError } from "../../resource";
+import { resourceError, resourceValue } from "../../resource";
 import { invalidateR2, r2List } from "../../resources";
 import { R2_UPLOAD_LIMIT } from "../../runner";
 import { ChevronLeft, ChevronRight, Refresh, Search } from "../../ui/icons";
 import { DetailPanel, EmptyState } from "../shared";
 import { R2DetailPanel } from "./detail";
+import {
+  checkedVisible,
+  cursorAt,
+  emptySelection,
+  nextFolder,
+  nextSelection as nextSelectionState,
+  prevFolder,
+  R2Sel,
+  startFolder,
+} from "./folder";
+import type { FolderCursors, R2Selection } from "./folder";
 import { R2ColumnRows, R2ListRows } from "./rows";
-import { R2_VIEW_LABELS, R2_VIEWS, toggledKey } from "./state";
+import { R2_VIEW_LABELS, R2_VIEWS } from "./state";
 import type { R2View } from "./state";
 import { NewFolderButton, UploadButton, putObject } from "./upload";
+import {
+  deleting,
+  nextWrite,
+  R2WriteState,
+  writeProblem,
+  writeRunning,
+} from "./write";
+import type { R2Write, R2WriteScope } from "./write";
 
 const ViewSwitch = ({
   onPick,
@@ -69,24 +95,20 @@ const R2Page = ({
   setView: (view: R2View) => void;
   view: R2View;
 }) => {
-  const res = r2List(appId, bucket, prefix, cursor);
+  const state = r2List(appId, bucket, prefix, cursor).state();
+  const data = resourceValue(state);
+  const loadError = resourceError(state);
+  const selection = atom<R2Selection>(emptySelection());
+  const write = atom<R2Write>(R2WriteState.Idle());
   const search = atom("");
-  const selected = atom<string | null>(null);
-  // A Set serializes as `{}`: out of the SSR snapshot, rebuilt by the
-  // client on hydration.
-  const checked = atom<Set<string>>(new Set<string>(), { snapshot: false });
-  const confirming = atom(false);
-  const busy = atom(false);
-  const failure = atom("");
 
-  const data = resourceValue(res.state());
-  const loadError = resourceError(res.state());
+  if (data === undefined) {
+    if (state._tag === "Failed") {
+      return (
+        <p class="text-error m-0 p-4 text-sm">{errorMessage(state.error)}</p>
+      );
+    }
 
-  if (loadError && data === undefined) {
-    return <p class="text-error m-0 p-4 text-sm">{errorMessage(loadError)}</p>;
-  }
-
-  if (!data) {
     return (
       <div class="flex flex-col gap-2 p-4">
         <span class="skeleton h-8 w-full" />
@@ -96,39 +118,52 @@ const R2Page = ({
     );
   }
 
-  /** Run a write; `run` returns a problem message (null when it worked), and
-   * the listing refreshes either way so a partial result is visible. */
-  const write = async (
-    run: () => Promise<string | null>,
-    done: string
-  ): Promise<void> => {
-    if (busy()) {
-      return;
+  /** Run one write: the machine owns the lifecycle, the listing always
+   * refreshes so a partial result is visible, and the promise says whether
+   * it fully succeeded (the new-folder form keeps its draft otherwise). */
+  const run = async (
+    scope: R2WriteScope,
+    count: number,
+    done: string,
+    work: () => Promise<string[]>
+  ): Promise<boolean> => {
+    if (writeRunning(write())) {
+      return false;
     }
 
-    busy.set(true);
-    failure.set("");
+    write.set(nextWrite(write(), { count, kind: "start", scope }));
+
+    let problems: string[];
 
     try {
-      const problem = await run();
-      invalidateR2(appId, bucket);
-
-      if (problem === null) {
-        notify(done);
-      } else {
-        failure.set(problem);
-      }
+      problems = await work();
     } catch (error) {
-      failure.set(errorMessage(error));
+      write.set(
+        nextWrite(write(), { kind: "failed", message: errorMessage(error) })
+      );
+
+      return false;
     } finally {
-      busy.set(false);
+      invalidateR2(appId, bucket);
     }
+
+    write.set(nextWrite(write(), { kind: "settled", problems }));
+
+    if (problems.length === 0) {
+      notify(done);
+    }
+
+    return problems.length === 0;
   };
 
   const upload = (files: File[]) => {
     const uploadable = files.filter((file) => file.size <= R2_UPLOAD_LIMIT);
     const oversized = files.length - uploadable.length;
-    void write(
+
+    void run(
+      "upload",
+      uploadable.length,
+      `${uploadable.length} uploaded`,
       async () => {
         // One request per object (progress and failures stay per file), in
         // parallel so a multi-file selection is one round trip long.
@@ -159,14 +194,13 @@ const R2Page = ({
           );
         }
 
-        return notes.length > 0 ? notes.join("\n") : null;
-      },
-      `${uploadable.length} file${uploadable.length === 1 ? "" : "s"} uploaded`
+        return notes;
+      }
     );
   };
 
-  const createFolder = (name: string) => {
-    void write(async () => {
+  const createFolder = (name: string) =>
+    run("mkdir", 1, `Folder “${name}” created`, async () => {
       await putObject(
         appId,
         bucket,
@@ -175,30 +209,27 @@ const R2Page = ({
         "application/octet-stream"
       );
 
-      return null;
-    }, `Folder “${name}” created`);
-  };
+      return [];
+    });
 
-  const runDelete = (keys: string[]) => {
-    void write(
-      async () => {
-        await api<{ ok: true }>("/api/storage/r2Delete", {
-          appId,
-          bucket,
-          keys,
-        });
-        checked.set(new Set());
-        confirming.set(false);
+  const runDelete = (keys: readonly string[]) =>
+    run("delete", keys.length, `${keys.length} deleted`, async () => {
+      await api<{ ok: true }>("/api/storage/r2Delete", {
+        appId,
+        bucket,
+        keys: [...keys],
+      });
 
-        if (keys.includes(selected() ?? "")) {
-          selected.set(null);
-        }
+      const cleared = nextSelectionState(selection(), R2Sel.Clear());
 
-        return null;
-      },
-      `${keys.length} object${keys.length === 1 ? "" : "s"} deleted`
-    );
-  };
+      selection.set(
+        keys.includes(cleared.focused ?? "")
+          ? nextSelectionState(cleared, R2Sel.Focus({ key: null }))
+          : cleared
+      );
+
+      return [];
+    });
 
   const needle = search().trim().toLowerCase();
 
@@ -216,13 +247,20 @@ const R2Page = ({
           object.name.toLowerCase().includes(needle)
         );
 
-  const checkedKeys = [...checked()];
-  const selectedObject = data.objects.find((o) => o.key === selected()) ?? null;
+  const visibleKeys = files.map((object) => object.key);
+  const checkedKeys = checkedVisible(selection(), visibleKeys);
+  const checkedSet = new Set(selection().checked);
+  const { focused } = selection();
+  const selectedObject = data.objects.find((o) => o.key === focused) ?? null;
 
   let browser = (
     <EmptyState
       action={
-        <UploadButton busy={busy()} disabled={!canWrite} onUpload={upload} />
+        <UploadButton
+          busy={writeRunning(write())}
+          disabled={!canWrite}
+          onUpload={upload}
+        />
       }
       hint={
         prefix === ""
@@ -240,37 +278,48 @@ const R2Page = ({
           appId={appId}
           bucket={bucket}
           canWrite={canWrite}
-          checked={checked()}
+          checked={checkedSet}
           files={files}
           folders={folders}
           onOpen={(key) => {
-            selected.set(key);
-          }}
-          onToggle={(key, on) => {
-            checked.set(toggledKey(checked(), key, on));
-          }}
-          onToggleAll={(on) => {
-            checked.set(
-              on ? new Set(files.map((object) => object.key)) : new Set()
+            selection.set(
+              nextSelectionState(selection(), R2Sel.Focus({ key }))
             );
           }}
-          selected={selected()}
+          onToggle={(key, on) => {
+            selection.set(
+              nextSelectionState(selection(), R2Sel.Toggle({ key, on }))
+            );
+          }}
+          onToggleAll={() => {
+            selection.set(
+              nextSelectionState(
+                selection(),
+                R2Sel.ToggleAll({ visible: visibleKeys })
+              )
+            );
+          }}
+          selected={focused}
         />
       ) : (
         <R2ColumnRows
           appId={appId}
           bucket={bucket}
           canWrite={canWrite}
-          checked={checked()}
+          checked={checkedSet}
           files={files}
           folders={folders}
           onOpen={(key) => {
-            selected.set(key);
+            selection.set(
+              nextSelectionState(selection(), R2Sel.Focus({ key }))
+            );
           }}
           onToggle={(key, on) => {
-            checked.set(toggledKey(checked(), key, on));
+            selection.set(
+              nextSelectionState(selection(), R2Sel.Toggle({ key, on }))
+            );
           }}
-          selected={selected()}
+          selected={focused}
         />
       );
   }
@@ -304,64 +353,49 @@ const R2Page = ({
         <ViewSwitch onPick={setView} view={view} />
         <div class="ml-auto flex items-center gap-2">
           <NewFolderButton
-            busy={busy()}
+            busy={writeRunning(write())}
             disabled={!canWrite}
             onCreate={createFolder}
           />
-          <UploadButton busy={busy()} disabled={!canWrite} onUpload={upload} />
+          <UploadButton
+            busy={writeRunning(write())}
+            disabled={!canWrite}
+            onUpload={upload}
+          />
         </div>
       </div>
-      {failure() ? (
-        <p class="text-error m-0 px-3 py-1 text-sm whitespace-pre-wrap">
-          {failure()}
+      {state._tag === "Failed" ? (
+        <p class="text-error m-0 px-3 py-1 text-sm" role="alert">
+          {errorMessage(state.error)} — showing the last loaded page.
         </p>
       ) : null}
+      {writeProblem(write()) === null ? null : (
+        <p class="text-error m-0 px-3 py-1 text-sm whitespace-pre-wrap">
+          {writeProblem(write())}
+        </p>
+      )}
       {checkedKeys.length > 0 && canWrite ? (
         <div class="bg-base-200 dark:bg-base-300/50 flex flex-wrap items-center gap-2 px-3 py-1.5 text-sm">
           <span class="font-medium">{checkedKeys.length} selected</span>
-          {confirming() ? (
-            <>
-              <span class="text-error">
-                Delete {checkedKeys.length} object(s)? This cannot be undone.
-              </span>
-              <button
-                type="button"
-                class="btn btn-sm btn-error"
-                disabled={busy()}
-                onclick={() => {
-                  runDelete(checkedKeys);
-                }}
-              >
-                {busy() ? "Deleting…" : "Delete"}
-              </button>
-              <button
-                type="button"
-                class="btn btn-sm btn-ghost"
-                disabled={busy()}
-                onclick={() => {
-                  confirming.set(false);
-                }}
-              >
-                Cancel
-              </button>
-            </>
-          ) : (
-            <button
-              type="button"
-              class="btn btn-sm btn-ghost"
-              onclick={() => {
-                confirming.set(true);
-              }}
-            >
-              Delete
-            </button>
-          )}
+          <span class="text-error">
+            Delete {checkedKeys.length} object(s)? This cannot be undone.
+          </span>
+          <button
+            type="button"
+            class="btn btn-sm btn-error"
+            disabled={deleting(write())}
+            onclick={() => {
+              void runDelete(checkedKeys);
+            }}
+          >
+            {deleting(write()) ? "Deleting…" : "Delete"}
+          </button>
           <button
             type="button"
             class="btn btn-sm btn-ghost ml-auto"
+            disabled={deleting(write())}
             onclick={() => {
-              checked.set(new Set());
-              confirming.set(false);
+              selection.set(nextSelectionState(selection(), R2Sel.Clear()));
             }}
           >
             Clear
@@ -407,7 +441,9 @@ const R2Page = ({
         {selectedObject === null ? (
           <DetailPanel title="Details">
             <p class="m-0 text-sm opacity-60">
-              Select a file to preview it, download it or copy its URL.
+              {loadError === undefined
+                ? "Select a file to preview it, download it or copy its URL."
+                : "The selected file is no longer in this folder."}
             </p>
           </DetailPanel>
         ) : (
@@ -415,11 +451,11 @@ const R2Page = ({
             key={selectedObject.key}
             appId={appId}
             bucket={bucket}
-            busy={busy()}
+            busy={deleting(write())}
             canWrite={canWrite}
             object={selectedObject}
             onDelete={(key) => {
-              runDelete([key]);
+              void runDelete([key]);
             }}
           />
         )}
@@ -448,25 +484,23 @@ export const R2Folder = ({
   setView: (view: R2View) => void;
   view: R2View;
 }) => {
-  const cursors = atom<string[]>([""]);
-  const pageIndex = atom(0);
-  const at = Math.min(pageIndex(), cursors().length - 1);
+  const folder = atom<FolderCursors>(startFolder());
+  const at = folder();
 
   return (
     <R2Page
-      key={at}
+      key={at.index}
       appId={appId}
       bucket={bucket}
       canWrite={canWrite}
-      cursor={cursors()[at] ?? ""}
-      hasPrev={at > 0}
+      cursor={cursorAt(at)}
+      hasPrev={at.index > 0}
       notify={notify}
       onNext={(next) => {
-        cursors.set([...cursors().slice(0, at + 1), next]);
-        pageIndex.set(at + 1);
+        folder.set(nextFolder(at, next));
       }}
       onPrev={() => {
-        pageIndex.set(Math.max(at - 1, 0));
+        folder.set(prevFolder(at));
       }}
       prefix={prefix}
       setView={setView}

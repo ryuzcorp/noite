@@ -4,36 +4,69 @@
 //! pieces, not three near-copies of them.
 
 import { Link } from "@ilha/void";
-import { atom } from "ilha";
+import { atom, watch } from "ilha";
 import type { View } from "ilha";
 
 import { ChevronRight } from "../ui/icons";
+import { nextToasts, scheduleExpiry } from "./toast";
+import type { Toast } from "./toast";
 
-/** One transient confirmation (top-right, auto-hides). */
-export interface Toast {
-  id: number;
-  text: string;
-}
-
-/** Toast state for one panel; `notify` shows a message for four seconds. */
+/** Toast state for one panel: a bounded queue (see `MAX_TOASTS`), where an
+ * identical consecutive message refreshes the shown toast instead of
+ * stacking, and unmount clears every timer. */
 export const useToasts = () => {
   const toasts = atom<Toast[]>([]);
   const ids = atom.lazy(() => ({ n: 0 }))();
+  const timers = atom.lazy(() => new Map<number, number>())();
+
+  watch.once(() => () => {
+    for (const timer of timers.values()) {
+      window.clearTimeout(timer);
+    }
+
+    timers.clear();
+  });
 
   const notify = (text: string) => {
+    const last = toasts().at(-1);
+
+    if (last?.text === text) {
+      scheduleExpiry(
+        timers,
+        last.id,
+        () => toasts(),
+        (next) => {
+          toasts.set(next);
+        }
+      );
+
+      return;
+    }
+
     ids.n += 1;
     const id = ids.n;
-    toasts.set([...toasts(), { id, text }]);
-    window.setTimeout(() => {
-      toasts.set(toasts().filter((toast) => toast.id !== id));
-    }, 4000);
+    toasts.set(nextToasts(toasts(), { id, text }));
+    scheduleExpiry(
+      timers,
+      id,
+      () => toasts(),
+      (next) => {
+        toasts.set(next);
+      }
+    );
   };
 
   return { notify, toasts };
 };
 
-export const Toaster = ({ toasts }: { toasts: Toast[] }) => (
-  <div class="toast toast-top toast-end z-[100]">
+/** The page's toast region, announced politely so a screen reader hears the
+ * confirmation that a delete or an upload happened. */
+export const Toaster = ({ toasts }: { toasts: readonly Toast[] }) => (
+  <div
+    class="toast toast-top toast-end z-[100]"
+    role="status"
+    aria-live="polite"
+  >
     {toasts.map((toast) => (
       <div key={String(toast.id)} class="alert alert-success alert-soft">
         {toast.text}
