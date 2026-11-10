@@ -13,8 +13,8 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"reflect"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/caddyserver/caddy/v2"
@@ -42,6 +42,10 @@ const (
 	VarWake = "edge_wake"
 	// VarGate is "1" when the static config must forward_auth /v1/edge/env-gate.
 	VarGate = "edge_gate"
+	// VarHold is "1" when EdgeRoutes decided the request must wait for its
+	// fleet upstream's readiness probe. EdgeHold reads it; the static
+	// config never does, so the hold decision is made once.
+	VarHold = "edge_hold"
 )
 
 // Hold timing mirrors the old TENANT_PROXY: 20 s cap, 250 ms backstop.
@@ -52,23 +56,78 @@ const (
 	ProbeTimeout = 2 * time.Second
 )
 
+// Phase is the shared edge's lifecycle, shared by every EdgeRoutes and
+// EdgeHold instance.
+//
+//	stateDiagram-v2
+//	    [*] --> Booting: first instance Provisioned
+//	    Booting --> Loaded: a table is installed (file or push)
+//	    Loaded --> Loaded: a newer table is installed / re-pushed
+//	    Booting --> Draining: last instance Cleanup, no table yet
+//	    Loaded --> Draining: last instance Cleanup
+//	    Draining --> Booting: an instance is Provisioned again
+//	    Draining --> [*]: the process stops
+//
+// The phase owns the resources it needs, so they can never disagree with
+// it: Loaded has a table, a limiter and a prober; Booting and Draining have
+// none. Requests answer from the phase: Booting is 503 "edge starting"
+// (running, nothing pushed yet), Loaded routes and rate-limits, Draining is
+// 503 "edge shutting down" (the last instance cleaned up).
+type Phase uint8
+
+const (
+	// PhaseBooting is provisioned but has no table yet.
+	PhaseBooting Phase = iota
+	// PhaseLoaded has a table, a limiter and a prober.
+	PhaseLoaded
+	// PhaseDraining has no instances left: the prober is stopped and the
+	// table and limiter are dropped.
+	PhaseDraining
+)
+
+// String names the phase for logs and test failures.
+func (p Phase) String() string {
+	switch p {
+	case PhaseBooting:
+		return "booting"
+	case PhaseLoaded:
+		return "loaded"
+	case PhaseDraining:
+		return "draining"
+	}
+	return "unknown"
+}
+
+// edgeState is what the current phase owns. The zero value is Booting with
+// nothing, so the invariants hold by construction.
+type edgeState struct {
+	phase  Phase
+	tab    *Table
+	lim    *Limiter
+	prober *Prober
+}
+
+// edgeSnapshot is the consistent view a request serves from.
+type edgeSnapshot struct {
+	phase Phase
+	tab   *Table
+	lim   *Limiter
+}
+
 // sharedState is the process-wide edge state, shared by every EdgeRoutes
 // and EdgeHold instance (the static config provisions one per site).
 type sharedState struct {
 	mu sync.Mutex
-	// refs counts provisioned instances; the last Cleanup stops the
-	// probers so a full Caddy stop leaks no goroutines.
+	// refs counts provisioned instances; the last Cleanup drains the
+	// shared state so a full Caddy stop leaks no goroutines.
 	refs        int
-	tab         atomic.Pointer[Table]
-	lim         *Limiter
-	prober      *Prober
+	st          edgeState
 	log         *zap.Logger
 	holdRecheck time.Duration
 	holdCap     time.Duration
-	// loaded is true once any table has been installed (file or push).
-	// Lookup misses answer 404 only then; before that the edge is still
-	// starting and answers 503.
-	loaded bool
+	// newProber builds the prober a Loaded edge owns. Tests replace it with
+	// one whose check they control.
+	newProber func() *Prober
 }
 
 var shared = newSharedState()
@@ -77,70 +136,177 @@ func newSharedState() *sharedState {
 	return &sharedState{
 		holdRecheck: HoldRecheck,
 		holdCap:     HoldCap,
+		newProber:   func() *Prober { return NewProber(ProbeEvery, ProbeTimeout, nil) },
 	}
 }
 
-// initLocked creates the limiter and prober on first use. Callers hold mu.
-func (s *sharedState) initLocked(log *zap.Logger) {
-	if s.lim == nil {
-		s.lim = NewLimiter(nil)
+// transitionLocked is the only writer of the phase. It also creates or drops
+// the resources that phase has, in the same step, so a stale table can never
+// survive behind a nil limiter. Callers hold mu.
+func (s *sharedState) transitionLocked(next Phase) {
+	prev := s.st.phase
+	if prev == next {
+		return
 	}
-	if s.prober == nil {
-		s.prober = NewProber(ProbeEvery, ProbeTimeout, nil)
+	switch next {
+	case PhaseBooting:
+		s.st = edgeState{phase: PhaseBooting}
+	case PhaseLoaded:
+		if s.st.lim == nil {
+			s.st.lim = NewLimiter(nil)
+		}
+		if s.st.prober == nil {
+			s.st.prober = s.newProber()
+		}
+		s.st.phase = PhaseLoaded
+	case PhaseDraining:
+		if s.st.prober != nil {
+			s.st.prober.Stop()
+		}
+		s.st = edgeState{phase: PhaseDraining}
 	}
-	if log != nil {
-		s.log = log
+	if s.log != nil {
+		s.log.Info("edge: phase transition",
+			zap.String("from", prev.String()),
+			zap.String("to", next.String()))
 	}
 }
 
+// retain is the Provision transition: join the shared state, reviving it
+// from Draining when this is the first instance after a full cleanup.
 func (s *sharedState) retain(log *zap.Logger) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if log != nil {
+		s.log = log
+	}
 	s.refs++
-	s.initLocked(log)
+	if s.st.phase == PhaseDraining {
+		s.transitionLocked(PhaseBooting)
+	}
 }
 
+// release is the Cleanup transition: the last instance leaving drains the
+// shared state, so no request can be served from a table whose limiter and
+// prober are gone.
 func (s *sharedState) release() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.refs > 0 {
 		s.refs--
 	}
-	if s.refs == 0 && s.prober != nil {
-		s.prober.Stop()
-		s.prober = nil
-		s.lim = nil
+	if s.refs == 0 && s.st.phase != PhaseDraining {
+		s.transitionLocked(PhaseDraining)
 	}
 }
 
-// swap installs a table and converges the prober and limiter state.
-// Asleep routes are never probed: the wake hop waits for the fleet's
-// health gate itself, so probing them would only burn checks on a
-// deliberately parked fleet.
-func (s *sharedState) swap(t *Table) {
+// snapshot is the consistent phase, table and limiter one request serves
+// from. The table is immutable once installed, so it is safe to read after
+// the lock is released.
+func (s *sharedState) snapshot() edgeSnapshot {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.swapLocked(t)
+	return edgeSnapshot{phase: s.st.phase, tab: s.st.tab, lim: s.st.lim}
 }
 
-// swapLocked is swap with the mutex held, so an admin push's generation
-// check, the table store, prober.Track and lim.Sweep are one atomic step:
-// overlapping pushes (or a push racing the Provision load) cannot
-// interleave them.
-func (s *sharedState) swapLocked(t *Table) {
-	s.initLocked(nil)
-	s.tab.Store(t)
-	s.loaded = true
+// table returns the installed table, or nil before the first install.
+func (s *sharedState) table() *Table {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.st.tab
+}
+
+// logger returns the current logger, or nil before the first Provision.
+func (s *sharedState) logger() *zap.Logger {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.log
+}
+
+// Install is what installing a table did.
+//
+//	stateDiagram-v2
+//	    [*] --> Applied: no table installed yet
+//	    [*] --> Stale: generation older than the live table
+//	    [*] --> Identical: same generation and byte-equal content
+//	    [*] --> Applied: same generation, different content
+//	    [*] --> Invalid: Validate refused it
+//
+// Both writers — the table file read in Provision and an admin push — go
+// through install, so a config reload can no longer re-install a file older
+// than a table the runner has pushed since.
+type Install uint8
+
+const (
+	// InstallApplied means the table now serves.
+	InstallApplied Install = iota
+	// InstallStale means an older generation arrived too late.
+	InstallStale
+	// InstallIdentical means the re-push changed nothing.
+	InstallIdentical
+	// InstallInvalid means Validate refused the table.
+	InstallInvalid
+)
+
+// String names the outcome for logs and test failures.
+func (i Install) String() string {
+	switch i {
+	case InstallApplied:
+		return "applied"
+	case InstallStale:
+		return "stale"
+	case InstallIdentical:
+		return "identical"
+	case InstallInvalid:
+		return "invalid"
+	}
+	return "unknown"
+}
+
+// install validates and installs t, converging the phase, prober and limiter
+// in one locked step: overlapping pushes, or a push racing the Provision
+// load, cannot interleave them. A refused table leaves the live one serving
+// and returns the reason.
+func (s *sharedState) install(t *Table) (Install, error) {
+	if t.Exact == nil {
+		t.Exact = make(map[string]Route)
+	}
+	if err := t.Validate(); err != nil {
+		return InstallInvalid, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if cur := s.st.tab; cur != nil {
+		if t.Generation < cur.Generation {
+			return InstallStale, fmt.Errorf("edge: generation %d older than current %d", t.Generation, cur.Generation)
+		}
+		if t.Generation == cur.Generation && reflect.DeepEqual(cur, t) {
+			return InstallIdentical, nil
+		}
+	}
+	s.transitionLocked(PhaseLoaded)
+	s.st.tab = t
+	s.reconcileLocked(t)
+	return InstallApplied, nil
+}
+
+// reconcileLocked tracks exactly the upstreams a hold can wait on and drops
+// the limiter zones the table no longer references. Asleep routes are never
+// probed: the wake hop waits for the fleet's health gate itself, so probing
+// them would only burn checks on a deliberately parked fleet. Callers hold
+// mu.
+func (s *sharedState) reconcileLocked(t *Table) {
 	keep := make(map[string]bool)
 	fleet := make(map[string]bool)
 	collect := func(r Route) {
+		m := r.mode()
 		if r.ClientZone != "" {
 			keep[r.ClientZone] = true
 		}
 		if r.AppZone != "" {
 			keep[r.AppZone] = true
 		}
-		if FleetKind(r.Kind) && !r.Asleep && r.Upstream != "" {
+		if m.Hold() && r.Upstream != "" {
 			fleet[r.Upstream] = true
 		}
 	}
@@ -150,8 +316,8 @@ func (s *sharedState) swapLocked(t *Table) {
 	for _, w := range t.Wildcards {
 		collect(w.Route)
 	}
-	s.prober.Track(fleet)
-	s.lim.Sweep(keep, time.Hour)
+	s.st.prober.Track(fleet)
+	s.st.lim.Sweep(keep, time.Hour)
 }
 
 // EdgeRoutes holds the pushed route table and serves it per request.
@@ -176,19 +342,35 @@ func (*EdgeRoutes) CaddyModule() caddy.ModuleInfo {
 }
 
 // Provision joins the shared state and loads the table file (written by
-// the runner before Caddy starts; a missing file leaves the edge
-// unloaded — 503 — until the first push).
+// the runner before Caddy starts; a missing file leaves the edge booting —
+// 503 — until the first push). The file is installed through the same
+// generation ordering as a push, so a config reload never re-installs a
+// table older than the one already live.
 func (e *EdgeRoutes) Provision(ctx caddy.Context) error {
 	if e.TablePath == "" {
 		return fmt.Errorf("edge_routes: table path is required")
 	}
-	shared.retain(ctx.Logger())
+	log := ctx.Logger()
+	shared.retain(log)
 	t, err := loadTable(e.TablePath)
 	if err != nil {
-		ctx.Logger().Warn("edge_routes: no table yet", zap.Error(err))
+		log.Warn("edge_routes: no table yet", zap.Error(err))
 		return nil
 	}
-	shared.swap(t)
+	outcome, err := shared.install(t)
+	switch outcome {
+	case InstallApplied:
+		log.Info("edge_routes: table loaded",
+			zap.Uint64("generation", t.Generation),
+			zap.Int("exact", len(t.Exact)),
+			zap.Int("wildcards", len(t.Wildcards)))
+	case InstallInvalid:
+		log.Warn("edge_routes: ignoring invalid table file", zap.Error(err))
+	case InstallStale, InstallIdentical:
+		log.Debug("edge_routes: table file is not newer than the live table",
+			zap.Uint64("generation", t.Generation),
+			zap.String("outcome", outcome.String()))
+	}
 	return nil
 }
 
@@ -212,6 +394,8 @@ func (e *EdgeRoutes) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 	return parseInto(e, d)
 }
 
+// loadTable decodes the table file. install owns normalization and
+// validation, so the file and a push are judged by the same code.
 func loadTable(path string) (*Table, error) {
 	raw, err := os.ReadFile(path)
 	if err != nil {
@@ -221,61 +405,60 @@ func loadTable(path string) (*Table, error) {
 	if err := json.Unmarshal(raw, &t); err != nil {
 		return nil, err
 	}
-	if t.Exact == nil {
-		t.Exact = make(map[string]Route)
-	}
-	if err := t.Validate(); err != nil {
-		return nil, err
-	}
 	return &t, nil
 }
 
 // ServeHTTP implements caddyhttp.MiddlewareHandler.
 func (e *EdgeRoutes) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
-	t := shared.tab.Load()
-	// Snapshot shared pointers under the mutex: swap/release publish
-	// them there, and the limiter/prober have their own internal locks
-	// for use after the snapshot.
-	shared.mu.Lock()
-	loaded, lim := shared.loaded, shared.lim
-	shared.mu.Unlock()
-	if t == nil || !loaded || lim == nil {
+	snap := shared.snapshot()
+	switch snap.phase {
+	case PhaseBooting:
+		// Provisioned, nothing pushed yet: the boot gap.
 		http.Error(w, "edge starting", http.StatusServiceUnavailable)
 		return nil
+	case PhaseDraining:
+		// The last instance cleaned up. Nothing is left to route with, and
+		// this is not a boot: say so instead of blaming a missing table.
+		http.Error(w, "edge shutting down", http.StatusServiceUnavailable)
+		return nil
 	}
-	route, ok := t.Lookup(r.Host)
+	route, ok := snap.tab.Lookup(r.Host)
 	if !ok {
 		// No route with a loaded table: 404, as Caddy did for unmatched
 		// hosts. The 503 above is only for the boot gap.
 		http.Error(w, "not found", http.StatusNotFound)
 		return nil
 	}
-	if route.Kind == KindDeny {
+	mode := route.mode()
+	if mode.Deny() {
 		http.Error(w, "not found", http.StatusNotFound)
 		return nil
 	}
 	if route.ClientRPM > 0 {
 		clientIP, _ := caddyhttp.GetVar(r.Context(), caddyhttp.ClientIPVarKey).(string)
-		if allowed, retry := lim.Allow(route.ClientZone, route.ClientRPM, ClientKey(clientIP)); !allowed {
+		if allowed, retry := snap.lim.Allow(route.ClientZone, route.ClientRPM, ClientKey(clientIP)); !allowed {
 			w.Header().Set("Retry-After", fmt.Sprintf("%d", int(retry.Seconds())))
 			http.Error(w, "rate limited", http.StatusTooManyRequests)
 			return nil
 		}
 	}
 	if route.AppRPM > 0 {
-		if allowed, retry := lim.Allow(route.AppZone, route.AppRPM, "all"); !allowed {
+		if allowed, retry := snap.lim.Allow(route.AppZone, route.AppRPM, "all"); !allowed {
 			w.Header().Set("Retry-After", fmt.Sprintf("%d", int(retry.Seconds())))
 			http.Error(w, "rate limited", http.StatusTooManyRequests)
 			return nil
 		}
 	}
-	caddyhttp.SetVar(r.Context(), VarRoute, route.Kind)
+	caddyhttp.SetVar(r.Context(), VarRoute, mode.Kind())
 	caddyhttp.SetVar(r.Context(), VarUpstream, route.Upstream)
-	if route.Asleep {
+	if mode.Wake() {
 		caddyhttp.SetVar(r.Context(), VarWake, "1")
 	}
-	if route.Gated {
+	if mode.Gate() {
 		caddyhttp.SetVar(r.Context(), VarGate, "1")
+	}
+	if mode.Hold() {
+		caddyhttp.SetVar(r.Context(), VarHold, "1")
 	}
 	return next.ServeHTTP(w, r)
 }
@@ -315,26 +498,37 @@ func (EdgeHold) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 }
 
 // ServeHTTP implements caddyhttp.MiddlewareHandler.
+//
+//	stateDiagram-v2
+//	    [*] --> Skipped: VarHold != 1 (not a held route, or EdgeRoutes did not run)
+//	    [*] --> Passing: health is Up or Untracked (fail open)
+//	    Skipped --> [*]: proxy
+//	    Passing --> [*]: proxy
+//	    [*] --> Holding: health is Down
+//	    Holding --> Ready: Wait reports Ready
+//	    Holding --> Abandoned: Wait reports Abandoned (route changed)
+//	    Holding --> TimedOut: Wait reports TimedOut
+//	    Ready --> [*]: proxy
+//	    Abandoned --> [*]: proxy
+//	    TimedOut --> [*]: 503, handle_errors renders the starting page
 func (EdgeHold) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
-	route, _ := caddyhttp.GetVar(r.Context(), VarRoute).(string)
+	// The hold decision is made once, in EdgeRoutes, and published as
+	// VarHold: EdgeHold never re-derives it from the kind or the wake var.
+	if hold, _ := caddyhttp.GetVar(r.Context(), VarHold).(string); hold != "1" {
+		return next.ServeHTTP(w, r)
+	}
 	upstream, _ := caddyhttp.GetVar(r.Context(), VarUpstream).(string)
-	if !FleetKind(route) || upstream == "" {
-		return next.ServeHTTP(w, r)
-	}
-	if wake, _ := caddyhttp.GetVar(r.Context(), VarWake).(string); wake == "1" {
-		return next.ServeHTTP(w, r)
-	}
 	shared.mu.Lock()
-	prober, recheck, cap := shared.prober, shared.holdRecheck, shared.holdCap
+	prober, recheck, cap := shared.st.prober, shared.holdRecheck, shared.holdCap
 	shared.mu.Unlock()
-	if prober == nil || prober.Healthy(upstream) {
+	if prober == nil || prober.Health(upstream) != HealthDown {
 		return next.ServeHTTP(w, r)
 	}
 	// Held before any byte is sent (POSTs are never sent early). On
 	// recovery the request proxies; on timeout return a 503 error so
 	// the static handle_errors renders the starting page — proxying
 	// anyway would stack the hold cap on top of lb_try_duration.
-	if !prober.WaitHealthy(upstream, recheck, cap) {
+	if prober.Wait(upstream, recheck, cap) == WaitTimedOut {
 		return caddyhttp.Error(http.StatusServiceUnavailable, fmt.Errorf("edge: upstream %s not ready", upstream))
 	}
 	return next.ServeHTTP(w, r)
@@ -370,7 +564,7 @@ func (*EdgeAdmin) Routes() []caddy.AdminRoute {
 func handleAdmin(w http.ResponseWriter, r *http.Request) error {
 	switch r.Method {
 	case http.MethodGet:
-		t := shared.tab.Load()
+		t := shared.table()
 		var gen uint64
 		var n int
 		if t != nil {
@@ -386,52 +580,32 @@ func handleAdmin(w http.ResponseWriter, r *http.Request) error {
 				Err:        fmt.Errorf("edge: bad route table: %w", err),
 			}
 		}
-		if t.Exact == nil {
-			t.Exact = make(map[string]Route)
-		}
-		if err := t.Validate(); err != nil {
+		// The generation ordering, the store, prober.Track and lim.Sweep
+		// are one locked step in install, so overlapping pushes (or a push
+		// racing the Provision load) cannot interleave them.
+		log := shared.logger()
+		outcome, err := shared.install(&t)
+		switch outcome {
+		case InstallInvalid:
 			return caddy.APIError{HTTPStatus: http.StatusBadRequest, Err: err}
-		}
-		// Generations are monotonic (persisted in the file): an older
-		// table landing last would un-publish newer routes. The check, the
-		// store, prober.Track and lim.Sweep are one locked step, so
-		// overlapping pushes (or a push racing the Provision load) cannot
-		// interleave them.
-		shared.mu.Lock()
-		log := shared.log
-		var curGen uint64
-		var hasCur bool
-		if cur := shared.tab.Load(); cur != nil {
-			curGen, hasCur = cur.Generation, true
-		}
-		if hasCur && t.Generation < curGen {
-			shared.mu.Unlock()
-			return caddy.APIError{
-				HTTPStatus: http.StatusConflict,
-				Err:        fmt.Errorf("edge: generation %d older than current %d", t.Generation, curGen),
-			}
-		}
-		// No-op re-pushes (the runner re-pushes every tick as a backstop)
-		// stay quiet; only a new generation logs at info, so the lane can
-		// assert pushes happened and operators can see real changes.
-		if hasCur && t.Generation == curGen {
-			shared.mu.Unlock()
+		case InstallStale:
+			return caddy.APIError{HTTPStatus: http.StatusConflict, Err: err}
+		case InstallIdentical:
+			// No-op re-pushes (the runner re-pushes every tick as a
+			// backstop) stay quiet; only a new generation logs at info, so
+			// the lane can assert pushes happened and operators can see
+			// real changes.
 			if log != nil {
 				log.Debug("edge_routes: table re-push (unchanged)",
 					zap.Uint64("generation", t.Generation))
 			}
-			return writeJSON(w, map[string]any{
-				"generation": t.Generation,
-				"routes":     len(t.Exact) + len(t.Wildcards),
-			})
-		}
-		shared.swapLocked(&t)
-		shared.mu.Unlock()
-		if log != nil {
-			log.Info("edge_routes: table pushed",
-				zap.Uint64("generation", t.Generation),
-				zap.Int("exact", len(t.Exact)),
-				zap.Int("wildcards", len(t.Wildcards)))
+		case InstallApplied:
+			if log != nil {
+				log.Info("edge_routes: table pushed",
+					zap.Uint64("generation", t.Generation),
+					zap.Int("exact", len(t.Exact)),
+					zap.Int("wildcards", len(t.Wildcards)))
+			}
 		}
 		return writeJSON(w, map[string]any{
 			"generation": t.Generation,

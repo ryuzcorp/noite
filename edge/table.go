@@ -28,11 +28,108 @@ const (
 	KindDeny     = "deny"
 )
 
-// FleetKinds need the readiness hold: their upstream is a tenant fleet that
-// may be restarting while the route exists.
-func FleetKind(kind string) bool {
-	return kind == KindTenant || kind == KindCustom || kind == KindEnv
+// Shape is the closed set of routing behaviors a wire kind has.
+//
+// The static Caddyfile still branches on the kind string, which the module
+// publishes as {http.vars.edge_route}; Shape is what the Go handlers branch
+// on instead of re-inferring behavior from that string.
+type Shape uint8
+
+const (
+	// ShapeDeny answers 404 to every request before any hop or limit.
+	ShapeDeny Shape = iota
+	// ShapeProxy is the control plane, the API and git smart-HTTP: a plain
+	// local reverse proxy with no readiness hold.
+	ShapeProxy
+	// ShapeFleet is a tenant app or custom domain: a fleet upstream that
+	// may be restarting while the route exists.
+	ShapeFleet
+	// ShapeEnv is a live environment: a fleet upstream that can also be
+	// gated (forward_auth /v1/edge/env-gate) and woken.
+	ShapeEnv
+	// ShapeParked is a live environment with no fleet port yet: the
+	// runner's fallback page, no readiness hold.
+	ShapeParked
+	// ShapePreview is the pod preview host on the control plane.
+	ShapePreview
+	// ShapeFallback is the per-app and per-base wildcard fallback page.
+	ShapeFallback
+)
+
+// shapeOf maps a wire kind to its shape; ok is false for a kind this build
+// does not know (a newer runner, or a hand-written table).
+func shapeOf(kind string) (Shape, bool) {
+	switch kind {
+	case KindControl, KindAPI, KindGit:
+		return ShapeProxy, true
+	case KindTenant, KindCustom:
+		return ShapeFleet, true
+	case KindEnv:
+		return ShapeEnv, true
+	case KindEnvPark:
+		return ShapeParked, true
+	case KindPreview:
+		return ShapePreview, true
+	case KindFallback:
+		return ShapeFallback, true
+	case KindDeny:
+		return ShapeDeny, true
+	}
+	return ShapeDeny, false
 }
+
+// Mode is a route's behavior, derived once from its wire fields by
+// Route.mode. It is the single answer to "does this route deny, hold, wake
+// or gate?", so no handler re-infers behavior from the kind string.
+//
+//	stateDiagram-v2
+//	    [*] --> Deny: kind=deny
+//	    [*] --> Proxy: kind=control|api|git
+//	    [*] --> Fleet: kind=tenant|custom
+//	    [*] --> Env: kind=env
+//	    [*] --> Parked: kind=env-parked
+//	    [*] --> Preview: kind=preview
+//	    [*] --> Fallback: kind=fallback
+//
+// Only a Fleet or an awake Env holds; Asleep wakes; Gated gates. Validate
+// refuses every wire combination those rules cannot express.
+type Mode struct {
+	shape  Shape
+	kind   string
+	asleep bool
+	gated  bool
+}
+
+// mode derives the route's behavior. An unknown kind never reaches here: a
+// table is validated before it is installed. It maps to Deny anyway, so the
+// impossible case fails closed instead of proxying.
+func (r Route) mode() Mode {
+	m := Mode{kind: r.Kind, asleep: r.Asleep, gated: r.Gated}
+	if shape, ok := shapeOf(r.Kind); ok {
+		m.shape = shape
+	}
+	return m
+}
+
+// Kind is the wire kind the static config branches on.
+func (m Mode) Kind() string { return m.kind }
+
+// Deny reports whether the route answers 404 before any hop or limit.
+func (m Mode) Deny() bool { return m.shape == ShapeDeny }
+
+// Hold reports whether the request must wait for its upstream's readiness
+// probe. Only an awake fleet or environment is held: the wake hop and the
+// env gate wait for the fleet themselves, and the other shapes have no
+// fleet to wait for.
+func (m Mode) Hold() bool {
+	return (m.shape == ShapeFleet || m.shape == ShapeEnv) && !m.asleep
+}
+
+// Wake reports whether the static config must run the wake hop.
+func (m Mode) Wake() bool { return m.asleep }
+
+// Gate reports whether the static config must run the env gate.
+func (m Mode) Gate() bool { return m.gated }
 
 // Route is one host's edge behavior, fully resolved by the runner.
 type Route struct {
@@ -91,10 +188,11 @@ func validUpstream(upstream string) bool {
 	return n > 0
 }
 
-func validKind(kind string) bool {
+// rewritesKind reports the kinds the static config rewrites: git's smart
+// HTTP path and the runner's fallback page.
+func rewritesKind(kind string) bool {
 	switch kind {
-	case KindControl, KindAPI, KindGit, KindTenant, KindCustom,
-		KindEnv, KindEnvPark, KindPreview, KindFallback, KindDeny:
+	case KindGit, KindEnvPark, KindFallback:
 		return true
 	}
 	return false
@@ -127,13 +225,25 @@ func (t *Table) Validate() error {
 	return nil
 }
 
+// validate is the one place a wire Route is refused. Every check answers
+// the same question Route.mode does later: which behavior can this
+// combination express? A field no shape can act on is a runner bug, and
+// silently ignoring it would leave the route doing something other than
+// what its table says.
 func (r Route) validate() error {
-	if !validKind(r.Kind) {
+	shape, ok := shapeOf(r.Kind)
+	if !ok {
 		return fmt.Errorf("unknown kind %q", r.Kind)
 	}
-	if r.Kind == KindDeny {
+	if shape == ShapeDeny {
 		if r.Upstream != "" || r.Rewrite != "" {
 			return fmt.Errorf("deny route must not set upstream or rewrite")
+		}
+		if r.Asleep || r.Gated {
+			return fmt.Errorf("deny route must not sleep or gate")
+		}
+		if r.ClientRPM > 0 || r.AppRPM > 0 {
+			return fmt.Errorf("deny route must not set rate limits")
 		}
 		return nil
 	}
@@ -148,6 +258,15 @@ func (r Route) validate() error {
 	}
 	if r.AppRPM > 0 && r.AppZone == "" {
 		return fmt.Errorf("app_rpm without app_zone")
+	}
+	if r.Asleep && !(shape == ShapeFleet || shape == ShapeEnv || shape == ShapeParked) {
+		return fmt.Errorf("kind %q must not be asleep", r.Kind)
+	}
+	if r.Gated && !(shape == ShapeEnv || shape == ShapeParked) {
+		return fmt.Errorf("kind %q must not be gated", r.Kind)
+	}
+	if r.Rewrite != "" && !rewritesKind(r.Kind) {
+		return fmt.Errorf("kind %q must not set rewrite", r.Kind)
 	}
 	return nil
 }
