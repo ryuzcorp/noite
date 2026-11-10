@@ -67,6 +67,14 @@ sensitive:
   # runner and tenant backends. A wrong row exposes an internal service.
   - "apps/runner/src/host/edge.rs"
   - "apps/runner/src/host/edge_table.rs"
+  # The Caddy module built into the image (`edge/`, xcaddy stage): it owns the
+  # table, the wildcard/exact match and the per-host rate limits, so a bug
+  # there can route a tenant hostname to an internal upstream or lift a limit.
+  - "edge/**"
+  # The static Caddyfile writer that consumes that table: its `handle` blocks,
+  # `forward_auth` gate/asleep hops and guard lines define the same behavior,
+  # so dropping or reordering one there exposes a backend just as well.
+  - "apps/runner/src/host/caddy.rs"
 
   # Secrets and environment handling: env loading, per-app/per-environment
   # values, the env-auth route, and the documented secret surface itself.
