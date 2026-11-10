@@ -2,6 +2,7 @@
 //! control-plane card above it. The create form lives in ./create-form.
 
 import { Link, useRouter } from "@ilha/void";
+import { Data } from "effect";
 import { atom } from "ilha";
 
 import { api } from "../api";
@@ -36,22 +37,54 @@ import { ChevronRight } from "../ui/icons";
 import { ListSkeleton } from "../ui/skeletons";
 import { appUrl, presenceTone } from "./identity";
 
+/** One invitation's answer. `Failed` names the invitation it is about, so the
+ * error sits on the row that produced it instead of under the whole banner. */
+export type InviteAction = Data.TaggedEnum<{
+  Answering: { accept: boolean; id: string };
+  Failed: { error: string; id: string };
+  Idle: Record<never, never>;
+}>;
+
+export const Invite = Data.taggedEnum<InviteAction>();
+
+export type InviteMessage = Data.TaggedEnum<{
+  Answered: Record<never, never>;
+  Answering: { accept: boolean; id: string };
+  Failed: { error: string; id: string };
+}>;
+
+const InviteMsg = Data.taggedEnum<InviteMessage>();
+
+/** The banner's whole machine: `Idle → Answering → Idle` (answered) or
+ * `Failed`; a new answer clears the last error. One answer at a time, because
+ * an accept navigates away and two in flight would race the visit. */
+export const answerInvite = (
+  state: InviteAction,
+  message: InviteMessage
+): InviteAction =>
+  InviteMsg.$match(message, {
+    Answered: () => Invite.Idle(),
+    Answering: (started) =>
+      Invite.Answering({ accept: started.accept, id: started.id }),
+    Failed: (failed) => Invite.Failed({ error: failed.error, id: failed.id }),
+  });
+
 /** Collaborator invitations addressed to this account's email: nothing is
  * granted until the person accepts here. Renders nothing when there are none. */
 const InvitationsBanner = () => {
   const router = useRouter();
   const res = myInvitations();
-  const busy = atom(false);
-  const notice = atom("");
+  const action = atom<InviteAction>(Invite.Idle());
   const invites = resourceValue(res.state()) ?? [];
 
-  if (invites.length === 0 && !notice()) {
+  if (invites.length === 0 && action()._tag !== "Failed") {
     return null;
   }
 
   const answer = async (inviteId: string, accept: boolean) => {
-    busy.set(true);
-    notice.set("");
+    action.set(
+      answerInvite(action(), InviteMsg.Answering({ accept, id: inviteId }))
+    );
 
     try {
       if (accept) {
@@ -62,20 +95,25 @@ const InvitationsBanner = () => {
 
         invalidate(keys.myInvitations);
         router.visit(`/apps/${appId}`);
-      } else {
-        await api<{ ok: true }>(
-          "/api/collaborators/declineInvitation",
-          inviteId
-        );
-        invalidate(keys.myInvitations);
+
+        return;
       }
+
+      await api<{ ok: true }>("/api/collaborators/declineInvitation", inviteId);
+      invalidate(keys.myInvitations);
+      action.set(answerInvite(action(), InviteMsg.Answered()));
     } catch (error) {
-      notice.set(errorMessage(error));
+      action.set(
+        answerInvite(
+          action(),
+          InviteMsg.Failed({ error: errorMessage(error), id: inviteId })
+        )
+      );
       invalidate(keys.myInvitations);
     }
-
-    busy.set(false);
   };
+
+  const state = action;
 
   return (
     <section
@@ -84,41 +122,59 @@ const InvitationsBanner = () => {
     >
       <div class="card-body gap-2 p-4">
         <h2 class="m-0 text-lg font-semibold">Invitations</h2>
-        {notice() ? <p class="text-error m-0 text-sm">{notice()}</p> : null}
         <ul class="m-0 flex list-none flex-col gap-2 p-0">
-          {invites.map((invite) => (
-            <li
-              key={invite.id}
-              class="flex flex-wrap items-center justify-between gap-2 text-sm"
-            >
-              <span>
-                Join <strong>{invite.appName}</strong> as{" "}
-                <span class="badge badge-ghost badge-sm">{invite.role}</span>
-              </span>
-              <span class="flex gap-2">
-                <button
-                  type="button"
-                  class="btn btn-sm btn-neutral"
-                  disabled={busy()}
-                  onclick={() => {
-                    void answer(invite.id, true);
-                  }}
-                >
-                  Accept
-                </button>
-                <button
-                  type="button"
-                  class="btn btn-sm btn-ghost"
-                  disabled={busy()}
-                  onclick={() => {
-                    void answer(invite.id, false);
-                  }}
-                >
-                  Decline
-                </button>
-              </span>
-            </li>
-          ))}
+          {invites.map((invite) => {
+            const current = state();
+
+            const mine =
+              current._tag === "Answering" && current.id === invite.id
+                ? current
+                : null;
+
+            const error =
+              current._tag === "Failed" && current.id === invite.id
+                ? current.error
+                : "";
+
+            return (
+              <li
+                key={invite.id}
+                class="flex flex-wrap items-center justify-between gap-2 text-sm"
+              >
+                <span>
+                  Join <strong>{invite.appName}</strong> as{" "}
+                  <span class="badge badge-ghost badge-sm">{invite.role}</span>
+                </span>
+                <span class="flex gap-2">
+                  <button
+                    type="button"
+                    class="btn btn-sm btn-neutral"
+                    disabled={current._tag === "Answering"}
+                    aria-busy={mine?.accept === true ? "true" : "false"}
+                    onclick={() => {
+                      void answer(invite.id, true);
+                    }}
+                  >
+                    {mine?.accept === true ? "Accepting…" : "Accept"}
+                  </button>
+                  <button
+                    type="button"
+                    class="btn btn-sm btn-ghost"
+                    disabled={current._tag === "Answering"}
+                    aria-busy={mine?.accept === false ? "true" : "false"}
+                    onclick={() => {
+                      void answer(invite.id, false);
+                    }}
+                  >
+                    {mine?.accept === false ? "Declining…" : "Decline"}
+                  </button>
+                </span>
+                {error ? (
+                  <span class="text-error m-0 w-full text-sm">{error}</span>
+                ) : null}
+              </li>
+            );
+          })}
         </ul>
       </div>
     </section>
