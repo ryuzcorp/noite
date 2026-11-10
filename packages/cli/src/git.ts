@@ -27,8 +27,16 @@ const runGit = (
     return proc.stdout;
   });
 
-/** Which remote shape a push targets: a bootstrap (no `main` yet, so the ref
- * is created) or a fast-forward onto the existing tip. */
+/** Which remote shape a push targets, decided once by `remoteState`:
+ *
+ * ```mermaid
+ * stateDiagram-v2
+ *   [*] --> Bootstrap: ls-remote has no refs/heads/main
+ *   [*] --> FastForward: refs/heads/main exists
+ * ```
+ *
+ * `Bootstrap` creates the ref (`init` + `remote add`); `FastForward` clones
+ * the existing tip and commits on top of it. */
 export type PushMode = Data.TaggedEnum<{
   Bootstrap: Record<never, never>;
   FastForward: Record<never, never>;

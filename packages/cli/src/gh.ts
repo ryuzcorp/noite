@@ -146,7 +146,16 @@ export const parseCommentMode = (raw: string): CommentMode | null =>
   raw === "update" || raw === "create" || raw === "off" ? raw : null;
 
 /** What happened to the deploy comment. `Failed` still lets the deploy pass;
- * the warning names the failing `gh` exit. */
+ * the warning names the failing `gh` exit.
+ *
+ * | From | Event | To |
+ * | --- | --- | --- |
+ * | any | `mode = off` | `Off` |
+ * | any | no repo / no PR | `Skipped` |
+ * | create | `gh` exit 0 | `Posted` |
+ * | update | marker absent, `gh` exit 0 | `Posted` |
+ * | update | marker present, `gh` exit 0 | `Updated{id}` |
+ * | any | `gh` non-zero / unreadable list | `Failed{reason}` | */
 export type CommentOutcome = Data.TaggedEnum<{
   Failed: { readonly reason: string };
   Off: Record<never, never>;

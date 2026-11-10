@@ -9,8 +9,8 @@
  * ```mermaid
  * stateDiagram-v2
  *   [*] --> Checking: flags + env + GITHUB_REPOSITORY
- *   Checking --> Refused: no slug / no key / malformed git base
- *   Checking --> Resolved: slug + token + control base
+ *   Checking --> Refused: MissingSlug | MissingKey | MalformedBase
+ *   Checking --> Resolved: slug + token + one Base (Local | Prod | Custom)
  * ```
  *
  * The control base is itself a closed union, so "local install", "prod
