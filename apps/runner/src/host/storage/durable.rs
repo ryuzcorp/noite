@@ -80,7 +80,9 @@ pub async fn do_instances(cfg: &Config, app: &App, class_name: &str) -> anyhow::
     // fetch runs (the sample Counter reports { n } without advancing it); a
     // missing/unresponsive instance leaves the cell blank.
     for instance in &mut instances {
-        instance.preview = probe_instance(app, &instance.scope).await;
+        instance.preview = probe_instance(app, &instance.scope)
+            .await
+            .into_preview(&instance.scope);
     }
     Ok(DoPreview {
         app_id: app.id.clone(),
@@ -90,14 +92,58 @@ pub async fn do_instances(cfg: &Config, app: &App, class_name: &str) -> anyhow::
     })
 }
 
+/// What one `?read=1` probe found. The wire keeps today's single
+/// `preview: Option<String>` (blank cell for every non-preview outcome), but
+/// the reasons are distinct here so operators and agents can tell a stale
+/// token from a dead fleet (ROTH-3/ROTH-15) — the missing port, the missing
+/// operator token, a refusal and an unreachable node are not the same failure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DoProbe {
+    /// The object's handler answered; this is its capped body.
+    Preview(String),
+    /// No internal listener to probe (the fleet never advertised one).
+    NoPort,
+    /// The node refused the request (a 401 from a bare probe, a 404 for a
+    /// gone instance, …). The body is never surfaced: it is the app's.
+    Refused(u16),
+    /// The request itself failed (timeout, connection refused).
+    Unreachable,
+}
+
+impl DoProbe {
+    /// The wire view: only a real preview is content; every failure is a
+    /// blank cell, exactly as before, with the reason kept in the debug log
+    /// so a stale operator token is not mistaken for a dead fleet.
+    fn into_preview(self, scope: &str) -> Option<String> {
+        match self {
+            Self::Preview(body) => Some(body),
+            Self::NoPort => {
+                tracing::debug!(scope, "do probe skipped: no internal port");
+                None
+            }
+            Self::Refused(status) => {
+                tracing::debug!(scope, status, "do probe refused");
+                None
+            }
+            Self::Unreachable => {
+                tracing::debug!(scope, "do probe unreachable");
+                None
+            }
+        }
+    }
+}
+
 /// `GET /do/{scope}?read=1` on the fleet's internal listener, capped and
 /// best-effort. The loopback address matches ensure_fleet's --advertise;
 /// rootless podman routes it to the fleet child in the runner's netns. The
 /// fleet's operator token rides as a Bearer token (the node requires it on
-/// every internal route); without a cached token the probe goes out bare
-/// and a 401 reads as missing, exactly as an unresponsive instance does.
-async fn probe_instance(app: &App, scope: &str) -> Option<String> {
-    let port = app.internal_port?;
+/// every internal route); without a cached token the probe goes out bare and
+/// a 401 is a `Refused(401)` — the same blank cell on the wire, but no longer
+/// indistinguishable from a dead fleet in the probe's own state.
+async fn probe_instance(app: &App, scope: &str) -> DoProbe {
+    let Some(port) = app.internal_port else {
+        return DoProbe::NoPort;
+    };
     let url = format!("http://127.0.0.1:{port}/do/{scope}?read=1");
     let scope_key = crate::host::credentials::Scope::app(app).key();
     let mut request = reqwest::Client::new()
@@ -107,18 +153,18 @@ async fn probe_instance(app: &App, scope: &str) -> Option<String> {
         request = request.bearer_auth(token);
     }
     let Ok(response) = request.send().await else {
-        return None;
+        return DoProbe::Unreachable;
     };
     // A refusal (a 401 without the token, a 404 for a gone instance) is
     // missing, not a preview: surfacing the refusal body would misreport
     // tenant-visible data.
     if !response.status().is_success() {
-        return None;
+        return DoProbe::Refused(response.status().as_u16());
     }
     let Ok(body) = response.text().await else {
-        return None;
+        return DoProbe::Unreachable;
     };
-    Some(body.chars().take(2000).collect())
+    DoProbe::Preview(body.chars().take(2000).collect())
 }
 
 #[cfg(test)]
@@ -197,7 +243,7 @@ mod tests {
             tokio::spawn(serve_status(listener, status, body));
             let app = seed_app_on(&pool, port).await;
             assert_eq!(
-                probe_instance(&app, "scope").await,
+                probe_instance(&app, "scope").await.into_preview("scope"),
                 None,
                 "{status} is missing"
             );
@@ -210,7 +256,7 @@ mod tests {
         let app = seed_app_on(&pool, port).await;
         assert_eq!(
             probe_instance(&app, "scope").await,
-            Some(r#"{"n":1}"#.to_string()),
+            DoProbe::Preview(r#"{"n":1}"#.to_string()),
             "a 200 previews"
         );
         pool.close().await;

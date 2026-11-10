@@ -2,6 +2,10 @@ import { describe, expect, test } from "bun:test";
 
 import { collectSpecifiers, EsmTypes } from "./esm-fetch";
 import {
+  Budget,
+  budgetTransition,
+  MAX_TYPES_BYTES,
+  MAX_TYPES_FILES,
   canonicalUrl,
   collectVersions,
   declarationTargets,
@@ -778,5 +782,54 @@ describe("esm.sh acquisition", () => {
       expect(written.size).toBe(files);
       expect(changed()).toBe(notified + 1);
     });
+  });
+});
+
+const openBudget = () => Budget.Open({ bytes: 0, files: 0 });
+
+describe("the declaration budget", () => {
+  test("declarations spend the budget and the caps close it", () => {
+    const spent = budgetTransition(openBudget(), { bytes: 10, t: "spend" });
+
+    expect(spent).toEqual(Budget.Open({ bytes: 10, files: 1 }));
+
+    const capped = budgetTransition(openBudget(), {
+      bytes: 0,
+      files: MAX_TYPES_FILES,
+      t: "cap",
+    });
+
+    expect(Budget.$is("Capped")(capped)).toBe(true);
+    // A capped round refuses more spending rather than counting it.
+    expect(budgetTransition(capped, { bytes: 1, t: "spend" })).toEqual(capped);
+  });
+
+  test("one file past its own cap closes the budget", () => {
+    const capped = budgetTransition(openBudget(), {
+      bytes: MAX_TYPES_BYTES,
+      files: 0,
+      t: "cap",
+    });
+
+    expect(Budget.$is("Capped")(capped)).toBe(true);
+  });
+
+  test("a new snapshot opens it again", () => {
+    const capped = budgetTransition(openBudget(), {
+      bytes: MAX_TYPES_BYTES,
+      files: 0,
+      t: "cap",
+    });
+
+    expect(budgetTransition(capped, { t: "reset" })).toEqual(openBudget());
+  });
+
+  test("passing the byte cap while spending closes it", () => {
+    const state = budgetTransition(openBudget(), {
+      bytes: MAX_TYPES_BYTES,
+      t: "spend",
+    });
+
+    expect(Budget.$is("Capped")(state)).toBe(true);
   });
 });

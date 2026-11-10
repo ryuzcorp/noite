@@ -141,6 +141,14 @@ export const timingSafeEqual = (a: string, b: string): boolean => {
   return diff === 0;
 };
 
+/**
+ * Compile-time exhaustiveness for switches over closed tagged unions: a new
+ * variant makes the `default` arm fail to compile instead of falling through.
+ */
+export const assertNever = (value: never): never => {
+  throw new Error(`unreachable union member: ${JSON.stringify(value)}`);
+};
+
 export const json = (value: unknown, status = 200): Response =>
   Response.json(value, { status });
 

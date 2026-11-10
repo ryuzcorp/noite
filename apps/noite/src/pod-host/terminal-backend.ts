@@ -6,8 +6,15 @@
 //! where the pod does, and why the control page only sends it keystrokes and
 //! draws what comes back. A dev server started from here is the pod's own
 //! process, served through Nodepod's virtual routing like any other.
+//!
+//! The shell's own lifecycle is `BackendState` below: `closed` until `open`
+//! created it on the pod, `open` until `close` took it down. Input and resize
+//! are only applied in `open`, so a keystroke that races `open` (or lands after
+//! `close`) is refused by the state instead of being swallowed by an optional
+//! chain.
 
 import type { Nodepod, NodepodTerminal } from "@r1ck404/nodepod";
+import { Data } from "effect";
 
 import { PROJECT_ROOT } from "../lib/source/workspace/types";
 import type { StubTerminal } from "./stub-terminal";
@@ -26,6 +33,29 @@ export interface TerminalBackend {
   resize: (cols: number, rows: number) => void;
 }
 
+/** The shell on the pod.
+ *
+ * ```mermaid
+ * stateDiagram-v2
+ *   [*] --> closed
+ *   closed --> open: open(cols, rows)
+ *   open --> open: resize
+ *   open --> closed: close
+ * ```
+ *
+ * The SDK handles live inside `open`, so "there is a shell" and "the frame has
+ * a terminal" are the same fact. */
+export type BackendState = Data.TaggedEnum<{
+  Closed: Record<never, never>;
+  Open: {
+    host: HTMLDivElement;
+    shell: NodepodTerminal;
+    tap: StubTerminal;
+  };
+}>;
+
+export const Backend = Data.taggedEnum<BackendState>();
+
 /** Build the shell the SDK owns, tapped instead of rendered: `open` creates it
  * on the pod (nothing here can be built before the pod exists), and `close`
  * disposes it. */
@@ -34,50 +64,54 @@ export const createTerminalBackend = (options: {
   pod: Nodepod;
 }): TerminalBackend => {
   const { onWrite, pod } = options;
-  let shell: NodepodTerminal | null = null;
-  let tap: StubTerminal | null = null;
-  let host: HTMLDivElement | null = null;
+  let state: BackendState = Backend.Closed();
 
   return {
     close: () => {
+      if (Backend.$is("Closed")(state)) {
+        return;
+      }
+
+      const { host, shell } = state;
       // `detach` disposes the tap it created (and the addons it loaded).
-      shell?.detach();
-      shell = null;
-      tap = null;
-      host?.remove();
-      host = null;
+      shell.detach();
+      host.remove();
+      state = Backend.Closed();
     },
     input: (data) => {
       // Through the tap, which is where the SDK's own input handler is
       // attached: the keystroke takes exactly the path a renderer's would.
-      tap?.feed(data);
+      if (Backend.$is("Open")(state)) {
+        state.tap.feed(data);
+      }
     },
     open: (cols, rows) => {
-      if (shell !== null) {
+      if (Backend.$is("Open")(state)) {
         return;
       }
 
-      const next = pod.createTerminal({
+      const shell = pod.createTerminal({
         FitAddon: StubFitAddon,
         Terminal: stubTerminalClass(onWrite),
       });
 
-      next.setCwd(PROJECT_ROOT);
+      shell.setCwd(PROJECT_ROOT);
       // The tap draws nothing, but it still needs somewhere to be "open": a
       // node in the frame's own document, hidden, that never lays out.
-      const shellHost = document.createElement("div");
-      shellHost.hidden = true;
-      document.body.append(shellHost);
-      next.attach(shellHost);
+      const host = document.createElement("div");
+      host.hidden = true;
+      document.body.append(host);
+      shell.attach(host);
       // SAFETY: the SDK hands back the terminal this open built, whose
       // `Terminal` is this module's own stub.
-      tap = next.xterm as StubTerminal;
+      const tap = shell.xterm as StubTerminal;
       tap.resize(cols, rows);
-      shell = next;
-      host = shellHost;
+      state = Backend.Open({ host, shell, tap });
     },
     resize: (cols, rows) => {
-      tap?.resize(cols, rows);
+      if (Backend.$is("Open")(state)) {
+        state.tap.resize(cols, rows);
+      }
     },
   };
 };

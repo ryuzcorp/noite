@@ -27,6 +27,11 @@
 //! 3. The page checks the answer's origin and source window, then sends
 //!    `PodConnect` with `port2` transferred. From then on, everything is on
 //!    that port.
+//! 4. The frame posts `PodBound` on its window once the port is bound, and the
+//!    page only treats the workspace as connected after it: posting a port
+//!    into a window can be dropped (a navigation in between, a listener not
+//!    yet attached), and a page that assumed otherwise would sit on a port
+//!    nothing listens to while every request timed out one by one.
 //!
 //! The nonce is the capability: a document on the pod host origin — the pod's
 //! own virtual servers included — can post to the frame's window, but it
@@ -327,4 +332,15 @@ export interface PodConnect {
   v: number;
 }
 
-export type PodHandshake = PodConnect | PodHello | PodReady;
+/** The frame's proof that it took the port: posted to the frame's parent once
+ * the RPC server is bound. The page posts `connect` into a window, which can
+ * always be dropped (the frame navigated in between, or its listener is not
+ * attached yet) — so the page waits for this rather than assuming the port
+ * arrived. */
+export interface PodBound {
+  nonce: string;
+  t: "bound";
+  v: number;
+}
+
+export type PodHandshake = PodBound | PodConnect | PodHello | PodReady;

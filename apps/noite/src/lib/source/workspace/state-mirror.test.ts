@@ -5,7 +5,12 @@ import type {
   MirrorStorage,
   MirrorVolume,
 } from "./state-mirror";
-import { UNSAVED_PROJECT, restoreMirror, startMirror } from "./state-mirror";
+import {
+  Mirror,
+  UNSAVED_PROJECT,
+  restoreMirror,
+  startMirror,
+} from "./state-mirror";
 
 const ENCODER = new TextEncoder();
 const DECODER = new TextDecoder();
@@ -167,5 +172,80 @@ describe("unsaved project mirror", () => {
     restoreMirror(after, UNSAVED_PROJECT, ID, storage);
     expect(after.text("/home/project/util.ts")).toBe("newer, unsaved");
     mirror.stop();
+  });
+});
+
+describe("the mirror's state", () => {
+  test("a store that refuses the write drops the mirror and reports it", () => {
+    const storage: MirrorStorage = {
+      getItem: () => null,
+      removeItem: () => {
+        // Nothing stored: the refusal is the point of this test.
+      },
+      setItem: () => {
+        throw new Error("QuotaExceededError");
+      },
+    };
+
+    const dropped: string[] = [];
+    const volume = fakeVolume();
+
+    const mirror = startMirror(
+      volume,
+      UNSAVED_PROJECT,
+      ID,
+      storage,
+      (reason) => {
+        dropped.push(reason);
+      }
+    );
+
+    put(volume, "/home/project/a.ts", "a");
+
+    expect(mirror.state()).toEqual(Mirror.Dropped({ reason: "storage" }));
+    expect(dropped).toEqual(["storage"]);
+    // Nothing more is recorded: the state refuses every mutation.
+    put(volume, "/home/project/b.ts", "b");
+    expect(mirror.state()).toEqual(Mirror.Dropped({ reason: "storage" }));
+  });
+
+  test("a mirror past the cap is a fallback, not a reported failure", () => {
+    const dropped: string[] = [];
+    const volume = fakeVolume();
+
+    const mirror = startMirror(
+      volume,
+      UNSAVED_PROJECT,
+      ID,
+      fakeStorage(),
+      (reason) => {
+        dropped.push(reason);
+      }
+    );
+
+    // Past MAX_MIRROR_CHARS (1 000 000) in one write.
+    put(volume, "/home/project/big.ts", "x".repeat(1_000_001));
+
+    expect(mirror.state()).toEqual(Mirror.Dropped({ reason: "cap" }));
+    expect(dropped).toEqual([]);
+  });
+
+  test("clear re-arms a dropped mirror, and never an off one", () => {
+    const storage = fakeStorage();
+    const volume = fakeVolume();
+    const mirror = startMirror(volume, UNSAVED_PROJECT, ID, storage);
+    put(volume, "/home/project/big.ts", "x".repeat(1_000_001));
+    expect(mirror.state()).toEqual(Mirror.Dropped({ reason: "cap" }));
+
+    mirror.clear();
+    expect(mirror.state()).toEqual(Mirror.Recording());
+    put(volume, "/home/project/a.ts", "a");
+    const after = fakeVolume();
+    restoreMirror(after, UNSAVED_PROJECT, ID, storage);
+    expect(after.text("/home/project/a.ts")).toBe("a");
+
+    expect(startMirror(volume, UNSAVED_PROJECT, ID, null).state()).toEqual(
+      Mirror.Off()
+    );
   });
 });

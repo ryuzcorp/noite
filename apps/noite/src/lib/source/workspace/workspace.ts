@@ -5,6 +5,7 @@
 //! the single source of truth, and there is no draft store behind it.
 
 import type { Nodepod } from "@r1ck404/nodepod";
+import { Data } from "effect";
 
 import { deriveChanges, listCheckout } from "./changes";
 import {
@@ -22,10 +23,18 @@ import {
 import { isBinary } from "./git";
 import { openPod } from "./pod";
 import { markPushed, pushPayload, revertToBase } from "./push";
-import { PROJECT_ROOT, parentDir, projectPath, relPath } from "./types";
+import {
+  PROJECT_ROOT,
+  WorkspaceError,
+  parentDir,
+  projectPath,
+  relPath,
+} from "./types";
 import type {
+  BaseIndex,
   HashCache,
   Journal,
+  OpenKind,
   PushPayload,
   Workspace,
   WorkspaceChange,
@@ -49,6 +58,115 @@ export interface FrameWorkspace extends Omit<Workspace, "fs"> {
 /** How long a burst of filesystem events waits before one derive: a keystroke
  * storm is one walk, and a single write still lands well inside a frame. */
 const COALESCE_MS = 50;
+
+/** How one open relates the pod's saved base to the browsed ref — the decision
+ * `createWorkspace` makes once, before it does anything.
+ *
+ * ```mermaid
+ * stateDiagram-v2
+ *   [*] --> fresh: no base index in the pod
+ *   [*] --> restored: base == browsed commit
+ *   [*] --> diverged: base != browsed commit, unpushed rows held
+ *   [*] --> replaced: base != browsed commit, nothing unpushed
+ * ``` */
+export const openDecision = (input: {
+  base: BaseIndex | null;
+  /** The rows the saved base still holds against the pod. */
+  held: number;
+  sha: string;
+}): OpenKind => {
+  const { base, held, sha } = input;
+
+  if (base === null) {
+    return "fresh";
+  }
+
+  if (base.baseSha === sha) {
+    return "restored";
+  }
+
+  return held > 0 ? "diverged" : "replaced";
+};
+
+/** The derive loop.
+ *
+ * ```mermaid
+ * stateDiagram-v2
+ *   [*] --> idle
+ *   idle --> scheduled: a filesystem event
+ *   scheduled --> running: the coalescing timer fires
+ *   idle --> running: a verb asked (refresh)
+ *   scheduled --> running: a verb asked (refresh)
+ *   running --> running: another request arrived mid-pass
+ *   running --> idle: no request is newer than the pass
+ *   idle --> closed: close
+ *   scheduled --> closed: close
+ *   running --> closed: close
+ * ```
+ *
+ * `running` is one pass at a time; `want` counts the requests and `published`
+ * the pass that answered them, so a caller only lands once a pass that
+ * *started after* its request has published (never on one that was already
+ * walking the tree when the change arrived). */
+export type DeriveLoopState = Data.TaggedEnum<{
+  Closed: Record<never, never>;
+  Idle: Record<never, never>;
+  Running: { pass: number };
+  Scheduled: Record<never, never>;
+}>;
+
+export type DeriveEvent =
+  | { t: "close" }
+  | { t: "finish" }
+  | { t: "fire" }
+  | { t: "request" }
+  | { t: "schedule" };
+
+export const Derive = Data.taggedEnum<DeriveLoopState>();
+
+/** The one derive-loop transition. A request is never refused; it only moves
+ * the loop to `running` (or leaves it there, where the pass will see it).
+ * `closed` is terminal. */
+export const deriveTransition = (
+  state: DeriveLoopState,
+  event: DeriveEvent
+): DeriveLoopState => {
+  if (event.t === "close") {
+    return Derive.Closed();
+  }
+
+  return Derive.$match(state, {
+    Closed: () => state,
+    Idle: () => {
+      switch (event.t) {
+        case "request": {
+          return Derive.Running({ pass: 0 });
+        }
+
+        case "schedule": {
+          return Derive.Scheduled();
+        }
+
+        default: {
+          return state;
+        }
+      }
+    },
+    Running: () => (event.t === "finish" ? Derive.Idle() : state),
+    Scheduled: () => {
+      switch (event.t) {
+        case "fire":
+        case "request": {
+          return Derive.Running({ pass: 0 });
+        }
+
+        default: {
+          return state;
+        }
+      }
+    },
+  });
+};
 
 /** The one text reader, for the committed side a pane shows read-only. */
 const DECODER = new TextDecoder();
@@ -133,16 +251,25 @@ export const createWorkspace = async (
   let base = await readBase(fs);
   let journal = base === null ? {} : await readJournal(fs);
 
-  if (base !== null && base.baseSha !== sha) {
-    // The ref moved under the saved workspace. Unpushed work is kept — the
-    // panel is told the checkout is stale — but a clean pod is simply replaced.
-    const held = await deriveChanges({ base, cache, fs, journal });
+  // The ref moved under the saved workspace. Unpushed work is kept — the panel
+  // is told the checkout is stale — but a clean pod is simply replaced. The
+  // decision is one value (`openDecision`), taken once, before anything is
+  // written.
+  let held = 0;
 
-    if (held.length > 0) {
-      stale = sha;
-    } else {
-      base = null;
-    }
+  if (base !== null && base.baseSha !== sha) {
+    const rows = await deriveChanges({ base, cache, fs, journal });
+    held = rows.length;
+  }
+
+  const kind = openDecision({ base, held, sha });
+
+  if (kind === "diverged") {
+    stale = sha;
+  }
+
+  if (kind === "fresh" || kind === "replaced") {
+    base = null;
   }
 
   if (base === null) {
@@ -150,7 +277,10 @@ export const createWorkspace = async (
     base = await readBase(fs);
 
     if (base === null) {
-      throw new Error("workspace: the checkout left no base index behind");
+      throw new WorkspaceError(
+        "not-open",
+        "workspace: the checkout left no base index behind"
+      );
     }
 
     journal = {};
@@ -158,10 +288,26 @@ export const createWorkspace = async (
 
   const state: WorkspaceState = { base, cache, fs, journal };
   let changes: WorkspaceChange[] = [];
-  let running: Promise<void> | null = null;
-  let again = false;
-  let cooling = false;
-  let closed = false;
+  /** The derive loop (see `DeriveLoopState`). */
+  let loop: DeriveLoopState = Derive.Idle();
+  /** Requests made, and the pass that answered them. A caller's promise
+   * settles only when `published` has caught up with its own request. */
+  let want = 0;
+  let published = 0;
+  let failure: Error | null = null;
+
+  let waiting: {
+    reject: (error: Error) => void;
+    resolve: () => void;
+    want: number;
+  }[] = [];
+
+  let cooling: ReturnType<typeof setTimeout> | undefined;
+  /** A filesystem event arrived while a pass was running: one more pass has to
+   * follow it (the pass may have walked the tree before the write landed). */
+  let dirty = false;
+
+  const closed = (): boolean => Derive.$is("Closed")(loop);
 
   const publish = (next: WorkspaceChange[]): void => {
     changes = next;
@@ -173,7 +319,10 @@ export const createWorkspace = async (
 
   const requireWritable = (): void => {
     if (!canWrite) {
-      throw new Error("workspace: this checkout is read-only");
+      throw new WorkspaceError(
+        "read-only",
+        "workspace: this checkout is read-only"
+      );
     }
   };
 
@@ -206,56 +355,124 @@ export const createWorkspace = async (
     publish(next);
   };
 
-  /** Derive now, and never twice at once: a caller that arrives while a derive
-   * runs shares it and queues one more, so the last answer is the truth. */
-  const refresh = async (): Promise<void> => {
-    if (running !== null) {
-      again = true;
-      await running;
+  /** Wake every caller whose own request a published pass has answered, and
+   * every caller a failed pass can never answer. */
+  const settle = (): void => {
+    const remaining: typeof waiting = [];
 
-      return;
-    }
-
-    running = deriveOnce();
-
-    try {
-      await running;
-    } finally {
-      running = null;
-    }
-
-    if (again) {
-      again = false;
-      await refresh();
-    }
-  };
-
-  /** One scheduled derive. The walk reads a live filesystem — the terminal and
-   * an installer write to it while the pass runs — so a file that went away
-   * between the listing and the read is ordinary: the pass keeps the rows it
-   * last published (the panel is stale, never half-updated) and the next
-   * filesystem event, or the next operation, derives again. Nothing here may
-   * escape as an unhandled rejection. */
-  const deriveScheduled = async (): Promise<void> => {
-    try {
-      await refresh();
-    } catch {
-      // Left to the next pass (see above).
-    }
-  };
-
-  const schedule = (): void => {
-    if (cooling) {
-      return;
-    }
-
-    cooling = true;
-    setTimeout(() => {
-      cooling = false;
-
-      if (!closed) {
-        void deriveScheduled();
+    for (const waiter of waiting) {
+      if (published >= waiter.want) {
+        waiter.resolve();
+      } else if (failure === null) {
+        remaining.push(waiter);
+      } else {
+        waiter.reject(failure);
       }
+    }
+
+    waiting = remaining;
+  };
+
+  /** One pass over the filesystem per round of requests. The walk reads a live
+   * filesystem — the terminal and an installer write to it while the pass
+   * runs — so a file that went away between the listing and the read is
+   * ordinary: the pass keeps the rows it last published (the panel is stale,
+   * never half-updated) and the next filesystem event, or the next operation,
+   * derives again. A failed pass reports itself to the callers waiting on it
+   * and leaves the loop `idle`: nothing here may escape as an unhandled
+   * rejection. */
+  const drive = async (): Promise<void> => {
+    while (!Derive.$is("Closed")(loop)) {
+      if (dirty) {
+        dirty = false;
+        want += 1;
+      }
+
+      if (published >= want) {
+        loop = deriveTransition(loop, { t: "finish" });
+        settle();
+
+        return;
+      }
+
+      const pass = want;
+
+      try {
+        // oxlint-disable-next-line eslint/no-await-in-loop -- one pass at a time is the whole point: the next round is what answers a request that arrived during this one.
+        await deriveOnce();
+      } catch (error) {
+        failure = error instanceof Error ? error : new Error(String(error));
+        break;
+      }
+
+      failure = null;
+      published = pass;
+      settle();
+    }
+
+    if (Derive.$is("Running")(loop)) {
+      loop = deriveTransition(loop, { t: "finish" });
+    }
+
+    settle();
+  };
+
+  /** Derive now, and answer once a pass that started after this request has
+   * published: a caller is never answered by the pass that was already walking
+   * the tree when its change landed. */
+  const refresh = (): Promise<void> => {
+    if (closed()) {
+      return Promise.reject(
+        new WorkspaceError("closed", "workspace: this checkout is closed")
+      );
+    }
+
+    want += 1;
+    const mine = want;
+    const answered = Promise.withResolvers<undefined>();
+    waiting.push({
+      reject: answered.reject,
+      resolve: () => answered.resolve(),
+      want: mine,
+    });
+
+    if (!Derive.$is("Running")(loop)) {
+      if (cooling !== undefined) {
+        clearTimeout(cooling);
+        cooling = undefined;
+      }
+
+      loop = deriveTransition(loop, { t: "request" });
+      void drive();
+    }
+
+    return answered.promise;
+  };
+
+  /** Coalesce a burst of filesystem events into one pass (see `COALESCE_MS`),
+   * and never arm a second timer: the loop's `scheduled` state is the one timer
+   * this workspace has. */
+  const schedule = (): void => {
+    if (closed()) {
+      return;
+    }
+
+    if (Derive.$is("Running")(loop)) {
+      dirty = true;
+
+      return;
+    }
+
+    if (!Derive.$is("Idle")(loop)) {
+      return;
+    }
+
+    loop = deriveTransition(loop, { t: "schedule" });
+    cooling = setTimeout(() => {
+      cooling = undefined;
+      want += 1;
+      loop = deriveTransition(loop, { t: "fire" });
+      void drive();
     }, COALESCE_MS);
   };
 
@@ -289,7 +506,7 @@ export const createWorkspace = async (
     void (async () => {
       const next = await readBase(fs);
 
-      if (next !== null && !closed) {
+      if (next !== null && !closed()) {
         state.base = next;
         schedule();
       }
@@ -328,7 +545,14 @@ export const createWorkspace = async (
     },
     changes: () => changes,
     close: async () => {
-      closed = true;
+      loop = deriveTransition(loop, { t: "close" });
+      clearTimeout(cooling);
+      cooling = undefined;
+      failure = new WorkspaceError(
+        "closed",
+        "workspace: this checkout is closed"
+      );
+      settle();
       watching.close();
       stopPeers();
 

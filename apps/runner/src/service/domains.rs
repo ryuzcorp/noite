@@ -4,8 +4,19 @@
 //! `single` tenancy, where one trusted operator owns the DNS (SPEC, Custom
 //! domains).
 //!
-//! Several apps may hold a pending claim for one hostname; the first to
-//! verify wins and the losers' rows are dropped. Only verified rows reach
+//! ```text
+//! absent  --add(multi)-->  pending(token)  --verify+TXT-->  verified
+//! absent  --add(single)--> verified        (trusted operator owns the DNS)
+//! pending --rival verify--> absent         (the winner drops losers' rows)
+//! any     --remove-->      absent
+//! ```
+//!
+//! The status is [`DomainStatus`]; both `add` paths and the one `verify`
+//! transition live here and in `db::verify_domain`, which does the flip and
+//! the loser cleanup in one transaction. Several apps may hold a pending
+//! claim for one hostname; the first to verify wins and the losers' rows are
+//! dropped — their panel then reads an ordinary 404, which is today's
+//! contract (no `superseded` wire value exists). Only verified rows reach
 //! the edge: `host/caddy.rs` writes routes for them and `host/edge.rs`
 //! answers the on-demand TLS gate through `db::get_app_by_domain`, which
 //! only resolves verified claims.
@@ -19,7 +30,7 @@ use crate::config::{Config, Tenancy};
 use crate::db;
 use crate::dns;
 use crate::lifecycle::hostname_ok;
-use crate::models::{AppDomain, DOMAIN_STATUS_PENDING, DOMAIN_STATUS_VERIFIED};
+use crate::models::{AppDomain, DomainStatus};
 use crate::AppState;
 
 use super::apps::app_or_404;
@@ -73,6 +84,16 @@ async fn push_edge(state: &AppState, what: &str) {
     }
 }
 
+/// Where a new claim starts. `single` tenancy trusts the one operator who
+/// owns the DNS, so the row is born verified; `multi` demands a TXT proof.
+/// This is the only place the two add paths diverge.
+fn initial_claim(tenancy: Tenancy, now: &str) -> (DomainStatus, Option<String>) {
+    match tenancy {
+        Tenancy::Single => (DomainStatus::Verified, Some(now.to_string())),
+        Tenancy::Multi => (DomainStatus::Pending, None),
+    }
+}
+
 pub async fn add(
     state: &AppState,
     app_id: &str,
@@ -108,18 +129,22 @@ pub async fn add(
     }
     let now = crate::models::now_iso();
     let token = dns::new_token();
-    let (status, verified_at) = match state.config.tenancy {
-        Tenancy::Single => (DOMAIN_STATUS_VERIFIED, Some(now.as_str())),
-        Tenancy::Multi => (DOMAIN_STATUS_PENDING, None),
-    };
+    let (status, verified_at) = initial_claim(state.config.tenancy, &now);
     // Re-check under the insert: a rival verified row committed between the
     // check above and now fails here on the partial unique index, and a
     // concurrent same-app claim loses the primary-key race. Only a unique
     // violation maps to 409 (re-reading for idempotency); anything else —
     // pool timeouts, I/O — is a 500. The message stays static: the storage
     // detail in the sqlx error is not for callers.
-    if let Err(e) =
-        db::add_domain(&state.pool, app_id, &hostname, status, &token, verified_at).await
+    if let Err(e) = db::add_domain(
+        &state.pool,
+        app_id,
+        &hostname,
+        status,
+        &token,
+        verified_at.as_deref(),
+    )
+    .await
     {
         let unique = e
             .as_database_error()
@@ -188,13 +213,20 @@ pub async fn verify(
         )));
     }
     match db::verify_domain(&state.pool, app_id, &hostname).await {
-        Ok(true) => {
+        Ok(db::VerifyOutcome::Verified) => {
             push_edge(state, "verify").await;
             list(state, app_id, role).await
         }
-        Ok(false) => {
-            // Lost a race inside the transaction, or the claim vanished:
-            // re-read to answer precisely.
+        // Already verified (a concurrent verify of ours): nothing to push.
+        Ok(db::VerifyOutcome::AlreadyVerified) => list(state, app_id, role).await,
+        // The partial index refused: a rival verified between our read and
+        // the flip.
+        Ok(db::VerifyOutcome::RivalWon) => Err(ApiError::conflict(
+            "hostname was just verified by another app",
+        )),
+        // Our row vanished: removed concurrently, or dropped by a rival's
+        // verify. Re-read first so the answer stays precise.
+        Ok(db::VerifyOutcome::Gone) => {
             match db::verified_domain_owner(&state.pool, &hostname).await {
                 Ok(Some(owner)) if owner != app_id => Err(ApiError::conflict(
                     "hostname was just verified by another app",

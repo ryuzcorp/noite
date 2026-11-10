@@ -3,7 +3,7 @@
 /* oxlint-disable anti-slop/no-unsafe-dictionary-type, anti-slop/no-known-value-widening, anti-slop/require-safety-comment-for-type-assertion -- tests shuttle untyped JSON bodies and assert on parsed shapes */
 import { describe, expect, test } from "bun:test";
 
-import { smtpSubmit } from "./src/email/smtp.ts";
+import { negotiateAuth, SmtpError, smtpSubmit } from "./src/email/smtp.ts";
 import type { Env, ProxySocket } from "./src/env.ts";
 import {
   bunSocketConnect,
@@ -18,6 +18,15 @@ import {
   TEST_FROM,
 } from "./test-helpers.ts";
 import type { CannedSocketShared } from "./test-helpers.ts";
+
+/** A minimal SMTP reply for the AUTH-negotiation unit tests. */
+const smtpReply = (
+  code: number
+): { code: number; extensions: string[]; text: string } => ({
+  code,
+  extensions: [],
+  text: `${code} reply`,
+});
 
 const emailEnv = (kv: FakeKv, overrides: Partial<Env> = {}): Env =>
   makeEnv({
@@ -1707,5 +1716,60 @@ describe("SMTP over real TCP", () => {
     } finally {
       server.stop();
     }
+  });
+});
+
+describe("SMTP AUTH negotiation", () => {
+  test("a transport timeout is classified separately from a credential rejection", async () => {
+    const transport = await negotiateAuth(
+      () => Promise.reject(new Error("smtp command timed out")),
+      ["AUTH PLAIN LOGIN"],
+      "user",
+      "pass"
+    );
+
+    expect(transport._tag).toBe("Transport");
+
+    const rejected = await negotiateAuth(
+      () => Promise.reject(new SmtpError("535 bad", smtpReply(535))),
+      ["AUTH PLAIN LOGIN"],
+      "user",
+      "pass"
+    );
+
+    expect(rejected).toMatchObject({ _tag: "Rejected" });
+  });
+
+  test("a server offering only unsupported mechanisms is a rejection, not transport", async () => {
+    const outcome = await negotiateAuth(
+      () => Promise.reject(new Error("must not run")),
+      ["AUTH XOAUTH2"],
+      "user",
+      "pass"
+    );
+
+    expect(outcome).toMatchObject({ _tag: "Rejected", mechanism: "none" });
+  });
+
+  test("PLAIN challenge success authenticates without falling back to LOGIN", async () => {
+    const lines: string[] = [];
+
+    const outcome = await negotiateAuth(
+      (line) => {
+        lines.push(line ?? "");
+
+        return lines.length === 1
+          ? Promise.reject(new SmtpError("334 continue", smtpReply(334)))
+          : Promise.resolve(smtpReply(235));
+      },
+      ["AUTH PLAIN LOGIN"],
+      "user",
+      "pass"
+    );
+
+    expect(outcome).toMatchObject({ _tag: "Authed", mechanism: "plain" });
+    expect(lines).toHaveLength(2);
+    expect(lines[0]?.startsWith("AUTH PLAIN ")).toBe(true);
+    expect(lines[1]?.startsWith("AUTH LOGIN")).toBe(false);
   });
 });

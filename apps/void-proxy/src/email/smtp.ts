@@ -32,7 +32,7 @@ interface SmtpReply {
   extensions: string[];
 }
 
-class SmtpError extends Error {
+export class SmtpError extends Error {
   readonly reply: SmtpReply | null;
 
   constructor(message: string, reply: SmtpReply | null = null) {
@@ -245,8 +245,50 @@ const smtpFailureText = (err: unknown, fallback: string): string => {
   );
 };
 
-/** AUTH PLAIN, then AUTH LOGIN. Returns true on `235`. */
-const smtpAuth = async (
+/**
+ * SMTP AUTH negotiation as one explicit machine: PLAIN (initial response,
+ * then challenge), then LOGIN, then a terminal outcome.
+ *
+ * ```mermaid
+ * stateDiagram-v2
+ *     [*] --> PlainInitial: server offers PLAIN
+ *     PlainInitial --> Authed: 235
+ *     PlainInitial --> PlainChallenge: 334
+ *     PlainInitial --> LoginUser: other reply
+ *     PlainChallenge --> Authed: 235
+ *     PlainChallenge --> LoginUser: rejection or transport error
+ *     [*] --> LoginUser: server offers LOGIN
+ *     LoginUser --> LoginPass: 334
+ *     LoginPass --> Authed: 235
+ *     PlainInitial --> Transport: timeout / EOF / write error
+ *     LoginUser --> Transport: timeout / EOF / write error
+ *     LoginPass --> Transport: timeout / EOF / write error
+ * ```
+ *
+ * `Rejected` means a reply arrived and refused the credentials; `Transport`
+ * means no usable reply arrived (timeout, disconnect, write error). Only
+ * `Rejected` may be logged or surfaced as a credential failure. A challenge
+ * transport error still falls through to LOGIN (the pre-machine behavior), and
+ * is reported as `Transport` only when LOGIN is not offered.
+ */
+export type AuthMechanism = "login" | "plain";
+
+export type AuthOutcome =
+  | { readonly _tag: "Authed"; readonly mechanism: AuthMechanism }
+  | {
+      readonly _tag: "Rejected";
+      readonly detail: string;
+      readonly mechanism: AuthMechanism | "none";
+    }
+  | { readonly _tag: "Transport"; readonly error: unknown };
+
+/** A reply-carrying `SmtpError` is a refusal; anything else is transport. */
+const isReplyRejection = (
+  error: unknown
+): error is SmtpError & { reply: SmtpReply } =>
+  error instanceof SmtpError && error.reply !== null;
+
+export const negotiateAuth = async (
   command: (
     line: string | null,
     expect: (code: number) => boolean
@@ -254,7 +296,7 @@ const smtpAuth = async (
   extensions: string[],
   username: string,
   password: string
-): Promise<boolean> => {
+): Promise<AuthOutcome> => {
   const authLine = extensions.find(
     (e) => e === "AUTH" || e.startsWith("AUTH ")
   );
@@ -264,29 +306,34 @@ const smtpAuth = async (
   const offers = (mech: string): boolean =>
     mechanisms.length === 0 || mechanisms.includes(mech);
 
+  let challengeTransportError: unknown = null;
+
   if (offers("PLAIN")) {
     const initial = base64Encode(encoder.encode(`\0${username}\0${password}`));
 
     try {
       await command(`AUTH PLAIN ${initial}`, (code) => code === 235);
 
-      return true;
+      return { _tag: "Authed", mechanism: "plain" };
     } catch (error) {
-      // Some servers reject the initial response but accept the challenge flow.
-      if (!(error instanceof SmtpError) || error.reply === null) {
-        throw error;
+      if (!isReplyRejection(error)) {
+        return { _tag: "Transport", error };
       }
 
+      // Some servers reject the initial response but accept the challenge flow.
       if (error.reply.code === 334) {
         try {
           await command(initial, (code) => code === 235);
 
-          return true;
-        } catch {
-          // Fall through to LOGIN below.
+          return { _tag: "Authed", mechanism: "plain" };
+        } catch (challengeError) {
+          // The old ladder swallowed every challenge error and tried LOGIN;
+          // keep that, but remember a transport failure for the final
+          // classification when LOGIN is not offered.
+          if (!isReplyRejection(challengeError)) {
+            challengeTransportError = challengeError;
+          }
         }
-      } else {
-        // Fall through to LOGIN below.
       }
     }
   }
@@ -303,13 +350,101 @@ const smtpAuth = async (
         (code) => code === 235
       );
 
-      return true;
-    } catch {
-      return false;
+      return { _tag: "Authed", mechanism: "login" };
+    } catch (error) {
+      return isReplyRejection(error)
+        ? {
+            _tag: "Rejected",
+            detail: smtpFailureText(error, "smtp authentication failed"),
+            mechanism: "login",
+          }
+        : { _tag: "Transport", error };
     }
   }
 
-  return false;
+  if (challengeTransportError !== null) {
+    return { _tag: "Transport", error: challengeTransportError };
+  }
+
+  return {
+    _tag: "Rejected",
+    detail: "server offered no supported authentication mechanism",
+    mechanism: "none",
+  };
+};
+
+/**
+ * SMTP transaction phases, advanced only through `enterPhase`.
+ *
+ * ```mermaid
+ * stateDiagram-v2
+ *     [*] --> connect
+ *     connect --> greet: socket open
+ *     greet --> ehlo: 220
+ *     ehlo --> starttls: STARTTLS offered
+ *     ehlo --> auth: credentials configured
+ *     ehlo --> mail: no credentials
+ *     starttls --> ehloTls: 220 + TLS upgrade
+ *     ehloTls --> auth: credentials configured
+ *     ehloTls --> mail: no credentials
+ *     auth --> mail: authenticated
+ *     mail --> rcpt: 250
+ *     rcpt --> rcpt: another RCPT
+ *     rcpt --> data: at least one accepted
+ *     rcpt --> done: none accepted
+ *     data --> body: 354
+ *     data --> done: refused
+ *     body --> done: final reply (accepted or refused)
+ * ```
+ *
+ * `body` is the point of no return: an error there means the server may have
+ * queued the message, so the accepted recipients become `outcome_unknown`; an
+ * error in any earlier phase means nothing was written past DATA, so they
+ * become `failed`.
+ */
+export type SmtpPhase =
+  | "auth"
+  | "body"
+  | "connect"
+  | "data"
+  | "done"
+  | "ehlo"
+  | "ehloTls"
+  | "greet"
+  | "mail"
+  | "rcpt"
+  | "starttls";
+
+const SMTP_PHASE_TRANSITIONS: Readonly<
+  Record<SmtpPhase, readonly SmtpPhase[]>
+> = {
+  auth: ["mail"],
+  body: ["done"],
+  connect: ["greet"],
+  data: ["body", "done"],
+  done: [],
+  ehlo: ["auth", "mail", "starttls"],
+  ehloTls: ["auth", "mail"],
+  greet: ["ehlo"],
+  mail: ["rcpt"],
+  rcpt: ["data", "done", "rcpt"],
+  starttls: ["ehloTls"],
+};
+
+interface SmtpSession {
+  phase: SmtpPhase;
+  reader: SmtpLineReader | null;
+  socket: ProxySocket | null;
+  writer: WritableStreamDefaultWriter<Uint8Array> | null;
+}
+
+/** The only place a phase changes: an illegal transition is a bug, not data. */
+const enterPhase = (session: SmtpSession, next: SmtpPhase): void => {
+  if (!SMTP_PHASE_TRANSITIONS[session.phase].includes(next)) {
+    throw new SmtpError(`smtp phase ${session.phase} cannot become ${next}`);
+  }
+
+  session.phase = next;
 };
 
 /**
@@ -334,12 +469,15 @@ export const smtpSubmit = async (
     }
   };
 
-  let socket: ProxySocket | null = null;
-  let reader: SmtpLineReader | null = null;
-  let writer: WritableStreamDefaultWriter<Uint8Array> | null = null;
+  const session: SmtpSession = {
+    phase: "connect",
+    reader: null,
+    socket: null,
+    writer: null,
+  };
 
   try {
-    socket = await withTimeout(
+    session.socket = await withTimeout(
       input.connectTimeoutMs,
       () =>
         input.connect(
@@ -351,8 +489,8 @@ export const smtpSubmit = async (
     // NOTE: `starttls` mode connects with the `starttls` transport (plaintext
     // until the upgrade) because `startTls()` requires it; the TLS upgrade
     // happens after the STARTTLS command below.
-    writer = socket.writable.getWriter();
-    reader = new SmtpLineReader(socket);
+    session.writer = session.socket.writable.getWriter();
+    session.reader = new SmtpLineReader(session.socket);
 
     const command = (
       line: string | null,
@@ -361,8 +499,8 @@ export const smtpSubmit = async (
       withTimeout(
         input.commandTimeoutMs,
         async () => {
-          const activeWriter = writer;
-          const activeReader = reader;
+          const activeWriter = session.writer;
+          const activeReader = session.reader;
 
           if (activeWriter === null || activeReader === null) {
             throw new SmtpError("smtp connection closed");
@@ -395,7 +533,10 @@ export const smtpSubmit = async (
         () => new SmtpTimeoutError()
       );
 
+    enterPhase(session, "greet");
     await command(null, (code) => code === 220);
+
+    enterPhase(session, "ehlo");
 
     const greetingEhlo = await command(
       `EHLO ${input.ehloName}`,
@@ -423,10 +564,11 @@ export const smtpSubmit = async (
         return null;
       }
 
+      enterPhase(session, "starttls");
       await command("STARTTLS", (code) => code === 220);
-      const plainSocket = socket;
-      const plainReader = reader;
-      const plainWriter = writer;
+      const plainSocket = session.socket;
+      const plainReader = session.reader;
+      const plainWriter = session.writer;
 
       if (!plainSocket) {
         throw new SmtpError("smtp connection closed");
@@ -440,9 +582,12 @@ export const smtpSubmit = async (
         await plainWriter.close().catch(() => null);
       }
 
-      socket = plainSocket.startTls({ expectedServerHostname: input.host });
-      writer = socket.writable.getWriter();
-      reader = new SmtpLineReader(socket);
+      enterPhase(session, "ehloTls");
+      session.socket = plainSocket.startTls({
+        expectedServerHostname: input.host,
+      });
+      session.writer = session.socket.writable.getWriter();
+      session.reader = new SmtpLineReader(session.socket);
 
       return command(`EHLO ${input.ehloName}`, (code) => code === 250);
     };
@@ -454,19 +599,31 @@ export const smtpSubmit = async (
     }
 
     if (input.username !== null) {
-      const authed = await smtpAuth(
+      enterPhase(session, "auth");
+
+      const auth = await negotiateAuth(
         command,
         ehlo.extensions,
         input.username,
         input.password
-      ).catch(() => false);
+      );
 
-      if (!authed) {
+      if (auth._tag !== "Authed") {
+        // A transport failure is not a credential failure: log it as such so
+        // an operator rotating a password after a flaky relay is visible.
+        if (auth._tag === "Transport") {
+          console.warn(
+            `[void/proxy] smtp AUTH transport error (${sanitizeForLog(input.host, 120)}): ${sanitizeForLog(errorMessage(auth.error), SMTP_REPLY_TEXT_MAX_CHARS)}`
+          );
+        }
+
         failAll("failed", "UPSTREAM_ERROR", "smtp authentication failed");
 
         return outcomes;
       }
     }
+
+    enterPhase(session, "mail");
 
     try {
       await command(`MAIL FROM:<${input.from}>`, (code) => code === 250);
@@ -480,6 +637,7 @@ export const smtpSubmit = async (
       return outcomes;
     }
 
+    enterPhase(session, "rcpt");
     const accepted: string[] = [];
 
     for (const recipient of input.recipients) {
@@ -504,10 +662,14 @@ export const smtpSubmit = async (
     }
 
     if (accepted.length === 0) {
+      enterPhase(session, "done");
+
       return outcomes;
     }
 
     const runDataPhase = async (): Promise<void> => {
+      enterPhase(session, "data");
+
       try {
         await command("DATA", (code) => code === 354);
       } catch (error) {
@@ -523,14 +685,16 @@ export const smtpSubmit = async (
         return;
       }
 
+      enterPhase(session, "body");
+
       try {
         // Once the DATA bytes leave, a timeout or disconnect means the server
         // may have queued the message — see the `outcome_unknown` catch below.
         const endReply = await withTimeout(
           input.commandTimeoutMs,
           async () => {
-            const activeWriter = writer;
-            const activeReader = reader;
+            const activeWriter = session.writer;
+            const activeReader = session.reader;
 
             if (activeWriter === null || activeReader === null) {
               throw new SmtpError("smtp connection closed");
@@ -583,44 +747,46 @@ export const smtpSubmit = async (
 
     await runDataPhase();
 
+    enterPhase(session, "done");
+
     return outcomes;
   } catch (error) {
-    // Pre-DATA failures (connect, greeting, EHLO, TLS, MAIL): nothing was
-    // accepted, so `failed` is accurate.
+    // Before DATA the message cannot have been queued (`failed`); after the
+    // DATA bytes left it may have been (`outcome_unknown`).
     failAll(
-      "failed",
+      session.phase === "body" ? "outcome_unknown" : "failed",
       "UPSTREAM_ERROR",
       smtpFailureText(error, "smtp submission failed")
     );
 
     return outcomes;
   } finally {
-    if (writer) {
+    if (session.writer) {
       try {
-        writer.releaseLock();
+        session.writer.releaseLock();
       } catch {
         // Already closed by the STARTTLS upgrade path.
       }
     }
 
-    if (reader) {
+    if (session.reader) {
       try {
-        reader.release();
+        session.reader.release();
       } catch {
         // Already released by the STARTTLS upgrade path.
       }
     }
 
-    if (socket) {
+    if (session.socket) {
       try {
-        const quitWriter = socket.writable.getWriter();
+        const quitWriter = session.socket.writable.getWriter();
         await quitWriter.write(encoder.encode("QUIT\r\n")).catch(() => null);
         quitWriter.releaseLock();
       } catch {
         // Best effort on a broken connection.
       }
 
-      await socket.close().catch(() => null);
+      await session.socket.close().catch(() => null);
     }
   }
 };

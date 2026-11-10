@@ -417,6 +417,141 @@ describe("/ai/provider envelopes", () => {
     }
   });
 
+  test("text envelope keeps the old coercion for non-string fields", async () => {
+    const upstream = startUpstream(() => Response.json({ ok: true }));
+
+    try {
+      const deps = { fetchUpstream: localFetch(upstream.url) };
+
+      await post(
+        "/ai/provider",
+        providerBody({ body: { data: 5, type: "text" } }),
+        aiEnv(),
+        deps
+      );
+      await post(
+        "/ai/provider",
+        providerBody({ body: { data: null, type: "text" } }),
+        aiEnv(),
+        deps
+      );
+      await post(
+        "/ai/provider",
+        providerBody({
+          body: { contentType: 5, data: "x", type: "text" },
+        }),
+        aiEnv(),
+        deps
+      );
+      await post(
+        "/ai/provider",
+        providerBody({
+          body: { contentType: false, data: "x", type: "text" },
+        }),
+        aiEnv(),
+        deps
+      );
+
+      const [number, empty, header, falsyHeader] = upstream.requests;
+
+      if (!number || !empty || !header || !falsyHeader) {
+        throw new Error("expected four upstream requests");
+      }
+
+      expect(new TextDecoder().decode(number.body)).toBe("5");
+      expect(number.headers["content-type"]).toBeUndefined();
+      expect(empty.body.byteLength).toBe(0);
+      expect(header.headers["content-type"]).toBe("5");
+      expect(falsyHeader.headers["content-type"]).toBeUndefined();
+    } finally {
+      upstream.close();
+    }
+  });
+
+  test("form envelope keeps the old coercion for non-string name and value", async () => {
+    const received: { name: string; value: string }[] = [];
+
+    const upstream = startUpstream(async (_req, seen) => {
+      const clone = new Request("http://upstream.test/", {
+        body: seen.body.buffer as ArrayBuffer,
+        headers: { "content-type": seen.headers["content-type"] ?? "" },
+        method: "POST",
+      });
+
+      const form = await clone.formData();
+      const value = form.get("5");
+
+      received.push({
+        name: "5",
+        value: typeof value === "string" ? value : "",
+      });
+
+      return Response.json({ ok: true });
+    });
+
+    try {
+      const { status } = await post(
+        "/ai/provider",
+        providerBody({
+          body: { entries: [{ name: 5, value: 6 }], type: "form" },
+        }),
+        aiEnv(),
+        { fetchUpstream: localFetch(upstream.url) }
+      );
+
+      expect(status).toBe(200);
+      expect(received).toEqual([{ name: "5", value: "6" }]);
+    } finally {
+      upstream.close();
+    }
+  });
+
+  test("base64 envelope coerces a non-string payload through atob", async () => {
+    const upstream = startUpstream(() => Response.json({ ok: true }));
+
+    try {
+      const { status } = await post(
+        "/ai/provider",
+        providerBody({ body: { data: 1234, type: "base64" } }),
+        aiEnv(),
+        { fetchUpstream: localFetch(upstream.url) }
+      );
+
+      expect(status).toBe(200);
+
+      const expected = Uint8Array.from(
+        atob("1234"),
+        (ch) => ch.codePointAt(0) ?? 0
+      );
+
+      expect(onlyRequest(upstream.requests).body).toEqual(expected);
+    } finally {
+      upstream.close();
+    }
+  });
+
+  test("a non-iterable form entries value keeps the old 502", async () => {
+    const { status, json } = await post(
+      "/ai/provider",
+      providerBody({ body: { entries: 5, type: "form" } }),
+      aiEnv()
+    );
+
+    expect(status).toBe(502);
+    expect(json).toEqual({ error: "upstream error" });
+  });
+
+  test("a null form entry keeps the old 502", async () => {
+    const { status, json } = await post(
+      "/ai/provider",
+      providerBody({ body: { entries: [null], type: "form" } }),
+      aiEnv()
+    );
+
+    expect(status).toBe(502);
+    expect(json).toEqual({ error: "upstream error" });
+  });
+
   test("invalid file base64 is a 400", async () => {
     // oxlint-disable-next-line eslint/no-await-in-loop -- sequential cases, each asserted before the next
     const { status, json } = await post(

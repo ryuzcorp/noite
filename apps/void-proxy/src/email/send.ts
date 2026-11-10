@@ -2,6 +2,30 @@
  * `POST /email/send` (Void's response contract verbatim): allowlist admission,
  * KV idempotency, and SMTP submission.
  *
+ * The request is one machine; the wire shapes are unchanged:
+ *
+ * ```mermaid
+ * stateDiagram-v2
+ *     [*] --> Validate
+ *     Validate --> Refused: first refusal wins (one status table)
+ *     Validate --> Lookup: valid envelope
+ *     Lookup --> Replayed: stored digest matches
+ *     Lookup --> Conflict: stored digest differs (409)
+ *     Lookup --> Unavailable: KV read failed (503)
+ *     Lookup --> Admit: no record
+ *     Admit --> Submit: allowlist partitions recipients
+ *     Submit --> Record: complete / expired / refused
+ *     Record --> [*]: deliveries + operationId
+ *     Refused --> [*]
+ *     Replayed --> [*]
+ *     Conflict --> [*]
+ *     Unavailable --> [*]
+ * ```
+ *
+ * Per-recipient outcomes are the `Delivery` union below. The idempotency
+ * record keeps its `{ digest, status, body }` shape and always stores
+ * `status: 200`, exactly as before (so a replay is byte-identical).
+ *
  * Portions ported from the Void project (MIT License — see the attribution
  * note in SPEC.md "Void platform proxy"). Noite adaptations (KV idempotency
  * instead of SQL admission, SMTP transport instead of the `send_email`
@@ -10,9 +34,17 @@
 
 /* oxlint-disable anti-slop/no-runtime-typeof, anti-slop/no-unsafe-dictionary-type, anti-slop/no-unknown-parameters, anti-slop/no-unknown-returns, anti-slop/no-known-value-widening -- untyped-JSON I/O boundary: every handler validates untrusted bodies field-by-field, so typeof-narrowing and open dictionaries are the job, not slop */
 
-import { asString, encoder, isRecord, json, sanitizeForLog } from "../auth.ts";
+import {
+  asString,
+  assertNever,
+  encoder,
+  isRecord,
+  json,
+  sanitizeForLog,
+} from "../auth.ts";
+import type { EmailConfig, ProxyConfig } from "../config.ts";
 import type { Env, MailKvNamespace, ProxyDeps, SocketConnect } from "../env.ts";
-import type { SmtpMode, SmtpRecipientOutcome } from "./smtp.ts";
+import type { SmtpRecipientOutcome } from "./smtp.ts";
 import { smtpSubmit } from "./smtp.ts";
 import type { EmailProviderDeadline, RecipientResult } from "./validate.ts";
 import {
@@ -21,8 +53,7 @@ import {
   customMimeHeaderBytesWithinLimit,
   EMAIL_SEND_DEADLINE_MS,
   logSend,
-  readSenderDomain,
-  refuseMimeFromMismatch,
+  mimeFromRefusalDetail,
   strictFromRe,
 } from "./validate.ts";
 
@@ -177,69 +208,160 @@ const platformSocketConnect = async (): Promise<SocketConnect> => {
   return mod.connect as SocketConnect;
 };
 
-interface SmtpConfig {
-  host: string;
-  port: number;
-  mode: SmtpMode;
-  username: string | null;
-  password: string;
+/**
+ * `/email/send` refusals as one closed type plus one status mapping.
+ *
+ * Every validation helper returns a `Refusal` (never a bare `Response`), so
+ * the order in `validateEmailRequest` is the only precedence rule and the
+ * status/code pair lives in exactly one table. `status: 200` entries are the
+ * endpoint's historical compatibility behaviour (`INVALID_TO` with no
+ * recipients, `INVALID_FROM` off-domain/not-pinned) — the wire contract the
+ * runtime and its tests rely on, not a new choice.
+ *
+ * | kind                          | code            | status |
+ * | ----------------------------- | --------------- | ------ |
+ * | bodyInvalid                   | UPSTREAM_ERROR  | 400    |
+ * | idempotencyKeyInvalid         | INVALID_TO      | 400    |
+ * | idempotencyStoreUnconfigured  | UPSTREAM_ERROR  | 502    |
+ * | mimeFromMismatch              | INVALID_FROM    | 403    |
+ * | mimeHeadersTooLarge           | MIME_ERROR      | 413    |
+ * | mimeInvalidBase64             | MIME_ERROR      | 400    |
+ * | mimeTooLargeDecoded           | MIME_ERROR      | 413    |
+ * | mimeTooLargeEncoded           | MIME_ERROR      | 413    |
+ * | recipientInvalid              | INVALID_TO      | 400    |
+ * | recipientTooLong              | INVALID_TO      | 413    |
+ * | recipientsEmpty               | INVALID_TO      | 200    |
+ * | recipientsTooMany             | INVALID_TO      | 413    |
+ * | senderDomainUnconfigured      | UPSTREAM_ERROR  | 502    |
+ * | senderIdentityUnconfigured    | UPSTREAM_ERROR  | 502    |
+ * | senderNonAscii                | INVALID_FROM    | 403    |
+ * | senderNotPinned               | INVALID_FROM    | 200    |
+ * | senderTooLong                 | INVALID_FROM    | 413    |
+ * | senderWrongDomain             | INVALID_FROM    | 200    |
+ * | smtpMisconfigured             | UPSTREAM_ERROR  | 502    |
+ * | smtpUnconfigured              | UPSTREAM_ERROR  | 502    |
+ */
+interface RefusalMapping {
+  readonly code: string;
+  readonly status: number;
 }
 
-/** Read SMTP config; returns an error message string when misconfigured. */
-const readSmtpConfig = (env: Env): SmtpConfig | string => {
-  const host = (env.VOID_PROXY_SMTP_HOST ?? "").trim();
+const REFUSAL_MAPPING = {
+  bodyInvalid: { code: "UPSTREAM_ERROR", status: 400 },
+  idempotencyKeyInvalid: { code: "INVALID_TO", status: 400 },
+  idempotencyStoreUnconfigured: { code: "UPSTREAM_ERROR", status: 502 },
+  mimeFromMismatch: { code: "INVALID_FROM", status: 403 },
+  mimeHeadersTooLarge: { code: "MIME_ERROR", status: 413 },
+  mimeInvalidBase64: { code: "MIME_ERROR", status: 400 },
+  mimeTooLargeDecoded: { code: "MIME_ERROR", status: 413 },
+  mimeTooLargeEncoded: { code: "MIME_ERROR", status: 413 },
+  recipientInvalid: { code: "INVALID_TO", status: 400 },
+  recipientTooLong: { code: "INVALID_TO", status: 413 },
+  recipientsEmpty: { code: "INVALID_TO", status: 200 },
+  recipientsTooMany: { code: "INVALID_TO", status: 413 },
+  senderDomainUnconfigured: { code: "UPSTREAM_ERROR", status: 502 },
+  senderIdentityUnconfigured: { code: "UPSTREAM_ERROR", status: 502 },
+  senderNonAscii: { code: "INVALID_FROM", status: 403 },
+  senderNotPinned: { code: "INVALID_FROM", status: 200 },
+  senderTooLong: { code: "INVALID_FROM", status: 413 },
+  senderWrongDomain: { code: "INVALID_FROM", status: 200 },
+  smtpMisconfigured: { code: "UPSTREAM_ERROR", status: 502 },
+  smtpUnconfigured: { code: "UPSTREAM_ERROR", status: 502 },
+} as const satisfies Record<string, RefusalMapping>;
 
-  if (!host) {
-    return "email sending is not configured";
-  }
+type RefusalKind = keyof typeof REFUSAL_MAPPING;
 
-  const modeRaw = (env.VOID_PROXY_SMTP_MODE ?? "starttls").trim().toLowerCase();
+interface Refusal {
+  readonly _tag: "Refusal";
+  readonly kind: RefusalKind;
+  readonly message: string;
+}
 
-  if (modeRaw !== "starttls" && modeRaw !== "implicit" && modeRaw !== "plain") {
-    return `email smtp mode must be starttls, implicit or plain (got ${sanitizeForLog(modeRaw, 32)})`;
-  }
+const refusalResponse = (refusal: Refusal): Response => {
+  const mapping = REFUSAL_MAPPING[refusal.kind];
 
-  if (modeRaw === "plain" && env.VOID_PROXY_SMTP_ALLOW_PLAINTEXT !== "1") {
-    return "email smtp plaintext mode requires the operator plaintext allowance";
-  }
-
-  let defaultPort = 25;
-
-  if (modeRaw === "implicit") {
-    defaultPort = 465;
-  } else if (modeRaw === "starttls") {
-    defaultPort = 587;
-  }
-
-  const portRaw = (env.VOID_PROXY_SMTP_PORT ?? "").trim();
-  let port = defaultPort;
-
-  if (portRaw !== "") {
-    if (!/^\d+$/u.test(portRaw)) {
-      return "email smtp port is invalid";
-    }
-
-    port = Number(portRaw);
-
-    if (!Number.isInteger(port) || port < 1 || port > 65_535) {
-      return "email smtp port is invalid";
-    }
-  }
-
-  const usernameRaw = env.VOID_PROXY_SMTP_USERNAME;
-
-  const username =
-    typeof usernameRaw === "string" && usernameRaw.length > 0
-      ? usernameRaw
-      : null;
-
-  const password =
-    typeof env.VOID_PROXY_SMTP_PASSWORD === "string"
-      ? env.VOID_PROXY_SMTP_PASSWORD
-      : "";
-
-  return { host, mode: modeRaw, password, port, username };
+  return emailError(mapping.code, refusal.message, mapping.status);
 };
+
+/**
+ * Per-recipient delivery, one closed union shared by submission, idempotency
+ * storage and the wire mapping.
+ *
+ * `provider_accepted` is the only success state; `rejected` means the
+ * allowlist refused the address; `failed` means the provider definitively did
+ * not accept it; `outcome_unknown` means the message may have been queued
+ * (never retry blindly).
+ */
+type Delivery =
+  | { readonly _tag: "ProviderAccepted"; readonly messageId: string }
+  | {
+      readonly _tag: "Rejected";
+      readonly code: string;
+      readonly message: string;
+    }
+  | {
+      readonly _tag: "Failed";
+      readonly code: string;
+      readonly message: string;
+    }
+  | {
+      readonly _tag: "OutcomeUnknown";
+      readonly code: string;
+      readonly message: string;
+    };
+
+/** The only place a delivery becomes the Void-compatible wire shape. */
+const toRecipientResult = (
+  recipient: string,
+  delivery: Delivery
+): RecipientResult => {
+  switch (delivery._tag) {
+    case "ProviderAccepted": {
+      return {
+        messageId: delivery.messageId,
+        ok: true,
+        recipient,
+        state: "provider_accepted",
+      };
+    }
+
+    case "Rejected": {
+      return {
+        error: { code: delivery.code, message: delivery.message },
+        ok: false,
+        recipient,
+        state: "rejected",
+      };
+    }
+
+    case "Failed": {
+      return {
+        error: { code: delivery.code, message: delivery.message },
+        ok: false,
+        recipient,
+        state: "failed",
+      };
+    }
+
+    case "OutcomeUnknown": {
+      return {
+        error: { code: delivery.code, message: delivery.message },
+        ok: false,
+        recipient,
+        state: "outcome_unknown",
+      };
+    }
+
+    default: {
+      return assertNever(delivery);
+    }
+  }
+};
+
+interface DeliveryEntry {
+  readonly delivery: Delivery;
+  readonly recipient: string;
+}
 
 const finishEmailSend = async (
   mailKv: MailKvNamespace,
@@ -247,24 +369,35 @@ const finishEmailSend = async (
   digest: string,
   projectId: string,
   requestId: string,
-  deliveries: RecipientResult[]
+  deliveries: readonly DeliveryEntry[]
 ): Promise<Response> => {
   const operationId = crypto.randomUUID();
-  const anyFailed = deliveries.some((d) => !d.ok);
 
-  const body: unknown = anyFailed
-    ? { deliveries, ok: false, operationId }
-    : {
-        ids: deliveries.map((d) => ({
-          messageId: d.messageId ?? "",
-          recipient: d.recipient,
-          state: "provider_accepted",
-        })),
-        ok: true,
-        operationId,
-      };
+  const wire = deliveries.map((entry) =>
+    toRecipientResult(entry.recipient, entry.delivery)
+  );
 
-  logSend(projectId, requestId, deliveries);
+  const accepted = deliveries.flatMap((entry) =>
+    entry.delivery._tag === "ProviderAccepted"
+      ? [
+          {
+            messageId: entry.delivery.messageId,
+            recipient: entry.recipient,
+            state: "provider_accepted",
+          },
+        ]
+      : []
+  );
+
+  const body: unknown =
+    accepted.length === deliveries.length
+      ? { ids: accepted, ok: true, operationId }
+      : { deliveries: wire, ok: false, operationId };
+
+  logSend(projectId, requestId, wire);
+  // The record replays whatever this attempt produced, including failures and
+  // `outcome_unknown`, for 24 h. Changing that changes what a retry with the
+  // same idempotency key observes, so it is an owner decision, not a cleanup.
   // Best-effort store: a KV failure here must not turn an accepted send into
   // an error (a repeat may double-send — the documented at-least-once limit).
   await mailKv
@@ -281,6 +414,7 @@ const finishEmailSend = async (
 };
 
 interface ValidatedEmailRequest {
+  readonly _tag: "Validated";
   fromLower: string;
   mimeBase64: string;
   raw: Uint8Array;
@@ -299,7 +433,7 @@ interface ValidatedEmailRequest {
  */
 const normalizeEmailRecipients = (
   recipientsRaw: unknown[]
-): { recipients: ParsedMailbox[] } | { response: Response } => {
+): { recipients: ParsedMailbox[] } | Refusal => {
   const recipients: ParsedMailbox[] = [];
   const seen = new Set<string>();
 
@@ -311,11 +445,9 @@ const normalizeEmailRecipients = (
     // Before `.trim().toLowerCase()` — that call is the allocation.
     if (r.length > MAX_RECIPIENT_LENGTH) {
       return {
-        response: emailError(
-          "INVALID_TO",
-          `recipient exceeds ${MAX_RECIPIENT_LENGTH} characters`,
-          413
-        ),
+        _tag: "Refusal",
+        kind: "recipientTooLong",
+        message: `recipient exceeds ${MAX_RECIPIENT_LENGTH} characters`,
       };
     }
 
@@ -331,7 +463,9 @@ const normalizeEmailRecipients = (
 
     if (!mailbox) {
       return {
-        response: emailError("INVALID_TO", "invalid recipient address", 400),
+        _tag: "Refusal",
+        kind: "recipientInvalid",
+        message: "invalid recipient address",
       };
     }
 
@@ -340,7 +474,11 @@ const normalizeEmailRecipients = (
   }
 
   if (recipients.length === 0) {
-    return { response: emailError("INVALID_TO", "no recipients", 200) };
+    return {
+      _tag: "Refusal",
+      kind: "recipientsEmpty",
+      message: "no recipients",
+    };
   }
 
   return { recipients };
@@ -349,17 +487,15 @@ const normalizeEmailRecipients = (
 /** Decode and bound the MIME payload, or the refusal to return. */
 const validateEmailMime = (
   mimeBase64: string
-): { raw: Uint8Array } | { response: Response } => {
+): { raw: Uint8Array } | Refusal => {
   // Pre-decode size guard — base64 expands ~4/3, so a base64 string longer
   // than `MAX_MIME_BYTES * 4 / 3 + 4` can't decode within the limit. Reject
   // before allocating for what we'd reject anyway.
   if (mimeBase64.length > Math.ceil((MAX_MIME_BYTES * 4) / 3) + 4) {
     return {
-      response: emailError(
-        "MIME_ERROR",
-        `mime exceeds ${MAX_MIME_BYTES} bytes (base64 length ${mimeBase64.length})`,
-        413
-      ),
+      _tag: "Refusal",
+      kind: "mimeTooLargeEncoded",
+      message: `mime exceeds ${MAX_MIME_BYTES} bytes (base64 length ${mimeBase64.length})`,
     };
   }
 
@@ -368,26 +504,26 @@ const validateEmailMime = (
   try {
     raw = base64Decode(mimeBase64);
   } catch {
-    return { response: emailError("MIME_ERROR", "invalid base64 mime", 400) };
+    return {
+      _tag: "Refusal",
+      kind: "mimeInvalidBase64",
+      message: "invalid base64 mime",
+    };
   }
 
   if (raw.byteLength > MAX_MIME_BYTES) {
     return {
-      response: emailError(
-        "MIME_ERROR",
-        `mime exceeds ${MAX_MIME_BYTES} bytes (got ${raw.byteLength})`,
-        413
-      ),
+      _tag: "Refusal",
+      kind: "mimeTooLargeDecoded",
+      message: `mime exceeds ${MAX_MIME_BYTES} bytes (got ${raw.byteLength})`,
     };
   }
 
   if (!customMimeHeaderBytesWithinLimit(raw)) {
     return {
-      response: emailError(
-        "MIME_ERROR",
-        "custom headers exceed the 16 KiB limit",
-        413
-      ),
+      _tag: "Refusal",
+      kind: "mimeHeadersTooLarge",
+      message: "custom headers exceed the 16 KiB limit",
     };
   }
 
@@ -399,7 +535,7 @@ const validateEmailSender = (
   env: Env,
   from: string,
   senderDomain: string
-): { fromLower: string } | { response: Response } => {
+): { fromLower: string } | Refusal => {
   // Noite has no custom-domain `send_raw` path in v1: the sender must be on the
   // configured domain.
   const fromAt = from.indexOf("@");
@@ -407,11 +543,9 @@ const validateEmailSender = (
 
   if (fromDomain !== "" && fromDomain !== senderDomain) {
     return {
-      response: emailError(
-        "INVALID_FROM",
-        `from address must use the configured domain ${senderDomain}`,
-        200
-      ),
+      _tag: "Refusal",
+      kind: "senderWrongDomain",
+      message: `from address must use the configured domain ${senderDomain}`,
     };
   }
 
@@ -420,11 +554,9 @@ const validateEmailSender = (
   // non-ASCII before that.
   if (!/^[\u0021-\u007E]+$/u.test(from)) {
     return {
-      response: emailError(
-        "INVALID_FROM",
-        "from address must be printable ASCII",
-        403
-      ),
+      _tag: "Refusal",
+      kind: "senderNonAscii",
+      message: "from address must be printable ASCII",
     };
   }
 
@@ -436,11 +568,9 @@ const validateEmailSender = (
 
   if (!slug) {
     return {
-      response: emailError(
-        "UPSTREAM_ERROR",
-        "email sender identity is not configured",
-        502
-      ),
+      _tag: "Refusal",
+      kind: "senderIdentityUnconfigured",
+      message: "email sender identity is not configured",
     };
   }
 
@@ -448,11 +578,9 @@ const validateEmailSender = (
 
   if (!strictFromRe(senderDomain).test(fromLower)) {
     return {
-      response: emailError(
-        "INVALID_FROM",
-        `from address must be <${slug}>[+tag]@${senderDomain}`,
-        200
-      ),
+      _tag: "Refusal",
+      kind: "senderNotPinned",
+      message: `from address must be <${slug}>[+tag]@${senderDomain}`,
     };
   }
 
@@ -461,21 +589,19 @@ const validateEmailSender = (
 
   if (localPrefix !== slug) {
     return {
-      response: emailError(
-        "INVALID_FROM",
-        `from address must be <${slug}>[+tag]@${senderDomain}`,
-        200
-      ),
+      _tag: "Refusal",
+      kind: "senderNotPinned",
+      message: `from address must be <${slug}>[+tag]@${senderDomain}`,
     };
   }
 
   return { fromLower };
 };
 
-/** Derive the idempotency operation key, or the refusal response to return. */
+/** Derive the idempotency operation key, or the refusal to return. */
 const resolveOperationKey = (
   body: Record<string, unknown>
-): { operationKey: string; requestId: string } | { response: Response } => {
+): { operationKey: string; requestId: string } | Refusal => {
   // Bounded and sanitized here, once, so `logSend` never interpolates the raw value.
   const requestIdRaw = asString(body.requestId);
 
@@ -493,7 +619,9 @@ const resolveOperationKey = (
       !/^[\u0020-\u007E]+$/u.test(callerKey))
   ) {
     return {
-      response: emailError("INVALID_TO", "invalid idempotency key", 400),
+      _tag: "Refusal",
+      kind: "idempotencyKeyInvalid",
+      message: "invalid idempotency key",
     };
   }
 
@@ -508,93 +636,106 @@ const resolveOperationKey = (
   return { operationKey, requestId };
 };
 
-/** Validate the send request envelope, or the refusal response to return. */
+/**
+ * Validate the send request envelope, or the refusal to return.
+ *
+ * The order below is the precedence contract (keys → presence → caps → sender
+ * config → recipients → MIME → sender pin → MIME `From` → idempotency store);
+ * the first refusal wins.
+ */
 const validateEmailRequest = (
   env: Env,
+  config: ProxyConfig,
   body: Record<string, unknown>
-): ValidatedEmailRequest | Response => {
+): ValidatedEmailRequest | Refusal => {
   const from = asString(body.from);
   const mimeBase64 = asString(body.mimeBase64);
   const keys = resolveOperationKey(body);
 
-  if ("response" in keys) {
-    return keys.response;
+  if ("kind" in keys) {
+    return keys;
   }
 
   const { operationKey, requestId } = keys;
   const recipientsRaw = Array.isArray(body.recipients) ? body.recipients : null;
 
   if (!from || !mimeBase64 || !recipientsRaw) {
-    return emailError("UPSTREAM_ERROR", "invalid body", 400);
+    return {
+      _tag: "Refusal",
+      kind: "bodyInvalid",
+      message: "invalid body",
+    };
   }
 
   // Bound the list before the normalization loop below allocates per entry.
   if (recipientsRaw.length > MAX_RECIPIENTS) {
-    return emailError(
-      "INVALID_TO",
-      `too many recipients (max ${MAX_RECIPIENTS}, got ${recipientsRaw.length})`,
-      413
-    );
+    return {
+      _tag: "Refusal",
+      kind: "recipientsTooMany",
+      message: `too many recipients (max ${MAX_RECIPIENTS}, got ${recipientsRaw.length})`,
+    };
   }
 
   // Bound the sender before anything copies it.
   if (from.length > MAX_SENDER_LENGTH) {
-    return emailError(
-      "INVALID_FROM",
-      `sender exceeds ${MAX_SENDER_LENGTH} characters`,
-      413
-    );
+    return {
+      _tag: "Refusal",
+      kind: "senderTooLong",
+      message: `sender exceeds ${MAX_SENDER_LENGTH} characters`,
+    };
   }
 
   // Fail closed on missing sender configuration before admission.
-  const senderDomain = readSenderDomain(env);
-
-  if (!senderDomain) {
-    return emailError(
-      "UPSTREAM_ERROR",
-      "email sender domain is not configured",
-      502
-    );
+  if (config.senderDomain._tag !== "Ready") {
+    return {
+      _tag: "Refusal",
+      kind: "senderDomainUnconfigured",
+      message: "email sender domain is not configured",
+    };
   }
 
+  const { value: senderDomain } = config.senderDomain;
   const normalized = normalizeEmailRecipients(recipientsRaw);
 
-  if ("response" in normalized) {
-    return normalized.response;
+  if ("_tag" in normalized) {
+    return normalized;
   }
 
   const mime = validateEmailMime(mimeBase64);
 
-  if ("response" in mime) {
-    return mime.response;
+  if ("_tag" in mime) {
+    return mime;
   }
 
   const sender = validateEmailSender(env, from, senderDomain);
 
-  if ("response" in sender) {
-    return sender.response;
+  if ("_tag" in sender) {
+    return sender;
   }
 
   // The envelope is pinned; now pin what the recipient will actually SEE.
-  const mimeFromRefusal = refuseMimeFromMismatch(mime.raw, from);
+  const mimeFromDetail = mimeFromRefusalDetail(mime.raw, from);
 
-  if (mimeFromRefusal) {
-    return mimeFromRefusal;
+  if (mimeFromDetail !== null) {
+    return {
+      _tag: "Refusal",
+      kind: "mimeFromMismatch",
+      message: mimeFromDetail,
+    };
   }
 
-  const mailKv = env.MAIL_IDEMPOTENCY;
-
-  if (!mailKv) {
-    return emailError(
-      "UPSTREAM_ERROR",
-      "email idempotency store is not configured",
-      502
-    );
+  if (config.mailKv._tag !== "Ready") {
+    return {
+      _tag: "Refusal",
+      kind: "idempotencyStoreUnconfigured",
+      message: "email idempotency store is not configured",
+    };
   }
 
   return {
+    _tag: "Validated",
     fromLower: sender.fromLower,
-    mailKv,
+    mailKv: config.mailKv.value,
     mimeBase64,
     operationKey,
     raw: mime.raw,
@@ -604,16 +745,26 @@ const validateEmailRequest = (
   };
 };
 
-/** Read a recorded idempotency outcome, or the failure response to return. */
+/**
+ * Idempotency lookup states: no usable record (send), a replayable record, or
+ * the store being unavailable (503). A parseable record with the wrong shape
+ * counts as `Missing` — re-sending is today's behavior.
+ */
+type StoredLookup =
+  | { readonly _tag: "Missing" }
+  | { readonly _tag: "Stored"; readonly outcome: StoredOutcome }
+  | { readonly _tag: "Unavailable" };
+
+/** Read a recorded idempotency outcome, or the failure state to return. */
 const readStoredOutcome = async (
   mailKv: MailKvNamespace,
   idempotencyKey: string
-): Promise<StoredOutcome | null | Response> => {
+): Promise<StoredLookup> => {
   try {
     const rawStored = await mailKv.get(idempotencyKey);
 
     if (rawStored === null) {
-      return null;
+      return { _tag: "Missing" };
     }
 
     const parsed: unknown = JSON.parse(rawStored);
@@ -625,46 +776,67 @@ const readStoredOutcome = async (
       "body" in parsed
     ) {
       return {
-        body: parsed.body,
-        digest: parsed.digest,
-        status: parsed.status,
+        _tag: "Stored",
+        outcome: {
+          body: parsed.body,
+          digest: parsed.digest,
+          status: parsed.status,
+        },
       };
     }
 
-    return null;
+    return { _tag: "Missing" };
   } catch {
-    return emailError("UPSTREAM_ERROR", "email admission unavailable", 503);
+    return { _tag: "Unavailable" };
   }
 };
 
-interface AdmittedSubmission {
-  submit: Map<string, SmtpRecipientOutcome> | null;
-  batchExpired: boolean;
-}
+/**
+ * Submission states for one `/email/send`:
+ * `Skipped` (nothing was admitted), `Smtp` (a completed transaction with a
+ * per-recipient outcome map), or `Expired` (the batch deadline elapsed, so
+ * every admitted recipient is unresolved).
+ */
+type Submission =
+  | { readonly _tag: "Skipped" }
+  | {
+      readonly _tag: "Smtp";
+      readonly outcomes: ReadonlyMap<string, SmtpRecipientOutcome>;
+    }
+  | { readonly _tag: "Expired" };
 
-/** Submit admitted recipients within the batch deadline (null config = refusal). */
+/** Submit admitted recipients within the batch deadline. */
 const submitAdmittedEmail = async (
-  env: Env,
+  emailConfig: EmailConfig,
   validated: ValidatedEmailRequest,
   admitted: ReadonlySet<string>,
   sendDeadline: EmailProviderDeadline,
   deps: ProxyDeps
-): Promise<AdmittedSubmission | Response> => {
-  let submit: Map<string, SmtpRecipientOutcome> | null = null;
-  let batchExpired = false;
-
+): Promise<Submission | Refusal> => {
   if (admitted.size === 0) {
-    return { batchExpired, submit };
+    return { _tag: "Skipped" };
   }
 
-  const smtpConfig = readSmtpConfig(env);
-
-  if (typeof smtpConfig === "string") {
-    return emailError("UPSTREAM_ERROR", smtpConfig, 502);
+  if (emailConfig._tag === "Off") {
+    return {
+      _tag: "Refusal",
+      kind: "smtpUnconfigured",
+      message: "email sending is not configured",
+    };
   }
+
+  if (emailConfig._tag === "Misconfigured") {
+    return {
+      _tag: "Refusal",
+      kind: "smtpMisconfigured",
+      message: emailConfig.detail,
+    };
+  }
+
+  const smtpConfig = emailConfig.value;
 
   try {
-    submit = await sendDeadline.run(
+    const outcomes = await sendDeadline.run(
       async () =>
         smtpSubmit({
           commandTimeoutMs:
@@ -684,17 +856,64 @@ const submitAdmittedEmail = async (
         }),
       EMAIL_SEND_FINALIZATION_MARGIN_MS
     );
+
+    return { _tag: "Smtp", outcomes };
   } catch {
     // Overall batch deadline elapsed: submissions may be in flight, so every
     // admitted recipient is unresolved.
-    batchExpired = true;
+    return { _tag: "Expired" };
+  }
+};
+
+/** One requested recipient's delivery state, from the submission result. */
+const deliveryFor = (
+  recipient: string,
+  admitted: ReadonlySet<string>,
+  submission: Submission
+): Delivery => {
+  if (!admitted.has(recipient)) {
+    return {
+      _tag: "Rejected",
+      code: "UNVERIFIED_DESTINATION",
+      message: `recipient '${recipient}' is not allowlisted`,
+    };
   }
 
-  return { batchExpired, submit };
+  if (submission._tag === "Expired") {
+    return {
+      _tag: "OutcomeUnknown",
+      code: "OUTCOME_UNKNOWN",
+      message: "provider outcome unknown; inspect email logs before retrying",
+    };
+  }
+
+  const outcome =
+    submission._tag === "Smtp" ? submission.outcomes.get(recipient) : null;
+
+  if (!outcome) {
+    return {
+      _tag: "OutcomeUnknown",
+      code: "OUTCOME_UNKNOWN",
+      message: "provider outcome unknown; inspect email logs before retrying",
+    };
+  }
+
+  if (outcome.ok) {
+    return { _tag: "ProviderAccepted", messageId: outcome.messageId };
+  }
+
+  return outcome.state === "failed"
+    ? { _tag: "Failed", code: outcome.code, message: outcome.message }
+    : {
+        _tag: "OutcomeUnknown",
+        code: outcome.code,
+        message: outcome.message,
+      };
 };
 
 export const handleEmailSend = async (
   env: Env,
+  config: ProxyConfig,
   body: Record<string, unknown>,
   projectId: string,
   deps: ProxyDeps
@@ -703,10 +922,10 @@ export const handleEmailSend = async (
     deps.timeouts?.emailTotalMs ?? EMAIL_SEND_DEADLINE_MS
   );
 
-  const validated = validateEmailRequest(env, body);
+  const validated = validateEmailRequest(env, config, body);
 
-  if (validated instanceof Response) {
-    return validated;
+  if (validated._tag === "Refusal") {
+    return refusalResponse(validated);
   }
 
   const digest = await emailPayloadDigest(
@@ -718,20 +937,30 @@ export const handleEmailSend = async (
   const idempotencyKey = `${IDEMPOTENCY_KEY_PREFIX}${validated.operationKey}`;
   const stored = await readStoredOutcome(validated.mailKv, idempotencyKey);
 
-  if (stored instanceof Response) {
-    return stored;
-  }
-
-  if (stored) {
-    if (stored.digest !== digest) {
-      return emailError(
-        "IDEMPOTENCY_CONFLICT",
-        "idempotency key has different content",
-        409
-      );
+  switch (stored._tag) {
+    case "Unavailable": {
+      return emailError("UPSTREAM_ERROR", "email admission unavailable", 503);
     }
 
-    return json(stored.body, stored.status);
+    case "Stored": {
+      if (stored.outcome.digest !== digest) {
+        return emailError(
+          "IDEMPOTENCY_CONFLICT",
+          "idempotency key has different content",
+          409
+        );
+      }
+
+      return json(stored.outcome.body, stored.outcome.status);
+    }
+
+    case "Missing": {
+      break;
+    }
+
+    default: {
+      return assertNever(stored);
+    }
   }
 
   // Admission (replaces Void's SQL admission): operator allowlist of exact
@@ -748,66 +977,25 @@ export const handleEmailSend = async (
   );
 
   const submission = await submitAdmittedEmail(
-    env,
+    config.email,
     validated,
     admitted,
     sendDeadline,
     deps
   );
 
-  if (submission instanceof Response) {
-    return submission;
+  if (submission._tag === "Refusal") {
+    return refusalResponse(submission);
   }
-
-  const { batchExpired, submit } = submission;
 
   // One entry per requested recipient, in requested order (the runtime matches
   // them as a set, but ordered output is easier to read and test).
-  const deliveries: RecipientResult[] = [];
-
-  for (const { address: recipient } of validated.recipients) {
-    if (!admitted.has(recipient)) {
-      deliveries.push({
-        error: {
-          code: "UNVERIFIED_DESTINATION",
-          message: `recipient '${recipient}' is not allowlisted`,
-        },
-        ok: false,
-        recipient,
-        state: "rejected",
-      });
-      continue;
-    }
-
-    const outcome = batchExpired ? null : (submit?.get(recipient) ?? null);
-
-    if (outcome === null) {
-      deliveries.push({
-        error: {
-          code: "OUTCOME_UNKNOWN",
-          message:
-            "provider outcome unknown; inspect email logs before retrying",
-        },
-        ok: false,
-        recipient,
-        state: "outcome_unknown",
-      });
-    } else if (outcome.ok) {
-      deliveries.push({
-        messageId: outcome.messageId,
-        ok: true,
-        recipient,
-        state: "provider_accepted",
-      });
-    } else {
-      deliveries.push({
-        error: { code: outcome.code, message: outcome.message },
-        ok: false,
-        recipient,
-        state: outcome.state,
-      });
-    }
-  }
+  const deliveries: DeliveryEntry[] = validated.recipients.map(
+    ({ address: recipient }) => ({
+      delivery: deliveryFor(recipient, admitted, submission),
+      recipient,
+    })
+  );
 
   return finishEmailSend(
     validated.mailKv,

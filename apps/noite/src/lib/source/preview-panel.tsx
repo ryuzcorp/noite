@@ -52,6 +52,8 @@ import {
   expiryLabel,
   workspacePreviewRef,
 } from "./preview-env";
+import { PreviewFrame, previewFrameTransition } from "./preview-machine";
+import type { PreviewFrameState } from "./preview-machine";
 
 /** How long the frame has to report itself loaded before the panel says it is
  * not answering: a host that black-holes the connection, or a version the
@@ -446,19 +448,20 @@ const TargetPreview = ({
   // Bumped by the reload button (and by Enter on the address already
   // loaded): part of the frame's reload token, see the frame's `ref`.
   const loads = atom(0);
-  // The reload token the frame last loaded for: a new successful deploy or a
-  // reload bump changes it, and the frame's `ref` then loads it again.
-  const loaded = atom.lazy(() => ({ token: "" }))();
   // The build log's disclosure: open while the deploy is still going, closed
   // once it succeeded (the frame gets the height). Only a *change* of status
   // decides it, so a repaint never closes a log the viewer opened.
   const logOpen = atom(false);
   const seen = atom.lazy(() => ({ status: "" }))();
   const focusing = atom.lazy(() => ({ armed: false }))();
-  // The frame's own liveness: a load that never arrives says so and can be
-  // retried, instead of leaving a blank pane that looks like an empty app.
-  const timedOut = atom(false);
-  const loadTimer = atom.lazy(() => ({ id: 0 }))();
+  // The frame's own liveness (`preview-machine.ts`): one value per reload
+  // token, so a load that never arrives says so — and a deploy that lands
+  // while it is stalled reloads it instead of waiting for Retry.
+  const frame = atom<PreviewFrameState>(PreviewFrame.Loading({ token: "" }));
+  // The armed timer, and the token the frame element currently holds. A box,
+  // not body `let`s: ilha re-runs the component and `watch` keeps the latest
+  // render's closures (see AGENTS.md, ilha pitfalls).
+  const frameBox = atom.lazy(() => ({ id: 0, token: "" }))();
   watch(feed.state, (state) => {
     const status = (feedValue(state) ?? [])[0]?.status ?? "";
 
@@ -474,13 +477,13 @@ const TargetPreview = ({
     }
   });
 
-  /** Give the frame `LOAD_TIMEOUT_MS` to load again: what a reload and a
-   * fresh target start with. */
-  const armFrame = () => {
-    window.clearTimeout(loadTimer.id);
-    timedOut.set(false);
-    loadTimer.id = window.setTimeout(() => {
-      timedOut.set(true);
+  /** Give the frame `LOAD_TIMEOUT_MS` to load `token`: a new navigation, the
+   * reload button or a deploy that went live all start here. */
+  const armFrame = (token: string): void => {
+    window.clearTimeout(frameBox.id);
+    frame.set(previewFrameTransition(frame(), { t: "arm", token }));
+    frameBox.id = window.setTimeout(() => {
+      frame.set(previewFrameTransition(frame(), { t: "timeout", token }));
     }, LOAD_TIMEOUT_MS);
   };
 
@@ -490,20 +493,28 @@ const TargetPreview = ({
       return;
     }
 
-    armFrame();
     onCleanup(() => {
-      window.clearTimeout(loadTimer.id);
+      window.clearTimeout(frameBox.id);
     });
   });
 
   const reload = () => {
     loads.set(loads() + 1);
-    armFrame();
   };
 
   // Read here, in the render, so a reload bump repaints (the frame's `ref`
   // runs on each paint, but reads made inside it are not tracked).
   const reloadToken = `${live?.id ?? ""}:${loads()}`;
+  // The state that belongs to the navigation on screen: a token the machine has
+  // not seen yet is a fresh arm, whose timer the frame element starts below.
+  const current = frame();
+
+  const frameState =
+    current.token === reloadToken
+      ? current
+      : PreviewFrame.Loading({ token: reloadToken });
+
+  const stalled = PreviewFrame.$is("Stalled")(frameState);
 
   const deploysHref =
     target.environmentId === ""
@@ -664,7 +675,7 @@ const TargetPreview = ({
           {note}
         </p>
       )}
-      {note === null && timedOut() ? (
+      {note === null && stalled ? (
         <div
           class="border-base-300 flex flex-wrap items-center gap-2 border-b px-3 py-1.5"
           role="status"
@@ -684,8 +695,9 @@ const TargetPreview = ({
           title={`${target.label} preview`}
           class="bg-base-100 min-h-0 w-full flex-1 border-0"
           onload={() => {
-            window.clearTimeout(loadTimer.id);
-            timedOut.set(false);
+            const { token } = frame();
+            window.clearTimeout(frameBox.id);
+            frame.set(previewFrameTransition(frame(), { t: "loaded", token }));
           }}
           ref={(el) => {
             // ilha patches the frame in place (a changed `key` does not
@@ -695,13 +707,14 @@ const TargetPreview = ({
             if (
               typeof HTMLIFrameElement !== "undefined" &&
               el instanceof HTMLIFrameElement &&
-              loaded.token !== reloadToken
+              frameBox.token !== reloadToken
             ) {
-              if (loaded.token !== "") {
+              if (frameBox.token !== "") {
                 el.src = address();
               }
 
-              loaded.token = reloadToken;
+              frameBox.token = reloadToken;
+              armFrame(reloadToken);
             }
           }}
         />

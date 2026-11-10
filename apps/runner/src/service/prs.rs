@@ -16,11 +16,11 @@ use serde::Serialize;
 use ts_rs::TS;
 
 use crate::api_error::ApiError;
-use crate::db::prs::{self, PrCommentRow, PrReviewRow, PullRequestRow};
+use crate::db::prs::{self, PrCommentRow, PrReviewRow, PrWrite, PullRequestRow};
 use crate::host::forge;
 use crate::host::git_identity::{self, Actor};
 use crate::host::prs as host_prs;
-use crate::models::App;
+use crate::models::{App, PrState, ReviewState};
 use crate::service::apps::app_or_404;
 use crate::AppState;
 
@@ -35,7 +35,7 @@ pub struct PrSummary {
     pub author_id: String,
     pub base: String,
     pub head: String,
-    pub state: String,
+    pub state: PrState,
     pub head_sha: String,
     pub merge_sha: Option<String>,
     pub merged_by: Option<String>,
@@ -71,7 +71,7 @@ pub struct PrComment {
 pub struct PrReview {
     pub id: String,
     pub reviewer_id: String,
-    pub state: String,
+    pub state: ReviewState,
     pub commit_sha: String,
     pub created_at: String,
     pub dismissed_at: Option<String>,
@@ -94,7 +94,30 @@ pub struct PrList {
     pub counts: PrCounts,
 }
 
-/// `mergeState` values the merge box renders.
+/// The merge box's closed set, serialized with the strings the UI already
+/// renders. Derived from the PR row plus the live compare: terminal states
+/// win, then a missing head, then a conflicting merge, then the approval
+/// gate (ROTH-1).
+///
+/// ```text
+/// merged | closed                     terminal
+/// head_missing                        the head branch is gone
+/// conflicts                           base..head does not merge cleanly
+/// blocked_approvals | mergeable       open, mergeable
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export)]
+pub enum MergeState {
+    Merged,
+    Closed,
+    HeadMissing,
+    Conflicts,
+    BlockedApprovals,
+    Mergeable,
+}
+
+/// One PR's full detail page.
 #[derive(Debug, Clone, Serialize, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export)]
@@ -107,7 +130,7 @@ pub struct PrDetail {
     pub approvals: i64,
     pub required_approvals: i64,
     pub require_pr: bool,
-    pub merge_state: String,
+    pub merge_state: MergeState,
 }
 
 #[derive(Debug, Clone, Serialize, TS)]
@@ -156,7 +179,7 @@ fn summary(row: &PullRequestRow, comment_count: i64) -> PrSummary {
         author_id: row.author_id.clone(),
         base: row.base.clone(),
         head: row.head.clone(),
-        state: row.state.clone(),
+        state: row.state,
         head_sha: row.head_sha.clone(),
         merge_sha: row.merge_sha.clone(),
         merged_by: row.merged_by.clone(),
@@ -172,7 +195,7 @@ fn review_view(row: &PrReviewRow) -> PrReview {
     PrReview {
         id: row.id.clone(),
         reviewer_id: row.reviewer_id.clone(),
-        state: row.state.clone(),
+        state: row.state,
         commit_sha: row.commit_sha.clone(),
         created_at: row.created_at.clone(),
         dismissed_at: row.dismissed_at.clone(),
@@ -194,7 +217,7 @@ pub fn counted_approvals(reviews: &[PrReview], head_sha: &str, author_id: &str) 
     latest
         .values()
         .filter(|review| {
-            review.state == "approved"
+            review.state == ReviewState::Approved
                 && review.dismissed_at.is_none()
                 && review.commit_sha == head_sha
                 && review.reviewer_id != author_id
@@ -210,25 +233,24 @@ fn merge_state(
     compare: Option<&forge::GitCompare>,
     approvals: i64,
     required: i64,
-) -> String {
-    if row.state == "merged" {
-        return "merged".into();
-    }
-    if row.state == "closed" {
-        return "closed".into();
+) -> MergeState {
+    match row.state {
+        PrState::Merged => return MergeState::Merged,
+        PrState::Closed => return MergeState::Closed,
+        PrState::Open => {}
     }
     if !head_known {
-        return "head_missing".into();
+        return MergeState::HeadMissing;
     }
     match compare {
         Some(c) if c.mergeable => {
             if required > 0 && approvals < required {
-                "blocked_approvals".into()
+                MergeState::BlockedApprovals
             } else {
-                "mergeable".into()
+                MergeState::Mergeable
             }
         }
-        _ => "conflicts".into(),
+        _ => MergeState::Conflicts,
     }
 }
 
@@ -375,12 +397,10 @@ pub async fn list(
 ) -> Result<PrList, ApiError> {
     let state_filter = match state_filter {
         Some("all") | None => None,
-        Some(other) => {
-            if !matches!(other, "open" | "closed" | "merged") {
-                return Err(ApiError::bad(format!("unknown state {other:?}")));
-            }
-            Some(other)
-        }
+        Some(other) => Some(
+            PrState::parse(other)
+                .ok_or_else(|| ApiError::bad(format!("unknown state {other:?}")))?,
+        ),
     };
     let app = app_or_404(state, id).await?;
     let skip = skip.max(0);
@@ -521,14 +541,29 @@ pub async fn update(
     match next_state {
         None => {}
         Some("closed") => {
-            if row.state == "open" {
-                prs::close_pr(&state.pool, &row.id, &actor.user_id)
-                    .await
-                    .map_err(internal_error)?;
+            match prs::close_pr(&state.pool, &row.id, &actor.user_id)
+                .await
+                .map_err(internal_error)?
+            {
+                // Already closed (or merged): the repeat is a no-op, exactly
+                // as it was before the CAS existed.
+                PrWrite::Applied
+                | PrWrite::Refused {
+                    current: PrState::Closed | PrState::Merged,
+                } => {}
+                // The row moved to `merged` between our read and the write:
+                // a close must not overwrite a merge.
+                PrWrite::Refused { current } => {
+                    return Err(ApiError::conflict(format!(
+                        "pull request #{number} is {} and cannot be closed",
+                        current.as_str()
+                    )))
+                }
             }
         }
         Some("open") => {
-            if row.state == "closed" {
+            let reopenable = row.state == PrState::Closed;
+            if reopenable {
                 if forge::resolve_ref(&bare, &row.head).await.is_err() {
                     return Err(ApiError::conflict(
                         "the head branch no longer exists; push it again before reopening",
@@ -543,9 +578,32 @@ pub async fn update(
                         "another open pull request already targets that branch",
                     ));
                 }
-                prs::reopen_pr(&state.pool, &row.id)
-                    .await
-                    .map_err(internal_error)?;
+            }
+            match prs::reopen_pr(&state.pool, &row.id)
+                .await
+                .map_err(internal_error)?
+            {
+                // Already open: idempotent, as before.
+                PrWrite::Applied
+                | PrWrite::Refused {
+                    current: PrState::Open,
+                } => {}
+                // A merged PR is terminal: its squash commit is on the base
+                // branch, so there is nothing to reopen.
+                PrWrite::Refused {
+                    current: PrState::Merged,
+                } => {
+                    return Err(ApiError::conflict(format!(
+                        "pull request #{number} was merged and cannot be reopened"
+                    )))
+                }
+                PrWrite::Refused {
+                    current: PrState::Closed,
+                } => {
+                    return Err(ApiError::conflict(
+                        "the pull request changed while reopening; retry",
+                    ))
+                }
             }
         }
         Some(other) => {
@@ -701,17 +759,14 @@ pub async fn review(
     if role == "view" {
         return Err(ApiError::bad("viewers may not review"));
     }
-    if !matches!(review_state, "approved" | "changes_requested") {
-        return Err(ApiError::bad(
-            "state must be 'approved' or 'changes_requested'",
-        ));
-    }
+    let review_state = ReviewState::parse(review_state)
+        .ok_or_else(|| ApiError::bad("state must be 'approved' or 'changes_requested'"))?;
     let (app, bare) = app_repo(state, id).await?;
     let row = prs::get_by_number(&state.pool, &app.id, number)
         .await
         .map_err(internal_error)?
         .ok_or_else(|| ApiError::not_found(format!("pull request #{number} not found")))?;
-    if row.state != "open" {
+    if row.state != PrState::Open {
         return Err(ApiError::conflict("this pull request is not open"));
     }
     if row.author_id == actor.user_id {
@@ -720,6 +775,8 @@ pub async fn review(
     let head_sha = forge::resolve_ref(&bare, &row.head)
         .await
         .map_err(|_| ApiError::conflict("the head branch no longer exists"))?;
+    // The insert itself re-checks `open`: a close between the read above and
+    // this write refuses the review instead of recording it on a dead PR.
     prs::insert_review(
         &state.pool,
         &row.id,
@@ -728,7 +785,8 @@ pub async fn review(
         &head_sha,
     )
     .await
-    .map_err(internal_error)?;
+    .map_err(internal_error)?
+    .ok_or_else(|| ApiError::conflict("this pull request is not open"))?;
     detail(state, &app, &bare, row).await
 }
 
@@ -754,7 +812,7 @@ pub async fn merge(
         .await
         .map_err(internal_error)?
         .ok_or_else(|| ApiError::not_found(format!("pull request #{number} not found")))?;
-    if row.state != "open" {
+    if row.state != PrState::Open {
         return Err(ApiError::conflict("this pull request is not open"));
     }
     let rules = prs::branch_rules(&state.pool, &app.id)
@@ -816,19 +874,47 @@ pub async fn merge(
     .await
     .map_err(repo_error)?;
 
-    forge::publish_ref(state, &app, &row.base, Some(&base_sha), Some(&merge_sha))
+    // Claim the transition before publishing: `merge_pr` is the CAS from
+    // `open`, so a concurrent close either already won (and we publish
+    // nothing) or loses to us (and is told the PR is not open). The reverse
+    // order is what used to let a close overwrite a completed merge.
+    match prs::merge_pr(&state.pool, &row.id, &merge_sha, &actor.user_id)
         .await
-        .map_err(|e| {
-            let msg = format!("{e:#}");
-            if msg.contains("tip moved") {
-                ApiError::conflict("the base branch moved; retry the merge")
-            } else {
-                repo_error(e)
-            }
-        })?;
-    prs::merge_pr(&state.pool, &row.id, &merge_sha, &actor.user_id)
-        .await
-        .map_err(internal_error)?;
+        .map_err(internal_error)?
+    {
+        PrWrite::Applied => {}
+        PrWrite::Refused { current } => {
+            return Err(ApiError::conflict(format!(
+                "pull request #{number} is {} and cannot be merged",
+                current.as_str()
+            )))
+        }
+    }
+    if let Err(e) =
+        forge::publish_ref(state, &app, &row.base, Some(&base_sha), Some(&merge_sha)).await
+    {
+        // The claim is undone, not left dangling: the PR goes back to `open`
+        // with no merge fields, exactly as it was before this request.
+        match prs::revert_merge(&state.pool, &row.id, &merge_sha).await {
+            Ok(PrWrite::Applied) => {}
+            Ok(PrWrite::Refused { current }) => tracing::warn!(
+                pr_id = %row.id,
+                current = current.as_str(),
+                "merge rollback refused: the pull request moved during the failed publish"
+            ),
+            Err(revert_err) => tracing::warn!(
+                pr_id = %row.id,
+                error = %revert_err,
+                "merge rollback failed; the pull request reads merged without a published ref"
+            ),
+        }
+        let msg = format!("{e:#}");
+        return Err(if msg.contains("tip moved") {
+            ApiError::conflict("the base branch moved; retry the merge")
+        } else {
+            repo_error(e)
+        });
+    }
     if delete_branch {
         if let Err(e) = forge::publish_ref(state, &app, &row.head, Some(&head_sha), None).await {
             tracing::warn!(error = %format!("{e:#}"), "pr head delete after merge");
@@ -913,11 +999,11 @@ pub async fn branch_rules_set(
 mod tests {
     use super::*;
 
-    fn review(id: &str, reviewer: &str, state: &str, sha: &str, at: &str) -> PrReview {
+    fn review(id: &str, reviewer: &str, state: ReviewState, sha: &str, at: &str) -> PrReview {
         PrReview {
             id: id.into(),
             reviewer_id: reviewer.into(),
-            state: state.into(),
+            state,
             commit_sha: sha.into(),
             created_at: at.into(),
             dismissed_at: None,
@@ -928,12 +1014,36 @@ mod tests {
     fn approvals_count_latest_per_reviewer_on_head_only() {
         let head = "aaaa";
         let reviews = vec![
-            review("1", "a", "approved", head, "2026-01-01T00:00:00Z"),
+            review(
+                "1",
+                "a",
+                ReviewState::Approved,
+                head,
+                "2026-01-01T00:00:00Z",
+            ),
             // A later review by `a` replaces the approval.
-            review("2", "a", "changes_requested", head, "2026-01-02T00:00:00Z"),
-            review("3", "b", "approved", head, "2026-01-01T00:00:00Z"),
+            review(
+                "2",
+                "a",
+                ReviewState::ChangesRequested,
+                head,
+                "2026-01-02T00:00:00Z",
+            ),
+            review(
+                "3",
+                "b",
+                ReviewState::Approved,
+                head,
+                "2026-01-01T00:00:00Z",
+            ),
             // An approval on an older sha does not count.
-            review("4", "c", "approved", "bbbb", "2026-01-03T00:00:00Z"),
+            review(
+                "4",
+                "c",
+                ReviewState::Approved,
+                "bbbb",
+                "2026-01-03T00:00:00Z",
+            ),
         ];
         assert_eq!(counted_approvals(&reviews, head, "author"), 1);
         // The author's own approval is excluded.
@@ -941,7 +1051,7 @@ mod tests {
         with_author.push(review(
             "5",
             "author",
-            "approved",
+            ReviewState::Approved,
             head,
             "2026-01-04T00:00:00Z",
         ));
@@ -950,9 +1060,31 @@ mod tests {
         let mut dismissed = reviews.clone();
         dismissed.push(PrReview {
             dismissed_at: Some("2026-01-05T00:00:00Z".into()),
-            ..review("6", "d", "approved", head, "2026-01-01T00:00:00Z")
+            ..review(
+                "6",
+                "d",
+                ReviewState::Approved,
+                head,
+                "2026-01-01T00:00:00Z",
+            )
         });
         assert_eq!(counted_approvals(&dismissed, head, "author"), 1);
+    }
+
+    #[test]
+    fn pr_state_strings_round_trip() {
+        // The wire strings are the DB values the CAS predicates spell out.
+        for state in [PrState::Open, PrState::Closed, PrState::Merged] {
+            assert_eq!(PrState::parse(state.as_str()), Some(state));
+        }
+        assert_eq!(PrState::parse("superseded"), None);
+        for state in [ReviewState::Approved, ReviewState::ChangesRequested] {
+            let wire = match state {
+                ReviewState::Approved => "approved",
+                ReviewState::ChangesRequested => "changes_requested",
+            };
+            assert_eq!(ReviewState::parse(wire), Some(state));
+        }
     }
 
     #[test]
@@ -966,7 +1098,7 @@ mod tests {
             author_id: "u".into(),
             base: "main".into(),
             head: "feat".into(),
-            state: "open".into(),
+            state: PrState::Open,
             head_sha: "aaaa".into(),
             merge_sha: None,
             merged_by: None,
@@ -975,11 +1107,14 @@ mod tests {
             closed_at: None,
             merged_at: None,
         };
-        assert_eq!(merge_state(&row, false, None, 0, 0), "head_missing");
-        row.state = "closed".into();
-        assert_eq!(merge_state(&row, false, None, 0, 0), "closed");
-        row.state = "merged".into();
-        assert_eq!(merge_state(&row, false, None, 0, 0), "merged");
+        assert_eq!(
+            merge_state(&row, false, None, 0, 0),
+            MergeState::HeadMissing
+        );
+        row.state = PrState::Closed;
+        assert_eq!(merge_state(&row, false, None, 0, 0), MergeState::Closed);
+        row.state = PrState::Merged;
+        assert_eq!(merge_state(&row, false, None, 0, 0), MergeState::Merged);
     }
 
     // ---- integration: real bare repos + an in-process S3 stub ----
@@ -1307,6 +1442,175 @@ mod tests {
         (base, head)
     }
 
+    /// A close that races a completed merge must not rewrite the row: the
+    /// CAS `open -> closed` refuses and the merge fields survive (before the
+    /// CAS, `close_pr ... WHERE id = ?` turned the row into `closed` with a
+    /// merge sha — a state the merge box cannot render).
+    #[tokio::test]
+    async fn close_refuses_a_merged_pr_and_keeps_its_merge_fields() {
+        let h = Harness::new("prcasclose").await;
+        let app_id = h.app.id.clone();
+        let pr = prs::insert_pr(
+            &h.state.pool,
+            &app_id,
+            1,
+            "t",
+            "",
+            "user_a",
+            "main",
+            "feat",
+            "sha_a",
+        )
+        .await
+        .expect("insert");
+        assert_eq!(
+            prs::merge_pr(&h.state.pool, &pr.id, "merge_sha", "user_b")
+                .await
+                .expect("merge"),
+            PrWrite::Applied
+        );
+        assert_eq!(
+            prs::close_pr(&h.state.pool, &pr.id, "user_a")
+                .await
+                .expect("close"),
+            PrWrite::Refused {
+                current: PrState::Merged
+            }
+        );
+        let row = prs::get_pr(&h.state.pool, &pr.id)
+            .await
+            .expect("get")
+            .expect("row");
+        assert_eq!(row.state, PrState::Merged);
+        assert_eq!(row.merge_sha.as_deref(), Some("merge_sha"));
+        assert_eq!(
+            row.merged_by.as_deref(),
+            Some("user_b"),
+            "the close must not touch the merge fields"
+        );
+        h.finish().await;
+    }
+
+    /// The other direction: a merge that races a close is refused instead of
+    /// landing on the closed row.
+    #[tokio::test]
+    async fn merge_refuses_a_closed_pr() {
+        let h = Harness::new("prcasmerge").await;
+        let app_id = h.app.id.clone();
+        let pr = prs::insert_pr(
+            &h.state.pool,
+            &app_id,
+            1,
+            "t",
+            "",
+            "user_a",
+            "main",
+            "feat",
+            "sha_a",
+        )
+        .await
+        .expect("insert");
+        assert_eq!(
+            prs::close_pr(&h.state.pool, &pr.id, "user_a")
+                .await
+                .expect("close"),
+            PrWrite::Applied
+        );
+        assert_eq!(
+            prs::merge_pr(&h.state.pool, &pr.id, "merge_sha", "user_b")
+                .await
+                .expect("merge"),
+            PrWrite::Refused {
+                current: PrState::Closed
+            }
+        );
+        let row = prs::get_pr(&h.state.pool, &pr.id)
+            .await
+            .expect("get")
+            .expect("row");
+        assert_eq!(row.state, PrState::Closed);
+        assert_eq!(row.merge_sha, None, "a refused merge records no commit");
+        h.finish().await;
+    }
+
+    /// `merged` is terminal: reopening would claim a live PR whose squash
+    /// commit is already on the base branch.
+    #[tokio::test]
+    async fn reopen_refuses_a_merged_pr() {
+        let h = Harness::new("prcasreopen").await;
+        let app_id = h.app.id.clone();
+        let pr = prs::insert_pr(
+            &h.state.pool,
+            &app_id,
+            1,
+            "t",
+            "",
+            "user_a",
+            "main",
+            "feat",
+            "sha_a",
+        )
+        .await
+        .expect("insert");
+        prs::merge_pr(&h.state.pool, &pr.id, "merge_sha", "user_b")
+            .await
+            .expect("merge");
+        assert_eq!(
+            prs::reopen_pr(&h.state.pool, &pr.id).await.expect("reopen"),
+            PrWrite::Refused {
+                current: PrState::Merged
+            }
+        );
+        let row = prs::get_pr(&h.state.pool, &pr.id)
+            .await
+            .expect("get")
+            .expect("row");
+        assert_eq!(row.state, PrState::Merged);
+        h.finish().await;
+    }
+
+    /// A review written after the PR closed is refused by the insert itself,
+    /// so a close racing the review cannot leave a verdict on a dead PR.
+    #[tokio::test]
+    async fn review_insert_is_refused_after_close() {
+        let h = Harness::new("prcasreview").await;
+        let app_id = h.app.id.clone();
+        let pr = prs::insert_pr(
+            &h.state.pool,
+            &app_id,
+            1,
+            "t",
+            "",
+            "user_a",
+            "main",
+            "feat",
+            "sha_a",
+        )
+        .await
+        .expect("insert");
+        prs::close_pr(&h.state.pool, &pr.id, "user_a")
+            .await
+            .expect("close");
+        assert!(
+            prs::insert_review(
+                &h.state.pool,
+                &pr.id,
+                "user_b",
+                ReviewState::Approved,
+                "sha_a"
+            )
+            .await
+            .expect("insert")
+            .is_none(),
+            "a review on a closed PR is refused"
+        );
+        assert!(prs::list_reviews(&h.state.pool, &pr.id)
+            .await
+            .expect("reviews")
+            .is_empty());
+        h.finish().await;
+    }
+
     #[tokio::test]
     async fn head_move_dismisses_reviews() {
         let h = Harness::new("prmove").await;
@@ -1324,9 +1628,15 @@ mod tests {
         )
         .await
         .expect("insert");
-        prs::insert_review(&h.state.pool, &pr.id, "user_b", "approved", "sha_a")
-            .await
-            .expect("review");
+        prs::insert_review(
+            &h.state.pool,
+            &pr.id,
+            "user_b",
+            ReviewState::Approved,
+            "sha_a",
+        )
+        .await
+        .expect("review");
         host_prs::on_branch_moved(&h.state, &app_id, "feat", "sha_b")
             .await
             .expect("move");
@@ -1375,9 +1685,15 @@ mod tests {
         )
         .await
         .expect("line comment");
-        prs::insert_review(&h.state.pool, &pr.id, "user_b", "approved", "sha")
-            .await
-            .expect("review");
+        prs::insert_review(
+            &h.state.pool,
+            &pr.id,
+            "user_b",
+            ReviewState::Approved,
+            "sha",
+        )
+        .await
+        .expect("review");
         db::delete_app(&h.state.pool, &app_id)
             .await
             .expect("delete");
@@ -1406,7 +1722,7 @@ mod tests {
         let detail = create(&h.state, &h.app.id, &author, "Add b", "", "main", "feat")
             .await
             .expect("open");
-        assert_eq!(detail.merge_state, "mergeable");
+        assert_eq!(detail.merge_state, MergeState::Mergeable);
         let merger = actor("user_merger", "Merger");
         let merged = merge(
             &h.state,
@@ -1421,7 +1737,7 @@ mod tests {
         )
         .await
         .expect("merge");
-        assert_eq!(merged.merge_state, "merged");
+        assert_eq!(merged.merge_state, MergeState::Merged);
         let merge_sha = merged.pull_request.merge_sha.clone().expect("merge sha");
         let tip = git(&bare, &["rev-parse", "main"]).await;
         assert_eq!(tip.trim(), merge_sha);
@@ -1602,7 +1918,7 @@ mod tests {
         .await
         .expect("insert");
         let detail = get(&h.state, &h.app.id, 1).await.expect("get");
-        assert_eq!(detail.merge_state, "head_missing");
+        assert_eq!(detail.merge_state, MergeState::HeadMissing);
         assert!(detail.compare.is_none());
         h.finish().await;
     }

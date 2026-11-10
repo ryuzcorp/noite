@@ -480,6 +480,36 @@ describe("the frame's events", () => {
     expect(checkpoint.workspace.baseSha).toBe("beef2");
   });
 
+  test("a lower revision than the one already shown is dropped", async () => {
+    const { checkpoint, frame } = await open();
+    const seen: number[] = [];
+    checkpoint.workspace.onChanges(() => {
+      seen.push(checkpoint.workspace.changes().length);
+    });
+    frame.emit("changes", {
+      baseSha: "beef2",
+      changes: [row("src/a.ts"), row("src/b.ts")],
+      revision: 2,
+    });
+    // A pass that started earlier, published later: its rows are older.
+    frame.emit("changes", {
+      baseSha: "beef3",
+      changes: [row("src/a.ts")],
+      revision: 1,
+    });
+    // The frame answers in order, so once it has seen a request the page sent
+    // after both events, both events have been dispatched.
+    void checkpoint.workspace.refresh().catch(() => {
+      // The fake frame has no `refresh` handler; its refusal is the arrival
+      // signal this test waits on.
+    });
+    await frame.received("refresh");
+
+    expect(seen.at(-1)).toBe(2);
+    expect(checkpoint.workspace.changes()).toHaveLength(2);
+    expect(checkpoint.workspace.baseSha).toBe("beef2");
+  });
+
   test("another tab's structural change reaches the tree", async () => {
     const { checkpoint, frame } = await open();
 
