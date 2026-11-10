@@ -210,10 +210,11 @@ fn upstream(cfg: &Config, port: i64) -> String {
 }
 
 /// Every hostname the platform itself routes, with its route: the control
-/// hosts, then the API and Git hosts under every tenant base. The route
-/// table inserts this list before any app route, and `lifecycle::slug_ok`
-/// refuses a slug whose tenant host lands on one — so the two cannot drift
-/// when `CONTROL_SUBDOMAIN` or `CONTROL_EXTRA_HOSTS` changes.
+/// hosts, the loopback healthcheck, then the API and Git hosts under every
+/// tenant base. The route table inserts this list before any app route, and
+/// `lifecycle::slug_ok` refuses a slug whose tenant host lands on one — so
+/// the reservation and the table share one set and cannot drift when
+/// `CONTROL_SUBDOMAIN` or `CONTROL_EXTRA_HOSTS` changes.
 pub fn platform_routes(cfg: &Config) -> Vec<(String, EdgeRoute)> {
     let mut out: Vec<(String, EdgeRoute)> = cfg
         .control_hosts()
@@ -231,6 +232,11 @@ pub fn platform_routes(cfg: &Config) -> Vec<(String, EdgeRoute)> {
             )
         })
         .collect();
+    // The loopback healthcheck carries no zones (it never had a guard).
+    out.push((
+        "127.0.0.1".into(),
+        unzoned(EdgeKind::Control, cfg.caddy_control_upstream.clone()),
+    ));
     for base in cfg.tenant_bases() {
         out.push((
             format!("api.{base}").to_lowercase(),
@@ -259,6 +265,18 @@ pub fn platform_routes(cfg: &Config) -> Vec<(String, EdgeRoute)> {
     out
 }
 
+/// Whether a dropped host should be warned about now: once per host per
+/// process. `build_table` runs on every reconcile tick, and a colliding app
+/// row keeps existing, so warning unconditionally would log every 5 s.
+fn first_drop_warning(host: &str) -> bool {
+    static WARNED: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+        std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+    WARNED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(host.to_string())
+}
+
 /// Insert an app-owned route unless the host is a platform host. A collision
 /// means a slug (or a custom claim) spells a platform hostname: the platform
 /// keeps the host, the tenant loses that route but keeps its row.
@@ -270,12 +288,14 @@ fn insert_app_route(
     source: &'static str,
 ) {
     if let Some(owned) = platform.get(&host) {
-        tracing::warn!(
-            %host,
-            source,
-            platform = ?owned.kind,
-            "app route dropped: the host belongs to the platform"
-        );
+        if first_drop_warning(&host) {
+            tracing::warn!(
+                %host,
+                source,
+                platform = ?owned.kind,
+                "app route dropped: the host belongs to the platform"
+            );
+        }
         return;
     }
     exact.insert(host, route);
@@ -289,12 +309,13 @@ pub fn build_table(
     limits: &[AppLimit],
     envs: &[EnvironmentRoute],
 ) -> EdgeTable {
-    let mut exact: HashMap<String, EdgeRoute> = platform_routes(cfg).into_iter().collect();
-    // The loopback healthcheck carries no zones (it never had a guard).
-    exact.insert(
-        "127.0.0.1".into(),
-        unzoned(EdgeKind::Control, cfg.caddy_control_upstream.clone()),
-    );
+    // First-wins: the control hosts come first in `platform_routes`, so even
+    // a misconfigured `CONTROL_SUBDOMAIN=api` leaves the control route in
+    // place instead of letting the api/git route shadow it.
+    let mut exact: HashMap<String, EdgeRoute> = HashMap::new();
+    for (host, route) in platform_routes(cfg) {
+        exact.entry(host).or_insert(route);
+    }
     // Platform routes win every host collision below: a tenant slug or a
     // custom claim that spells one of these hosts is dropped (warned), never
     // allowed to overwrite the control/API/Git backend.
@@ -730,6 +751,25 @@ mod tests {
         );
     }
 
+    /// First-wins platform insertion: even a hand-written table config where
+    /// the control subdomain is `api` keeps the control route.
+    #[test]
+    fn control_host_wins_an_api_name_collision() {
+        let mut cfg = config_for_tests();
+        cfg.control_subdomain = "api".into();
+        let t = build_table(&cfg, &[], &[], &[], &[]);
+        assert_eq!(t.exact["api.localhost"].kind, EdgeKind::Control);
+    }
+
+    /// The reconcile tick rebuilds the table every few seconds; a colliding
+    /// app must not log on every pass.
+    #[test]
+    fn a_dropped_host_warns_once() {
+        let host = "warn-once.localhost";
+        assert!(first_drop_warning(host), "first drop warns");
+        assert!(!first_drop_warning(host), "later passes stay quiet");
+    }
+
     /// A dotted/uppercase extra control host canonicalizes to the host the
     /// edge actually matches, so a tenant cannot take the reachable form.
     #[test]
@@ -772,6 +812,7 @@ mod tests {
         cfg.control_extra_hosts = vec!["noite.local".into()];
         let hosts: Vec<String> = platform_routes(&cfg).into_iter().map(|(h, _)| h).collect();
         for host in [
+            "127.0.0.1",
             "api.localhost",
             "git.localhost",
             "api.noite.local",

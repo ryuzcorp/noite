@@ -1808,9 +1808,6 @@ impl Config {
         if self.otel_flush_ms < 1000 {
             problems.push("RUNNER_OTEL_FLUSH_MS must be >= 1000".into());
         }
-        // A 0 memory limit means DuckDB's own 80%-of-RAM default, which is
-        // exactly what this knob exists to avoid; a tiny one makes every
-        // query spill forever. 64 MiB is the floor DuckDB can run a scan in.
         // Every edge-facing domain must be what a Host header can carry: a
         // bare DNS name or IP literal. A scheme/port/path value would key a
         // route the edge can never match while its short form stays a
@@ -1829,14 +1826,35 @@ impl Config {
                 self.control_subdomain
             ));
         }
+        // A control host may not spell an api/git route: the collision would
+        // be resolved first-wins by `build_table`, but the operator's intent
+        // (control on that host) and the api/git host are contradictory.
+        let bases = self.tenant_bases();
+        if sub == "api" || sub == "git" {
+            problems.push(format!(
+                "CONTROL_SUBDOMAIN {sub:?} collides with the platform's {sub}.{{base}} route"
+            ));
+        }
         for raw in &self.control_extra_hosts {
             let host = normalize_host(raw);
             if !host.is_empty() && !bare_host_ok(&host) {
                 problems.push(format!(
                     "CONTROL_EXTRA_HOSTS entries must be bare DNS names or IP literals, got {raw:?}"
                 ));
+                continue;
+            }
+            if bases
+                .iter()
+                .any(|base| host == format!("api.{base}") || host == format!("git.{base}"))
+            {
+                problems.push(format!(
+                    "CONTROL_EXTRA_HOSTS entry {host:?} collides with an api./git. platform route"
+                ));
             }
         }
+        // A 0 memory limit means DuckDB's own 80%-of-RAM default, which is
+        // exactly what this knob exists to avoid; a tiny one makes every
+        // query spill forever. 64 MiB is the floor DuckDB can run a scan in.
         if self.duckdb_memory_mb < 64 {
             problems.push("RUNNER_DUCKDB_MEMORY_MB must be >= 64".into());
         }
@@ -3024,6 +3042,22 @@ mod tests {
         assert!(bad.validate().is_err(), "port in BASE_DOMAIN");
         bad.base_domain = "example.com".into();
         assert!(bad.validate().is_ok(), "a bare base validates");
+    }
+
+    #[test]
+    fn control_hosts_cannot_claim_an_api_or_git_route() {
+        let mut cfg = config_for_tests();
+        for sub in ["api", "git"] {
+            cfg.control_subdomain = sub.into();
+            assert!(cfg.validate().is_err(), "CONTROL_SUBDOMAIN={sub}");
+        }
+        cfg.control_subdomain = "console".into();
+        for host in ["api.localhost", "git.localhost"] {
+            cfg.control_extra_hosts = vec![host.into()];
+            assert!(cfg.validate().is_err(), "CONTROL_EXTRA_HOSTS={host}");
+        }
+        cfg.control_extra_hosts = vec!["panel.localhost".into()];
+        assert!(cfg.validate().is_ok());
     }
 
     #[test]
