@@ -106,6 +106,17 @@ test("a sync during the pane's own write reads nothing", () => {
   expect(sync.machine.seq).toBe(machine.seq);
 });
 
+test("a stale surface is not reopened as already painted", () => {
+  const { machine } = opened("a.ts", "one");
+  const rebased = stepPane(machine, PaneEvents.Rebased()).machine;
+  const reopening = stepPane(rebased, PaneEvents.Requested({ path: "a.ts" }));
+
+  // `from` would let the open dedupe against the old checkout's text and skip
+  // the paint (and its edit session).
+  expect(reopening.machine.view._tag).toBe("Opening");
+  expect(ownedPainted(reopening.machine.view)).toBeNull();
+});
+
 test("a rebase keeps the text but gives up the path", () => {
   const { machine } = opened("a.ts", "one");
   const rebased = stepPane(machine, PaneEvents.Rebased());

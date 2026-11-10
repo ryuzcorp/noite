@@ -193,7 +193,14 @@ const beginRead = (machine: PaneMachine, path: string): PaneDecision => {
     close: false,
     machine: {
       seq: token,
-      view: PaneViews.Opening({ from: paintedOf(machine.view), path, token }),
+      // Only a paint the current checkout owns is worth keeping as `from`: a
+      // stale surface (the checkout that went) must repaint, or the new
+      // checkout's file opens without its edit session.
+      view: PaneViews.Opening({
+        from: ownedPainted(machine.view),
+        path,
+        token,
+      }),
     },
     read: { path, token },
     recheck: false,
