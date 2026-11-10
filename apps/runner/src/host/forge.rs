@@ -352,6 +352,20 @@ pub async fn publish_ref(
     .await
 }
 
+/// Refuse a publish whose app row is gone or now carries another slug: the
+/// row is the authority for "this slug is mine", and the check runs under the
+/// slug's push guard (see [`publish_refname`]).
+async fn ensure_app_row(state: &AppState, app: &App) -> anyhow::Result<()> {
+    match crate::db::get_app(&state.pool, &app.id).await? {
+        Some(row) if row.slug == app.slug => Ok(()),
+        _ => bail!(
+            "app {} no longer owns the slug {}; refusing to publish",
+            app.id,
+            app.slug
+        ),
+    }
+}
+
 /// [`publish_ref`] for a full ref name: `refs/heads/<branch>` (a branch) or
 /// `refs/previews/<userId>/<branch>` (a workspace preview's hidden ref, which
 /// is never advertised or browsed). Anything else is refused.
@@ -372,6 +386,11 @@ pub async fn publish_refname(
     // and the publish below run inside this guard; the locked variants
     // re-taking it would self-deadlock.
     let _push_guard = state.wal.lock(&app.slug).await;
+    // Inside the guard, and only here: the caller's `App` may be a snapshot
+    // from before a delete or a rename freed this slug, and a ref move made
+    // for it would create the *next* app's history (the tip sweep would
+    // deploy it). Checked under the lock so create/rename cannot interleave.
+    ensure_app_row(state, app).await?;
     let bare = read_mirror_locked(state, &app.slug).await?;
     if refname.starts_with(crate::host::git_http::PREVIEW_REF_PREFIX) {
         // A mirror hydrated before preview environments existed has no hidden
@@ -1223,6 +1242,24 @@ mod tests {
                 control_boot: Default::default(),
             };
             let app = test_app(slug);
+            // The publish guard reads the row (a publish is only ever for an
+            // app that still owns its slug), so the fixture app needs one.
+            sqlx::query(
+                "INSERT INTO app (id, slug, name, user_id, status, subdomain, git_prefix, \
+                 fleet_bucket, listen_port, internal_port, desired_state, created_at, updated_at) \
+                 VALUES (?, ?, ?, ?, 'provisioned', ?, ?, ?, 30100, 30101, 'running', \
+                 '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z')",
+            )
+            .bind(&app.id)
+            .bind(&app.slug)
+            .bind(&app.name)
+            .bind(&app.user_id)
+            .bind(&app.subdomain)
+            .bind(&app.git_prefix)
+            .bind(&app.fleet_bucket)
+            .execute(&state.pool)
+            .await
+            .expect("seed app row");
             Self {
                 state,
                 app,
@@ -1346,6 +1383,43 @@ mod tests {
         assert!(valid_ref("abcdef1"));
         assert!(!valid_ref("a..b"));
         assert!(!valid_ref("-x"));
+    }
+
+    /// A publish is only ever for an app that still owns its slug. A delete
+    /// (or a rename) frees the slug; a caller holding the old row must be
+    /// refused inside the push guard, or a late import would create
+    /// `refs/heads/main` for the *next* app that takes that slug.
+    #[tokio::test]
+    async fn a_publish_for_a_gone_or_renamed_app_is_refused() {
+        let h = Harness::new("publishguard").await;
+        assert!(
+            ensure_app_row(&h.state, &h.app).await.is_ok(),
+            "the live app owns its slug"
+        );
+
+        // A rename: the row keeps the id but carries another slug.
+        sqlx::query("UPDATE app SET slug = ? WHERE id = ?")
+            .bind("renamed")
+            .bind(&h.app.id)
+            .execute(&h.state.pool)
+            .await
+            .expect("rename row");
+        let renamed = ensure_app_row(&h.state, &h.app).await;
+        assert!(renamed.is_err(), "the old slug is not this app's any more");
+
+        // A delete: no row at all.
+        sqlx::query("DELETE FROM app WHERE id = ?")
+            .bind(&h.app.id)
+            .execute(&h.state.pool)
+            .await
+            .expect("delete row");
+        let gone = ensure_app_row(&h.state, &h.app).await;
+        assert!(gone.is_err(), "a deleted app cannot publish");
+        assert!(
+            format!("{:#}", gone.unwrap_err()).contains("refusing to publish"),
+            "the refusal names the reason"
+        );
+        h.finish().await;
     }
 
     #[tokio::test]
@@ -2728,20 +2802,7 @@ mod tests {
     #[tokio::test]
     async fn rpc_and_rest_serve_the_forge() {
         let h = Harness::new("rpcs").await;
-        let app = crate::db::create_app(
-            &h.state.pool,
-            &h.state.config,
-            crate::db::NewApp {
-                name: "rpcs",
-                slug: "rpcs",
-                user_id: "user_test",
-                subdomain: "rpcs.localhost",
-                listen: 30000,
-                internal: 30001,
-            },
-        )
-        .await
-        .expect("seed app");
+        let app = h.app.clone();
         let bare = h.mirror().await;
         let work = Work::new(&h.dir.join("scratch")).await;
         work.write("f.txt", "base\n");
@@ -3058,20 +3119,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
 
         let h = Harness::new("archive").await;
-        let app = crate::db::create_app(
-            &h.state.pool,
-            &h.state.config,
-            crate::db::NewApp {
-                name: "archive",
-                slug: "archive",
-                user_id: "user_test",
-                subdomain: "archive.localhost",
-                listen: 30000,
-                internal: 30001,
-            },
-        )
-        .await
-        .expect("seed app");
+        let app = h.app.clone();
         let bare = h.mirror().await;
         let work = Work::new(&h.dir.join("scratch")).await;
         work.write("dir/file.txt", "hello\n");
@@ -3174,20 +3222,7 @@ mod tests {
     #[tokio::test]
     async fn source_archive_refuses_a_repo_over_the_cap() {
         let h = Harness::new("archivecap").await;
-        let app = crate::db::create_app(
-            &h.state.pool,
-            &h.state.config,
-            crate::db::NewApp {
-                name: "archivecap",
-                slug: "archivecap",
-                user_id: "user_test",
-                subdomain: "archivecap.localhost",
-                listen: 30000,
-                internal: 30001,
-            },
-        )
-        .await
-        .expect("seed app");
+        let app = h.app.clone();
         let bare = h.mirror().await;
         let work = Work::new(&h.dir.join("scratch")).await;
         // Sparse: 100 MiB + 1 without writing the bytes.
@@ -3232,14 +3267,15 @@ mod tests {
     #[tokio::test]
     async fn tls_ask_admits_preview_hosts_for_existing_apps() {
         let h = Harness::new("previewtls").await;
+        // The pod label spells the app id, so this one needs a real row id.
         let app = crate::db::create_app(
             &h.state.pool,
             &h.state.config,
             crate::db::NewApp {
-                name: "previewtls",
-                slug: "previewtls",
+                name: "previewtls-pod",
+                slug: "previewtls-pod",
                 user_id: "user_test",
-                subdomain: "previewtls.localhost",
+                subdomain: "previewtls-pod.localhost",
                 listen: 30000,
                 internal: 30001,
             },

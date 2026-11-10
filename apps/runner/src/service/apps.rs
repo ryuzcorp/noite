@@ -229,6 +229,7 @@ async fn create_inner(
 
 /// Retry a failed import (A2) with the source stored on the app row.
 pub async fn retry_import(state: &AppState, id: &str) -> Result<App, ApiError> {
+    ensure_not_deleting(id)?;
     let app = app_or_404(state, id).await?;
     let Some(stored) = app.import_source.clone() else {
         return Err(ApiError::bad("this app was not created from an import"));
@@ -272,6 +273,7 @@ pub async fn retry_import(state: &AppState, id: &str) -> Result<App, ApiError> {
 }
 
 pub async fn patch(state: &AppState, id: &str, desired: Option<&str>) -> Result<App, ApiError> {
+    ensure_not_deleting(id)?;
     if let Some(desired) = desired {
         let Some(ds) = DesiredState::parse(desired) else {
             return Err(ApiError::bad("desiredState must be running|stopped"));
@@ -307,7 +309,10 @@ pub async fn rename(
     let state = state.clone();
     let id = id.to_string();
     super::detached::run(format!("rename:{id}"), async move {
-        let out = rename_inner(&state, &id, name.as_deref(), slug.as_deref()).await;
+        let out = match ensure_not_deleting(&id) {
+            Ok(()) => rename_inner(&state, &id, name.as_deref(), slug.as_deref()).await,
+            Err(e) => Err(e),
+        };
         if let Err(e) = &out {
             tracing::warn!(app_id = %id, error = %e, "app rename failed");
         }
@@ -467,9 +472,32 @@ impl Deletions {
 static DELETIONS: LazyLock<Deletions> = LazyLock::new(Deletions::default);
 
 /// An app is hidden from every caller from the moment its delete starts
-/// ([`list`], [`get`], [`get_by_slug`]).
-fn deleting(id: &str) -> bool {
+/// ([`list`], [`get`], [`get_by_slug`]), and every other mutation refuses it
+/// (the row is about to be purged; a late write would land on a freed slug).
+pub(crate) fn deleting(id: &str) -> bool {
     DELETIONS.phase(id).is_some()
+}
+
+/// Claim `id` for a delete, for tests outside this module that need the
+/// registry in a known phase.
+#[cfg(test)]
+pub(crate) fn deleting_claim_for_test(id: &str) -> bool {
+    DELETIONS.begin(id)
+}
+
+/// Release a claim taken by [`deleting_claim_for_test`].
+#[cfg(test)]
+pub(crate) fn deleting_release_for_test(id: &str) {
+    DELETIONS.finish(id);
+}
+
+/// Refuse a mutation of an app whose delete is running. Reuses the delete's
+/// own conflict vocabulary: the caller retries once it is gone.
+fn ensure_not_deleting(id: &str) -> Result<(), ApiError> {
+    if deleting(id) {
+        return Err(ApiError::conflict("app is being deleted"));
+    }
+    Ok(())
 }
 
 /// An app's delete claim, released on drop — however the task ends, a panic
@@ -540,6 +568,13 @@ async fn delete_inner(state: &AppState, id: &str) -> Result<(), ApiError> {
     else {
         return Err(ApiError::conflict("deploy in flight; retry delete shortly"));
     };
+    // A background import is part of this delete: stop it and wait for it to
+    // end before the purge. A clone that finishes late would publish
+    // `refs/heads/main` under the slug this delete is about to free, and the
+    // next app to take that slug would inherit the imported tree.
+    if import::cancel_and_wait(&app.id).await {
+        tracing::info!(app_id = %app.id, "import stopped for delete");
+    }
     // R-02: a concurrent push writes under the slug lock across git +
     // S3 + manifest; the purge must not run inside one of those writes.
     let push = state.wal.lock(&app.slug).await;
@@ -933,6 +968,47 @@ mod tests {
             .expect("lookup")
             .is_none());
         assert!(!deleting(&app.id), "a finished delete leaves no marker");
+        drop(dir);
+    }
+
+    /// Every mutation refuses an app whose delete is running: the row is about
+    /// to be purged, and a late write (an import retry, a desired-state patch,
+    /// a rename) would land on a slug the delete is freeing.
+    #[tokio::test]
+    async fn mutations_refuse_an_app_that_is_being_deleted() {
+        let (state, dir) = test_state(10).await;
+        let app = create(&state, "Doomed", "doomed-app", Some("u1"), None)
+            .await
+            .expect("create");
+        assert!(DELETIONS.begin(&app.id));
+        let guard = DeletionGuard(app.id.clone());
+
+        assert!(matches!(
+            retry_import(&state, &app.id).await,
+            Err(ApiError::Conflict(_))
+        ));
+        assert!(matches!(
+            patch(&state, &app.id, Some(DesiredState::Stopped.as_str())).await,
+            Err(ApiError::Conflict(_))
+        ));
+        assert!(matches!(
+            rename(&state, &app.id, Some("Other"), None).await,
+            Err(ApiError::Conflict(_))
+        ));
+        // The stop was refused too: the app still wants to run.
+        let row = db::get_app(&state.pool, &app.id)
+            .await
+            .expect("lookup")
+            .expect("row");
+        assert_eq!(row.desired(), DesiredState::Running);
+
+        drop(guard);
+        assert!(
+            patch(&state, &app.id, Some(DesiredState::Stopped.as_str()))
+                .await
+                .is_ok(),
+            "the same mutation works once the delete is over"
+        );
         drop(dir);
     }
 

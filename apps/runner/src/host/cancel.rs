@@ -175,6 +175,18 @@ impl Cancels {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
+    /// Drop the token for `deploy_id`, and only while it is still `token`'s:
+    /// a late release from an earlier run can never free a newer one.
+    pub fn release_if(&self, deploy_id: &str, token: &CancelHandle) {
+        let mut live = self.guard_map();
+        if live
+            .get(deploy_id)
+            .is_some_and(|current| Arc::ptr_eq(current, token))
+        {
+            live.remove(deploy_id);
+        }
+    }
+
     /// Drop a token, as a finished run does. Production goes through
     /// [`ReleaseGuard`] (which only removes its own token); tests use this to
     /// simulate a run that already ended.
@@ -226,11 +238,8 @@ pub struct ReleaseGuard {
 
 impl Drop for ReleaseGuard {
     fn drop(&mut self) {
-        let mut live = self.registry.guard_map();
-        if let (Some(ours), Some(current)) = (&self.token, live.get(&self.id)) {
-            if Arc::ptr_eq(ours, current) {
-                live.remove(&self.id);
-            }
+        if let Some(token) = &self.token {
+            self.registry.release_if(&self.id, token);
         }
     }
 }
