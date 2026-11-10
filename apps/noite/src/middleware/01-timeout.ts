@@ -6,13 +6,21 @@
  *
  * Whether a path is bounded is one explicit decision ({@link routeTimeout}),
  * not a substring hunt: a stream is a path that *ends* in `/stream` (plus
- * the multiplexing `/api/streams`), and a download is the R2 object routes
- * under `/storage/` or the source archive (`…/archive`). A JSON action whose
+ * the multiplexing `/api/streams`), a download is the R2 object routes
+ * under `/storage/` or the source archive (`…/archive`), and a static file
+ * is the fingerprinted client bundle under `/assets/`. A JSON action whose
  * name merely contains `/stream` (e.g. `…/streamSomething`) is bounded like
  * any other action.
  *
- * Exempt: SSE streams and streaming downloads — bounding them would cut a
- * healthy long-lived response.
+ * Exempt: SSE streams, streaming downloads and static files — bounding a
+ * stream or a download would cut a healthy long-lived response, and bounding
+ * a static file is worse than useless: the 504 is JSON, so a bundle that
+ * outlives the bound never executes and the page never hydrates (the e2e
+ * "flake wave": a chunk 504'd at exactly 15 s, then every locator on the
+ * un-hydrated page timed out 30 s later). celld serves `/assets/*` itself
+ * (`RUN_WORKER_FIRST` in `void.config.ts` excludes it), so this exemption
+ * covers the paths that still reach the Worker: a missing file's fall
+ * through, and a direct-to-worker request.
  */
 import { defineMiddleware } from "void";
 
@@ -23,16 +31,20 @@ export const TIMEOUT_MS = 15_000;
  * function that decides it. */
 export type RouteTimeout =
   | { readonly kind: "bounded"; readonly ms: number }
-  | { readonly kind: "exempt"; readonly why: "download" | "stream" };
+  | { readonly kind: "exempt"; readonly why: "download" | "static" | "stream" };
 
 /** Why `path` is exempt, or `null` when it is bounded. */
-const exemptWhy = (path: string): "download" | "stream" | null => {
+const exemptWhy = (path: string): "download" | "static" | "stream" | null => {
   if (path === "/api/streams" || path.endsWith("/stream")) {
     return "stream";
   }
 
   if (path.startsWith("/storage/") || path.endsWith("/archive")) {
     return "download";
+  }
+
+  if (path.startsWith("/assets/")) {
+    return "static";
   }
 
   return null;

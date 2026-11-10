@@ -56,6 +56,39 @@ describe("routeTimeout", () => {
       kind: "exempt",
       why: "download",
     });
+    expect(routeTimeout("/assets/pages-client-CA3vIREc.js")).toEqual({
+      kind: "exempt",
+      why: "static",
+    });
+  });
+
+  test("spares the fingerprinted client bundle, bounded pages included", () => {
+    // The e2e flake wave: a chunk that outlived the bound was answered with
+    // this middleware's JSON 504, so the module never executed and the page
+    // never hydrated. A static file must never carry the action bound — not
+    // even the miss fall-through or a direct-to-worker request (celld serves
+    // the bundle itself; see `RUN_WORKER_FIRST` in void.config.ts).
+    for (const path of [
+      "/assets/pages-client-CA3vIREc.js",
+      "/assets/layout-CirV7yER.css",
+      "/assets/geist-latin-wght-normal-BgDaEnEv.woff2",
+    ]) {
+      expect(routeTimeout(path)).toEqual({ kind: "exempt", why: "static" });
+    }
+
+    // A page, an action and the pod document keep the bound.
+    expect(routeTimeout("/apps/new")).toEqual({
+      kind: "bounded",
+      ms: TIMEOUT_MS,
+    });
+    expect(routeTimeout("/api/apps/create")).toEqual({
+      kind: "bounded",
+      ms: TIMEOUT_MS,
+    });
+    expect(routeTimeout("/__nodepod_bridge__.html")).toEqual({
+      kind: "bounded",
+      ms: TIMEOUT_MS,
+    });
   });
 
   test("a JSON action merely containing /stream is still bounded", () => {
@@ -130,6 +163,37 @@ describe("timeout middleware", () => {
 
     expect(nextCalls).toBe(1);
     expect(result).toBeUndefined();
+  });
+
+  test("a static file never arms the bound, so it can never be 504'd", async () => {
+    // The real failure: `next()` (for `/assets/*` that is Void's pages
+    // fallback reading `env.ASSETS`) outlived the bound, and the middleware
+    // replaced the module with a 504 the browser cannot execute. An exempt
+    // path never arms the timer at all, so there is nothing to fire however
+    // long the read takes — and a page still arms it.
+    const realSetTimeout = globalThis.setTimeout;
+    let armed = 0;
+
+    // SAFETY: the middleware reads `setTimeout` from the global scope; this
+    // stub only counts the calls it makes and delegates to the real one.
+    globalThis.setTimeout = ((...args: Parameters<typeof setTimeout>) => {
+      armed += 1;
+
+      return realSetTimeout(...args);
+    }) as typeof setTimeout;
+
+    try {
+      await withTimeout(20)(
+        contextFor("/assets/pages-client-CA3vIREc.js"),
+        () => Promise.resolve()
+      );
+      expect(armed).toBe(0);
+
+      await withTimeout(20)(contextFor("/apps/new"), () => Promise.resolve());
+      expect(armed).toBe(1);
+    } finally {
+      globalThis.setTimeout = realSetTimeout;
+    }
   });
 
   test("the default export gates with the 15 s bound", async () => {

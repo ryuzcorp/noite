@@ -21,6 +21,7 @@ import {
   PREVIEW_HOST_ASSETS,
 } from "./src/lib/preview-host.ts";
 import { CURATED_SHIKI_LANGS } from "./src/lib/shiki-langs.ts";
+import { RUN_WORKER_FIRST } from "./void.config.ts";
 
 const git = (...args: string[]): string =>
   execFileSync("git", args, { encoding: "utf-8" }).trim();
@@ -387,18 +388,21 @@ const emitCelldConfig = (): Plugin => ({
     }
 
     config["main"] = `ssr/${ssrMain}`;
-    // Boolean `true`: the same form `cloudflare.config.ts` used on main (the
-    // lane-green shape), kept because Void's build forces the pattern-array
-    // form whenever routing rules exist (ours do: the isolation headers).
-    // This file is celld's config surface only; `dist/ssr/wrangler.json`
-    // keeps Void's own form. (The control-origin 404 for pod assets is not
-    // enforced here — Void's generated entry retries an app 404 against
-    // `ASSETS`, so the worker gate's 404 becomes the file's 200 — but at the
-    // edge, by the runner's Caddyfile; see `apps/runner/src/host/caddy.rs`.)
+    // The same rule list as `void.config.ts` (`RUN_WORKER_FIRST`, imported
+    // above): celld serves `/assets/*` from its own resolver — with the
+    // `public/_headers` cache and isolation policy — instead of invoking the
+    // Worker, where Void's pages fallback would fetch them inside the app
+    // (and its 15 s action bound). Void's own `dist/ssr/wrangler.json` is
+    // rewritten to `["/**"]` by its asset-bypass normalizer, so this file is
+    // the only place the deployed rule survives. (The control-origin 404 for
+    // pod assets is not enforced here — Void's generated entry retries an app
+    // 404 against `ASSETS`, so the worker gate's 404 becomes the file's 200 —
+    // but at the edge, by the runner's Caddyfile; see
+    // `apps/runner/src/host/caddy.rs`.)
     config["assets"] = {
       ...ssrAssets,
       directory: "client",
-      run_worker_first: true,
+      run_worker_first: [...RUN_WORKER_FIRST],
     };
 
     // D1 is keyed by name: drop Void's default `migrations_dir` (it points
