@@ -139,8 +139,8 @@ type Route struct {
 	// Rewrite is a URI rewrite applied by the static config before
 	// proxying ("/v1/edge/fallback", "/v1/git{uri}").
 	Rewrite string `json:"rewrite,omitempty"`
-	// Per-client zone (0 = off). Limits mirror caddy.rs guard_lines:
-	// budget = ceil(rpm/6) per 10 s window, IPv6 /64 collapse.
+	// Per-client zone (0 = off). Budget: limitFor in limit.go (rounds the
+	// rate down per 10 s window, widening it below 6/min), IPv6 /64 collapse.
 	ClientRPM  uint32 `json:"client_rpm,omitempty"`
 	ClientZone string `json:"client_zone,omitempty"`
 	// Shared per-app zone (0 = off).
@@ -250,7 +250,7 @@ func (r Route) validate() error {
 	if !validUpstream(r.Upstream) {
 		return fmt.Errorf("upstream %q must be 127.0.0.1:<port>", r.Upstream)
 	}
-	if r.ClientRPM > 1<<30 || r.AppRPM > 1<<30 {
+	if r.ClientRPM > maxRPM || r.AppRPM > maxRPM {
 		return fmt.Errorf("rpm out of range")
 	}
 	if r.ClientRPM > 0 && r.ClientZone == "" {

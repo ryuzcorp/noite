@@ -50,6 +50,10 @@ var _ = [1]struct{}{}[time.Minute%RateWindow]
 // throttled, so memory stays bounded without resetting a live budget.
 const maxKeys = 65536
 
+// maxRPM is the highest per-minute rate a table may configure: rpm·RateWindow
+// in nanoseconds stays far below uint64's range.
+const maxRPM = 1 << 30
+
 // RateLimit is one zone a request counts against: the zone name the table
 // shares between hosts, its configured per-minute rate and the key inside it.
 // The zero value is no limit.
@@ -136,6 +140,9 @@ func limitFor(rpm uint32) (time.Duration, int) {
 	if rpm == 0 {
 		return 0, 0
 	}
+	// Table.Validate refuses rates above maxRPM; clamp anyway so the
+	// product below cannot wrap uint64 if a caller ever skips validation.
+	rpm = min(rpm, maxRPM)
 	if budget := int(uint64(rpm) * uint64(RateWindow) / uint64(time.Minute)); budget > 0 {
 		return RateWindow, budget
 	}
