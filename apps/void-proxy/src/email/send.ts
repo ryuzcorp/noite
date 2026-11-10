@@ -14,7 +14,10 @@
  *     Lookup --> Unavailable: KV read failed (503)
  *     Lookup --> Admit: no record
  *     Admit --> Submit: allowlist partitions recipients
- *     Submit --> Record: complete / expired / refused
+ *     Submit --> Refused: relay unconfigured / misconfigured
+ *     Submit --> Outcome: one delivery per requested recipient
+ *     Outcome --> Record: Accepted / Partial
+ *     Outcome --> [*]: Failed / Unknown (nothing recorded)
  *     Record --> [*]: deliveries + operationId
  *     Refused --> [*]
  *     Replayed --> [*]
@@ -22,9 +25,23 @@
  *     Unavailable --> [*]
  * ```
  *
- * Per-recipient outcomes are the `Delivery` union below. The idempotency
- * record keeps its `{ digest, status, body }` shape and always stores
- * `status: 200`, exactly as before (so a replay is byte-identical).
+ * Per-recipient outcomes are the `Delivery` union below; one attempt folds
+ * into the `SendOutcome` union, which is what decides idempotency storage:
+ *
+ * | outcome  | meaning                                       | 24 h record    |
+ * | -------- | --------------------------------------------- | -------------- |
+ * | Accepted | every recipient was accepted by the provider  | yes — replay   |
+ * | Partial  | at least one accepted, at least one not       | yes — replay   |
+ * | Failed   | none accepted; every refusal definitive       | no — retryable |
+ * | Unknown  | none accepted; at least one `outcome_unknown` | no — retryable |
+ *
+ * A record replays the earlier attempt's response byte-identically and
+ * submits nothing, so recording a `Partial` outcome is what guarantees a
+ * retry with the same key never re-sends to the recipients the provider
+ * already accepted. A `Failed` / `Unknown` / rejected-only attempt is
+ * deliberately not recorded, so a retry with the same key really retries.
+ * The record keeps its `{ digest, status, body }` shape and always stores
+ * `status: 200` — internal, so the `/email/send` JSON stays unchanged.
  *
  * Portions ported from the Void project (MIT License — see the attribution
  * note in SPEC.md "Void platform proxy"). Noite adaptations (KV idempotency
@@ -363,15 +380,81 @@ interface DeliveryEntry {
   readonly recipient: string;
 }
 
+type OutcomeTag = "Accepted" | "Failed" | "Partial" | "Unknown";
+
+/**
+ * One attempt, folded from its per-recipient deliveries. `deliveries` holds
+ * one entry per requested recipient, in requested order (never empty: the
+ * envelope refuses a send with no recipients).
+ */
+interface SendOutcome {
+  readonly _tag: OutcomeTag;
+  readonly deliveries: readonly DeliveryEntry[];
+}
+
+/**
+ * Which outcomes are recorded for 24 h. Only an attempt that got at least one
+ * recipient accepted is replayable: the record replays the earlier response
+ * and submits nothing, so recording a `Partial` keeps a retry from re-sending
+ * to the recipients the provider already accepted. A `Failed` / `Unknown` /
+ * rejected-only attempt is not recorded, so a retry really retries.
+ */
+const OUTCOME_RECORDED = {
+  Accepted: true,
+  Failed: false,
+  Partial: true,
+  Unknown: false,
+} as const satisfies Record<OutcomeTag, boolean>;
+
+/** Fold one attempt's deliveries into its outcome (see the module table). */
+const classifyOutcome = (deliveries: readonly DeliveryEntry[]): SendOutcome => {
+  let accepted = 0;
+  let unknown = 0;
+
+  for (const { delivery } of deliveries) {
+    switch (delivery._tag) {
+      case "ProviderAccepted": {
+        accepted += 1;
+        break;
+      }
+
+      case "OutcomeUnknown": {
+        unknown += 1;
+        break;
+      }
+
+      case "Failed":
+      case "Rejected": {
+        break;
+      }
+
+      default: {
+        return assertNever(delivery);
+      }
+    }
+  }
+
+  if (accepted === deliveries.length) {
+    return { _tag: "Accepted", deliveries };
+  }
+
+  if (accepted > 0) {
+    return { _tag: "Partial", deliveries };
+  }
+
+  return { _tag: unknown > 0 ? "Unknown" : "Failed", deliveries };
+};
+
 const finishEmailSend = async (
   mailKv: MailKvNamespace,
   idempotencyKey: string,
   digest: string,
   projectId: string,
   requestId: string,
-  deliveries: readonly DeliveryEntry[]
+  outcome: SendOutcome
 ): Promise<Response> => {
   const operationId = crypto.randomUUID();
+  const { deliveries } = outcome;
 
   const wire = deliveries.map((entry) =>
     toRecipientResult(entry.recipient, entry.delivery)
@@ -390,25 +473,27 @@ const finishEmailSend = async (
   );
 
   const body: unknown =
-    accepted.length === deliveries.length
+    outcome._tag === "Accepted"
       ? { ids: accepted, ok: true, operationId }
       : { deliveries: wire, ok: false, operationId };
 
   logSend(projectId, requestId, wire);
-  // The record replays whatever this attempt produced, including failures and
-  // `outcome_unknown`, for 24 h. Changing that changes what a retry with the
-  // same idempotency key observes, so it is an owner decision, not a cleanup.
+
+  // Only an accepted / partially accepted attempt is stored; its replay is
+  // what keeps a retry from re-sending to the recipients already accepted.
   // Best-effort store: a KV failure here must not turn an accepted send into
   // an error (a repeat may double-send — the documented at-least-once limit).
-  await mailKv
-    .put(
-      idempotencyKey,
-      JSON.stringify({ body, digest, status: 200 } satisfies StoredOutcome),
-      {
-        expirationTtl: IDEMPOTENCY_TTL_SECONDS,
-      }
-    )
-    .catch(() => null);
+  if (OUTCOME_RECORDED[outcome._tag]) {
+    await mailKv
+      .put(
+        idempotencyKey,
+        JSON.stringify({ body, digest, status: 200 } satisfies StoredOutcome),
+        {
+          expirationTtl: IDEMPOTENCY_TTL_SECONDS,
+        }
+      )
+      .catch(() => null);
+  }
 
   return json(body, 200);
 };
@@ -1003,6 +1088,6 @@ export const handleEmailSend = async (
     digest,
     projectId,
     validated.requestId,
-    deliveries
+    classifyOutcome(deliveries)
   );
 };
