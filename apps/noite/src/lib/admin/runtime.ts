@@ -44,18 +44,36 @@ const SETTLED_RUNNING = {
   sleeping: true,
 } satisfies Record<string, true>;
 
+/** Statuses that are actively moving towards the desired state. Only these
+ * make a row "transitioning" (and worth polling): `failed` and `provisioned`
+ * are settled too — they need a deploy, not a start/stop, so the panel offers
+ * no action and stops polling them. */
+const IN_FLIGHT = {
+  building: true,
+  deploying: true,
+  importing: true,
+} satisfies Record<string, true>;
+
 /** The one constructor for the admin panel's view of an app. */
 export const runtimeOf = (status: string, desiredState: string): AppRuntime => {
   if (desiredState === "stopped") {
-    return status === "stopped"
-      ? Runtime.Stopped()
-      : Runtime.Transitioning({ to: "stopped" });
+    if (status === "stopped") {
+      return Runtime.Stopped();
+    }
+
+    return status in IN_FLIGHT
+      ? Runtime.Transitioning({ to: "stopped" })
+      : Runtime.Unknown();
   }
 
   if (desiredState === "running") {
-    return status in SETTLED_RUNNING
-      ? Runtime.Running()
-      : Runtime.Transitioning({ to: "running" });
+    if (status in SETTLED_RUNNING) {
+      return Runtime.Running();
+    }
+
+    return status in IN_FLIGHT
+      ? Runtime.Transitioning({ to: "running" })
+      : Runtime.Unknown();
   }
 
   return Runtime.Unknown();

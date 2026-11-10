@@ -1,7 +1,7 @@
 //! Admin tab: every app on the instance, whichever account owns it.
 
 import { Link } from "@ilha/void";
-import { atom } from "ilha";
+import { atom, watch } from "ilha";
 import type { View } from "ilha";
 
 import { api } from "../api";
@@ -105,6 +105,11 @@ const AdminAppRowItem = ({
 /** Every app on the instance, whichever account owns it: filter by name,
  * slug or owner; start, stop or delete any of them. The search lives in the
  * URL (`?aq=`) and narrows the loaded list in the browser. */
+/** How often the panel re-reads while a row is transitional (start/stop is
+ * asynchronous runner-side; one-shot refetch caught a mid-flight row and then
+ * froze, so a "Start" click could leave a dead row). */
+const TRANSITION_POLL_MS = 2000;
+
 export const AdminAppsPanel = () => {
   const res = listAllApps();
   const search = searchParam("aq", { default: "" });
@@ -113,6 +118,36 @@ export const AdminAppsPanel = () => {
   const apps = resourceValue(res.state()) ?? [];
   const loadError = resourceError(res.state());
   const needle = search().trim().toLowerCase();
+
+  // Track transitional rows until they settle: the mutation already refetched
+  // once, but the runner may still be moving.
+  watch.once(({ signal }) => {
+    if (typeof window === "undefined") {
+      return;
+    }
+
+    const timer = window.setInterval(() => {
+      if (signal.aborted) {
+        return;
+      }
+
+      const rows = resourceValue(res.state()) ?? [];
+
+      if (rows.some((row) => row.runtime === "transitioning")) {
+        void (async () => {
+          try {
+            await res.refetch();
+          } catch {
+            // The next tick retries; the panel's own error line stays as is.
+          }
+        })();
+      }
+    }, TRANSITION_POLL_MS);
+
+    return () => {
+      window.clearInterval(timer);
+    };
+  });
 
   const shown = needle
     ? apps.filter((app) =>

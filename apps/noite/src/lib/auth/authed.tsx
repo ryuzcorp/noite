@@ -6,6 +6,8 @@ import type { View } from "ilha";
 import { authClient } from "../auth-client";
 import { errorMessage } from "../errors";
 import { resourceValue } from "../resource";
+import type { ResourceState } from "../resource";
+import type { SessionView } from "../resources";
 import { session as sessionResource } from "../resources";
 import { sleep } from "../sleep";
 import { DashboardSkeleton } from "../ui/skeletons";
@@ -19,6 +21,13 @@ export const SessionSplash = () => <DashboardSkeleton />;
 
 /** How long the gate waits between cookie-readiness reads. */
 const RETRY_INTERVAL_MS = 50;
+
+/** A fetch aborted by a navigation or an unmount is not a failure: the gate
+ * must ignore it (the old gate let it escape, and mapping it to `Failed`
+ * would paint an error over a page that is simply being left). */
+// oxlint-disable-next-line anti-slop/no-unknown-parameters -- catch-site values are unknown by construction.
+const isAbort = (error: unknown): boolean =>
+  error instanceof DOMException && error.name === "AbortError";
 
 /** Re-read only when the tab is actually in the foreground. */
 const rereadWhenVisible = (reread: () => void) => (): void => {
@@ -73,7 +82,9 @@ export const Authed = ({
         dispatch(GateEvt.Read({ session: resourceValue(res.state()) ?? null }))
       );
     } catch (error) {
-      dispatch(GateEvt.ReadFailed({ message: errorMessage(error) }));
+      if (!isAbort(error)) {
+        dispatch(GateEvt.ReadFailed({ message: errorMessage(error) }));
+      }
     }
   };
 
@@ -96,7 +107,9 @@ export const Authed = ({
           return;
         }
       } catch (error) {
-        dispatch(GateEvt.ReadFailed({ message: errorMessage(error) }));
+        if (!isAbort(error)) {
+          dispatch(GateEvt.ReadFailed({ message: errorMessage(error) }));
+        }
 
         return;
       }
@@ -155,6 +168,33 @@ export const Authed = ({
       returning.set(false);
     }
   };
+
+  // The gate follows the session resource, not only its first read: sign-in,
+  // sign-out and impersonation are SPA transitions, so the layout keeps the
+  // gate's own copy of the session and must repaint it when the resource
+  // settles. The key is a primitive so `watch` can observe it; a blanked
+  // resource (the invalidate in flight) leaves the gate as it is.
+  const paintedKey = atom(
+    Atom.map((state: ResourceState<SessionView | null>): string => {
+      const value = resourceValue(state);
+
+      return value?.user
+        ? `${value.user.id}|${value.session.impersonatedBy ?? ""}`
+        : "";
+    })(res.state.atom)
+  );
+
+  watch(paintedKey, (key) => {
+    if (key === "") {
+      return;
+    }
+
+    const value = resourceValue(res.state());
+
+    if (value?.user) {
+      dispatch(GateEvt.Read({ session: value }));
+    }
+  });
 
   // An impersonated session expires server-side, and the admin's tab has no
   // other reason to re-read: when the tab comes back into view, re-read once

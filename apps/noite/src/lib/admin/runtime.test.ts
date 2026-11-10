@@ -32,7 +32,15 @@ describe("runtimeOf", () => {
   });
 
   test("a transitional app offers nothing", () => {
+    expect(runtimeOf("deploying", "running")._tag).toBe("Transitioning");
     expect(nextAction(runtimeOf("deploying", "running"))).toBeNull();
     expect(nextAction(runtimeOf("running", "stopped"))).toBeNull();
+  });
+
+  test("a failed or not-yet-deployed app is settled-unknown, not transitional", () => {
+    // Polling a `failed` row forever would be pointless and the row offers no
+    // action until a deploy fixes it.
+    expect(runtimeOf("failed", "running")._tag).toBe("Unknown");
+    expect(runtimeOf("provisioned", "running")._tag).toBe("Unknown");
   });
 });
