@@ -6,6 +6,7 @@ import {
   LookupTypes,
   RowActionTypes,
   RowMsg,
+  rollbackTarget,
   updateDropdown,
   updateRow,
 } from "./deploy.machine";
@@ -111,7 +112,7 @@ describe("updateDropdown", () => {
 
   test("a stale target cannot be rolled back", () => {
     const found = dropdown({
-      lookup: LookupTypes.Found({ sha: "bbb" }),
+      lookup: LookupTypes.Found({ candidates: ["bbb"] }),
     });
 
     const result = updateDropdown(
@@ -124,7 +125,9 @@ describe("updateDropdown", () => {
   });
 
   test("a second rollback click is refused while one is in flight", () => {
-    const found = dropdown({ lookup: LookupTypes.Found({ sha: "bbb" }) });
+    const found = dropdown({
+      lookup: LookupTypes.Found({ candidates: ["bbb"] }),
+    });
 
     const first = updateDropdown(
       found,
@@ -144,7 +147,7 @@ describe("updateDropdown", () => {
   test("a successful action reloads the targets so the new live sha is excluded", () => {
     const rolling = dropdown({
       action: DropdownActionTypes.RollingBack(),
-      lookup: LookupTypes.Found({ sha: "bbb" }),
+      lookup: LookupTypes.Found({ candidates: ["bbb"] }),
     });
 
     const done = updateDropdown(rolling, DropdownMsg.Succeeded());
@@ -157,7 +160,29 @@ describe("updateDropdown", () => {
     const none = dropdown({ lookup: LookupTypes.None() });
 
     expect(
-      updateDropdown(none, DropdownMsg.TargetsLoaded({ sha: "bbb" })).model
+      updateDropdown(none, DropdownMsg.TargetsLoaded({ candidates: ["bbb"] }))
+        .model
     ).toBe(none);
+  });
+});
+
+describe("rollbackTarget", () => {
+  // The surviving flake (run 42838911565, multi shard 2): the menu opened
+  // while the header still painted the previous snapshot, so the lookup ran
+  // with `lastDeploySha` null and the DOM offered "Roll back to
+  // 6eb24527f829" — the release already serving — instead of the previous
+  // one, for the whole 30 s assertion. The rows are facts; the target is
+  // derived against the live sha at render, so the detail landing fixes the
+  // label instead of freezing it.
+  test("tracks the live sha that lands after the open", () => {
+    const rows = ["6eb24527f829", "19178faa1d4a", "6eb24527f829"];
+
+    expect(rollbackTarget(rows, "6eb24527f829")).toBe("19178faa1d4a");
+    expect(rollbackTarget(rows, "19178faa1d4a")).toBe("6eb24527f829");
+    // Before the detail lands no release is known to serve, so the newest
+    // row is the only target the history can offer.
+    expect(rollbackTarget(rows, null)).toBe("6eb24527f829");
+    expect(rollbackTarget([], "6eb24527f829")).toBe("");
+    expect(rollbackTarget(["", "abc"], null)).toBe("abc");
   });
 });
