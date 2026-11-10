@@ -11,7 +11,9 @@ import { createAppWithKey, deleteApp, pushAppDir } from "./helpers";
 
 const SLUG = "source-switch";
 const DEAD_SLUG = "source-switch-dead";
-const ARCHIVE = "**/source/archive?**";
+
+/** The ref's archive, as the control page fetches it for the frame. */
+const ARCHIVE = /\/source\/archive\?/u;
 
 /** Every app this spec creates, dropped after the file: the account's app
  * quota (10) is shared by the whole lane. */
@@ -78,9 +80,12 @@ test("a browse settles, after a reload and after a branch switch", async ({
   await expect(page.getByRole("treeitem", { name: "index.ts" })).toBeVisible();
 
   // And back to the ref it came from: the checkout the browser kept warm is
-  // installed under the same panes, and the overlay clears again.
+  // installed under the same panes, and the overlay clears again. `main` is
+  // this app's default ref, so the param drops out of the URL rather than
+  // naming it (see `searchParam`).
   await pickBranch(page, "main");
-  await expect(page).toHaveURL(/ref=main/u);
+  await expect(page).not.toHaveURL(/[?&]ref=/u);
+  await expect(page.getByLabel(/^Branch or ref: main/u)).toBeVisible();
   await expect(overlay(page)).toHaveCount(0, { timeout: 60_000 });
   await expect(editor).toBeVisible();
 });
@@ -106,14 +111,10 @@ test("a lost open answer ends in the failure card, and Retry recovers", async ({
 
   // The pod's `open` waits for the ref's archive, which this page fetches: a
   // fetch that never answers is exactly the answer that could be lost. The
-  // frame took the `open` and will never reply to it.
-  await page.route(ARCHIVE, async (route) => {
-    if (new URL(route.request().url()).searchParams.get("ref") === "stuck") {
-      // Deliberately unanswered: the request stays pending for the page's life.
-      return;
-    }
-
-    await route.fallback();
+  // frame takes the `open` and never gets a reply to it. Every archive is
+  // held, and the checkout on screen already has its files.
+  await page.route(ARCHIVE, () => {
+    // Deliberately unanswered: the request stays pending for the page's life.
   });
 
   await page.getByLabel(/^Branch or ref:/u).click();
