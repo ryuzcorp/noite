@@ -1,18 +1,20 @@
-import { cp, readdir, rm } from "node:fs/promises";
+import { cp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 
-import { Effect } from "effect";
+import { Data, Effect } from "effect";
 
 import { runProc } from "./proc.js";
 import { withTempDir } from "./temp.js";
 
-/** Run git in cwd, resolving stdout. Rejects with scrubbed stderr. */
+/** Run git in cwd, resolving stdout. Rejects with scrubbed stderr. `env` is
+ * merged onto the parent's environment (the auth header travels that way). */
 const runGit = (
   args: readonly string[],
-  cwd: string
+  cwd: string,
+  env?: NodeJS.ProcessEnv
 ): Effect.Effect<string, Error> =>
   Effect.gen(function* run() {
-    const proc = yield* runProc("git", args, cwd);
+    const proc = yield* runProc("git", args, cwd, env);
 
     if (proc.code !== 0) {
       return yield* Effect.fail(
@@ -25,16 +27,59 @@ const runGit = (
     return proc.stdout;
   });
 
+/** Which remote shape a push targets: a bootstrap (no `main` yet, so the ref
+ * is created) or a fast-forward onto the existing tip. */
+export type PushMode = Data.TaggedEnum<{
+  Bootstrap: Record<never, never>;
+  FastForward: Record<never, never>;
+}>;
+
+const { Bootstrap, FastForward } = Data.taggedEnum<PushMode>();
+
+/** GitHub-style Basic `git` + profile key, supplied to git through
+ * `GIT_CONFIG_*` so it never appears in a remote URL, `.git/config`, or a
+ * process argument list. `GIT_TERMINAL_PROMPT=0` keeps a rejected key from
+ * hanging a CI step on a credential prompt. */
+export const gitAuthEnv = (token: string): NodeJS.ProcessEnv => ({
+  GIT_CONFIG_COUNT: "1",
+  GIT_CONFIG_KEY_0: "http.extraHeader",
+  GIT_CONFIG_VALUE_0: `Authorization: Basic ${Buffer.from(`git:${token}`).toString("base64")}`,
+  GIT_TERMINAL_PROMPT: "0",
+});
+
+/** Strip URL userinfo out of a workdir's `.git/config` before it is kept for
+ * inspection. Best effort: a missing or unreadable config is already clean. */
+export const scrubGitConfig = (dir: string): Effect.Effect<void, never> =>
+  Effect.promise(async () => {
+    try {
+      const config = path.join(dir, ".git", "config");
+      const text = await readFile(config, "utf-8");
+
+      const scrubbed = text.replaceAll(
+        /(?<prefix>url = [a-z]+:\/\/)[^/@\s]+@/gu,
+        "$<prefix>"
+      );
+
+      if (scrubbed !== text) {
+        await writeFile(config, scrubbed);
+      }
+    } catch {
+      // No config (git init failed) or not readable: nothing to scrub.
+    }
+  });
+
 /** Current `refs/heads/main` tip on the remote, if the ref exists yet. */
 // ls-remote exits 0 with empty stdout when the ref is missing, so any
 // error here is real (auth/network) and must surface.
 export const lsRemoteTip = (
-  remoteUrl: string
+  remoteUrl: string,
+  token: string
 ): Effect.Effect<string | null, Error> =>
   Effect.gen(function* run() {
     const out = yield* runGit(
       ["ls-remote", remoteUrl, "refs/heads/main"],
-      process.cwd()
+      process.cwd(),
+      gitAuthEnv(token)
     );
 
     const sha = out.split("\t")[0]?.trim();
@@ -42,11 +87,24 @@ export const lsRemoteTip = (
     return sha !== undefined && sha !== "" ? sha : null;
   });
 
+/** Probe once, decide once: does the push create `main` or fast-forward it? */
+export const remoteState = (
+  remoteUrl: string,
+  token: string
+): Effect.Effect<PushMode, Error> =>
+  Effect.map(lsRemoteTip(remoteUrl, token), (tip) =>
+    tip === null ? Bootstrap() : FastForward()
+  );
+
 export interface PushInput {
+  readonly message: string;
+  /** Test/diagnostic seam: runs before a failed workdir is kept. */
+  readonly onKeep?: (dir: string) => Effect.Effect<void, never>;
+  /** Token-free remote URL: `remoteUrlOf` never embeds the key. */
   readonly remoteUrl: string;
+  readonly token: string;
   /** Assembled tree: dist contents + wrangler.jsonc at root. */
   readonly treeDir: string;
-  readonly message: string;
 }
 
 /**
@@ -96,44 +154,70 @@ export const clearWorkdir = (workdir: string): Effect.Effect<void, Error> =>
  * the push is always fast-forward (works with the `push` role — never
  * force). First deploy (no remote ref) creates it. Resolves the new sha.
  * The workdir is removed on success; on failure it is kept and warned
- * about (`withTempDir`) — its `.git/config` holds the profile API key.
+ * about (`withTempDir`), with any URL credentials scrubbed first.
  */
 export const pushTree = (input: PushInput): Effect.Effect<string, Error> =>
   Effect.gen(function* run() {
-    const tip = yield* lsRemoteTip(input.remoteUrl);
+    const mode = yield* remoteState(input.remoteUrl, input.token);
+    const env = gitAuthEnv(input.token);
 
-    return yield* withTempDir((workdir) =>
-      Effect.gen(function* push() {
-        if (tip === null) {
-          yield* runGit(["init", "-b", "main"], workdir);
-          yield* runGit(["remote", "add", "origin", input.remoteUrl], workdir);
-        } else {
+    return yield* withTempDir(
+      (workdir) =>
+        Effect.gen(function* push() {
+          if (mode._tag === "Bootstrap") {
+            yield* runGit(["init", "-b", "main"], workdir, env);
+            yield* runGit(
+              ["remote", "add", "origin", input.remoteUrl],
+              workdir,
+              env
+            );
+          } else {
+            yield* runGit(
+              [
+                "clone",
+                "--depth",
+                "1",
+                "--branch",
+                "main",
+                input.remoteUrl,
+                ".",
+              ],
+              workdir,
+              env
+            );
+            // Empty the old dist, keep the fresh clone's .git for ancestry.
+            yield* runGit(["rm", "-r", "--cached", "."], workdir, env);
+            yield* clearWorkdir(workdir);
+          }
+
+          yield* copyTreeEntries(input.treeDir, workdir);
+          yield* runGit(["add", "-A"], workdir, env);
           yield* runGit(
-            ["clone", "--depth", "1", "--branch", "main", input.remoteUrl, "."],
-            workdir
+            [
+              "-c",
+              "user.name=Noite",
+              "-c",
+              "user.email=noite@local",
+              "commit",
+              "-m",
+              input.message,
+            ],
+            workdir,
+            env
           );
-          // Empty the old dist, keep the fresh clone's .git for ancestry.
-          yield* runGit(["rm", "-r", "--cached", "."], workdir);
-          yield* clearWorkdir(workdir);
-        }
+          yield* runGit(["push", "-u", "origin", "main"], workdir, env);
 
-        yield* copyTreeEntries(input.treeDir, workdir);
-        yield* runGit(["add", "-A"], workdir);
-        yield* runGit(
-          [
-            "-c",
-            "user.name=Noite",
-            "-c",
-            "user.email=noite@local",
-            "commit",
-            "-m",
-            input.message,
-          ],
-          workdir
-        );
-        yield* runGit(["push", "-u", "origin", "main"], workdir);
+          return yield* runGit(["rev-parse", "HEAD"], workdir, env);
+        }),
+      {
+        onKeep: (dir) =>
+          Effect.gen(function* retain() {
+            yield* scrubGitConfig(dir);
 
-        return yield* runGit(["rev-parse", "HEAD"], workdir);
-      })
+            if (input.onKeep !== undefined) {
+              yield* input.onKeep(dir);
+            }
+          }),
+      }
     );
   });

@@ -2,7 +2,13 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 
 import { Effect } from "effect";
 
-import { connection, resolveSlug, sanitizeSlug } from "./config.js";
+import {
+  connection,
+  controlBase,
+  resolveConnection,
+  resolveSlug,
+  sanitizeSlug,
+} from "./config.js";
 
 /** The environment each test starts from, restored afterwards: the resolution
  * under test reads `process.env`, so a stray NOITE_* on the machine would hide
@@ -68,6 +74,33 @@ describe("resolveSlug", () => {
   });
 });
 
+describe("controlBase", () => {
+  test("classifies a local install, a prod install and a named origin", () => {
+    expect(controlBase("http://git.noite.localhost:9080", "")).toEqual({
+      _tag: "Local",
+      origin: "http://noite.localhost:9080",
+    });
+    expect(controlBase("https://git.noite.now/", "")).toEqual({
+      _tag: "Prod",
+      origin: "https://app.noite.now",
+    });
+    expect(
+      controlBase("https://git.noite.now", "https://control.example.com/")
+    ).toEqual({
+      _tag: "Custom",
+      origin: "https://control.example.com",
+    });
+  });
+
+  test("refuses a malformed base only when no origin was named", () => {
+    expect(controlBase("not a url", "")).toBeNull();
+    expect(controlBase("not a url", "https://control.example.com")).toEqual({
+      _tag: "Custom",
+      origin: "https://control.example.com",
+    });
+  });
+});
+
 describe("connection", () => {
   test("derives the control origin from the git base", async () => {
     const prod = await Effect.runPromise(
@@ -79,6 +112,7 @@ describe("connection", () => {
 
     expect(prod).toEqual({
       appUrl: "https://app.noite.now",
+      base: { _tag: "Prod", origin: "https://app.noite.now" },
       gitBase: "https://git.noite.now",
       slug: "my-app",
       token: "k",
@@ -93,6 +127,7 @@ describe("connection", () => {
     );
 
     expect(dev.appUrl).toBe("http://noite.localhost:9080");
+    expect(dev.base._tag).toBe("Local");
   });
 
   test("--app-url and NOITE_APP_URL win over the derivation", async () => {
@@ -108,6 +143,7 @@ describe("connection", () => {
     );
 
     expect(explicit.appUrl).toBe("https://control.example.com");
+    expect(explicit.base._tag).toBe("Custom");
     process.env.NOITE_APP_URL = "http://noite.localhost:9080";
 
     const fromEnv = await Effect.runPromise(
@@ -145,5 +181,37 @@ describe("connection", () => {
         )
       )
     ).toContain("git base URL is malformed");
+  });
+});
+
+describe("resolveConnection", () => {
+  test("names the refusal instead of only carrying a message", () => {
+    const noSlug = resolveConnection(flags({ token: "k" }), null);
+    expect(noSlug._tag).toBe("Refused");
+
+    if (noSlug._tag === "Refused") {
+      expect(noSlug.error._tag).toBe("MissingSlug");
+    }
+
+    const noKey = resolveConnection(flags({ url: "not a url" }), "o/app");
+    expect(noKey._tag).toBe("Refused");
+
+    if (noKey._tag === "Refused") {
+      expect(noKey.error._tag).toBe("MissingKey");
+    }
+
+    const badBase = resolveConnection(
+      flags({ token: "k", url: "not a url" }),
+      "o/app"
+    );
+
+    expect(badBase._tag).toBe("Refused");
+
+    if (badBase._tag === "Refused") {
+      expect(badBase.error).toEqual({
+        _tag: "MalformedBase",
+        gitBase: "not a url",
+      });
+    }
   });
 });
