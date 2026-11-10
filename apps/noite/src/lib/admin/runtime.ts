@@ -44,14 +44,13 @@ const SETTLED_RUNNING = {
   sleeping: true,
 } satisfies Record<string, true>;
 
-/** Statuses that are actively moving towards the desired state. Only these
- * make a row "transitioning" (and worth polling): `failed` and `provisioned`
- * are settled too — they need a deploy, not a start/stop, so the panel offers
- * no action and stops polling them. */
-const IN_FLIGHT = {
-  building: true,
-  deploying: true,
-  importing: true,
+/** Statuses that are settled but not at any start/stop target: a failed app or
+ * one that was never deployed needs a deploy, not a toggle, so the panel
+ * offers no action and stops polling it. Everything else is on its way
+ * somewhere (running while a stop lands, building while a start does). */
+const NEEDS_DEPLOY = {
+  failed: true,
+  provisioned: true,
 } satisfies Record<string, true>;
 
 /** The one constructor for the admin panel's view of an app. */
@@ -61,9 +60,9 @@ export const runtimeOf = (status: string, desiredState: string): AppRuntime => {
       return Runtime.Stopped();
     }
 
-    return status in IN_FLIGHT
-      ? Runtime.Transitioning({ to: "stopped" })
-      : Runtime.Unknown();
+    return status in NEEDS_DEPLOY
+      ? Runtime.Unknown()
+      : Runtime.Transitioning({ to: "stopped" });
   }
 
   if (desiredState === "running") {
@@ -71,9 +70,9 @@ export const runtimeOf = (status: string, desiredState: string): AppRuntime => {
       return Runtime.Running();
     }
 
-    return status in IN_FLIGHT
-      ? Runtime.Transitioning({ to: "running" })
-      : Runtime.Unknown();
+    return status in NEEDS_DEPLOY
+      ? Runtime.Unknown()
+      : Runtime.Transitioning({ to: "running" });
   }
 
   return Runtime.Unknown();
@@ -88,6 +87,14 @@ export const nextAction = (runtime: AppRuntime): "start" | "stop" | null => {
 
     case "Stopped": {
       return "start";
+    }
+
+    case "Transitioning": {
+      // The action that *changes the desired state*, not the one the current
+      // fleet status implies. The runner accepts it idempotently, and it
+      // keeps a moving row operable (a one-shot refetch used to leave the
+      // button dead until the row happened to refresh).
+      return runtime.to === "running" ? "stop" : "start";
     }
 
     default: {

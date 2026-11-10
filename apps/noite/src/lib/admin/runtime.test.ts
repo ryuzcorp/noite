@@ -31,10 +31,12 @@ describe("runtimeOf", () => {
     expect(actionDesiredState("start")).toBe("running");
   });
 
-  test("a transitional app offers nothing", () => {
+  test("a transitional row still offers the action that changes desiredState", () => {
+    // While it settles towards stopped the button reads Start (and vice
+    // versa), so a moving row never turns into a dead "—".
     expect(runtimeOf("deploying", "running")._tag).toBe("Transitioning");
-    expect(nextAction(runtimeOf("deploying", "running"))).toBeNull();
-    expect(nextAction(runtimeOf("running", "stopped"))).toBeNull();
+    expect(nextAction(runtimeOf("deploying", "running"))).toBe("stop");
+    expect(nextAction(runtimeOf("running", "stopped"))).toBe("start");
   });
 
   test("a failed or not-yet-deployed app is settled-unknown, not transitional", () => {

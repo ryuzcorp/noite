@@ -45,6 +45,10 @@ export type SettingsState = Data.TaggedEnum<{
   Ready: {
     /** The mark the last save saw, so a later load can retire "saved". */
     readonly baseline: boolean;
+    /** The server answer this model was folded from. `syncStatus` compares it
+     * with the render's answer, so a re-render cannot replay `Loaded` over a
+     * user's edit (that made the checkbox flip back on every click). */
+    readonly seen: string;
     readonly check: CheckPhase;
     /** The newest release seen when the check started (`latest`), or "". */
     readonly checkMark: string;
@@ -76,6 +80,10 @@ export const Evt = Data.taggedEnum<SettingsEvent>();
 const checkMark = (status: SettingStatus): string =>
   `${status.checkedAt ?? ""}|${status.latest ?? ""}`;
 
+/** Identity of one server answer: everything the card renders from it. */
+const statusKey = (status: SettingStatus): string =>
+  `${String(status.setting)}|${String(status.locked)}|${status.lockReason ?? ""}|${checkMark(status)}`;
+
 /** The one constructor. */
 export const stateFromStatus = (status: SettingStatus): SettingsState => {
   if (status.locked) {
@@ -92,6 +100,7 @@ export const stateFromStatus = (status: SettingStatus): SettingsState => {
     draft: status.setting,
     error: null,
     save: "idle",
+    seen: statusKey(status),
     stored: status.setting,
   });
 };
@@ -155,6 +164,7 @@ export const transition = (
         draft: event.value,
         error: null,
         save: "saved",
+        seen: statusKey(event.status),
         stored: event.value,
       });
     }
@@ -187,7 +197,12 @@ export const syncStatus = (
   error: unknown
 ): SettingsState => {
   if (status !== undefined) {
-    return transition(state, Evt.Loaded({ status }));
+    // The same answer as last render is already folded in: folding it again
+    // would reset the checkbox (and the error/check sub-state) on every
+    // click.
+    return state._tag === "Ready" && state.seen === statusKey(status)
+      ? state
+      : transition(state, Evt.Loaded({ status }));
   }
 
   if (error !== undefined && state._tag === "Loading") {

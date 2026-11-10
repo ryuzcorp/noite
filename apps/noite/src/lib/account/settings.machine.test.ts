@@ -46,6 +46,29 @@ describe("stateFromStatus", () => {
 const ready = (over: Partial<SettingStatus> = {}) =>
   stateFromStatus(status(over));
 
+describe("syncStatus replay", () => {
+  test("the same server answer does not undo a click", () => {
+    // The card folds the render's answer into the machine on every render;
+    // replaying it after a toggle reset the checkbox (the e2e `uncheck` failed
+    // with "clicking the checkbox did not change its state").
+    const loaded = syncStatus(Settings.Loading(), status(), null);
+    const toggled = transition(loaded, Evt.Toggled({ value: false }));
+    const rerendered = syncStatus(toggled, status(), null);
+
+    expect(rerendered).toBe(toggled);
+    expect(rerendered._tag === "Ready" && rerendered.draft).toBe(false);
+  });
+
+  test("a changed server answer is still applied", () => {
+    const loaded = syncStatus(Settings.Loading(), status(), null);
+    const toggled = transition(loaded, Evt.Toggled({ value: false }));
+    const reloaded = syncStatus(toggled, status({ setting: false }), null);
+
+    expect(reloaded._tag === "Ready" && reloaded.draft).toBe(false);
+    expect(reloaded._tag === "Ready" && reloaded.stored).toBe(false);
+  });
+});
+
 describe("transition", () => {
   test("toggling edits the draft and clears a previous confirmation", () => {
     const saved = transition(
