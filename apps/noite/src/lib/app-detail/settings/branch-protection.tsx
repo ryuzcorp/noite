@@ -1,4 +1,4 @@
-//! Settings panel: branch protection for `main` (`require_pr` plus the
+//! Settings view: branch protection for `main` (`require_pr` plus the
 //! number of approvals a merge needs). Admin-only; the panel is mounted
 //! inside the settings stack's admin gate, and the fields self-disable.
 

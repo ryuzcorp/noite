@@ -1,4 +1,4 @@
-//! Settings panel: the app's display name.
+//! Settings view: the app's display name.
 
 import { atom } from "ilha";
 

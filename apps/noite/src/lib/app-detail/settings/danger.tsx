@@ -1,4 +1,4 @@
-//! Settings panel: the two destructive app actions (change slug, delete).
+//! Settings view: the two destructive app actions (change slug, delete).
 
 import { useRouter } from "@ilha/void";
 import { atom } from "ilha";

@@ -13,13 +13,14 @@ describe("sidebarPlace", () => {
     }
   });
 
-  test("every page of an app selects that app and its App, Code or Pulls item", () => {
+  test("every page of an app selects that app and its own item", () => {
     for (const [path, view] of [
       ["/apps/a1", "app"],
       ["/apps/a1/source", "code"],
       ["/apps/a1/source/compare", "code"],
       ["/apps/a1/pulls", "pulls"],
       ["/apps/a1/pulls/3", "pulls"],
+      ["/apps/a1/settings", "settings"],
       ["/apps/a1/constructor", "app"],
       ["/storage/a1/r2%3Auploads", "app"],
       ["/storage/a1/source", "app"],

@@ -341,8 +341,8 @@ const FirstPushCard = ({ appId }: { appId: string }) => {
 export const AppDetailPanel = ({ appId }: { appId: string }) => (
   <div class="@container flex flex-col gap-4">
     <FirstPushCard appId={appId} />
-    {/* Columns follow the tab body's width, not the viewport's, so an open
-        Settings panel stacks the cards instead of squeezing them. */}
+    {/* Columns follow the tab body's width, not the viewport's, so a narrow
+        body stacks the cards instead of squeezing them. */}
     <div class="grid grid-cols-1 gap-4 @4xl:grid-cols-2">
       <MetricsCard appId={appId} viewAllHref={`/apps/${appId}?t=metrics`} />
       <ErrorsSummary appId={appId} />

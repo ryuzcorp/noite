@@ -1,4 +1,4 @@
-//! Settings panel: the browser error-reporting DSN and key rotation.
+//! Settings view: the browser error-reporting DSN and key rotation.
 
 import { atom } from "ilha";
 

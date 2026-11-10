@@ -10,23 +10,21 @@ import {
 } from "$lib/app-detail/metrics";
 import { AppDetailPanel, AppHeader } from "$lib/app-detail/panel";
 import {
+  legacySettingsHref,
   parseAppRoute,
   parseAppTab,
   parseScope,
   scopeId,
 } from "$lib/app-detail/route.machine";
 import type { AppTab } from "$lib/app-detail/route.machine";
-import { AppSettingsPanel } from "$lib/app-detail/settings/panel";
 import { DetailShell, DetailTabs } from "$lib/app-detail/shell";
 import { ControlAppDetail } from "$lib/apps/control-panel";
 import { CONTROL_APP_NAME, isControlApp } from "$lib/control-app";
 import { appDetail, environments } from "$lib/resources";
 import { searchParam } from "$lib/search-param";
 import { DocumentTitle } from "$lib/ui/document-title";
-import { Cog } from "$lib/ui/icons";
-import { SidePanel } from "$lib/ui/side-panel";
-import { useParams } from "@ilha/void";
-import type { View } from "ilha";
+import { useParams, useRouter } from "@ilha/void";
+import { watch } from "ilha";
 
 import { resourceValue } from "../../lib/resource";
 
@@ -86,15 +84,6 @@ const MetricsTab = ({ appId }: { appId: string }) => {
   );
 };
 
-/** Settings beside the tabs, a third of the width, like Code mode's panels. */
-const SettingsAside = ({ onClose }: { onClose: () => void }) => (
-  <SidePanel title="Settings" onClose={onClose}>
-    <div class="min-h-0 flex-1 overflow-auto">
-      <AppSettingsPanel />
-    </div>
-  </SidePanel>
-);
-
 /** Tab bar with live badges. `liveFeed` binds its stream URL once per
  * component life, so the Errors badge — which follows the tabs' `?env=` —
  * lives in this child, keyed by environment: changing scope remounts it
@@ -105,13 +94,11 @@ const TabBar = ({
   appId,
   environmentId,
   onSelect,
-  trailing,
 }: {
   active: TabId;
   appId: string;
   environmentId: string;
   onSelect: (id: string) => void;
-  trailing: View;
 }) => {
   const counts = {
     errors: liveErrors(appId, "open", environmentId).data()?.counts.open ?? 0,
@@ -124,7 +111,6 @@ const TabBar = ({
       counts={counts}
       onSelect={onSelect}
       tabs={TABS}
-      trailing={trailing}
     />
   );
 };
@@ -147,9 +133,20 @@ const AppPageBody = ({ appId }: { appId: string }) => {
     parse: parseAppTab,
   });
 
-  // Settings opens beside the tabs (`?panel=settings`), so it stays open
-  // while they switch.
+  // Settings was a side panel on this page (`?panel=settings`); it has its
+  // own view under the sidebar's Settings item now, so an old link redirects
+  // there with its `?section=` deep link intact.
   const panel = searchParam("panel", { default: "" });
+  const section = searchParam("section", { default: "" });
+  const router = useRouter();
+
+  watch.once(() => {
+    if (typeof window === "undefined" || panel() !== "settings") {
+      return;
+    }
+
+    void router.visit(legacySettingsHref(appId, section()));
+  });
 
   // The open error (ErrorsPanel's `?e=`): a tab click always lands on the
   // tab's top level, so the Errors tab shows the list, not a stale detail.
@@ -172,7 +169,11 @@ const AppPageBody = ({ appId }: { appId: string }) => {
 
   const environmentId = scopeId(route.scope);
 
-  const settingsOpen = route.panel === "settings";
+  // The redirect above runs on the client; render nothing here rather than a
+  // tab that is about to be replaced (the server head still names the app).
+  if (route.panel === "settings") {
+    return <DocumentTitle title={`${name ?? "App"} · Noite`} />;
+  }
 
   return (
     <>
@@ -190,31 +191,10 @@ const AppPageBody = ({ appId }: { appId: string }) => {
                 openError.set("");
                 tab.set(parseAppTab(next));
               }}
-              trailing={
-                <button
-                  type="button"
-                  class={`btn btn-ghost btn-sm mb-1 shrink-0 ${settingsOpen ? "btn-active" : ""}`}
-                  aria-pressed={settingsOpen ? "true" : "false"}
-                  onclick={() => {
-                    panel.set(settingsOpen ? "" : "settings");
-                  }}
-                >
-                  <Cog />
-                  Settings
-                </button>
-              }
             />
           </>
         }
-        panel={
-          settingsOpen ? (
-            <SettingsAside
-              onClose={() => {
-                panel.set("");
-              }}
-            />
-          ) : null
-        }
+        panel={null}
       >
         <StaleEnvNotice notice={route.notice} />
         {route.tab === "overview" ? <AppDetailPanel appId={appId} /> : null}

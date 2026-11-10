@@ -1,4 +1,4 @@
-//! Settings panel: the edge rate limits (per visitor and whole app) and the
+//! Settings view: the edge rate limits (per visitor and whole app) and the
 //! fleet's memory cap. One draft-over-saved form (`draft.ts`): the draft
 //! survives an edit, a save makes it the baseline, and a failure keeps the
 //! user's input while painting why.

@@ -19,17 +19,18 @@ import { OpenPrBadge } from "../prs/layout";
 import { resourceValue } from "../resource";
 import { adminStatus, session } from "../resources";
 import type { RunnerApp } from "../runner";
-import { Code, GitPullRequest, LayoutDashboard } from "../ui/icons";
+import { Code, Cog, GitPullRequest, LayoutDashboard } from "../ui/icons";
 import { presenceTone } from "./identity";
 
 /** Which part of the open app a page belongs to: Code mode (`/source…`),
- * the pulls (`/pulls…`) or everything else (overview tabs, storage
- * editors). */
-export type AppView = "app" | "code" | "pulls";
+ * the pulls (`/pulls…`), settings (`/settings`), or everything else
+ * (overview tabs, storage editors). */
+export type AppView = "app" | "code" | "pulls" | "settings";
 
 /** `/apps/<id>/<sub>` pages that are not the App view. */
 const SUB_VIEWS = {
   pulls: "pulls",
+  settings: "settings",
   source: "code",
 } as const satisfies Record<string, AppView>;
 
@@ -92,9 +93,10 @@ const MenuLink = ({
   );
 };
 
-/** One app. The open app (`view` set) expands into App, Code and Pulls, and
- * the highlight moves to whichever the page is in; the Noite admin home has
- * neither Code mode nor pulls, so it stays a single highlighted row. */
+/** One app. The open app (`view` set) expands into App, Code, Pull requests
+ * and Settings, and the highlight moves to whichever the page is in; the
+ * Noite admin home has none of those views, so it stays a single
+ * highlighted row. */
 const SidebarAppLink = ({
   appId,
   desiredState,
@@ -147,6 +149,10 @@ const SidebarAppLink = ({
             <GitPullRequest class="shrink-0" />
             Pull requests
             <OpenPrBadge appId={appId} class="ms-auto" />
+          </MenuLink>
+          <MenuLink active={view === "settings"} href={`${href}/settings`}>
+            <Cog class="shrink-0" />
+            Settings
           </MenuLink>
         </ul>
       ) : null}
