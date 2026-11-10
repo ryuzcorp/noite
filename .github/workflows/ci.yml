@@ -18,6 +18,16 @@
 # `e2e` is a single run. Adding `e2e` to an open PR takes effect on the next
 # push (or close/reopen, or a manual dispatch): push an empty commit if the
 # branch is otherwise done.
+#
+# A push that starts no run at all is GitHub's, not this file's: there is no
+# `paths` filter on `pull_request`, the concurrency group is the PR's own
+# `refs/pull/<n>/merge`, and no commit here carries a skip marker. Seen
+# 2026-11-10 — PR #229 got no run for `opened` or `reopened` (neither `ci` nor
+# `security-gate`), and a re-run attempt of #222's `ci` answered
+# `startup_failure` with zero jobs — while the next real push ran within
+# seconds. Recover with a close/reopen or
+# `gh workflow run ci.yml --ref <branch> -f suite=release`; do not weaken this
+# file to chase it.
 name: ci
 
 on:
