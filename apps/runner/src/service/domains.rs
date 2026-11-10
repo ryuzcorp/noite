@@ -26,7 +26,7 @@
 //! loop: verification is one DNS lookup per explicit Verify call.
 
 use crate::api_error::ApiError;
-use crate::config::{Config, Tenancy};
+use crate::config::{normalize_host, Config, Tenancy};
 use crate::db;
 use crate::dns;
 use crate::lifecycle::hostname_ok;
@@ -57,12 +57,13 @@ fn require(role: Option<&str>, need: &str) -> Result<(), ApiError> {
 /// address). An app may never claim one — `Host` dispatch would otherwise
 /// fight the control plane.
 fn platform_host(cfg: &Config, hostname: &str) -> bool {
-    let base = cfg.base_domain.to_lowercase();
-    if hostname == base || hostname.ends_with(&format!(".{base}")) {
+    let hostname = normalize_host(hostname);
+    let base = normalize_host(&cfg.base_domain);
+    if !base.is_empty() && (hostname == base || hostname.ends_with(&format!(".{base}"))) {
         return true;
     }
     cfg.control_extra_hosts.iter().any(|raw| {
-        let extra = raw.trim().trim_matches('.').to_lowercase();
+        let extra = normalize_host(raw);
         !extra.is_empty() && (hostname == extra || hostname.ends_with(&format!(".{extra}")))
     })
 }
@@ -468,6 +469,23 @@ mod tests {
             .await
             .expect_err("no resolver must fail");
         assert_eq!(err.to_string(), "DNS resolver unavailable: no nameservers");
+    }
+
+    #[test]
+    fn platform_host_normalizes_the_configured_base_and_extras() {
+        let mut cfg = crate::config::config_for_tests();
+        cfg.base_domain = "example.com.".into();
+        cfg.control_subdomain = "Console.".into();
+        cfg.control_extra_hosts = vec!["Panel.Example.COM.".into()];
+        for host in [
+            "example.com",
+            "console.example.com",
+            "panel.example.com",
+            "x.panel.example.com",
+        ] {
+            assert!(platform_host(&cfg, host), "{host} is a platform host");
+        }
+        assert!(!platform_host(&cfg, "notexample.com"));
     }
 
     #[tokio::test]

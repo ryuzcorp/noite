@@ -21,6 +21,15 @@ fn parse_host_list(raw: &str) -> Vec<String> {
         .collect()
 }
 
+/// A hostname in the one shape the edge matches: no surrounding whitespace,
+/// no trailing dot, lowercase. The Go table normalizes `Host` headers this
+/// way, so every configured host and every comparison must agree — a dotted
+/// or uppercase `BASE_DOMAIN`/`CONTROL_*` value would otherwise leave keys
+/// the edge can never match (and a tenant could take the reachable form).
+pub(crate) fn normalize_host(raw: &str) -> String {
+    raw.trim().trim_end_matches('.').to_lowercase()
+}
+
 fn parse_auto_https(raw: Option<&str>, base_domain: &str) -> bool {
     // An empty value means "not configured" (compose renders
     // `CADDY_AUTO_HTTPS: ""` when the operator leaves it unset), so trim and
@@ -1245,8 +1254,9 @@ impl Config {
         if runner_token.is_empty() {
             anyhow::bail!("RUNNER_TOKEN must not be empty");
         }
-        let base_domain = env::var("BASE_DOMAIN").unwrap_or_else(|_| "localhost".into());
-        if base_domain.trim().is_empty() {
+        let base_domain =
+            normalize_host(&env::var("BASE_DOMAIN").unwrap_or_else(|_| "localhost".into()));
+        if base_domain.is_empty() {
             anyhow::bail!(
                 "BASE_DOMAIN must not be empty (got blank); set it to your domain, e.g. noite.now"
             );
@@ -1380,9 +1390,14 @@ impl Config {
                 .or_else(|_| env::var("RUSTFS_SECRET_KEY"))
                 .unwrap_or_else(|_| "noitesecretnoitesecretnoite12".into()),
             base_domain: base_domain.clone(),
-            control_subdomain: env::var("CONTROL_SUBDOMAIN").unwrap_or_default(),
+            control_subdomain: normalize_host(&env::var("CONTROL_SUBDOMAIN").unwrap_or_default()),
             control_extra_hosts: env::var("CONTROL_EXTRA_HOSTS")
-                .map(|v| parse_host_list(&v))
+                .map(|v| {
+                    parse_host_list(&v)
+                        .into_iter()
+                        .map(|host| normalize_host(&host))
+                        .collect()
+                })
                 .unwrap_or_default(),
             work_dir: env_or(&["RUNNER_WORK_DIR"], "/data/runner"),
             caddyfile_path: env::var("CADDYFILE_PATH")
@@ -1847,14 +1862,22 @@ impl Config {
         }
     }
 
-    /// Hostnames serving the control UI (bare/sub + extras).
+    /// Hostnames serving the control UI (bare/sub + extras), canonicalized
+    /// to the shape the edge matches.
     pub fn control_hosts(&self) -> Vec<String> {
-        let mut out = vec![if self.control_subdomain.is_empty() {
-            self.base_domain.clone()
+        let base = normalize_host(&self.base_domain);
+        let sub = normalize_host(&self.control_subdomain);
+        let mut out = vec![if sub.is_empty() {
+            base
         } else {
-            format!("{}.{}", self.control_subdomain, self.base_domain)
+            format!("{sub}.{base}")
         }];
-        out.extend(self.control_extra_hosts.iter().cloned());
+        out.extend(
+            self.control_extra_hosts
+                .iter()
+                .map(|host| normalize_host(host))
+                .filter(|host| !host.is_empty()),
+        );
         out
     }
 
@@ -1962,9 +1985,14 @@ impl Config {
     /// matches) so they're control-only; entries with ports/paths are
     /// operator error — skipped rather than rendered half-working.
     pub fn tenant_bases(&self) -> Vec<String> {
-        let mut bases = vec![self.base_domain.clone()];
+        let base = normalize_host(&self.base_domain);
+        let mut bases = if base.is_empty() {
+            Vec::new()
+        } else {
+            vec![base]
+        };
         for raw in &self.control_extra_hosts {
-            let host = raw.trim().trim_matches('.');
+            let host = normalize_host(raw);
             if host.is_empty()
                 || host.parse::<std::net::IpAddr>().is_ok()
                 || host.contains(':')
@@ -1972,8 +2000,8 @@ impl Config {
             {
                 continue;
             }
-            if !bases.iter().any(|b| b.eq_ignore_ascii_case(host)) {
-                bases.push(host.to_string());
+            if !bases.iter().any(|b| b == &host) {
+                bases.push(host);
             }
         }
         bases
@@ -2919,6 +2947,20 @@ mod tests {
             "".into(),
         ];
         assert_eq!(cfg.tenant_bases(), vec!["localhost", "noite.local"]);
+    }
+
+    #[test]
+    fn configured_hosts_are_canonical() {
+        let mut cfg = config_for_tests();
+        cfg.base_domain = "Example.COM.".into();
+        cfg.control_extra_hosts = vec!["Panel.Example.COM.".into(), "".into()];
+        assert_eq!(
+            cfg.control_hosts(),
+            vec!["example.com", "panel.example.com"]
+        );
+        assert_eq!(cfg.tenant_bases(), vec!["example.com", "panel.example.com"]);
+        cfg.control_subdomain = "Console.".into();
+        assert_eq!(cfg.control_hosts()[0], "console.example.com");
     }
 
     #[test]

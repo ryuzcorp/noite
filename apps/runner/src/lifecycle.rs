@@ -209,11 +209,17 @@ mod tests {
         cfg.control_subdomain = "console".into();
         assert!(!slug_ok(&cfg, "console"));
         assert!(slug_ok(&cfg, "console2"));
-        // An extra control host under a tenant base reserves its own label.
-        cfg.control_extra_hosts = vec!["panel.localhost".into()];
+        // An extra control host under a tenant base reserves its own label,
+        // even when the operator wrote it dotted or uppercase.
+        cfg.control_extra_hosts = vec!["Panel.Localhost.".into()];
         assert!(!slug_ok(&cfg, "panel"));
         // Tenant bases gain API and Git hosts too.
         assert!(!slug_ok(&cfg, "git"));
         assert!(!slug_ok(&cfg, "api"));
+        // A dotted base domain is canonicalized before both sides compare.
+        let mut dotted = config_for_tests();
+        dotted.base_domain = "example.com.".into();
+        dotted.control_subdomain = "console".into();
+        assert!(!slug_ok(&dotted, "console"));
     }
 }

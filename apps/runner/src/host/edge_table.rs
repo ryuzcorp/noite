@@ -730,6 +730,19 @@ mod tests {
         );
     }
 
+    /// A dotted/uppercase extra control host canonicalizes to the host the
+    /// edge actually matches, so a tenant cannot take the reachable form.
+    #[test]
+    fn dotted_control_extra_hosts_still_win() {
+        let mut cfg = config_for_tests();
+        cfg.control_extra_hosts = vec!["Console.Localhost.".into()];
+        let app = test_app("console");
+        let t = build_table(&cfg, std::slice::from_ref(&app), &[], &[], &[]);
+        let control = t.exact.get("console.localhost").expect("control host");
+        assert_eq!(control.kind, EdgeKind::Control);
+        assert!(!t.exact.contains_key("console.localhost."));
+    }
+
     /// Defense in depth: even a verified custom claim (which `domains.add`
     /// refuses) cannot overwrite a platform host in the table.
     #[test]
