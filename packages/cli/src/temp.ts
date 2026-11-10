@@ -59,7 +59,17 @@ export const withTempDir = <A, E>(
           try: () => rm(dir, { force: true, recursive: true }),
         }).pipe(
           Effect.tapError((cause) =>
-            Effect.logWarning(`warning: ${cause.message}`)
+            Effect.gen(function* report() {
+              // The dir is still there: let the caller scrub it, exactly as
+              // on the keep path.
+              const scrub = options.onKeep?.(dir);
+
+              if (scrub !== undefined) {
+                yield* scrub;
+              }
+
+              yield* Effect.logWarning(`warning: ${cause.message}`);
+            })
           ),
           Effect.ignore
         );
