@@ -19,7 +19,7 @@ Set any of them to `0` to turn it off. The edge counts over a sliding window who
 
 A refused request gets `Retry-After` with the real remaining time of the limit that refused it, in whole seconds and never less than 1, so a client that honours the header can retry once instead of looping on `429`s. The per-visitor limit and the whole-app ceiling of a request are checked together and only spent when both admit it, so a refusal caused by the app ceiling does not also use up the visitor's own budget.
 
-Each zone remembers up to 65,536 visitors. Under a flood of that many distinct addresses, a visitor still inside their window keeps their budget: new addresses can be refused for up to one window instead of being let in at the expense of someone else's throttle.
+Each zone remembers up to 65,536 visitors. Under a flood of that many distinct addresses, a visitor still inside their window keeps the budget they have spent, and new addresses are let through uncounted until the flood's windows pass, instead of being let in at the expense of someone else's limit.
 
 The whole-app ceiling stops traffic from many addresses at once from taking the server's CPU away from every other app. It is off by default because a real traffic spike looks the same. Set a platform-wide ceiling with `NOITE_EDGE_APP_RPM`, or set one app's limits in its **Settings → Rate Limits** (app admins only). There, an empty field uses the platform default and `0` means no limit.
 

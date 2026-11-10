@@ -21,8 +21,11 @@
 //
 // Every transition is in fitLocked/commitLocked below, and eviction of a
 // Cold key is in makeRoomLocked. A refusal records no stamp, so a throttled
-// key cannot extend its own window, and eviction never picks a Throttled
-// key: a key flood must not clear the throttle of the key that caused it.
+// key cannot extend its own window. Eviction only ever touches a Cold key:
+// a key still inside its window keeps the budget it has spent, so a flood of
+// fresh keys cannot clear a throttle. When a zone is full of such keys the
+// request that would add one is admitted unrecorded (fitUnrecorded) rather
+// than resetting a budget that is still in force.
 package edge
 
 import (
@@ -42,19 +45,26 @@ const RateWindow = 10 * time.Second
 // per-minute ceiling; a bad RateWindow fails the build here.
 var _ = [1]struct{}{}[time.Minute%RateWindow]
 
-// maxKeys bounds memory under a wide flood: one entry per client address.
+// maxKeys bounds memory under a wide flood: one entry per client address. A
+// full zone admits new keys unrecorded instead of evicting one that is still
+// throttled, so memory stays bounded without resetting a live budget.
 const maxKeys = 65536
 
 // RateLimit is one zone a request counts against: the zone name the table
 // shares between hosts, its configured per-minute rate and the key inside it.
+// The zero value is no limit.
 type RateLimit struct {
 	Zone string
 	RPM  uint32
 	Key  string
 }
 
+// enabled reports whether the limit applies: a zero rate turns it off and an
+// empty key (an unparsable client address) skips it.
+func (r RateLimit) enabled() bool { return r.RPM > 0 && r.Key != "" }
+
 // Decision is a request's verdict. RetryAfter is only set when Allowed is
-// false: the time until the zone that refused starts admitting again.
+// false: the time until the key that refused starts admitting again.
 type Decision struct {
 	Allowed    bool
 	RetryAfter time.Duration
@@ -63,16 +73,30 @@ type Decision struct {
 type keyState struct {
 	stamps   []int64 // unix nanos, ascending, oldest first
 	lastSeen int64   // unix nanos; last request, admitted or refused
-	window   int64   // window of the rate its stamps were counted against
-	size     int     // budget of that rate, so a Throttled key is recognised
+	window   int64   // longest window its stamps were counted against
 }
 
 type zoneState struct {
 	keys map[string]*keyState
 	// noRoomUntil is set when a full zone found no key it may evict; new
-	// keys are then refused without rescanning every key until it passes.
+	// keys are then admitted unrecorded without rescanning every key until
+	// it passes.
 	noRoomUntil int64
 }
+
+// fit is what one zone decides about a request.
+type fit uint8
+
+const (
+	// fitAdmit admits the request and records a stamp in the zone.
+	fitAdmit fit = iota
+	// fitRefuse refuses it: the key is over its budget.
+	fitRefuse
+	// fitUnrecorded admits it without a stamp: the zone holds maxKeys keys
+	// that are all still inside their windows, and evicting one would reset
+	// a budget that is still in force.
+	fitUnrecorded
+)
 
 // Limiter holds the process-wide pool of rate-limit zones. Zones are
 // shared by name across hosts (a subdomain, its custom domains and its
@@ -81,6 +105,7 @@ type Limiter struct {
 	mu    sync.Mutex
 	zones map[string]*zoneState
 	now   func() time.Time
+	base  time.Time
 }
 
 // NewLimiter returns a Limiter using now for time (inject a fake clock in
@@ -89,8 +114,14 @@ func NewLimiter(now func() time.Time) *Limiter {
 	if now == nil {
 		now = time.Now
 	}
-	return &Limiter{zones: make(map[string]*zoneState), now: now}
+	return &Limiter{zones: make(map[string]*zoneState), now: now, base: now()}
 }
+
+// nanos is the clock the limiter counts in: nanoseconds since it was created.
+// time.Time.Sub keeps the monotonic reading, so a wall-clock step (NTP, a VM
+// resume) cannot reorder a key's stamps, which the ascending log and its
+// binary searches rely on, or expire every window at once.
+func (l *Limiter) nanos() int64 { return int64(l.now().Sub(l.base)) }
 
 // limitFor returns the sliding window and the number of events the budget
 // admits in it for a configured per-minute rate.
@@ -141,26 +172,34 @@ func ClientKey(clientIP string) string {
 // it when it does. retryAfter is how long the caller should tell the client
 // to wait when denied.
 func (l *Limiter) Allow(zone string, rpm uint32, key string) (bool, time.Duration) {
-	d := l.AllowAll([]RateLimit{{Zone: zone, RPM: rpm, Key: key}})
+	d := l.AllowRequest(RateLimit{Zone: zone, RPM: rpm, Key: key}, RateLimit{})
 	return d.Allowed, d.RetryAfter
 }
 
-// AllowAll plans and commits one request against every zone at once: the
-// request is admitted only when all zones fit it, and only then does each
-// zone record a stamp. A refusal in the second zone therefore spends no
-// budget in the first, so a client is not throttled twice for one refusal.
-// RetryAfter is the longest remaining wait among the zones that refused.
-func (l *Limiter) AllowAll(limits []RateLimit) Decision {
-	now := l.now().UnixNano()
+// AllowRequest plans and commits one request against the client zone and the
+// app zone of its route in one step: the request is admitted only when both
+// zones fit it, and only then does each zone record a stamp. A refusal in the
+// second zone therefore spends no budget in the first, so a client is not
+// throttled twice for one refusal. RetryAfter is the longest remaining wait
+// among the zones that refused.
+//
+// A zero-RPM or empty-key limit is absent, so either or both arguments may be
+// the zero value.
+func (l *Limiter) AllowRequest(client, app RateLimit) Decision {
+	now := l.nanos()
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
+	limits := [2]RateLimit{client, app}
+	var fits [2]fit
 	decision := Decision{Allowed: true}
-	for _, lim := range limits {
-		if lim.RPM == 0 || lim.Key == "" {
+	for i, lim := range limits {
+		if !lim.enabled() {
 			continue
 		}
-		if ok, wait := l.fitLocked(lim, now); !ok {
+		ok, wait := l.fitLocked(lim, now)
+		fits[i] = ok
+		if ok == fitRefuse {
 			decision.Allowed = false
 			if wait > decision.RetryAfter {
 				decision.RetryAfter = wait
@@ -171,61 +210,62 @@ func (l *Limiter) AllowAll(limits []RateLimit) Decision {
 		decision.RetryAfter = ceilSeconds(decision.RetryAfter)
 		return decision
 	}
-	for _, lim := range limits {
-		if lim.RPM == 0 || lim.Key == "" {
-			continue
+	for i, lim := range limits {
+		if fits[i] == fitAdmit {
+			l.commitLocked(lim, now)
 		}
-		l.commitLocked(lim, now)
 	}
 	return decision
 }
 
-// fitLocked reports whether lim's key admits one more event and, when it
-// does not, how long until it does. It records nothing: the caller commits
-// only after every zone admitted the request. Expired stamps are dropped as
-// they are encountered, which is not a state change (they no longer count).
-func (l *Limiter) fitLocked(lim RateLimit, now int64) (bool, time.Duration) {
+// fitLocked reports what lim's key decides and, when it refuses, how long
+// until it admits again. It records no stamp: the caller commits only after
+// every zone admitted the request. Expired stamps are dropped as they are
+// encountered, which is not a state change (they no longer count).
+func (l *Limiter) fitLocked(lim RateLimit, now int64) (fit, time.Duration) {
 	window, size := limitFor(lim.RPM)
 	z := l.zones[lim.Zone]
 	if z == nil {
 		// A new zone has room for a first key by definition.
-		return true, 0
+		return fitAdmit, 0
 	}
 	ks := z.keys[lim.Key]
 	if ks == nil {
 		if len(z.keys) < maxKeys {
-			return true, 0
+			return fitAdmit, 0
 		}
 		// The zone is full: make room by evicting keys whose budget has
-		// recovered, never a throttled one. A failed scan is remembered for
-		// one window so a flood of new keys cannot make every request in it
-		// rescan the whole zone.
+		// recovered, never one that is still inside its window. A failed scan
+		// is remembered for a window so a flood of new keys cannot make every
+		// request rescan the whole zone.
 		if now < z.noRoomUntil {
-			return false, window
+			return fitUnrecorded, 0
 		}
 		if !l.makeRoomLocked(z, now) {
 			z.noRoomUntil = now + int64(RateWindow)
-			return false, window
+			return fitUnrecorded, 0
 		}
-		return true, 0
+		return fitAdmit, 0
 	}
 	cutoff := now - int64(window)
 	keep := sort.Search(len(ks.stamps), func(i int) bool { return ks.stamps[i] > cutoff })
 	ks.stamps = ks.stamps[keep:]
 	ks.lastSeen = now
-	ks.window, ks.size = int64(window), size
+	if int64(window) > ks.window {
+		ks.window = int64(window)
+	}
 	if len(ks.stamps) < size {
-		return true, 0
+		return fitAdmit, 0
 	}
 	// Enough stamps must leave the window for this key to admit another
 	// event; more than one when a lowered rate shrank the budget.
 	need := len(ks.stamps) - size + 1
-	return false, time.Duration(ks.stamps[need-1] + int64(window) - now)
+	return fitRefuse, time.Duration(ks.stamps[need-1] + int64(window) - now)
 }
 
 // commitLocked records one admitted event for lim.
 func (l *Limiter) commitLocked(lim RateLimit, now int64) {
-	window, size := limitFor(lim.RPM)
+	window, _ := limitFor(lim.RPM)
 	z := l.zones[lim.Zone]
 	if z == nil {
 		z = &zoneState{keys: make(map[string]*keyState)}
@@ -238,16 +278,17 @@ func (l *Limiter) commitLocked(lim RateLimit, now int64) {
 	}
 	ks.stamps = append(ks.stamps, now)
 	ks.lastSeen = now
-	ks.window, ks.size = int64(window), size
+	if int64(window) > ks.window {
+		ks.window = int64(window)
+	}
 }
 
-// makeRoomLocked evicts the least-recently-seen quarter of keys that are not
-// currently throttled, and reports whether it freed a slot. A key whose
-// stamps still fill its live budget is never evicted: a client that floods a
-// zone with fresh keys could otherwise cycle them to flush its own (or
-// another client's) throttle and carry on unthrottled. When every key is
-// throttled the zone refuses new keys for up to one window instead. O(n log
-// n), and only while a zone is full.
+// makeRoomLocked evicts the least-recently-seen quarter of keys that are no
+// longer inside their window, and reports whether it freed a slot. A key
+// with even one live stamp is never evicted: a client that floods a zone with
+// fresh keys could otherwise cycle them to flush its own (or another
+// client's) budget and carry on before its window ends. O(n log n), and only
+// while a zone is full.
 func (l *Limiter) makeRoomLocked(z *zoneState, now int64) bool {
 	type kv struct {
 		k string
@@ -255,7 +296,7 @@ func (l *Limiter) makeRoomLocked(z *zoneState, now int64) bool {
 	}
 	all := make([]kv, 0, len(z.keys)/4+1)
 	for k, ks := range z.keys {
-		if throttled(ks, now) {
+		if live(ks, now) > 0 {
 			continue
 		}
 		all = append(all, kv{k, ks.lastSeen})
@@ -274,17 +315,14 @@ func (l *Limiter) makeRoomLocked(z *zoneState, now int64) bool {
 	return true
 }
 
-// throttled reports whether ks carries a live budget that a further request
-// would be refused against. Its window and size are those of the last
-// request it saw, so a key that changed zones' rate is judged as it was
-// charged.
-func throttled(ks *keyState, now int64) bool {
-	if ks.size == 0 {
-		return false
+// live returns how many of ks's stamps are still inside the window they were
+// counted against.
+func live(ks *keyState, now int64) int {
+	if ks.window == 0 {
+		return 0
 	}
 	cutoff := now - ks.window
-	live := len(ks.stamps) - sort.Search(len(ks.stamps), func(i int) bool { return ks.stamps[i] > cutoff })
-	return live >= ks.size
+	return len(ks.stamps) - sort.Search(len(ks.stamps), func(i int) bool { return ks.stamps[i] > cutoff })
 }
 
 // ceilSeconds rounds a wait up to whole seconds, never below one: the
@@ -301,7 +339,7 @@ func ceilSeconds(wait time.Duration) time.Duration {
 // window keeps its budget regardless of idle, so a sweep never resets a live
 // throttle.
 func (l *Limiter) Sweep(keep map[string]bool, idle time.Duration) {
-	now := l.now().UnixNano()
+	now := l.nanos()
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	for name, z := range l.zones {
@@ -310,7 +348,7 @@ func (l *Limiter) Sweep(keep map[string]bool, idle time.Duration) {
 			continue
 		}
 		for k, ks := range z.keys {
-			if time.Duration(now-ks.lastSeen) <= idle || throttled(ks, now) {
+			if time.Duration(now-ks.lastSeen) <= idle || live(ks, now) > 0 {
 				continue
 			}
 			delete(z.keys, k)
