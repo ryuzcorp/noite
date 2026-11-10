@@ -36,6 +36,7 @@
 import { Data } from "effect";
 
 import type { AppStatus } from "../runner-types/AppStatus";
+import type { DeployIntent } from "../runner-types/DeployIntent";
 import type { DeployStatus } from "../runner-types/DeployStatus";
 import type { DesiredState } from "../runner-types/DesiredState";
 
@@ -225,6 +226,33 @@ const DEPLOY_FACTS = {
     succeeded: true,
   },
 } as const satisfies Record<DeployStatus, DeployStatusFacts>;
+
+/** What the history says about why a row exists. `deploy` is a plain push,
+ * the sweep or a web commit — nothing to add to the row — while a rollback
+ * names the release it re-runs and a redeploy names the action. */
+export interface DeployIntentFacts {
+  readonly label: (sha: string | null) => string | null;
+}
+
+const DEPLOY_INTENTS: Record<DeployIntent, DeployIntentFacts> = {
+  deploy: { label: () => null },
+  redeploy: { label: () => "Redeploy" },
+  rollback: {
+    label: (sha) =>
+      sha === null ? "Rollback" : `Rollback to ${sha.slice(0, 12)}`,
+  },
+};
+
+export const isDeployIntent = (raw: string): raw is DeployIntent =>
+  Object.hasOwn(DEPLOY_INTENTS, raw);
+
+/** The history label for one deploy row: `null` for a plain deploy. An
+ * unmodelled intent reads as a plain deploy, never as another trigger. */
+export const deployIntentLabel = (
+  raw: string,
+  sha: string | null
+): string | null =>
+  isDeployIntent(raw) ? DEPLOY_INTENTS[raw].label(sha) : null;
 
 export const isDeployStatus = (raw: string): raw is DeployStatus =>
   Object.hasOwn(DEPLOY_FACTS, raw);

@@ -120,3 +120,5 @@ A deploy ends as **success**, **failed**, **Stopped** (`cancelled`: the operator
 ## Rollback
 
 `POST /v1/apps/<id>/rollback {sha}` redeploys a past successful SHA — bundles are immutable per SHA. The UI offers rollback on success rows.
+
+Every deploy row also records why it exists: `intent` is `deploy` for a push, a web commit or the runner's tip sweep, `rollback` for a rollback, and `redeploy` for an environment deploy (the Redeploy action). It is settled when the row is created and never rewritten, so a rollback that then fails is still a rollback; the API serves it on every deploy row, and the Deployments tab labels those rows **Rollback to `<sha>`** and **Redeploy**.

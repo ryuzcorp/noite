@@ -4,7 +4,7 @@
 //! pin that contract and the sweep's leniency toward it.
 
 use crate::api::tests::Harness;
-use crate::models::DeployStatus;
+use crate::models::{DeployIntent, DeployStatus};
 
 /// Seed a deploy row the way callers do (the one writer in production too).
 async fn seed(h: &Harness, app_id: &str, status: DeployStatus, sha: &str) -> String {
@@ -48,6 +48,8 @@ async fn a_rollback_row_is_queued_before_its_run_starts() {
         .expect("deploy row");
     assert_eq!(row.status, DeployStatus::Queued);
     assert_eq!(row.sha.as_deref(), Some(sha));
+    // The row says why it exists, before the pipeline touches it.
+    assert_eq!(row.intent, DeployIntent::Rollback);
 
     h.finish().await;
 }
@@ -107,6 +109,7 @@ async fn a_preview_rollback_is_proven_in_its_own_target() {
         .expect("deploy row");
     assert_eq!(row.environment_id.as_deref(), Some(env.id.as_str()));
     assert_eq!(row.status, DeployStatus::Queued);
+    assert_eq!(row.intent, DeployIntent::Rollback);
 
     h.finish().await;
 }
@@ -158,4 +161,93 @@ async fn the_sweep_spares_a_queued_row_twice_as_long_as_a_building_one() {
     assert_eq!(swept, 1);
 
     h.finish().await;
+}
+
+/// An environment deploy is the Redeploy action (UI, MCP
+/// `deploy_environment`): its pre-created row records `redeploy`, so the
+/// history never reads it as a plain push.
+#[tokio::test]
+async fn an_environment_deploy_records_a_redeploy() {
+    let h = Harness::new().await;
+    let app = h.seed_app("env-redeploy").await;
+    let env = crate::db::create_environment(
+        &h.state.pool,
+        &h.state.config,
+        crate::db::NewEnvironment {
+            app_id: &app.id,
+            slug: &app.slug,
+            label: "pr-9",
+            kind: crate::models::EnvironmentKind::Branch,
+            git_ref: "refs/heads/pr-9",
+            created_by: "local",
+            listen: 31100,
+            internal: 31101,
+        },
+    )
+    .await
+    .expect("create environment");
+
+    // A push mirror carrying the environment's branch: `deploy` resolves the
+    // ref before it creates the row.
+    let bare = crate::host::git_http::http_bare(&h.state.config, &app.slug);
+    let work = h.dir.join("redeploy-work");
+    std::fs::create_dir_all(&work).expect("worktree");
+    std::fs::write(work.join("index.ts"), "export const a = 1;\n").expect("source");
+    git(&work, &["init", "-q", "--initial-branch=pr-9", "."]).await;
+    git(&work, &["add", "-A"]).await;
+    git(&work, &["commit", "-qm", "init"]).await;
+    std::fs::create_dir_all(bare.parent().expect("mirror parent")).expect("mirror parent");
+    git(
+        &h.dir,
+        &[
+            "init",
+            "-q",
+            "--bare",
+            "--initial-branch=pr-9",
+            bare.to_str().expect("mirror path"),
+        ],
+    )
+    .await;
+    git(
+        &work,
+        &[
+            "push",
+            "-q",
+            bare.to_str().expect("mirror path"),
+            "pr-9:pr-9",
+        ],
+    )
+    .await;
+
+    let (deploy_id, sha) =
+        crate::service::environments::deploy(&h.state, &app.id, &env.id, Some("push"))
+            .await
+            .expect("redeploy the environment");
+    let row = crate::db::get_deploy(&h.state.pool, &app.id, &deploy_id)
+        .await
+        .expect("read deploy")
+        .expect("deploy row");
+    assert_eq!(row.intent, DeployIntent::Redeploy);
+    assert_eq!(row.environment_id.as_deref(), Some(env.id.as_str()));
+    assert_eq!(row.sha.as_deref(), Some(sha.as_str()));
+
+    h.finish().await;
+}
+
+/// A git command in `dir`, panicking with git's output on failure.
+async fn git(dir: &std::path::Path, args: &[&str]) -> String {
+    crate::host::exec::run_cmd(
+        "git",
+        args,
+        Some(dir),
+        &[
+            ("GIT_AUTHOR_NAME", "Test"),
+            ("GIT_AUTHOR_EMAIL", "test@example.com"),
+            ("GIT_COMMITTER_NAME", "Test"),
+            ("GIT_COMMITTER_EMAIL", "test@example.com"),
+        ],
+        std::time::Duration::from_secs(30),
+    )
+    .await
+    .unwrap_or_else(|e| panic!("git {args:?}: {e:#}"))
 }

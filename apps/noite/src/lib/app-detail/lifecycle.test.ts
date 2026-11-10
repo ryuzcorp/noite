@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 
 import {
   appLifecycle,
+  deployIntentLabel,
   deployStatusFacts,
   domainClaim,
   environmentHeaderState,
@@ -108,6 +109,27 @@ describe("isServing", () => {
     expect(isServing({ desiredState: "running", status: "stopped" })).toBe(
       false
     );
+  });
+});
+
+describe("deployIntentLabel", () => {
+  test("a plain push, the sweep or a web commit adds no label", () => {
+    expect(deployIntentLabel("deploy", "abc1234def0")).toBeNull();
+  });
+
+  test("a rollback names the release it re-runs", () => {
+    expect(deployIntentLabel("rollback", "abc1234def05555")).toBe(
+      "Rollback to abc1234def05"
+    );
+    expect(deployIntentLabel("rollback", null)).toBe("Rollback");
+  });
+
+  test("an environment deploy reads as the Redeploy action", () => {
+    expect(deployIntentLabel("redeploy", "abc1234def0")).toBe("Redeploy");
+  });
+
+  test("an unmodelled intent reads as a plain deploy, never another trigger", () => {
+    expect(deployIntentLabel("scheduled", "abc1234def0")).toBeNull();
   });
 });
 

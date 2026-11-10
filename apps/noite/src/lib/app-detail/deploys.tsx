@@ -52,7 +52,12 @@ import {
   DeployGroupMeta,
   EnvironmentGroup,
 } from "./environments";
-import { deployBadgeTone, deployStatusFacts, isServing } from "./lifecycle";
+import {
+  deployBadgeTone,
+  deployIntentLabel,
+  deployStatusFacts,
+  isServing,
+} from "./lifecycle";
 import { RuntimeLogs } from "./logs";
 
 /** The status badge for one deploy row, from the shared deploy facts: the
@@ -354,6 +359,7 @@ const RowApp = defineApp({
     const props = RowProps.read();
     const { d } = props;
     const facts = deployStatusFacts(d.status);
+    const intent = deployIntentLabel(d.intent, d.sha);
     const open = rowOpen(model, props.live);
 
     const busy =
@@ -385,6 +391,7 @@ const RowApp = defineApp({
               )}
             </div>
             <div class="text-base-content/70 text-xs">
+              {intent === null ? null : <span class="mr-2">{intent}</span>}
               {formatDateTime(d.createdAt)}
             </div>
           </div>
