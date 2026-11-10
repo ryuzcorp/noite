@@ -77,10 +77,12 @@ beforeEach(() => {
 });
 
 describe("ssr", () => {
-  test("the create form renders without browser globals", async () => {
+  test("the create form renders without browser globals, controls inert", async () => {
     const html = await renderHtml(CreateAppForm);
     expect(html).not.toContain("data-ilha-error");
     expect(html).toContain("Create app");
+    // No handlers exist until the island mounts, so the whole form is disabled.
+    expect(html).toContain('disabled=""');
   });
 
   test("onboarding renders without browser globals", async () => {
