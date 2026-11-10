@@ -17,7 +17,7 @@
 //! the app's root as one squashed commit — the same snapshot a tarball
 //! extractor such as giget makes, without a second host to allow.
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::sync::{LazyLock, Mutex};
@@ -228,35 +228,80 @@ async fn note(state: &AppState, app_id: &str, event: &str, description: &str) {
     .await;
 }
 
+/// One background import's state in THIS process: the in-memory half of the
+/// import machine (RDEP-5). The row's status is the durable half
+/// ([`crate::models::AppStatus::Importing`] → `provisioned` / `error`).
+///
+/// ```mermaid
+/// stateDiagram-v2
+///   [*] --> Done: no task here (never started, or an earlier process died)
+///   [*] --> Running: spawn claims the app
+///   Running --> Done: import_once returned, or the task panicked
+/// ```
+///
+/// The claim moves to `Done` through a drop guard, so a panic inside the
+/// import (or a cancelled task) cannot leave an app permanently
+/// "importing here", which used to make every later Retry answer 409 until a
+/// runner restart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImportState {
+    /// A task in this process is cloning and publishing the source.
+    Running,
+    /// The attempt ended; the row already carries the outcome.
+    Done,
+}
+
+/// The in-process import claims: app id → [`ImportState`].
+static IMPORTS: LazyLock<Mutex<HashMap<String, ImportState>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn imports() -> std::sync::MutexGuard<'static, HashMap<String, ImportState>> {
+    IMPORTS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+impl ImportState {
+    /// Whether a task here holds the app right now. A row that says
+    /// `importing` while this is false is an import whose task died with an
+    /// earlier process — exactly the case Retry must still serve.
+    pub fn is_running(self) -> bool {
+        self == Self::Running
+    }
+}
+
+/// The attempt's claim, moved into the import task and moved to
+/// [`ImportState::Done`] on every exit path — a panic included — so an app can
+/// never stay "importing here" forever. One entry per app at most: the map is
+/// bounded by the number of apps, and the next spawn overwrites it.
+struct ImportClaim(String);
+
+impl Drop for ImportClaim {
+    fn drop(&mut self) {
+        imports().insert(self.0.clone(), ImportState::Done);
+    }
+}
+
 /// Start the background import (A2/A3). The caller has already stored the
 /// source and flipped the app to `importing`, so `create` returns at once.
 pub fn spawn(state: &AppState, app: App, source: GitSource) {
     let app_id = app.id.clone();
-    if let Ok(mut running) = IN_FLIGHT.lock() {
-        running.insert(app_id.clone());
-    }
+    imports().insert(app_id.clone(), ImportState::Running);
+    let claim = ImportClaim(app_id);
     let state = state.clone();
     tokio::spawn(async move {
+        let _claim = claim;
         if let Err(e) = run(&state, &app, &source, Protocols::default()).await {
             tracing::error!(slug = %app.slug, error = %format!("{e:#}"), "import failed");
-        }
-        if let Ok(mut running) = IN_FLIGHT.lock() {
-            running.remove(&app_id);
         }
     });
 }
 
-/// App ids with an import running in THIS process. A row that says `importing`
-/// while nothing is in flight is an import whose task died with an earlier
-/// process (a restart, a crash) — exactly the case Retry must still serve.
-static IN_FLIGHT: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
-
 /// Whether this process is running an import for `app_id`.
 pub fn running(app_id: &str) -> bool {
-    IN_FLIGHT
-        .lock()
-        .map(|running| running.contains(app_id))
-        .unwrap_or(false)
+    imports()
+        .get(app_id)
+        .is_some_and(|state| state.is_running())
 }
 
 /// The whole import, with the app row's status moved by the outcome. Only runs
@@ -277,14 +322,29 @@ async fn run(
                 &format!("{} at {}", source.url, &sha[..sha.len().min(7)]),
             )
             .await;
-            db::finish_app_import(&state.pool, &app.id, AppStatus::Provisioned.as_str(), None)
-                .await?;
+            if !db::finish_app_import(&state.pool, &app.id, AppStatus::Provisioned, None)
+                .await?
+                .is_applied()
+            {
+                tracing::info!(
+                    app_id = %app.id,
+                    "import outcome lost the race to a deploy; the row keeps its story"
+                );
+            }
             Ok(())
         }
         Err(e) => {
             let message = format!("{e:#}");
             note(state, &app.id, "Import failed", &message).await;
-            db::finish_app_import(&state.pool, &app.id, "error", Some(&message)).await?;
+            if !db::finish_app_import(&state.pool, &app.id, AppStatus::Error, Some(&message))
+                .await?
+                .is_applied()
+            {
+                tracing::info!(
+                    app_id = %app.id,
+                    "import failure lost the race to a deploy; the row keeps its story"
+                );
+            }
             Err(e)
         }
     }

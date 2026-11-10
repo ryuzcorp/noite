@@ -216,9 +216,16 @@ async fn reconcile_once(
     for app in &apps {
         if app.desired() == DesiredState::Stopped {
             supervisor::stop_fleet(procs, &app.slug, supervisor::StopGrace::NORMAL).await;
-            if app.status != AppStatus::Stopped.as_str() {
-                db::update_app_status(pool, &app.id, AppStatus::Stopped.as_str(), None, None)
-                    .await?;
+            if app.status != AppStatus::Stopped {
+                db::write_app_status(
+                    pool,
+                    &app.id,
+                    AppStatus::Stopped,
+                    None,
+                    None,
+                    crate::models::WriteGuard::Table,
+                )
+                .await?;
             }
             continue;
         }
@@ -242,7 +249,7 @@ async fn reconcile_once(
                     // flip only while still wanted, so a stop in the window
                     // wins. Without any confirm, start/resume would leave the
                     // stop-time status stuck until the next deploy flips it.
-                    if app.status != AppStatus::Running.as_str() {
+                    if app.status != AppStatus::Running {
                         if let Some(port) = app.listen_port {
                             let (pool, cfg, confirming) =
                                 (pool.clone(), cfg.clone(), confirming.clone());
@@ -263,7 +270,15 @@ async fn reconcile_once(
                 Err(e) => {
                     tracing::warn!(slug = %app.slug, error = %e, "ensure_fleet");
                     let msg = format!("{e:#}");
-                    db::update_app_status_if_wanted(pool, &app.id, &app.status, Some(&msg)).await?;
+                    db::write_app_status(
+                        pool,
+                        &app.id,
+                        app.status,
+                        Some(&msg),
+                        None,
+                        crate::models::WriteGuard::Wanted,
+                    )
+                    .await?;
                 }
             }
         }
@@ -300,9 +315,15 @@ async fn reconcile_once(
         let fleet = format!("{}.{}", env.app_slug, env.label);
         if env.is_stopped() || stopped_apps.contains(&env.app_id) {
             supervisor::stop_environment_fleet(procs, &env.app_slug, &env.label).await;
-            if env.is_stopped() && env.status != AppStatus::Stopped.as_str() {
-                db::update_environment_status(pool, &env.id, AppStatus::Stopped.as_str(), None)
-                    .await?;
+            if env.is_stopped() && env.status != AppStatus::Stopped {
+                db::write_environment_status(
+                    pool,
+                    &env.id,
+                    AppStatus::Stopped,
+                    None,
+                    crate::models::WriteGuard::Table,
+                )
+                .await?;
             }
             continue;
         }
@@ -317,7 +338,7 @@ async fn reconcile_once(
             match supervisor::ensure_environment_fleet(pool, cfg, procs, logs, env).await {
                 Ok(()) => {
                     // Same truthful order as the app branch above.
-                    if env.status != AppStatus::Running.as_str() {
+                    if env.status != AppStatus::Running {
                         if let Some(port) = env.listen_port {
                             let (pool, cfg, confirming) =
                                 (pool.clone(), cfg.clone(), confirming.clone());
@@ -338,8 +359,14 @@ async fn reconcile_once(
                 Err(e) => {
                     tracing::warn!(fleet = %fleet, error = %e, "ensure_environment_fleet");
                     let msg = format!("{e:#}");
-                    db::update_environment_status_if_wanted(pool, &env.id, &env.status, Some(&msg))
-                        .await?;
+                    db::write_environment_status(
+                        pool,
+                        &env.id,
+                        env.status,
+                        Some(&msg),
+                        crate::models::WriteGuard::Wanted,
+                    )
+                    .await?;
                 }
             }
         }
@@ -437,10 +464,7 @@ async fn app_has_in_flight(pool: &SqlitePool, app_id: &str) -> bool {
         return true;
     };
     recent.iter().any(|(status, updated_at)| {
-        let Some(st) = crate::models::DeployStatus::parse(status) else {
-            return false;
-        };
-        if !st.is_in_flight() {
+        if !status.is_in_flight() {
             return false;
         }
         crate::models::parse_time(updated_at)
@@ -456,10 +480,7 @@ async fn env_has_in_flight(pool: &SqlitePool, environment_id: &str) -> bool {
         return true;
     };
     recent.iter().any(|(status, updated_at)| {
-        let Some(st) = crate::models::DeployStatus::parse(status) else {
-            return false;
-        };
-        if !st.is_in_flight() {
+        if !status.is_in_flight() {
             return false;
         }
         crate::models::parse_time(updated_at)

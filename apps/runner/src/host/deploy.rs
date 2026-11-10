@@ -24,7 +24,7 @@ use crate::host::void_proxy;
 use crate::host::void_sandbox;
 use crate::host::worker_vars;
 use crate::lifecycle::{self, sha_same};
-use crate::models::{App, AppStatus, DeployStatus, Environment};
+use crate::models::{App, AppStatus, DeployStatus, Environment, WriteGuard};
 use sqlx::SqlitePool;
 
 /// The workflow file a repo root may carry (read by the deploy).
@@ -231,7 +231,7 @@ pub async fn deploy_app(
                 Some(id),
                 &app.id,
                 target.environment_id(),
-                DeployStatus::Failed.as_str(),
+                DeployStatus::Failed,
                 tip_sha,
                 &text,
             )
@@ -277,13 +277,13 @@ pub async fn deploy_app(
             None,
             &app.id,
             target.environment_id(),
-            DeployStatus::Building.as_str(),
+            DeployStatus::Building,
             tip_sha,
             "▸ queued\n",
         )
         .await
         {
-            Ok(id) => Some(id),
+            Ok(written) => Some(written.id),
             Err(e) => {
                 tracing::error!(slug = %app.slug, error = %e, "deploy row create failed");
                 None
@@ -409,18 +409,53 @@ struct Progress<'a> {
 }
 
 impl Progress<'_> {
-    async fn log(&mut self, status: DeployStatus, text: &str) -> sqlx::Result<()> {
-        let id = db::upsert_deploy(
+    /// Append a line under `status`. The row write refuses a move the
+    /// transition table forbids: a run whose row another writer already
+    /// closed (the stop endpoint, the stall sweep) stops here instead of
+    /// rewriting a finished row.
+    async fn log(&mut self, status: DeployStatus, text: &str) -> anyhow::Result<()> {
+        let written = db::upsert_deploy(
             self.pool,
             self.id.as_deref(),
             self.app_id,
             self.environment_id.as_deref(),
-            status.as_str(),
+            status,
             self.sha.as_deref(),
             text,
         )
         .await?;
-        self.id = Some(id);
+        self.id = Some(written.id.clone());
+        match written.outcome {
+            crate::models::DeployWrite::Applied => Ok(()),
+            crate::models::DeployWrite::Refused { current } => anyhow::bail!(
+                "deploy row {} was closed as {} by another writer",
+                written.id,
+                current.as_str()
+            ),
+        }
+    }
+
+    /// Write the run's terminal failure line. A row another writer already
+    /// closed keeps its own story, so a refusal is not an error here.
+    async fn close(&mut self, text: &str) -> anyhow::Result<()> {
+        let written = db::upsert_deploy(
+            self.pool,
+            self.id.as_deref(),
+            self.app_id,
+            self.environment_id.as_deref(),
+            DeployStatus::Failed,
+            self.sha.as_deref(),
+            text,
+        )
+        .await?;
+        if !written.outcome.is_applied() {
+            tracing::warn!(
+                deploy_id = %written.id,
+                step = self.step,
+                "deploy row was already closed; keeping its terminal status"
+            );
+        }
+        self.id = Some(written.id);
         Ok(())
     }
 
@@ -433,11 +468,14 @@ impl Progress<'_> {
         Ok(())
     }
 
-    /// The run's generation is on the fleet: from here a stop is refused, not
-    /// silently half-applied.
-    fn commit_cancel(&self) {
-        if let Some(token) = &self.cancel {
-            token.commit();
+    /// Enter the point of no return, atomically with the stop check: either
+    /// this commits (and every later stop answers 409) or the operator's stop
+    /// won and the run must not activate. That compare-and-swap is what makes
+    /// a 200 answer mean "the activation will not happen".
+    fn commit_cancel(&self) -> anyhow::Result<()> {
+        match &self.cancel {
+            Some(token) if !token.commit() => anyhow::bail!("{CANCELLED}"),
+            _ => Ok(()),
         }
     }
 
@@ -469,28 +507,30 @@ impl Progress<'_> {
 
     /// Record `err` on the row and a one-line summary on the target (the app
     /// for production, the environment for a preview).
-    async fn fail(&mut self, err: &anyhow::Error) -> sqlx::Result<()> {
+    async fn fail(&mut self, err: &anyhow::Error) -> anyhow::Result<()> {
         // A stopped run says why and nothing else: the step that was cut
         // short did not fail on its own.
         if self.cancel.as_ref().is_some_and(|c| c.is_cancelled()) {
-            self.log(DeployStatus::Failed, &format!("ERROR: {CANCELLED}\n"))
-                .await?;
+            self.close(&format!("ERROR: {CANCELLED}\n")).await?;
             match self.environment_id.as_deref() {
                 Some(env_id) => {
-                    db::update_environment_status_if_wanted(
+                    db::write_environment_status(
                         self.pool,
                         env_id,
-                        AppStatus::Failed.as_str(),
+                        AppStatus::Failed,
                         Some(CANCELLED),
+                        WriteGuard::Wanted,
                     )
                     .await?;
                 }
                 None => {
-                    db::update_app_status_if_wanted(
+                    db::write_app_status(
                         self.pool,
                         self.app_id,
-                        AppStatus::Failed.as_str(),
+                        AppStatus::Failed,
                         Some(CANCELLED),
+                        None,
+                        WriteGuard::Wanted,
                     )
                     .await?;
                 }
@@ -499,30 +539,30 @@ impl Progress<'_> {
         }
         let detail = lifecycle::strip_ansi(&format!("{err:#}")).into_owned();
         let detail = lifecycle::tail_utf8(detail.trim_end(), FAILURE_TAIL);
-        self.log(
-            DeployStatus::Failed,
-            &format!("ERROR: {} failed\n{detail}\n", self.step),
-        )
-        .await?;
+        self.close(&format!("ERROR: {} failed\n{detail}\n", self.step))
+            .await?;
         let summary = failure_summary(self.step, detail);
         match self.environment_id.as_deref() {
             // `upsert_deploy` already moved the environment to failed with the
             // log tail; this adds the one-line summary the UI lists.
             Some(env_id) => {
-                db::update_environment_status_if_wanted(
+                db::write_environment_status(
                     self.pool,
                     env_id,
-                    AppStatus::Failed.as_str(),
+                    AppStatus::Failed,
                     Some(&summary),
+                    WriteGuard::Wanted,
                 )
                 .await?;
             }
             None => {
-                db::update_app_status_if_wanted(
+                db::write_app_status(
                     self.pool,
                     self.app_id,
-                    AppStatus::Failed.as_str(),
+                    AppStatus::Failed,
                     Some(&summary),
+                    None,
+                    WriteGuard::Wanted,
                 )
                 .await?;
             }
@@ -1599,18 +1639,19 @@ async fn deploy_inner(
         .await?;
         probe_staged_generation(cfg, &celld, &staged, None, &mut *progress).await?;
         // A stop in the probe window must not activate: the staged pointer is
-        // the last irreversible step before the fleet serves it.
-        progress.check_cancel()?;
+        // the last irreversible step before the fleet serves it. The commit
+        // and the stop check are one atomic step, so a 200 answer for a stop
+        // always means this activation does not happen.
+        progress.commit_cancel()?;
         let stats =
             void_cohost::activate_staged(pool, &app.id, target.environment_id(), &celld, staged)
                 .await?;
         let environment = load_deploy_target(pool, app, target).await?;
         (stats, environment)
     };
-    // The staged generation is on the fleet: from here a stop cannot take it
-    // back, so the token commits (later stops answer 409) and the run is
-    // allowed to finish routing and recording its success.
-    progress.commit_cancel();
+    // The activation above ran past the point of no return, so a stop from
+    // here answers 409 (the run committed) and cannot abort the rest of the
+    // pipeline: the generation is already on the fleet.
     for line in stats.log_lines() {
         progress.log(DeployStatus::Deploying, &line).await?;
     }
@@ -2132,6 +2173,7 @@ async fn activate_after_staged_migrate(
     progress
         .step("deploy", DeployStatus::Deploying, "celld activate")
         .await?;
+    progress.commit_cancel()?;
     void_cohost::activate_staged(pool, &app.id, target.environment_id(), celld, staged).await
 }
 
@@ -2231,7 +2273,7 @@ async fn ensure_prior_fleet_healthy(
 async fn log_migrate_warnings(
     progress: &mut Progress<'_>,
     response: &void_migrate::MigrateResponse,
-) -> sqlx::Result<()> {
+) -> anyhow::Result<()> {
     if response.warnings.is_empty() && response.warnings_dropped == 0 {
         return Ok(());
     }
@@ -2263,7 +2305,7 @@ async fn log_migrate_warnings(
 async fn log_migrate_outcome(
     progress: &mut Progress<'_>,
     response: &void_migrate::MigrateResponse,
-) -> sqlx::Result<()> {
+) -> anyhow::Result<()> {
     let applied: Vec<&str> = response
         .migrations
         .iter()
@@ -2683,6 +2725,7 @@ mod tests {
         parse_wrangler_build, probe_staged_generation, quoted, route_live, wipe_worktree,
         without_runner_keys, DeployTarget, MigrateInputs, Progress,
     };
+    use crate::models::DeployStatus;
     use serde_json::json;
 
     /// A client that waits for the deploy row (the CLI, the UI, the e2e)
@@ -2717,10 +2760,17 @@ mod tests {
         )
         .await
         .expect("seed app");
-        let deploy_id =
-            crate::db::upsert_deploy(&pool, None, &app.id, None, "deploying", Some("abc123"), "")
-                .await
-                .expect("deploy row");
+        let deploy_id = crate::db::upsert_deploy(
+            &pool,
+            None,
+            &app.id,
+            None,
+            DeployStatus::Deploying,
+            Some("abc123"),
+            "",
+        )
+        .await
+        .expect("deploy row");
 
         route_live(&pool, &cfg, &app.id, None, "abc123")
             .await
@@ -2735,12 +2785,17 @@ mod tests {
             "{host} not routed: {:?}",
             table.exact.keys().collect::<Vec<_>>()
         );
-        let status: String = sqlx::query_scalar("SELECT status FROM deploy WHERE id = ?")
-            .bind(&deploy_id)
-            .fetch_one(&pool)
-            .await
-            .expect("deploy status");
-        assert_eq!(status, "deploying", "routing must not announce the deploy");
+        let status: crate::models::DeployStatus =
+            sqlx::query_scalar("SELECT status FROM deploy WHERE id = ?")
+                .bind(&deploy_id.id)
+                .fetch_one(&pool)
+                .await
+                .expect("deploy status");
+        assert_eq!(
+            status,
+            crate::models::DeployStatus::Deploying,
+            "routing must not announce the deploy"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

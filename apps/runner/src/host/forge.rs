@@ -1010,6 +1010,7 @@ mod tests {
     use super::*;
     use crate::host::exec;
     use crate::host::git_http::http_bare;
+    use crate::models::{AppStatus, DesiredState};
 
     /// A text (`utf8`) browser file.
     fn text_file(path: &str, content: &str) -> crate::host::web_commit::WebFile {
@@ -1155,7 +1156,7 @@ mod tests {
             slug: slug.to_string(),
             name: slug.to_string(),
             user_id: "user_test".to_string(),
-            status: "running".to_string(),
+            status: AppStatus::Running,
             subdomain: format!("{slug}.localhost"),
             git_prefix: format!("git/{slug}/"),
             fleet_bucket: format!("fleet-{slug}"),
@@ -1163,7 +1164,7 @@ mod tests {
             internal_port: None,
             last_deploy_sha: None,
             last_error: None,
-            desired_state: "running".to_string(),
+            desired_state: DesiredState::Running,
             created_at: "2026-01-01T00:00:00Z".to_string(),
             updated_at: "2026-01-01T00:00:00Z".to_string(),
             asleep_since: None,

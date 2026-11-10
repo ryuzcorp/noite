@@ -8,7 +8,7 @@ use crate::api_error::ApiError;
 use crate::db;
 use crate::host::{deploy, git_http, import, purge, rename, sleep, supervisor};
 use crate::lifecycle::slug_ok;
-use crate::models::{App, AppSource, AppStatus, DesiredState};
+use crate::models::{App, AppSource, AppStatus, DesiredState, WriteGuard};
 use crate::AppState;
 
 /// Serializes the create critical section (NOITE-APPS-001). The per-account
@@ -210,17 +210,16 @@ async fn create_inner(
     db::set_app_import_source(&state.pool, &app.id, Some(&stored))
         .await
         .map_err(|e| ApiError::internal(e.to_string()))?;
-    if let Err(e) = db::update_app_status(
+    db::write_app_status(
         &state.pool,
         &app.id,
-        AppStatus::Importing.as_str(),
+        AppStatus::Importing,
         None,
         None,
+        WriteGuard::Table,
     )
     .await
-    {
-        return Err(ApiError::internal(e.to_string()));
-    }
+    .map_err(|e| ApiError::internal(e.to_string()))?;
     let app = app_or_404(state, &app.id).await?;
     import::spawn(state, app.clone(), git.clone());
     Ok(app)
@@ -239,19 +238,30 @@ pub async fn retry_import(state: &AppState, id: &str) -> Result<App, ApiError> {
     };
     // `importing` with a live task is a real conflict; `importing` without one
     // is an import interrupted by a restart, which is what Retry is for.
-    if app.status == AppStatus::Importing.as_str() && import::running(&app.id) {
+    if app.status == AppStatus::Importing && import::running(&app.id) {
         return Err(ApiError::conflict("an import is already running"));
     }
-    if let Err(e) = db::update_app_status(
+    // The status write is the gate: only a state an import can start from
+    // (pending, provisioned, error, stopped, failed) moves to `importing`, so
+    // Retry can no longer drag a running or deploying app back to
+    // `importing` while its fleet keeps serving.
+    let written = db::write_app_status(
         &state.pool,
         &app.id,
-        AppStatus::Importing.as_str(),
+        AppStatus::Importing,
         None,
         None,
+        WriteGuard::Table,
     )
     .await
-    {
-        return Err(ApiError::internal(e.to_string()));
+    .map_err(|e| ApiError::internal(e.to_string()))?;
+    if let crate::models::StatusWrite::Refused { current } = written {
+        return Err(ApiError::conflict(match current {
+            AppStatus::Running | AppStatus::Sleeping => {
+                "the app is deployed; an import cannot replace it"
+            }
+            _ => "the app is busy; retry after its current operation",
+        }));
     }
     let app = app_or_404(state, &app.id).await?;
     import::spawn(state, app.clone(), git);
@@ -263,7 +273,7 @@ pub async fn patch(state: &AppState, id: &str, desired: Option<&str>) -> Result<
         let Some(ds) = DesiredState::parse(desired) else {
             return Err(ApiError::bad("desiredState must be running|stopped"));
         };
-        db::patch_app_desired(&state.pool, id, ds.as_str())
+        db::patch_app_desired(&state.pool, id, ds)
             .await
             .map_err(|e| ApiError::internal(e.to_string()))?;
         // A stop parks the route (and a start restores it): push now.
@@ -388,40 +398,91 @@ const DELETE_ANSWER_WITHIN: Duration = Duration::from_secs(3);
 /// from leaking the detached task and its in-memory delete marker.
 const DELETE_CLEANUP_WITHIN: Duration = Duration::from_secs(30);
 
-/// Apps whose delete is running. They are gone for every caller from the
-/// moment the delete starts ([`list`], [`get`], [`get_by_slug`]), and a
-/// second delete reports the running one instead of starting another purge.
-/// In memory on purpose: a runner restart mid-delete leaves the app
-/// stopped and listed again, and deleting it again finishes the job.
-static DELETING: LazyLock<std::sync::Mutex<std::collections::HashSet<String>>> =
-    LazyLock::new(Default::default);
-
-fn deleting(id: &str) -> bool {
-    DELETING
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .contains(id)
+/// Where one app's delete is (RDEP-6). There is no DB column for it on
+/// purpose (a hard DELETE is the only removal path): the phases live in the
+/// process, and a runner restart mid-delete leaves the app stopped and
+/// listed again, which a second delete finishes.
+///
+/// ```mermaid
+/// stateDiagram-v2
+///   [*] --> Purging: DELETE claims the app (hidden from list/get)
+///   Purging --> Cleanup: the row is gone and the slug is free
+///   Cleanup --> [*]: routes, credentials and tokens done (bounded)
+///   Purging --> [*]: purge failed; the row stays stopped and listed again
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeletePhase {
+    /// Claimed: the fleet is stopping, the slug's data is being wiped.
+    Purging,
+    /// The row is deleted and the slug released; only best-effort cleanup
+    /// (routes, scoped credentials, operator tokens) is still running.
+    Cleanup,
 }
 
-/// An app's [`DELETING`] entry, removed on drop.
-struct DeletingMarker(String);
+/// The in-process delete registry: one phase per app being deleted. The
+/// phase is the only state; every read and write goes through this type, so
+/// "is this app being deleted" has one answer.
+#[derive(Default)]
+struct Deletions {
+    phases: std::sync::Mutex<std::collections::HashMap<String, DeletePhase>>,
+}
 
-impl Drop for DeletingMarker {
-    fn drop(&mut self) {
-        DELETING
+impl Deletions {
+    fn guard(&self) -> std::sync::MutexGuard<'_, std::collections::HashMap<String, DeletePhase>> {
+        self.phases
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(&self.0);
+    }
+
+    /// Claim `id` for a delete. `false` = one is already running (the caller
+    /// reports [`Deletion::InProgress`] instead of starting a second purge).
+    fn begin(&self, id: &str) -> bool {
+        self.guard()
+            .insert(id.to_string(), DeletePhase::Purging)
+            .is_none()
+    }
+
+    /// Move a claimed app on. Only ever Purging → Cleanup, and only while the
+    /// app is still claimed.
+    fn advance(&self, id: &str, next: DeletePhase) {
+        if let Some(phase) = self.guard().get_mut(id) {
+            *phase = next;
+        }
+    }
+
+    fn phase(&self, id: &str) -> Option<DeletePhase> {
+        self.guard().get(id).copied()
+    }
+
+    /// Release the claim: the delete finished (or failed, and a retry may
+    /// start again).
+    fn finish(&self, id: &str) {
+        self.guard().remove(id);
+    }
+}
+
+static DELETIONS: LazyLock<Deletions> = LazyLock::new(Deletions::default);
+
+/// An app is hidden from every caller from the moment its delete starts
+/// ([`list`], [`get`], [`get_by_slug`]).
+fn deleting(id: &str) -> bool {
+    DELETIONS.phase(id).is_some()
+}
+
+/// An app's delete claim, released on drop — however the task ends, a panic
+/// included, so a marker can never hide an app from every listing until a
+/// restart.
+struct DeletionGuard(String);
+
+impl Drop for DeletionGuard {
+    fn drop(&mut self) {
+        DELETIONS.finish(&self.0);
     }
 }
 
 pub async fn delete(state: &AppState, id: &str) -> Result<Deletion, ApiError> {
     let app = app_or_404(state, id).await?;
-    let started = DELETING
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .insert(app.id.clone());
-    if !started {
+    if !DELETIONS.begin(&app.id) {
         return Ok(Deletion::InProgress);
     }
     // A dropped HTTP handler must not cancel the purge halfway (see
@@ -432,7 +493,7 @@ pub async fn delete(state: &AppState, id: &str) -> Result<Deletion, ApiError> {
     let work = super::detached::run(format!("app:{id}"), async move {
         // Released however the task ends (a panic included): a marker left
         // behind would hide the app from every listing until a restart.
-        let _marker = DeletingMarker(id.clone());
+        let _marker = DeletionGuard(id.clone());
         let out = delete_inner(&state, &id).await;
         if let Err(e) = &out {
             // The caller may be long gone: the log and the row are where a
@@ -440,8 +501,15 @@ pub async fn delete(state: &AppState, id: &str) -> Result<Deletion, ApiError> {
             // retries.
             tracing::warn!(app_id = %id, error = %e, "app delete failed");
             let note = format!("delete failed: {e}; delete the app again to retry");
-            if let Err(db_error) =
-                db::update_app_status(&state.pool, &id, "stopped", Some(&note), None).await
+            if let Err(db_error) = db::write_app_status(
+                &state.pool,
+                &id,
+                AppStatus::Stopped,
+                Some(&note),
+                None,
+                WriteGuard::Table,
+            )
+            .await
             {
                 tracing::warn!(app_id = %id, error = %db_error, "could not record the failed delete");
             }
@@ -476,9 +544,7 @@ async fn delete_inner(state: &AppState, id: &str) -> Result<(), ApiError> {
     // (S3 prefixes), and an app still marked running is respawned in that
     // window by the reconcile loop or by a wake. A failed purge leaves the
     // app stopped, which a retried delete finishes.
-    if let Err(e) =
-        db::patch_app_desired(&state.pool, &app.id, DesiredState::Stopped.as_str()).await
-    {
+    if let Err(e) = db::patch_app_desired(&state.pool, &app.id, DesiredState::Stopped).await {
         return Err(ApiError::internal(e.to_string()));
     }
     let purge_result = purge::purge_slug(
@@ -511,6 +577,9 @@ async fn delete_inner(state: &AppState, id: &str) -> Result<(), ApiError> {
     // was the "deleted app, slug still taken" bug.
     drop(push);
     drop(claim);
+    // The row is gone and the slug is free: only the best-effort cleanup is
+    // left, which is the state a caller's 202 keeps the app in.
+    DELETIONS.advance(id, DeletePhase::Cleanup);
     let cleanup = async {
         if let Err(e) = crate::host::edge_table::push_routes(&state.pool, &state.config).await {
             tracing::warn!(app_id = %id, error = %format!("{e:#}"), "edge push after app delete");
@@ -862,6 +931,27 @@ mod tests {
             .is_none());
         assert!(!deleting(&app.id), "a finished delete leaves no marker");
         drop(dir);
+    }
+
+    /// The delete registry owns "is this app being deleted": one claim per
+    /// app, one-way phase, and a release on every exit path (the drop guard
+    /// is what a panic or a dropped caller relies on).
+    #[test]
+    fn the_delete_claim_is_one_per_app_and_released_on_drop() {
+        let id = "sm-delete-claim-test";
+        assert!(DELETIONS.begin(id), "the first delete claims the app");
+        assert!(!DELETIONS.begin(id), "a second delete reports the first");
+        assert_eq!(DELETIONS.phase(id), Some(DeletePhase::Purging));
+        DELETIONS.advance(id, DeletePhase::Cleanup);
+        assert_eq!(DELETIONS.phase(id), Some(DeletePhase::Cleanup));
+        assert!(deleting(id));
+        drop(DeletionGuard(id.to_string()));
+        assert!(!deleting(id), "the guard releases the claim");
+        assert!(
+            DELETIONS.begin(id),
+            "a failed or finished delete may start again"
+        );
+        DELETIONS.finish(id);
     }
 
     /// R-03: two apps renaming onto one slug serialize under CREATE_LOCK —

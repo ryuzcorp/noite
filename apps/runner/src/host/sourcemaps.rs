@@ -1413,7 +1413,7 @@ async fn prune_old_maps(
         deploys.iter().map(|d| {
             (
                 d.sha.clone(),
-                d.status_enum() == Some(crate::models::DeployStatus::Success),
+                d.status == crate::models::DeployStatus::Success,
             )
         }),
     );

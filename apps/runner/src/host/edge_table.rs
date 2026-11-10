@@ -515,7 +515,7 @@ mod tests {
             slug: slug.into(),
             name: slug.into(),
             user_id: "u".into(),
-            status: AppStatus::Running.as_str().into(),
+            status: AppStatus::Running,
             subdomain: format!("{slug}.localhost"),
             git_prefix: format!("git/{slug}"),
             fleet_bucket: format!("s3://noite/fleets/{slug}"),
@@ -523,7 +523,7 @@ mod tests {
             internal_port: None,
             last_deploy_sha: Some("abc".into()),
             last_error: None,
-            desired_state: DesiredState::Running.as_str().into(),
+            desired_state: DesiredState::Running,
             created_at: "t".into(),
             updated_at: "t".into(),
             asleep_since: None,
@@ -542,7 +542,7 @@ mod tests {
             label: label.into(),
             listen_port: Some(20021),
             public: false,
-            desired_state: DesiredState::Running.as_str().into(),
+            desired_state: DesiredState::Running,
             asleep_since: None,
             last_deployed_at: Some("t".into()),
         }
@@ -597,9 +597,9 @@ mod tests {
     fn stopped_and_never_deployed_apps_get_no_route() {
         let cfg = config_for_tests();
         let mut stopped = test_app("parked");
-        stopped.desired_state = DesiredState::Stopped.as_str().into();
+        stopped.desired_state = DesiredState::Stopped;
         let mut fresh = test_app("fresh");
-        fresh.status = "created".into();
+        fresh.status = AppStatus::Provisioned;
         fresh.last_deploy_sha = None;
         let t = build_table(&cfg, &[stopped, fresh], &[], &[], &[]);
         assert!(!t.exact.contains_key("parked.localhost"));

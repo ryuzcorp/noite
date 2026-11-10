@@ -15,7 +15,7 @@
 
 use std::collections::HashMap;
 use std::future::Future;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 
 /// The operator's stop, in the log and the app summary alike.
@@ -25,24 +25,54 @@ tokio::task_local! {
     static CURRENT: CancelHandle;
 }
 
-/// One deploy's cancellation state. `flag` makes repeated checks cheap and
-/// idempotent; `notify` wakes the waiting child process the moment the
-/// operator asks.
+/// One live deploy's admission state: whether a stop can still change the
+/// outcome, and whether one already has.
+///
+/// ```mermaid
+/// stateDiagram-v2
+///   [*] --> Live: the run registers its deploy id
+///   Live --> Cancelled: operator stop (answers 200)
+///   Live --> Committed: activation starts (point of no return)
+///   Cancelled --> [*]: the run aborts before it activates
+///   Committed --> [*]: the run finishes; later stops answer 409
+/// ```
+///
+/// `Cancelled` and `Committed` are terminal and mutually exclusive, and the
+/// move out of `Live` is one compare-and-swap: a stop and an activation
+/// cannot both win, so a 200 always means the generation never activates and
+/// the run can never abort after committing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RunState {
+    Live = 0,
+    Cancelled = 1,
+    Committed = 2,
+}
+
+impl RunState {
+    fn load(value: u8) -> Self {
+        match value {
+            1 => Self::Cancelled,
+            2 => Self::Committed,
+            _ => Self::Live,
+        }
+    }
+}
+
+/// One deploy's cancellation state as one value. `notify` wakes the waiting
+/// child process the moment the operator asks.
 pub struct Cancel {
-    flag: AtomicBool,
-    /// Set once the run moved the staged generation onto the fleet: the
-    /// release now serves it, so a stop cannot un-do it (the endpoint
-    /// answers 409 instead of pretending).
-    committed: AtomicBool,
+    /// The [`RunState`], as its discriminant: one atomic compare-and-swap
+    /// decides every race the old `flag`/`committed` pair could lose.
+    state: AtomicU8,
     notify: tokio::sync::Notify,
 }
 
 /// What a stop request found for its deploy id.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CancelOutcome {
-    /// A live run was told to stop.
+    /// A live run was told to stop (or already had been).
     Signalled,
-    /// The run is past its point of no return (it activated its generation).
+    /// The run is past its point of no return (it started activating).
     Committed,
     /// No live run holds this id: the caller decides from the row's status.
     Missing,
@@ -53,20 +83,25 @@ pub type CancelHandle = Arc<Cancel>;
 impl Cancel {
     fn new() -> Self {
         Self {
-            flag: AtomicBool::new(false),
-            committed: AtomicBool::new(false),
+            state: AtomicU8::new(RunState::Live as u8),
             notify: tokio::sync::Notify::new(),
         }
     }
 
+    fn state(&self) -> RunState {
+        RunState::load(self.state.load(Ordering::SeqCst))
+    }
+
+    /// Whether the operator has stopped this run *and* it can still be
+    /// stopped: a committed run is never "cancelled" again.
     pub fn is_cancelled(&self) -> bool {
-        self.flag.load(Ordering::SeqCst)
+        self.state() == RunState::Cancelled
     }
 
     /// Resolve once the operator cancels; returns at once when it already
     /// happened.
     pub async fn cancelled(&self) {
-        // Register the waiter *before* re-reading the flag: a trip between
+        // Register the waiter *before* re-reading the state: a trip between
         // the old check and `notified()` would find no waiter and never wake
         // this future, so the stop would wait out the step instead of
         // killing it.
@@ -79,20 +114,45 @@ impl Cancel {
         notified.await;
     }
 
-    /// Mark the run past the point where a stop can change its outcome.
-    pub fn commit(&self) {
-        self.committed.store(true, Ordering::SeqCst);
+    /// Enter the point of no return: from here a stop is refused (409).
+    /// `false` means the operator's stop won the race instead — the caller
+    /// MUST NOT activate, and must fail the run with [`CANCELLED`]. The
+    /// compare-and-swap makes "stop then commit" and "commit then stop"
+    /// mutually exclusive, which is what closes the activate→commit window.
+    pub fn commit(&self) -> bool {
+        match self.state.compare_exchange(
+            RunState::Live as u8,
+            RunState::Committed as u8,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        ) {
+            Ok(_) => true,
+            Err(current) => RunState::load(current) == RunState::Committed,
+        }
     }
 
+    /// Whether the run is past its point of no return.
     pub fn is_committed(&self) -> bool {
-        self.committed.load(Ordering::SeqCst)
+        self.state() == RunState::Committed
     }
 
-    fn trip(&self) {
-        self.flag.store(true, Ordering::SeqCst);
-        // `notify_waiters` wakes everyone already parked; the flag covers
-        // every waiter that arrives after this line.
-        self.notify.notify_waiters();
+    /// Stop the run, unless it already committed. `false` = the stop lost to
+    /// an activation that has started.
+    fn trip(&self) -> bool {
+        match self.state.compare_exchange(
+            RunState::Live as u8,
+            RunState::Cancelled as u8,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        ) {
+            Ok(_) => {
+                // `notify_waiters` wakes everyone already parked; the state
+                // covers every waiter that arrives after this line.
+                self.notify.notify_waiters();
+                true
+            }
+            Err(_) => false,
+        }
     }
 }
 
@@ -131,14 +191,19 @@ impl Cancels {
     }
 
     /// Trip the live token for `deploy_id`, unless its run already committed
-    /// (it activated a generation: nothing is left to stop).
+    /// (it started activating: nothing is left to stop).
     pub fn cancel(&self, deploy_id: &str) -> CancelOutcome {
         let token = self.guard_map().get(deploy_id).cloned();
         match token {
             Some(token) if token.is_committed() => CancelOutcome::Committed,
             Some(token) => {
-                token.trip();
-                CancelOutcome::Signalled
+                // `trip` loses to a commit that landed between the read above
+                // and this line; the caller must still answer 409 then.
+                if token.trip() || token.is_cancelled() {
+                    CancelOutcome::Signalled
+                } else {
+                    CancelOutcome::Committed
+                }
             }
             None => CancelOutcome::Missing,
         }
@@ -177,4 +242,58 @@ pub fn current() -> Option<CancelHandle> {
 /// Run `fut` as part of `token`'s deploy.
 pub async fn with<T>(token: CancelHandle, fut: impl Future<Output = T>) -> T {
     CURRENT.scope(token, fut).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The race the old two-flag token lost: a stop arriving between the last
+    /// cancel check and `commit_cancel` tripped the flag, the run committed
+    /// anyway (the flags were independent), activated the generation and then
+    /// failed the row — while the stop had already answered 200. A stop and a
+    /// commit can now never both win, so 200 always means "nothing
+    /// activates".
+    #[test]
+    fn a_stop_and_a_commit_cannot_both_win() {
+        let stopped_first = Cancel::new();
+        assert!(stopped_first.trip(), "the first stop trips a live run");
+        assert!(
+            !stopped_first.commit(),
+            "a stopped run must refuse the commit, so it cannot activate"
+        );
+        assert!(stopped_first.is_cancelled());
+        assert!(!stopped_first.is_committed());
+
+        let committed_first = Cancel::new();
+        assert!(committed_first.commit(), "activation commits a live run");
+        assert!(
+            !committed_first.trip(),
+            "a committed run refuses the stop (the endpoint answers 409)"
+        );
+        assert!(committed_first.is_committed());
+        assert!(
+            !committed_first.is_cancelled(),
+            "every later cancel check stays satisfied past the point of no return"
+        );
+    }
+
+    /// Repeated stops are idempotent, and a released token stops being a
+    /// stop target (the endpoint answers from the row instead).
+    #[test]
+    fn repeated_stops_are_idempotent_and_release_ends_the_token() {
+        let cancels = Cancels::default();
+        let token = cancels.register("d1");
+        assert_eq!(cancels.cancel("d1"), CancelOutcome::Signalled);
+        assert_eq!(cancels.cancel("d1"), CancelOutcome::Signalled);
+        assert!(token.is_cancelled());
+
+        assert!(!token.commit(), "a stopped run cannot commit afterwards");
+        cancels.release("d1");
+        assert_eq!(cancels.cancel("d1"), CancelOutcome::Missing);
+
+        let committed = cancels.register("d2");
+        assert!(committed.commit());
+        assert_eq!(cancels.cancel("d2"), CancelOutcome::Committed);
+    }
 }

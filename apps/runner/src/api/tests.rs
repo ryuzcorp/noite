@@ -487,9 +487,16 @@ async fn domains_roles_hold_on_both_transports() {
 async fn pending_domains_mint_no_certificates() {
     let h = Harness::new().await;
     let app = h.seed_app("tls-app").await;
-    crate::db::update_app_status(&h.state.pool, &app.id, "running", None, Some("abc"))
-        .await
-        .expect("deployed");
+    crate::db::write_app_status(
+        &h.state.pool,
+        &app.id,
+        crate::models::AppStatus::Running,
+        None,
+        Some("abc"),
+        crate::models::WriteGuard::Table,
+    )
+    .await
+    .expect("deployed");
     // A pending claim (what `domains.add` writes in `multi` tenancy) mints
     // no certificate, even on a deployed and running app.
     crate::db::add_domain(
@@ -847,7 +854,7 @@ async fn patch_rejects_unknown_keys_on_both_transports() {
         .await
         .expect("lookup")
         .expect("app");
-    assert_eq!(stored.desired_state, "running");
+    assert_eq!(stored.desired_state, crate::models::DesiredState::Running);
     h.finish().await;
 }
 
@@ -1161,12 +1168,13 @@ async fn a_watched_environment_deploy_waits_for_the_apps_other_deploy() {
         None,
         &app.id,
         Some(&env.id),
-        "building",
+        crate::models::DeployStatus::Building,
         Some("0123456789abcdef0123456789abcdef01234567"),
         "▸ queued\n",
     )
     .await
-    .expect("queued row");
+    .expect("queued row")
+    .id;
     // Production holds the app's lock.
     let prod_lock = crate::host::deploy::claim_owned(&h.state.deploying, &app.id)
         .await
@@ -1233,7 +1241,7 @@ async fn rollback_queues_behind_the_apps_in_flight_deploy() {
         None,
         &app.id,
         None,
-        "success",
+        crate::models::DeployStatus::Success,
         Some(sha),
         "deploy complete\n",
     )
@@ -1429,15 +1437,23 @@ async fn deploys_filter_by_environment() {
     )
     .await;
     let pool = &h.state.pool;
-    crate::db::upsert_deploy(pool, None, &app.id, None, "success", Some("aaa1111"), "")
-        .await
-        .expect("production deploy");
+    crate::db::upsert_deploy(
+        pool,
+        None,
+        &app.id,
+        None,
+        crate::models::DeployStatus::Success,
+        Some("aaa1111"),
+        "",
+    )
+    .await
+    .expect("production deploy");
     crate::db::upsert_deploy(
         pool,
         None,
         &app.id,
         Some(&env.id),
-        "success",
+        crate::models::DeployStatus::Success,
         Some("bbb2222"),
         "",
     )
@@ -1577,7 +1593,7 @@ async fn preview_refs_are_hidden_and_ref_routed() {
         &git_ref,
     )
     .await;
-    assert_eq!(env.kind, "workspace");
+    assert_eq!(env.kind, crate::models::EnvironmentKind::Workspace);
     // Routing: only the environment that tracks the ref is found.
     let found = crate::db::get_environment_by_ref(&h.state.pool, &app.id, &git_ref)
         .await
@@ -1742,16 +1758,29 @@ async fn the_state_stream_resends_the_app_and_its_environments_on_change() {
     assert_eq!(first["app"]["status"], json!(app.status));
     assert_eq!(first["environments"][0]["id"], json!(env.id));
 
-    crate::db::update_app_status(&h.state.pool, &app.id, "running", None, Some("abc123"))
-        .await
-        .expect("app status");
+    crate::db::write_app_status(
+        &h.state.pool,
+        &app.id,
+        crate::models::AppStatus::Running,
+        None,
+        Some("abc123"),
+        crate::models::WriteGuard::Table,
+    )
+    .await
+    .expect("app status");
     let deployed = frames.next_json().await;
     assert_eq!(deployed["app"]["status"], json!("running"));
     assert_eq!(deployed["app"]["lastDeploySha"], json!("abc123"));
 
-    crate::db::update_environment_status(&h.state.pool, &env.id, "failed", Some("boom"))
-        .await
-        .expect("environment status");
+    crate::db::write_environment_status(
+        &h.state.pool,
+        &env.id,
+        crate::models::AppStatus::Failed,
+        Some("boom"),
+        crate::models::WriteGuard::Table,
+    )
+    .await
+    .expect("environment status");
     let failed = frames.next_json().await;
     assert_eq!(failed["environments"][0]["status"], json!("failed"));
 
@@ -1791,5 +1820,70 @@ async fn limits_set_role_gate_holds_over_rpc() {
         .await
         .expect("limits.get needs no role");
     assert_eq!(got["clientRpm"], json!(30));
+    h.finish().await;
+}
+
+/// Retrying an import on an app that already deployed used to flip its badge
+/// to `importing` while its fleet kept serving. The retry gate is the status
+/// write itself now, and a deployed app answers 409 instead.
+#[tokio::test]
+async fn retry_import_refuses_an_app_that_is_already_deployed() {
+    let h = Harness::new().await;
+    let app = h.seed_app("retry-deployed").await;
+    let source = crate::models::AppSource::Git(crate::models::GitSource {
+        url: "https://github.com/example/repo".to_string(),
+        reference: None,
+        squash: true,
+        path: None,
+        actor: crate::host::git_identity::Actor {
+            user_id: "user_1".to_string(),
+            name: "User One".to_string(),
+        },
+    });
+    let stored = serde_json::to_string(&source).expect("source json");
+    crate::db::set_app_import_source(&h.state.pool, &app.id, Some(&stored))
+        .await
+        .expect("store source");
+    crate::db::write_app_status(
+        &h.state.pool,
+        &app.id,
+        crate::models::AppStatus::Running,
+        None,
+        Some("abc1234"),
+        crate::models::WriteGuard::Table,
+    )
+    .await
+    .expect("app deployed");
+
+    let (status, body) = h
+        .rest("POST", &format!("/v1/apps/{}/retry-import", app.id), None)
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body:?}");
+    let row = crate::db::get_app(&h.state.pool, &app.id)
+        .await
+        .expect("lookup")
+        .expect("app");
+    assert_eq!(
+        row.status,
+        crate::models::AppStatus::Running,
+        "the deployed app keeps its status"
+    );
+
+    // A failed import is exactly what Retry is for.
+    crate::db::write_app_status(
+        &h.state.pool,
+        &app.id,
+        crate::models::AppStatus::Failed,
+        Some("import failed"),
+        None,
+        crate::models::WriteGuard::Table,
+    )
+    .await
+    .expect("failed");
+    let (retried, body) = h
+        .rest("POST", &format!("/v1/apps/{}/retry-import", app.id), None)
+        .await;
+    assert_eq!(retried, StatusCode::OK, "{body:?}");
+    assert_eq!(body["status"], json!("importing"));
     h.finish().await;
 }

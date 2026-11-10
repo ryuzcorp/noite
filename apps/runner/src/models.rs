@@ -7,11 +7,24 @@ use uuid::Uuid;
 use crate::host::git_identity::Actor;
 
 /// Operator intent: only running|stopped. Removal is hard DELETE, not a state.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// ```mermaid
+/// stateDiagram-v2
+///   [*] --> Running: app created
+///   Running --> Stopped: PATCH desiredState=stopped
+///   Stopped --> Running: PATCH desiredState=running
+/// ```
+///
+/// Intent is the *only* thing an operator writes; the observed status
+/// ([`AppStatus`]) follows it a tick later, and every observed write made on
+/// behalf of a deploy/wake/confirm requires `desired_state='running'`, so a
+/// stop always wins the race.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type, TS)]
+#[serde(rename_all = "lowercase")]
+#[sqlx(rename_all = "lowercase")]
+#[ts(export)]
 pub enum DesiredState {
-    #[serde(rename = "running")]
     Running,
-    #[serde(rename = "stopped")]
     Stopped,
 }
 
@@ -32,59 +45,157 @@ impl DesiredState {
     }
 }
 
-/// Observed app status written by deploy / reconcile.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// Observed status of one app — or one preview environment — as deploy,
+/// import, sleep and the reconcile loop record it (`app.status`,
+/// `environment.status`).
+///
+/// ```mermaid
+/// stateDiagram-v2
+///   [*] --> Pending: row inserted without a status (schema default)
+///   [*] --> Provisioned: app/environment created
+///   Pending --> Provisioned: first deploy prepares it
+///   Provisioned --> Importing: source create / retry
+///   Importing --> Provisioned: import finished
+///   Importing --> Error: import failed
+///   Error --> Importing: retry
+///   Importing --> Building: a push raced the import
+///   Provisioned --> Building: deploy starts
+///   Running --> Building: redeploy starts
+///   Sleeping --> Building: redeploy wakes it
+///   Stopped --> Building: a deploy runs while stopped (status kept by the guard)
+///   Failed --> Building: retry deploy
+///   Building --> Deploying: stage/activate
+///   Deploying --> Running: health gate confirmed / deploy live
+///   Building --> Running: confirmed without a stage
+///   Running --> Sleeping: scale to zero
+///   Sleeping --> Running: woken + confirmed
+///   Running --> Stopped: operator stop (next reconcile tick)
+///   Sleeping --> Stopped: operator stop
+///   Building --> Failed: deploy failed / stalled
+///   Deploying --> Failed: deploy failed / stalled
+///   Running --> Failed: deploy failed over a serving app
+///   Failed --> Running: later deploy succeeded
+/// ```
+///
+/// Every write goes through `db::write_app_status` (or
+/// `db::write_environment_status`), which refuses a transition the table
+/// below does not allow and reports it; nothing writes the column directly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type, TS)]
+#[serde(rename_all = "lowercase")]
+#[sqlx(rename_all = "lowercase")]
+#[ts(export)]
 pub enum AppStatus {
-    #[serde(rename = "provisioned")]
+    /// The schema default (`app.status DEFAULT 'pending'`): a row that was
+    /// inserted without an observed status. A preview environment is created
+    /// this way and stays `pending` until its first deploy.
+    Pending,
+    /// Created, never deployed (and never imported).
     Provisioned,
-    #[serde(rename = "building")]
+    /// A background GitHub/template import is running (A2); flips to
+    /// `provisioned` (then the deploy pipeline takes over) or `error`.
+    Importing,
+    /// The import failed; `last_error` says why. Retry moves it back to
+    /// `importing`.
+    Error,
     Building,
-    #[serde(rename = "deploying")]
     Deploying,
-    #[serde(rename = "running")]
     Running,
-    #[serde(rename = "stopped")]
-    Stopped,
-    #[serde(rename = "failed")]
-    Failed,
     /// Deployed and desired running, but its fleet is stopped until the next
     /// request (SPEC, Scale to zero).
-    #[serde(rename = "sleeping")]
     Sleeping,
-    /// A background GitHub/template import is still running (A2); flips to
-    /// `provisioned` (then the deploy pipeline takes over) or `error`.
-    #[serde(rename = "importing")]
-    Importing,
+    Stopped,
+    Failed,
 }
+
+/// Every status, for the transition tables whose target accepts any
+/// predecessor (`stopped` and `failed` are reachable from any observed state).
+const EVERY_APP_STATUS: &[AppStatus] = &[
+    AppStatus::Pending,
+    AppStatus::Provisioned,
+    AppStatus::Importing,
+    AppStatus::Error,
+    AppStatus::Building,
+    AppStatus::Deploying,
+    AppStatus::Running,
+    AppStatus::Sleeping,
+    AppStatus::Stopped,
+    AppStatus::Failed,
+];
 
 impl AppStatus {
     pub fn as_str(self) -> &'static str {
         match self {
+            Self::Pending => "pending",
             Self::Provisioned => "provisioned",
+            Self::Importing => "importing",
+            Self::Error => "error",
             Self::Building => "building",
             Self::Deploying => "deploying",
             Self::Running => "running",
+            Self::Sleeping => "sleeping",
             Self::Stopped => "stopped",
             Self::Failed => "failed",
-            Self::Sleeping => "sleeping",
-            Self::Importing => "importing",
+        }
+    }
+
+    /// The states a row may hold immediately before it is written as `self`:
+    /// the one transition table for the app/environment machine. A state is
+    /// always its own predecessor, because a writer that re-states the
+    /// current status (a log line, a repeated summary) must apply.
+    pub fn predecessors(self) -> &'static [AppStatus] {
+        match self {
+            Self::Pending => &[Self::Pending],
+            Self::Provisioned => &[Self::Pending, Self::Provisioned, Self::Importing],
+            Self::Importing => &[
+                Self::Pending,
+                Self::Provisioned,
+                Self::Importing,
+                Self::Error,
+                Self::Stopped,
+                Self::Failed,
+            ],
+            Self::Error => &[Self::Importing, Self::Error],
+            Self::Building => &[
+                Self::Pending,
+                Self::Provisioned,
+                Self::Importing,
+                Self::Building,
+                Self::Deploying,
+                Self::Running,
+                Self::Sleeping,
+                Self::Stopped,
+                Self::Failed,
+            ],
+            Self::Deploying => &[Self::Pending, Self::Building, Self::Deploying],
+            Self::Running => &[
+                Self::Pending,
+                Self::Provisioned,
+                Self::Importing,
+                Self::Building,
+                Self::Deploying,
+                Self::Running,
+                Self::Sleeping,
+                Self::Stopped,
+                Self::Failed,
+            ],
+            Self::Sleeping => &[Self::Running, Self::Sleeping],
+            Self::Stopped => EVERY_APP_STATUS,
+            Self::Failed => EVERY_APP_STATUS,
         }
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type, TS)]
+#[serde(rename_all = "lowercase")]
+#[sqlx(rename_all = "lowercase")]
+#[ts(export)]
 pub enum DeployStatus {
     /// Obliged to run and waiting for the app's in-flight deploy to release
     /// the claim (`claim_wait`); the pipeline's first step moves it on.
-    #[serde(rename = "queued")]
     Queued,
-    #[serde(rename = "building")]
     Building,
-    #[serde(rename = "deploying")]
     Deploying,
-    #[serde(rename = "success")]
     Success,
-    #[serde(rename = "failed")]
     Failed,
 }
 
@@ -103,15 +214,83 @@ impl DeployStatus {
         matches!(self, Self::Queued | Self::Building | Self::Deploying)
     }
 
-    pub fn parse(s: &str) -> Option<Self> {
-        match s {
-            "queued" => Some(Self::Queued),
-            "building" => Some(Self::Building),
-            "deploying" => Some(Self::Deploying),
-            "success" => Some(Self::Success),
-            "failed" => Some(Self::Failed),
-            _ => None,
+    /// The states a row may hold immediately before it is written as `self`:
+    /// the one transition table for `db::deploys::upsert_deploy`. A terminal
+    /// row (`success`, `failed`) is its own predecessor only, so a stopped,
+    /// failed or succeeded deploy can never be moved again — the late writer
+    /// is refused instead of rewriting history.
+    pub fn predecessors(self) -> &'static [DeployStatus] {
+        match self {
+            Self::Queued => &[Self::Queued],
+            Self::Building => &[Self::Queued, Self::Building],
+            Self::Deploying => &[Self::Queued, Self::Building, Self::Deploying],
+            Self::Success => &[Self::Building, Self::Deploying, Self::Success],
+            Self::Failed => &[Self::Queued, Self::Building, Self::Deploying, Self::Failed],
         }
+    }
+}
+
+/// What a status write is allowed to apply to, on top of the transition
+/// table ([`AppStatus::predecessors`]). The single extra condition per write
+/// site, made a value instead of a flag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WriteGuard {
+    /// Only the table constrains the write.
+    Table,
+    /// The table, and only from these states: `finish_app_import` may only
+    /// move a row that still reads `importing`.
+    From(&'static [AppStatus]),
+    /// The table, and only while the target still wants to run
+    /// (`desired_state = 'running'`): a stop (or delete) racing a deploy, a
+    /// wake or a confirm always wins the write.
+    Wanted,
+}
+
+/// A persisted status vocabulary: what the SQL writers need to render a
+/// `status IN (…)` list from a transition table without a `String` in sight.
+pub trait PersistedStatus: Copy {
+    fn as_str(self) -> &'static str;
+}
+
+impl PersistedStatus for AppStatus {
+    fn as_str(self) -> &'static str {
+        AppStatus::as_str(self)
+    }
+}
+
+impl PersistedStatus for DeployStatus {
+    fn as_str(self) -> &'static str {
+        DeployStatus::as_str(self)
+    }
+}
+
+/// What one guarded write of `app.status` / `environment.status` did.
+/// `Refused` carries the row's status at read-back, so a caller can tell
+/// "another writer closed the row" from "the stop guard held".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatusWrite {
+    Applied,
+    Refused { current: AppStatus },
+}
+
+impl StatusWrite {
+    pub fn is_applied(self) -> bool {
+        matches!(self, Self::Applied)
+    }
+}
+
+/// What one guarded write of a `deploy.status` row did (see
+/// [`DeployStatus::predecessors`]): a terminal row refuses every later write,
+/// so a stopped, failed or succeeded deploy can never be moved again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeployWrite {
+    Applied,
+    Refused { current: DeployStatus },
+}
+
+impl DeployWrite {
+    pub fn is_applied(self) -> bool {
+        matches!(self, Self::Applied)
     }
 }
 
@@ -123,7 +302,7 @@ pub struct App {
     pub slug: String,
     pub name: String,
     pub user_id: String,
-    pub status: String,
+    pub status: AppStatus,
     pub subdomain: String,
     pub git_prefix: String,
     pub fleet_bucket: String,
@@ -131,7 +310,7 @@ pub struct App {
     pub internal_port: Option<i64>,
     pub last_deploy_sha: Option<String>,
     pub last_error: Option<String>,
-    pub desired_state: String,
+    pub desired_state: DesiredState,
     pub created_at: String,
     pub updated_at: String,
     /// Set while the app is asleep (scale to zero); NULL when awake.
@@ -154,7 +333,7 @@ pub struct App {
 
 impl App {
     pub fn desired(&self) -> DesiredState {
-        DesiredState::parse(&self.desired_state).unwrap_or(DesiredState::Running)
+        self.desired_state
     }
 
     pub fn is_stopped(&self) -> bool {
@@ -167,7 +346,7 @@ impl App {
     }
 
     pub fn is_deployed(&self) -> bool {
-        self.status == AppStatus::Running.as_str() || self.last_deploy_sha.is_some()
+        self.status == AppStatus::Running || self.last_deploy_sha.is_some()
     }
 }
 
@@ -180,15 +359,73 @@ pub struct Deploy {
     /// The preview environment this deploy targets; `None` is production.
     pub environment_id: Option<String>,
     pub sha: Option<String>,
-    pub status: String,
+    pub status: DeployStatus,
     pub log: String,
     pub created_at: String,
     pub updated_at: String,
 }
 
-impl Deploy {
-    pub fn status_enum(&self) -> Option<DeployStatus> {
-        DeployStatus::parse(&self.status)
+/// Who wrote one `app_env` / `environment_env` row: the operator, or one of
+/// the runner's provisioning paths. Stored as today's strings — `''` for a
+/// user row, else the marker — so nothing on the wire or in the database
+/// changes.
+///
+/// ```mermaid
+/// stateDiagram-v2
+///   [*] --> User: operator saves a variable
+///   [*] --> AuthDefault: deploy mints BETTER_AUTH_SECRET
+///   [*] --> VoidProxyToken: deploy mints __VOID_PROXY_TOKEN
+///   [*] --> VoidSandboxAdmission: deploy mints the admission name
+///   AuthDefault --> User: operator saves the same name
+///   VoidProxyToken --> User: operator saves the same name
+///   VoidSandboxAdmission --> User: operator saves the same name
+///   User --> AuthDefault: a provisioner overwrites (rotation)
+/// ```
+///
+/// A value outside this set cannot be decoded: a hand-edited marker fails
+/// loudly at read instead of silently routing a secret through the wrong
+/// merge (the bug this type closes).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type, TS)]
+#[sqlx(rename_all = "kebab-case")]
+#[ts(export)]
+pub enum EnvSource {
+    /// Operator-written (`''`).
+    #[serde(rename = "")]
+    #[sqlx(rename = "")]
+    User,
+    /// The auto-provisioned `BETTER_AUTH_SECRET`.
+    #[serde(rename = "auth-default")]
+    AuthDefault,
+    /// The per-fleet `__VOID_PROXY_TOKEN` (runner-owned merge only).
+    #[serde(rename = "void-proxy-token")]
+    VoidProxyToken,
+    /// The per-fleet `__VOID_SANDBOX_ADMISSION_NAME` (controller render only).
+    #[serde(rename = "void-sandbox-admission")]
+    VoidSandboxAdmission,
+}
+
+impl EnvSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::User => "",
+            Self::AuthDefault => "auth-default",
+            Self::VoidProxyToken => "void-proxy-token",
+            Self::VoidSandboxAdmission => "void-sandbox-admission",
+        }
+    }
+
+    /// Written by the runner, not by the operator: no settings merge may
+    /// hand it to a tenant.
+    pub fn is_provisioned(self) -> bool {
+        self != Self::User
+    }
+
+    /// Consumed by one runner-owned merge (the proxy token and the sandbox
+    /// admission name), never by the ordinary settings merges: their names
+    /// are reserved there. The auth secret is *not* in this set — it is an
+    /// ordinary Worker var under an allowed name.
+    pub fn is_runner_owned(self) -> bool {
+        matches!(self, Self::VoidProxyToken | Self::VoidSandboxAdmission)
     }
 }
 
@@ -200,16 +437,16 @@ pub struct AppEnv {
     pub name: String,
     pub value: String,
     pub updated_at: String,
-    /// Who wrote the row: `''` for a user setting, else the runner's
-    /// provision marker (`auth-default`, `void-proxy-token`). Served like the
-    /// rest of the row; the deploy merges read it, the UI ignores it.
-    pub source: String,
+    /// Who wrote the row ([`EnvSource`]). Served like the rest of the row;
+    /// the deploy merges read it, the UI ignores it.
+    pub source: EnvSource,
 }
 
 /// What an environment was created from (ROADMAP): a pushed branch, or a
 /// workspace preview of uncommitted Code mode changes (a hidden ref).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type, TS)]
 #[serde(rename_all = "lowercase")]
+#[sqlx(rename_all = "lowercase")]
 #[ts(export)]
 pub enum EnvironmentKind {
     Branch,
@@ -236,16 +473,17 @@ pub struct Environment {
     pub app_id: String,
     pub label: String,
     /// `EnvironmentKind` as stored: `branch` or `workspace`.
-    pub kind: String,
+    pub kind: EnvironmentKind,
     /// `refs/heads/<branch>` or `refs/previews/<userId>/<branch>`.
     pub git_ref: String,
     pub created_by: String,
     pub fleet_bucket: String,
     pub listen_port: Option<i64>,
     pub internal_port: Option<i64>,
-    /// Observed status, as `AppStatus` strings.
-    pub status: String,
-    pub desired_state: String,
+    /// Observed status, the same machine as an app's ([`AppStatus`]); a new
+    /// environment starts `pending` until its first deploy.
+    pub status: AppStatus,
+    pub desired_state: DesiredState,
     pub asleep_since: Option<String>,
     pub woke_at: Option<String>,
     pub last_deploy_sha: Option<String>,
@@ -273,7 +511,7 @@ pub struct AppStateFrame {
 
 impl Environment {
     pub fn desired(&self) -> DesiredState {
-        DesiredState::parse(&self.desired_state).unwrap_or(DesiredState::Running)
+        self.desired_state
     }
 
     pub fn is_stopped(&self) -> bool {
@@ -286,7 +524,7 @@ impl Environment {
     }
 
     pub fn is_deployed(&self) -> bool {
-        self.status == AppStatus::Running.as_str() || self.last_deploy_sha.is_some()
+        self.status == AppStatus::Running || self.last_deploy_sha.is_some()
     }
 }
 

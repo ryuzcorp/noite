@@ -60,6 +60,7 @@ use sqlx::SqlitePool;
 
 use crate::db;
 use crate::host::build_output::BuiltRoot;
+use crate::models::EnvSource;
 
 /// The runner-owned proxy Worker script, one per Void fleet (proxy slice).
 /// A tenant config using it as its script `name` would alias the proxy's
@@ -159,7 +160,7 @@ pub async fn ensure_auth_secret(
                 app_id,
                 AUTH_SECRET_NAME,
                 &mint_auth_secret(),
-                db::SOURCE_AUTH_DEFAULT,
+                EnvSource::AuthDefault,
             )
             .await?;
             Ok(inserted)
@@ -175,7 +176,7 @@ pub async fn ensure_auth_secret(
             // inheritance; only the auto-provisioned app row is per-fleet, so
             // only then does the preview mint its own override.
             if let Some(row) = db::get_env(pool, app_id, AUTH_SECRET_NAME).await? {
-                if row.source != db::SOURCE_AUTH_DEFAULT {
+                if row.source != EnvSource::AuthDefault {
                     return Ok(false);
                 }
             }
@@ -184,7 +185,7 @@ pub async fn ensure_auth_secret(
                 env_id,
                 AUTH_SECRET_NAME,
                 &mint_auth_secret(),
-                db::SOURCE_AUTH_DEFAULT,
+                EnvSource::AuthDefault,
             )
             .await?;
             Ok(inserted)
@@ -197,7 +198,7 @@ pub async fn ensure_auth_secret(
 /// post-mint re-read, so a row that lands in between is refused rather than
 /// returned as the token.
 fn check_token_row(row: &crate::models::AppEnv, settings_label: &str) -> anyhow::Result<()> {
-    if row.source != db::SOURCE_VOID_PROXY_TOKEN {
+    if row.source != EnvSource::VoidProxyToken {
         anyhow::bail!(
             "settings variable `{}` is reserved for the platform and cannot become a Worker var (rename it or remove it from {})",
             PROXY_TOKEN_VAR,
@@ -230,7 +231,7 @@ pub async fn ensure_proxy_token(
                 app_id,
                 PROXY_TOKEN_VAR,
                 &token,
-                db::SOURCE_VOID_PROXY_TOKEN,
+                EnvSource::VoidProxyToken,
             )
             .await?;
             let row = db::get_env(pool, app_id, PROXY_TOKEN_VAR)
@@ -251,7 +252,7 @@ pub async fn ensure_proxy_token(
                 env_id,
                 PROXY_TOKEN_VAR,
                 &token,
-                db::SOURCE_VOID_PROXY_TOKEN,
+                EnvSource::VoidProxyToken,
             )
             .await?;
             let row = db::get_env_override(pool, env_id, PROXY_TOKEN_VAR)
@@ -283,7 +284,7 @@ pub async fn rotate_proxy_token(
                 app_id,
                 PROXY_TOKEN_VAR,
                 &token,
-                db::SOURCE_VOID_PROXY_TOKEN,
+                EnvSource::VoidProxyToken,
             )
             .await?;
         }
@@ -293,7 +294,7 @@ pub async fn rotate_proxy_token(
                 env_id,
                 PROXY_TOKEN_VAR,
                 &token,
-                db::SOURCE_VOID_PROXY_TOKEN,
+                EnvSource::VoidProxyToken,
             )
             .await?;
         }
@@ -990,7 +991,7 @@ mod tests {
                 .unwrap()
                 .unwrap()
                 .source,
-            db::SOURCE_VOID_PROXY_TOKEN
+            EnvSource::VoidProxyToken
         );
         assert_eq!(
             db::get_env_override(&pool, &env.id, PROXY_TOKEN_VAR)
@@ -998,7 +999,7 @@ mod tests {
                 .unwrap()
                 .unwrap()
                 .source,
-            db::SOURCE_VOID_PROXY_TOKEN
+            EnvSource::VoidProxyToken
         );
     }
 
@@ -1039,7 +1040,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_ne!(rotated.value, before);
-        assert_eq!(rotated.source, db::SOURCE_VOID_PROXY_TOKEN);
+        assert_eq!(rotated.source, EnvSource::VoidProxyToken);
         let (again, minted) = ensure_proxy_token(&pool, &app.id, None).await.unwrap();
         assert!(!minted);
         assert_eq!(again, rotated.value);
@@ -1056,7 +1057,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_ne!(preview_rotated.value, preview_before);
-        assert_eq!(preview_rotated.source, db::SOURCE_VOID_PROXY_TOKEN);
+        assert_eq!(preview_rotated.source, EnvSource::VoidProxyToken);
         let (again, minted) = ensure_proxy_token(&pool, &app.id, Some(&env.id))
             .await
             .unwrap();
@@ -1117,7 +1118,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(prod.source, db::SOURCE_AUTH_DEFAULT);
+        assert_eq!(prod.source, EnvSource::AuthDefault);
         assert!(!ensure_auth_secret(&pool, &app.id, None).await.unwrap());
 
         // The preview mints its own override — distinct from production's —
@@ -1129,7 +1130,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(preview.source, db::SOURCE_AUTH_DEFAULT);
+        assert_eq!(preview.source, EnvSource::AuthDefault);
         assert_ne!(preview.value, prod.value);
         assert!(!ensure_auth_secret(&pool, &app.id, Some(&env.id))
             .await
@@ -1187,7 +1188,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(row.value, "mine");
-        assert_eq!(row.source, "");
+        assert_eq!(row.source, EnvSource::User);
 
         // A user override wins for its preview, without touching the app.
         let pool = crate::db::connect("sqlite::memory:").await.expect("boot");
@@ -1283,12 +1284,12 @@ mod tests {
             name: PROXY_TOKEN_VAR.to_string(),
             value: "spoof".to_string(),
             updated_at: "now".to_string(),
-            source: String::new(),
+            source: EnvSource::User,
         };
         let err = check_token_row(&user, "Settings → Environment").unwrap_err();
         assert!(format!("{:#}", err).contains(PROXY_TOKEN_VAR));
         let own = crate::models::AppEnv {
-            source: db::SOURCE_VOID_PROXY_TOKEN.to_string(),
+            source: EnvSource::VoidProxyToken,
             ..user
         };
         assert!(check_token_row(&own, "Settings → Environment").is_ok());
