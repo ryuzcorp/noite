@@ -1,6 +1,8 @@
 import { expect, test } from "@playwright/test";
 import type { Page } from "@playwright/test";
 
+import { withInviteLock } from "./helpers";
+
 // The control plane as an app: the e2e account is the first account, so it
 // bootstrapped as admin. Its Noite card opens the admin home, whose Overview
 // lists the control D1; that opens the full table editor backed by the
@@ -65,7 +67,9 @@ test("an admin browses the control D1 and edits a permitted row", async ({
   await page.keyboard.press("Escape");
 
   // A permitted write: insert an invite through the row editor, then rewrite
-  // its note from the grid.
+  // its note from the grid. The insert holds the invite lock: admin.spec
+  // diffs the invite list around its mint, and a row landing inside that
+  // window would read as one of its minted codes.
   await nav.getByRole("button", { name: /^invite\b/u }).click();
   await page.getByRole("button", { name: "Insert" }).click();
   await expect(
@@ -74,8 +78,10 @@ test("an admin browses the control D1 and edits a permitted row", async ({
   await page.locator("#d1-field-invite-code").fill("E2E-CONTROL-1");
   await page.locator("#d1-field-invite-createdBy").fill("e2e");
   await page.locator("#d1-field-invite-note").fill("e2e note");
-  await page.getByRole("button", { name: "Save" }).click();
-  await expect(page.getByText("Row created")).toBeVisible();
+  await withInviteLock(async () => {
+    await page.getByRole("button", { name: "Save" }).click();
+    await expect(page.getByText("Row created")).toBeVisible();
+  });
   await expect(page.getByRole("cell", { name: "E2E-CONTROL-1" })).toBeVisible();
 
   const row = page.locator("tbody tr", { hasText: "E2E-CONTROL-1" });
