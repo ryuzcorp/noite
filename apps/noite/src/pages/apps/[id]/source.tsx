@@ -423,9 +423,9 @@ const SourceBody = ({ appId }: { appId: string }) => {
   const browser = atom<SourceBrowserState>({
     conflicts: [],
     files: [],
-    previewError: "",
+    previewError: null,
     previewed: null,
-    pushError: "",
+    pushError: null,
     pushed: null,
     pushing: false,
     readOnly: "",

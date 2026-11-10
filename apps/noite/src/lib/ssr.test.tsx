@@ -31,9 +31,9 @@ const PreviewProbe = () => (
     state={atom<SourceBrowserState>({
       conflicts: [],
       files: [],
-      previewError: "",
+      previewError: null,
       previewed: null,
-      pushError: "",
+      pushError: null,
       pushed: null,
       pushing: false,
       readOnly: "",

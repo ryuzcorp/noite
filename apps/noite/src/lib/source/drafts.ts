@@ -5,7 +5,7 @@
 
 import type { PreviewResult } from "../runner";
 import type { StaleBase } from "./stale-base";
-import type { WorkspaceChange } from "./workspace/types";
+import type { WorkspaceChange, WorkspaceErrorCode } from "./workspace/types";
 
 /** Why the browsed checkout is read-only: `""` when it is editable, else
  * `tag`/`commit` (a tag or a raw commit sha — the runner can only commit to a
@@ -25,6 +25,14 @@ export interface PreviewedSnapshot {
   fingerprint: string;
 }
 
+/** One failed push or preview: the reason to show, plus the workspace refusal
+ * `code` when the pod named one. A runner HTTP refusal carries text only, so
+ * `code` is null there and its message is what the pane reads. */
+export interface OperationFailure {
+  readonly code: WorkspaceErrorCode | null;
+  readonly message: string;
+}
+
 /** Change/push state reported to the page (the Changes panel renders it). */
 export interface SourceBrowserState {
   /** The paths another tab changed under this one's feet that this tab also
@@ -32,17 +40,17 @@ export interface SourceBrowserState {
   conflicts: readonly string[];
   /** The workspace's changes, as of the last derive. */
   files: readonly WorkspaceChange[];
-  /** Why the last Deploy preview failed ("" = the last one, if any, landed).
-   * Its own field: a preview is not a push, so its failure never renders as
-   * one. */
-  previewError: string;
+  /** Why the last Deploy preview failed (null = the last one, if any,
+   * landed). Its own field: a preview is not a push, so its failure never
+   * renders as one. */
+  previewError: OperationFailure | null;
   /** What this browser last deployed as a preview, or null when it has not
    * deployed one: the Preview panel compares its fingerprint with the
    * checkout's current one to tell whether the framed snapshot holds every
    * edit. */
   previewed: PreviewedSnapshot | null;
-  /** Why the last push failed ("" = it did not): the Changes form's line. */
-  pushError: string;
+  /** Why the last push failed (null = it did not): the Changes form's line. */
+  pushError: OperationFailure | null;
   pushed: PushedTo | null;
   pushing: boolean;
   /** Why the installed checkout cannot be edited (see `ReadOnlyRef`). */

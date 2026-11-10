@@ -21,6 +21,7 @@ import {
 } from "./commit-target";
 import type { CommitChoice } from "./commit-target";
 import type { CommitDrafts, PushRequest, SourceBrowserState } from "./drafts";
+import { pushErrorCopy, READ_ONLY_PUSH } from "./failure-copy";
 import {
   rowBadge,
   rowBytes,
@@ -99,54 +100,6 @@ const defaultMessage = (state: SourceBrowserState): string => {
     : `Update ${files.length} files`;
 };
 
-/** Why the checkout cannot be edited, and what to do about it. */
-const READ_ONLY_NOTICE: Record<
-  Exclude<SourceBrowserState["readOnly"], "">,
-  string
-> = {
-  commit:
-    "Read-only: this is a single commit, not a branch. Switch to a branch to edit files.",
-  role: "Read-only: your role on this app can't push. Ask an admin for the push role to edit files.",
-  tag: "Read-only: this is a tag, not a branch. Switch to a branch to edit files.",
-};
-
-/** A push error as the user reads it: known runner and workspace refusals get
- * copy that says what to do; anything else keeps its own words. */
-const pushErrorCopy = (
-  raw: string,
-  readOnly: SourceBrowserState["readOnly"]
-): string => {
-  const lower = raw.toLowerCase();
-
-  if (lower.includes("read-only")) {
-    return readOnly === ""
-      ? "This checkout is read-only, so nothing was pushed."
-      : READ_ONLY_NOTICE[readOnly];
-  }
-
-  if (lower.includes("protected")) {
-    return "That branch is protected. Push to a new branch and open a pull request instead.";
-  }
-
-  if (lower.includes("tip moved")) {
-    return "The branch moved while you were editing. Refresh the page to see the new commits, then push again.";
-  }
-
-  if (lower.includes("invalid branch")) {
-    return "That branch name is not valid.";
-  }
-
-  if (lower.includes("branch") && lower.includes("exists")) {
-    return "A branch with that name already exists.";
-  }
-
-  if (lower.includes("failed to fetch") || lower.includes("network")) {
-    return "Could not reach the server. Check your connection and try again.";
-  }
-
-  return raw;
-};
-
 /** The outcome line under the form: the error, or where the push landed
  * (with the pull-request shortcut after a push to a new branch). */
 const PushOutcome = ({
@@ -160,7 +113,7 @@ const PushOutcome = ({
   state: SourceBrowserState;
   title: string;
 }) => {
-  if (state.pushError !== "") {
+  if (state.pushError !== null) {
     return (
       <p class="text-error m-0 text-xs" role="alert">
         {pushErrorCopy(state.pushError, state.readOnly)}
@@ -605,7 +558,7 @@ export const ChangesPanel = ({
                 <span class="font-mono">{branch}</span> show up here.
               </>
             ) : (
-              READ_ONLY_NOTICE[readOnly]
+              READ_ONLY_PUSH[readOnly]
             )}
           </p>
         ) : (
@@ -628,7 +581,7 @@ export const ChangesPanel = ({
                 role="status"
               >
                 These changes were made outside the editor and can't be pushed
-                here. {READ_ONLY_NOTICE[readOnly]}
+                here. {READ_ONLY_PUSH[readOnly]}
               </p>
             )}
             {diffed.length === 0 ? null : (

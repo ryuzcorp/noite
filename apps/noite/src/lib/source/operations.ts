@@ -7,10 +7,10 @@
 //!   [*] --> Idle
 //!   Idle --> Pushing: start (refused while Pushing)
 //!   Pushing --> Done: succeeded{to}
-//!   Pushing --> Failed: rejected{message}
+//!   Pushing --> Failed: rejected{failure}
 //!   Idle --> Running: start (refused while Running)
 //!   Running --> Done: succeeded{snapshot}
-//!   Running --> Failed: rejected{message}
+//!   Running --> Failed: rejected{failure}
 //!   Done --> Idle: reset (a change landed)
 //!   Failed --> Idle: reset / start
 //! ```
@@ -20,12 +20,14 @@
 
 import { Data } from "effect";
 
-import type { PreviewedSnapshot, PushedTo } from "./drafts";
+import { errorMessage } from "../errors";
+import type { OperationFailure, PreviewedSnapshot, PushedTo } from "./drafts";
+import { workspaceErrorCodeOf } from "./workspace/types";
 
 /** One push, from the button to the outcome line. */
 export type PushOperation = Data.TaggedEnum<{
   Done: { to: PushedTo };
-  Failed: { message: string };
+  Failed: { failure: OperationFailure };
   Idle: Record<never, never>;
   Pushing: Record<never, never>;
 }>;
@@ -35,7 +37,7 @@ export const PushOps = Data.taggedEnum<PushOperation>();
 /** One deploy preview, from the button to the panel's notice. */
 export type PreviewOperation = Data.TaggedEnum<{
   Done: { snapshot: PreviewedSnapshot };
-  Failed: { message: string };
+  Failed: { failure: OperationFailure };
   Idle: Record<never, never>;
   Running: Record<never, never>;
 }>;
@@ -44,13 +46,21 @@ export const PreviewOps = Data.taggedEnum<PreviewOperation>();
 
 /** One operation's outcome: what it produced, or why it failed. */
 export type PushOutcome =
-  | { readonly message: string; readonly ok: false }
+  | { readonly failure: OperationFailure; readonly ok: false }
   | { readonly ok: true; readonly to: PushedTo };
 
 /** One preview's outcome. */
 export type PreviewOutcome =
-  | { readonly message: string; readonly ok: false }
+  | { readonly failure: OperationFailure; readonly ok: false }
   | { readonly ok: true; readonly snapshot: PreviewedSnapshot };
+
+/** A caught push/preview error as the state reports it: the pod's refusal
+ * code when it threw one, and the message either way. */
+// oxlint-disable-next-line anti-slop/no-unknown-parameters -- a catch value is unknown by construction; this is the one place it becomes a failure.
+export const operationFailure = (error: unknown): OperationFailure => ({
+  code: workspaceErrorCodeOf(error),
+  message: errorMessage(error),
+});
 
 /** Start a push; null when one is already in flight. */
 export const startPush = (state: PushOperation): PushOperation | null => {
@@ -74,7 +84,7 @@ export const settlePush = (
     return PushOps.Done({ to: outcome.to });
   }
 
-  return PushOps.Failed({ message: outcome.message });
+  return PushOps.Failed({ failure: outcome.failure });
 };
 
 /** Start a deploy preview; null when one is already running. */
@@ -101,7 +111,7 @@ export const settlePreview = (
     return PreviewOps.Done({ snapshot: outcome.snapshot });
   }
 
-  return PreviewOps.Failed({ message: outcome.message });
+  return PreviewOps.Failed({ failure: outcome.failure });
 };
 
 /** A change landed: whichever push outcome the Changes form is showing is
@@ -113,13 +123,13 @@ export const resetOperations = () => ({
 
 /** What the Changes panel reads of the push slot. */
 export const pushView = (state: PushOperation) => ({
-  pushError: state._tag === "Failed" ? state.message : "",
+  pushError: state._tag === "Failed" ? state.failure : null,
   pushed: state._tag === "Done" ? state.to : null,
   pushing: state._tag === "Pushing",
 });
 
 /** What the Preview panel reads of the preview slot. */
 export const previewView = (state: PreviewOperation) => ({
-  previewError: state._tag === "Failed" ? state.message : "",
+  previewError: state._tag === "Failed" ? state.failure : null,
   previewed: state._tag === "Done" ? state.snapshot : null,
 });
