@@ -29,6 +29,8 @@ import type { MenuTarget, Toaster, TreeMenu } from "./tree-menu";
 import { createTreeNaming } from "./tree-naming";
 import { createTreeRows } from "./tree-rows";
 import type { TreeRowStore } from "./tree-rows";
+import { askResync, finishResync, ResyncStates } from "./tree-sync";
+import type { ResyncState } from "./tree-sync";
 import { createTreeUploads } from "./tree-uploads";
 import type {
   ChangeKind,
@@ -152,28 +154,54 @@ export const createTreeWiring = (host: TreeHost): TreeWiring => {
   let menu: TreeMenu | null = null;
   const toaster: Toaster = newToaster();
 
+  /** Push the changes into the tree: the markers of the derive, plus the paths
+   * the checkout's rules exclude, which pierre paints dimmed beside them. A
+   * no-op while neither set moved, so typing never repaints the tree. */
+  let treeStatusKey = "";
+
+  const syncStatus = () => {
+    const entries = [...markers(host.changes()), ...ignored];
+    const key = statusKey(entries);
+
+    if (key === treeStatusKey) {
+      return;
+    }
+
+    treeStatusKey = key;
+    tree?.setGitStatus(entries);
+  };
+
   /** Whether pierre still holds a path (its store, not the visible rows). */
   const hasRow = (path: string): boolean =>
     tree !== undefined && tree.getItem(path) !== null;
 
-  /** Drop a row pierre still holds — removing an absent path throws. */
+  /** Drop a row pierre still holds — removing an absent path throws. The
+   * markers go with it: a row that left the tree must not leave its status
+   * behind in the store. */
   const dropRow = (path: string) => {
     if (hasRow(path)) {
       tree?.remove(path);
     }
 
     held.delete(path);
+    syncStatus();
+  };
+
+  /** Add a row to pierre's store, and mirror it only when pierre took it: a
+   * `held` entry without a row made `hasRow` and `filesUnder` disagree (a
+   * delete counted files the tree could not remove). */
+  const addRow = (path: string) => {
+    if (tree === undefined) {
+      return;
+    }
+
+    tree.add(path);
+    held.add(path);
+    syncStatus();
   };
 
   /** The live rows, as the row flows reach them (see `TreeRowStore`). */
-  const store: TreeRowStore = {
-    add: (path) => {
-      tree?.add(path);
-      held.add(path);
-    },
-    drop: dropRow,
-    has: hasRow,
-  };
+  const store: TreeRowStore = { add: addRow, drop: dropRow, has: hasRow };
 
   /** The change the workspace derived for `path`, when it has one. */
   const changeAt = (path: string): WorkspaceChange | undefined =>
@@ -201,23 +229,6 @@ export const createTreeWiring = (host: TreeHost): TreeWiring => {
    * repository, and nothing about it is ever pushed. */
   const ignoredPath = (path: string): boolean =>
     excluded.has(withoutSlash(path));
-
-  /** Push the changes into the tree: the markers of the derive, plus the paths
-   * the checkout's rules exclude, which pierre paints dimmed beside them. A
-   * no-op while neither set moved, so typing never repaints the tree. */
-  let treeStatusKey = "";
-
-  const syncStatus = () => {
-    const entries = [...markers(host.changes()), ...ignored];
-    const key = statusKey(entries);
-
-    if (key === treeStatusKey) {
-      return;
-    }
-
-    treeStatusKey = key;
-    tree?.setGitStatus(entries);
-  };
 
   /** The placeholder path the inline input is naming, if any. The naming flow
    * below owns it, but the flows it feeds need `resync` first — so this cell
@@ -287,29 +298,38 @@ export const createTreeWiring = (host: TreeHost): TreeWiring => {
    * own watcher and a `.gitignore` write all ask for one, and two listings
    * landing out of order would put back a row the pod no longer holds (the
    * empty-folder and ignored-folder rows are the ones nothing else implies).
-   * A caller that arrives mid-run is answered by the run after it. */
-  let syncing: Promise<void> | null = null;
-  let again = false;
+   * A caller that arrives mid-run is answered by the run after it (see
+   * `./tree-sync`). */
+  let queue: ResyncState = ResyncStates.Idle();
+  let running: Promise<void> | null = null;
 
   const resync = async (): Promise<void> => {
-    if (syncing !== null) {
-      again = true;
-      await syncing;
+    const asked = askResync(queue);
+    queue = asked.state;
+
+    if (!asked.run) {
+      await running;
 
       return;
     }
 
-    do {
-      again = false;
-      syncing = syncRows();
+    let run = true;
+
+    while (run) {
+      const pass = syncRows();
+      running = pass;
 
       try {
         // oxlint-disable-next-line eslint/no-await-in-loop -- one run at a time is the point: a later listing must not overtake an earlier one.
-        await syncing;
+        await pass;
       } finally {
-        syncing = null;
+        running = null;
       }
-    } while (again);
+
+      const next = finishResync(queue);
+      queue = next.state;
+      ({ run } = next);
+    }
   };
 
   const flow = createTreeRows({
@@ -622,7 +642,7 @@ export const createTreeWiring = (host: TreeHost): TreeWiring => {
       const row = `${dir}/`;
 
       if (!hasRow(row)) {
-        tree.add(row);
+        addRow(row);
       }
     }
 

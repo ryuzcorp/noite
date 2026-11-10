@@ -35,6 +35,16 @@ import type {
   IntelFile,
   IntelPosition,
 } from "./intel-protocol";
+import {
+  bindIntel,
+  bootIntel,
+  boundPath,
+  detachIntel,
+  intelStarted,
+  loseIntelSession,
+  newIntelMachine,
+  resetIntel,
+} from "./intel-state";
 import type { DiffsModule, MarkerTarget } from "./pierre";
 import type { WorkspaceChange } from "./workspace/types";
 
@@ -143,21 +153,19 @@ export const createEditorIntel = (host: EditorIntelHost): EditorIntel => {
   /** Only the newest diagnostics run may write markers: a file switch, an
    * edit or a push invalidates whatever is in flight. */
   let intelSeq = 0;
-  /** Hover answers arrive out of order too (`quickInfo` is async): only the
-   * newest one, for the token the pointer is still on, may open the tip. */
-  let hoverSeq = 0;
   /** Diagnostics from the open file's last check, for the hover stack. */
   let currentDiagnostics: readonly IntelDiagnostic[] = [];
   /** Cancels the pending debounced diagnostics run, if any. */
   let cancelDiagnostics: (() => void) | undefined;
-  let intelStarted = false;
+  /** The session's own readiness: whether the worker was started, and which
+   * file's pierre session is bound (see `./intel-state`). */
+  let machine = newIntelMachine();
   /** Pierre's edit session only accepts marker ranges once its document is
    * initialized and rendered — `Editor.setMarkers` throws before that, and a
    * throw here would land in `openFile`'s error path and replace the whole
    * pane. Its `onAttach` callback is the readiness signal (see
    * `#scheduleOnAttach` in the editor), so anything computed earlier waits in
    * `pendingIntel`. */
-  let sessionReady = false;
   const pendingIntel: PendingIntel = {};
 
   /** The server payload — the ref's own text sources — for the revision this
@@ -203,7 +211,7 @@ export const createEditorIntel = (host: EditorIntelHost): EditorIntel => {
    * `SourceIntel`; the package declarations the worker fetches from esm.sh
    * arrive later, as a `typesChanged` event. */
   const ensureIntel = (): Promise<void> => {
-    intelStarted = true;
+    machine = bootIntel(machine);
 
     return intel.sync(fetchServerBundle, workerDrafts());
   };
@@ -256,10 +264,12 @@ export const createEditorIntel = (host: EditorIntelHost): EditorIntel => {
    * escalated. */
   const paintIntel = () => {
     const target = sessionTarget;
+    const ready = boundPath(machine.state);
 
     if (
       target === undefined ||
-      !sessionReady ||
+      ready === null ||
+      ready !== host.currentPath() ||
       pendingIntel.path !== host.currentPath()
     ) {
       return;
@@ -271,7 +281,7 @@ export const createEditorIntel = (host: EditorIntelHost): EditorIntel => {
       } catch {
         // The session went away between the check and the write: the next
         // attach (or file switch) settles it.
-        sessionReady = false;
+        machine = loseIntelSession(machine);
 
         return;
       }
@@ -304,14 +314,18 @@ export const createEditorIntel = (host: EditorIntelHost): EditorIntel => {
   const clearMarkers = () => {
     const target = sessionTarget;
 
-    if (target === undefined || !(sessionReady && pendingIntel.markers)) {
+    if (
+      target === undefined ||
+      boundPath(machine.state) === null ||
+      !pendingIntel.markers
+    ) {
       return;
     }
 
     try {
       target.setMarkers([]);
     } catch {
-      sessionReady = false;
+      machine = loseIntelSession(machine);
     }
 
     pendingIntel.markers = undefined;
@@ -379,7 +393,13 @@ export const createEditorIntel = (host: EditorIntelHost): EditorIntel => {
    * can be painted onto it. */
   const onAttach = (attached: MarkerTarget) => {
     sessionTarget = attached;
-    sessionReady = true;
+
+    const path = host.currentPath();
+
+    if (path !== null) {
+      machine = bindIntel(machine, path);
+    }
+
     paintIntel();
   };
 
@@ -420,8 +440,10 @@ export const createEditorIntel = (host: EditorIntelHost): EditorIntel => {
       return;
     }
 
-    hoverSeq += 1;
-    const seq = hoverSeq;
+    // One token per token: the tip's machine names the token the pointer is
+    // on, and refuses an answer for one it has left (see `./hover-state`).
+    const token = `${hit.path}:${hit.offset}`;
+    tip.enter(token);
     // Ask right away, open only once the pointer has rested: a pass over the
     // code must not flash a tip on every token it crosses.
     const rested = Promise.withResolvers<undefined>();
@@ -434,7 +456,9 @@ export const createEditorIntel = (host: EditorIntelHost): EditorIntel => {
       rested.promise,
     ]);
 
-    if (seq !== hoverSeq) {
+    const epoch = tip.rest(token);
+
+    if (epoch === null) {
       return;
     }
 
@@ -443,10 +467,14 @@ export const createEditorIntel = (host: EditorIntelHost): EditorIntel => {
     const errors = diagnosticMessagesAtOffset(currentDiagnostics, hit.offset);
 
     if (!info && errors.length === 0) {
+      tip.leave();
+
       return;
     }
 
-    await tip.show(
+    await tip.paint(
+      token,
+      epoch,
       {
         code: info?.signature ?? "",
         docs: info?.docs ?? [],
@@ -460,7 +488,6 @@ export const createEditorIntel = (host: EditorIntelHost): EditorIntel => {
   /** Leaving the token closes the tip after a grace period, so the pointer
    * can move onto it (`HoverTip.leave`). */
   const tokenLeave = () => {
-    hoverSeq += 1;
     tip.leave();
   };
 
@@ -491,8 +518,17 @@ export const createEditorIntel = (host: EditorIntelHost): EditorIntel => {
         }
 
         if (target.preview) {
-          hoverSeq += 1;
-          await tip.show(
+          const token = `definition:${target.path}:${target.start.line}`;
+          tip.enter(token);
+          const epoch = tip.rest(token);
+
+          if (epoch === null) {
+            return;
+          }
+
+          await tip.paint(
+            token,
+            epoch,
             {
               code: target.preview.join("\n"),
               docs: [],
@@ -529,10 +565,9 @@ export const createEditorIntel = (host: EditorIntelHost): EditorIntel => {
 
     pendingIntel.markers = undefined;
     pendingIntel.path = path;
-    sessionReady = false;
+    machine = detachIntel(machine, path);
     intelSeq += 1;
     currentDiagnostics = [];
-    hoverSeq += 1;
     cancelDiagnostics?.();
     cancelDiagnostics = undefined;
     tip.hide();
@@ -541,7 +576,7 @@ export const createEditorIntel = (host: EditorIntelHost): EditorIntel => {
   /** The pane closed its file: nothing may write markers until the next
    * attach. */
   const detachSession = () => {
-    sessionReady = false;
+    machine = detachIntel(machine, host.currentPath());
   };
 
   const reset = () => {
@@ -549,6 +584,7 @@ export const createEditorIntel = (host: EditorIntelHost): EditorIntel => {
     // declarations were pinned to) are whatever the push left, so the memo goes
     // with the worker.
     serverBundle = undefined;
+    machine = resetIntel(machine);
     void intel.reset(fetchServerBundle, workerDrafts());
   };
 
@@ -570,7 +606,7 @@ export const createEditorIntel = (host: EditorIntelHost): EditorIntel => {
     reset,
     runDiagnostics,
     scheduleDiagnostics,
-    started: () => intelStarted,
+    started: () => intelStarted(machine.state),
     tokenClick,
     tokenEnter,
     tokenLeave,

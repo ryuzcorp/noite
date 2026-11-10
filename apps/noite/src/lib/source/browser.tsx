@@ -54,18 +54,36 @@ import type {
   CommitDrafts,
   DraftActions,
   PreviewDrafts,
-  PreviewedSnapshot,
-  PushedTo,
   ReadOnlyRef,
   SourceBrowserState,
 } from "./drafts";
 import { createEditorPane } from "./editor";
 import { IGNORE_FILE } from "./gitignore";
+import {
+  previewView,
+  PreviewOps,
+  PushOps,
+  pushView,
+  settlePreview,
+  settlePush,
+  startPreview,
+  startPush,
+} from "./operations";
+import type { PreviewOperation, PushOperation } from "./operations";
 import { paintSkeleton, paneIn } from "./pane";
 import type { DiffsModule, EditModule, TreesModule } from "./pierre";
 import type { PodConnection } from "./pod-client";
 import { changesFingerprint } from "./preview-env";
 import { previewPayload } from "./preview-payload";
+import {
+  failureOf,
+  readOnlyOf,
+  RefEvents,
+  RefViews,
+  stepRef,
+  switchingTo,
+} from "./ref-view";
+import type { RefEvent, RefView } from "./ref-view";
 import type { TerminalLink } from "./terminal-session";
 import { createTreeWiring } from "./tree";
 import { base64Bytes, checkLimits, UPLOAD_LIMITS } from "./uploads";
@@ -197,22 +215,15 @@ export const SourceBrowser = ({
    * them. */
   const refs = forgeRefs(appId);
   const notice = atom("");
-  /** Why the installed checkout is read-only ("" = it is editable): what the
-   * banner above the editor says, and what keeps the Changes form and Deploy
-   * preview off. */
-  const readOnly = atom<ReadOnlyRef>("");
+  /** The ref/checkout lifecycle: what the panes show, what is opening, and
+   * why the browse failed (see `./ref-view`). The banner, the switch spinner
+   * and the failure card all read this one value, so none of them can describe
+   * a different ref than the panes do. */
+  const view = atom<RefView>(RefViews.Booting());
   /** A save that did not reach IndexedDB, kept apart from `notice`: a write
    * that lands in the pod clears that one, and it says nothing about whether
    * the work is being kept. */
   const saveNotice = atom("");
-  /** The ref a switch is opening ("" = none): the panes go on showing the
-   * checkout they have — marked with this — until the new ref's rows and file
-   * are ready to paint (see `install`). */
-  const switching = atom("");
-  /** Why the browsed ref could not be opened ("" = it is fine). What the panes
-   * show is the failed ref's own state, and the card over them offers a retry
-   * that opens the ref again. */
-  const failure = atom("");
 
   /** Report a failure that would otherwise lose work quietly: a save the
    * browser refused (a full store, a denied quota, a partition that went away)
@@ -321,15 +332,13 @@ export const SourceBrowser = ({
     /** Paths the user acknowledged: a peer write to one of them brings it
      * back (see `dismissConflicts`). */
     const dismissed = new Set<string>();
-    /** Whether a preview snapshot is in flight (its own flag: a preview is
-     * not a push, and neither one blocks the other's payload). */
-    let previewing = false;
-    let pushError = "";
-    let pushed: PushedTo | null = null;
-    let pushing = false;
-    /** What the last preview deploy snapshotted, and where (see
-     * `SourceBrowserState.previewed`). */
-    let previewed: PreviewedSnapshot | null = null;
+    /** The ref/checkout lifecycle (see `./ref-view`): the panes, the banner
+     * and the failure card all read this one value. */
+    let refView: RefView = RefViews.Booting();
+    /** The two commit operations, one slot each: a preview's failure can never
+     * surface as a push's, and neither can run twice (see `./operations`). */
+    let pushOp: PushOperation = PushOps.Idle();
+    let previewOp: PreviewOperation = PreviewOps.Idle();
     let revision = 0;
     /** The installed ref's resolved commit: the tip a branch the Changes
      * panel creates starts from (the runner's `fromSha`). */
@@ -372,17 +381,21 @@ export const SourceBrowser = ({
     const syncState = () => {
       const workspace = current?.workspace ?? null;
       const changed = new Set(changes.map((change) => change.path));
+      const push = pushView(pushOp);
+      const formed = previewView(previewOp);
+
       onState({
         // A conflict only counts while the path is still a change of this
         // checkout: a peer write that put the path back to its committed
         // bytes leaves nothing to warn about.
         conflicts: conflicts.filter((path) => changed.has(path)),
         files: changes,
-        previewed,
-        pushError,
-        pushed,
-        pushing,
-        readOnly: readOnly(),
+        previewError: formed.previewError,
+        previewed: formed.previewed,
+        pushError: push.pushError,
+        pushed: push.pushed,
+        pushing: push.pushing,
+        readOnly: readOnlyOf(refView),
         revision,
         // The notice names the commit the pod is based on; the pod only calls
         // itself stale against a tip that moved on from it.
@@ -393,10 +406,10 @@ export const SourceBrowser = ({
       });
     };
 
-    /** A change landed: whatever the last push said is superseded. */
+    /** A change landed: whatever the last push said is superseded (a preview's
+     * own outcome is the Preview panel's, and stays). */
     const report = () => {
-      pushError = "";
-      pushed = null;
+      pushOp = PushOps.Idle();
       revision += 1;
       syncState();
     };
@@ -426,17 +439,40 @@ export const SourceBrowser = ({
       }
 
       checkouts.delete(ref);
+      // A pruned checkout's frame can be forgotten: the set only exists to
+      // keep an install from reusing a pod that stopped.
+      dead.delete(held.checkout.connection);
       void teardown(() => held.checkout.workspace.close());
+    };
+
+    /** Store the machine's state and perform what its transition asked for. */
+    const applyRef = (event: RefEvent): void => {
+      const decision = stepRef(refView, event);
+
+      if (decision.refused) {
+        return;
+      }
+
+      refView = decision.state;
+      view.set(refView);
+
+      for (const ref of decision.drop) {
+        drop(ref);
+      }
+
+      if (decision.wipe) {
+        // Nothing on screen describes a live checkout any more: the panes go,
+        // and the failure card says what happened.
+        treeEl.textContent = "";
+        codeEl.textContent =
+          "message" in event ? event.message : "The checkout is not open.";
+      }
     };
 
     /** A checkout's frame died (its pod stopped): the ref has to be opened
      * again — nothing can be read from that one — and the user hears why. */
     const failed = (ref: string, message: string): void => {
-      drop(ref);
-
-      if (current?.ref === ref) {
-        failure.set(message);
-      }
+      applyRef(RefEvents.PodDied({ message, ref }));
     };
 
     /** Keep the installed checkout and the one the user came from. A checkout
@@ -537,6 +573,15 @@ export const SourceBrowser = ({
       const { connection, workspace: opened } = checkout;
       frame = connection;
 
+      if (dead.has(connection)) {
+        // The pod died while the open was in flight: the fatal handler has
+        // already reported it, and nothing may read from this frame. The frame
+        // is closed, so it leaves the dead set with it.
+        dead.delete(connection);
+        void teardown(() => opened.close());
+        throw new Error("the checkout's pod stopped while it opened");
+      }
+
       if (closed || aborted()) {
         // The pane went while the frame was coming up: nothing will read it.
         void teardown(() => opened.close());
@@ -579,6 +624,15 @@ export const SourceBrowser = ({
 
       try {
         const checkout = await pending;
+
+        if (dead.has(checkout.connection)) {
+          // A fatal that arrived after the open answered: this checkout must
+          // never become the current one, nor be served from the cache.
+          dead.delete(checkout.connection);
+          void teardown(() => checkout.workspace.close());
+          throw new Error("the checkout's pod stopped while it opened");
+        }
+
         checkouts.set(ref, { at: Date.now(), checkout });
 
         return checkout;
@@ -643,6 +697,13 @@ export const SourceBrowser = ({
         return;
       }
 
+      if (dead.has(next.connection)) {
+        // The listing resolved, but the frame behind it stopped: a checkout
+        // whose pod is gone must never become the current one (the fatal
+        // handler already put the failure card up).
+        return;
+      }
+
       const previous = current;
       unsubscribe?.();
       unsubscribe = null;
@@ -654,7 +715,6 @@ export const SourceBrowser = ({
       current = next;
       browsedSha = next.sha;
       notice.set("");
-      readOnly.set(next.readOnly);
       // Another ref's peer conflicts are not this one's: its paths are
       // checkout-relative to a checkout the panes no longer drive.
       conflicts = [];
@@ -665,8 +725,9 @@ export const SourceBrowser = ({
       // rather than awaited: painting them is what makes a switch land on the
       // branch's own unpushed work.
       changes = next.workspace.changes();
-      pushError = "";
-      pushed = null;
+      // Another ref's push outcome is not this one's (a preview's snapshot is
+      // the panel's, and is compared by fingerprint).
+      pushOp = PushOps.Idle();
       revision += 1;
       unsubscribe = next.workspace.onChanges((rows) => {
         changes = rows;
@@ -733,6 +794,9 @@ export const SourceBrowser = ({
         return;
       }
 
+      // The panes now show this checkout: only here does the browse become
+      // Ready (a stale `Opened` is refused by the machine).
+      applyRef(RefEvents.Opened({ readOnly: next.readOnly, ref: next.ref }));
       syncState();
 
       // The shell runs on the checkout the panes now drive: the one it was on
@@ -750,9 +814,10 @@ export const SourceBrowser = ({
      * already on starts anything. `force` is the retry a failure offered: it
      * drops whatever that attempt left and opens the ref again. */
     const request = (ref: string, force?: boolean): void => {
-      if (force === true) {
+      const forced = force === true;
+
+      if (forced) {
         wanted = null;
-        drop(ref);
       } else if (current?.ref === ref || wanted === ref) {
         return;
       }
@@ -760,10 +825,9 @@ export const SourceBrowser = ({
       wanted = ref;
       generation += 1;
       const mine = generation;
-      // Marked as switching only when there is something to keep on screen: a
-      // first open has the panes' own note, and nothing to leave standing.
-      switching.set(current === null ? "" : ref);
-      failure.set("");
+      // The machine keeps what the panes show while the new ref opens (a first
+      // open has the panes' own note and nothing to leave standing).
+      applyRef(RefEvents.Requested({ force: forced, ref }));
       void (async () => {
         try {
           const checkout = await ensure(ref);
@@ -783,24 +847,15 @@ export const SourceBrowser = ({
           if (held !== undefined) {
             held.at = Date.now();
           }
-
-          switching.set("");
         } catch (error) {
           if (mine !== generation || closed) {
             return;
           }
 
           wanted = null;
-          switching.set("");
-
-          if (current === null) {
-            // Nothing but the panes' own note is on screen: say what failed,
-            // and leave what a switch kept standing alone when it did not.
-            treeEl.textContent = "";
-            codeEl.textContent = errorMessage(error);
-          }
-
-          failure.set(errorMessage(error));
+          // A failed switch keeps what the panes show (the machine's
+          // `previous`); a failed first open wipes them and says why.
+          applyRef(RefEvents.Failed({ message: errorMessage(error), ref }));
         } finally {
           evict();
         }
@@ -865,12 +920,14 @@ export const SourceBrowser = ({
     const commit: CommitDrafts = async ({ branch, message }) => {
       const checkout = current;
 
-      if (pushing || changes.length === 0 || checkout === null) {
+      const started =
+        changes.length === 0 || checkout === null ? null : startPush(pushOp);
+
+      if (checkout === null || started === null) {
         return false;
       }
 
-      pushing = true;
-      pushError = "";
+      pushOp = started;
       syncState();
       // The ref the commit lands on, and the ref the pod settles on after it:
       // the branch the form named, or the branch this checkout holds when it
@@ -896,7 +953,10 @@ export const SourceBrowser = ({
             commitInput(payload, message, target, branch ? browsedSha : null)
           )
         );
-        pushed = { branch: target, newBranch: created };
+        pushOp = settlePush(pushOp, {
+          ok: true,
+          to: { branch: target, newBranch: created },
+        });
         // The branch moved — the browsed one, or one the picker did not know
         // about yet: its tip, its distance from the default branch and every
         // History page were read before the commit and are stale now.
@@ -917,11 +977,13 @@ export const SourceBrowser = ({
 
         return true;
       } catch (error) {
-        pushError = errorMessage(error);
+        pushOp = settlePush(pushOp, {
+          message: errorMessage(error),
+          ok: false,
+        });
 
         return false;
       } finally {
-        pushing = false;
         syncState();
       }
     };
@@ -938,12 +1000,16 @@ export const SourceBrowser = ({
     const preview: PreviewDrafts = async () => {
       const checkout = current;
 
-      if (previewing || checkout === null || changes.length === 0) {
+      const started =
+        checkout === null || changes.length === 0
+          ? null
+          : startPreview(previewOp);
+
+      if (checkout === null || started === null) {
         return null;
       }
 
-      previewing = true;
-      pushError = "";
+      previewOp = started;
       syncState();
 
       try {
@@ -963,15 +1029,20 @@ export const SourceBrowser = ({
           moves: payload.moves,
         });
 
-        previewed = { branch: checkout.ref, fingerprint: snapshot };
+        previewOp = settlePreview(previewOp, {
+          ok: true,
+          snapshot: { branch: checkout.ref, fingerprint: snapshot },
+        });
 
         return deployed;
       } catch (error) {
-        pushError = errorMessage(error);
+        previewOp = settlePreview(previewOp, {
+          message: errorMessage(error),
+          ok: false,
+        });
 
         return null;
       } finally {
-        previewing = false;
         syncState();
       }
     };
@@ -1071,7 +1142,9 @@ export const SourceBrowser = ({
   //
   // Read once, so the banner's copy is picked from a narrowed value rather
   // than from a second read the compiler cannot narrow.
-  const readOnlyNow = readOnly();
+  const readOnlyNow = readOnlyOf(view());
+  const failed = failureOf(view());
+  const switchingNow = switchingTo(view());
 
   return (
     <div class="contents">
@@ -1106,35 +1179,35 @@ export const SourceBrowser = ({
         )}
         <div ref={attach} class="min-h-0 min-w-0 flex-1 overflow-auto"></div>
       </div>
-      {switching() === "" ? null : (
+      {switchingNow === "" ? null : (
         <div
           class="absolute inset-0 z-20 cursor-progress"
           role="status"
-          data-source-switch={switching()}
+          data-source-switch={switchingNow}
         >
           <div class="rounded-box border-base-300 bg-base-100/95 absolute top-2 right-2 flex items-center gap-2 border px-2.5 py-1.5 text-xs shadow-lg">
             <span class="loading loading-spinner loading-xs"></span>
             <span>
-              Switching to <span class="font-mono">{switching()}</span>…
+              Switching to <span class="font-mono">{switchingNow}</span>…
             </span>
           </div>
         </div>
       )}
-      {failure() === "" ? null : (
+      {failed === null ? null : (
         <div
           class="bg-base-100/85 absolute inset-0 z-30 flex items-center justify-center p-6"
           role="alert"
         >
           <div class="rounded-box border-base-300 bg-base-100 flex max-w-md flex-col items-start gap-3 border p-4 shadow-lg">
             <p class="m-0 text-sm">
-              Could not open <span class="font-mono">{gitRef()}</span>:{" "}
-              {failure()}
+              Could not open <span class="font-mono">{failed.ref}</span>:{" "}
+              {failed.message}
             </p>
             <button
               type="button"
               class="btn btn-sm btn-neutral"
               onclick={() => {
-                box.request(gitRef(), true);
+                box.request(failed.ref, true);
               }}
             >
               Retry

@@ -31,11 +31,16 @@ export interface SourceBrowserState {
   conflicts: readonly string[];
   /** The workspace's changes, as of the last derive. */
   files: readonly WorkspaceChange[];
+  /** Why the last Deploy preview failed ("" = the last one, if any, landed).
+   * Its own field: a preview is not a push, so its failure never renders as
+   * one. */
+  previewError: string;
   /** What this browser last deployed as a preview, or null when it has not
    * deployed one: the Preview panel compares its fingerprint with the
    * checkout's current one to tell whether the framed snapshot holds every
    * edit. */
   previewed: PreviewedSnapshot | null;
+  /** Why the last push failed ("" = it did not): the Changes form's line. */
   pushError: string;
   pushed: PushedTo | null;
   pushing: boolean;

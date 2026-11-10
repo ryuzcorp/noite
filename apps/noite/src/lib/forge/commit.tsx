@@ -3,11 +3,11 @@
 import { Link } from "@ilha/void";
 
 import { formatDateTime } from "../dates";
-import { LoadError } from "../ui/load-error";
 import { SectionSkeleton } from "../ui/skeletons";
 import { forgeCommit } from "./data";
 import { DiffView } from "./diff";
 import { commitHref, gitTime, shortSha } from "./format";
+import { loadState } from "./load";
 import { FileStats } from "./parts";
 
 export const CommitView = ({
@@ -24,18 +24,23 @@ export const CommitView = ({
   sha: string;
 }) => {
   const res = forgeCommit(appId, sha);
-  const data = res.data();
-  const error = res.error();
+  const load = loadState(res.data(), res.error());
 
-  if (data === undefined) {
+  if (load._tag !== "Ready") {
     return (
       <div class="flex flex-col gap-4">
-        <LoadError error={error} label="Failed to load commit" />
-        {error ? null : <SectionSkeleton lines={5} />}
+        {load._tag === "Loading" ? (
+          <SectionSkeleton lines={5} />
+        ) : (
+          <p class="text-error m-0 text-sm">
+            Failed to load commit: {load.message}
+          </p>
+        )}
       </div>
     );
   }
 
+  const data = load.value;
   const c = data.commit;
   const from = { file, ref: gitRef };
 

@@ -11,6 +11,15 @@ import { errorMessage } from "../errors";
 import { confirmDialog } from "../ui/confirm";
 import { menuDir } from "./tree-menu";
 import {
+  finishUpload,
+  newUploadMachine,
+  pickChanged,
+  startDrop,
+  startPick,
+  startWriting,
+} from "./upload-run";
+import type { UploadMachine } from "./upload-run";
+import {
   checkLimits,
   readDroppedItems,
   readPickedFiles,
@@ -87,12 +96,16 @@ const dropDirAt = (x: number, y: number): string => {
 };
 
 export const createTreeUploads = (host: TreeUploadsHost): TreeUploads => {
+  /** The one run at a time: a pick, a drop and their reads/writes never
+   * interleave (see `./upload-run`). */
+  let run: UploadMachine = newUploadMachine();
+
   /** Weigh one read set, then write it into the folder it was dropped on (or
    * picked for): a text file lands as its text, anything else byte-for-byte. A
    * path the tree already holds — or one a staged deletion emptied — is asked
    * about first. A read the browser could not make is reported and skipped; a
    * set that breaks the commit's caps is refused whole, with nothing written. */
-  const applyUploads = async (
+  const writeReads = async (
     reads: readonly UploadRead[],
     dir: string
   ): Promise<void> => {
@@ -154,32 +167,64 @@ export const createTreeUploads = (host: TreeUploadsHost): TreeUploads => {
     host.report();
   };
 
+  const applyUploads = async (
+    reads: readonly UploadRead[],
+    dir: string
+  ): Promise<void> => {
+    run = startWriting(run);
+
+    try {
+      await writeReads(reads, dir);
+    } finally {
+      run = finishUpload(run);
+    }
+  };
+
   /** The folder the picker's files go into (the menu's own target), and the
    * hidden input they are picked through — one per wiring, parked in the pane
    * (the host `overlay` names) rather than in the body pierre's rows live in:
    * pierre renders those in a shadow root of its own, so the body's light DOM
    * never shows, while a shadow root is also what ilha's morph cannot reach
    * into. */
-  let pickDir = "";
+  /** The token of the pick the input is open for, so a `change` can only
+   * answer that pick (and never a folder a later menu click named). */
+  const tokenOfPick = (): number =>
+    run.state._tag === "Picking" ? run.state.token : -1;
+
   const input = document.createElement("input");
   input.type = "file";
   input.multiple = true;
   input.style.display = "none";
   input.dataset.fileUpload = "true";
   input.addEventListener("change", () => {
+    const picked = pickChanged(run, tokenOfPick());
     // Snapshotted before the value is cleared: the same file must be pickable
     // twice in a row.
     const files = [...(input.files ?? [])];
     input.value = "";
 
+    if (picked.dir === null) {
+      return;
+    }
+
+    run = picked.machine;
+
     if (files.length === 0) {
+      run = finishUpload(run);
+
       return;
     }
 
     void (async () => {
       const reads = await readPickedFiles(files);
-      await applyUploads(reads, pickDir);
+
+      await applyUploads(reads, picked.dir ?? "");
     })();
+  });
+  // The picker was dismissed: the pick it was for is over, or the flow would
+  // stay busy for the rest of the mount.
+  input.addEventListener("cancel", () => {
+    run = finishUpload(run);
   });
 
   /** The drop highlight: the pane's own rectangle, click-through (so the
@@ -213,7 +258,13 @@ export const createTreeUploads = (host: TreeUploadsHost): TreeUploads => {
   /** The menu's "Upload files…": the input is clicked inside the menu item's
    * own user gesture, which is what the picker requires. */
   const pick = (dir: string) => {
-    pickDir = dir;
+    const started = startPick(run, dir);
+
+    if (!started.picked) {
+      return;
+    }
+
+    run = started.machine;
     input.click();
   };
 
@@ -252,22 +303,33 @@ export const createTreeUploads = (host: TreeUploadsHost): TreeUploads => {
   /** An OS drop: the items are read synchronously (the list empties as the
    * handler returns) and land in the folder under the pointer. */
   const onTreeDrop = (event: DragEvent) => {
+    // The outline goes whatever happens next: a drop the pane refuses left it
+    // standing before.
+    hideDropHighlight();
+
     if (!host.editable() || !isFileDrag(event)) {
       return;
     }
 
     event.preventDefault();
-    hideDropHighlight();
     const items = event.dataTransfer?.items;
 
     if (items === undefined) {
       return;
     }
 
-    const dir = dropDirAt(event.clientX, event.clientY);
+    const started = startDrop(run, dropDirAt(event.clientX, event.clientY));
+
+    if (!started.started) {
+      return;
+    }
+
+    run = started.machine;
     void (async () => {
       const reads = await readDroppedItems(items);
-      await applyUploads(reads, dir);
+      const { state } = run;
+
+      await applyUploads(reads, state._tag === "Reading" ? state.dir : "");
     })();
   };
 

@@ -8,7 +8,7 @@ import { collectRef, newLiveRef } from "$lib/live-ref";
 import { PREVIEW_MIXED_CONTENT_MESSAGE } from "$lib/preview-host";
 import { appDetail } from "$lib/resources";
 import type { AppRole } from "$lib/roles";
-import type { GitRefs, RunnerEnvironment } from "$lib/runner";
+import type { BranchRules, GitRefs, RunnerEnvironment } from "$lib/runner";
 import { parseSkip, searchParam } from "$lib/search-param";
 import type { SearchParam } from "$lib/search-param";
 import { branchRules } from "$lib/source/branch-rules";
@@ -22,7 +22,7 @@ import type {
   SourceBrowserState,
 } from "$lib/source/drafts";
 import { PreviewPanel } from "$lib/source/preview-panel";
-import { editableRef, protectedRef } from "$lib/source/push-target";
+import { refAccess } from "$lib/source/push-target";
 import { TerminalPanel } from "$lib/source/terminal-panel";
 import { createTerminalSession } from "$lib/source/terminal-session";
 import { SquareTerminal } from "$lib/ui/icons";
@@ -82,30 +82,17 @@ const TAB_CLASS: Record<Exclude<CodePanel, "">, string> = {
   preview: "contents",
 };
 
-/** The refs a sha (`?ref=` mid-commit, a commit link) looks like: the
- * runner's own `is_hex_sha` (7..=40 hex digits). */
-const SHA_REF = /^[0-9a-f]{7,40}$/iu;
-
-/** Why the browsed ref opens read-only. A branch the viewer may push to is
- * editable (`editableRef`); a branch they may not is a role, and anything
- * that is not a branch at all is a commit when it looks like a sha and a tag
- * otherwise (the refs list is the only place the UI learns a name is a
- * branch). */
+/** Why the browsed ref opens read-only (see `refAccess`): a branch the viewer
+ * may push to is editable, a branch they may not is a role, and anything that
+ * is not a branch at all is a commit when it looks like a sha and a tag
+ * otherwise. */
 const readOnlyReason = (
   refs: GitRefs | undefined,
+  rules: BranchRules | undefined,
   role: AppRole | undefined,
-  ref: string
-): ReadOnlyRef => {
-  if (editableRef(refs, role, ref)) {
-    return "";
-  }
-
-  if (refs?.branches.some((branch) => branch.name === ref) === true) {
-    return "role";
-  }
-
-  return SHA_REF.test(ref) ? "commit" : "tag";
-};
+  ref: string,
+  defaultBranch: string
+): ReadOnlyRef => refAccess(refs, rules, role, ref, defaultBranch).readOnly;
 
 /** Code mode's pane groups (`$lib/ui/resizable`): the file tree against
  * everything else, that column in two (the editor beside the side panel, the
@@ -432,6 +419,7 @@ const SourceBody = ({ appId }: { appId: string }) => {
   const browser = atom<SourceBrowserState>({
     conflicts: [],
     files: [],
+    previewError: "",
     previewed: null,
     pushError: "",
     pushed: null,
@@ -471,7 +459,13 @@ const SourceBody = ({ appId }: { appId: string }) => {
       role = detail?.myRole;
     }
 
-    return readOnlyReason(known, role, ref);
+    return readOnlyReason(
+      known,
+      branchRules(appId).data(),
+      role,
+      ref,
+      defaultBranch
+    );
   };
 
   // The ref the browser browses, kept in step with `?ref=` here: the browser
@@ -646,7 +640,8 @@ const SourceBody = ({ appId }: { appId: string }) => {
                     // instead. Browsing another branch takes its commits
                     // however the app-wide rule is set (see `./push-target`).
                     isProtected: (name) =>
-                      protectedRef(rules, myRole, name, defaultBranch),
+                      refAccess(refs, rules, myRole, name, defaultBranch)
+                        .commit === "pr-only",
                     restore: (path) => {
                       committer.actions?.restore(path);
                     },
