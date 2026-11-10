@@ -170,10 +170,11 @@ pub struct BundleMeta {
     pub bundle_sha256: String,
 }
 
-/// The fixed controller bundle: `dist/worker.js` plus its meta. Read from
-/// disk at deploy time (the image build compiles it; a dev checkout runs
-/// `bun run build` in `apps/void-sandbox`), verified against its own
-/// digest before anything deploys it.
+/// The fixed controller bundle: `worker.js` plus its meta. Read from disk at
+/// deploy time — the image build compiles it, and the dev stack
+/// (`docker/dev-sandbox.sh`) compiles it at container start and on every
+/// source change — and verified against its own digest before anything
+/// deploys it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Bundle {
     pub worker_js: Vec<u8>,
@@ -189,7 +190,7 @@ pub fn load_bundle(dir: &Path) -> anyhow::Result<Bundle> {
     for path in [&worker, &meta_path] {
         if !path.is_file() {
             anyhow::bail!(
-                "sandbox controller bundle incomplete at {}: {} is missing (the image ships the bundle at /opt/noite/void-sandbox; a dev checkout builds it with `bun run build` in apps/void-sandbox)",
+                "sandbox controller bundle incomplete at {}: {} is missing (the image bakes the bundle into /opt/noite/void-sandbox during its build; the dev stack compiles apps/void-sandbox there when the container starts and after every source change, so a missing file means that build failed — restart it with `make dev` or `make dev-host` and read its log)",
                 dir.display(),
                 path.display()
             );
@@ -228,7 +229,7 @@ pub fn load_bundle(dir: &Path) -> anyhow::Result<Bundle> {
         .collect();
     if sha256 != meta.bundle_sha256 {
         anyhow::bail!(
-            "sandbox controller bundle at {} is inconsistent: worker.js does not match meta.json's bundleSha256 (rebuild the controller bundle)",
+            "sandbox controller bundle at {} is inconsistent: worker.js does not match meta.json's bundleSha256 (both files are written together by the build — the image bakes them at image build time and the dev stack rebuilds them from apps/void-sandbox; restart it with `make dev` or `make dev-host` to rebuild)",
             dir.display()
         );
     }
@@ -798,12 +799,14 @@ mod tests {
         std::fs::write(dir.join("worker.js"), b"controller-bundle-tampered").unwrap();
         let err = format!("{:#}", load_bundle(&dir).unwrap_err());
         assert!(err.contains("does not match"), "{}", err);
-        assert!(err.contains("rebuild the controller bundle"), "{}", err);
+        // The message names the fix an operator or a dev can actually run.
+        assert!(err.contains("make dev-host"), "{}", err);
 
         std::fs::remove_file(dir.join("worker.js")).unwrap();
         let err = format!("{:#}", load_bundle(&dir).unwrap_err());
         assert!(err.contains("is missing"), "{}", err);
-        assert!(err.contains("bun run build"), "{}", err);
+        assert!(err.contains("make dev"), "{}", err);
+        assert!(!err.contains("bun run build"), "{}", err);
 
         let (guard_bundle_broken, _) = bundle_dir("bundle-broken", b"x");
 

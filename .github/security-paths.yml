@@ -107,6 +107,10 @@ sensitive:
   # boundary ships from here, including the third-party binaries baked in.
   - "docker/Dockerfile"
   - "docker/dev.sh"
+  # The dev container's sandbox controller build: it installs the package's
+  # dependencies and compiles the bundle the runner deploys, so a change here
+  # alters what a dev stack executes.
+  - "docker/dev-sandbox.sh"
   - "docker/install-sidecars.sh"
   - "docker/install.sh"
   - "docker/uninstall.sh"
