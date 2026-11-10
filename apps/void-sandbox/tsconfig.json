@@ -23,6 +23,10 @@
     "test-helpers.ts",
     "controller.test.ts",
     "admission.test.ts",
+    "admission-entry.test.ts",
+    "activity.test.ts",
+    "bridge.test.ts",
+    "lease.test.ts",
     "protocol.test.ts",
     "build.test.ts"
   ]

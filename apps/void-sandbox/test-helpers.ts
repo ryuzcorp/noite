@@ -31,6 +31,11 @@ export class FakeStorage {
   alarmAt: number | null = null;
   gets = 0;
   puts = 0;
+  /** Resolves when the first gated `delete` is reached. */
+  readonly deleteEntered = new Deferred<void>();
+  /** When set, the first `delete` of this key waits for the gate. */
+  holdDelete: { readonly gate: Deferred<void>; readonly key: string } | null =
+    null;
   /** Crash-window scripting: puts whose 1-based index matches throw. */
   failPut: ((putIndex: number) => boolean) | null = null;
 
@@ -54,6 +59,14 @@ export class FakeStorage {
 
   async delete(key: string): Promise<boolean> {
     await Promise.resolve();
+
+    const held = this.holdDelete;
+
+    if (held !== null && held.key === key) {
+      this.holdDelete = null;
+      this.deleteEntered.resolve();
+      await held.gate.promise;
+    }
 
     return this.store.delete(key);
   }
@@ -135,6 +148,10 @@ export class FakeContainer {
   readonly starts: NoiteStartOptions[] = [];
   readonly execCalls: ExecCall[] = [];
   destroys = 0;
+  /** Resolves when `destroy` is entered, before the container reports gone. */
+  readonly destroyEntered = new Deferred<void>();
+  /** Set to hold a destroy mid-flight (the crash/reap race window). */
+  holdDestroy: Deferred<void> | null = null;
   readonly inactivityTimeouts: number[] = [];
   readonly tcpFetches: { readonly port: number; readonly request: Request }[] =
     [];
@@ -161,6 +178,12 @@ export class FakeContainer {
 
   async destroy(): Promise<void> {
     this.destroys += 1;
+    this.destroyEntered.resolve();
+
+    if (this.holdDestroy !== null) {
+      await this.holdDestroy.promise;
+    }
+
     this.running = false;
   }
 

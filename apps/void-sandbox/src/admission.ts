@@ -20,23 +20,21 @@
 /* oxlint-disable anti-slop/no-known-value-widening -- RPC inputs arrive untyped at runtime; `validId` re-establishes the string contract at every entry point. */
 import { DurableObject } from "cloudflare:workers";
 
+import type { AdmissionReason, StoredEntry } from "./admission-entry.ts";
+import { applyEntry, decodeEntry, encodeEntry } from "./admission-entry.ts";
 import type { ControllerEnv } from "./env.ts";
 import { DEFAULT_MAX_CONCURRENT } from "./meta.ts";
 
 /** Admission verdict. The controller maps these to Void's exact `VOID_SANDBOX_*` error strings. */
 export type AdmissionResult =
   | { readonly ok: true }
-  | { readonly ok: false; readonly reason: "concurrency" | "unavailable" };
+  | { readonly ok: false; readonly reason: AdmissionReason };
 
-interface Entry {
-  readonly generation: string;
-  readonly phase: "reserved" | "running";
-  readonly startedAt?: number;
-  /** Set before the stop receipt commits; the alarm finishes a torn stop. */
-  readonly stoppedAt?: number;
-}
-
-type Entries = Record<string, Entry>;
+/**
+ * The stored table. Values keep the previous code's shape; `decodeEntry`
+ * derives the tagged state and `encodeEntry` writes the same keys back.
+ */
+type Entries = Record<string, StoredEntry>;
 
 const ENTRIES_KEY = "noite-sandbox-admission-v1";
 const COMPLETIONS_KEY = "noite-sandbox-completions-v1";
@@ -176,32 +174,34 @@ export class NoiteSandboxAdmission extends DurableObject<ControllerEnv> {
     return await this.#serialize(async () => {
       const cap = this.#cap();
       const entries = await this.#load();
-      const current = entries[instanceId];
+      const entry = decodeEntry(entries[instanceId]);
 
-      if (current !== undefined) {
-        if (
-          current.generation !== generation ||
-          current.stoppedAt !== undefined
-        ) {
-          return { ok: false, reason: "unavailable" };
-        }
+      const decision = applyEntry(entry, {
+        _tag: "Reserve",
+        admitted: withinLimit(entries, instanceId, cap),
+        // A timed-out reserve can finish after stop. Never admit that run again.
+        fenced:
+          entry === undefined
+            ? await this.#hasCompletion(instanceId, generation)
+            : false,
+        generation,
+        hasCapacity: Object.keys(entries).length < cap,
+      });
 
-        return withinLimit(entries, instanceId, cap)
-          ? { ok: true }
-          : { ok: false, reason: "concurrency" };
+      if (decision._tag !== "Admitted") {
+        return {
+          ok: false,
+          reason: decision._tag === "Refused" ? decision.reason : "unavailable",
+        };
       }
 
-      // A timed-out reserve can finish after stop. Never admit that run again.
-      if (await this.#hasCompletion(instanceId, generation)) {
-        return { ok: false, reason: "unavailable" };
+      if (decision.changed) {
+        entries[instanceId] = encodeEntry(decision.entry);
+        await this.#save(entries);
+        // An entry that exists always has a scheduled sweep, so a crash
+        // between a stop mark and its receipt can never leak capacity.
+        await this.#ensureAlarm();
       }
-
-      if (Object.keys(entries).length >= cap) {
-        return { ok: false, reason: "concurrency" };
-      }
-
-      entries[instanceId] = { generation, phase: "reserved" };
-      await this.#save(entries);
 
       return { ok: true };
     });
@@ -218,26 +218,24 @@ export class NoiteSandboxAdmission extends DurableObject<ControllerEnv> {
     return await this.#serialize(async () => {
       const cap = this.#cap();
       const entries = await this.#load();
-      const current = entries[instanceId];
+      const entry = decodeEntry(entries[instanceId]);
 
-      if (
-        current === undefined ||
-        current.generation !== generation ||
-        current.stoppedAt !== undefined
-      ) {
-        return { ok: false, reason: "unavailable" };
-      }
+      const decision = applyEntry(entry, {
+        _tag: "Start",
+        admitted: withinLimit(entries, instanceId, cap),
+        at: Date.now(),
+        generation,
+      });
 
-      if (!withinLimit(entries, instanceId, cap)) {
-        return { ok: false, reason: "concurrency" };
-      }
-
-      if (current.startedAt === undefined) {
-        entries[instanceId] = {
-          ...current,
-          phase: "running",
-          startedAt: Date.now(),
+      if (decision._tag !== "Admitted") {
+        return {
+          ok: false,
+          reason: decision._tag === "Refused" ? decision.reason : "unavailable",
         };
+      }
+
+      if (decision.changed) {
+        entries[instanceId] = encodeEntry(decision.entry);
         await this.#save(entries);
       }
 
@@ -256,18 +254,19 @@ export class NoiteSandboxAdmission extends DurableObject<ControllerEnv> {
     return await this.#serialize(async () => {
       const cap = this.#cap();
       const entries = await this.#load();
-      const current = entries[instanceId];
+      const entry = decodeEntry(entries[instanceId]);
 
-      if (
-        current === undefined ||
-        current.generation !== generation ||
-        current.stoppedAt !== undefined
-      ) {
-        return { ok: false, reason: "unavailable" };
-      }
+      const decision = applyEntry(entry, {
+        _tag: "Heartbeat",
+        admitted: withinLimit(entries, instanceId, cap),
+        generation,
+      });
 
-      if (!withinLimit(entries, instanceId, cap)) {
-        return { ok: false, reason: "concurrency" };
+      if (decision._tag !== "Admitted") {
+        return {
+          ok: false,
+          reason: decision._tag === "Refused" ? decision.reason : "unavailable",
+        };
       }
 
       return { ok: true };
@@ -285,48 +284,51 @@ export class NoiteSandboxAdmission extends DurableObject<ControllerEnv> {
       throw new Error("Invalid Sandbox admission identity.");
     }
 
-    const stoppedAt = Date.now();
+    const at = Date.now();
 
     return await this.#serialize(async () => {
       const entries = await this.#load();
-      const current = entries[instanceId];
+      const entry = decodeEntry(entries[instanceId]);
+      const decision = applyEntry(entry, { _tag: "Stop", at, generation });
 
-      if (current === undefined || current.generation !== generation) {
-        // Stop may overtake a reserve whose transport timed out.
-        await this.#recordCompletion(instanceId, generation);
-
+      if (decision._tag !== "Released") {
         return;
       }
 
       // Mark first: from this put on the generation refuses re-admission even
-      // if the isolate dies before the receipt below commits.
-      if (current.stoppedAt === undefined) {
-        entries[instanceId] = { ...current, stoppedAt };
+      // if the isolate dies before the receipt below commits. The sweep is
+      // armed before the mark, so a crash from here on always has an alarm.
+      if (decision.entry !== undefined) {
+        entries[instanceId] = encodeEntry(decision.entry);
+        await this.#ensureAlarm();
         await this.#save(entries);
       }
 
-      await this.#ensureAlarm();
-      // Receipt precedes capacity release; any partial failure is safe for the
-      // alarm to retry.
       await this.#recordCompletion(instanceId, generation);
-      const { [instanceId]: _dropped, ...kept } = entries;
-      void _dropped;
-      await this.#save(kept);
+
+      if (decision.entry !== undefined) {
+        const { [instanceId]: _dropped, ...kept } = entries;
+        void _dropped;
+        await this.#save(kept);
+      }
     });
   }
 
   /**
    * Finish stops torn by an isolate death between the mark and the receipt.
    * Never infers stop from age: only the controller's own lifecycle verifies
-   * liveness and destroys denied containers.
+   * liveness and destroys denied containers. Re-arms itself while entries
+   * remain, so a torn stop always has a future sweep to finish it.
    */
   override async alarm(): Promise<void> {
     await this.#serialize(async () => {
       const entries = await this.#load();
       const swept = new Set<string>();
 
-      for (const [id, entry] of Object.entries(entries)) {
-        if (entry.stoppedAt !== undefined) {
+      for (const [id, value] of Object.entries(entries)) {
+        const entry = decodeEntry(value);
+
+        if (entry?._tag === "Stopping") {
           // oxlint-disable-next-line eslint/no-await-in-loop -- completions share one storage key; the receipts must commit in order.
           await this.#recordCompletion(id, entry.generation);
           swept.add(id);
@@ -336,13 +338,17 @@ export class NoiteSandboxAdmission extends DurableObject<ControllerEnv> {
       if (swept.size > 0) {
         const kept: Entries = {};
 
-        for (const [id, entry] of Object.entries(entries)) {
+        for (const [id, value] of Object.entries(entries)) {
           if (!swept.has(id)) {
-            kept[id] = entry;
+            kept[id] = value;
           }
         }
 
         await this.#save(kept);
+      }
+
+      if (Object.keys(entries).length > swept.size) {
+        await this.#ensureAlarm();
       }
     });
   }

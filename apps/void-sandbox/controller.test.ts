@@ -25,6 +25,7 @@ import {
   FakeProcess,
   FakeSandboxStub,
   FakeStorage,
+  Deferred,
   makeControllerEnv,
   makeCtx,
   makeService,
@@ -899,5 +900,172 @@ describe("lease lifecycle", () => {
     expect(container.destroys).toBe(1);
     expect(admission.calls.some((c) => c.method === "stopped")).toBe(true);
     expect(storage.store.has("__voidSandboxLease")).toBe(false);
+  });
+  test("afterStart refuses a stopped lease and destroys the live container", async () => {
+    const storage = new FakeStorage();
+    const container = new FakeContainer();
+    container.running = true;
+    storage.store.set("__voidSandboxLease", {
+      generation: "gen-old",
+      phase: "stopped",
+    });
+    const { admission, controller } = rig({ container, storage });
+
+    // SAFETY: white-box call into the runtime-visible lifecycle hook.
+    const direct = controller as unknown as {
+      afterStart: () => Promise<void>;
+    };
+
+    await expect(direct.afterStart()).rejects.toThrow(
+      "VOID_SANDBOX_unavailable"
+    );
+    // The refusal must not leave a container the durable record cannot stop.
+    expect(container.destroys).toBe(1);
+    expect(container.running).toBe(false);
+    expect(admission.calls.some((call) => call.method === "stopped")).toBe(
+      true
+    );
+  });
+
+  test("a release parked mid-clear cannot delete a lease a start wrote", async () => {
+    const storage = new FakeStorage();
+    const container = new FakeContainer();
+    storage.store.set("__voidSandboxLease", {
+      generation: "gen-1",
+      phase: "running",
+    });
+    const { admission, controller } = rig({ container, storage });
+
+    const gate = new Deferred<void>();
+    storage.holdDelete = { gate, key: "__voidSandboxLease" };
+
+    // SAFETY: white-box calls into the runtime-visible lifecycle hooks.
+    const direct = controller as unknown as {
+      beforeStart: () => Promise<void>;
+      stopped: () => Promise<void>;
+    };
+
+    const releasing = direct.stopped();
+    await storage.deleteEntered.promise;
+
+    const starting = direct.beforeStart();
+
+    // Without the lease lock the whole start runs while the release is parked
+    // at its clear; with it, the start stays queued. Drain microtasks (no
+    // timers) so the unfixed ordering gets its chance to lose the lease.
+    for (let turn = 0; turn < 100; turn += 1) {
+      // oxlint-disable-next-line eslint/no-await-in-loop -- each turn must yield to the microtask queue in order; Promise.all would not advance it.
+      await Promise.resolve();
+    }
+
+    gate.resolve();
+    await Promise.all([releasing, starting]);
+
+    const lease = storage.store.get("__voidSandboxLease") as
+      | { generation: string; phase: string }
+      | undefined;
+
+    expect(lease?.phase).toBe("pending");
+
+    const reserved = admission.calls.filter(
+      (call) => call.method === "reserve"
+    );
+
+    expect(reserved.at(-1)?.generation).toBe(lease?.generation);
+  });
+
+  test("a failed activity write does not leave the cell looking busy", async () => {
+    const storage = new FakeStorage();
+    const container = new FakeContainer();
+    container.running = true;
+    storage.store.set("__voidSandboxLease", {
+      generation: "gen-1",
+      phase: "running",
+    });
+    storage.store.set("__voidSandboxActivity", {
+      idleDeadline: 1,
+      lastActivity: 0,
+    });
+    const { controller } = rig({ container, storage });
+    succeedExec(container);
+
+    // The request's Begin cannot persist the deadline it touched.
+    storage.failPut = (): boolean => true;
+    await expect(controller.invoke("exec", [["echo", "hi"]])).rejects.toThrow(
+      "storage boom"
+    );
+    storage.failPut = null;
+
+    // The count must not be stranded: the cell is still idle-expired, so the
+    // alarm reaps it instead of heartbeating a phantom request forever.
+    await controller.alarm();
+    expect(container.destroys).toBe(1);
+  });
+
+  test("a direct exec is refused while the alarm is reaping", async () => {
+    const storage = new FakeStorage();
+    const container = new FakeContainer();
+    container.running = true;
+    storage.store.set("__voidSandboxLease", {
+      generation: "gen-1",
+      phase: "running",
+    });
+    storage.store.set("__voidSandboxActivity", {
+      idleDeadline: 1,
+      lastActivity: 0,
+    });
+    const { controller } = rig({ container, storage });
+
+    const gate = new Deferred<void>();
+    container.holdDestroy = gate;
+
+    const reaping = controller.alarm();
+    await container.destroyEntered.promise;
+
+    // SAFETY: white-box call into the runtime-visible exec hook.
+    const direct = controller as unknown as {
+      execProcess: (argv: string[]) => Promise<{ readonly pid: number }>;
+    };
+
+    await expect(direct.execProcess(["id"])).rejects.toThrow(
+      "VOID_SANDBOX_unavailable"
+    );
+    expect(container.execCalls).toHaveLength(0);
+
+    gate.resolve();
+    await reaping;
+  });
+
+  test("the idle reap refuses a request that arrives mid-teardown", async () => {
+    const storage = new FakeStorage();
+    const container = new FakeContainer();
+    container.running = true;
+    storage.store.set("__voidSandboxLease", {
+      generation: "gen-1",
+      phase: "running",
+    });
+    storage.store.set("__voidSandboxActivity", {
+      idleDeadline: 1,
+      lastActivity: 0,
+    });
+    const { controller } = rig({ container, storage });
+    succeedExec(container);
+
+    const gate = new Deferred<void>();
+    container.holdDestroy = gate;
+
+    const reaping = controller.alarm();
+    await container.destroyEntered.promise;
+
+    // The reap decided already: the request must be refused before it can
+    // touch the container, instead of racing the teardown.
+    await expect(controller.invoke("exec", [["echo", "hi"]])).rejects.toThrow(
+      "VOID_SANDBOX_unavailable"
+    );
+    expect(container.execCalls).toHaveLength(0);
+
+    gate.resolve();
+    await reaping;
+    expect(container.running).toBe(false);
   });
 });

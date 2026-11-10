@@ -315,3 +315,46 @@ describe("alarm", () => {
     expect(storage.puts).toBe(puts);
   });
 });
+
+describe("sweep scheduling (capacity cannot leak)", () => {
+  test("a new entry always has a reconcile alarm", async () => {
+    const storage = new FakeStorage();
+    const admission = makeAdmission(storage);
+
+    expect(storage.alarmAt).toBeNull();
+    await expect(admission.reserve("i1", "g1")).resolves.toEqual({ ok: true });
+    expect(storage.alarmAt).not.toBeNull();
+  });
+
+  test("the alarm re-arms itself while entries remain", async () => {
+    const storage = new FakeStorage();
+    const admission = makeAdmission(storage);
+    await admission.reserve("i1", "g1");
+    // The platform clears the alarm before it runs the handler.
+    storage.alarmAt = null;
+
+    await admission.alarm();
+    expect(storage.alarmAt).not.toBeNull();
+  });
+
+  test("a stop never persists its mark before the sweep is armed", async () => {
+    const storage = new FakeStorage();
+    const admission = makeAdmission(storage, "1");
+    await admission.reserve("i1", "g1");
+    // The sweep already fired once, so this stop must schedule its own.
+    storage.alarmAt = null;
+    storage.setAlarm = (): Promise<void> =>
+      Promise.reject(new Error("alarm boom"));
+
+    await expect(admission.stopped("i1", "g1")).rejects.toThrow("alarm boom");
+
+    // SAFETY: the fake storage holds exactly the table this class wrote.
+    const table = storage.store.get("noite-sandbox-admission-v1") as Record<
+      string,
+      { stoppedAt?: number }
+    >;
+
+    // No unreachable mark: the still-live entry is releasable by its retry.
+    expect(table.i1?.stoppedAt).toBeUndefined();
+  });
+});

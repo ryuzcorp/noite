@@ -44,9 +44,26 @@ import type {
   SandboxProcessWire,
 } from "void/_sandbox-container";
 
+import type {
+  Activity,
+  ActivityDecision,
+  ActivityEvent,
+  ActivityRecord,
+} from "./activity.ts";
+import { decodeActivity, stepActivity } from "./activity.ts";
 import type { AdmissionResult } from "./admission.ts";
 import { MIN_ADMISSION_NAME_LENGTH } from "./admission.ts";
+import type { WriteState } from "./bridge.ts";
+import { closeWrite, StreamBridge } from "./bridge.ts";
 import type { ControllerEnv } from "./env.ts";
+import type {
+  AdmissionMethod,
+  Lease,
+  LeaseDecision,
+  LeaseEffect,
+  LeaseFacts,
+} from "./lease.ts";
+import { decodeLease, encodeLease, stepLease } from "./lease.ts";
 
 interface Control {
   readonly reserve: (
@@ -64,18 +81,8 @@ interface Control {
   readonly stopped: (instanceId: string, generation: string) => Promise<void>;
 }
 
-interface Lease {
-  readonly generation: string;
-  readonly phase: "pending" | "running" | "stopped";
-}
-
 const LEASE_KEY = "__voidSandboxLease";
 const ACTIVITY_KEY = "__voidSandboxActivity";
-
-interface Activity {
-  readonly lastActivity: number;
-  readonly idleDeadline: number;
-}
 
 const HEARTBEAT_MS = 30_000;
 const CONTROL_TIMEOUT_MS = 5000;
@@ -208,16 +215,16 @@ const bounded = async <T>(operation: Promise<T>): Promise<T> => {
   }
 };
 
-const settleStart = (): void => {
+const settleTail = (): void => {
   // The tail only sequences; each waiter already owns its own outcome.
 };
 
 /** Platform-owned lifecycle; no application code is loaded in this Worker. */
 export class SandboxController extends SandboxContainer<ControllerEnv> {
   #finishing: Promise<void> | undefined;
-  #activity: Activity | undefined;
-  #activityReady: Promise<void> | undefined;
-  #busy = 0;
+  #activity: Activity = { _tag: "Absent" };
+  #activityLoaded = false;
+  #activityTail: Promise<void> = Promise.resolve();
   #generation: ProcessCompletion = {};
   #startTail: Promise<void> = Promise.resolve();
 
@@ -242,31 +249,102 @@ export class SandboxController extends SandboxContainer<ControllerEnv> {
     return completion;
   }
 
+  /**
+   * Serialize every activity read/mutation. The alarm's reap decision and a
+   * request's `Begin` are ordered by this queue, so a request can never land
+   * between the idle check and the teardown.
+   */
+  #serializeActivity<T>(operation: () => Promise<T>): Promise<T> {
+    // oxlint-disable-next-line promise/prefer-await-to-then -- the queue links continuations; awaiting here would serialize the caller instead of the work.
+    const result = this.#activityTail.then(operation);
+    // oxlint-disable-next-line promise/prefer-await-to-then -- see above: the tail must advance without blocking this call.
+    this.#activityTail = result.then(settleTail, settleTail);
+
+    return result;
+  }
+
   async #loadActivity(): Promise<void> {
-    this.#activityReady ??= (async () => {
-      this.#activity = await this.ctx.storage.get<Activity>(ACTIVITY_KEY);
-    })();
-    await this.#activityReady;
+    if (this.#activityLoaded) {
+      return;
+    }
+
+    this.#activity = decodeActivity(
+      await this.ctx.storage.get<ActivityRecord>(ACTIVITY_KEY)
+    );
+    this.#activityLoaded = true;
+  }
+
+  /**
+   * One serialized transition; the record write rides along inside the lock.
+   *
+   * A failed write rolls the transition back, so the cell never looks busier
+   * than it is — a stranded count would suppress idle reaping until the
+   * isolate resets. `End` is the one exception: the request is over whatever
+   * the disk did (the old `#busy -= 1` ran in a `finally`), so its count
+   * commits before the write and a failed deadline write only leaves the
+   * stored record stale, never a phantom request.
+   */
+  async #activityStep(event: ActivityEvent): Promise<ActivityDecision> {
+    return await this.#serializeActivity(async () => {
+      await this.#loadActivity();
+
+      const decision = stepActivity(this.#activity, event);
+
+      if (decision._tag === "Refused") {
+        return decision;
+      }
+
+      if (event._tag === "End") {
+        this.#activity = decision.activity;
+
+        if (decision.persist !== undefined) {
+          await this.ctx.storage.put(ACTIVITY_KEY, decision.persist);
+        }
+
+        return decision;
+      }
+
+      if (decision.persist !== undefined) {
+        await this.ctx.storage.put(ACTIVITY_KEY, decision.persist);
+      }
+
+      this.#activity = decision.activity;
+
+      return decision;
+    });
   }
 
   async #touch(): Promise<void> {
-    await this.#loadActivity();
-    const lastActivity = Date.now();
-    this.#activity = {
-      idleDeadline: lastActivity + this.inactivityTimeoutMs,
-      lastActivity,
-    };
-    await this.ctx.storage.put(ACTIVITY_KEY, this.#activity);
+    const at = Date.now();
+
+    await this.#activityStep({
+      _tag: "Touch",
+      at,
+      timeoutMs: this.inactivityTimeoutMs,
+    });
+  }
+
+  /** Teardown clears the idle record and the reap lock (the key is deleted too). */
+  async #resetActivity(): Promise<void> {
+    await this.#serializeActivity(async () => {
+      this.#activity = { _tag: "Absent" };
+      this.#activityLoaded = true;
+      await this.ctx.storage.delete(ACTIVITY_KEY);
+    });
   }
 
   async #active(): Promise<() => Promise<void>> {
-    this.#busy += 1;
+    const at = Date.now();
 
-    try {
-      await this.#touch();
-    } catch (error) {
-      this.#busy -= 1;
-      throw error;
+    const decision = await this.#activityStep({
+      _tag: "Begin",
+      at,
+      timeoutMs: this.inactivityTimeoutMs,
+    });
+
+    if (decision._tag === "Refused") {
+      // The alarm is reaping this cell: refuse before touching the container.
+      throw denied("unavailable");
     }
 
     let finished = false;
@@ -278,27 +356,21 @@ export class SandboxController extends SandboxContainer<ControllerEnv> {
 
       finished = true;
 
-      try {
-        if (this.container.running) {
-          await this.#touch();
-        }
-      } finally {
-        this.#busy -= 1;
-      }
+      await this.#activityStep({
+        _tag: "End",
+        at: Date.now(),
+        running: this.container.running,
+        timeoutMs: this.inactivityTimeoutMs,
+      });
     };
   }
 
   override async configure(options: SandboxOptions): Promise<void> {
     await super.configure(options);
-    await this.#loadActivity();
-
-    if (this.#activity !== undefined) {
-      this.#activity = {
-        ...this.#activity,
-        idleDeadline: this.#activity.lastActivity + this.inactivityTimeoutMs,
-      };
-      await this.ctx.storage.put(ACTIVITY_KEY, this.#activity);
-    }
+    await this.#activityStep({
+      _tag: "Configure",
+      timeoutMs: this.inactivityTimeoutMs,
+    });
   }
 
   protected override async waitForProcessExit(
@@ -330,10 +402,7 @@ export class SandboxController extends SandboxContainer<ControllerEnv> {
     }
   }
 
-  #readable(
-    stream: ReadableStream,
-    finish?: () => Promise<void>
-  ): ReadableStream {
+  #readable(stream: ReadableStream, bridge?: StreamBridge): ReadableStream {
     const reader = stream.getReader();
 
     return new ReadableStream(
@@ -342,9 +411,7 @@ export class SandboxController extends SandboxContainer<ControllerEnv> {
           try {
             await reader.cancel(reason);
           } finally {
-            if (finish !== undefined) {
-              await finish();
-            }
+            await bridge?.close("cancel");
           }
         },
         pull: async (controller) => {
@@ -354,12 +421,12 @@ export class SandboxController extends SandboxContainer<ControllerEnv> {
             if (chunk.done) {
               controller.close();
 
-              await finish?.();
+              await bridge?.close("done");
             } else {
               // Workers RPC eagerly pumps transferred streams, even if the
               // application never reads them. A pending transport read must
               // not keep an unattended background process alive forever.
-              if (finish === undefined) {
+              if (bridge === undefined) {
                 await this.#touch();
               }
 
@@ -368,7 +435,7 @@ export class SandboxController extends SandboxContainer<ControllerEnv> {
           } catch (error) {
             controller.error(error);
 
-            await finish?.();
+            await bridge?.close("error");
           }
         },
       },
@@ -378,6 +445,7 @@ export class SandboxController extends SandboxContainer<ControllerEnv> {
 
   #writable(stream: WritableStream): WritableStream {
     const writer = stream.getWriter();
+    let state: WriteState = { _tag: "Open" };
 
     const run = async (operation: () => Promise<void>): Promise<void> => {
       const finish = await this.#active();
@@ -389,9 +457,18 @@ export class SandboxController extends SandboxContainer<ControllerEnv> {
       }
     };
 
+    const terminal = async (operation: () => Promise<void>): Promise<void> => {
+      if (state._tag === "Closed") {
+        return;
+      }
+
+      state = closeWrite(state);
+      await run(operation);
+    };
+
     return new WritableStream({
-      abort: (reason) => run(() => writer.abort(reason)),
-      close: () => run(() => writer.close()),
+      abort: (reason) => terminal(() => writer.abort(reason)),
+      close: () => terminal(() => writer.close()),
       write: (chunk) => run(() => writer.write(chunk)),
     });
   }
@@ -415,7 +492,10 @@ export class SandboxController extends SandboxContainer<ControllerEnv> {
       if (result instanceof Response && result.body !== null) {
         streaming = true;
 
-        return new Response(this.#readable(result.body, finish), result);
+        return new Response(
+          this.#readable(result.body, new StreamBridge(finish)),
+          result
+        );
       }
 
       if (operation === "exec") {
@@ -482,7 +562,24 @@ export class SandboxController extends SandboxContainer<ControllerEnv> {
   ): Promise<BaseExecProcess> {
     await this.#guardExec();
 
-    return this.container.exec(argv, { ...options });
+    // A direct `execProcess` (tenant RPC) never goes through
+    // `waitForProcessExit`, so it must enter the activity machine itself:
+    // `Begin` refuses a cell the alarm is reaping, and the exit settles the
+    // count even when nothing waits on the process.
+    const finish = await this.#active();
+
+    try {
+      const process = await this.container.exec(argv, { ...options });
+
+      // oxlint-disable-next-line promise/prefer-await-to-then -- a lifetime listener, not a wait: the spawn must return while the process runs.
+      void process.exitCode.then(finish, finish);
+
+      return process;
+    } catch (error) {
+      await finish();
+
+      throw error;
+    }
   }
 
   /**
@@ -499,9 +596,9 @@ export class SandboxController extends SandboxContainer<ControllerEnv> {
       return;
     }
 
-    const lease = await this.ctx.storage.get<Lease>(LEASE_KEY);
+    const lease = await this.#readLease();
 
-    if (lease?.phase === "pending") {
+    if (lease._tag === "Pending") {
       return;
     }
 
@@ -550,12 +647,20 @@ export class SandboxController extends SandboxContainer<ControllerEnv> {
     await this.ctx.storage.setAlarm(Date.now() + HEARTBEAT_MS);
   }
 
-  async #control(
-    method: "reserve" | "started" | "heartbeat",
-    lease: Lease
-  ): Promise<void> {
+  async #readLease(): Promise<Lease> {
+    return decodeLease(await this.ctx.storage.get(LEASE_KEY));
+  }
+
+  #facts(): LeaseFacts {
+    return {
+      container: this.container.running ? "running" : "stopped",
+      starting: this.starting,
+    };
+  }
+
+  async #control(method: AdmissionMethod, generation: string): Promise<void> {
     const result = await bounded(
-      this.#admission()[method](this.ctx.id.toString(), lease.generation)
+      this.#admission()[method](this.ctx.id.toString(), generation)
     );
 
     if (!result.ok) {
@@ -563,89 +668,203 @@ export class SandboxController extends SandboxContainer<ControllerEnv> {
     }
   }
 
+  async #saveLease(lease: Lease): Promise<void> {
+    const stored = encodeLease(lease);
+
+    if (stored === null) {
+      await this.ctx.storage.delete(LEASE_KEY);
+
+      return;
+    }
+
+    await this.ctx.storage.put(LEASE_KEY, stored);
+  }
+
   /**
-   * Noite: serialize the lease-reserve sequence per cell. The `invoke` path
-   * already funnels through one `#setup`, but direct `beforeStart` calls
-   * would interleave: two starts could both mint generations, race at
-   * `reserve`, and leave the winner's admission entry with no controller
-   * lease to ever stop it. Queued, a second start cleanly supersedes the
-   * first (`stopped` releases its reservation before the new one mints).
+   * Compare-and-clear: a release computed from an older snapshot must never
+   * delete a newer lease (that would orphan the newer admission row).
    */
-  #serializeStart<T>(operation: () => Promise<T>): Promise<T> {
+  async #clearLease(generation: string): Promise<void> {
+    const lease = await this.#readLease();
+
+    if (lease._tag === "Absent" || lease.generation !== generation) {
+      return;
+    }
+
+    await this.ctx.storage.delete(LEASE_KEY);
+    await this.#resetActivity();
+    await this.ctx.storage.deleteAlarm();
+  }
+
+  /**
+   * Compare-and-set `pending` → `running`. `afterStart` runs outside the lease
+   * lock, so a supersede or a stop must win over this write.
+   */
+  async #markRunning(generation: string): Promise<void> {
+    const lease = await this.#readLease();
+
+    if (lease._tag !== "Pending" || lease.generation !== generation) {
+      return;
+    }
+
+    await this.#saveLease({ _tag: "Running", generation });
+  }
+
+  /** Compare-and-set the durable stop mark, for the same reason. */
+  async #markStopping(generation: string): Promise<void> {
+    const lease = await this.#readLease();
+
+    if (lease._tag === "Absent" || lease.generation !== generation) {
+      return;
+    }
+
+    await this.#saveLease({ _tag: "Stopping", generation });
+  }
+
+  /** Run a lease transition's effects in order; a failure leaves the durable state as the recovery point. */
+  async #applyEffect(effect: LeaseEffect): Promise<void> {
+    if (effect._tag === "Kill") {
+      await this.container.destroy();
+
+      return;
+    }
+
+    if (effect._tag === "Destroy") {
+      await this.destroy();
+
+      return;
+    }
+
+    if (effect._tag === "Admit") {
+      await this.#control(effect.method, effect.generation);
+
+      return;
+    }
+
+    if (effect._tag === "Persist") {
+      await this.#saveLease(effect.lease);
+
+      return;
+    }
+
+    if (effect._tag === "MarkStopping") {
+      await this.#markStopping(effect.generation);
+
+      return;
+    }
+
+    if (effect._tag === "MarkRunning") {
+      await this.#markRunning(effect.generation);
+
+      return;
+    }
+
+    if (effect._tag === "ReleaseAdmission") {
+      await bounded(
+        this.#admission().stopped(this.ctx.id.toString(), effect.generation)
+      );
+
+      return;
+    }
+
+    if (effect._tag === "Clear") {
+      await this.#clearLease(effect.generation);
+
+      return;
+    }
+
+    if (effect._tag === "ReleaseNow") {
+      await this.stopped();
+
+      return;
+    }
+
+    if (effect._tag === "Arm") {
+      await this.#arm();
+
+      return;
+    }
+
+    await this.#touch();
+  }
+
+  async #runLease(decision: LeaseDecision): Promise<void> {
+    for (const effect of decision.effects) {
+      // oxlint-disable-next-line eslint/no-await-in-loop -- effects are ordered: persist before admit, release before clear.
+      await this.#applyEffect(effect);
+    }
+  }
+
+  /**
+   * Noite: serialize every lease mutation per cell. The `invoke` path already
+   * funnels through one `#setup`, but direct `beforeStart` calls would
+   * interleave: two starts could both mint generations, race at `reserve`,
+   * and leave the winner's admission entry with no controller lease to ever
+   * stop it. The same lock keeps a release from interleaving with a start, so
+   * a teardown can never clear a lease a newer start just wrote. Queued, a
+   * second start cleanly supersedes the first (`Release` frees its
+   * reservation before the new one mints).
+   *
+   * Not re-entrant: a transition run under this lock must never emit
+   * `Destroy` or `ReleaseNow` (both re-enter `stopped()`); only `beforeStart`
+   * and `stopped()` take the lock, and neither emits them.
+   */
+  #serializeLease<T>(operation: () => Promise<T>): Promise<T> {
     // oxlint-disable-next-line promise/prefer-await-to-then -- the queue links continuations; awaiting here would serialize the caller instead of the work.
     const result = this.#startTail.then(operation);
     // oxlint-disable-next-line promise/prefer-await-to-then -- see above: the tail must advance without blocking this call.
-    this.#startTail = result.then(settleStart, settleStart);
+    this.#startTail = result.then(settleTail, settleTail);
 
     return result;
   }
 
   protected override async beforeStart(): Promise<void> {
-    return await this.#serializeStart(async () => {
+    return await this.#serializeLease(async () => {
       // Noite: no `instanceType` assignment — celld sizes from config, and the
       // `container` wrapper strips the `instance` start arg.
-      let lease = await this.ctx.storage.get<Lease>(LEASE_KEY);
+      const decision = stepLease(
+        await this.#readLease(),
+        { _tag: "Start", generation: crypto.randomUUID() },
+        this.#facts()
+      );
 
-      if (lease?.phase === "running" && this.container.running) {
-        await this.#control("heartbeat", lease);
-        await this.#arm();
-
-        return;
+      if (decision._tag === "Next" && decision.lease._tag === "Pending") {
+        this.#generation = {};
       }
 
-      if (lease !== undefined) {
-        if (this.container.running) {
-          await this.container.destroy();
-        }
-
-        await this.stopped();
-      }
-
-      // A container with no durable admission record must never be adopted.
-      if (this.container.running) {
-        await this.container.destroy();
-      }
-
-      this.#generation = {};
-      lease = { generation: crypto.randomUUID(), phase: "pending" };
-      await this.ctx.storage.put(LEASE_KEY, lease);
-      await this.#arm();
-      await this.#control("reserve", lease);
+      await this.#runLease(decision);
     });
   }
 
   protected override async afterStart(): Promise<void> {
-    const lease = await this.ctx.storage.get<Lease>(LEASE_KEY);
+    const decision = stepLease(
+      await this.#readLease(),
+      { _tag: "Started" },
+      this.#facts()
+    );
 
-    if (
-      lease === undefined ||
-      lease.phase === "stopped" ||
-      !this.container.running
-    ) {
+    // A refusal still runs its effects: the container it refuses must not keep
+    // running without a durable record to ever stop it.
+    await this.#runLease(decision);
+
+    if (decision._tag === "Refused") {
       throw denied("unavailable");
     }
-
-    if (lease.phase === "pending") {
-      await this.#control("started", lease);
-      await this.ctx.storage.put(LEASE_KEY, {
-        ...lease,
-        phase: "running",
-      } satisfies Lease);
-      await this.#touch();
-    }
-
-    await this.#arm();
   }
 
   protected override async beforeUse(): Promise<void> {
-    const lease = await this.ctx.storage.get<Lease>(LEASE_KEY);
+    const decision = stepLease(
+      await this.#readLease(),
+      { _tag: "Use" },
+      this.#facts()
+    );
 
-    if (lease === undefined || lease.phase !== "running") {
+    if (decision._tag === "Refused") {
       throw denied("unavailable");
     }
 
     try {
-      await this.#control("heartbeat", lease);
+      await this.#runLease(decision);
     } catch (error) {
       this.#generation.failure =
         error instanceof Error ? error : denied("unavailable");
@@ -660,35 +879,31 @@ export class SandboxController extends SandboxContainer<ControllerEnv> {
     }
   }
 
+  /**
+   * The base class calls this from `destroy()` after the container is gone.
+   * It is the release transition: a stop mark first (so a crash still finds
+   * it), the admission receipt, then the keys. It never releases while the
+   * container still runs — that would hand a live container's capacity to
+   * another cell.
+   */
   protected override async stopped(): Promise<void> {
     if (this.#finishing !== undefined) {
       return this.#finishing;
     }
 
-    const pending = (async () => {
-      if (this.container.running) {
-        return;
-      }
-
-      const lease = await this.ctx.storage.get<Lease>(LEASE_KEY);
-
-      if (lease === undefined) {
-        return;
-      }
-
-      await this.ctx.storage.put(LEASE_KEY, {
-        ...lease,
-        phase: "stopped",
-      } satisfies Lease);
-      await this.#arm();
-      await bounded(
-        this.#admission().stopped(this.ctx.id.toString(), lease.generation)
+    const pending = this.#serializeLease(async () => {
+      const decision = stepLease(
+        await this.#readLease(),
+        { _tag: "Release" },
+        this.#facts()
       );
-      await this.ctx.storage.delete(LEASE_KEY);
-      await this.ctx.storage.delete(ACTIVITY_KEY);
-      this.#activity = undefined;
-      await this.ctx.storage.deleteAlarm();
-    })();
+
+      if (decision._tag === "Refused") {
+        return;
+      }
+
+      await this.#runLease(decision);
+    });
 
     this.#finishing = pending;
 
@@ -703,33 +918,31 @@ export class SandboxController extends SandboxContainer<ControllerEnv> {
 
   override async alarm(): Promise<void> {
     try {
-      const lease = await this.ctx.storage.get<Lease>(LEASE_KEY);
+      const lease = await this.#readLease();
 
-      if (lease === undefined) {
+      if (lease._tag === "Absent") {
         return;
       }
 
-      if (lease.phase === "running" && this.container.running) {
-        await this.#loadActivity();
+      if (lease._tag === "Running" && this.container.running) {
+        const activity = await this.#activityStep({
+          _tag: "Tick",
+          now: Date.now(),
+          timeoutMs: this.inactivityTimeoutMs,
+        });
 
-        if (this.#activity === undefined) {
-          await this.#touch();
-        }
-
-        // SAFETY: `#touch` above assigns `#activity` before its first await
-        // resolves, so a successful return guarantees it is set.
-        const activity = this.#activity as Activity;
-
-        if (this.#busy === 0 && Date.now() >= activity.idleDeadline) {
+        if (activity._tag === "Ok" && activity.reap) {
+          // The activity lock held only the decision; every later `Begin`
+          // sees `Expired` and is refused, so no request races this destroy.
           await this.destroy();
 
           return;
         }
-
-        await this.#control("heartbeat", lease);
-      } else if (lease.phase !== "pending" || !this.starting) {
-        await this.destroy();
       }
+
+      await this.#runLease(
+        stepLease(lease, { _tag: "Recover" }, this.#facts())
+      );
     } catch (error) {
       this.#generation.failure =
         error instanceof Error ? error : denied("unavailable");
@@ -742,7 +955,9 @@ export class SandboxController extends SandboxContainer<ControllerEnv> {
 
       console.error("[void/sandbox] lifecycle check failed", error);
     } finally {
-      if ((await this.ctx.storage.get(LEASE_KEY)) !== undefined) {
+      const lease = await this.#readLease();
+
+      if (lease._tag !== "Absent") {
         await this.#arm();
       }
     }
