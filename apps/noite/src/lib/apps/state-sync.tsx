@@ -54,6 +54,17 @@ export interface FrameRole {
   readonly myRole?: AppRole | undefined;
 }
 
+/**
+ * The hold a badge paints, coarse enough to be a change signal: the reason
+ * plus the deadline to the second. `retryAt` is the same instant on every
+ * frame up to a sub-millisecond jitter, so comparing the raw string would
+ * refetch the detail every two seconds for nothing.
+ */
+const holdShown = (hold: RunnerAppState["app"]["fleetHold"]): string =>
+  hold === null || hold === undefined
+    ? ""
+    : `${hold.hold}@${hold.retryAt.slice(0, 19)}`;
+
 const appShown = (
   app: AppDetail["app"],
   frame: RunnerAppState["app"]
@@ -63,6 +74,7 @@ const appShown = (
   app.lastDeploySha !== frame.lastDeploySha ||
   app.lastError !== frame.lastError ||
   app.asleepSince !== frame.asleepSince ||
+  holdShown(app.fleetHold) !== holdShown(frame.fleetHold) ||
   app.name !== frame.name ||
   app.slug !== frame.slug ||
   app.subdomain !== frame.subdomain;

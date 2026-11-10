@@ -6,12 +6,14 @@ import { Link } from "@ilha/void";
 import { watch } from "ilha";
 
 import { appHost, appUrl } from "../apps/identity";
+import { formatAgo } from "../dates";
 import { errorMessage } from "../errors";
 import { appStateUrl, decodeAppState, feedKeys, liveFeed } from "../feeds";
 import { islandProps } from "../island";
 import { resourceValue, resourceError } from "../resource";
 import { appDetail } from "../resources";
 import type { AppRole } from "../roles";
+import type { FleetHoldInfo } from "../runner-types/FleetHoldInfo";
 import { AppStorageList } from "../storage/list";
 import { Avatar } from "../ui/avatar";
 import { CopyButton } from "../ui/copy-button";
@@ -35,6 +37,7 @@ export interface AppDetailInfo {
   app: {
     desiredState: string;
     fleetBucket: string;
+    fleetHold?: FleetHoldInfo | null;
     id: string;
     imported: boolean;
     lastDeploySha: string | null;
@@ -67,6 +70,11 @@ const IdentityLine = ({
     <span class="inline-flex items-center gap-1.5">
       <span class={`status ${view.tone}`} aria-hidden="true" />
       {view.label}
+      {view.retryAt ? (
+        <span class="opacity-70" title={view.retryAt}>
+          · {formatAgo(view.retryAt)}
+        </span>
+      ) : null}
     </span>
     <span class="opacity-30" aria-hidden="true">
       ·

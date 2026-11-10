@@ -320,6 +320,31 @@ impl DeployWrite {
     }
 }
 
+/// Why a fleet is being retried while its row still says `running`: the
+/// supervisor's crash or OOM backoff. Its own type because it is process
+/// state — never a column, and never folded into [`AppStatus`], which is
+/// about what the app is doing, not about why the runner is waiting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub enum FleetHold {
+    /// The child exited on its own; the next spawn backs off 5 s … 60 s.
+    Crash,
+    /// The kernel OOM-killed the child at its memory cap.
+    Oom,
+}
+
+/// A held fleet as the API serves it: the reason plus the instant the next
+/// spawn attempt is due. Carried by [`App::fleet_hold`] only.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct FleetHoldInfo {
+    pub hold: FleetHold,
+    /// RFC 3339 instant the next spawn attempt is due.
+    pub retry_at: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export)]
@@ -355,6 +380,14 @@ pub struct App {
     /// Whether the row carries a stored import source — the UI's Retry gate.
     /// Derived in SQL (`import_source IS NOT NULL`), never a column.
     pub imported: bool,
+    /// Why the supervisor is holding this app's next spawn (a crash or an OOM
+    /// backoff), `None` when it is not held. Filled by the service layer from
+    /// the supervisor's [`crate::host::supervisor::FleetState`] — process
+    /// state, never a column, and it never changes [`AppStatus`].
+    #[sqlx(skip)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub fleet_hold: Option<FleetHoldInfo>,
 }
 
 impl App {

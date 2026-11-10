@@ -111,6 +111,39 @@ describe("staleKeys", () => {
     ).toEqual([keys.appDetail("app_1")]);
   });
 
+  test("a fleet hold appearing, changing or lifting refetches the detail", () => {
+    const hold = {
+      hold: "crash" as const,
+      retryAt: "2026-11-10T16:40:05.000Z",
+    };
+
+    // The badge flips to "crashed, retrying" and back: both are shown.
+    expect(
+      staleKeys("app_1", frame({ fleetHold: hold }), detail(), [env()])
+    ).toEqual([keys.appDetail("app_1")]);
+    expect(
+      staleKeys("app_1", frame(), detail({ fleetHold: hold }), [env()])
+    ).toEqual([keys.appDetail("app_1")]);
+    // A later attempt (a new deadline, same reason) moves the time.
+    expect(
+      staleKeys(
+        "app_1",
+        frame({ fleetHold: { ...hold, retryAt: "2026-11-10T16:41:05.000Z" } }),
+        detail({ fleetHold: hold }),
+        [env()]
+      )
+    ).toEqual([keys.appDetail("app_1")]);
+    // The same hold at sub-second jitter is not a change.
+    expect(
+      staleKeys(
+        "app_1",
+        frame({ fleetHold: { ...hold, retryAt: "2026-11-10T16:40:05.499Z" } }),
+        detail({ fleetHold: hold }),
+        [env()]
+      )
+    ).toEqual([]);
+  });
+
   test("bookkeeping a page never shows refetches nothing", () => {
     expect(
       staleKeys(

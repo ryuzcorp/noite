@@ -223,6 +223,86 @@ async fn apps_get_agrees() {
     h.finish().await;
 }
 
+/// The app API carries the supervisor's crash/OOM hold, on both transports
+/// and in the list: a crash-looping fleet answered `running` with nothing to
+/// say why, which is what the "crashed, retrying" badge reads. A fleet that is
+/// not held omits the field entirely (the row never carries it).
+#[tokio::test]
+async fn apps_report_a_held_fleet_on_both_transports() {
+    let h = Harness::new().await;
+    let held = h.seed_app("held-app").await;
+    let fine = h.seed_app("fine-app").await;
+    // A fleet that exited on its own, through the supervisor's own exit path,
+    // plus one that never ran.
+    {
+        let child = tokio::process::Command::new("true")
+            .kill_on_drop(true)
+            .spawn()
+            .expect("a child that exits at once");
+        let mut map = h.state.procs.lock().await;
+        map.insert(
+            held.slug.clone(),
+            crate::host::supervisor::FleetEntry::test_entry(child),
+        );
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while std::time::Instant::now() < deadline {
+        if crate::host::supervisor::note_exit(&h.state.procs, &held.slug, 256)
+            .await
+            .is_some()
+        {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        crate::host::supervisor::hold_until(&h.state.procs, &held.slug)
+            .await
+            .is_some(),
+        "the fleet took its crash hold"
+    );
+
+    let (status, rest_app) = h.rest("GET", &format!("/v1/apps/{}", held.id), None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(rest_app["fleetHold"]["hold"], "crash");
+    assert!(
+        chrono::DateTime::parse_from_rfc3339(
+            rest_app["fleetHold"]["retryAt"]
+                .as_str()
+                .expect("retryAt is a string")
+        )
+        .is_ok(),
+        "retryAt is RFC 3339: {}",
+        rest_app["fleetHold"]["retryAt"]
+    );
+    let rpc_app = h
+        .rpc("apps.get", json!({ "id": held.id }))
+        .await
+        .expect("apps.get");
+    assert_eq!(rest_app, rpc_app, "both transports serve the same hold");
+
+    let (status, list) = h.rest("GET", "/v1/apps", None).await;
+    assert_eq!(status, StatusCode::OK);
+    let listed = list
+        .as_array()
+        .expect("a list of apps")
+        .iter()
+        .find(|app| app["id"] == json!(held.id))
+        .expect("the held app is listed");
+    assert_eq!(listed["fleetHold"]["hold"], "crash");
+    let other = list
+        .as_array()
+        .expect("a list of apps")
+        .iter()
+        .find(|app| app["id"] == json!(fine.id))
+        .expect("the running app is listed");
+    assert!(
+        other.get("fleetHold").is_none(),
+        "a fleet that is not held sends no hold: {other}"
+    );
+    h.finish().await;
+}
+
 #[tokio::test]
 async fn apps_patch_agrees() {
     let h = Harness::new().await;

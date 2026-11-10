@@ -531,6 +531,7 @@ mod tests {
             deployed_config: None,
             import_source: None,
             imported: false,
+            fleet_hold: None,
         }
     }
 

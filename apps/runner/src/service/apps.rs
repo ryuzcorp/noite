@@ -26,21 +26,34 @@ use crate::AppState;
 static CREATE_LOCK: LazyLock<tokio::sync::Mutex<()>> =
     LazyLock::new(|| tokio::sync::Mutex::new(()));
 
+/// Fill a row's [`App::fleet_hold`] on its way out: the supervisor's crash or
+/// OOM backoff is process state, so the row never carries it and every read
+/// that answers a client annotates here. One helper so REST, RPC and the state
+/// stream cannot disagree about whether an app is held.
+async fn with_hold(state: &AppState, mut app: App) -> App {
+    crate::host::supervisor::annotate_holds(&state.procs, std::slice::from_mut(&mut app)).await;
+    app
+}
+
 /// The single "load the app or answer 404" helper every domain uses, so the
 /// not-found body is uniform across REST and RPC.
 pub async fn app_or_404(state: &AppState, id: &str) -> Result<App, ApiError> {
     match db::get_app(&state.pool, id).await {
-        Ok(Some(app)) => Ok(app),
+        Ok(Some(app)) => Ok(with_hold(state, app).await),
         Ok(None) => Err(ApiError::not_found("app not found")),
         Err(e) => Err(ApiError::internal(e.to_string())),
     }
 }
 
 pub async fn list(state: &AppState) -> Result<Vec<App>, ApiError> {
-    db::list_apps(&state.pool)
+    let mut apps: Vec<App> = db::list_apps(&state.pool)
         .await
-        .map(|apps| apps.into_iter().filter(|app| !deleting(&app.id)).collect())
-        .map_err(|e| ApiError::internal(e.to_string()))
+        .map_err(|e| ApiError::internal(e.to_string()))?
+        .into_iter()
+        .filter(|app| !deleting(&app.id))
+        .collect();
+    crate::host::supervisor::annotate_holds(&state.procs, &mut apps).await;
+    Ok(apps)
 }
 
 pub async fn get(state: &AppState, id: &str) -> Result<App, ApiError> {
@@ -53,7 +66,7 @@ pub async fn get(state: &AppState, id: &str) -> Result<App, ApiError> {
 
 pub async fn get_by_slug(state: &AppState, slug: &str) -> Result<App, ApiError> {
     match db::get_app_by_slug(&state.pool, slug).await {
-        Ok(Some(app)) if !deleting(&app.id) => Ok(app),
+        Ok(Some(app)) if !deleting(&app.id) => Ok(with_hold(state, app).await),
         Ok(_) => Err(ApiError::not_found("app not found")),
         Err(e) => Err(ApiError::internal(e.to_string())),
     }

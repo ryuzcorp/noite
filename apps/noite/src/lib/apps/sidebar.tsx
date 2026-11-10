@@ -18,6 +18,7 @@ import {
 import { OpenPrBadge } from "../prs/layout";
 import { resourceValue } from "../resource";
 import { adminStatus, session } from "../resources";
+import type { RunnerApp } from "../runner";
 import { Code, GitPullRequest, LayoutDashboard } from "../ui/icons";
 import { presenceTone } from "./identity";
 
@@ -97,12 +98,14 @@ const MenuLink = ({
 const SidebarAppLink = ({
   appId,
   desiredState,
+  fleetHold,
   name,
   status,
   view,
 }: {
   appId: string;
   desiredState: string;
+  fleetHold?: RunnerApp["fleetHold"];
   name: string;
   status: string;
   view: AppView | null;
@@ -123,8 +126,8 @@ const SidebarAppLink = ({
             up with "Apps". */}
         <span class="flex h-5 w-5 shrink-0 items-center justify-center">
           <span
-            class={`status ${presenceTone(status, desiredState)}`}
-            title={status}
+            class={`status ${presenceTone(status, desiredState, fleetHold)}`}
+            title={fleetHold ? `${status} (retrying)` : status}
             aria-hidden="true"
           />
         </span>
@@ -194,6 +197,7 @@ export const SidebarApps = ({
           key={app.id}
           appId={app.id}
           desiredState={app.desiredState}
+          fleetHold={app.fleetHold}
           name={app.name}
           status={app.status}
           view={activeId === app.id ? activeView : null}
