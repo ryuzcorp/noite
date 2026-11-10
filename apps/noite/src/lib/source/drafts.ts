@@ -4,6 +4,7 @@
 //! this module holds the shapes that cross the boundary.
 
 import type { PreviewResult } from "../runner";
+import type { StaleBase } from "./stale-base";
 import type { WorkspaceChange } from "./workspace/types";
 
 /** Why the browsed checkout is read-only: `""` when it is editable, else
@@ -48,9 +49,10 @@ export interface SourceBrowserState {
   readOnly: ReadOnlyRef;
   /** Bumped on every change: a key for views rebuilt from `files`. */
   revision: number;
-  /** The commit the pod is based on, when the browsed tip has moved on since —
-   * pushing from it may conflict. */
-  stale: string | null;
+  /** The checkout's staleness when the pod's work is based on a commit the
+   * browsed tip has moved past — pushing from it may conflict. Its own entry
+   * carries both commits, never one under the other's name. */
+  stale: StaleBase | null;
 }
 
 /** A push the Changes panel asks for. `branch` names a new branch to commit

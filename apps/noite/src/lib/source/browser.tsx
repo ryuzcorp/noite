@@ -84,6 +84,7 @@ import {
   switchingTo,
 } from "./ref-view";
 import type { RefEvent, RefView } from "./ref-view";
+import { staleBase } from "./stale-base";
 import type { TerminalLink } from "./terminal-session";
 import { createTreeWiring } from "./tree";
 import { base64Bytes, checkLimits, UPLOAD_LIMITS } from "./uploads";
@@ -398,11 +399,12 @@ export const SourceBrowser = ({
         readOnly: readOnlyOf(refView),
         revision,
         // The notice names the commit the pod is based on; the pod only calls
-        // itself stale against a tip that moved on from it.
+        // itself stale against a tip that moved on from it. Both are carried:
+        // `Workspace.stale` is the tip, the panel names the base.
         stale:
-          workspace?.stale === null || workspace === null
+          workspace === null
             ? null
-            : workspace.baseSha,
+            : staleBase(workspace.stale, workspace.baseSha),
       });
     };
 

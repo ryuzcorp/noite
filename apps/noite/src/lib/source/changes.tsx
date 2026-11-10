@@ -561,8 +561,12 @@ export const ChangesPanel = ({
           role="status"
         >
           Based on an older commit:{" "}
-          <span class="font-mono">{stale.slice(0, 7)}</span>; pushing may
-          conflict.
+          <span class="font-mono">{stale.baseSha.slice(0, 7)}</span>; pushing
+          may conflict with{" "}
+          <span class="font-mono" title={stale.tipSha}>
+            {stale.tipSha.slice(0, 7)}
+          </span>
+          .
         </p>
       )}
       <div class="min-h-0 flex-1 overflow-auto">

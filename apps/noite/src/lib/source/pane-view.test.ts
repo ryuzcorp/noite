@@ -2,6 +2,7 @@ import { expect, test } from "bun:test";
 
 import {
   newPaneMachine,
+  ownedPainted,
   paintedOf,
   PaneEvents,
   panePath,
@@ -111,6 +112,9 @@ test("a rebase keeps the text but gives up the path", () => {
 
   expect(rebased.machine.view._tag).toBe("Stale");
   expect(paintedOf(rebased.machine.view)?.text).toBe("one");
+  // A stale surface is not "already painted": the same path must repaint (and
+  // re-attach the edit session) when the new checkout opens it.
+  expect(ownedPainted(rebased.machine.view)).toBeNull();
   // `?file=` may not name a file the new checkout has not painted.
   expect(panePath(rebased.machine.view)).toBeNull();
 });

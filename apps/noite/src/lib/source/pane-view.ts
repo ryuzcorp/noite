@@ -85,6 +85,23 @@ export const paintedOf = (state: PaneView): PaintedView | null => {
   return null;
 };
 
+/** The file the current checkout painted: `Painted`, or the `Opening` that
+ * started from it. A `Stale` surface is the previous checkout's, so a re-open
+ * of the same path must repaint it (which re-attaches the edit session) —
+ * `paintedOf` still describes what is on screen, but nothing may treat it as
+ * already-painted. */
+export const ownedPainted = (state: PaneView): PaintedView | null => {
+  if (state._tag === "Painted") {
+    return state;
+  }
+
+  if (state._tag === "Opening") {
+    return state.from;
+  }
+
+  return null;
+};
+
 /** The path the pane is responsible for (the one `?file=` may name), or null
  * while nothing is open. A `Stale` surface belongs to no path. */
 export const panePath = (state: PaneView): string | null => {

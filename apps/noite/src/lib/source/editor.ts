@@ -17,13 +17,14 @@ import type { IntelPosition } from "./intel-protocol";
 import { THEME } from "./pane";
 import {
   newPaneMachine,
+  ownedPainted,
   paintedOf,
   PaneEvents,
   panePath,
   PaneViews,
   stepPane,
 } from "./pane-view";
-import type { PaneMachine, ResolvedShow } from "./pane-view";
+import type { PaneMachine, PaintedView, ResolvedShow } from "./pane-view";
 import type { DiffsModule, EditModule } from "./pierre";
 import { TEXT_MAX_BYTES, isTextBytes } from "./uploads";
 import { projectPath } from "./workspace/types";
@@ -353,7 +354,10 @@ export const createEditorPane = (host: EditorHost): EditorPane => {
    * `path`: painting it again would rebuild the same document, and that (not
    * the text) is what drops the caret's place and the edit session's focus. */
   const shows = (path: string, show: Show): boolean => {
-    const painted = paintedOf(machine.view);
+    // Only the current checkout's own paint counts: a `Stale` surface (the
+    // checkout that went) must be repainted even for the same path and text,
+    // because the rebase took the edit session with it.
+    const painted: PaintedView | null = ownedPainted(machine.view);
 
     return (
       painted !== null &&
