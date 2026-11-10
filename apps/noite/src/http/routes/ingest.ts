@@ -1,6 +1,7 @@
 import { authFromEnv, MissingAuthSecretError } from "../../lib/auth";
 import { requireAppRole } from "../../lib/collaborators";
 import { ensureDb } from "../../lib/db";
+import { keyOwnerActive } from "../../lib/server/api-keys.server";
 import { MAX_BODY_BYTES, readBoundedText, tooLarge } from "../body";
 import { runnerConfig } from "../config";
 import type { RouteHandler } from "../config";
@@ -44,6 +45,12 @@ export const forwardIngest: RouteHandler = async (request, env, params) => {
     });
 
     if (!(verified.valid && verified.key?.referenceId)) {
+      return new Response("invalid key", { status: 401 });
+    }
+
+    // A banned owner's key must stop ingesting even if the ban's revocation
+    // missed it (shared predicate, lib/server/api-keys.server).
+    if (!(await keyOwnerActive(verified.key.referenceId))) {
       return new Response("invalid key", { status: 401 });
     }
 

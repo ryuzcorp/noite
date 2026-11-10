@@ -35,6 +35,8 @@ It prints a code and where to enter it. The code is the same kind the email carr
 
 An instance admin sees the control plane itself in `/apps`: the **Noite** card ("admin"), which is not a user app but a link to a dedicated detail page. That page is the whole admin home — the control plane's telemetry tabs (Overview, Metrics, Errors, Logs) next to instance administration (Users, Apps, Invites), with the control database linked from Overview. Every tab re-checks the same rule server-side: a real instance admin, never an impersonated session.
 
+**Ban** in the Users tab revokes the account's sessions and deletes its API keys, so `git push`, event ingest and `/mcp` stop immediately. The ban is checked on every request as well, so a key that somehow survived the deletion is still refused. Unbanning does not restore a deleted key: the account mints a new one.
+
 In `make dev` the control UI runs under vite and supervises no celld, so Metrics, Errors and Logs are hidden — there is no control fleet to record them — while the Users, Apps and Invites tabs and the control database still work.
 
 ## Browsing the control database

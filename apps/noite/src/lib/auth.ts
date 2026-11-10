@@ -14,6 +14,7 @@ import { getAuthDb, resolveEnv } from "./db";
 import { errorMessage } from "./errors";
 import { isLocalhostDomain } from "./local-host";
 import { fail } from "./server/api";
+import { revokeApiKeysForUser } from "./server/api-keys.server";
 import {
   checkInvite,
   claimBootstrapAdmin,
@@ -236,6 +237,24 @@ export const createAuth = (env: KitEnv, baseURL: string) =>
     },
     baseURL,
     database: getAuthDb(),
+    // A ban revokes the account's machine credentials in the same flow as
+    // the session deletion: the admin plugin's `banUser` (and a direct
+    // `POST /api/auth/admin/ban-user`) both write `banned: true` through
+    // `internalAdapter.updateUser`, so every ban path lands here. Deleting
+    // the keys is deliberate — an unban must not silently revive a key.
+    // Consumers still refuse a banned owner's key (lib/server/api-keys.server),
+    // so a failure to delete here can never leave a credential working.
+    databaseHooks: {
+      user: {
+        update: {
+          after: async (user) => {
+            if (user.banned === true) {
+              await revokeApiKeysForUser(user.id);
+            }
+          },
+        },
+      },
+    },
     plugins: [
       // The admin home impersonates any account (including fellow admins) — the
       // impersonator is already an admin, so this grants no new power.
