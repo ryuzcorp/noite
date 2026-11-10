@@ -156,21 +156,24 @@ pub async fn list_deploys(
         .await
 }
 
-/// Restorable release pointer: a successful production deploy row for this
-/// sha. Rollback re-runs the pipeline at the old sha — no separate state.
+/// Restorable release pointer: a successful deploy row for this sha, in one
+/// target (`environment_id = None` is production). Rollback re-runs the
+/// pipeline at the old sha — no separate state.
 pub async fn get_success_deploy(
     pool: &SqlitePool,
     app_id: &str,
     sha: &str,
+    environment_id: Option<&str>,
 ) -> sqlx::Result<Option<Deploy>> {
     let sql = format!(
         "SELECT {DEPLOY_COLS} FROM deploy \
-         WHERE app_id = ? AND sha = ? AND status = 'success' AND environment_id IS NULL \
+         WHERE app_id = ? AND sha = ? AND status = 'success' AND {TARGET_CLAUSE} \
          ORDER BY created_at DESC LIMIT 1"
     );
     sqlx::query_as::<_, Deploy>(sqlx::AssertSqlSafe(sql))
         .bind(app_id)
         .bind(sha)
+        .bind(environment_id)
         .fetch_optional(pool)
         .await
 }

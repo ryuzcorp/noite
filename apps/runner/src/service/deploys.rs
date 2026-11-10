@@ -101,6 +101,8 @@ pub struct PreparedRollback {
     pub deploy_id: String,
     pub sha: String,
     app: crate::models::App,
+    /// Production, or the preview environment the sha came from.
+    target: deploy::DeployTarget,
     key: String,
     pool: sqlx::SqlitePool,
     cfg: std::sync::Arc<crate::config::Config>,
@@ -118,6 +120,7 @@ impl PreparedRollback {
             deploy_id,
             sha,
             app,
+            target,
             key,
             pool,
             cfg,
@@ -132,7 +135,7 @@ impl PreparedRollback {
             &logs,
             &deploying,
             app,
-            deploy::DeployTarget::Production,
+            target,
             &key,
             Some(&sha),
             deploy::DeployTrigger::Explicit,
@@ -144,23 +147,46 @@ impl PreparedRollback {
 
 /// Validate the sha and pre-create the rollback's queued deploy row, so a
 /// caller watching the stream sees the rollback even while the app's
-/// previous deploy is still finishing.
+/// previous deploy is still finishing. `environment_id` scopes both the
+/// proof (a successful row *in that target*) and the run (that environment's
+/// fleet), so a preview sha never lands in production.
 pub async fn prepare_rollback(
     state: &AppState,
     id: &str,
     sha: &str,
+    environment_id: Option<&str>,
 ) -> Result<PreparedRollback, ApiError> {
     let sha = sha.trim().to_lowercase();
     if !sha_valid(&sha) {
         return Err(ApiError::bad("sha must be 7-40 hex chars"));
     }
     let app = app_or_404(state, id).await?;
-    match db::get_success_deploy(&state.pool, &app.id, &sha).await {
+    let environment = match environment_id {
+        Some(env_id) => Some(super::environments::env_or_404(state, &app.id, env_id).await?),
+        None => None,
+    };
+    match db::get_success_deploy(
+        &state.pool,
+        &app.id,
+        &sha,
+        environment.as_ref().map(|env| env.id.as_str()),
+    )
+    .await
+    {
         Ok(Some(_)) => {}
         Ok(None) => return Err(ApiError::not_found("no successful deploy at that sha")),
         Err(e) => return Err(ApiError::internal(e.to_string())),
     }
-    let key = format!("git/{}/refs/heads/main/{sha}.bundle", app.slug);
+    // The bundle lives under the ref the deploy came from: `git/<slug>/<ref>/`
+    // for a preview (mirroring `after_receive`), the main tip for production.
+    let key = match &environment {
+        Some(env) => format!("git/{}/{}/{sha}.bundle", app.slug, env.git_ref),
+        None => format!("git/{}/refs/heads/main/{sha}.bundle", app.slug),
+    };
+    let target = match environment {
+        Some(env) => deploy::DeployTarget::Environment(Box::new(env)),
+        None => deploy::DeployTarget::Production,
+    };
     // A caller watches this deploy (the UI stream, the e2e `waitForDeploy`):
     // without its own row a rollback issued while the previous deploy still
     // holds the app's lock silently skips (`claim` fails) after answering
@@ -171,7 +197,7 @@ pub async fn prepare_rollback(
         &state.pool,
         None,
         &app.id,
-        None,
+        target.environment_id(),
         crate::models::DeployStatus::Queued.as_str(),
         Some(&sha),
         "▸ queued behind the app's running deploy\n",
@@ -182,6 +208,7 @@ pub async fn prepare_rollback(
         deploy_id,
         sha,
         app,
+        target,
         key,
         pool: state.pool.clone(),
         cfg: state.config.clone(),
@@ -191,10 +218,23 @@ pub async fn prepare_rollback(
     })
 }
 
-/// Re-run the pipeline at an old successful tip bundle (immutable per-sha).
-/// Returns the new deploy id and the sha; progress follows on the stream.
-pub async fn rollback(state: &AppState, id: &str, sha: &str) -> Result<(String, String), ApiError> {
-    let prepared = prepare_rollback(state, id, sha).await?;
+/// Re-run the pipeline at an old successful tip bundle (immutable per-sha),
+/// for production or one preview environment. Returns the new deploy id and
+/// the sha; progress follows on that target's stream.
+pub async fn rollback(
+    state: &AppState,
+    id: &str,
+    sha: &str,
+    environment_id: Option<&str>,
+    role: Option<&str>,
+) -> Result<(String, String), ApiError> {
+    // A preview target is an environment operation, so it carries the same
+    // push-role gate `environments.deploy` enforces; production rollback is
+    // unchanged (the control already gates it).
+    if environment_id.is_some() {
+        super::environments::require_push(role)?;
+    }
+    let prepared = prepare_rollback(state, id, sha, environment_id).await?;
     let out = (prepared.deploy_id.clone(), prepared.sha.clone());
     tokio::spawn(async move { prepared.run().await });
     Ok(out)

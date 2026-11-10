@@ -402,14 +402,11 @@ const DeployRow = ({
     d.status === "building" ||
     d.status === "deploying";
 
-  // Roll back re-runs production's pipeline at that sha, so it belongs to
-  // production rows only — an environment row must never deploy its sha to
-  // production (its header's Redeploy covers redeploying the environment).
-  const canRollBack =
-    environmentId === "" &&
-    d.status === "success" &&
-    !!d.sha &&
-    d.sha !== currentSha;
+  // Roll back re-runs *this row's* target at that sha: production rows
+  // rebuild production, a preview row rebuilds that environment (the runner
+  // proves the sha was successful there), so a preview sha can never land in
+  // production.
+  const canRollBack = d.status === "success" && !!d.sha && d.sha !== currentSha;
 
   return (
     <>
@@ -464,7 +461,11 @@ const DeployRow = ({
               rollError.set("");
 
               try {
-                await api<{ ok: true }>("/api/apps/rollback", { appId, sha });
+                await api<{ ok: true }>("/api/apps/rollback", {
+                  appId,
+                  environmentId,
+                  sha,
+                });
               } catch (error) {
                 rollError.set(errorMessage(error));
               }

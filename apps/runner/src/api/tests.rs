@@ -1243,7 +1243,7 @@ async fn rollback_queues_behind_the_apps_in_flight_deploy() {
     let previous = crate::host::deploy::claim_owned(&h.state.deploying, &app.id)
         .await
         .expect("previous deploy takes the claim");
-    let prepared = crate::service::deploys::prepare_rollback(&h.state, &app.id, sha)
+    let prepared = crate::service::deploys::prepare_rollback(&h.state, &app.id, sha, None)
         .await
         .expect("rollback queues");
     assert_eq!(prepared.sha, sha);

@@ -18,18 +18,34 @@ use crate::AppState;
 /// the old tip bundle (bundles are immutable per-sha). 202 immediately;
 /// progress follows on the deploys stream.
 #[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct RollbackBody {
     sha: String,
+    /// One preview environment's history; absent/empty is production.
+    #[serde(default)]
+    environment_id: Option<String>,
+    /// The caller's role in the app (a preview target needs `push`, the way
+    /// `environments.deploy` does). The query carries it too; the body is the
+    /// shape the RPC and tests use.
+    #[serde(default)]
+    role: Option<String>,
 }
 
 pub async fn rollback(
     State(state): State<AppState>,
     Path(id): Path<String>,
+    Query(q): Query<super::environments::RoleQuery>,
     Json(body): Json<RollbackBody>,
 ) -> impl IntoResponse {
-    service::deploys::rollback(&state, &id, &body.sha)
-        .await
-        .map(|(deploy_id, sha)| Json(json!({ "ok": true, "sha": sha, "deployId": deploy_id })))
+    service::deploys::rollback(
+        &state,
+        &id,
+        &body.sha,
+        body.environment_id.as_deref().filter(|env| !env.is_empty()),
+        q.role.as_deref().or(body.role.as_deref()),
+    )
+    .await
+    .map(|(deploy_id, sha)| Json(json!({ "ok": true, "sha": sha, "deployId": deploy_id })))
 }
 
 /// `?environmentId=` — one preview environment's history; absent is

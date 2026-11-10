@@ -307,6 +307,12 @@ struct IngestKeyParams {
 struct RollbackParams {
     id: String,
     sha: String,
+    #[serde(default)]
+    environment_id: Option<String>,
+    /// The caller's role in the app: a preview target needs `push`, the way
+    /// `environments.deploy` does.
+    #[serde(default)]
+    role: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -995,9 +1001,15 @@ async fn dispatch_call(
             };
             complete(
                 id,
-                service::deploys::rollback(state, &p.id, &p.sha).await.map(
-                    |(deploy_id, sha)| json!({ "ok": true, "sha": sha, "deployId": deploy_id }),
-                ),
+                service::deploys::rollback(
+                    state,
+                    &p.id,
+                    &p.sha,
+                    p.environment_id.as_deref().filter(|env| !env.is_empty()),
+                    p.role.as_deref(),
+                )
+                .await
+                .map(|(deploy_id, sha)| json!({ "ok": true, "sha": sha, "deployId": deploy_id })),
             )
         }
         "git.remote" => {

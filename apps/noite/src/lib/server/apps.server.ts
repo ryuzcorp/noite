@@ -425,6 +425,8 @@ export const get = apiAction(
 
 const RollbackArgs = Schema.Struct({
   appId: Schema.String,
+  /** One preview environment's history; absent/"" is production. */
+  environmentId: Schema.optional(Schema.String),
   sha: Schema.String,
 });
 
@@ -433,12 +435,12 @@ const RollbackArgs = Schema.Struct({
  * stream like a normal deploy. */
 export const rollback = apiAction(
   RollbackArgs,
-  async ({ appId, sha }, { env, request }) => {
+  async ({ appId, sha, environmentId }, { env, request }) => {
     const user = await sessionUser(request, env);
-    await requireAppRole(appId, user.id, "push");
+    const { role } = await requireAppRole(appId, user.id, "push");
 
     try {
-      return await runnerRollback(appId, sha);
+      return await runnerRollback(appId, sha, environmentId ?? "", role);
     } catch (error) {
       failUnknown(error);
     }
