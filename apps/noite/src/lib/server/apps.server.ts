@@ -24,8 +24,9 @@ import {
   runnerPatchApp,
   runnerRenameApp,
   runnerRetryImport,
-  runnerRollback,
+  runnerFailureMessage,
   runnerFailureOf,
+  runnerRollback,
 } from "../runner";
 import type {
   RunnerFailure,
@@ -36,6 +37,12 @@ import type {
 import { apiAction, fail } from "./api";
 import { requireTelemetryRole } from "./errors.server";
 import { requireViewApp, sessionUser } from "./session.server";
+
+/** A runner failure as the action's 422 text: the runner's own RPC text
+ * (e.g. the app limit) or a status line, never an upstream HTTP body. */
+// oxlint-disable-next-line anti-slop/no-unknown-parameters -- catch-site mapper: the thrown value is unknown by construction and becomes the safe runner text here.
+const failRunner = (error: unknown): never =>
+  failUnknown(runnerFailureMessage(runnerFailureOf(error)));
 
 /** A lifecycle mutation's outcome, as the action answers it. One closed
  * type: `Purging` is a real state (the row is gone from every list, storage
@@ -164,7 +171,7 @@ export const slugCheck = apiAction(
         result.suggestion = freeVariant(normalized, taken);
       }
     } catch (error) {
-      failUnknown(error);
+      failRunner(error);
     }
 
     return result;
@@ -388,7 +395,7 @@ export const create = apiAction(
         throw error;
       }
 
-      return failUnknown(error);
+      return failRunner(error);
     }
   }
 );
@@ -402,7 +409,7 @@ export const retryImport = apiAction(AppId, async (appId, { env, request }) => {
   try {
     return await runnerRetryImport(appId);
   } catch (error) {
-    failUnknown(error);
+    failRunner(error);
   }
 });
 
@@ -423,7 +430,7 @@ export const remove = apiAction(AppId, async (appId, { env, request }) => {
       throw error;
     }
 
-    failUnknown(error);
+    failRunner(error);
   }
 });
 
@@ -445,7 +452,7 @@ export const setDesired = apiAction(
         throw error;
       }
 
-      failUnknown(error);
+      failRunner(error);
     }
   }
 );
@@ -484,7 +491,7 @@ export const renameApp = apiAction(
         throw error;
       }
 
-      failUnknown(error);
+      failRunner(error);
     }
   }
 );
@@ -527,7 +534,7 @@ export const rollback = apiAction(
     try {
       return await runnerRollback(appId, sha, environmentId ?? "", role);
     } catch (error) {
-      failUnknown(error);
+      failRunner(error);
     }
   }
 );
@@ -549,7 +556,7 @@ export const cancelDeploy = apiAction(
     try {
       return await runnerCancelDeploy(appId, deployId);
     } catch (error) {
-      failUnknown(error);
+      failRunner(error);
     }
   }
 );
@@ -569,7 +576,7 @@ export const deployLog = apiAction(
     try {
       return await runnerDeployLog(appId, deployId);
     } catch (error) {
-      failUnknown(error);
+      failRunner(error);
     }
   }
 );
@@ -606,7 +613,7 @@ export const listDeploys = apiAction(
 
       return leanDeployRows(rows);
     } catch (error) {
-      failUnknown(error);
+      failRunner(error);
     }
   }
 );

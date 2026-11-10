@@ -169,6 +169,8 @@ const cache = Effect.runSync(
         catch: (cause: unknown): unknown => cause,
         try: async (signal: AbortSignal) => {
           const key = bareKey(effectKey);
+          // The epoch this lookup was requested under (see `cacheKey`).
+          const epoch = Number(effectKey.slice(0, effectKey.indexOf(":")));
           const run = fetchers.get(key);
 
           const value: unknown =
@@ -178,11 +180,16 @@ const cache = Effect.runSync(
                 )
               : await run(key, { signal });
 
-          writeSwr(
-            key,
-            value,
-            memoryOnly.has(key) ? { persist: false } : undefined
-          );
+          // An auth change while the fetch was in flight makes this value the
+          // previous account's; resource keys carry no account id, so only a
+          // lookup still in the current epoch may write the snapshot.
+          if (epoch === swrEpoch()) {
+            writeSwr(
+              key,
+              value,
+              memoryOnly.has(key) ? { persist: false } : undefined
+            );
+          }
 
           return value;
         },

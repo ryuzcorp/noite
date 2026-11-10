@@ -7,12 +7,14 @@ import { atom, watch } from "ilha";
 import { render } from "ilha/test";
 
 import {
+  invalidate,
   nextResourceState,
   resourceError,
   resourceValue,
   tracked,
 } from "./resource";
 import type { Resource, ResourceState } from "./resource";
+import { clearSwrStore, readSwr } from "./swr-store";
 
 class FakeNode {
   children: FakeNode[] = [];
@@ -218,6 +220,80 @@ const resetSignals = (): void => {
   signalPainted = undefined;
   signalSettled = undefined;
 };
+
+/** Let the Effect runtime's promises settle (microtasks, not a wall clock). */
+const flush = async (): Promise<void> => {
+  for (let i = 0; i < 20; i += 1) {
+    // oxlint-disable-next-line eslint/no-await-in-loop -- draining microtasks in order
+    await Promise.resolve();
+  }
+};
+
+describe("account epoch", () => {
+  test("a lookup that started before an auth reset never writes the old account's snapshot", async () => {
+    const restoreDom = installDomFixture();
+
+    try {
+      const key = nextKey();
+      const slow = Promise.withResolvers<string[]>();
+      let calls = 0;
+      probeKey = key;
+      probeFetch = () => {
+        calls += 1;
+
+        return calls === 1 ? slow.promise : Promise.resolve(["account-b"]);
+      };
+
+      const ui = render(ResourceProbe);
+      await ui.settled();
+      expect(calls).toBe(1);
+
+      // The account changes while account A's fetch is still in flight:
+      // resetUserCaches() forgets the store and reloads every key.
+      clearSwrStore();
+      const settledAgain = nextSettled();
+      invalidate(key);
+      await settledAgain;
+      await ui.settled();
+      expect(calls).toBe(2);
+
+      // Account A's response lands late: it must not overwrite B's snapshot.
+      slow.resolve(["account-a"]);
+      await flush();
+
+      expect(readSwr<string[]>(key)).toEqual(["account-b"]);
+      ui.unmount();
+    } finally {
+      resetSignals();
+      restoreDom();
+    }
+  });
+
+  test("a late lookup writes nothing once the store was forgotten", async () => {
+    const restoreDom = installDomFixture();
+
+    try {
+      const key = nextKey();
+      const slow = Promise.withResolvers<string[]>();
+      probeKey = key;
+      probeFetch = () => slow.promise;
+
+      const ui = render(ResourceProbe);
+      await ui.settled();
+
+      // No reload: only the store reset (the panel is gone with the user).
+      clearSwrStore();
+      ui.unmount();
+      slow.resolve(["account-a"]);
+      await flush();
+
+      expect(readSwr<string[]>(key)).toBeUndefined();
+    } finally {
+      resetSignals();
+      restoreDom();
+    }
+  });
+});
 
 describe("resource state machine", () => {
   test("a reload and a failure keep the last value; only a cold load is Loading", () => {

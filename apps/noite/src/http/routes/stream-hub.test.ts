@@ -12,7 +12,9 @@ import {
 } from "../../lib/feeds";
 import type { RouteHandler } from "../config";
 import {
+  MAX_FRAME_BYTES,
   MAX_TOPICS,
+  SseFrameTooLargeError,
   TOPIC_ROUTES,
   matchTopic,
   readSseData,
@@ -164,6 +166,46 @@ describe("readSseData", () => {
     );
 
     expect(seen).toEqual(["one\ntwo", "three"]);
+  });
+});
+
+describe("readSseData bounds", () => {
+  test("an unterminated line over the cap rejects instead of buffering forever", async () => {
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(encoder.encode("data: "));
+        controller.enqueue(encoder.encode("x".repeat(MAX_FRAME_BYTES)));
+
+        // No newline ever arrives.
+      },
+    });
+
+    await expect(
+      readSseData(body, () => {}, new AbortController().signal)
+    ).rejects.toBeInstanceOf(SseFrameTooLargeError);
+  });
+
+  test("a frame at the cap still parses", async () => {
+    const line = "x".repeat(MAX_FRAME_BYTES - 10);
+
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(encoder.encode(`data: ${line}\n\n`));
+        controller.close();
+      },
+    });
+
+    const seen: string[] = [];
+
+    await readSseData(
+      body,
+      (data) => {
+        seen.push(data);
+      },
+      new AbortController().signal
+    );
+
+    expect(seen).toEqual([line]);
   });
 });
 
@@ -428,6 +470,51 @@ describe("streamHub", () => {
     // Resolves only if the topic's own request is aborted (the test times
     // out otherwise).
     await stopped.promise;
+  });
+
+  test("an oversized frame refuses its topic terminally instead of retrying", async () => {
+    let opens = 0;
+
+    const routes: TopicRoute[] = [
+      {
+        handler: (request) => {
+          opens += 1;
+
+          return new Response(
+            new ReadableStream<Uint8Array>({
+              start(controller) {
+                controller.enqueue(
+                  encoder.encode(`data: ${"x".repeat(MAX_FRAME_BYTES)}`)
+                );
+
+                request.signal.addEventListener("abort", () => {
+                  try {
+                    controller.close();
+                  } catch {
+                    // Already cancelled by the relay.
+                  }
+                });
+              },
+            }),
+            { headers: { "content-type": "text/event-stream" } }
+          );
+        },
+        pattern: /^\/api\/apps\/(?<appId>[^/]+)\/logs\/stream$/u,
+      },
+    ];
+
+    const page = new AbortController();
+
+    const frames = await readFrames(
+      streamHub(hubRequest([logsUrl("app_1")], page.signal), env, routes),
+      (got) => got.includes("0:~502")
+    );
+
+    page.abort();
+
+    expect(frames).toContain("0:~502");
+    expect(frames).not.toContain("0:!");
+    expect(opens).toBe(1);
   });
 
   test("a duplicate topic opens once and mirrors its frames to both indexes", async () => {

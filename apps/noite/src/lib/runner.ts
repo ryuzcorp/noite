@@ -257,7 +257,9 @@ export class RunnerHttpError extends Error {
   readonly status: number;
 
   constructor(path: string, status: number, body: string) {
-    super(`runner ${path}: ${status} ${body}`);
+    // The body stays in the field only: this message reaches `failUnknown`
+    // and therefore a client, and an upstream body is not ours to forward.
+    super(`runner ${path}: ${status}`);
     this.name = "RunnerHttpError";
     this.path = path;
     this.status = status;

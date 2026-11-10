@@ -22,9 +22,10 @@
 //!                      before its first frame); the hub reopens it on its
 //!                      own with capped backoff while the others keep
 //!                      streaming.
-//! - `<index>:~<status>` — the topic was refused with a 4xx. Terminal: the
-//!                      hub never reopens it (a revoked role or a deleted app
-//!                      must not retry forever).
+//! - `<index>:~<status>` — the topic was refused (4xx from its handler, or
+//!                      502 for a frame over `MAX_FRAME_BYTES`). Terminal:
+//!                      the hub never reopens it (a revoked role, a deleted
+//!                      app or an unbounded frame must not retry forever).
 //!
 //! Every attempt runs under its own `AbortController`; ending an attempt
 //! aborts that handler's `request.signal`, so an in-process poll loop (the
@@ -160,9 +161,27 @@ export const matchTopic = (
  * bounds the handlers one request can start. */
 export const MAX_TOPICS = 24;
 
+/** Most bytes one SSE frame may buffer (its line plus accumulated `data`):
+ * frames are JSON of rows, so a megabyte is already far beyond any real one,
+ * and a line with no terminator must not grow the control worker's heap. */
+export const MAX_FRAME_BYTES = 1_048_576;
+
+/** A frame that exceeded {@link MAX_FRAME_BYTES}. The relay treats it as a
+ * terminal refusal of that topic (`~502`): retrying would re-read the same
+ * unbounded line forever. */
+export class SseFrameTooLargeError extends Error {
+  constructor(bytes: number) {
+    super(`SSE frame exceeded ${MAX_FRAME_BYTES} bytes (${bytes})`);
+    this.name = "SseFrameTooLargeError";
+  }
+}
+
 /** Read an SSE body and hand each event's `data` to `onData` (multi-line
  * data joined with `\n`, comments and other fields dropped), awaiting it when
- * it answers a promise. Resolves when the body ends; rejects when it errors. */
+ * it answers a promise. Resolves when the body ends; rejects when it errors.
+ * The buffer is bounded ({@link MAX_FRAME_BYTES}) and scanned from a carried
+ * offset, so each byte is visited once per chunk rather than rescanning the
+ * whole buffer (a long line used to cost O(n²)). */
 export const readSseData = async (
   body: ReadableStream<Uint8Array>,
   onData: (data: string) => Promise<void> | undefined,
@@ -180,6 +199,20 @@ export const readSseData = async (
   signal.addEventListener("abort", stop, { once: true });
   let buffer = "";
   let data: string[] = [];
+  let dataBytes = 0;
+  // Bytes at the head of `buffer` already scanned without a line end.
+  let scanned = 0;
+
+  const dispatch = async (): Promise<void> => {
+    if (data.length === 0) {
+      return;
+    }
+
+    const event = data.join("\n");
+    data = [];
+    dataBytes = 0;
+    await onData(event);
+  };
 
   try {
     for (;;) {
@@ -192,28 +225,37 @@ export const readSseData = async (
 
       buffer += decoder.decode(chunk.value, { stream: true });
 
-      for (;;) {
-        const end = /\r\n|\r|\n/u.exec(buffer);
+      let lineStart = 0;
+      let i = scanned;
 
-        // A trailing CR may be the first half of a CRLF split across chunks.
-        if (
-          end === null ||
-          (end[0] === "\r" && end.index === buffer.length - 1)
-        ) {
-          break;
-        }
+      while (i < buffer.length) {
+        const char = buffer[i];
+        let end = -1;
+        let next = -1;
 
-        const line = buffer.slice(0, end.index);
-        buffer = buffer.slice(end.index + end[0].length);
-
-        if (line === "") {
-          if (data.length > 0) {
-            const event = data.join("\n");
-            data = [];
-            // oxlint-disable-next-line eslint/no-await-in-loop -- frames go out in arrival order
-            await onData(event);
+        if (char === "\n") {
+          end = i;
+          next = i + 1;
+        } else if (char === "\r") {
+          // A trailing CR may be the first half of a CRLF split across chunks.
+          if (i === buffer.length - 1) {
+            break;
           }
 
+          end = i;
+          next = buffer[i + 1] === "\n" ? i + 2 : i + 1;
+        } else {
+          i += 1;
+          continue;
+        }
+
+        const line = buffer.slice(lineStart, end);
+        lineStart = next;
+        i = next;
+
+        if (line === "") {
+          // oxlint-disable-next-line eslint/no-await-in-loop -- frames go out in arrival order
+          await dispatch();
           continue;
         }
 
@@ -222,8 +264,20 @@ export const readSseData = async (
 
         if (field === "data") {
           const value = colon === -1 ? "" : line.slice(colon + 1);
-          data.push(value.startsWith(" ") ? value.slice(1) : value);
+          const text = value.startsWith(" ") ? value.slice(1) : value;
+          data.push(text);
+          dataBytes += text.length + 1;
         }
+      }
+
+      if (lineStart > 0) {
+        buffer = buffer.slice(lineStart);
+      }
+
+      scanned = Math.max(0, i - lineStart);
+
+      if (buffer.length + dataBytes > MAX_FRAME_BYTES) {
+        throw new SseFrameTooLargeError(buffer.length + dataBytes);
       }
     }
   } finally {
@@ -475,6 +529,14 @@ const relayOnce = async (pump: Pump): Promise<RelayOutcome> => {
 
     return delivered ? { kind: "streamed" } : { kind: "empty", stalled };
   } catch (error) {
+    if (error instanceof SseFrameTooLargeError) {
+      // Terminal: retrying re-reads the same unbounded line. The client sees
+      // `~502` and stops retrying this topic.
+      console.error("stream hub: topic frame too large", topic, error.message);
+
+      return { kind: "refused", status: 502 };
+    }
+
     if (!stream.signal.aborted) {
       console.error("stream hub: topic dropped", topic, error);
     }
