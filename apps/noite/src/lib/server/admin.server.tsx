@@ -3,6 +3,7 @@ import { eq, sql } from "void/db";
 
 import { apikeyTable, appCollaboratorTable, userTable } from "../../db/schema";
 import { runtimeOf, runtimeWire, nextAction } from "../admin/runtime";
+import { adminRoleOf } from "../admin/user-role";
 import type { AdminAppRow, AdminUserRow } from "../api-types";
 import {
   authFromEnv,
@@ -187,7 +188,8 @@ const asUserRow = (row: DbUser, actorId: string): AdminUserRow => ({
   email: row.email,
   id: row.id,
   name: row.name ?? "",
-  role: row.role === "admin" ? "admin" : "user",
+  role: adminRoleOf(row.role).role,
+  roleKnown: adminRoleOf(row.role).known,
   self: row.id === actorId,
 });
 

@@ -1,4 +1,5 @@
 import { useRouter } from "@ilha/void";
+import * as Atom from "effect/reactivity/Atom";
 import { atom, watch } from "ilha";
 import type { View } from "ilha";
 
@@ -10,6 +11,7 @@ import { sleep } from "../sleep";
 import { DashboardSkeleton } from "../ui/skeletons";
 import { GateEvt, GateState, gateTransition } from "./gate";
 import type { Gate, GateEvent } from "./gate";
+import { takeImpersonationReturn } from "./impersonation";
 import { invalidateSession } from "./session";
 
 /** Dashboard-chrome skeleton while the gate resolves. */
@@ -17,6 +19,13 @@ export const SessionSplash = () => <DashboardSkeleton />;
 
 /** How long the gate waits between cookie-readiness reads. */
 const RETRY_INTERVAL_MS = 50;
+
+/** Re-read only when the tab is actually in the foreground. */
+const rereadWhenVisible = (reread: () => void) => (): void => {
+  if (document.visibilityState === "visible") {
+    reread();
+  }
+};
 
 /**
  * Session gate for the dashboard. Renders `fallback` until the session cookie
@@ -48,6 +57,26 @@ export const Authed = ({
     return next;
   };
 
+  /** Apply a settled gate: a signed-out state always leaves for the login
+   * page (the initial pass and a later re-read alike). */
+  const settle = (next: Gate): void => {
+    if (next._tag === "SignedOut") {
+      router.visit("/login");
+    }
+  };
+
+  /** One re-read outside the initial pass: the impersonation watch below. */
+  const refresh = async (): Promise<void> => {
+    try {
+      await res.refetch();
+      settle(
+        dispatch(GateEvt.Read({ session: resourceValue(res.state()) ?? null }))
+      );
+    } catch (error) {
+      dispatch(GateEvt.ReadFailed({ message: errorMessage(error) }));
+    }
+  };
+
   /** Read the session, retrying only while the gate is still `Checking`, and
    * settle on Authed / SignedOut / Failed. Never throws: a rejected refetch is
    * the `Failed` state, not an abandoned watcher. */
@@ -62,9 +91,7 @@ export const Authed = ({
         const next = dispatch(GateEvt.Read({ session }));
 
         if (next._tag !== "Checking") {
-          if (next._tag === "SignedOut") {
-            router.visit("/login");
-          }
+          settle(next);
 
           return;
         }
@@ -120,12 +147,38 @@ export const Authed = ({
       }
 
       invalidateSession();
-      router.visit("/apps/_control?t=users");
+      // Back where the admin started the impersonation (the admin home when
+      // that is unknown), never a page they did not come from.
+      router.visit(takeImpersonationReturn("/apps/_control?t=users"));
     } catch (error) {
       returnError.set(errorMessage(error));
       returning.set(false);
     }
   };
+
+  // An impersonated session expires server-side, and the admin's tab has no
+  // other reason to re-read: when the tab comes back into view, re-read once
+  // so the banner cannot outlive the session it describes. Event-driven, no
+  // polling timer.
+  const impersonating = atom(
+    Atom.map(
+      (state: Gate) =>
+        state._tag === "Authed" && state.session.session.impersonatedBy !== null
+    )(gate.atom)
+  );
+
+  watch(impersonating, (on, { signal }) => {
+    if (!on) {
+      return;
+    }
+
+    const reread = rereadWhenVisible(() => {
+      void refresh();
+    });
+
+    document.addEventListener("visibilitychange", reread, { signal });
+    window.addEventListener("focus", reread, { signal });
+  });
 
   const state = gate();
 

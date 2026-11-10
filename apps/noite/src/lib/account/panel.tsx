@@ -300,15 +300,33 @@ const PasskeysCard = () => {
   );
 };
 
+/** What the API-key card is doing, per action and (for a revoke) per row. */
+type KeyPending =
+  | { readonly action: "create" }
+  | { readonly action: "revoke"; readonly id: string }
+  | null;
+
+/** How long a freshly created secret stays on the page. */
+const KEY_REVEAL_MS = 10 * 60 * 1000;
+
 /** Create / list / revoke Better Auth API keys (Git push password). */
 export const AccountPanel = () => {
   const keysRes = apiKeys();
   const keys: ApiKeyRow[] = resourceValue(keysRes.state()) ?? [];
   const sessionRes = session();
-  const busy = atom(false);
+  // One pending action for this card, keyed by what it is doing: the old
+  // shared `busy` disabled every row and the Create button alike, with no way
+  // to say which one was in flight.
+  const pending = atom<KeyPending>(null);
+  const busy = (): boolean => pending() !== null;
   const keyError = atom("");
+  // The freshly created secret. Shown once and only for a bounded time: it
+  // used to live in the page (and in the agent snippets) until revoke or
+  // navigation.
   const freshKey = atom<string | null>(null);
   const keyModal = atom(false);
+  // Holds the reveal timer across re-renders (a body `let` would be reset).
+  const keyTimer = atom.lazy<{ id: number | null }>(() => ({ id: null }))();
   const saveBusy = atom(false);
   const saveError = atom("");
   const saveOk = atom(false);
@@ -333,6 +351,28 @@ export const AccountPanel = () => {
   const user = resourceValue(sessionRes.state())?.user;
   const nameValue = nameDraft() ?? user?.name ?? "";
 
+  const revealKey = (key: string): void => {
+    freshKey.set(key);
+
+    if (keyTimer.id !== null) {
+      window.clearTimeout(keyTimer.id);
+    }
+
+    keyTimer.id = window.setTimeout(() => {
+      freshKey.set(null);
+      keyTimer.id = null;
+    }, KEY_REVEAL_MS);
+  };
+
+  const hideKey = (): void => {
+    if (keyTimer.id !== null) {
+      window.clearTimeout(keyTimer.id);
+      keyTimer.id = null;
+    }
+
+    freshKey.set(null);
+  };
+
   const createKey = async (event: SubmitEvent) => {
     event.preventDefault();
     const label = keyName().trim();
@@ -344,9 +384,9 @@ export const AccountPanel = () => {
     }
 
     const { appManagement, events } = scopeInput(scope());
-    busy.set(true);
+    pending.set({ action: "create" });
     keyError.set("");
-    freshKey.set(null);
+    hideKey();
 
     try {
       const { key } = await api<{ key: string }>("/api/account/createApiKey", {
@@ -355,33 +395,45 @@ export const AccountPanel = () => {
         name: label,
       });
 
-      freshKey.set(key);
+      revealKey(key);
       keyModal.set(false);
       await reload();
     } catch (error) {
       keyError.set(errorMessage(error));
     } finally {
-      busy.set(false);
+      pending.set(null);
     }
   };
 
+  /** Is this row's revoke the action in flight? */
+  const isRevoking = (keyId: string): boolean => {
+    const current = pending();
+
+    return (
+      current !== null && current.action === "revoke" && current.id === keyId
+    );
+  };
+
   const revoke = async (keyId: string) => {
-    busy.set(true);
+    pending.set({ action: "revoke", id: keyId });
     keyError.set("");
-    const result = await authClient.apiKey.delete({ keyId });
-    busy.set(false);
 
-    if (result.error) {
-      keyError.set(result.error.message ?? "Failed to revoke API key");
+    try {
+      const result = await authClient.apiKey.delete({ keyId });
 
-      return;
+      if (result.error) {
+        keyError.set(result.error.message ?? "Failed to revoke API key");
+
+        return;
+      }
+
+      hideKey();
+      await reload();
+    } catch (error) {
+      keyError.set(errorMessage(error));
+    } finally {
+      pending.set(null);
     }
-
-    if (freshKey()) {
-      freshKey.set(null);
-    }
-
-    await reload();
   };
 
   const saveProfile = async () => {
@@ -581,9 +633,20 @@ export const AccountPanel = () => {
           </form>
         </Dialog>
         {freshKey() ? (
-          <div class="bg-base-200 flex flex-col gap-1 rounded p-3 text-xs">
+          <div class="bg-base-200 flex flex-col gap-2 rounded p-3 text-xs">
             <p class="m-0 font-medium">Copy now — shown once:</p>
             <code class="break-all">{freshKey()}</code>
+            <p class="m-0 opacity-70">
+              It disappears from this page after ten minutes; the agent snippets
+              below fall back to a placeholder when it does.
+            </p>
+            <button
+              type="button"
+              class="btn btn-sm btn-ghost w-fit"
+              onclick={hideKey}
+            >
+              Done — hide it
+            </button>
           </div>
         ) : null}
         {keyError() ? <p class="text-error m-0 text-sm">{keyError()}</p> : null}
@@ -625,7 +688,7 @@ export const AccountPanel = () => {
                     void revoke(row.id);
                   }}
                 >
-                  Revoke
+                  {isRevoking(row.id) ? "Revoking…" : "Revoke"}
                 </button>
               </li>
             ))}

@@ -51,6 +51,9 @@ export interface AdminUserRow {
   id: string;
   name: string;
   role: string;
+  /** False when the stored role was neither `admin` nor `user`: the row shows
+   * it instead of pretending the account is a regular user. */
+  roleKnown: boolean;
   /** This row is the signed-in admin's own account. */
   self: boolean;
 }

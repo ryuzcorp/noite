@@ -62,6 +62,17 @@ describe("gateTransition", () => {
     expect(state._tag).toBe("SignedOut");
   });
 
+  test("a session that vanished under a painted page signs out", () => {
+    // The impersonated session expired (or another tab signed out): the gate
+    // must bounce instead of painting another user's data.
+    expect(
+      gateTransition(
+        GateState.Authed({ session }),
+        GateEvt.Read({ session: null })
+      )
+    ).toEqual(GateState.SignedOut());
+  });
+
   test("a read after Failed keeps the failure (no silent recovery)", () => {
     expect(
       gateTransition(

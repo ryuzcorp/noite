@@ -60,6 +60,13 @@ export const gateTransition = (state: Gate, event: GateEvent): Gate => {
         return GateState.Authed({ session: event.session });
       }
 
+      // A session that disappeared under a painted page (the impersonated
+      // session expired, or the cookie was cleared in another tab) signs out:
+      // the gate must never keep rendering user data from a dead session.
+      if (state._tag === "Authed") {
+        return GateState.SignedOut();
+      }
+
       // Only a checking gate retries; any other state that reads null is
       // already settled (signed out, or a page that has painted).
       if (state._tag !== "Checking" && state._tag !== "Ssr") {

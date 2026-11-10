@@ -7,6 +7,7 @@ import type { View } from "ilha";
 import { api } from "../api";
 import type { AdminUserRow } from "../api-types";
 import { authClient } from "../auth-client";
+import { rememberImpersonationReturn } from "../auth/impersonation";
 import { invalidateSession } from "../auth/session";
 import { errorMessage } from "../errors";
 import { resourceValue, resourceError } from "../resource";
@@ -69,7 +70,14 @@ const AdminUserRowItem = (props: AdminUserRowItemProps) => {
             <button
               type="button"
               class={`${ACTION} ${W_LG}`}
-              disabled={props.pending !== null}
+              // A stored role outside {admin, user} cannot be reasoned about:
+              // toggling it would rewrite a value nobody understands.
+              disabled={props.pending !== null || !row.roleKnown}
+              title={
+                row.roleKnown
+                  ? undefined
+                  : "This account's stored role is not admin or user"
+              }
               onclick={() => {
                 props.onRole(row);
               }}
@@ -106,6 +114,9 @@ const AdminUserRowItem = (props: AdminUserRowItemProps) => {
         {row.banned ? (
           <span class="badge badge-sm badge-error">banned</span>
         ) : null}
+        {row.roleKnown ? null : (
+          <span class="badge badge-sm badge-warning">unknown role</span>
+        )}
       </div>
       <div class="truncate text-xs opacity-70">
         {row.email} · {row.role}
@@ -154,6 +165,7 @@ const AdminUsersRows = ({ onPage, page, query }: AdminUsersListProps) => {
       // The session cookie is swapped server-side. The layout stays
       // mounted across navigation, so drop every user-scoped cache —
       // otherwise the chrome keeps showing the admin's session.
+      rememberImpersonationReturn();
       invalidateSession();
       router.visit("/apps");
     } catch (error) {
