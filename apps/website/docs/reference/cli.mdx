@@ -33,7 +33,7 @@ Flags fall back to env, then to GitHub Actions context:
 | `--message` | — | `deploy <sha12>` |
 | `--comment` | — | `update` (`create` / `off`) |
 
-`app`, `api`, `git` slugs are reserved and refused. The tree carries `dist/*` + `wrangler.jsonc` with no `package.json`, so the runner skips to release → `celld deploy`. Commits parent the remote tip (fast-forward); values are never logged, and the token travels in the remote URL exactly like a plain `git push`.
+`app`, `api`, `git` slugs are reserved and refused. The tree carries `dist/*` + `wrangler.jsonc` with no `package.json`, so the runner skips to release → `celld deploy`. Commits parent the remote tip (fast-forward); values are never logged, and the token is passed to `git` as its HTTP Basic auth header through the environment — never in the remote URL, the process arguments or the workdir's `.git/config`, so a retained temp dir holds no key.
 
 ## Workflow
 
@@ -53,7 +53,7 @@ In Actions it writes `url=` + `sha=` to `$GITHUB_OUTPUT` for downstream steps, a
 - `--comment create`: a new comment per deploy.
 - `--comment off`: no comment.
 
-Commenting soft-fails: missing `gh`, missing token, or no PR number only warns — the deploy already succeeded.
+Reporting soft-fails: a missing `gh`, a missing token, a non-zero `gh` exit, no PR number, or a `$GITHUB_OUTPUT` write error only warns — by then the deploy is already live.
 
 ## Environments
 

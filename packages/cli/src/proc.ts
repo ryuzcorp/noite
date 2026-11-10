@@ -9,14 +9,20 @@ export interface ProcResult {
   readonly stdout: string;
 }
 
-/** Run `command` with `args` (no shell, no interpolation) in `cwd`,
- * capturing stdout and stderr trimmed. Spawn failures (missing binary)
- * reject; a non-zero exit resolves, so the caller decides what it means. */
-export const runProc = (
+/** The one process runner every command injects, so tests can answer without
+ * a real binary. */
+export type RunProc = (
   command: string,
   args: readonly string[],
-  cwd?: string
-): Effect.Effect<ProcResult, Error> =>
+  cwd?: string,
+  env?: NodeJS.ProcessEnv
+) => Effect.Effect<ProcResult, Error>;
+
+/** Run `command` with `args` (no shell, no interpolation) in `cwd`,
+ * capturing stdout and stderr trimmed. Spawn failures (missing binary)
+ * reject; a non-zero exit resolves, so the caller decides what it means.
+ * `env` is merged onto the parent's environment when given. */
+export const runProc: RunProc = (command, args, cwd, env) =>
   Effect.try({
     catch: (cause) =>
       cause instanceof Error
@@ -26,6 +32,7 @@ export const runProc = (
       const proc = spawnSync(command, [...args], {
         cwd,
         encoding: "utf-8",
+        env: env === undefined ? undefined : { ...process.env, ...env },
         maxBuffer: 16 * 1024 * 1024,
         stdio: ["ignore", "pipe", "pipe"],
       });

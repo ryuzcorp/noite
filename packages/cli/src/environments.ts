@@ -62,7 +62,8 @@ const run =
   (flags: Flags): Effect.Effect<void, Error | string, never> =>
     Effect.gen(function* tool() {
       const ctx = yield* readActionContext();
-      const conn: Connection = yield* connection(flags, ctx.repo);
+      const repo = ctx._tag === "Actions" ? ctx.repo : null;
+      const conn: Connection = yield* connection(flags, repo);
 
       const result = yield* callTool<unknown>(conn, name, {
         app: conn.slug,
