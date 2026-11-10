@@ -112,7 +112,7 @@ export interface AppRoute {
 
 export const parseAppRoute = (
   params: { readonly env: string; readonly panel: string; readonly t: string },
-  envs: readonly RunnerEnvironment[] | undefined
+  envs?: readonly RunnerEnvironment[] | undefined
 ): AppRoute => {
   const { notice, scope } = parseScope(params.env, envs);
 

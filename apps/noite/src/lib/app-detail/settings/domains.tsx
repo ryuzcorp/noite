@@ -195,9 +195,9 @@ const DomainsApp = defineApp({
             Only an app admin can add or remove hostnames.
           </p>
         )}
-        {model.notice._tag === "None" ? null : (
+        {model.notice._tag === "Added" || model.notice._tag === "Verified" ? (
           <p class="m-0 text-sm opacity-70">{domainNoticeText(model.notice)}</p>
-        )}
+        ) : null}
       </SettingsSection>
     );
   },
