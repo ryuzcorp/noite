@@ -20,6 +20,7 @@ import {
   failedDraft,
   formBusy,
   formCanSave,
+  rebaseDraft,
   savedDraft,
   savingDraft,
 } from "./draft";
@@ -65,7 +66,7 @@ export const BranchProtectionPanel = ({
     const fresh = resourceValue(state);
 
     if (fresh && form().status._tag !== "Dirty") {
-      form.set(draftForm(toDraft(fresh)));
+      form.set(rebaseDraft(form(), toDraft(fresh)));
     }
   });
 

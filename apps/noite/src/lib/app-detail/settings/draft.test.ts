@@ -37,6 +37,12 @@ describe("draft form", () => {
     expect(rebaseDraft(edited, "c").saved).toBe("c");
   });
 
+  test("a refetch after a save keeps the Saved note", () => {
+    const saved = savedDraft(draftForm("a"), "b");
+
+    expect(rebaseDraft(saved, "b").status._tag).toBe("Saved");
+  });
+
   test("a saved form is clean and not saveable", () => {
     const saved = savedDraft(draftForm("a"), "b");
 

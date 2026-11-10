@@ -20,6 +20,7 @@ import {
   failedDraft,
   formBusy,
   formCanSave,
+  rebaseDraft,
   savedDraft,
   savingDraft,
 } from "./draft";
@@ -157,7 +158,7 @@ export const RateLimitsPanel = ({
     const next = toDraft(fresh);
 
     if (form().status._tag !== "Dirty") {
-      form.set(draftForm(next));
+      form.set(rebaseDraft(form(), next));
     }
   });
 

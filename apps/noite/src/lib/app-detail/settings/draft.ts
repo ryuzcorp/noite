@@ -98,7 +98,11 @@ export const rebaseDraft = <Value>(
     return { ...form, saved };
   }
 
-  return savedDraft(form, saved);
+  // A form that just saved keeps its "Saved" note while the refetch moves the
+  // baseline; a clean form stays clean.
+  return form.status._tag === "Saved"
+    ? savedDraft(form, saved)
+    : draftForm(saved);
 };
 
 export const formCanSave = (form: DraftForm<unknown>): boolean =>
