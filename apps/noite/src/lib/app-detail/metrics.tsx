@@ -8,6 +8,7 @@ import {
   decodeMetrics,
   feedKeys,
   feedLoaded,
+  feedProblem,
   feedRetrying,
   feedValue,
   liveFeed,
@@ -671,7 +672,9 @@ export const MetricsCard = ({
   const loaded = (): boolean => feedLoaded(feed.state());
 
   const loadError = (): string =>
-    feedRetrying(feed.state()) ? "Usage stream disconnected — retrying…" : "";
+    feedRetrying(feed.state())
+      ? "Usage stream disconnected — retrying…"
+      : (feedProblem(feed.state()) ?? "");
 
   const pickers = {
     cpuMs: (r: RunnerMetric) => r.cpuMs,

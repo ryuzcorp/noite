@@ -5,6 +5,7 @@ import { api } from "../api";
 import {
   decodeLogs,
   feedKeys,
+  feedProblem,
   feedRetrying,
   feedValue,
   liveFeed,
@@ -54,6 +55,8 @@ export const RuntimeLogs = ({
 
   const lines = (): string[] => feedValue(feed.state()) ?? [];
   const retrying = (): boolean => feedRetrying(feed.state());
+
+  const problem = (): string | null => feedProblem(feed.state());
   // Pane state must survive re-renders: this body re-runs on every frame
   // (it reads feed.latest()), so plain `let`s would reset `stick` to true
   // each line and yank a scrolled-up reader back down. atom.lazy runs once
@@ -82,7 +85,8 @@ export const RuntimeLogs = ({
           Log stream disconnected — retrying…
         </p>
       ) : null}
-      {lines().length === 0 && !retrying() ? (
+      {problem() ? <p class="text-error m-0 text-sm">{problem()}</p> : null}
+      {lines().length === 0 && !retrying() && !problem() ? (
         <p class="m-0 text-sm opacity-70">
           No output yet from the running fleet.
         </p>

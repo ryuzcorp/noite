@@ -4,15 +4,17 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { render } from "ilha/test";
 
 import {
+  ConnTypes,
   connectStream,
   createStreamHub,
+  feedLoading,
+  feedProblem,
   feedValue,
   liveFeed,
-  paintInitial,
-  streamHubUrl,
-  ConnTypes,
   nextConn,
   nextFeedState,
+  paintInitial,
+  streamHubUrl,
 } from "./feeds";
 import type { FeedSink, FeedState, LiveFeed, StreamHooks } from "./feeds";
 import { readSwr, writeSwr } from "./swr-store";
@@ -177,6 +179,33 @@ const connect = (hooks: StreamHooks, document_: FakeDocument): (() => void) => {
 
 const feedOf = (state: FeedState<string[]>): string[] | undefined =>
   feedValue(state);
+
+describe("feed problem", () => {
+  test("only a refused or offline feed has a problem; neither is loading", () => {
+    expect(feedProblem<string[]>({ _tag: "Cold" })).toBeNull();
+    expect(feedProblem<string[]>({ _tag: "Cached", value: [] })).toBeNull();
+    expect(feedProblem<string[]>({ _tag: "Live", value: [] })).toBeNull();
+    expect(
+      feedProblem<string[]>({ _tag: "Reconnecting", value: [] })
+    ).toBeNull();
+
+    expect(
+      feedProblem<string[]>({ _tag: "Refused", value: undefined })
+    ).toContain("refused");
+    expect(
+      feedProblem<string[]>({ _tag: "Offline", value: undefined })
+    ).toContain("unavailable");
+
+    // Only a cold panel is loading: a dead feed must not paint a skeleton.
+    expect(feedLoading<string[]>({ _tag: "Cold" })).toBe(true);
+    expect(feedLoading<string[]>({ _tag: "Offline", value: undefined })).toBe(
+      false
+    );
+    expect(feedLoading<string[]>({ _tag: "Refused", value: undefined })).toBe(
+      false
+    );
+  });
+});
 
 describe("feed state machine", () => {
   test("a bare open with no frame is not loaded", () => {

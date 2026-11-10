@@ -11,6 +11,8 @@ import {
   deploysUrl,
   feedKeys,
   feedLoaded,
+  feedLoading,
+  feedProblem,
   feedRetrying,
   feedValue,
   liveFeed,
@@ -569,6 +571,8 @@ const DeployFeedList = ({
 
   const retrying = (): boolean => feedRetrying(feed.state());
 
+  const problem = (): string | null => feedProblem(feed.state());
+
   const currentSha =
     environmentId === ""
       ? (resourceValue(appDetail(appId).state())?.app.lastDeploySha ?? null)
@@ -600,13 +604,14 @@ const DeployFeedList = ({
           Deploy stream disconnected — retrying…
         </p>
       ) : null}
+      {problem() ? <p class="text-error m-0 text-sm">{problem()}</p> : null}
       <ul class="list bg-base-100 dark:bg-base-200 border-base-300 rounded-box w-full border shadow-md">
-        {!loaded() && items().length === 0 && !retrying() ? (
+        {feedLoading(feed.state()) ? (
           <li class="px-4 pt-4 pb-4">
             <ListSkeleton rows={2} />
           </li>
         ) : null}
-        {loaded() && items().length === 0 && !retrying() ? (
+        {loaded() && items().length === 0 && !retrying() && !problem() ? (
           <li class="text-base-content/70 px-4 pt-4 pb-4 text-sm">
             {emptyText}
           </li>

@@ -9,6 +9,7 @@ import {
   eventsUrl,
   feedKeys,
   feedLoaded,
+  feedProblem,
   feedRetrying,
   feedValue,
   liveFeed,
@@ -349,6 +350,8 @@ const EventsFeed = ({
   const loaded = (): boolean => feedLoaded(feed.state());
 
   const retrying = (): boolean => feedRetrying(feed.state());
+
+  const problem = (): string | null => feedProblem(feed.state());
   const expanded = atom<string | null>(null);
   const profiles = atom<Record<string, string>>({});
   const profileError = atom<Record<string, string>>({});
@@ -455,6 +458,7 @@ const EventsFeed = ({
               Events stream disconnected — retrying…
             </p>
           ) : null}
+          {problem() ? <p class="text-error m-0 text-sm">{problem()}</p> : null}
           {loaded() &&
           snapshot().feed.length > 0 &&
           matchedEvents().length === 0 ? (

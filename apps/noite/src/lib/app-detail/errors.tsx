@@ -8,6 +8,7 @@ import {
   decodeErrors,
   errorsUrl,
   feedKeys,
+  feedProblem,
   feedRetrying,
   feedValue,
   liveFeed,
@@ -197,6 +198,7 @@ export const liveErrors = (
     data,
     // The only "still cold" state: a settled snapshot or frame has a value.
     pending: (): boolean => feed.state()._tag === "Cold",
+    problem: (): string | null => feedProblem(feed.state()),
     retrying,
     state: feed.state,
   };
@@ -268,6 +270,9 @@ const ErrorList = ({
           </div>
         </div>
         {live.retrying() ? <StreamRetrying /> : null}
+        {live.problem() ? (
+          <p class="text-error m-0 text-sm">{live.problem()}</p>
+        ) : null}
         {live.pending() ? <ListSkeleton rows={4} /> : null}
         {data !== undefined && issues.length === 0 ? (
           <EmptyErrors status={status} />
@@ -688,6 +693,9 @@ export const ErrorsSummary = ({ appId }: { appId: string }) => {
           </Link>
         </div>
         {live.retrying() ? <StreamRetrying /> : null}
+        {live.problem() ? (
+          <p class="text-error m-0 text-sm">{live.problem()}</p>
+        ) : null}
         {live.pending() ? <ListSkeleton rows={2} /> : null}
         {data !== undefined && issues.length === 0 ? (
           <p class="m-0 text-sm opacity-70">No open errors.</p>

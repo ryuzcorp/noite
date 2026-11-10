@@ -191,7 +191,7 @@ export const EnvVarsPanel = ({
       {err() ? <p class="text-error m-0 text-sm">{err()}</p> : null}
       {err() ? null : <LoadError error={resourceError(res.state())} />}
       {res.state()._tag === "Loading" ? <ListSkeleton rows={2} /> : null}
-      {rows.length === 0 && !(res.state()._tag === "Loading") ? (
+      {rows.length === 0 && resourceValue(res.state()) !== undefined ? (
         <p class="m-0 text-sm opacity-70">
           No variables yet — add one to configure the build, the release
           command, the fleet, or Worker code.

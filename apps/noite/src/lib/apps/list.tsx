@@ -17,6 +17,8 @@ import {
   decodeApps,
   feedKeys,
   feedLoaded,
+  feedLoading,
+  feedProblem,
   feedRetrying,
   feedValue,
   liveFeed,
@@ -185,6 +187,8 @@ export const AppsList = () => {
 
   const retrying = (): boolean => feedRetrying(feed.state());
 
+  const problem = (): string | null => feedProblem(feed.state());
+
   return (
     <>
       <InvitationsBanner />
@@ -193,6 +197,7 @@ export const AppsList = () => {
           App stream disconnected — retrying…
         </p>
       ) : null}
+      {problem() ? <p class="text-error m-0 text-sm">{problem()}</p> : null}
 
       <ul class="list bg-base-100 dark:bg-base-200 border-base-300 rounded-box w-full border shadow-md">
         <li class="flex items-center justify-between gap-2 p-4 pb-2">
@@ -205,11 +210,11 @@ export const AppsList = () => {
           </Link>
         </li>
         {showControl() ? <ControlAppRow /> : null}
-        {!loaded() && (
+        {feedLoading(feed.state()) ? (
           <li class="px-4 pt-2 pb-4">
             <ListSkeleton rows={3} />
           </li>
-        )}
+        ) : null}
         {loaded() && items().length === 0 && (
           <li class="px-4 pt-2 pb-4 text-sm">
             <span class="text-base-content/70">No apps yet. </span>

@@ -166,6 +166,30 @@ export const feedLoaded = <T>(state: FeedState<T>): boolean =>
 export const feedRetrying = (state: FeedState<unknown>): boolean =>
   state._tag === "Reconnecting";
 
+/** Whether the panel is still waiting for any data: the only skeleton. A
+ * refused or offline feed is not loading, it is not coming. */
+export const feedLoading = <T>(state: FeedState<T>): boolean =>
+  state._tag === "Cold";
+
+/** A short reason the feed cannot deliver data (terminal refusal, no
+ * transport), or null while it can. Panels render this instead of an endless
+ * skeleton or a misleading empty state. */
+export const feedProblem = <T>(state: FeedState<T>): string | null => {
+  switch (state._tag) {
+    case "Refused": {
+      return "This feed was refused. Reload the page to try again.";
+    }
+
+    case "Offline": {
+      return "Live updates are unavailable. Reload the page to try again.";
+    }
+
+    default: {
+      return null;
+    }
+  }
+};
+
 /** What moves a {@link FeedState}. */
 export type FeedEvent<T> =
   | { readonly kind: "conn"; readonly conn: Conn }
