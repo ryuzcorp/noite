@@ -553,24 +553,34 @@ async fn write_target_status(
     }
 }
 
+/// One target whose row the stall sweep just closed: what the automatic-deploy
+/// budget must re-read (the host layer emits the pause event — the db layer
+/// never calls `host`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StalledDeploy {
+    pub app_id: String,
+    pub environment_id: Option<String>,
+}
+
 /// Sweep deploys whose row has not moved since `older_than_ms`, closing them
 /// as `stalled` (not `failed`: nothing in the run reported an error — the host
 /// interrupted it or the step timed out). A preview row marks its
 /// environment, never the app. The row write
 /// is guarded by the transition table, so a row that another writer closed
 /// between the read and the update is left alone (and does not touch the
-/// target's status).
+/// target's status). Returns the closed rows' targets: a stall spends the
+/// automatic-deploy budget exactly like a failure.
 pub async fn fail_stuck_deploys(
     pool: &SqlitePool,
     older_than_ms: i64,
     skip_app_ids: &HashSet<String>,
-) -> sqlx::Result<u64> {
+) -> sqlx::Result<Vec<StalledDeploy>> {
     let rows = sqlx::query_as::<_, Deploy>(sqlx::AssertSqlSafe(format!(
         "SELECT {DEPLOY_COLS} FROM deploy ORDER BY updated_at DESC LIMIT 200"
     )))
     .fetch_all(pool)
     .await?;
-    let mut n = 0u64;
+    let mut closed = Vec::new();
     for row in rows {
         if skip_app_ids.contains(&row.app_id) {
             continue;
@@ -597,14 +607,14 @@ pub async fn fail_stuck_deploys(
              WHERE id = ? AND status IN ({})",
             status_list(IN_FLIGHT),
         );
-        let closed = sqlx::query(sqlx::AssertSqlSafe(sql))
+        let written = sqlx::query(sqlx::AssertSqlSafe(sql))
             .bind(DeployStatus::Stalled.as_str())
             .bind(&log)
             .bind(now_iso())
             .bind(&row.id)
             .execute(pool)
             .await?;
-        if closed.rows_affected() == 0 {
+        if written.rows_affected() == 0 {
             // Another writer (the stop endpoint, the run itself) got there
             // first: its story stands, and the target keeps its status.
             continue;
@@ -617,9 +627,12 @@ pub async fn fail_stuck_deploys(
             Some(STALLED_SUMMARY),
         )
         .await?;
-        n += 1;
+        closed.push(StalledDeploy {
+            app_id: row.app_id.clone(),
+            environment_id: row.environment_id.clone(),
+        });
     }
-    Ok(n)
+    Ok(closed)
 }
 
 fn utc_cutoff(older_than_ms: i64) -> chrono::DateTime<chrono::Utc> {
@@ -799,7 +812,7 @@ mod tests {
         let swept = fail_stuck_deploys(&pool, 60_000, &HashSet::new())
             .await
             .expect("sweep");
-        assert_eq!(swept, 0, "the row was already closed");
+        assert!(swept.is_empty(), "the row was already closed");
         let fresh = get_deploy(&pool, &app.id, &row.id)
             .await
             .expect("read")
@@ -898,7 +911,8 @@ mod tests {
         assert_eq!(
             fail_stuck_deploys(&pool, 60_000, &HashSet::new())
                 .await
-                .expect("sweep"),
+                .expect("sweep")
+                .len(),
             1
         );
 
@@ -945,7 +959,8 @@ mod tests {
         assert_eq!(
             fail_stuck_deploys(&pool, 60_000, &HashSet::new())
                 .await
-                .expect("second sweep"),
+                .expect("second sweep")
+                .len(),
             0
         );
     }

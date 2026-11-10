@@ -173,8 +173,10 @@ async fn reconcile_once(
 ) -> anyhow::Result<()> {
     let claimed = deploy::snapshot_claimed(deploying).await;
     let swept = db::fail_stuck_deploys(pool, DEPLOY_STUCK_MS, &claimed).await?;
-    if swept > 0 {
-        tracing::info!(swept, "swept stalled deploys");
+    if !swept.is_empty() {
+        tracing::info!(swept = swept.len(), "swept stalled deploys");
+        // A stalled row spends the automatic-deploy budget like a failure.
+        crate::host::auto_deploy::note_stalled(pool, &swept).await;
     }
 
     // Push-driven fast path (T2.2): every queued tip deploys this tick. The

@@ -137,7 +137,7 @@ async fn the_sweep_spares_a_queued_row_twice_as_long_as_a_building_one() {
     let swept = crate::db::fail_stuck_deploys(&h.state.pool, 1000, &skipped)
         .await
         .expect("sweep");
-    assert_eq!(swept, 1, "only the building row is past its bound");
+    assert_eq!(swept.len(), 1, "only the building row is past its bound");
 
     assert_eq!(status_of(&h, &app.id, &queued).await, DeployStatus::Queued);
     assert_eq!(
@@ -158,7 +158,7 @@ async fn the_sweep_spares_a_queued_row_twice_as_long_as_a_building_one() {
     let swept = crate::db::fail_stuck_deploys(&h.state.pool, 1000, &skipped)
         .await
         .expect("sweep");
-    assert_eq!(swept, 1);
+    assert_eq!(swept.len(), 1);
 
     h.finish().await;
 }

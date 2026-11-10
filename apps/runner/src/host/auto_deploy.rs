@@ -172,22 +172,39 @@ fn fill(state: &mut AutoDeploy, read: sqlx::Result<AutoDeploy>, target: &str) {
     }
 }
 
+/// Note the targets the stall sweep just closed: a stalled row counts as a
+/// failure, so two stalls can spend the budget without `Progress::fail` ever
+/// running (the host was interrupted).
+pub async fn note_stalled(pool: &SqlitePool, targets: &[db::StalledDeploy]) {
+    for target in targets {
+        note_exhausted(pool, &target.app_id, target.environment_id.as_deref()).await;
+    }
+}
+
 /// Record the tenant-visible `deploy` event at the moment the budget runs out:
-/// the second consecutive automatic failure. Best effort — a lost event never
-/// changes the deploy's own outcome, and an explicit or later failure does not
-/// repeat it.
+/// the target reads `Exhausted`. Best effort — a lost event never changes the
+/// deploy's own outcome, and the notice is emitted once per sha (the sweep can
+/// close several dead rows of one target in a single pass, and a later failure
+/// keeps the same exhausted state).
 pub async fn note_exhausted(pool: &SqlitePool, app_id: &str, environment_id: Option<&str>) {
     let Ok(AutoDeploy::Exhausted { sha, failures }) =
         for_target(pool, app_id, environment_id).await
     else {
         return;
     };
-    if failures != AutoDeploy::FAILURE_CAP {
-        // Only the transition into the cap emits: a third manual-then-failed
-        // attempt must not duplicate the notice.
+    if failures < AutoDeploy::FAILURE_CAP {
         return;
     }
     let short = &sha[..12.min(sha.len())];
+    let marker = format!("of {short};");
+    if let Ok(events) = db::list_app_events(pool, app_id, Some("deploy"), 50).await {
+        if events
+            .iter()
+            .any(|event| event.event == "auto deploy paused" && event.description.contains(&marker))
+        {
+            return;
+        }
+    }
     let detail = format!(
         "automatic deploys are paused after {failures} failed attempts of {short}; \
          push a fix or deploy manually"
@@ -427,6 +444,68 @@ mod tests {
             "{}",
             events[0].description
         );
+        pool.close().await;
+    }
+
+    /// A stall spends the budget too: two stalled rows at one sha are
+    /// `Exhausted`, and the host layer that runs the sweep records the same
+    /// pause event a failed run does (the sweep itself only closes rows).
+    #[tokio::test]
+    async fn stalled_rows_spend_the_budget_and_record_the_pause() {
+        let cfg = crate::config::config_for_tests();
+        let pool = db::connect("sqlite::memory:").await.expect("memory db");
+        let app = db::create_app(
+            &pool,
+            &cfg,
+            db::NewApp {
+                name: "stalled",
+                slug: "stalled",
+                user_id: "local",
+                subdomain: "stalled.localhost",
+                listen: 30390,
+                internal: 30391,
+            },
+        )
+        .await
+        .expect("app");
+        for _ in 0..2 {
+            db::upsert_deploy(
+                &pool,
+                None,
+                &app.id,
+                None,
+                DeployStatus::Building,
+                Some("sha1"),
+                "building",
+            )
+            .await
+            .expect("running deploy");
+        }
+        // Past any bound the sweep uses: the runs are dead (a restart).
+        sqlx::query("UPDATE deploy SET updated_at = '2026-01-01T00:00:00.000Z' WHERE app_id = ?")
+            .bind(&app.id)
+            .execute(&pool)
+            .await
+            .expect("age the rows");
+
+        let stalled = db::fail_stuck_deploys(&pool, 1_000, &std::collections::HashSet::new())
+            .await
+            .expect("sweep");
+        assert_eq!(stalled.len(), 2, "both dead rows are closed");
+        note_stalled(&pool, &stalled).await;
+
+        assert_eq!(
+            for_target(&pool, &app.id, None).await.expect("state"),
+            AutoDeploy::Exhausted {
+                sha: "sha1".into(),
+                failures: 2,
+            }
+        );
+        let events = db::list_app_events(&pool, &app.id, Some("deploy"), 10)
+            .await
+            .expect("events");
+        assert_eq!(events.len(), 1, "the stall path records the pause");
+        assert_eq!(events[0].event, "auto deploy paused");
         pool.close().await;
     }
 

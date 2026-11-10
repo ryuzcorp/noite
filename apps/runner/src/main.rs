@@ -296,9 +296,11 @@ async fn main() -> anyhow::Result<()> {
     }
     let swept = db::fail_stuck_deploys(&pool, DEPLOY_STUCK_MS, &HashSet::new())
         .await
-        .unwrap_or(0);
-    if swept > 0 {
-        tracing::info!(swept, "swept stalled deploys on boot");
+        .unwrap_or_default();
+    if !swept.is_empty() {
+        tracing::info!(swept = swept.len(), "swept stalled deploys on boot");
+        // A stalled row spends the automatic-deploy budget like a failure.
+        crate::host::auto_deploy::note_stalled(&pool, &swept).await;
     }
 
     // Install identity for the instance heartbeat: created on first boot and
