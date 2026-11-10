@@ -92,6 +92,65 @@ test("a sync does not cancel the open it would then abandon", () => {
   expect(landed.machine.view._tag).toBe("Painted");
 });
 
+test("a keystroke spends the token of the read in flight", () => {
+  // A sync read is out when the user keeps typing: the bytes it answers with
+  // are older than the editor, so it must not settle the surface (painting
+  // them undoes the keystroke, and pierre drops the typing after the repaint).
+  const painted = opened("a.ts", "one");
+
+  const syncing = stepPane(
+    painted.machine,
+    PaneEvents.SyncStarted({ path: "a.ts", writing: false })
+  );
+
+  const token = syncing.read?.token ?? -1;
+
+  expect(syncing.machine.view._tag).toBe("Opening");
+
+  const typed = stepPane(
+    syncing.machine,
+    PaneEvents.TextChanged({ path: "a.ts", text: "one, typed" })
+  );
+
+  expect(typed.refused).toBe(false);
+  expect(typed.machine.view._tag).toBe("Painted");
+  expect(paintedOf(typed.machine.view)?.text).toBe("one, typed");
+  // The surface moved on: the read still to land is spent.
+  expect(typed.machine.seq).not.toBe(token);
+
+  const late = stepPane(
+    typed.machine,
+    PaneEvents.Resolved({ show: show("a.ts", "one"), token })
+  );
+
+  expect(late.refused).toBe(true);
+  expect(late.machine).toEqual(typed.machine);
+  expect(paintedOf(late.machine.view)?.text).toBe("one, typed");
+});
+
+test("a keystroke re-keys the paint it types over", () => {
+  const { machine } = opened("a.ts", "one");
+
+  const typed = stepPane(
+    machine,
+    PaneEvents.TextChanged({ path: "a.ts", text: "two" })
+  );
+
+  expect(typed.machine.view._tag).toBe("Painted");
+  expect(panePath(typed.machine.view)).toBe("a.ts");
+  // The write's own derive compares against the typed text, not the paint's.
+  expect(ownedPainted(typed.machine.view)?.text).toBe("two");
+
+  // A keystroke for another file is not this surface's.
+  const other = stepPane(
+    typed.machine,
+    PaneEvents.TextChanged({ path: "b.ts", text: "three" })
+  );
+
+  expect(other.refused).toBe(true);
+  expect(other.machine).toEqual(typed.machine);
+});
+
 test("a sync during the pane's own write reads nothing", () => {
   const { machine } = opened("a.ts", "one");
 

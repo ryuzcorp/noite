@@ -262,15 +262,14 @@ export const createEditorPane = (host: EditorHost): EditorPane => {
     const text = editor.getText();
     liveText.set(path, text);
 
-    // The surface now holds the typed text: a later read of the pod must
-    // compare against this, not against the text it was painted with.
-    const painted = paintedOf(machine.view);
+    // The surface holds the typed text now: the machine spends the token of
+    // any read the pod is still answering, so its older bytes cannot paint
+    // over the keystrokes (and the rest of the typing, which pierre sends to
+    // the document a repaint rebuilt). The write's own derive reads again.
+    const typed = stepPane(machine, PaneEvents.TextChanged({ path, text }));
 
-    if (painted !== null && painted.path === path) {
-      machine = {
-        seq: machine.seq,
-        view: PaneViews.Painted({ ...painted, text }),
-      };
+    if (!typed.refused) {
+      ({ machine } = typed);
     }
 
     pendingWrites.set(path, text);
@@ -622,6 +621,10 @@ export const createEditorPane = (host: EditorHost): EditorPane => {
     const { token } = started.read;
     const show = await resolveShow(path);
 
+    // The token is spent when the surface moved on under the read — another
+    // request, a rebase, or a keystroke (`TextChanged`). A keystroke is the
+    // common one: the read was sent before it, so the pod answers with bytes
+    // older than the editor, and painting them would undo the typing.
     if (machine.seq !== token || path !== currentPath() || host.aborted()) {
       return;
     }

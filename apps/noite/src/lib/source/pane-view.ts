@@ -12,6 +12,7 @@
 //!   Opening --> Failed: OpenFailed{token,message}
 //!   Opening --> Painted: Abandoned        (nothing to show)
 //!   Painted --> Opening: Requested{path} / SyncStarted{path,!writing}
+//!   Painted --> Painted: TextChanged{path,text}  (a read in flight is spent)
 //!   Painted --> Stale: Rebased            (text stays, ownership does not)
 //!   Painted --> Empty: Dropped
 //!   Stale --> Opening: Requested{path}
@@ -58,7 +59,8 @@ export const PaneViews = Data.taggedEnum<PaneView>();
 /** The pane's state and the token every read is stamped with. */
 export interface PaneMachine {
   /** The last token handed out. Monotonic: a read answers for its own token
-   * or not at all. */
+   * or not at all. Every event that makes a read older than the surface — a
+   * request, a rebase, and a keystroke — moves it on. */
   readonly seq: number;
   readonly view: PaneView;
 }
@@ -162,6 +164,11 @@ export type PaneEvent = Data.TaggedEnum<{
   /** The pod moved: open the same path again, unless a write of the pane's own
    * is in flight (the read would answer with bytes older than the editor). */
   SyncStarted: { path: string; writing: boolean };
+  /** The user typed: the surface holds `text` now, so a read the pod is still
+   * answering started before it — painting those bytes would undo the
+   * keystrokes (and the rest of the typing, which pierre sends to a document
+   * it has since rebuilt). */
+  TextChanged: { path: string; text: string };
 }>;
 
 export const PaneEvents = Data.taggedEnum<PaneEvent>();
@@ -269,6 +276,32 @@ const resolved = (
     }),
     false
   );
+};
+
+/** The user typed: the surface holds `text` now. The token moves on, so a read
+ * the pod is still answering (a sync, or the pane's own open) is spent: it
+ * would paint bytes older than the editor. The path and the edit session stay
+ * the surface's own, and the write's derive is what reads again. */
+const textChanged = (
+  machine: PaneMachine,
+  event: { readonly path: string; readonly text: string }
+): PaneDecision => {
+  const painted = ownedPainted(machine.view);
+
+  if (painted === null || painted.path !== event.path) {
+    return refuse(machine);
+  }
+
+  return {
+    close: false,
+    machine: {
+      seq: machine.seq + 1,
+      view: PaneViews.Painted({ ...painted, text: event.text }),
+    },
+    read: null,
+    recheck: false,
+    refused: false,
+  };
 };
 
 const openFailed = (
@@ -388,6 +421,10 @@ export const stepPane = (
 
   if (event._tag === "OpenFailed") {
     return openFailed(machine, event);
+  }
+
+  if (event._tag === "TextChanged") {
+    return textChanged(machine, event);
   }
 
   if (event._tag === "Rebased") {
