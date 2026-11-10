@@ -13,7 +13,6 @@ import (
 	"fmt"
 	"net/http"
 	"os"
-	"reflect"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -172,7 +171,8 @@ func (s *sharedState) snapshot() *edgeSnapshot {
 
 // transitionLocked is the only writer of the phase. It also creates or drops
 // the resources that phase has, in the same step, so a stale table can never
-// survive behind a nil limiter. Callers hold mu.
+// survive behind a nil limiter. Callers hold mu and publish afterwards, once
+// the whole operation is done.
 func (s *sharedState) transitionLocked(next Phase) {
 	prev := s.st.phase
 	if prev == next {
@@ -195,7 +195,6 @@ func (s *sharedState) transitionLocked(next Phase) {
 		}
 		s.st = edgeState{phase: PhaseDraining}
 	}
-	s.publishLocked()
 	if s.log != nil {
 		s.log.Info("edge: phase transition",
 			zap.String("from", prev.String()),
@@ -214,6 +213,7 @@ func (s *sharedState) retain(log *zap.Logger) {
 	s.refs++
 	if s.st.phase == PhaseDraining {
 		s.transitionLocked(PhaseBooting)
+		s.publishLocked()
 	}
 }
 
@@ -228,6 +228,7 @@ func (s *sharedState) release() {
 	}
 	if s.refs == 0 && s.st.phase != PhaseDraining {
 		s.transitionLocked(PhaseDraining)
+		s.publishLocked()
 	}
 }
 
@@ -302,17 +303,37 @@ func (s *sharedState) install(t *Table) (Install, error) {
 		if t.Generation < cur.Generation {
 			return InstallStale, fmt.Errorf("edge: generation %d older than current %d", t.Generation, cur.Generation)
 		}
-		if t.Generation == cur.Generation && reflect.DeepEqual(cur, t) {
+		if t.Generation == cur.Generation && sameRoutes(cur, t) {
 			return InstallIdentical, nil
 		}
 	}
-	// The table is part of the snapshot the phase publishes, so it is set
-	// before the transition that makes it visible.
 	s.st.tab = t
 	s.transitionLocked(PhaseLoaded)
 	s.reconcileLocked(t)
 	s.publishLocked()
 	return InstallApplied, nil
+}
+
+// sameRoutes compares two tables' routes. Map iteration order and the JSON
+// key order the runner's HashMap serializes with are irrelevant, so equal
+// content compares equal however it was decoded.
+func sameRoutes(a, b *Table) bool {
+	if len(a.Exact) != len(b.Exact) || len(a.Wildcards) != len(b.Wildcards) {
+		return false
+	}
+	for host, ra := range a.Exact {
+		rb, ok := b.Exact[host]
+		if !ok || ra != rb {
+			return false
+		}
+	}
+	for i, wa := range a.Wildcards {
+		wb := b.Wildcards[i]
+		if wa.Suffix != wb.Suffix || wa.Route != wb.Route {
+			return false
+		}
+	}
+	return true
 }
 
 // reconcileLocked tracks exactly the upstreams a hold can wait on and drops

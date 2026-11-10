@@ -793,6 +793,16 @@ func TestEqualGenerationContentApplies(t *testing.T) {
 	if _, ok := liveTable().Lookup("new.test"); !ok {
 		t.Fatalf("equal-generation correction was dropped")
 	}
+	// The identical re-push (the runner's backstop tick) is a no-op: the
+	// installed table must stay the same value.
+	before := liveTable()
+	r = httptest.NewRequest(http.MethodPost, "/edge/routes", strings.NewReader(corrected))
+	if err := handleAdmin(httptest.NewRecorder(), r); err != nil {
+		t.Fatalf("identical re-push rejected: %v", err)
+	}
+	if liveTable() != before {
+		t.Fatalf("identical re-push replaced the table")
+	}
 }
 
 func writeTableFile(t *testing.T, path, body string) {
