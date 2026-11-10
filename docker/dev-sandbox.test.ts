@@ -25,16 +25,33 @@ import path from "node:path";
 const root = new URL("../", import.meta.url).pathname;
 const script = path.join(root, "docker/dev-sandbox.sh");
 
+/** Every stub build records its attempt in the work dir, so a retry loop is
+ * countable from the test (the work dir survives each source sync). */
+const ATTEMPT = `appendFileSync("attempts.log", "attempt\\n");`;
+
 /** A `build.ts` stand-in: copies `worker.ts` into `dist/`, plus a fixed meta.
  * The real bundler is covered by `apps/void-sandbox/build.test.ts`. */
-const STUB_BUILD = `import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+const STUB_BUILD = `import {
+  appendFileSync,
+  mkdirSync,
+  readFileSync,
+  writeFileSync,
+} from "node:fs";
 
+${ATTEMPT}
 mkdirSync("dist", { recursive: true });
 writeFileSync("dist/worker.js", readFileSync("worker.ts", "utf-8"));
 writeFileSync(
   "dist/meta.json",
   JSON.stringify({ bundleSha256: "stub", controllerProtocol: 2, void: "1.5.0" })
 );
+`;
+
+/** The same stand-in, failing the way a broken edit does. */
+const FAILING_BUILD = `import { appendFileSync } from "node:fs";
+
+${ATTEMPT}
+process.exit(1);
 `;
 
 interface Fixture {
@@ -152,6 +169,30 @@ const stdoutTail = (stream: ReadableStream<Uint8Array>) => {
   return drain;
 };
 
+/** Start `--watch` with no pause between checks: the watch tests wait on the
+ * child's output, never on the clock. stderr is merged into the same pipe
+ * because the failure diagnostics (the ones a dev reads in `make logs`) go
+ * there. */
+const startWatch = (fix: Fixture) =>
+  Bun.spawn(
+    [
+      "sh",
+      "-c",
+      'exec "$0" "$@" 2>&1',
+      script,
+      "--source",
+      fix.source,
+      "--work",
+      fix.work,
+      "--bundle",
+      fix.bundle,
+      "--watch",
+      "--poll",
+      "0",
+    ],
+    { stderr: "inherit", stdout: "pipe" }
+  );
+
 describe("dev-sandbox.sh", () => {
   test("--once publishes a bundle through a symlink it owns", () => {
     const fix = fixture();
@@ -229,26 +270,7 @@ describe("dev-sandbox.sh", () => {
 
   test("--watch rebuilds a source change made during the session", async () => {
     const fix = fixture();
-
-    const child = Bun.spawn(
-      [
-        "sh",
-        script,
-        "--source",
-        fix.source,
-        "--work",
-        fix.work,
-        "--bundle",
-        fix.bundle,
-        "--watch",
-        // No pause between checks: the test waits on the child's output, not
-        // on the clock.
-        "--poll",
-        "0",
-      ],
-      { stderr: "inherit", stdout: "pipe" }
-    );
-
+    const child = startWatch(fix);
     const awaitOutput = stdoutTail(child.stdout);
 
     try {
@@ -270,6 +292,57 @@ describe("dev-sandbox.sh", () => {
     } finally {
       child.kill();
       await child.exited;
+      rmSync(fix.dir, { force: true, recursive: true });
+    }
+  });
+
+  test("--watch does not retry a failing source until it changes", async () => {
+    const fix = fixture();
+    const child = startWatch(fix);
+    const awaitOutput = stdoutTail(child.stdout);
+
+    try {
+      await awaitOutput("published the controller bundle");
+
+      // A broken edit: the rebuild fails, which must not turn into a rebuild
+      // of the same bytes on every poll. The stale bundle is withdrawn first,
+      // then the failure is reported.
+      edit(path.join(fix.source, "build.ts"), FAILING_BUILD);
+      await awaitOutput("withdrew the stale controller bundle");
+      await awaitOutput("sandbox controller build failed");
+
+      edit(path.join(fix.source, "build.ts"), STUB_BUILD);
+      await awaitOutput("published the controller bundle");
+
+      // The first build, the failed one, the fixed one — a per-poll retry of
+      // the failing digest would leave hundreds of attempts here.
+      const log = readFileSync(path.join(fix.work, "attempts.log"), "utf-8");
+
+      expect(log.trim().split("\n")).toHaveLength(3);
+    } finally {
+      child.kill();
+      await child.exited;
+      rmSync(fix.dir, { force: true, recursive: true });
+    }
+  });
+
+  test("--once withdraws the bundle the sources no longer build", () => {
+    const fix = fixture();
+
+    try {
+      expect(runOnce(fix).exitCode).toBe(0);
+      expect(lstatSync(fix.bundle).isSymbolicLink()).toBe(true);
+
+      edit(path.join(fix.source, "build.ts"), FAILING_BUILD);
+
+      const failed = runOnce(fix);
+
+      expect(failed.exitCode).not.toBe(0);
+      expect(failed.stderr.toString()).toContain("withdrew");
+      // A deploy must fail instead of running the controller from bytes the
+      // sources no longer produce.
+      expect(lstatSync(fix.bundle, { throwIfNoEntry: false })).toBeUndefined();
+    } finally {
       rmSync(fix.dir, { force: true, recursive: true });
     }
   });

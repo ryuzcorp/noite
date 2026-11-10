@@ -174,6 +174,14 @@ build_or_report() {
     echo "dev-sandbox: published the controller bundle at $bundle_dir"
     return 0
   fi
+  # A failed build leaves no current bundle. Keeping the previous one would let
+  # a deploy run the controller from bytes the sources no longer have, which is
+  # how a dev session silently ships stale sandbox code; withdraw it so the
+  # verify-then-publish contract of `load_bundle` holds.
+  if [ -L "$bundle_dir" ]; then
+    rm -f "$bundle_dir"
+    echo "dev-sandbox: withdrew the stale controller bundle at $bundle_dir" >&2
+  fi
   echo "dev-sandbox: sandbox controller build failed; fix the error above — a sandbox app deploy fails until it builds" >&2
   return 1
 }
@@ -183,32 +191,33 @@ require_sources
 if [ "$mode" = once ]; then
   digest=$(sources_digest)
   if needs_build "$digest"; then
-    build_or_report "$digest"
+    build_or_report "$digest" || exit 1
   else
     echo "dev-sandbox: controller bundle current at $bundle_dir"
   fi
   exit 0
 fi
 
-# Watch: build once if needed, then keep the bundle matched to the sources. A
-# failed build is retried on the next change (never in a hot loop) so a broken
-# edit cannot spin the container.
-digest=$(sources_digest)
-built="failed:$digest"
-if needs_build "$digest"; then
-  if build_or_report "$digest"; then built=$digest; fi
+# Watch: build once if needed, then keep the bundle matched to the sources.
+# `attempted` is the digest of the last build attempt whether it succeeded or
+# failed, so a broken edit is not retried until the sources change (a failed
+# build must never spin the container); the published bundle is withdrawn while
+# the sources do not build.
+attempted=$(sources_digest)
+if needs_build "$attempted"; then
+  build_or_report "$attempted" || :
 else
-  built=$digest
+  echo "dev-sandbox: controller bundle current at $bundle_dir"
 fi
 while :; do
   sleep "$poll"
   if ! next=$(sources_digest); then
     continue
   fi
-  if [ "$next" = "$built" ]; then
+  if [ "$next" = "$attempted" ]; then
     continue
   fi
   echo "dev-sandbox: sources changed; rebuilding the controller bundle"
-  built="failed:$next"
-  if build_or_report "$next"; then built=$next; fi
+  attempted=$next
+  build_or_report "$next" || :
 done

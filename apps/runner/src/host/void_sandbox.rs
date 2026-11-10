@@ -190,7 +190,7 @@ pub fn load_bundle(dir: &Path) -> anyhow::Result<Bundle> {
     for path in [&worker, &meta_path] {
         if !path.is_file() {
             anyhow::bail!(
-                "sandbox controller bundle incomplete at {}: {} is missing (the image bakes the bundle into /opt/noite/void-sandbox during its build; the dev stack compiles apps/void-sandbox there when the container starts and after every source change, so a missing file means that build failed — restart it with `make dev` or `make dev-host` and read its log)",
+                "sandbox controller bundle incomplete at {}: {} is missing (the image bakes the bundle into /opt/noite/void-sandbox at build time, so a release container without it runs an image built without it — re-run the installer to refresh the image; a dev stack compiles apps/void-sandbox into the same path at container start and after every source change, and withdraws it while that build fails — its log holds the error, and `make dev` or `make dev-host` restarts it)",
                 dir.display(),
                 path.display()
             );
@@ -229,7 +229,7 @@ pub fn load_bundle(dir: &Path) -> anyhow::Result<Bundle> {
         .collect();
     if sha256 != meta.bundle_sha256 {
         anyhow::bail!(
-            "sandbox controller bundle at {} is inconsistent: worker.js does not match meta.json's bundleSha256 (both files are written together by the build — the image bakes them at image build time and the dev stack rebuilds them from apps/void-sandbox; restart it with `make dev` or `make dev-host` to rebuild)",
+            "sandbox controller bundle at {} is inconsistent: worker.js does not match meta.json's bundleSha256 (the build writes both files together and nothing else may — re-run the installer to refresh a release image, or `make dev`/`make dev-host` to rebuild a dev stack)",
             dir.display()
         );
     }
@@ -805,12 +805,16 @@ mod tests {
         std::fs::write(dir.join("worker.js"), b"controller-bundle-tampered").unwrap();
         let err = format!("{:#}", load_bundle(&dir).unwrap_err());
         assert!(err.contains("does not match"), "{}", err);
-        // The message names the fix an operator or a dev can actually run.
+        // The message names the fix an operator or a dev can actually run, and
+        // keeps the two recoveries apart: a dev-stack command never repairs a
+        // release container.
+        assert!(err.contains("installer"), "{}", err);
         assert!(err.contains("make dev-host"), "{}", err);
 
         std::fs::remove_file(dir.join("worker.js")).unwrap();
         let err = format!("{:#}", load_bundle(&dir).unwrap_err());
         assert!(err.contains("is missing"), "{}", err);
+        assert!(err.contains("installer"), "{}", err);
         assert!(err.contains("make dev"), "{}", err);
         assert!(!err.contains("bun run build"), "{}", err);
 
