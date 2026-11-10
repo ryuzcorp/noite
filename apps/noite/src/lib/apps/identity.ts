@@ -4,6 +4,7 @@
 
 import { kebabCase } from "scule";
 
+import { appLifecycle, lifecycleView } from "../app-detail/lifecycle";
 import { isLocalhostDomain } from "../local-host";
 
 // Letters, digits, plus hyphens: fold whitespace, drop other symbols,
@@ -33,23 +34,16 @@ export const initials = (name: string): string => {
   return `${first}${second}`.toUpperCase() || "?";
 };
 
-/** Presence dot tone: running = green, error = red, sleeping (scale to
- * zero: healthy, parked until its next request) = neutral, rest = yellow. */
-export const presenceTone = (status: string): string => {
-  if (status === "running") {
-    return "status-success";
-  }
-
-  if (status === "sleeping") {
-    return "status-neutral";
-  }
-
-  if (status === "failed" || status === "error") {
-    return "status-error";
-  }
-
-  return "status-warning";
-};
+/** Presence dot tone, one source (`lifecycle.ts`): running = green, error =
+ * red, sleeping (scale to zero: healthy, parked until its next request) or
+ * stopped = neutral, mid-pipeline = yellow. Pass `desiredState` when the row
+ * has it, so a deliberate stop paints neutral before the observed status has
+ * converged. */
+export const presenceTone = (status: string, desiredState?: string): string =>
+  lifecycleView(
+    appLifecycle({ desiredState, status }),
+    desiredState ?? "running"
+  ).tone;
 
 /** Reachable host for a stored subdomain on the current page's network.
  * Stored subdomains anchor on the configured base (dev: `slug.noite.localhost`).

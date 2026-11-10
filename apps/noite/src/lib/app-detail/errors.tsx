@@ -30,16 +30,16 @@ import { searchParam } from "../search-param";
 import { ArrowLeft } from "../ui/icons";
 import { LoadError } from "../ui/load-error";
 import { ListSkeleton, SectionSkeleton } from "../ui/skeletons";
-import { EnvPicker, validEnvId } from "./env-picker";
+import { capabilities } from "./capabilities";
+import { EnvPicker } from "./env-picker";
+import { issueActions, issueNote, issueState } from "./lifecycle";
+import { parseErrorFilter, parseScope, scopeId } from "./route.machine";
 
 const STATUSES: { id: ErrorStatus; label: string }[] = [
   { id: "open", label: "Open" },
   { id: "resolved", label: "Resolved" },
   { id: "ignored", label: "Ignored" },
 ];
-
-const toStatus = (raw: string): ErrorStatus =>
-  STATUSES.find((s) => s.id === raw)?.id ?? "open";
 
 const US_PER_MS = 1000;
 const DAY_MS = 86_400_000;
@@ -419,6 +419,18 @@ const Occurrence = ({ event }: { event: RunnerErrorEvent }) => (
   </div>
 );
 
+const triageLabel = (status: "ignored" | "open" | "resolved"): string => {
+  if (status === "ignored") {
+    return "Ignore";
+  }
+
+  if (status === "resolved") {
+    return "Resolve";
+  }
+
+  return "Reopen";
+};
+
 const TriageButtons = ({
   appId,
   environmentId,
@@ -432,6 +444,7 @@ const TriageButtons = ({
 }) => {
   const busy = atom(false);
   const failure = atom("");
+  const state = issueState(issue);
 
   const apply = async (status: ErrorStatus) => {
     busy.set(true);
@@ -455,52 +468,25 @@ const TriageButtons = ({
   return (
     <div class="flex flex-col items-end gap-1">
       <div class="flex gap-2">
-        {issue.status === "open" ? (
-          <>
-            <button
-              type="button"
-              class="btn btn-sm"
-              disabled={busy()}
-              onclick={() => apply("ignored")}
-            >
-              Ignore
-            </button>
-            <button
-              type="button"
-              class="btn btn-sm btn-neutral"
-              disabled={busy()}
-              onclick={() => apply("resolved")}
-            >
-              Resolve
-            </button>
-          </>
-        ) : (
+        {issueActions(state).map((status) => (
           <button
+            key={status}
             type="button"
-            class="btn btn-sm"
+            class={`btn btn-sm ${status === "resolved" ? "btn-neutral" : ""}`}
             disabled={busy()}
-            onclick={() => apply("open")}
+            onclick={() => apply(status)}
           >
-            Reopen
+            {triageLabel(status)}
           </button>
-        )}
+        ))}
       </div>
       {failure() ? <span class="text-error text-xs">{failure()}</span> : null}
     </div>
   );
 };
 
-const statusNote = (issue: RunnerErrorIssue): string => {
-  if (issue.status === "resolved") {
-    return "Resolved — reopens if it happens again.";
-  }
-
-  if (issue.status === "ignored") {
-    return "Ignored — still counted, never reopened.";
-  }
-
-  return "";
-};
+const statusNote = (issue: RunnerErrorIssue): string =>
+  issueNote(issueState(issue));
 
 const ErrorDetailView = ({
   appId,
@@ -735,20 +721,20 @@ export const ErrorsPanel = ({
   // shared link lands on the same view.
   const status = searchParam<ErrorStatus>("es", {
     default: "open",
-    parse: toStatus,
+    parse: parseErrorFilter,
   });
 
   const selected = searchParam("e", { default: "" });
   const env = searchParam("env", { default: "" });
   const envs = resourceValue(environments(appId).state()) ?? [];
-  const environmentId = validEnvId(envs, env());
+  const environmentId = scopeId(parseScope(env(), envs).scope);
 
   const role =
     canTriageProp === undefined
       ? resourceValue(appDetail(appId).state())?.myRole
       : undefined;
 
-  const canTriage = canTriageProp ?? (role === "push" || role === "admin");
+  const canTriage = canTriageProp ?? capabilities(role).push;
 
   if (selected()) {
     return (

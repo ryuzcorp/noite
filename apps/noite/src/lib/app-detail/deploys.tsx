@@ -1,11 +1,12 @@
 //! Deploy history: header dropdown + SSE list.
+import { defineApp } from "@ilha/model";
+import type { UpdateResult } from "@ilha/model";
 import { Link } from "@ilha/void";
 import { atom } from "ilha";
 
 import { api } from "../api";
 import { appHost, appUrl } from "../apps/identity";
 import { formatDateTime } from "../dates";
-import { errorMessage } from "../errors";
 import {
   decodeDeploys,
   deploysUrl,
@@ -17,205 +18,180 @@ import {
   feedValue,
   liveFeed,
 } from "../feeds";
+import { islandProps } from "../island";
 import { resourceValue, resourceError } from "../resource";
 import { appDetail, deployLog, environments } from "../resources";
 import type { AppRole } from "../roles";
-import type { RunnerDeploy } from "../runner";
+import type { RunnerDeploy, RunnerEnvironment } from "../runner";
 import { searchParam } from "../search-param";
 import { confirmDialog } from "../ui/confirm";
 import { CopyButton } from "../ui/copy-button";
 import { ChevronDown, ChevronUp, CloudUpload, Plus } from "../ui/icons";
 import { LoadError } from "../ui/load-error";
 import { ListSkeleton } from "../ui/skeletons";
+import { capabilities } from "./capabilities";
+import {
+  DropdownActionTypes,
+  DropdownMsg,
+  LookupTypes,
+  RowActionTypes,
+  RowMsg,
+  rowOpen,
+  updateDropdown,
+  updateRow,
+} from "./deploy.machine";
+import type {
+  DropdownMessage,
+  DropdownModel,
+  RowMessage,
+  RowModel,
+} from "./deploy.machine";
 import {
   CreateEnvironmentDialog,
   DeployGroupMeta,
   EnvironmentGroup,
 } from "./environments";
+import { deployBadgeTone, deployStatusFacts, isServing } from "./lifecycle";
 import { RuntimeLogs } from "./logs";
 
-export const deployBadge = (status: string) => {
-  let tone = "badge-ghost";
+/** The status badge for one deploy row, from the shared deploy facts. */
+export const deployBadge = (status: string) => (
+  <span class={`badge badge-sm ${deployBadgeTone(status)}`}>{status}</span>
+);
 
-  if (status === "success") {
-    tone = "badge-primary";
-  } else if (status === "failed") {
-    tone = "badge-error";
-  } else if (
-    status === "queued" ||
-    status === "building" ||
-    status === "deploying"
-  ) {
-    tone = "badge-warning";
-  }
-
-  return <span class={`badge badge-sm ${tone}`}>{status}</span>;
-};
+const DropdownProps = islandProps<{
+  appId: string;
+  canPush: boolean;
+  gitRemote: string;
+  lastDeploySha: string | null;
+  username: string;
+}>("DeployDropdown");
 
 /** Deploy (git remote) card dropdown. Lives in the page header next to
- * Code so it works on every tab; loads its own detail via the shared
- * resource. CSS-only dropdown (focus-based) — no visibility atom needed. */
-export const DeployDropdown = ({ appId }: { appId: string }) => {
-  const info = resourceValue(appDetail(appId).state());
-  const redeploying = atom(false);
-  const redeployError = atom("");
-  // Rows behind the rollback target. `null` = not loaded / refresh in
-  // flight, which hides the action.
-  const deployRows = atom<RunnerDeploy[] | null>(null);
-  const rollbacking = atom(false);
-  const rollbackError = atom("");
+ * Code so it works on every tab; the rollback-target lookup and both
+ * destructive actions are one machine (`deploy.machine.ts`): a failed lookup
+ * is a failure with a retry, never "no target", and a second click is
+ * refused. */
+const DropdownApp = defineApp({
+  init: (): UpdateResult<DropdownModel, DropdownMessage> => ({
+    model: {
+      action: DropdownActionTypes.Idle(),
+      appId: DropdownProps.read().appId,
+      liveSha: null,
+      lookup: LookupTypes.Idle(),
+    } satisfies DropdownModel,
+  }),
+  update: updateDropdown,
+  view: (model, dispatch) => {
+    const props = DropdownProps.read();
 
-  if (!info) {
-    return null;
-  }
+    const reload = (): void => {
+      dispatch(DropdownMsg.TargetsOpened({ liveSha: props.lastDeploySha }));
+    };
 
-  const canPush = info.myRole === "push" || info.myRole === "admin";
+    let target = "";
 
-  /** The newest successful production row that is not the live release. A
-   * target that equals the live sha is not a rollback: the pipeline would
-   * rebuild the release already serving. */
-  const rollbackSha = (): string => {
-    const rows = deployRows();
-
-    if (rows === null) {
-      return "";
+    if (model.lookup._tag === "Found") {
+      target = model.lookup.sha;
     }
 
-    const previous = rows.find(
-      (row) =>
-        // Production rows carry `null` (the runner stores NULL); older frames
-        // and fixtures may say "". Either is production.
-        (row.environmentId === null || row.environmentId === "") &&
-        row.status === "success" &&
-        !!row.sha &&
-        row.sha !== info.app.lastDeploySha
-    );
+    const busy =
+      model.action._tag === "Redeploying" ||
+      model.action._tag === "RollingBack";
 
-    return previous?.sha ?? "";
-  };
-
-  /** Refresh the history behind the target on every open: nothing stale may be
-   * clicked, so the action hides until the fresh rows land. */
-  const loadRollbackTarget = (): void => {
-    deployRows.set(null);
-    void (async () => {
-      try {
-        deployRows.set(
-          await api<RunnerDeploy[]>("/api/apps/listDeploys", { appId })
-        );
-      } catch {
-        // No target is the safe reading of a failed lookup: the button stays
-        // hidden and Redeploy (which needs no history) still works.
-        deployRows.set([]);
-      }
-    })();
-  };
-
-  return (
-    <div class="dropdown dropdown-end">
-      <div
-        tabindex={0}
-        role="button"
-        class="btn btn-sm btn-neutral"
-        onfocus={loadRollbackTarget}
-      >
-        <span class="inline-flex items-center gap-1">
-          <CloudUpload />
-          Deploy
-        </span>
-      </div>
-      <div
-        tabindex={0}
-        class="dropdown-content card bg-base-100 dark:bg-base-200 border-base-300 z-10 w-80 border shadow-md"
-      >
-        <div class="card-body gap-4">
-          <h3 class="card-title m-0 text-base">Deploy</h3>
-          <div class="flex items-center gap-2">
-            <code class="bg-base-200 block min-w-0 flex-1 overflow-x-auto rounded p-2 font-mono text-xs">
-              {info.gitRemote}
-            </code>
-            <CopyButton
-              class="btn btn-sm shrink-0"
-              iconOnly
-              label="Copy git remote"
-              value={info.gitRemote}
-            />
-          </div>
-          <p class="m-0 text-sm opacity-80">
-            Stock Git over HTTP — push <code>main</code> to deploy. Auth:{" "}
-            <code>username={info.username}</code>, password = API key from{" "}
-            <Link href="/account" class="link">
-              Account
-            </Link>
-            .
-          </p>
-          {canPush ? null : (
-            <p class="m-0 text-sm opacity-70">
-              Need <code>push</code> or <code>admin</code> to push;{" "}
-              <code>view</code> can fetch.
+    return (
+      <div class="dropdown dropdown-end">
+        <div
+          tabindex={0}
+          role="button"
+          class="btn btn-sm btn-neutral"
+          onfocus={reload}
+        >
+          <span class="inline-flex items-center gap-1">
+            <CloudUpload />
+            Deploy
+          </span>
+        </div>
+        <div
+          tabindex={0}
+          class="dropdown-content card bg-base-100 dark:bg-base-200 border-base-300 z-10 w-80 border shadow-md"
+        >
+          <div class="card-body gap-4">
+            <h3 class="card-title m-0 text-base">Deploy</h3>
+            <div class="flex items-center gap-2">
+              <code class="bg-base-200 block min-w-0 flex-1 overflow-x-auto rounded p-2 font-mono text-xs">
+                {props.gitRemote}
+              </code>
+              <CopyButton
+                class="btn btn-sm shrink-0"
+                iconOnly
+                label="Copy git remote"
+                value={props.gitRemote}
+              />
+            </div>
+            <p class="m-0 text-sm opacity-80">
+              Stock Git over HTTP — push <code>main</code> to deploy. Auth:{" "}
+              <code>username={props.username}</code>, password = API key from{" "}
+              <Link href="/account" class="link">
+                Account
+              </Link>
+              .
             </p>
-          )}
-          {canPush && info.app.lastDeploySha ? (
-            <div class="flex flex-col gap-2">
-              {redeployError() ? (
-                <p class="text-error m-0 text-sm">{redeployError()}</p>
-              ) : null}
-              <button
-                type="button"
-                class="btn btn-sm btn-neutral w-full"
-                disabled={redeploying()}
-                title="Re-run the pipeline at the current commit with the latest env vars and flags"
-                onclick={() => {
-                  const sha = info.app.lastDeploySha;
+            {props.canPush ? null : (
+              <p class="m-0 text-sm opacity-70">
+                Need <code>push</code> or <code>admin</code> to push;{" "}
+                <code>view</code> can fetch.
+              </p>
+            )}
+            {props.canPush && props.lastDeploySha ? (
+              <div class="flex flex-col gap-2">
+                {model.action._tag === "Failed" &&
+                model.action.kind === "redeploy" ? (
+                  <p class="text-error m-0 text-sm">{model.action.error}</p>
+                ) : null}
+                <button
+                  type="button"
+                  class="btn btn-sm btn-neutral w-full"
+                  disabled={busy}
+                  title="Re-run the pipeline at the current commit with the latest env vars and flags"
+                  onclick={() => {
+                    const sha = props.lastDeploySha;
 
-                  if (!sha) {
-                    return;
-                  }
-
-                  redeploying.set(true);
-                  redeployError.set("");
-                  void (async () => {
-                    try {
-                      await api<{ ok: true }>("/api/apps/rollback", {
-                        appId,
-                        sha,
-                      });
-                    } catch (error) {
-                      redeployError.set(errorMessage(error));
+                    if (!sha) {
+                      return;
                     }
 
-                    redeploying.set(false);
-                  })();
-                }}
-              >
-                {redeploying()
-                  ? "Redeploying…"
-                  : `Redeploy ${(info.app.lastDeploySha ?? "").slice(0, 12)}`}
-              </button>
-              <p class="m-0 text-xs opacity-70">
-                Picks up the latest env vars and flags. Progress shows in
-                Deployments.
-              </p>
-            </div>
-          ) : null}
-          {canPush && rollbackSha() ? (
-            <div class="flex flex-col gap-2">
-              {rollbackError() ? (
-                <p class="text-error m-0 text-sm">{rollbackError()}</p>
-              ) : null}
-              <button
-                type="button"
-                class="btn btn-sm btn-ghost w-full"
-                disabled={rollbacking()}
-                title="Re-run the pipeline at an earlier release, without touching the checkout"
-                onclick={() => {
-                  const sha = rollbackSha();
+                    dispatch(DropdownMsg.RedeployRequested({ sha }));
+                  }}
+                >
+                  {model.action._tag === "Redeploying"
+                    ? "Redeploying…"
+                    : `Redeploy ${(props.lastDeploySha ?? "").slice(0, 12)}`}
+                </button>
+                <p class="m-0 text-xs opacity-70">
+                  Picks up the latest env vars and flags. Progress shows in
+                  Deployments.
+                </p>
+              </div>
+            ) : null}
+            {props.canPush && target ? (
+              <div class="flex flex-col gap-2">
+                {model.action._tag === "Failed" &&
+                model.action.kind === "rollback" ? (
+                  <p class="text-error m-0 text-sm">{model.action.error}</p>
+                ) : null}
+                <button
+                  type="button"
+                  class="btn btn-sm btn-ghost w-full"
+                  disabled={busy}
+                  title="Re-run the pipeline at an earlier release, without touching the checkout"
+                  onclick={async () => {
+                    const sha = target;
 
-                  if (!sha) {
-                    return;
-                  }
+                    if (!sha) {
+                      return;
+                    }
 
-                  void (async () => {
                     const ok = await confirmDialog({
                       confirmLabel: "Roll back",
                       title: `Roll back to ${sha.slice(0, 12)}?`,
@@ -225,40 +201,61 @@ export const DeployDropdown = ({ appId }: { appId: string }) => {
                       return;
                     }
 
-                    rollbacking.set(true);
-                    rollbackError.set("");
-
-                    try {
-                      await api<{ ok: true }>("/api/apps/rollback", {
-                        appId,
-                        sha,
-                      });
-                    } catch (error) {
-                      rollbackError.set(errorMessage(error));
-                    }
-
-                    rollbacking.set(false);
-                  })();
-                }}
-              >
-                {rollbacking()
-                  ? "Rolling back…"
-                  : `Roll back to ${rollbackSha().slice(0, 12)}`}
-              </button>
-              <p class="m-0 text-xs opacity-70">
-                Restores the previous release; the checkout stays where it is.
-                Progress shows in Deployments.
+                    dispatch(DropdownMsg.RollbackRequested({ sha }));
+                  }}
+                >
+                  {model.action._tag === "RollingBack"
+                    ? "Rolling back…"
+                    : `Roll back to ${target.slice(0, 12)}`}
+                </button>
+                <p class="m-0 text-xs opacity-70">
+                  Restores the previous release; the checkout stays where it is.
+                  Progress shows in Deployments.
+                </p>
+              </div>
+            ) : null}
+            {model.lookup._tag === "Failed" ? (
+              <div class="flex flex-col gap-1">
+                <p class="text-error m-0 text-xs">{model.lookup.error}</p>
+                <button
+                  type="button"
+                  class="btn btn-sm btn-ghost self-start"
+                  disabled={busy}
+                  onclick={reload}
+                >
+                  Retry
+                </button>
+              </div>
+            ) : null}
+            {props.canPush && model.lookup._tag === "None" ? (
+              <p class="m-0 text-xs opacity-60">
+                No earlier successful deploy to roll back to yet.
               </p>
-            </div>
-          ) : null}
-          {canPush && deployRows() !== null && rollbackSha() === "" ? (
-            <p class="m-0 text-xs opacity-60">
-              No earlier successful deploy to roll back to yet.
-            </p>
-          ) : null}
+            ) : null}
+          </div>
         </div>
       </div>
-    </div>
+    );
+  },
+});
+
+const DeployDropdownIsland = DropdownProps.wrap(DropdownApp);
+
+export const DeployDropdown = ({ appId }: { appId: string }) => {
+  const info = resourceValue(appDetail(appId).state());
+
+  if (!info) {
+    return null;
+  }
+
+  return (
+    <DeployDropdownIsland
+      appId={appId}
+      canPush={capabilities(info.myRole).push}
+      gitRemote={info.gitRemote}
+      lastDeploySha={info.app.lastDeploySha}
+      username={info.username}
+    />
   );
 };
 
@@ -320,234 +317,201 @@ const BuildLogPane = ({
   return <FinishedBuildLog appId={appId} deployId={d.id} />;
 };
 
-/** Confirm and stop one in-flight deploy: the rejection text, or `""`. */
-const stopDeploy = async (appId: string, deployId: string): Promise<string> => {
-  try {
-    await api<{ ok: true }>("/api/apps/cancelDeploy", { appId, deployId });
-
-    return "";
-  } catch (error) {
-    return errorMessage(error);
-  }
-};
-
-/** The row's Stop button (push/admin, in-flight only): the run dies with its
- * step's process group and the row closes as failed. */
-const StopDeployButton = ({
-  appId,
-  deployId,
-}: {
+const RowProps = islandProps<{
   appId: string;
-  deployId: string;
-}) => {
-  const stopping = atom(false);
-  const error = atom("");
-
-  return (
-    <>
-      {error() ? <p class="text-error m-0 text-xs">{error()}</p> : null}
-      <button
-        type="button"
-        class="btn btn-sm btn-ghost text-error shrink-0"
-        disabled={stopping()}
-        onclick={async () => {
-          const ok = await confirmDialog({
-            confirmLabel: "Stop deploy",
-            message:
-              "The step running now is killed and the deploy is closed as failed. The release serving traffic stays as it is.",
-            title: "Stop this deploy?",
-          });
-
-          if (!ok) {
-            return;
-          }
-
-          stopping.set(true);
-          error.set("");
-
-          error.set(await stopDeploy(appId, deployId));
-          stopping.set(false);
-        }}
-      >
-        {stopping() ? "Stopping…" : "Stop"}
-      </button>
-    </>
-  );
-};
-
-const DeployRow = ({
-  appId,
-  currentSha,
-  d,
-  environmentId,
-  live,
-}: {
-  appId: string;
+  canPush: boolean;
   currentSha: string | null;
   d: RunnerDeploy;
-  /** The row's environment ("" = production). */
   environmentId: string;
-  /** The deploy serving traffic now, which starts expanded. */
   live: boolean;
-}) => {
-  // Atom-driven expansion: the log is a sibling <li> (block layout, full
-  // width by construction) instead of a grid child — immune to list-row
-  // span subtleties. Until the reader toggles it, the row follows `live`:
-  // that is only known once both the app's live sha and the feed's rows are
-  // in, in either order, so a row seeded at mount stayed collapsed whenever
-  // the rows came first.
-  const toggled = atom<boolean | null>(null);
-  const open = (): boolean => toggled() ?? live;
-  const logTab = atom<"build" | "deploy">("deploy");
-  const rolling = atom(false);
-  const rollError = atom("");
-  const info = resourceValue(appDetail(appId).state());
+}>("DeployRow");
 
-  const canPush =
-    info !== undefined && (info.myRole === "push" || info.myRole === "admin");
+/** One deploy row. Expansion, the log tab, Stop and Roll back are one
+ * machine: Stop is refused while a call is in flight, and a 409 ("already
+ * closed") reads as information instead of a permanent red error. */
+const RowApp = defineApp({
+  init: (): UpdateResult<RowModel, RowMessage> => ({
+    model: {
+      action: RowActionTypes.Idle(),
+      expanded: null,
+      tab: "deploy",
+    } satisfies RowModel,
+  }),
+  update: updateRow,
+  view: (model, dispatch) => {
+    const props = RowProps.read();
+    const { d } = props;
+    const facts = deployStatusFacts(d.status);
+    const open = rowOpen(model, props.live);
 
-  // A row nothing is building any more is only stopped once the runner has
-  // closed it: the button is for the live run.
-  const inFlight =
-    d.status === "queued" ||
-    d.status === "building" ||
-    d.status === "deploying";
+    const busy =
+      model.action._tag === "Stopping" || model.action._tag === "RollingBack";
 
-  // Roll back re-runs *this row's* target at that sha: production rows
-  // rebuild production, a preview row rebuilds that environment (the runner
-  // proves the sha was successful there), so a preview sha can never land in
-  // production.
-  const canRollBack = d.status === "success" && !!d.sha && d.sha !== currentSha;
+    // Roll back re-runs *this row's* target at that sha: production rows
+    // rebuild production, a preview row rebuilds that environment (the runner
+    // proves the sha was successful there), so a preview sha can never land in
+    // production.
+    const canRollBack =
+      facts.succeeded && !!d.sha && d.sha !== props.currentSha;
 
-  return (
-    <>
-      <li class="list-row">
-        <div>{deployBadge(d.status)}</div>
-        <div>
-          <div class="font-mono text-sm">
-            {d.sha ? (
-              <Link
-                class="link link-hover"
-                href={`/apps/${appId}/source/commit/${d.sha}`}
-                title={d.sha}
-              >
-                {d.sha.slice(0, 12)}
-              </Link>
-            ) : (
-              "—"
-            )}
+    return (
+      <>
+        <li class="list-row">
+          <div>{deployBadge(d.status)}</div>
+          <div>
+            <div class="font-mono text-sm">
+              {d.sha ? (
+                <Link
+                  class="link link-hover"
+                  href={`/apps/${props.appId}/source/commit/${d.sha}`}
+                  title={d.sha}
+                >
+                  {d.sha.slice(0, 12)}
+                </Link>
+              ) : (
+                "—"
+              )}
+            </div>
+            <div class="text-base-content/70 text-xs">
+              {formatDateTime(d.createdAt)}
+            </div>
           </div>
-          <div class="text-base-content/70 text-xs">
-            {formatDateTime(d.createdAt)}
-          </div>
-        </div>
-        {rollError() ? (
-          <p class="text-error m-0 text-xs">{rollError()}</p>
-        ) : null}
-        {canPush && inFlight ? (
-          <StopDeployButton appId={appId} deployId={d.id} />
-        ) : null}
-        {canRollBack ? (
+          {model.action._tag === "Failed" ? (
+            <p class="text-error m-0 text-xs">{model.action.error}</p>
+          ) : null}
+          {model.action._tag === "AlreadyClosed" ? (
+            <p class="m-0 text-xs opacity-70">This deploy already finished.</p>
+          ) : null}
+          {props.canPush && facts.inFlight ? (
+            <button
+              type="button"
+              class="btn btn-sm btn-ghost text-error shrink-0"
+              disabled={busy}
+              onclick={async () => {
+                const ok = await confirmDialog({
+                  confirmLabel: "Stop deploy",
+                  message:
+                    "The step running now is killed and the deploy is closed as failed. The release serving traffic stays as it is.",
+                  title: "Stop this deploy?",
+                });
+
+                if (!ok) {
+                  return;
+                }
+
+                dispatch(
+                  RowMsg.StopRequested({
+                    appId: props.appId,
+                    deployId: d.id,
+                  })
+                );
+              }}
+            >
+              {model.action._tag === "Stopping" ? "Stopping…" : "Stop"}
+            </button>
+          ) : null}
+          {canRollBack ? (
+            <button
+              type="button"
+              class="btn btn-sm btn-ghost shrink-0"
+              disabled={busy}
+              onclick={async () => {
+                const { sha } = d;
+
+                if (!sha) {
+                  return;
+                }
+
+                const ok = await confirmDialog({
+                  confirmLabel: "Roll back",
+                  title: `Roll back to ${sha.slice(0, 12)}?`,
+                });
+
+                if (!ok) {
+                  return;
+                }
+
+                dispatch(
+                  RowMsg.RollbackRequested({
+                    appId: props.appId,
+                    deployId: d.id,
+                    environmentId: props.environmentId,
+                    sha,
+                  })
+                );
+              }}
+            >
+              {model.action._tag === "RollingBack"
+                ? "Rolling back…"
+                : "Roll back"}
+            </button>
+          ) : null}
           <button
             type="button"
             class="btn btn-sm btn-ghost shrink-0"
-            disabled={rolling()}
-            onclick={async () => {
-              const { sha } = d;
-
-              if (!sha) {
-                return;
-              }
-
-              const ok = await confirmDialog({
-                confirmLabel: "Roll back",
-                title: `Roll back to ${sha.slice(0, 12)}?`,
-              });
-
-              if (!ok) {
-                return;
-              }
-
-              rolling.set(true);
-              rollError.set("");
-
-              try {
-                await api<{ ok: true }>("/api/apps/rollback", {
-                  appId,
-                  environmentId,
-                  sha,
-                });
-              } catch (error) {
-                rollError.set(errorMessage(error));
-              }
-
-              rolling.set(false);
+            aria-expanded={open}
+            onclick={() => {
+              dispatch(RowMsg.LogsToggled({ live: props.live }));
             }}
           >
-            {rolling() ? "Rolling back…" : "Roll back"}
+            <span class="inline-flex items-center gap-1">
+              {open ? "Hide logs" : "View logs"}
+              {open ? <ChevronUp /> : <ChevronDown />}
+            </span>
           </button>
-        ) : null}
-        <button
-          type="button"
-          class="btn btn-sm btn-ghost shrink-0"
-          aria-expanded={open()}
-          onclick={() => {
-            toggled.set(!open());
-          }}
-        >
-          <span class="inline-flex items-center gap-1">
-            {open() ? "Hide logs" : "View logs"}
-            {open() ? <ChevronUp /> : <ChevronDown />}
-          </span>
-        </button>
-      </li>
-      {open() ? (
-        <li class="flex flex-col gap-2 px-4 pb-4">
-          <div role="tablist" class="tabs tabs-border w-fit">
-            <button
-              type="button"
-              role="tab"
-              aria-selected={logTab() === "deploy"}
-              class={`tab ${logTab() === "deploy" ? "tab-active" : ""}`}
-              onclick={() => {
-                logTab.set("deploy");
-              }}
-            >
-              Deployment logs
-            </button>
-            <button
-              type="button"
-              role="tab"
-              aria-selected={logTab() === "build"}
-              class={`tab ${logTab() === "build" ? "tab-active" : ""}`}
-              onclick={() => {
-                logTab.set("build");
-              }}
-            >
-              Build logs
-            </button>
-          </div>
-          <BuildLogPane
-            appId={appId}
-            d={d}
-            environmentId={environmentId}
-            tab={logTab()}
-          />
         </li>
-      ) : null}
-    </>
-  );
-};
+        {open ? (
+          <li class="flex flex-col gap-2 px-4 pb-4">
+            <div role="tablist" class="tabs tabs-border w-fit">
+              <button
+                type="button"
+                role="tab"
+                aria-selected={model.tab === "deploy"}
+                class={`tab ${model.tab === "deploy" ? "tab-active" : ""}`}
+                onclick={() => {
+                  dispatch(RowMsg.TabPicked({ tab: "deploy" }));
+                }}
+              >
+                Deployment logs
+              </button>
+              <button
+                type="button"
+                role="tab"
+                aria-selected={model.tab === "build"}
+                class={`tab ${model.tab === "build" ? "tab-active" : ""}`}
+                onclick={() => {
+                  dispatch(RowMsg.TabPicked({ tab: "build" }));
+                }}
+              >
+                Build logs
+              </button>
+            </div>
+            <BuildLogPane
+              appId={props.appId}
+              d={d}
+              environmentId={props.environmentId}
+              tab={model.tab}
+            />
+          </li>
+        ) : null}
+      </>
+    );
+  },
+});
+
+const DeployRowIsland = RowProps.wrap(RowApp);
 
 /** One environment's deploy history over SSE: skeleton until the first frame,
  * then the event stream pushes updates — no polling, and rows never remount
  * underneath an open log. `environmentId` is `""` for production. */
 const DeployFeedList = ({
   appId,
+  canPush,
   emptyText,
   environmentId,
 }: {
   appId: string;
+  canPush: boolean;
   /** Shown once the feed has loaded with no rows. */
   emptyText: string;
   environmentId: string;
@@ -573,27 +537,38 @@ const DeployFeedList = ({
 
   const problem = (): string | null => feedProblem(feed.state());
 
-  const currentSha =
-    environmentId === ""
-      ? (resourceValue(appDetail(appId).state())?.app.lastDeploySha ?? null)
-      : null;
+  const app = resourceValue(appDetail(appId).state())?.app;
 
-  // One sha can be deployed many times (redeploys, rollbacks); only the
-  // newest successful deploy of the live sha is the one serving traffic.
-  // The feed is newest-first. In an environment's feed the newest successful
-  // deploy is that environment's live one.
+  const env: RunnerEnvironment | undefined =
+    environmentId === ""
+      ? undefined
+      : (resourceValue(environments(appId).state()) ?? []).find(
+          (one) => one.id === environmentId
+        );
+
+  // Production's live release is the app's own sha; an environment's is its
+  // newest successful row. A scope the runner has stopped serves nothing.
+  const currentSha = environmentId === "" ? (app?.lastDeploySha ?? null) : null;
+
   const liveId = (): string | null => {
-    if (environmentId !== "") {
-      return items().find((d) => d.status === "success")?.id ?? null;
+    if (environmentId === "") {
+      if (!app || !isServing(app) || currentSha === null) {
+        return null;
+      }
+
+      return (
+        items().find(
+          (d) => d.sha === currentSha && deployStatusFacts(d.status).succeeded
+        )?.id ?? null
+      );
     }
 
-    if (currentSha === null) {
+    if (!env || !isServing(env)) {
       return null;
     }
 
     return (
-      items().find((d) => d.sha === currentSha && d.status === "success")?.id ??
-      null
+      items().find((d) => deployStatusFacts(d.status).succeeded)?.id ?? null
     );
   };
 
@@ -617,9 +592,10 @@ const DeployFeedList = ({
           </li>
         ) : null}
         {items().map((d) => (
-          <DeployRow
+          <DeployRowIsland
             key={d.id}
             appId={appId}
+            canPush={canPush}
             currentSha={currentSha}
             d={d}
             environmentId={environmentId}
@@ -648,7 +624,7 @@ export const DeployList = ({
   const envs = resourceValue(res.state()) ?? [];
   const open = atom(false);
   const deep = searchParam("env", { default: "" });
-  const canPush = myRole === "push" || myRole === "admin";
+  const canPush = capabilities(myRole).push;
 
   return (
     <div class="flex w-full flex-col gap-4">
@@ -673,6 +649,7 @@ export const DeployList = ({
           {app ? (
             <DeployGroupMeta
               appId={appId}
+              desiredState={app.desiredState}
               host={appHost(subdomain)}
               sha={app.lastDeploySha}
               status={app.status}
@@ -682,6 +659,7 @@ export const DeployList = ({
         </div>
         <DeployFeedList
           appId={appId}
+          canPush={canPush}
           emptyText="No deployments yet. Push to main to trigger one."
           environmentId=""
         />
@@ -698,6 +676,7 @@ export const DeployList = ({
         >
           <DeployFeedList
             appId={appId}
+            canPush={canPush}
             emptyText="No deployments yet for this environment."
             environmentId={env.id}
           />

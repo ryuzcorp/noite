@@ -1,22 +1,34 @@
+import { defineApp } from "@ilha/model";
+import type { UpdateResult } from "@ilha/model";
 //! App page chrome and Overview: the header shown above every tab
 //! (identity, status, actions) and the Overview tab's cards.
 import { Link } from "@ilha/void";
-import { atom, watch } from "ilha";
+import { watch } from "ilha";
 
-import { api } from "../api";
-import { appHost, appUrl, presenceTone } from "../apps/identity";
+import { appHost, appUrl } from "../apps/identity";
 import { errorMessage } from "../errors";
+import { appStateUrl, decodeAppState, feedKeys, liveFeed } from "../feeds";
+import { islandProps } from "../island";
 import { resourceValue, resourceError } from "../resource";
 import { appDetail } from "../resources";
 import type { AppRole } from "../roles";
-import { sleep } from "../sleep";
 import { AppStorageList } from "../storage/list";
 import { Avatar } from "../ui/avatar";
 import { CopyButton } from "../ui/copy-button";
 import { ArrowUpRight, Pause, Play, Refresh } from "../ui/icons";
 import { AppHeaderSkeleton } from "../ui/skeletons";
+import {
+  HeaderMsg,
+  HeaderNoticeTypes,
+  PendingTypes,
+  updateHeader,
+} from "./app-header.machine";
+import type { HeaderMessage, HeaderModel } from "./app-header.machine";
+import { capabilities } from "./capabilities";
 import { DeployDropdown } from "./deploys";
 import { ErrorsSummary } from "./errors";
+import { appLifecycle, lifecycleView } from "./lifecycle";
+import type { LifecycleView } from "./lifecycle";
 import { MetricsCard } from "./metrics";
 
 export interface AppDetailInfo {
@@ -40,41 +52,21 @@ export interface AppDetailInfo {
 }
 
 const SHA_CHARS = 7;
-const CONVERGE_POLLS = 20;
-const CONVERGE_INTERVAL_MS = 3000;
-
-// Retry of a failed import (A2): the runner's clone can take minutes, and the
-// app page is the only place that shows the outcome, so poll the detail.
-const IMPORT_POLLS = 60;
-const IMPORT_INTERVAL_MS = 3000;
-
-// A failed import offers Retry, and so does one that a restart interrupted
-// (still `importing`, with no task behind it — the runner refuses the retry
-// while an import really is running).
-const RETRY_IMPORT_STATUSES = new Set(["error", "importing"]);
-
-const STATUS_LABELS = new Map([
-  ["running", "Running"],
-  ["sleeping", "Sleeping"],
-  ["stopped", "Stopped"],
-  ["deploying", "Deploying"],
-  ["building", "Building"],
-  ["failed", "Failed"],
-  ["error", "Error"],
-  ["importing", "Importing"],
-]);
-
-const statusLabel = (status: string): string =>
-  STATUS_LABELS.get(status) ?? status;
 
 /** Status · host · commit, under the app name. The full SHA sits in a
  * native `title` (a daisyUI tooltip's hidden pseudo-element widened the
  * page on phones). */
-const IdentityLine = ({ app }: { app: AppDetailInfo["app"] }) => (
+const IdentityLine = ({
+  app,
+  view,
+}: {
+  app: AppDetailInfo["app"];
+  view: LifecycleView;
+}) => (
   <p class="m-0 flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 text-sm">
     <span class="inline-flex items-center gap-1.5">
-      <span class={`status ${presenceTone(app.status)}`} aria-hidden="true" />
-      {statusLabel(app.status)}
+      <span class={`status ${view.tone}`} aria-hidden="true" />
+      {view.label}
     </span>
     <span class="opacity-30" aria-hidden="true">
       ·
@@ -100,181 +92,187 @@ const IdentityLine = ({ app }: { app: AppDetailInfo["app"] }) => (
   </p>
 );
 
+const HeaderProps = islandProps<{ appId: string }>("AppHeader");
+
 /** Header above every tab: which app, whether it's up, and what you can do
- * with it (visit, browse code, start/stop, deploy). */
-export const AppHeader = ({ appId }: { appId: string }) => {
-  const res = appDetail(appId);
-  const notice = atom<string | null>(null);
-  const converging = atom<string | null>(null);
-  const importBusy = atom(false);
+ * with it (visit, browse code, start/stop, deploy). The Start/Stop and import
+ * retry are one machine (`app-header.machine.ts`) fed by the app's state
+ * stream: the stream is the authority, and a deadline paints an explicit
+ * "still waiting" notice instead of a poll loop that re-enables the button in
+ * silence. */
+const HeaderApp = defineApp({
+  init: (): UpdateResult<HeaderModel, HeaderMessage> => ({
+    model: {
+      appId: HeaderProps.read().appId,
+      notice: HeaderNoticeTypes.None(),
+      pending: PendingTypes.Idle(),
+      seq: 0,
+    } satisfies HeaderModel,
+  }),
+  update: updateHeader,
+  view: (model, dispatch) => {
+    const res = appDetail(model.appId);
 
-  // The fleet converges asynchronously (reconcile loop), so the first
-  // re-fetch still shows the old status. Poll the shared detail until the
-  // live status matches or the budget runs out — then stop (never
-  // endless). Keyed on the pending state so the watch signal stops it on
-  // unmount or when a newer toggle supersedes it.
-  watch(converging, async (pending, { signal }) => {
-    if (!pending) {
-      return;
+    // The state stream pushes the runner's row; a frame ends a pending
+    // action (convergence) instead of a 3-second poll.
+    const feed = liveFeed(
+      feedKeys.appState(model.appId),
+      appStateUrl(model.appId),
+      decodeAppState,
+      { persist: false }
+    );
+
+    watch(feed.state, (state) => {
+      if (state._tag !== "Live" || model.pending._tag === "Idle") {
+        return;
+      }
+
+      dispatch(
+        HeaderMsg.FrameReceived({
+          desiredState: state.value.app.desiredState,
+          status: state.value.app.status,
+        })
+      );
+    });
+
+    if (res.state()._tag === "Loading") {
+      return (
+        <header class="flex flex-col gap-3">
+          <AppHeaderSkeleton />
+        </header>
+      );
     }
 
-    try {
-      for (let i = 0; i < CONVERGE_POLLS; i += 1) {
-        if (signal.aborted) {
-          return;
-        }
+    const info = resourceValue(res.state());
+    const loadError = resourceError(res.state());
 
-        // oxlint-disable-next-line eslint/no-await-in-loop -- sequential converge poll; parallel makes no sense here
-        const fresh = await res.refetch();
-
-        if (signal.aborted) {
-          return;
-        }
-
-        if (!fresh || fresh.app.status === pending) {
-          break;
-        }
-
-        // oxlint-disable-next-line eslint/no-await-in-loop -- sequential converge poll; parallel makes no sense here
-        await sleep(CONVERGE_INTERVAL_MS);
-      }
-    } finally {
-      if (!signal.aborted) {
-        converging.set(null);
-      }
+    if (!info) {
+      return (
+        <header class="flex flex-col gap-3">
+          <p class="text-error m-0">
+            {loadError ? errorMessage(loadError) : "App not found"}
+          </p>
+        </header>
+      );
     }
-  });
 
-  const info = resourceValue(res.state());
+    const { app } = info;
+    const caps = capabilities(info.myRole);
+    const lifecycle = appLifecycle(app);
+    const view = lifecycleView(lifecycle, app.desiredState);
+    const pending = model.pending._tag !== "Idle";
 
-  if (res.state()._tag === "Loading") {
     return (
       <header class="flex flex-col gap-3">
-        <AppHeaderSkeleton />
-      </header>
-    );
-  }
-
-  const loadError = resourceError(res.state());
-
-  if (!info) {
-    return (
-      <header class="flex flex-col gap-3">
-        <p class="text-error m-0">
-          {loadError ? errorMessage(loadError) : "App not found"}
-        </p>
-      </header>
-    );
-  }
-
-  const { app } = info;
-  const canPush = info.myRole === "push" || info.myRole === "admin";
-  const running = app.desiredState === "running";
-  // Never deployed: there is nothing to stop or start yet.
-  const deployed = app.status !== "provisioned";
-
-  return (
-    <header class="flex flex-col gap-3">
-      <div class="flex flex-wrap items-center justify-between gap-x-4 gap-y-3">
-        <div class="flex min-w-0 items-center gap-3">
-          <Avatar class="shrink-0" label={app.name} size="lg" />
-          <div class="min-w-0">
-            <h1 class="m-0 truncate text-xl font-semibold">{app.name}</h1>
-            <IdentityLine app={app} />
+        <div class="flex flex-wrap items-center justify-between gap-x-4 gap-y-3">
+          <div class="flex min-w-0 items-center gap-3">
+            <Avatar class="shrink-0" label={app.name} size="lg" />
+            <div class="min-w-0">
+              <h1 class="m-0 truncate text-xl font-semibold">{app.name}</h1>
+              <IdentityLine app={app} view={view} />
+            </div>
+          </div>
+          <div class="flex shrink-0 flex-wrap items-center gap-2">
+            <a
+              href={appUrl(app.subdomain)}
+              target="_blank"
+              rel="noopener noreferrer"
+              class="btn btn-sm"
+            >
+              <span class="inline-flex items-center gap-1">
+                <ArrowUpRight />
+                Visit
+              </span>
+            </a>
+            {caps.push && view.action ? (
+              <button
+                type="button"
+                class="btn btn-sm"
+                disabled={pending}
+                onclick={() => {
+                  dispatch(
+                    HeaderMsg.ToggleRequested({
+                      next: view.action === "start" ? "running" : "stopped",
+                    })
+                  );
+                }}
+              >
+                <span class="inline-flex items-center gap-1">
+                  {view.action === "start" ? <Play /> : <Pause />}
+                  {view.action === "start" ? "Start" : "Stop"}
+                </span>
+              </button>
+            ) : null}
+            {caps.push && view.retryable ? (
+              <button
+                type="button"
+                class="btn btn-sm"
+                disabled={pending}
+                onclick={() => {
+                  dispatch(HeaderMsg.RetryRequested());
+                }}
+              >
+                <span class="inline-flex items-center gap-1">
+                  <Refresh />
+                  Retry import
+                </span>
+              </button>
+            ) : null}
+            <DeployDropdown appId={model.appId} />
           </div>
         </div>
-        <div class="flex shrink-0 flex-wrap items-center gap-2">
-          <a
-            href={appUrl(app.subdomain)}
-            target="_blank"
-            rel="noopener noreferrer"
-            class="btn btn-sm"
-          >
-            <span class="inline-flex items-center gap-1">
-              <ArrowUpRight />
-              Visit
+        {pending ? (
+          <p class="m-0 text-xs opacity-70">
+            {model.pending._tag === "Retrying"
+              ? "Retry started — waiting for the runner…"
+              : "Waiting for the runner to apply the change…"}
+          </p>
+        ) : null}
+        {model.notice._tag === "TimedOut" ? (
+          <div class="alert alert-warning m-0 py-2" role="status">
+            <span>
+              Still waiting for the app to{" "}
+              {model.notice.action === "retry"
+                ? "finish importing"
+                : model.notice.action}
+              . The runner has not reported the new state yet.
             </span>
-          </a>
-          {canPush && deployed ? (
             <button
               type="button"
-              class="btn btn-sm"
-              disabled={converging() !== null}
-              onclick={async () => {
-                const next = running ? "stopped" : "running";
-
-                try {
-                  await api<{ ok: true }>("/api/apps/setDesired", {
-                    desiredState: next,
-                    id: app.id,
-                  });
-                  notice.set(null);
-                  converging.set(next);
-                } catch (error) {
-                  notice.set(errorMessage(error));
-                }
+              class="btn btn-sm btn-ghost"
+              onclick={() => {
+                dispatch(HeaderMsg.NoticeDismissed());
               }}
             >
-              <span class="inline-flex items-center gap-1">
-                {running ? <Pause /> : <Play />}
-                {running ? "Stop" : "Start"}
-              </span>
+              Dismiss
             </button>
-          ) : null}
-          {canPush && app.imported && RETRY_IMPORT_STATUSES.has(app.status) ? (
+          </div>
+        ) : null}
+        {model.notice._tag === "Failure" ? (
+          <div class="alert alert-error m-0 py-2" role="alert">
+            <span>{model.notice.message}</span>
             <button
               type="button"
-              class="btn btn-sm"
-              disabled={importBusy()}
-              onclick={async () => {
-                importBusy.set(true);
-
-                try {
-                  await api<{ ok: true }>("/api/apps/retryImport", app.id);
-                  notice.set(null);
-
-                  // The import runs in the background: poll the shared detail
-                  // until the app leaves `importing` (then the deploy, or a
-                  // fresh error, is what the page shows).
-                  for (let i = 0; i < IMPORT_POLLS; i += 1) {
-                    // oxlint-disable-next-line eslint/no-await-in-loop -- sequential poll backoff
-                    await sleep(IMPORT_INTERVAL_MS);
-                    // oxlint-disable-next-line eslint/no-await-in-loop -- sequential poll; parallel makes no sense here
-                    const fresh = await res.refetch();
-
-                    if (!fresh || fresh.app.status !== "importing") {
-                      break;
-                    }
-                  }
-                } catch (error) {
-                  notice.set(errorMessage(error));
-                }
-
-                importBusy.set(false);
+              class="btn btn-sm btn-ghost"
+              onclick={() => {
+                dispatch(HeaderMsg.NoticeDismissed());
               }}
             >
-              <span class="inline-flex items-center gap-1">
-                <Refresh />
-                Retry import
-              </span>
+              Dismiss
             </button>
-          ) : null}
-          <DeployDropdown appId={appId} />
-        </div>
-      </div>
-      {notice() ? (
-        <div class="alert alert-error m-0 py-2" role="alert">
-          <span>{notice()}</span>
-        </div>
-      ) : null}
-      {app.lastError ? (
-        <div class="alert alert-error alert-soft m-0 py-2" role="alert">
-          <span class="text-sm break-words">{app.lastError}</span>
-        </div>
-      ) : null}
-    </header>
-  );
-};
+          </div>
+        ) : null}
+        {app.lastError ? (
+          <div class="alert alert-error alert-soft m-0 py-2" role="alert">
+            <span class="text-sm break-words">{app.lastError}</span>
+          </div>
+        ) : null}
+      </header>
+    );
+  },
+});
+
+export const AppHeader = HeaderProps.wrap(HeaderApp);
 
 /** Overview's first card for an app nothing has been pushed to yet (a blank
  * create): the remote and the two commands that deploy it. Gone after the
@@ -286,7 +284,7 @@ const FirstPushCard = ({ appId }: { appId: string }) => {
     !info ||
     info.app.lastDeploySha ||
     info.app.imported ||
-    !(info.myRole === "push" || info.myRole === "admin")
+    !capabilities(info.myRole).push
   ) {
     return null;
   }

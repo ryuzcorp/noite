@@ -10,6 +10,7 @@ import type { AppRole } from "../../roles";
 import type { RunnerIngestKey } from "../../runner";
 import { LoadError } from "../../ui/load-error";
 import { SectionSkeleton } from "../../ui/skeletons";
+import { capabilities } from "../capabilities";
 import { SettingsSection } from "./section";
 
 /** Error reporting (Sentry-compatible browser ingest): the DSN the browser
@@ -26,7 +27,7 @@ export const ErrorReportingPanel = ({
   const err = atom("");
   const note = atom("");
   const busy = atom(false);
-  const isAdmin = myRole === "admin";
+  const isAdmin = capabilities(myRole).admin;
 
   const current = resourceValue(res.state());
 

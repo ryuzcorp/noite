@@ -4,13 +4,24 @@ import { environments } from "../resources";
 //! each preview environment by label. The tabs deep-link it through `?env=`
 //! (the Deployments tab's convention); absent/unknown is production.
 import type { RunnerEnvironment } from "../runner";
+import { parseScope, scopeId } from "./route.machine";
+import type { RouteNotice } from "./route.machine";
 
 /** `?env=` validated against the app's environments: unknown ids (a deleted
  * environment, a stale link) fall back to production. */
 export const validEnvId = (
   envs: readonly RunnerEnvironment[],
   raw: string
-): string => (raw !== "" && envs.some((env) => env.id === raw) ? raw : "");
+): string => scopeId(parseScope(raw, envs).scope);
+
+/** A `?env=` that names an environment the app no longer has: the page shows
+ * production, and says so, instead of pretending this is a preview. */
+export const StaleEnvNotice = ({ notice }: { notice: RouteNotice }) =>
+  notice._tag === "StaleEnvironment" ? (
+    <p class="alert alert-warning m-0 py-2 text-sm" role="status">
+      That environment no longer exists — showing Production instead.
+    </p>
+  ) : null;
 
 /** Production + the app's environments, for the telemetry tabs. Hidden while
  * the app has no environments — then there is nothing to pick. */

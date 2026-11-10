@@ -12,10 +12,36 @@ import type { BranchRules } from "../../runner";
 import { branchRules } from "../../source/branch-rules";
 import { LoadError } from "../../ui/load-error";
 import { SectionSkeleton } from "../../ui/skeletons";
+import { capabilities } from "../capabilities";
+import { watchResource } from "../watch-resource";
+import {
+  draftForm,
+  editDraft,
+  failedDraft,
+  formBusy,
+  formCanSave,
+  rebaseDraft,
+  savedDraft,
+  savingDraft,
+} from "./draft";
+import type { DraftForm } from "./draft";
 import { SettingsSection } from "./section";
 
 /** The runner accepts 0–2 required approvals (`0` = no approval needed). */
 const APPROVAL_CHOICES = [0, 1, 2] as const;
+
+interface RulesDraft {
+  readonly approvals: number;
+  readonly requirePr: boolean;
+}
+
+const toDraft = (rules: BranchRules): RulesDraft => ({
+  approvals: rules.requiredApprovals,
+  requirePr: rules.requirePr,
+});
+
+const sameDraft = (a: RulesDraft, b: RulesDraft): boolean =>
+  a.approvals === b.approvals && a.requirePr === b.requirePr;
 
 /** Branch protection for `main`: with `require_pr` on, only admins may push
  * to `main` directly — everyone else opens a pull. */
@@ -27,14 +53,22 @@ export const BranchProtectionPanel = ({
   myRole: AppRole;
 }) => {
   const res = branchRules(appId);
-  const requireDraft = atom<boolean | null>(null);
-  const approvalsDraft = atom<number | null>(null);
-  const err = atom("");
-  const note = atom("");
-  const busy = atom(false);
-  const isAdmin = myRole === "admin";
-
   const current = resourceValue(res.state());
+
+  const form = atom<DraftForm<RulesDraft>>(
+    draftForm(current ? toDraft(current) : { approvals: 0, requirePr: false })
+  );
+
+  const isAdmin = capabilities(myRole).admin;
+
+  // A refetch after a save moves the baseline; a dirty form keeps its edits.
+  watchResource(res.state, (state) => {
+    const fresh = resourceValue(state);
+
+    if (fresh && form().status._tag !== "Dirty") {
+      form.set(rebaseDraft(form(), toDraft(fresh)));
+    }
+  });
 
   if (res.state()._tag === "Loading") {
     return <SectionSkeleton lines={2} />;
@@ -49,32 +83,27 @@ export const BranchProtectionPanel = ({
     );
   }
 
-  const requirePr = requireDraft() ?? current.requirePr;
-  const approvals = approvalsDraft() ?? current.requiredApprovals;
+  const { draft } = form();
+  const busy = formBusy(form());
+  const failure = form().status;
 
   const save = async () => {
-    if (!isAdmin || busy()) {
+    if (!isAdmin || busy) {
       return;
     }
 
-    busy.set(true);
-    err.set("");
-    note.set("");
+    form.set(savingDraft(form()));
 
     try {
       await api<BranchRules>("/api/prs/branchRulesSet", {
         appId,
-        requirePr,
-        requiredApprovals: approvals,
+        requirePr: draft.requirePr,
+        requiredApprovals: draft.approvals,
       });
-      requireDraft.set(null);
-      approvalsDraft.set(null);
+      form.set(savedDraft(form(), draft));
       await res.refetch();
-      note.set("Saved.");
     } catch (error) {
-      err.set(errorMessage(error));
-    } finally {
-      busy.set(false);
+      form.set(failedDraft(form(), errorMessage(error)));
     }
   };
 
@@ -86,7 +115,9 @@ export const BranchProtectionPanel = ({
         <code>main</code> directly: everyone else commits to a branch and opens
         a pull. Merges then need the number of approvals set below.
       </p>
-      {err() ? <p class="text-error m-0 text-sm">{err()}</p> : null}
+      {failure._tag === "Failed" ? (
+        <p class="text-error m-0 text-sm">{failure.error}</p>
+      ) : null}
       <div class="flex flex-wrap items-end gap-6">
         <label
           class="label cursor-pointer justify-start gap-3"
@@ -96,10 +127,16 @@ export const BranchProtectionPanel = ({
             id="branch-require-pr"
             type="checkbox"
             class="toggle toggle-sm"
-            checked={requirePr}
-            disabled={!isAdmin || busy()}
+            checked={draft.requirePr}
+            disabled={!isAdmin || busy}
             onchange={(e) => {
-              requireDraft.set(e.currentTarget.checked);
+              form.set(
+                editDraft(
+                  form(),
+                  { ...draft, requirePr: e.currentTarget.checked },
+                  sameDraft
+                )
+              );
             }}
           />
           <span class="text-sm">
@@ -113,17 +150,23 @@ export const BranchProtectionPanel = ({
           <select
             id="branch-approvals"
             class="select select-sm"
-            value={String(approvals)}
-            disabled={!isAdmin || busy()}
+            value={String(draft.approvals)}
+            disabled={!isAdmin || busy}
             onchange={(e) => {
-              approvalsDraft.set(Number(e.currentTarget.value));
+              form.set(
+                editDraft(
+                  form(),
+                  { ...draft, approvals: Number(e.currentTarget.value) },
+                  sameDraft
+                )
+              );
             }}
           >
             {APPROVAL_CHOICES.map((choice) => (
               <option
                 key={choice}
                 value={String(choice)}
-                selected={choice === approvals}
+                selected={choice === draft.approvals}
               >
                 {choice}
               </option>
@@ -134,12 +177,12 @@ export const BranchProtectionPanel = ({
           <button
             type="button"
             class="btn btn-sm"
-            disabled={busy()}
+            disabled={busy || !formCanSave(form())}
             onclick={() => {
               void save();
             }}
           >
-            {busy() ? "Saving…" : "Save branch rules"}
+            {busy ? "Saving…" : "Save branch rules"}
           </button>
         ) : null}
       </div>
@@ -148,7 +191,9 @@ export const BranchProtectionPanel = ({
           Only an app admin can change branch protection.
         </p>
       )}
-      {note() ? <p class="m-0 text-sm opacity-70">{note()}</p> : null}
+      {failure._tag === "Saved" ? (
+        <p class="m-0 text-sm opacity-70">Saved.</p>
+      ) : null}
     </SettingsSection>
   );
 };

@@ -95,11 +95,13 @@ const MenuLink = ({
  * neither Code mode nor pulls, so it stays a single highlighted row. */
 const SidebarAppLink = ({
   appId,
+  desiredState,
   name,
   status,
   view,
 }: {
   appId: string;
+  desiredState: string;
   name: string;
   status: string;
   view: AppView | null;
@@ -120,7 +122,7 @@ const SidebarAppLink = ({
             up with "Apps". */}
         <span class="flex h-5 w-5 shrink-0 items-center justify-center">
           <span
-            class={`status ${presenceTone(status)}`}
+            class={`status ${presenceTone(status, desiredState)}`}
             title={status}
             aria-hidden="true"
           />
@@ -177,6 +179,7 @@ export const SidebarApps = ({
       {showControl ? (
         <SidebarAppLink
           appId={CONTROL_APP_ID}
+          desiredState="running"
           name={CONTROL_APP_NAME}
           status="running"
           view={activeId === CONTROL_APP_ID ? activeView : null}
@@ -186,6 +189,7 @@ export const SidebarApps = ({
         <SidebarAppLink
           key={app.id}
           appId={app.id}
+          desiredState={app.desiredState}
           name={app.name}
           status={app.status}
           view={activeId === app.id ? activeView : null}
