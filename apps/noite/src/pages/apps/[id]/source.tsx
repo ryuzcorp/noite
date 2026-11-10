@@ -8,7 +8,7 @@ import { collectRef, newLiveRef } from "$lib/live-ref";
 import { PREVIEW_MIXED_CONTENT_MESSAGE } from "$lib/preview-host";
 import { appDetail } from "$lib/resources";
 import type { AppRole } from "$lib/roles";
-import type { BranchRules, GitRefs, RunnerEnvironment } from "$lib/runner";
+import type { GitRefs, RunnerEnvironment } from "$lib/runner";
 import { parseSkip, searchParam } from "$lib/search-param";
 import type { SearchParam } from "$lib/search-param";
 import { branchRules } from "$lib/source/branch-rules";
@@ -88,11 +88,13 @@ const TAB_CLASS: Record<Exclude<CodePanel, "">, string> = {
  * otherwise. */
 const readOnlyReason = (
   refs: GitRefs | undefined,
-  rules: BranchRules | undefined,
   role: AppRole | undefined,
-  ref: string,
-  defaultBranch: string
-): ReadOnlyRef => refAccess(refs, rules, role, ref, defaultBranch).readOnly;
+  ref: string
+): ReadOnlyRef =>
+  // The commit mode does not decide whether the pane may edit, so the branch
+  // rule is not read here (it would also mean mounting another resource
+  // reader from this async path).
+  refAccess(refs, undefined, role, ref, "").readOnly;
 
 /** Code mode's pane groups (`$lib/ui/resizable`): the file tree against
  * everything else, that column in two (the editor beside the side panel, the
@@ -459,13 +461,7 @@ const SourceBody = ({ appId }: { appId: string }) => {
       role = detail?.myRole;
     }
 
-    return readOnlyReason(
-      known,
-      branchRules(appId).data(),
-      role,
-      ref,
-      defaultBranch
-    );
+    return readOnlyReason(known, role, ref);
   };
 
   // The ref the browser browses, kept in step with `?ref=` here: the browser
