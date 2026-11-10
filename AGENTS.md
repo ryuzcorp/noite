@@ -113,17 +113,17 @@ Every lifecycle in the product is one closed type with one transition point (dec
 
 Runner paths are under `apps/runner/src/`; control paths (`http/`, `lib/`, `pod-host/`) under `apps/noite/src/`.
 
-|Layer|Pattern|Where|
-|---|---|---|
-|Runner, persisted|enum + `predecessors()` + guarded writer|`models.rs` (`AppStatus`, `DeployStatus`, `DesiredState`, `EnvironmentKind`, `EnvSource`, `PrState`, `ReviewState`, `DomainStatus`, `IssueStatus`), `db/{apps,deploys,environments,prs,credentials}.rs`, `service/prs.rs` (`MergeState`)|
-|Runner, in memory|`enum State` + one transition fn|deploy cancel `host/cancel.rs` (`RunState`); import/delete `host/import.rs`, `service/apps.rs` (`Deletion`); fleets `host/supervisor.rs` (`FleetState`, spawn epoch), `host/children.rs` (`ChildState`), `host/cgroups.rs` (`OomState`), `host/state.rs` (`SnapshotPhase`), `host/rehydrate.rs` (`MirrorState`), `host/isolation.rs` (`Capability`); readiness `main.rs` (`Readiness`, `ReadyFailure`); telemetry/update/compaction/access log `host/{telemetry_report,update_check,metrics/compact,accesslog}.rs`; SSE `api/sse.rs` (`StreamPhase`); git mirror `host/forge.rs` (`MirrorPhase`)|
-|Edge (Go)|`Phase` constants under the mutex, lock-free published snapshot|`edge/{edge,table,ready}.go`|
-|CLI|TaggedEnum + pure `step`|`packages/cli/src/{config,deploy,git,gh,mcp,temp}.ts`|
-|Void proxy / sandbox|TaggedEnum (or `_tag`) + pure `step`; DO storage shapes unchanged|`apps/void-proxy/src/{ai,config,routes,revalidate,email/send,email/smtp}.ts`; `apps/void-sandbox/src/{lease,admission-entry,activity,bridge}.ts`|
-|Control server|closed outcome types|stream hub topics `http/routes/stream-hub.ts`; rate limit `lib/rate-limit.ts`; authority `lib/authority.ts` (the one admin predicate); membership `lib/membership.ts`; invites/bootstrap `lib/server/invites.server.ts`; sessions `lib/server/session.server.ts`; MCP auth `lib/server/mcp-auth.server.ts`|
-|UI shared state|one atom holding a `Data.TaggedEnum`|feeds `lib/feeds.ts` (`FeedState`; `feedProblem` for `Refused`/`Offline`); resources `lib/resource.ts` (`ResourceState`)|
-|UI islands|`@ilha/model` `defineApp`, inputs via `islandProps`|create wizard `lib/apps/create-machine.ts`; app detail `lib/app-detail/*.machine.ts`, `lifecycle.ts`; D1 grid `lib/storage/d1/{selection,editor-machine,query,search}.ts`; R2 `lib/storage/r2/{folder,write,body}.ts`; PRs `lib/prs/{status,mutation,composer,new-pr}.ts`; login `lib/auth/login-panel.tsx`, gate `lib/auth/gate.ts`; account `lib/account/{settings.machine,api-key.machine}.ts`|
-|Code mode|TaggedEnum + `step` per concern|`lib/source/{ref-view,operations,commit-target,pane-view,row-view,tree-sync,naming-state,upload-run,hover-state,intel-state,preview-machine,pod-frame,pod-client,terminal-session}.ts`, `lib/source/workspace/*`, `lib/forge/{picker-state,load}.ts`, `pod-host/{frame-state,pod-state,terminal-backend}.ts`|
+| Layer | Pattern | Where |
+| --- | --- | --- |
+| Runner, persisted | enum + `predecessors()` + guarded writer | `models.rs` (`AppStatus`, `DeployStatus`, `DesiredState`, `EnvironmentKind`, `EnvSource`, `PrState`, `ReviewState`, `DomainStatus`, `IssueStatus`), `db/{apps,deploys,environments,prs,credentials}.rs`, `service/prs.rs` (`MergeState`) |
+| Runner, in memory | `enum State` + one transition fn | deploy cancel `host/cancel.rs` (`RunState`); import/delete `host/import.rs`, `service/apps.rs` (`Deletion`); fleets `host/supervisor.rs` (`FleetState`, spawn epoch), `host/children.rs` (`ChildState`), `host/cgroups.rs` (`OomState`), `host/state.rs` (`SnapshotPhase`), `host/rehydrate.rs` (`MirrorState`), `host/isolation.rs` (`Capability`); readiness `main.rs` (`Readiness`, `ReadyFailure`); telemetry/update/compaction/access log `host/{telemetry_report,update_check,metrics/compact,accesslog}.rs`; SSE `api/sse.rs` (`StreamPhase`); git mirror `host/forge.rs` (`MirrorPhase`) |
+| Edge (Go) | `Phase` constants under the mutex, lock-free published snapshot | `edge/{edge,table,ready}.go` |
+| CLI | TaggedEnum + pure `step` | `packages/cli/src/{config,deploy,git,gh,mcp,temp}.ts` |
+| Void proxy / sandbox | TaggedEnum (or `_tag`) + pure `step`; DO storage shapes unchanged | `apps/void-proxy/src/{ai,config,routes,revalidate,email/send,email/smtp}.ts`; `apps/void-sandbox/src/{lease,admission-entry,activity,bridge}.ts` |
+| Control server | closed outcome types | stream hub topics `http/routes/stream-hub.ts`; rate limit `lib/rate-limit.ts`; authority `lib/authority.ts` (the one admin predicate); membership `lib/membership.ts`; invites/bootstrap `lib/server/invites.server.ts`; sessions `lib/server/session.server.ts`; MCP auth `lib/server/mcp-auth.server.ts` |
+| UI shared state | one atom holding a `Data.TaggedEnum` | feeds `lib/feeds.ts` (`FeedState`; `feedProblem` for `Refused`/`Offline`); resources `lib/resource.ts` (`ResourceState`) |
+| UI islands | `@ilha/model` `defineApp`, inputs via `islandProps` | create wizard `lib/apps/create-machine.ts`; app detail `lib/app-detail/*.machine.ts`, `lifecycle.ts`; D1 grid `lib/storage/d1/{selection,editor-machine,query,search}.ts`; R2 `lib/storage/r2/{folder,write,body}.ts`; PRs `lib/prs/{status,mutation,composer,new-pr}.ts`; login `lib/auth/login-panel.tsx`, gate `lib/auth/gate.ts`; account `lib/account/{settings.machine,api-key.machine}.ts` |
+| Code mode | TaggedEnum + `step` per concern | `lib/source/{ref-view,operations,commit-target,pane-view,row-view,tree-sync,naming-state,upload-run,hover-state,intel-state,preview-machine,pod-frame,pod-client,terminal-session}.ts`, `lib/source/workspace/*`, `lib/forge/{picker-state,load}.ts`, `pod-host/{frame-state,pod-state,terminal-backend}.ts` |
 
 ## Agent behavior
 
