@@ -4,7 +4,15 @@ import { api } from "../api";
 import { formatDateTime } from "../dates";
 import { errorMessage } from "../errors";
 import type { EventsSnapshot } from "../feeds";
-import { decodeEvents, eventsUrl, feedKeys, liveFeed } from "../feeds";
+import {
+  decodeEvents,
+  eventsUrl,
+  feedKeys,
+  feedLoaded,
+  feedRetrying,
+  feedValue,
+  liveFeed,
+} from "../feeds";
 import type { RunnerEvent, RunnerUserProps } from "../runner";
 //! Per-app event feed (LogSnag-style): channel filter, insight widgets,
 //! expandable rows with tags + user properties, and an ingest snippet.
@@ -157,7 +165,7 @@ export const liveEventCount = (appId: string): number => {
     }
   );
 
-  return feed.latest()?.feed.length ?? 0;
+  return feedValue(feed.state())?.feed.length ?? 0;
 };
 
 /** Parse `?s=` (page size): unknown sizes fall back to the default. */
@@ -336,12 +344,11 @@ const EventsFeed = ({
   );
 
   const snapshot = (): EventsSnapshot =>
-    feed.latest() ?? { channels: [], feed: [], insights: [] };
+    feedValue(feed.state()) ?? { channels: [], feed: [], insights: [] };
 
-  const loaded = (): boolean =>
-    feed.latest() !== undefined || feed.status() === "open";
+  const loaded = (): boolean => feedLoaded(feed.state());
 
-  const retrying = (): boolean => feed.status() === "retrying";
+  const retrying = (): boolean => feedRetrying(feed.state());
   const expanded = atom<string | null>(null);
   const profiles = atom<Record<string, string>>({});
   const profileError = atom<Record<string, string>>({});

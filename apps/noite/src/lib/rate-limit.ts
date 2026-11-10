@@ -12,6 +12,8 @@
  * real deployment can add one in front.
  */
 
+import { Data } from "effect";
+
 const WINDOW_MS = 60_000;
 
 /** Default requests per window per client, per route class, per isolate.
@@ -29,12 +31,15 @@ interface Bucket {
   resetAt: number;
 }
 
-export interface RateLimitDecision {
-  allowed: boolean;
-  /** Seconds until the window resets, for `Retry-After`. */
-  retryAfter: number;
-  remaining: number;
-}
+/** One decision. One closed type: `Disabled` is a configured bypass, not a
+ * used-up budget, and `Denied` is the only refusal. */
+export type RateLimitDecision = Data.TaggedEnum<{
+  Allowed: { readonly remaining: number; readonly resetAt: number };
+  Denied: { readonly retryAfter: number };
+  Disabled: Record<never, never>;
+}>;
+
+const Decision = Data.taggedEnum<RateLimitDecision>();
 
 /** One independent set of rate-limit buckets: decisions never touch another
  * instance's counters, so attacker-chosen keys cannot evict platform buckets
@@ -55,7 +60,7 @@ export const createRateLimiter = (): RateLimiter => {
     now: number
   ): RateLimitDecision => {
     if (limit <= 0) {
-      return { allowed: true, remaining: 0, retryAfter: 0 };
+      return Decision.Disabled();
     }
 
     const existing = buckets.get(key);
@@ -78,20 +83,24 @@ export const createRateLimiter = (): RateLimiter => {
 
       buckets.set(key, { count: 1, resetAt: now + WINDOW_MS });
 
-      return { allowed: true, remaining: limit - 1, retryAfter: 0 };
+      return Decision.Allowed({
+        remaining: limit - 1,
+        resetAt: now + WINDOW_MS,
+      });
     }
 
     if (existing.count >= limit) {
-      return {
-        allowed: false,
-        remaining: 0,
+      return Decision.Denied({
         retryAfter: Math.max(1, Math.ceil((existing.resetAt - now) / 1000)),
-      };
+      });
     }
 
     existing.count += 1;
 
-    return { allowed: true, remaining: limit - existing.count, retryAfter: 0 };
+    return Decision.Allowed({
+      remaining: limit - existing.count,
+      resetAt: existing.resetAt,
+    });
   };
 
   return {
@@ -102,15 +111,37 @@ export const createRateLimiter = (): RateLimiter => {
   };
 };
 
-/** The platform limiter behind the 04 middleware (per client IP, one budget
- * per route class): a request refused here never reaches better-auth, its
- * own limiter, or D1. */
-export const platformLimiter = createRateLimiter();
+/** One limiter per route class (per client IP): a request refused here never
+ * reaches better-auth, its own limiter, or D1. Separate stores, so a flood of
+ * attacker-chosen keys in one class can never evict another class's buckets
+ * (the eviction cap is per store). */
+const classLimiters = new Map<string, RateLimiter>();
+
+/** The limiter for one route class (created on first use). */
+export const limiterFor = (klass: string): RateLimiter => {
+  let limiter = classLimiters.get(klass);
+
+  if (limiter === undefined) {
+    limiter = createRateLimiter();
+    classLimiters.set(klass, limiter);
+  }
+
+  return limiter;
+};
 
 /** The envelope handler's own per-key limiter: its keys come from the
  * attacker's `sentry_key`, so they live in a store of their own and can
  * never evict platform buckets. */
 export const envelopeLimiter = createRateLimiter();
+
+/** Forget every platform bucket (tests; an operator can call it too). */
+export const resetPlatformLimits = (): void => {
+  for (const limiter of classLimiters.values()) {
+    limiter.reset();
+  }
+
+  envelopeLimiter.reset();
+};
 
 /** Client identity for the counter: the RIGHT-most forwarded address. Caddy
  * appends the peer it actually saw to whatever `X-Forwarded-For` the client

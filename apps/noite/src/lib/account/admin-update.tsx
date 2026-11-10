@@ -4,6 +4,7 @@ import type { AtomHandle } from "ilha";
 import { api } from "../api";
 import { formatDateTime } from "../dates";
 import { errorMessage } from "../errors";
+import { resourceValue, resourceError } from "../resource";
 import { invalidate, keys, updateStatus } from "../resources";
 import type { RunnerUpdateStatus } from "../runner";
 import { LoadError } from "../ui/load-error";
@@ -126,13 +127,13 @@ const UpdateSettings = ({
 /** The `/account` Admin tab's card: the opt-out release check. */
 export const UpdateCard = () => {
   const res = updateStatus();
-  const status = res.data();
+  const status = resourceValue(res.state());
   // Lives here, not in the body: the invalidate below blanks `status` for a
   // beat and remounts the body, which must keep the save confirmation.
   const saved = atom(false);
   const checking = atom(false);
 
-  if (res.loading() && status === undefined) {
+  if (res.state()._tag === "Loading") {
     return <SectionSkeleton lines={3} />;
   }
 
@@ -141,7 +142,7 @@ export const UpdateCard = () => {
       <section class="border-base-300 bg-base-100 dark:bg-base-200 rounded-box flex flex-col gap-4 border p-4 shadow-md">
         <h2 class="m-0 text-lg font-semibold">Release check</h2>
         <LoadError
-          error={res.error()}
+          error={resourceError(res.state())}
           label="Failed to load release check settings"
         />
       </section>

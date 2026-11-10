@@ -3,6 +3,7 @@
 import { Link } from "@ilha/void";
 
 import { formatDateTime } from "../dates";
+import { resourceValue, resourceError } from "../resource";
 import { LoadError } from "../ui/load-error";
 import { SectionSkeleton } from "../ui/skeletons";
 import { forgeCommit } from "./data";
@@ -24,8 +25,8 @@ export const CommitView = ({
   sha: string;
 }) => {
   const res = forgeCommit(appId, sha);
-  const data = res.data();
-  const error = res.error();
+  const data = resourceValue(res.state());
+  const error = resourceError(res.state());
 
   if (data === undefined) {
     return (

@@ -5,6 +5,7 @@
 import { useParams } from "@ilha/void";
 
 import { errorMessage } from "../../errors";
+import { resourceValue, resourceError } from "../../resource";
 import { appDetail, invalidate, keys } from "../../resources";
 import { SectionSkeleton } from "../../ui/skeletons";
 import { BranchProtectionPanel } from "./branch-protection";
@@ -24,13 +25,13 @@ const SECTION_CLASS = "py-5";
 export const AppSettingsPanel = () => {
   const { id } = useParams();
   const res = appDetail(id ?? "");
-  const info = res.data();
+  const info = resourceValue(res.state());
 
   if (!id) {
     return <p class="text-error m-0 p-4 text-sm">Missing app id</p>;
   }
 
-  if (res.loading() && info === undefined) {
+  if (res.state()._tag === "Loading") {
     return (
       <div class="p-4">
         <SectionSkeleton lines={4} />
@@ -38,7 +39,7 @@ export const AppSettingsPanel = () => {
     );
   }
 
-  const loadError = res.error();
+  const loadError = resourceError(res.state());
 
   if (loadError && !info) {
     return <p class="text-error m-0 p-4 text-sm">{errorMessage(loadError)}</p>;

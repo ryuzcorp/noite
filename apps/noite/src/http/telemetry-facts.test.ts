@@ -2,7 +2,7 @@
 import { beforeEach, describe, expect, test } from "bun:test";
 
 import { ensureDb, setD1Binding } from "../lib/db";
-import { platformLimiter } from "../lib/rate-limit";
+import { resetPlatformLimits } from "../lib/rate-limit";
 import * as telemetryFactsRoute from "../routes/internal/telemetry-facts";
 import { createTestD1 } from "../testing/d1";
 import type { TestD1 } from "../testing/d1";
@@ -18,7 +18,7 @@ const ENV = {
 let db: TestD1;
 
 beforeEach(async () => {
-  platformLimiter.reset();
+  resetPlatformLimits();
   db = createTestD1();
   setD1Binding(db.d1);
   await ensureDb();

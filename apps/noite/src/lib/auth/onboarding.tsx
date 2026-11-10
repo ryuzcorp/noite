@@ -10,6 +10,8 @@ import { atom, watch } from "ilha";
 import type { View } from "ilha";
 
 import { api } from "../api";
+import { resourceValue } from "../resource";
+import type { ResourceState } from "../resource";
 import { session } from "../resources";
 import type { SessionView } from "../resources";
 import { Dialog } from "../ui/dialog";
@@ -94,12 +96,15 @@ export const Onboarding = () => {
   // Derived from the session resource, so it also corrects itself if the
   // session arrives after mount or changes under the mounted layout.
   const show = atom(
-    Atom.map(
-      (value: SessionView | null | undefined): boolean =>
+    Atom.map((state: ResourceState<SessionView | null>): boolean => {
+      const value = resourceValue(state);
+
+      return (
         value?.user !== undefined &&
         value.user.onboardedAt === null &&
         !value.session.impersonatedBy
-    )(res.data.atom)
+      );
+    })(res.state.atom)
   );
 
   const open = atom(show());

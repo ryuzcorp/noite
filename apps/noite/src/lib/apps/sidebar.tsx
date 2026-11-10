@@ -7,8 +7,15 @@ import { useLink } from "@ilha/void";
 import type { View } from "ilha";
 
 import { CONTROL_APP_ID, CONTROL_APP_NAME } from "../control-app";
-import { applistUrl, decodeApps, feedKeys, liveFeed } from "../feeds";
+import {
+  applistUrl,
+  decodeApps,
+  feedKeys,
+  feedValue,
+  liveFeed,
+} from "../feeds";
 import { OpenPrBadge } from "../prs/layout";
+import { resourceValue } from "../resource";
 import { adminStatus, session } from "../resources";
 import { Code, GitPullRequest, LayoutDashboard } from "../ui/icons";
 import { presenceTone } from "./identity";
@@ -149,16 +156,16 @@ export const SidebarApps = ({
   activeView: AppView | null;
 }) => {
   const feed = liveFeed(feedKeys.apps, applistUrl(), decodeApps);
-  const user = session().data();
+  const user = resourceValue(session().state());
 
   // The control plane is listed for instance admins, never while
   // impersonating — the same rule as its card on /apps.
   const showControl =
     user !== undefined &&
     user !== null &&
-    (adminStatus().data()?.isAdmin ?? false);
+    (resourceValue(adminStatus().state())?.isAdmin ?? false);
 
-  const apps = feed.latest() ?? [];
+  const apps = feedValue(feed.state()) ?? [];
 
   if (!showControl && apps.length === 0) {
     return null;

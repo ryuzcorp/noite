@@ -1,7 +1,8 @@
 import "@fontsource-variable/geist";
-import "@fontsource-variable/geist-mono";
-import "../app.css";
 import { SidebarApps, sidebarPlace } from "$lib/apps/sidebar";
+import "@fontsource-variable/geist-mono";
+
+import "../app.css";
 import { AppStateSyncSlot } from "$lib/apps/state-sync";
 import { authClient } from "$lib/auth-client";
 import { Authed } from "$lib/auth/authed";
@@ -24,6 +25,8 @@ import { UpdateBanner } from "$lib/update/banner";
 import { Link, useLink, useRouter } from "@ilha/void";
 import { atom, watch } from "ilha";
 import type { View } from "ilha";
+
+import { resourceValue } from "../lib/resource";
 
 /**
  * Global chrome for the dashboard. Excludes the auth page so /login stays
@@ -152,7 +155,7 @@ export default function DashboardLayout({ children }: { children?: View }) {
   const { activeAppId, activeView, onAppsPages } = sidebarPlace(router.path);
   const appsItemActive = onAppsPages && activeAppId === null;
   const sessionRes = session();
-  const user = sessionRes.data()?.user;
+  const user = resourceValue(sessionRes.state())?.user;
   const displayName = user?.name || user?.email || "";
 
   if (router.path === "/login") {

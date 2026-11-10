@@ -4,6 +4,7 @@ import { Link } from "@ilha/void";
 import { watch } from "ilha";
 
 import { formatAgo } from "../dates";
+import { resourceValue, resourceError } from "../resource";
 import type { SearchParam } from "../search-param";
 import { LoadError } from "../ui/load-error";
 import { ListSkeleton } from "../ui/skeletons";
@@ -33,20 +34,22 @@ export const PrsList = ({
   state: PrStateFilter;
 }) => {
   const res = prList(appId, state, skip());
-  const data = res.data();
-  const error = res.error();
+  const data = resourceValue(res.state());
+  const error = resourceError(res.state());
   const pulls = data?.pullRequests ?? [];
 
-  const names = prNames(
-    appId,
-    pulls.map((pull) => pull.authorId)
-  ).data();
+  const names = resourceValue(
+    prNames(
+      appId,
+      pulls.map((pull) => pull.authorId)
+    ).state()
+  );
 
   const loading = data === undefined && error === undefined;
   // A deletion can leave `?skip=` past the end (and the page empty): clamp it
   // back to the page that holds the last row. Reacting to the resource's
   // answer keeps the write out of render.
-  watch(res.data, (value) => {
+  watch(res.value, (value) => {
     if (value === undefined || value.pullRequests.length > 0 || skip() === 0) {
       return;
     }

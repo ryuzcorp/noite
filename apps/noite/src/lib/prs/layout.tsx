@@ -4,6 +4,7 @@ import { Link } from "@ilha/void";
 import type { View } from "ilha";
 
 import { DetailShell } from "../app-detail/shell";
+import { resourceValue } from "../resource";
 import { ArrowLeft } from "../ui/icons";
 import { prList } from "./resources";
 
@@ -16,7 +17,7 @@ export const OpenPrBadge = ({
   appId: string;
   class?: string;
 }) => {
-  const open = prList(appId, "open").data()?.counts.open;
+  const open = resourceValue(prList(appId, "open").state())?.counts.open;
 
   if (open === undefined || open === 0) {
     return null;

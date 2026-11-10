@@ -6,6 +6,7 @@
 import { atom } from "ilha";
 
 import { errorMessage } from "../../errors";
+import { resourceValue, resourceError } from "../../resource";
 import { d1Schema, d1Tables, invalidateD1 } from "../../resources";
 import type { D1Cell, D1Filter, D1RowsQuery } from "../../runner";
 import { searchParam } from "../../search-param";
@@ -118,8 +119,8 @@ const TableWorkspace = ({
 }) => {
   const schemaRes = d1Schema(appId, databaseId, table);
   const editor = atom<null | { row: Record<string, D1Cell> | null }>(null);
-  const schema = schemaRes.data();
-  const loadError = schemaRes.error();
+  const schema = resourceValue(schemaRes.state());
+  const loadError = resourceError(schemaRes.state());
 
   if (!schema) {
     if (loadError) {
@@ -253,8 +254,8 @@ export const D1Editor = ({
 
   const { notify: onToast, toasts } = useToasts();
 
-  const tablesData = tablesRes.data();
-  const loadError = tablesRes.error();
+  const tablesData = resourceValue(tablesRes.state());
+  const loadError = resourceError(tablesRes.state());
   const tables = tablesData?.tables ?? [];
 
   const current =

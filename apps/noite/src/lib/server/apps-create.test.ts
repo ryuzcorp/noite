@@ -13,13 +13,15 @@ import {
   test,
 } from "bun:test";
 
+import { TIMEOUT_MS } from "../../middleware/01-timeout";
 import { createTestD1 } from "../../testing/d1";
 import { installRunnerMock, makeApp } from "../../testing/runner-mock";
 import type { RunnerMock } from "../../testing/runner-mock";
 import { ensureDb, setD1Binding } from "../db";
 import { errorMessage } from "../errors";
+import { CREATE_TIMEOUT_MS } from "../runner";
 import { ActionFailure } from "./api";
-import { createAppForUser } from "./apps.server";
+import { CREATE_RECOVERY_MS, createAppForUser } from "./apps.server";
 
 interface GrantCall {
   appId: string;
@@ -62,6 +64,16 @@ beforeEach(() => {
 
 afterAll(() => {
   runner.restore();
+});
+
+describe("create recovery budget", () => {
+  test("create plus its adopt poll fit under the route bound", () => {
+    // 2 s left for the grant and the response; the route answers 504 at
+    // TIMEOUT_MS, so a recovery that ends later fails a create that is about
+    // to succeed (14 s create + 10 s adopt before this budget).
+    expect(CREATE_TIMEOUT_MS).toBeLessThan(TIMEOUT_MS);
+    expect(CREATE_RECOVERY_MS).toBeLessThanOrEqual(TIMEOUT_MS - 2000);
+  });
 });
 
 describe("createAppForUser", () => {

@@ -1,6 +1,7 @@
 //! R2 object preview: bounded text/JSON body from the runner's preview route.
 
 import { errorMessage } from "../../errors";
+import { resourceValue, resourceError } from "../../resource";
 import { r2File } from "../../resources";
 import type { R2Object } from "../../runner";
 import { prettyJson } from "../shared";
@@ -18,8 +19,8 @@ export const R2TextPreview = ({
   object: R2Object;
 }) => {
   const res = r2File(appId, bucket, object.key);
-  const data = res.data();
-  const loadError = res.error();
+  const data = resourceValue(res.state());
+  const loadError = resourceError(res.state());
 
   if (loadError && data === undefined) {
     return <p class="text-error m-0 text-sm">{errorMessage(loadError)}</p>;

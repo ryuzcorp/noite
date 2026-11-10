@@ -1,3 +1,4 @@
+import { resourceValue, resourceError } from "../resource";
 /** History panel body: one page of a ref's commits (optionally scoped to a
  * path), paged by `?skip=` through the runner's `nextSkip` cursor. */
 import type { SearchParam } from "../search-param";
@@ -23,8 +24,8 @@ export const HistoryView = ({
   skip: SearchParam<number>;
 }) => {
   const res = forgeLog(appId, gitRef, path, skip());
-  const data = res.data();
-  const error = res.error();
+  const data = resourceValue(res.state());
+  const error = resourceError(res.state());
   const current = skip();
   const loading = data === undefined && error === undefined;
   // One page only: both directions are already disabled, so the pager is

@@ -9,6 +9,7 @@ import { atom } from "ilha";
 import type { View } from "ilha";
 
 import { errorMessage } from "../../errors";
+import { resourceValue, resourceError } from "../../resource";
 import { doPreview } from "../../resources";
 import type { DoPreview } from "../../runner";
 import { searchParam } from "../../search-param";
@@ -173,8 +174,8 @@ export const DoBrowser = ({
   const res = doPreview(appId, className);
   const query = searchParam("q", { default: "" });
   const selected = atom<string | null>(null);
-  const data = res.data();
-  const loadError = res.error();
+  const data = resourceValue(res.state());
+  const loadError = resourceError(res.state());
 
   if (loadError && data === undefined) {
     return <p class="text-error m-0 p-4 text-sm">{errorMessage(loadError)}</p>;

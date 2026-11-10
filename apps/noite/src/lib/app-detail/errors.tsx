@@ -4,7 +4,15 @@ import { atom } from "ilha";
 import { api } from "../api";
 import { formatAgo, formatDateTime } from "../dates";
 import { errorMessage } from "../errors";
-import { decodeErrors, errorsUrl, feedKeys, liveFeed } from "../feeds";
+import {
+  decodeErrors,
+  errorsUrl,
+  feedKeys,
+  feedRetrying,
+  feedValue,
+  liveFeed,
+} from "../feeds";
+import { resourceValue, resourceError } from "../resource";
 //! Errors tab: exceptions from celld telemetry grouped into issues by the
 //! runner (`host/errors.rs`) — no SDK in the app. List by status, detail
 //! with stack, request and the failing trace's logs; anyone who can push
@@ -182,13 +190,15 @@ export const liveErrors = (
     }
   );
 
-  const data = (): RunnerErrorList | undefined => feed.latest();
-  const retrying = (): boolean => feed.status() === "retrying";
+  const data = (): RunnerErrorList | undefined => feedValue(feed.state());
+  const retrying = (): boolean => feedRetrying(feed.state());
 
   return {
     data,
-    pending: (): boolean => data() === undefined && !retrying(),
+    // The only "still cold" state: a settled snapshot or frame has a value.
+    pending: (): boolean => feed.state()._tag === "Cold",
     retrying,
+    state: feed.state,
   };
 };
 
@@ -502,7 +512,7 @@ const ErrorDetailView = ({
 }) => {
   const res = errorDetail(appId, fingerprint, environmentId);
   const picked = atom(0);
-  const data = res.data();
+  const data = resourceValue(res.state());
 
   const back = (
     <button
@@ -515,7 +525,7 @@ const ErrorDetailView = ({
     </button>
   );
 
-  if (res.loading() && data === undefined) {
+  if (res.state()._tag === "Loading") {
     return (
       <div class="flex flex-col gap-3">
         {back}
@@ -528,7 +538,7 @@ const ErrorDetailView = ({
     return (
       <div class="flex flex-col gap-3">
         {back}
-        <LoadError error={res.error()} />
+        <LoadError error={resourceError(res.state())} />
       </div>
     );
   }
@@ -722,11 +732,13 @@ export const ErrorsPanel = ({
 
   const selected = searchParam("e", { default: "" });
   const env = searchParam("env", { default: "" });
-  const envs = environments(appId).data() ?? [];
+  const envs = resourceValue(environments(appId).state()) ?? [];
   const environmentId = validEnvId(envs, env());
 
   const role =
-    canTriageProp === undefined ? appDetail(appId).data()?.myRole : undefined;
+    canTriageProp === undefined
+      ? resourceValue(appDetail(appId).state())?.myRole
+      : undefined;
 
   const canTriage = canTriageProp ?? (role === "push" || role === "admin");
 

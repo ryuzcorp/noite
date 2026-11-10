@@ -1,6 +1,7 @@
 import { atom } from "ilha";
 
 import { isInstanceAdmin } from "../account/admin-telemetry";
+import { resourceValue } from "../resource";
 import { updateStatus } from "../resources";
 import { X } from "../ui/icons";
 import { shouldShowUpdateBanner } from "./decision";
@@ -24,7 +25,7 @@ const readDismissed = (): string | null => {
 /** Admin-only "a newer release exists" banner, fed by the page's normal
  * data loading (no EventSource). Dismissal is remembered per version. */
 const UpdateBannerInner = () => {
-  const status = updateStatus().data();
+  const status = resourceValue(updateStatus().state());
   const dismissed = atom<string | null>(readDismissed());
   const latest = status?.latest;
 

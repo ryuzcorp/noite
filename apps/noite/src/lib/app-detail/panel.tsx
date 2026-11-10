@@ -6,6 +6,7 @@ import { atom, watch } from "ilha";
 import { api } from "../api";
 import { appHost, appUrl, presenceTone } from "../apps/identity";
 import { errorMessage } from "../errors";
+import { resourceValue, resourceError } from "../resource";
 import { appDetail } from "../resources";
 import type { AppRole } from "../roles";
 import { sleep } from "../sleep";
@@ -144,9 +145,9 @@ export const AppHeader = ({ appId }: { appId: string }) => {
     }
   });
 
-  const info = res.data();
+  const info = resourceValue(res.state());
 
-  if (res.loading() && info === undefined) {
+  if (res.state()._tag === "Loading") {
     return (
       <header class="flex flex-col gap-3">
         <AppHeaderSkeleton />
@@ -154,7 +155,7 @@ export const AppHeader = ({ appId }: { appId: string }) => {
     );
   }
 
-  const loadError = res.error();
+  const loadError = resourceError(res.state());
 
   if (!info) {
     return (
@@ -279,7 +280,7 @@ export const AppHeader = ({ appId }: { appId: string }) => {
  * create): the remote and the two commands that deploy it. Gone after the
  * first deploy; an import or template builds on its own, so never shown. */
 const FirstPushCard = ({ appId }: { appId: string }) => {
-  const info = appDetail(appId).data();
+  const info = resourceValue(appDetail(appId).state());
 
   if (
     !info ||

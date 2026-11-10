@@ -5,6 +5,7 @@ import { atom } from "ilha";
 import { api } from "../../api";
 import type { EnvVarView } from "../../api-types";
 import { errorMessage } from "../../errors";
+import { resourceValue, resourceError } from "../../resource";
 import { envVars } from "../../resources";
 import type { AppRole } from "../../roles";
 import { confirmDialog } from "../../ui/confirm";
@@ -31,7 +32,7 @@ export const EnvVarsPanel = ({
   myRole: AppRole;
 }) => {
   const res = envVars(appId);
-  const rows = res.data() ?? [];
+  const rows = resourceValue(res.state()) ?? [];
   const err = atom("");
   const savedNote = atom(false);
   const busy = atom(false);
@@ -188,11 +189,9 @@ export const EnvVarsPanel = ({
         </p>
       ) : null}
       {err() ? <p class="text-error m-0 text-sm">{err()}</p> : null}
-      {err() ? null : <LoadError error={res.error()} />}
-      {res.loading() && res.data() === undefined ? (
-        <ListSkeleton rows={2} />
-      ) : null}
-      {rows.length === 0 && !(res.loading() && res.data() === undefined) ? (
+      {err() ? null : <LoadError error={resourceError(res.state())} />}
+      {res.state()._tag === "Loading" ? <ListSkeleton rows={2} /> : null}
+      {rows.length === 0 && !(res.state()._tag === "Loading") ? (
         <p class="m-0 text-sm opacity-70">
           No variables yet — add one to configure the build, the release
           command, the fleet, or Worker code.

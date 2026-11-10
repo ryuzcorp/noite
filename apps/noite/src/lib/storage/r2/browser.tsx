@@ -6,6 +6,7 @@ import { atom } from "ilha";
 import { api } from "../../api";
 import { formatBytes } from "../../bytes";
 import { errorMessage } from "../../errors";
+import { resourceValue, resourceError } from "../../resource";
 import { invalidateR2, r2List } from "../../resources";
 import { R2_UPLOAD_LIMIT } from "../../runner";
 import { ChevronLeft, ChevronRight, Refresh, Search } from "../../ui/icons";
@@ -78,8 +79,8 @@ const R2Page = ({
   const busy = atom(false);
   const failure = atom("");
 
-  const data = res.data();
-  const loadError = res.error();
+  const data = resourceValue(res.state());
+  const loadError = resourceError(res.state());
 
   if (loadError && data === undefined) {
     return <p class="text-error m-0 p-4 text-sm">{errorMessage(loadError)}</p>;

@@ -1,3 +1,6 @@
+import { Data } from "effect";
+import * as Cache from "effect/Cache";
+import * as Effect from "effect/Effect";
 //! Reactive resource cells over one shared Effect Cache — the ilha 0.16
 //! data-fetching recipe (https://ilha.build/guide/recipes/data-fetching)
 //! applied to the control UI's keyed resources. Replaces ilha 0.15's
@@ -6,28 +9,114 @@
 //! One Cache per module: every component on the page shares it. Concurrent
 //! reads of one key share one lookup; later reads hit the cache until the
 //! entry is invalidated. Each `tracked()` call is a mounted reader: it owns
-//! `data`/`error`/`loading` atoms (so `loading() && data() === undefined`
-//! still gates skeletons) and subscribes to reloads for its key. `data`
-//! paints the last good swr-store snapshot until the fresh fetch lands, and
-//! blanks while a reload is in flight — across SPA remounts and reloads.
+//! one {@link ResourceState} atom and subscribes to reloads for its key.
+//! The state paints the last good swr-store snapshot until the fresh fetch
+//! lands, and keeps it visible (as `Reloading`) while a reload is in
+//! flight — across SPA remounts and reloads.
 //! A failed load is evicted, never cached: the shared cache keeps failures
 //! forever, so the failure is dropped when it lands and a later mount (or an
 //! explicit refetch) starts a fresh lookup. After a mutation call
 //! `invalidate(key)` or `res.refetch()`.
-import * as Cache from "effect/Cache";
-import * as Effect from "effect/Effect";
+import * as Atom from "effect/reactivity/Atom";
 import { atom, watch } from "ilha";
 import type { AtomHandle } from "ilha";
 
-import { readSwr, withSnapshot, writeSwr } from "./swr-store";
+import { readSwr, writeSwr } from "./swr-store";
 
-/** What a resource hook returns (the ilha 0.15 `Resource` shape, kept so
- * every panel keeps its `data()`/`loading()`/`error()`/`refetch()` reads). */
+/** What one resource reader paints: one closed type, no parallel
+ * `data`/`error`/`loading` atoms.
+ *
+ * ```mermaid
+ * stateDiagram-v2
+ *   [*] --> Loading: cold key (skeleton)
+ *   [*] --> Ready: swr snapshot
+ *   Loading --> Ready: fetch ok
+ *   Loading --> Failed: fetch error
+ *   Ready --> Reloading: invalidate / refetch
+ *   Reloading --> Ready: fetch ok
+ *   Reloading --> Failed: fetch error
+ *   Failed --> Reloading: refetch
+ * ```
+ *
+ * `Loading` is the only state that renders a skeleton, and it only happens
+ * on a cold key. `Reloading` and `Failed` keep the last value so a panel
+ * never blanks while it still has something true to show. */
+export type ResourceState<T> = Data.TaggedEnum<{
+  Failed: { readonly error: unknown; readonly value: T | undefined };
+  Loading: Record<never, never>;
+  Ready: { readonly value: T };
+  Reloading: { readonly value: T };
+}>;
+
+interface ResourceStateDef extends Data.TaggedEnum.WithGenerics<1> {
+  readonly taggedEnum: ResourceState<this["A"]>;
+}
+
+const State = Data.taggedEnum<ResourceStateDef>();
+
+/** The value a reader paints, or undefined while it has none. */
+export const resourceValue = <T>(state: ResourceState<T>): T | undefined => {
+  switch (state._tag) {
+    case "Loading": {
+      return undefined;
+    }
+
+    case "Failed": {
+      return state.value;
+    }
+
+    default: {
+      return state.value;
+    }
+  }
+};
+
+/** What moves a {@link ResourceState}. */
+export type ResourceEvent<T> =
+  | { readonly error: unknown; readonly kind: "failed" }
+  | { readonly kind: "loaded"; readonly value: T }
+  | { readonly kind: "reload" };
+
+/** The one transition function for {@link ResourceState}: a reload keeps the
+ * value visible (`Reloading`), a failure keeps it too (`Failed`), and only a
+ * cold `Loading` paints a skeleton. */
+export const nextResourceState = <T>(
+  state: ResourceState<T>,
+  event: ResourceEvent<T>
+): ResourceState<T> => {
+  switch (event.kind) {
+    case "loaded": {
+      return State.Ready({ value: event.value });
+    }
+
+    case "failed": {
+      return State.Failed({ error: event.error, value: resourceValue(state) });
+    }
+
+    case "reload": {
+      const value = resourceValue(state);
+
+      return value === undefined ? State.Loading() : State.Reloading({ value });
+    }
+
+    default: {
+      return state;
+    }
+  }
+};
+
+/** The error a reader paints, or undefined when the last load succeeded. */
+// oxlint-disable-next-line anti-slop/no-unknown-returns -- a load failure is any thrown value; `LoadError`/`errorMessage` consume the unknown.
+export const resourceError = <T>(state: ResourceState<T>): unknown =>
+  state._tag === "Failed" ? state.error : undefined;
+
+/** What a resource hook returns: its state, a value projection of it (for
+ * `watch` call sites — a read-only view, not a second source of truth), and
+ * the reload trigger. */
 export interface Resource<T> {
-  readonly data: AtomHandle<T | undefined>;
-  readonly error: AtomHandle<unknown>;
-  readonly loading: AtomHandle<boolean>;
   refetch: () => Promise<T | undefined>;
+  readonly state: AtomHandle<ResourceState<T>>;
+  readonly value: AtomHandle<T | undefined>;
 }
 
 /** Async fetch scoped to a resource key. Receives an abort signal, like the
@@ -211,10 +300,12 @@ export const tracked = <T>(
     memoryOnly.delete(key);
   }
 
-  const data = atom<T | undefined>(readSwr<T>(key));
-  // oxlint-disable-next-line unicorn/no-useless-undefined -- the cell starts without an error; undefined is the seed
-  const error = atom<unknown>(undefined);
-  const loading = atom<boolean>(true);
+  const snapshot = readSwr<T>(key);
+
+  const state = atom<ResourceState<T>>(
+    snapshot === undefined ? State.Loading() : State.Ready({ value: snapshot })
+  );
+
   watch.once(() => {
     if (typeof document === "undefined") {
       // SSR: never fetch through the server (a self-fetch through the
@@ -225,20 +316,27 @@ export const tracked = <T>(
 
     const sub: KeySub = {
       blank: (): void => {
-        data.set(undefined);
-        error.set(undefined);
-        loading.set(true);
+        state.update((current) =>
+          nextResourceState<T>(current, { kind: "reload" })
+        );
       },
       settle: (outcome: SettleOutcome): void => {
         if (outcome.ok) {
           // SAFETY: the lookup ran this key's own fetcher, so the value is this key's T.
-          data.set(outcome.value as T);
-          error.set(undefined);
+          state.update((current) =>
+            nextResourceState<T>(current, {
+              kind: "loaded",
+              value: outcome.value as T,
+            })
+          );
         } else {
-          error.set(outcome.error);
+          state.update((current) =>
+            nextResourceState<T>(current, {
+              error: outcome.error,
+              kind: "failed",
+            })
+          );
         }
-
-        loading.set(false);
       },
     };
 
@@ -268,9 +366,6 @@ export const tracked = <T>(
   });
 
   return {
-    data: withSnapshot(key, data),
-    error,
-    loading,
     refetch: (): Promise<T | undefined> => {
       const settle = async (): Promise<T | undefined> => {
         const value = await reload(key);
@@ -281,5 +376,9 @@ export const tracked = <T>(
 
       return settle();
     },
+    state,
+    value: atom(
+      Atom.readable((get): T | undefined => resourceValue(get(state.atom)))
+    ),
   };
 };

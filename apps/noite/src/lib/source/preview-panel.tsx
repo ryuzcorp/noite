@@ -24,8 +24,15 @@ import type { AtomHandle, View } from "ilha";
 
 import { deployBadge } from "../app-detail/deploys";
 import { appUrl, environmentUrl, presenceTone } from "../apps/identity";
-import { decodeDeploys, deploysUrl, feedKeys, liveFeed } from "../feeds";
+import {
+  decodeDeploys,
+  deploysUrl,
+  feedKeys,
+  feedValue,
+  liveFeed,
+} from "../feeds";
 import { forgeRefs } from "../forge/data";
+import { resourceValue, resourceError } from "../resource";
 import {
   appDetail,
   deployLog,
@@ -64,10 +71,13 @@ const FinishedLog = ({
 }) => {
   const res = deployLog(appId, deployId);
 
-  if (res.error()) {
+  if (resourceError(res.state())) {
     return (
       <div class="flex flex-col items-start gap-2 px-3 pb-2">
-        <LoadError error={res.error()} label="Failed to load the build log" />
+        <LoadError
+          error={resourceError(res.state())}
+          label="Failed to load the build log"
+        />
         <button
           type="button"
           class="btn btn-xs"
@@ -83,7 +93,7 @@ const FinishedLog = ({
 
   return (
     <pre class="max-h-40 overflow-auto px-3 pb-2 font-mono text-xs whitespace-pre-wrap">
-      {res.data()?.log ?? "(loading build log…)"}
+      {resourceValue(res.state())?.log ?? "(loading build log…)"}
     </pre>
   );
 };
@@ -418,7 +428,7 @@ const TargetPreview = ({
     decodeDeploys
   );
 
-  const rows = feed.latest() ?? [];
+  const rows = feedValue(feed.state()) ?? [];
   const [row] = rows;
   // What is serving: the newest deploy that succeeded (the feed is newest
   // first). Its id keys the frame, so the frame reloads when it goes live.
@@ -449,8 +459,8 @@ const TargetPreview = ({
   // retried, instead of leaving a blank pane that looks like an empty app.
   const timedOut = atom(false);
   const loadTimer = atom.lazy(() => ({ id: 0 }))();
-  watch(feed.latest, (next) => {
-    const status = (next ?? [])[0]?.status ?? "";
+  watch(feed.state, (state) => {
+    const status = (feedValue(state) ?? [])[0]?.status ?? "";
 
     if (status !== seen.status) {
       // A deploy that just finished moved the environment's own status
@@ -896,9 +906,9 @@ export const PreviewPanel = ({
   onDeployPreview: () => Promise<RunnerEnvironment | null>;
   state: AtomHandle<SourceBrowserState>;
 }) => {
-  const app = appDetail(appId).data()?.app;
+  const app = resourceValue(appDetail(appId).state())?.app;
   const current = state();
-  const viewer = session().data()?.user.id ?? "";
+  const viewer = resourceValue(session().state())?.user.id ?? "";
   const envs = environments(appId);
 
   // The scope the viewer picked, and the branch they picked it on: a branch
@@ -954,9 +964,11 @@ export const PreviewPanel = ({
     );
   }
 
-  const defaultBranch = forgeRefs(appId).data()?.defaultBranch ?? "main";
+  const defaultBranch =
+    resourceValue(forgeRefs(appId).state())?.defaultBranch ?? "main";
+
   const mine = justDeployedFor(deployed(), branch);
-  const all = withDeployed(envs.data() ?? [], mine);
+  const all = withDeployed(resourceValue(envs.state()) ?? [], mine);
   const picked = scope();
 
   const view = panelView({

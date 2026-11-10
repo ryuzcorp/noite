@@ -1,3 +1,4 @@
+import { resourceValue, resourceError } from "../resource";
 /** Compare page body: base…head commits, three-dot diff and the squash-merge
  * verdict. This is the entry point for "Open pull request" (the PullRequests
  * slice adds that button; nothing renders for it yet). */
@@ -59,8 +60,8 @@ export const CompareView = ({
   onPick: (base: string, head: string) => void;
 }) => {
   const res = forgeCompare(appId, base, head);
-  const data = res.data();
-  const error = res.error();
+  const data = resourceValue(res.state());
+  const error = resourceError(res.state());
 
   return (
     <div class="flex flex-col gap-6">

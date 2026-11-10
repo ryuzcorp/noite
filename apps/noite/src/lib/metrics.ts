@@ -35,12 +35,15 @@ export interface MetricsPoll {
 export const pollMetricsVersion = async (
   base: string,
   auth: { authorization: string },
-  envQuery = ""
+  envQuery = "",
+  /** The stream's signal: a dropped topic aborts its in-flight poll too. */
+  signal?: AbortSignal
 ): Promise<number> => {
   const versionQuery = envQuery === "" ? "" : `?${envQuery.slice(1)}`;
 
   const vRes = await fetch(`${base}/metrics/version${versionQuery}`, {
     headers: auth,
+    signal,
   });
 
   if (!vRes.ok) {
@@ -58,16 +61,18 @@ export const pollMetricsVersion = async (
  * Also reused by the metrics frame action (the stream's initial snapshot). */
 export const pollMetricsFrame = async (
   poll: MetricsPoll,
-  lastTotal: number
+  lastTotal: number,
+  /** The stream's signal: a dropped topic aborts its in-flight poll too. */
+  signal?: AbortSignal
 ): Promise<{ frame: string; total: number } | null> => {
   const { auth, base, windowQuery } = poll;
 
   const [mRes, sRes, dRes, pRes, rRes] = await Promise.all([
-    fetch(`${base}/metrics?${windowQuery}`, { headers: auth }),
-    fetch(`${base}/spans?${windowQuery}`, { headers: auth }),
-    fetch(`${base}/devices?${windowQuery}`, { headers: auth }),
-    fetch(`${base}/paths?${windowQuery}`, { headers: auth }),
-    fetch(`${base}/refs?${windowQuery}`, { headers: auth }),
+    fetch(`${base}/metrics?${windowQuery}`, { headers: auth, signal }),
+    fetch(`${base}/spans?${windowQuery}`, { headers: auth, signal }),
+    fetch(`${base}/devices?${windowQuery}`, { headers: auth, signal }),
+    fetch(`${base}/paths?${windowQuery}`, { headers: auth, signal }),
+    fetch(`${base}/refs?${windowQuery}`, { headers: auth, signal }),
   ]);
 
   if (!mRes.ok || !sRes.ok || !dRes.ok || !pRes.ok || !rRes.ok) {

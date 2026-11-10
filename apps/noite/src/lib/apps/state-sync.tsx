@@ -82,12 +82,15 @@ const AppStateSync = ({ appId }: { appId: string }) => {
     { persist: false }
   );
 
-  watch(feed.latest, (frame) => {
-    // Only a frame the open stream delivered: the snapshot `latest` starts
-    // from is a previous visit's, older than the caches it would invalidate.
-    if (frame === undefined || feed.status() !== "open") {
+  watch(feed.state, (state) => {
+    // Only a frame this stream delivered: `Cached` is a previous visit's
+    // snapshot, older than the caches it would invalidate, and the other
+    // states carry no new data.
+    if (state._tag !== "Live") {
       return;
     }
+
+    const frame = state.value;
 
     const stale = staleKeys(
       appId,

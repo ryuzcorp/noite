@@ -12,7 +12,16 @@ import {
   CONTROL_APP_SUBTITLE,
 } from "../control-app";
 import { errorMessage } from "../errors";
-import { applistUrl, decodeApps, feedKeys, liveFeed } from "../feeds";
+import {
+  applistUrl,
+  decodeApps,
+  feedKeys,
+  feedLoaded,
+  feedRetrying,
+  feedValue,
+  liveFeed,
+} from "../feeds";
+import { resourceValue } from "../resource";
 import {
   adminStatus,
   invalidate,
@@ -32,7 +41,7 @@ const InvitationsBanner = () => {
   const res = myInvitations();
   const busy = atom(false);
   const notice = atom("");
-  const invites = res.data() ?? [];
+  const invites = resourceValue(res.state()) ?? [];
 
   if (invites.length === 0 && !notice()) {
     return null;
@@ -161,21 +170,20 @@ export const AppsList = () => {
   const sess = session();
 
   const showControl = (): boolean => {
-    const user = sess.data();
+    const user = resourceValue(sess.state());
 
     if (!user || user.session.impersonatedBy !== null) {
       return false;
     }
 
-    return admin.data()?.isAdmin ?? false;
+    return resourceValue(admin.state())?.isAdmin ?? false;
   };
 
-  const items = (): App[] => feed.latest() ?? [];
+  const items = (): App[] => feedValue(feed.state()) ?? [];
 
-  const loaded = (): boolean =>
-    feed.latest() !== undefined || feed.status() === "open";
+  const loaded = (): boolean => feedLoaded(feed.state());
 
-  const retrying = (): boolean => feed.status() === "retrying";
+  const retrying = (): boolean => feedRetrying(feed.state());
 
   return (
     <>

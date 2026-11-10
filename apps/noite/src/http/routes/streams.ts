@@ -183,7 +183,13 @@ export const handleAppsStream: RouteHandler = async (request, env) => {
 
 /** Usage-stats poll cadence: the runner rolls minute buckets, so 30s
  * catches every change without hammering it. */
-const METRICS_STREAM_POLL_MS = 30_000;
+export const METRICS_STREAM_POLL_MS = 30_000;
+
+/** The hub's first-frame budget for this route: two poll cycles, so a
+ * cycle that fails before it can send (the poller skips unchanged cycles
+ * and only sends on a change) is not mistaken for a dead upstream. Agreed
+ * with the cadence in one place — the hub never guesses it. */
+export const METRICS_FIRST_FRAME_MS = METRICS_STREAM_POLL_MS * 2;
 
 /** `?hours=` → one of {@link METRICS_WINDOWS_HOURS}. */
 export const metricsWindowHours = (request: Request): number => {
@@ -225,7 +231,7 @@ export const streamMetrics = async (
       // the whole 5-call poll is skipped — but the cycle still ends in
       // the sleep below (a bare `continue` here would spin the loop).
       // oxlint-disable-next-line eslint/no-await-in-loop -- one sequential cycle per loop by design
-      const v = await pollMetricsVersion(base, auth, envQuery);
+      const v = await pollMetricsVersion(base, auth, envQuery, signal);
 
       const unchanged =
         !Number.isNaN(v) && lastVersion !== null && v === lastVersion;
@@ -234,7 +240,8 @@ export const streamMetrics = async (
         // oxlint-disable-next-line eslint/no-await-in-loop -- one sequential cycle per loop by design
         const polled = await pollMetricsFrame(
           { auth, base, envQuery, windowQuery },
-          lastReq
+          lastReq,
+          signal
         );
 
         // Remember the version only once its poll succeeded, so a failed

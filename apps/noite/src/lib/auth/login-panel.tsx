@@ -3,6 +3,7 @@ import { atom, watch } from "ilha";
 
 import { authClient } from "../auth-client";
 import { sameOriginPath } from "../env-auth";
+import { resourceValue } from "../resource";
 import { signupPolicy } from "../resources";
 import { searchParam } from "../search-param";
 import { sleep } from "../sleep";
@@ -65,7 +66,7 @@ export const LoginPanel = () => {
   // (the tab stayed on Sign in). The controls stay disabled until then.
   const mounted = atom(false);
   const policy = signupPolicy();
-  const invite = () => policy.data();
+  const invite = () => resourceValue(policy.state());
   // Where a gated flow (the environment gate) asked to come back to. Always a
   // rooted path on this origin; anything else falls back to the flow's own
   // landing page.

@@ -1,3 +1,4 @@
+import { resourceValue } from "../resource";
 import { environments } from "../resources";
 //! Environment picker shared by the telemetry tabs: Production first, then
 //! each preview environment by label. The tabs deep-link it through `?env=`
@@ -22,7 +23,7 @@ export const EnvPicker = ({
   onPick: (id: string) => void;
   value: string;
 }) => {
-  const envs = environments(appId).data() ?? [];
+  const envs = resourceValue(environments(appId).state()) ?? [];
 
   if (envs.length === 0) {
     return null;

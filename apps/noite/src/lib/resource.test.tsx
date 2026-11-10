@@ -2,11 +2,17 @@
 /* eslint-disable eslint/max-classes-per-file, eslint/no-use-before-define -- test doubles reference each other circularly, like the fixture in feeds.test.tsx */
 import { describe, expect, test } from "bun:test";
 
-import { watch } from "ilha";
+import * as Atom from "effect/reactivity/Atom";
+import { atom, watch } from "ilha";
 import { render } from "ilha/test";
 
-import { tracked } from "./resource";
-import type { Resource } from "./resource";
+import {
+  nextResourceState,
+  resourceError,
+  resourceValue,
+  tracked,
+} from "./resource";
+import type { Resource, ResourceState } from "./resource";
 
 class FakeNode {
   children: FakeNode[] = [];
@@ -166,14 +172,21 @@ let probeFetch: () => Promise<string[]> = () => Promise.resolve([]);
 const ResourceProbe = () => {
   const res = tracked<string[]>(probeKey, probeFetch);
   captured = res;
-  watch(res.data, (value) => {
+  watch(res.value, (value) => {
     if (value !== undefined) {
       signalPainted?.(value);
     }
   });
+
+  // ilha's `watch` only takes WatchValues, and a resource state carries an
+  // `unknown` error; the settled bit is the one reactive projection needed.
+  const settled = atom(
+    Atom.readable((get) => get(res.state.atom)._tag !== "Loading")
+  );
+
   // oxlint-disable-next-line promise/prefer-await-to-callbacks -- the probe reports the settle through a reactive subscription, not a deferred callback
-  watch(res.loading, (loading) => {
-    if (!loading) {
+  watch(settled, (done) => {
+    if (done) {
       signalSettled?.();
     }
   });
@@ -193,10 +206,46 @@ const nextSettled = (): Promise<void> =>
     signalSettled = resolve;
   });
 
+const capturedState = (): ResourceState<string[]> => {
+  if (captured === undefined) {
+    throw new Error("the probe captured no resource");
+  }
+
+  return captured.state();
+};
+
 const resetSignals = (): void => {
   signalPainted = undefined;
   signalSettled = undefined;
 };
+
+describe("resource state machine", () => {
+  test("a reload and a failure keep the last value; only a cold load is Loading", () => {
+    const loaded = nextResourceState<string[]>(
+      { _tag: "Loading" },
+      { kind: "loaded", value: ["a"] }
+    );
+
+    expect(loaded._tag).toBe("Ready");
+
+    const reloading = nextResourceState(loaded, { kind: "reload" });
+    expect(reloading).toEqual({ _tag: "Reloading", value: ["a"] });
+
+    const failed = nextResourceState<string[]>(reloading, {
+      error: new Error("D1 is down"),
+      kind: "failed",
+    });
+
+    expect(failed._tag).toBe("Failed");
+    expect(resourceValue(failed)).toEqual(["a"]);
+    expect(resourceError(failed)).toBeInstanceOf(Error);
+
+    // A cold reload is the only skeleton.
+    expect(
+      nextResourceState<string[]>({ _tag: "Loading" }, { kind: "reload" })._tag
+    ).toBe("Loading");
+  });
+});
 
 describe("tracked mount failures", () => {
   test("a failed mount load surfaces the error and never retries on its own", async () => {
@@ -219,9 +268,9 @@ describe("tracked mount failures", () => {
         await settledOnce;
         await ui.settled();
         expect(calls).toBe(1);
-        expect(captured?.data()).toBeUndefined();
-        expect(captured?.error()).toBeInstanceOf(Error);
-        expect(captured?.loading()).toBe(false);
+        expect(resourceValue(capturedState())).toBeUndefined();
+        expect(resourceError(capturedState())).toBeInstanceOf(Error);
+        expect(capturedState()._tag).not.toBe("Loading");
       } finally {
         ui.unmount();
       }
@@ -253,7 +302,7 @@ describe("tracked mount failures", () => {
         await settledOnce;
         await first.settled();
         expect(calls).toBe(1);
-        expect(captured?.error()).toBeInstanceOf(Error);
+        expect(resourceError(capturedState())).toBeInstanceOf(Error);
       } finally {
         first.unmount();
       }
@@ -268,9 +317,9 @@ describe("tracked mount failures", () => {
         expect(await painted).toEqual(["fresh"]);
         await second.settled();
         expect(calls).toBe(2);
-        expect(captured?.data()).toEqual(["fresh"]);
-        expect(captured?.error()).toBeUndefined();
-        expect(captured?.loading()).toBe(false);
+        expect(resourceValue(capturedState())).toEqual(["fresh"]);
+        expect(resourceError(capturedState())).toBeUndefined();
+        expect(capturedState()._tag).not.toBe("Loading");
       } finally {
         second.unmount();
       }

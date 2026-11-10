@@ -6,6 +6,7 @@ import { atom } from "ilha";
 
 import { api } from "../../api";
 import { errorMessage } from "../../errors";
+import { resourceValue, resourceError } from "../../resource";
 import type { AppRole } from "../../roles";
 import type { BranchRules } from "../../runner";
 import { branchRules } from "../../source/branch-rules";
@@ -33,9 +34,9 @@ export const BranchProtectionPanel = ({
   const busy = atom(false);
   const isAdmin = myRole === "admin";
 
-  const current = res.data();
+  const current = resourceValue(res.state());
 
-  if (res.loading() && current === undefined) {
+  if (res.state()._tag === "Loading") {
     return <SectionSkeleton lines={2} />;
   }
 
@@ -43,7 +44,7 @@ export const BranchProtectionPanel = ({
     return (
       <SettingsSection>
         <h3 class="m-0 text-lg font-semibold">Branch protection</h3>
-        <LoadError error={res.error()} />
+        <LoadError error={resourceError(res.state())} />
       </SettingsSection>
     );
   }

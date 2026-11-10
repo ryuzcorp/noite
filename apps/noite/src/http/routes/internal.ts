@@ -3,8 +3,13 @@ import * as Schema from "effect/Schema";
 import { authFromEnv, MissingAuthSecretError } from "../../lib/auth";
 import { requireAppRoleBySlug } from "../../lib/collaborators";
 import { ensureDb } from "../../lib/db";
-import { errorMessage } from "../../lib/errors";
 import { parseAppRole } from "../../lib/roles";
+import {
+  isAppLimitReached,
+  isSlugTaken,
+  runnerFailureMessage,
+  runnerFailureOf,
+} from "../../lib/runner";
 import { createAppForUser, slugError } from "../../lib/server/apps.server";
 import {
   findRecoveryEmail,
@@ -160,9 +165,9 @@ const gitAuthCreate = async (
 
     return Response.json({ appId: app.id, ok: true, role: "admin", userId });
   } catch (error) {
-    const message = errorMessage(error);
+    const failure = runnerFailureOf(error);
 
-    if (message.includes("already taken")) {
+    if (isSlugTaken(failure)) {
       const access = await requireAppRoleBySlug(slug, userId, "admin").catch(
         () => null
       );
@@ -179,10 +184,13 @@ const gitAuthCreate = async (
       });
     }
 
-    if (message.includes("app limit reached")) {
+    if (isAppLimitReached(failure)) {
       // Strip the runner RPC envelope ("runner rpc apps.create: 409 …") so the
       // pusher reads a sentence, not a status code.
-      const readable = message.replace(/^runner rpc \S+: \d+ /u, "");
+      const readable = runnerFailureMessage(failure).replace(
+        /^runner rpc \S+: \d+ /u,
+        ""
+      );
 
       return Response.json({ error: readable, ok: false }, { status: 403 });
     }

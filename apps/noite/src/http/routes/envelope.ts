@@ -216,7 +216,7 @@ export const makeEnvelopeHandler = (deps?: {
       now()
     );
 
-    if (!decision.allowed) {
+    if (decision._tag === "Denied") {
       return answer("rate limited", 429, {
         "retry-after": String(decision.retryAfter),
         "x-ratelimit-remaining": "0",

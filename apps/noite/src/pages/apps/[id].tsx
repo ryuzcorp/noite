@@ -21,6 +21,8 @@ import { SidePanel } from "$lib/ui/side-panel";
 import { useParams } from "@ilha/void";
 import type { View } from "ilha";
 
+import { resourceValue } from "../../lib/resource";
+
 const TABS = [
   { id: "overview", label: "Overview" },
   { id: "deployments", label: "Deployments" },
@@ -54,7 +56,7 @@ const MetricsTab = ({ appId }: { appId: string }) => {
   });
 
   const env = searchParam("env", { default: "" });
-  const envs = environments(appId).data() ?? [];
+  const envs = resourceValue(environments(appId).state()) ?? [];
   const environmentId = validEnvId(envs, env());
 
   return (
@@ -156,7 +158,7 @@ const AppPageBody = ({ appId }: { appId: string }) => {
   // The open error (ErrorsPanel's `?e=`): a tab click always lands on the
   // tab's top level, so the Errors tab shows the list, not a stale detail.
   const openError = searchParam("e", { default: "" });
-  const detail = appDetail(appId).data();
+  const detail = resourceValue(appDetail(appId).state());
   const name = detail?.app.name;
 
   // The server head only knows the fallback; refine once the detail loads.
@@ -166,7 +168,11 @@ const AppPageBody = ({ appId }: { appId: string }) => {
   // picked, via the keyed TabBar above); custom events are app-scoped, so
   // the Events badge is always app-wide.
   const env = searchParam("env", { default: "" });
-  const environmentId = validEnvId(environments(appId).data() ?? [], env());
+
+  const environmentId = validEnvId(
+    resourceValue(environments(appId).state()) ?? [],
+    env()
+  );
 
   const settingsOpen = panel() === "settings";
 

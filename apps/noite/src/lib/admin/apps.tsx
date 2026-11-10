@@ -7,6 +7,7 @@ import type { View } from "ilha";
 import { api } from "../api";
 import type { AdminAppRow } from "../api-types";
 import { presenceTone } from "../apps/identity";
+import { resourceValue, resourceError } from "../resource";
 import { listAllApps } from "../resources";
 import { searchParam } from "../search-param";
 import { Avatar } from "../ui/avatar";
@@ -96,8 +97,8 @@ export const AdminAppsPanel = () => {
   const search = searchParam("aq", { default: "" });
   const busy = atom(false);
   const panelError = atom("");
-  const apps = res.data() ?? [];
-  const loadError = res.error();
+  const apps = resourceValue(res.state()) ?? [];
+  const loadError = resourceError(res.state());
   const needle = search().trim().toLowerCase();
 
   const shown = needle
@@ -112,7 +113,7 @@ export const AdminAppsPanel = () => {
     await mutatePanel(busy, panelError, () => res.refetch(), work);
   };
 
-  const loading = res.loading() && res.data() === undefined;
+  const loading = res.state()._tag === "Loading";
   let body: View;
 
   if (loading) {

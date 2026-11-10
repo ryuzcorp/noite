@@ -6,7 +6,16 @@ import { api } from "../api";
 import { appHost, appUrl } from "../apps/identity";
 import { formatDateTime } from "../dates";
 import { errorMessage } from "../errors";
-import { decodeDeploys, deploysUrl, feedKeys, liveFeed } from "../feeds";
+import {
+  decodeDeploys,
+  deploysUrl,
+  feedKeys,
+  feedLoaded,
+  feedRetrying,
+  feedValue,
+  liveFeed,
+} from "../feeds";
+import { resourceValue, resourceError } from "../resource";
 import { appDetail, deployLog, environments } from "../resources";
 import type { AppRole } from "../roles";
 import type { RunnerDeploy } from "../runner";
@@ -45,7 +54,7 @@ export const deployBadge = (status: string) => {
  * Code so it works on every tab; loads its own detail via the shared
  * resource. CSS-only dropdown (focus-based) — no visibility atom needed. */
 export const DeployDropdown = ({ appId }: { appId: string }) => {
-  const info = appDetail(appId).data();
+  const info = resourceValue(appDetail(appId).state());
   const redeploying = atom(false);
   const redeployError = atom("");
   // Rows behind the rollback target. `null` = not loaded / refresh in
@@ -262,7 +271,7 @@ const FinishedBuildLog = ({
   deployId: string;
 }) => {
   const res = deployLog(appId, deployId);
-  const log = res.data()?.log;
+  const log = resourceValue(res.state())?.log;
 
   return (
     <div class="bg-base-200 rounded-lg p-3">
@@ -390,7 +399,7 @@ const DeployRow = ({
   const logTab = atom<"build" | "deploy">("deploy");
   const rolling = atom(false);
   const rollError = atom("");
-  const info = appDetail(appId).data();
+  const info = resourceValue(appDetail(appId).state());
 
   const canPush =
     info !== undefined && (info.myRole === "push" || info.myRole === "admin");
@@ -554,16 +563,15 @@ const DeployFeedList = ({
     }
   );
 
-  const items = (): RunnerDeploy[] => feed.latest() ?? [];
+  const items = (): RunnerDeploy[] => feedValue(feed.state()) ?? [];
 
-  const loaded = (): boolean =>
-    feed.latest() !== undefined || feed.status() === "open";
+  const loaded = (): boolean => feedLoaded(feed.state());
 
-  const retrying = (): boolean => feed.status() === "retrying";
+  const retrying = (): boolean => feedRetrying(feed.state());
 
   const currentSha =
     environmentId === ""
-      ? (appDetail(appId).data()?.app.lastDeploySha ?? null)
+      ? (resourceValue(appDetail(appId).state())?.app.lastDeploySha ?? null)
       : null;
 
   // One sha can be deployed many times (redeploys, rollbacks); only the
@@ -631,8 +639,8 @@ export const DeployList = ({
   subdomain: string;
 }) => {
   const res = environments(appId);
-  const app = appDetail(appId).data()?.app;
-  const envs = res.data() ?? [];
+  const app = resourceValue(appDetail(appId).state())?.app;
+  const envs = resourceValue(res.state()) ?? [];
   const open = atom(false);
   const deep = searchParam("env", { default: "" });
   const canPush = myRole === "push" || myRole === "admin";
@@ -673,7 +681,7 @@ export const DeployList = ({
           environmentId=""
         />
       </div>
-      <LoadError error={res.error()} />
+      <LoadError error={resourceError(res.state())} />
       {envs.map((env) => (
         <EnvironmentGroup
           key={env.id}
@@ -690,7 +698,7 @@ export const DeployList = ({
           />
         </EnvironmentGroup>
       ))}
-      {envs.length === 0 && res.data() !== undefined ? (
+      {envs.length === 0 && resourceValue(res.state()) !== undefined ? (
         <p class="m-0 text-sm opacity-70">
           No environments yet — create one from a branch above, or deploy a
           preview from Code mode.

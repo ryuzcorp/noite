@@ -5,6 +5,7 @@ import { atom } from "ilha";
 
 import { api } from "../../api";
 import { errorMessage } from "../../errors";
+import { resourceValue, resourceError } from "../../resource";
 import { domains } from "../../resources";
 import type { AppRole } from "../../roles";
 import type { RunnerDomain } from "../../runner";
@@ -116,9 +117,9 @@ export const CustomDomainsPanel = ({
     busy.set(false);
   };
 
-  const rows = res.data() ?? [];
+  const rows = resourceValue(res.state()) ?? [];
 
-  if (res.loading() && res.data() === undefined) {
+  if (res.state()._tag === "Loading") {
     return <SectionSkeleton lines={2} />;
   }
 
@@ -131,7 +132,7 @@ export const CustomDomainsPanel = ({
         server; the edge issues the hostname's certificate on demand.
       </p>
       {err() ? <p class="text-error m-0 text-sm">{err()}</p> : null}
-      {err() ? null : <LoadError error={res.error()} />}
+      {err() ? null : <LoadError error={resourceError(res.state())} />}
       {rows.length === 0 ? (
         <p class="m-0 text-sm opacity-70">No custom hostnames yet.</p>
       ) : (

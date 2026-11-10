@@ -7,6 +7,7 @@ import type { PrCreateInput } from "../api-types";
 import { errorMessage } from "../errors";
 import { RefSelect } from "../forge/branches";
 import { forgeCompare, forgeRefs } from "../forge/data";
+import { resourceValue } from "../resource";
 /** New-pull-request form: base/head branch pickers (from `gitRefs`), title
  * and body; it explains why Create is off and lands on the detail page on
  * success. */
@@ -256,7 +257,7 @@ export const NewPrForm = ({
   const body = atom("");
   const busy = atom(false);
   const notice = atom("");
-  const refs = forgeRefs(appId).data();
+  const refs = resourceValue(forgeRefs(appId).state());
   const branchNames = refs?.branches.map((branch) => branch.name) ?? [];
   const baseValue = base() || "main";
 
@@ -274,10 +275,13 @@ export const NewPrForm = ({
 
   // Cheap: the compare runs only once both picks are real, distinct branches.
   const compare = picksDiffer
-    ? forgeCompare(appId, baseValue.trim(), headValue.trim()).data()
+    ? resourceValue(
+        forgeCompare(appId, baseValue.trim(), headValue.trim()).state()
+      )
     : undefined;
 
-  const openPulls = prList(appId, "open").data()?.pullRequests ?? [];
+  const openPulls =
+    resourceValue(prList(appId, "open").state())?.pullRequests ?? [];
 
   const existing = openPulls.find(
     (pull) => pull.base === baseValue.trim() && pull.head === headValue.trim()

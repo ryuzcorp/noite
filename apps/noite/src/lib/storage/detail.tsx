@@ -7,6 +7,7 @@ import {
   CONTROL_APP_NAME,
   isControlApp,
 } from "../control-app";
+import { resourceValue } from "../resource";
 import { appDetail } from "../resources";
 import { parseAppRole, roleAtLeast } from "../roles";
 import { D1Editor } from "./d1/panel";
@@ -38,10 +39,13 @@ export const StorageDetail = ({
   }
 
   const detail = appDetail(appId);
-  const appName = detail.data()?.app.name ?? "";
+  const appName = resourceValue(detail.state())?.app.name ?? "";
+
   // Writes (upload, New folder, delete) need the push role; a viewer still
   // browses, previews and downloads.
-  const myRole = parseAppRole(detail.data()?.myRole ?? "") ?? "view";
+  const myRole =
+    parseAppRole(resourceValue(detail.state())?.myRole ?? "") ?? "view";
+
   const canWrite = roleAtLeast(myRole, "push");
 
   if (resourceId.startsWith("r2:")) {

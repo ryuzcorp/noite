@@ -45,8 +45,20 @@ export const parseSkip = (raw: string): number => {
   return Number.isSafeInteger(value) && value > 0 ? value : 0;
 };
 
-/** Version bumped after every in-place write; every param read subscribes. */
-let cell: AtomHandle<number> | undefined;
+/** The shared query cell's state. One closed type; there is no third case.
+ *
+ * | state | what a param read does |
+ * | --- | --- |
+ * | `unmounted` | returns the value but cannot subscribe (SSR, or a read above the layout — a bug on the client) |
+ * | `mounted` | returns the value and subscribes the reading component to `changed` |
+ */
+type QueryCell =
+  | { readonly kind: "mounted"; readonly version: AtomHandle<number> }
+  | { readonly kind: "unmounted" };
+
+/** The one writer: `provideQueryCell` mounts, nothing unmounts (the layout
+ * never unmounts without the document going away). */
+let cell: QueryCell = { kind: "unmounted" };
 
 /** Mount the shared query cell.
  *
@@ -56,12 +68,15 @@ let cell: AtomHandle<number> | undefined;
  * exists before the first param read; a route change that remounts the layout
  * (a different page component) replaces it. */
 export const provideQueryCell = (): void => {
-  cell = atom(0);
+  cell = { kind: "mounted", version: atom(0) };
 };
 
-/** An in-place write landed: repaint every query-param reader. */
+/** An in-place write landed: repaint every query-param reader. A no-op
+ * before the layout mounted (nothing could have subscribed yet). */
 export const notifyQueryChanged = (): void => {
-  cell?.update((version) => version + 1);
+  if (cell.kind === "mounted") {
+    cell.version.update((version) => version + 1);
+  }
 };
 
 /** A client navigation (a Void visit, back/forward) changes the query string
@@ -135,6 +150,8 @@ export const searchParam: SearchParamFn = <T>(
     }
 
     const query = params.toString();
+    // The patched `replaceState` below is the one transition that bumps the
+    // cell: writing here must not bump a second time (two repaints).
     window.history.replaceState(
       null,
       "",
@@ -142,14 +159,16 @@ export const searchParam: SearchParamFn = <T>(
         (query ? `?${query}` : "") +
         window.location.hash
     );
-    notifyQueryChanged();
   };
 
   const param: SearchParam<T> = Object.assign(
     (): T => {
       // The value is not used: reading the cell is what registers the
-      // subscription on the component that is rendering right now.
-      cell?.();
+      // subscription on the component that is rendering right now. Before
+      // the layout mounts there is nothing to subscribe to (see QueryCell).
+      if (cell.kind === "mounted") {
+        cell.version();
+      }
 
       return read();
     },

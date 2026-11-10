@@ -9,7 +9,7 @@ import {
   clientKey,
   DEFAULT_RPM,
   limitedClass,
-  platformLimiter,
+  limiterFor,
 } from "../lib/rate-limit";
 
 export default defineMiddleware((c, next) => {
@@ -20,13 +20,13 @@ export default defineMiddleware((c, next) => {
     const kit = c.env as KitEnv;
     const rpm = Number(kit.NOITE_RATE_LIMIT_RPM ?? DEFAULT_RPM);
 
-    const decision = platformLimiter.decision(
-      `${klass}:${clientKey(c.req.raw)}`,
+    const decision = limiterFor(klass).decision(
+      clientKey(c.req.raw),
       Number.isFinite(rpm) ? rpm : DEFAULT_RPM,
       Date.now()
     );
 
-    if (!decision.allowed) {
+    if (decision._tag === "Denied") {
       return Promise.resolve(
         new Response("Too many requests", {
           headers: {

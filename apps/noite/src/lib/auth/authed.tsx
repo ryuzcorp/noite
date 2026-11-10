@@ -4,6 +4,7 @@ import type { View } from "ilha";
 
 import { authClient } from "../auth-client";
 import { errorMessage } from "../errors";
+import { resourceValue } from "../resource";
 import { session as sessionResource } from "../resources";
 import { sleep } from "../sleep";
 import { DashboardSkeleton } from "../ui/skeletons";
@@ -57,13 +58,13 @@ export const Authed = ({
     // Wait for the first answer however long it takes: refetch() joins
     // the in-flight request, so a slow get-session never counts against
     // the retry budget below (sleeping through it bounced real users).
-    if (res.loading() || res.data() === undefined) {
+    if (res.state()._tag === "Loading" || res.state()._tag === "Failed") {
       await res.refetch();
     }
 
     // Post-registration cookie race: the first answer can arrive before
     // the session cookie is readable, so retry briefly before bouncing.
-    for (let i = 0; i < 20 && !res.data()?.user; i += 1) {
+    for (let i = 0; i < 20 && !resourceValue(res.state())?.user; i += 1) {
       if (signal.aborted) {
         return;
       }
@@ -79,7 +80,7 @@ export const Authed = ({
       await res.refetch();
     }
 
-    if (!signal.aborted && !res.data()?.user) {
+    if (!signal.aborted && !resourceValue(res.state())?.user) {
       router.visit("/login");
     }
   });
@@ -108,7 +109,7 @@ export const Authed = ({
     }
   };
 
-  const data = res.data();
+  const data = resourceValue(res.state());
   const user = data?.user;
 
   if (!data || !user) {

@@ -13,6 +13,7 @@ import {
 import { formatDateTime } from "../dates";
 import { shortSha } from "../forge/format";
 import { CommitList } from "../forge/parts";
+import { resourceValue, resourceError } from "../resource";
 import { appDetail, environments } from "../resources";
 import type { PrDetail } from "../runner";
 import { searchParam } from "../search-param";
@@ -124,11 +125,11 @@ const PrCommitsTab = ({
  * and environments the page's state stream keeps fresh (`AppStateSync`,
  * mounted by the layout), so this opens no second event stream. */
 const PrEnvironment = ({ appId, head }: { appId: string; head: string }) => {
-  const environment = (environments(appId).data() ?? []).find(
+  const environment = (resourceValue(environments(appId).state()) ?? []).find(
     (row) => row.gitRef === `refs/heads/${head}`
   );
 
-  const detail = appDetail(appId).data();
+  const detail = resourceValue(appDetail(appId).state());
   const subdomain = detail?.app.subdomain ?? "";
   const role = detail?.myRole;
   const canPush = role === "push" || role === "admin";
@@ -227,23 +228,25 @@ export const PrDetailView = ({
   });
 
   const res = prDetail(appId, number);
-  const detail = res.data();
-  const error = res.error();
-  const viewer = prViewer(appId).data();
+  const detail = resourceValue(res.state());
+  const error = resourceError(res.state());
+  const viewer = resourceValue(prViewer(appId).state());
   // `myRole` comes from the cached app detail; the viewer action covers a
   // cold cache and the standalone page.
-  const role = appDetail(appId).data()?.myRole ?? viewer?.role;
+  const role = resourceValue(appDetail(appId).state())?.myRole ?? viewer?.role;
 
-  const names = prNames(
-    appId,
-    detail === undefined
-      ? []
-      : [
-          detail.pullRequest.authorId,
-          ...detail.comments.map((comment) => comment.authorId),
-          ...detail.reviews.map((review) => review.reviewerId),
-        ]
-  ).data();
+  const names = resourceValue(
+    prNames(
+      appId,
+      detail === undefined
+        ? []
+        : [
+            detail.pullRequest.authorId,
+            ...detail.comments.map((comment) => comment.authorId),
+            ...detail.reviews.map((review) => review.reviewerId),
+          ]
+    ).state()
+  );
 
   if (detail === undefined) {
     return (

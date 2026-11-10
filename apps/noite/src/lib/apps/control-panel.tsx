@@ -16,6 +16,7 @@ import {
   CONTROL_APP_SUBTITLE,
   CONTROL_BUILD,
 } from "../control-app";
+import { resourceValue } from "../resource";
 import { adminStatus, session } from "../resources";
 //! Detail for the reserved control app (`_control`): the control plane as a
 //! tenant-shaped page AND the admin home. The control fleet emits celld
@@ -221,11 +222,14 @@ export const ControlAppDetail = () => {
   // hooks run only once the gate has admitted the viewer.
   const admin = adminStatus();
   const sess = session();
-  const ready = admin.data() !== undefined && sess.data() !== undefined;
+
+  const ready =
+    resourceValue(admin.state()) !== undefined &&
+    resourceValue(sess.state()) !== undefined;
 
   const allowed =
-    (admin.data()?.isAdmin ?? false) &&
-    sess.data()?.session.impersonatedBy === null;
+    (resourceValue(admin.state())?.isAdmin ?? false) &&
+    resourceValue(sess.state())?.session.impersonatedBy === null;
 
   if (!ready) {
     return (
@@ -250,8 +254,8 @@ export const ControlAppDetail = () => {
   // must never show the dev notice.
   return (
     <ControlAppDetailBody
-      controlFleet={admin.data()?.controlFleet !== false}
-      email={sess.data()?.user.email ?? ""}
+      controlFleet={resourceValue(admin.state())?.controlFleet !== false}
+      email={resourceValue(sess.state())?.user.email ?? ""}
     />
   );
 };
