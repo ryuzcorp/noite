@@ -36,6 +36,7 @@ import {
   LookupTypes,
   RowActionTypes,
   RowMsg,
+  rollbackTarget,
   rowOpen,
   updateDropdown,
   updateRow,
@@ -92,7 +93,10 @@ const DropdownApp = defineApp({
     let target = "";
 
     if (model.lookup._tag === "Found") {
-      target = model.lookup.sha;
+      // Derived at render: the live sha is an input that lands after the
+      // lookup (a page load opens the menu on the previous snapshot), so a
+      // lookup must never freeze the target it was asked with.
+      target = rollbackTarget(model.lookup.candidates, props.lastDeploySha);
     }
 
     const busy =

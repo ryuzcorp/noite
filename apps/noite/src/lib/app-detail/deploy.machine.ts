@@ -245,7 +245,7 @@ export const updateRow = (
 export type Lookup = Data.TaggedEnum<{
   Idle: Record<never, never>;
   Loading: Record<never, never>;
-  Found: { readonly sha: string };
+  Found: { readonly candidates: readonly string[] };
   None: Record<never, never>;
   Failed: { readonly error: string };
 }>;
@@ -279,16 +279,13 @@ export type DropdownMessage = Data.TaggedEnum<{
   RedeployRequested: { readonly sha: string };
   Succeeded: Record<never, never>;
   TargetsFailed: { readonly error: string };
-  TargetsLoaded: { readonly sha: string | null };
+  TargetsLoaded: { readonly candidates: readonly string[] };
   TargetsOpened: { readonly liveSha: string | null };
 }>;
 
 export const DropdownMsg = Data.taggedEnum<DropdownMessage>();
 
-const loadTargets = (
-  appId: string,
-  liveSha: string | null
-): Cmd<DropdownMessage> =>
+const loadTargets = (appId: string): Cmd<DropdownMessage> =>
   Effect.tryPromise({
     catch: (error) => new Error(errorMessage(error)),
     try: () =>
@@ -302,19 +299,22 @@ const loadTargets = (
   }).pipe(
     Effect.match({
       onFailure: (error) => DropdownMsg.TargetsFailed({ error: error.message }),
-      onSuccess: (rows) => {
-        // The newest successful production release that is not the live
-        // one: rolling back to the serving sha would rebuild what runs.
-        const target = rows.find(
-          (row) =>
-            isProductionRow(row.environmentId) &&
-            row.status === "success" &&
-            !!row.sha &&
-            row.sha !== liveSha
-        );
-
-        return DropdownMsg.TargetsLoaded({ sha: target?.sha ?? null });
-      },
+      onSuccess: (rows) =>
+        // Every successful production release, newest first. The live sha is
+        // picked against at render, not here: a lookup opened while the app
+        // detail is still the previous snapshot (`lastDeploySha` null or
+        // stale) must not freeze a target the current live release makes
+        // wrong — the header's own detail lands a beat after a page load.
+        DropdownMsg.TargetsLoaded({
+          candidates: rows
+            .filter(
+              (row) =>
+                isProductionRow(row.environmentId) &&
+                row.status === "success" &&
+                !!row.sha
+            )
+            .map((row) => row.sha ?? ""),
+        }),
     })
   );
 
@@ -334,6 +334,14 @@ const rollbackCall = (
       isConflict(error) ? DropdownMsg.Succeeded() : failed(errorMessage(error))
   );
 
+/** The rollback target the loaded history offers against `liveSha`: the
+ * newest successful production release that is not serving now. A target
+ * equal to the live sha would only rebuild what runs. */
+export const rollbackTarget = (
+  candidates: readonly string[],
+  liveSha: string | null
+): string => candidates.find((sha) => sha !== "" && sha !== liveSha) ?? "";
+
 /** The one transition function for the Deploy dropdown. */
 export const updateDropdown = (
   model: DropdownModel,
@@ -342,10 +350,7 @@ export const updateDropdown = (
   switch (message._tag) {
     case "TargetsOpened": {
       return {
-        cmd: keyed(
-          `targets:${model.appId}`,
-          loadTargets(model.appId, message.liveSha)
-        ),
+        cmd: keyed(`targets:${model.appId}`, loadTargets(model.appId)),
         model: {
           ...model,
           liveSha: message.liveSha,
@@ -366,9 +371,9 @@ export const updateDropdown = (
         model: {
           ...model,
           lookup:
-            message.sha === null
+            message.candidates.length === 0
               ? LookupTypes.None()
-              : LookupTypes.Found({ sha: message.sha }),
+              : LookupTypes.Found({ candidates: message.candidates }),
         },
       };
     }
@@ -406,12 +411,12 @@ export const updateDropdown = (
     }
 
     case "RollbackRequested": {
-      // The target must still be the loaded one: a sha the view computed
-      // after a refetch is not a target this machine accepted.
+      // The target must still be one this machine loaded: a sha the view
+      // computed after a refetch is not a target it accepted.
       if (
         model.action._tag !== "Idle" ||
         model.lookup._tag !== "Found" ||
-        model.lookup.sha !== message.sha
+        !model.lookup.candidates.includes(message.sha)
       ) {
         return { model };
       }
@@ -434,10 +439,7 @@ export const updateDropdown = (
       // A rollback moves `lastDeploySha`: reload the target before offering
       // another action, so the dropdown never offers the release now live.
       return {
-        cmd: keyed(
-          `targets:${model.appId}`,
-          loadTargets(model.appId, model.liveSha)
-        ),
+        cmd: keyed(`targets:${model.appId}`, loadTargets(model.appId)),
         model: {
           ...model,
           action: DropdownActionTypes.Idle(),

@@ -1,0 +1,3 @@
+### Fixed
+
+- **The header Deploy menu offers the right rollback after a page load.** The menu's history lookup answered "the newest successful release that is not the live one" against the `lastDeploySha` the header had _when the menu opened_ — and a page load paints the header from the previous snapshot first (`lastDeploySha` null), so the target froze on the release already serving. `deploy.machine.ts` now keeps the successful production releases (facts) and derives the target against the live sha at render, so the app detail landing fixes the label instead of freezing it. This is the surviving `rollback.spec.ts` flake (run 42838911565 offered "Roll back to 6eb24527f829", the serving release, for the whole assertion).
