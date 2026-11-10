@@ -659,7 +659,9 @@ const CreateForm = (model: CreateModel, dispatch: Dispatch<Message>): View => {
             <button
               type="submit"
               class="btn btn-neutral btn-sm"
-              disabled={status.busy || !model.mounted}
+              disabled={
+                status.busy || !model.mounted || model.drop.t === "Reading"
+              }
             >
               {label}
             </button>

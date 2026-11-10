@@ -125,6 +125,35 @@ describe("the create page's state machine", () => {
     ]);
   });
 
+  test("a folder still being read blocks the submit, and a late read cannot un-idle a create", () => {
+    const reading = update(
+      model(),
+      Msg.FolderDropped({ name: "shop", reads: Promise.resolve([]) })
+    );
+
+    expect(reading.model.drop).toEqual({ t: "Reading" });
+
+    const refused = update(
+      reading.model,
+      Msg.Submitted({ navigate: () => {} })
+    );
+
+    expect(refused.cmd).toBeUndefined();
+    expect(refused.model.submit).toEqual({ t: "Idle" });
+
+    // The read lands while a create is already in flight: it must not touch it.
+    const creating = model({ submit: { t: "Creating" } });
+
+    const late = update(
+      creating,
+      Msg.FolderRead({ result: { upload: UPLOAD } })
+    );
+
+    expect(late.model.submit).toEqual({ t: "Creating" });
+    expect(late.model.source).toEqual({ t: "None" });
+    expect(late.cmd).toBeUndefined();
+  });
+
   test("a second submit while creating starts nothing", () => {
     const creating = model({ submit: { t: "Creating" } });
     const next = update(creating, Msg.Submitted({ navigate: () => {} }));

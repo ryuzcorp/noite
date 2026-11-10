@@ -472,7 +472,10 @@ const readFolder = (name: string, reads: Promise<readonly UploadRead[]>): Cmd =>
 /** Validate, then create. One transition, so "can this be submitted" has one
  * answer and a double submit cannot start two creates. */
 const submitted = (model: CreateModel, navigate: Navigate): Step => {
-  if (busy(model)) {
+  // A create in flight owns the form, and a folder still being read is about to
+  // replace the source: submitting now would create from a state that is
+  // already stale.
+  if (busy(model) || model.drop.t === "Reading") {
     return { model };
   }
 
@@ -635,6 +638,12 @@ const step = (model: CreateModel, message: Message): Step =>
       };
     },
     FolderRead: (read): Step => {
+      // A read that lands after a create started is not this form's source any
+      // more: dropping it in would un-idle a create in flight.
+      if (busy(model)) {
+        return { model: { ...model, drop: OFF } };
+      }
+
       if ("error" in read.result) {
         return {
           model: {
