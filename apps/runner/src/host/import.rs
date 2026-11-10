@@ -289,6 +289,12 @@ pub fn spawn(state: &AppState, app: App, source: GitSource) -> bool {
     let task_id = slot_id.clone();
     let token = cancel.clone();
     let task = tokio::spawn(async move {
+        // Bound first, so a panic in `run` unwinds through it: the slot and
+        // the stop token are released on every exit path.
+        let _fin = Fin {
+            app_id: task_id,
+            token: token.clone(),
+        };
         // The token is the task-local a child process races, so a delete's
         // trip kills the clone instead of waiting out its timeout.
         let out = crate::host::cancel::with(
@@ -299,23 +305,47 @@ pub fn spawn(state: &AppState, app: App, source: GitSource) -> bool {
         if let Err(e) = out {
             tracing::error!(slug = %app.slug, error = %format!("{e:#}"), "import failed");
         }
-        finish(&task_id, &token);
     });
     runs.insert(slot_id, ImportRun { cancel, task });
     true
 }
 
-/// Release this attempt's reservation (and its stop token), unless a newer
-/// attempt already replaced it.
-fn finish(app_id: &str, cancel: &CancelHandle) {
-    let mut runs = imports();
-    let ours = runs
-        .get(app_id)
-        .is_some_and(|run| Arc::ptr_eq(&run.cancel, cancel));
-    if ours {
-        runs.remove(app_id);
-        crate::host::cancel::CANCELS.release_if(&import_key(app_id), cancel);
+/// The attempt's cleanup, bound inside the spawned task: dropping it releases
+/// the slot and the stop token, so a panic in `run` cannot leave the app
+/// permanently "importing here" (every later Retry would answer 409).
+struct Fin {
+    app_id: String,
+    token: CancelHandle,
+}
+
+impl Drop for Fin {
+    fn drop(&mut self) {
+        finish(&self.app_id, &self.token);
     }
+}
+
+/// Take the attempt's task handle, for a test that awaits it directly.
+#[cfg(test)]
+fn take_task_for_test(app_id: &str) -> Option<tokio::task::JoinHandle<()>> {
+    imports().remove(app_id).map(|run| run.task)
+}
+
+/// Release this attempt's reservation and its stop token. The slot goes only
+/// while it is this attempt's (a newer attempt may have replaced it); the
+/// token is released unconditionally through `release_if`, which is itself
+/// pointer-checked, so a slot already removed (a delete took it) still loses
+/// its token when the task unwinds.
+fn finish(app_id: &str, cancel: &CancelHandle) {
+    {
+        let mut runs = imports();
+        let ours = runs
+            .get(app_id)
+            .is_some_and(|run| Arc::ptr_eq(&run.cancel, cancel));
+        if ours {
+            runs.remove(app_id);
+        }
+    }
+    crate::host::cancel::CANCELS.release_if(&import_key(app_id), cancel);
 }
 
 /// Stop a running import and wait for it to end. A delete calls this before
@@ -329,12 +359,26 @@ pub async fn cancel_and_wait(app_id: &str) -> bool {
         return false;
     };
     crate::host::cancel::CANCELS.cancel(&import_key(app_id));
-    // The task ends on its own: the clone is killed with its group, the
-    // remaining steps are local, and the publish re-checks the row.
-    let _ = run.task.await;
+    // The task ends on its own: the clone is killed with its group and the
+    // remaining steps are local. Bounded anyway, so the delete's `Purging`
+    // phase has a hard ceiling; a task that outlives it can still publish
+    // nothing (the token is tripped and the publish re-checks the row).
+    match tokio::time::timeout(IMPORT_STOP_TIMEOUT, run.task).await {
+        Ok(_) => {}
+        Err(_) => tracing::warn!(
+            app_id,
+            timeout_s = IMPORT_STOP_TIMEOUT.as_secs(),
+            "import did not stop within the bound; the delete continues"
+        ),
+    }
     crate::host::cancel::CANCELS.release_if(&import_key(app_id), &run.cancel);
     true
 }
+
+/// How long a delete waits for a stopped import to end. The clone is killed
+/// with its process group, so only local git steps remain; this is a ceiling,
+/// not an expectation.
+const IMPORT_STOP_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The whole import, with the app row's status moved by the outcome. Only runs
 /// while the app is still `importing`, so a push that raced the import (and
@@ -860,6 +904,50 @@ mod tests {
         );
         cancel_and_wait(&app.id).await;
         h.finish().await;
+    }
+
+    /// A panic inside the attempt must still release the slot and the stop
+    /// token: the cleanup is a drop guard bound in the task, not a statement
+    /// after the await (which unwinding would skip, leaving every later Retry
+    /// answering 409 until a restart).
+    #[tokio::test]
+    async fn a_panicking_attempt_still_releases_its_slot_and_token() {
+        let app_id = "sm-panic-import";
+        let key = import_key(app_id);
+        let cancel = crate::host::cancel::CANCELS.register(&key);
+        let token = cancel.clone();
+        let (started, wait) = tokio::sync::oneshot::channel::<()>();
+        let task = tokio::spawn(async move {
+            let _fin = Fin {
+                app_id: app_id.to_string(),
+                token,
+            };
+            // Deterministic: the panic happens only after `spawn` has
+            // registered the attempt, exactly as the real task would.
+            wait.await.expect("start");
+            panic!("the import panicked");
+        });
+        imports().insert(
+            app_id.to_string(),
+            ImportRun {
+                cancel: cancel.clone(),
+                task,
+            },
+        );
+        started.send(()).expect("release the task");
+        // Await the panicking task directly (a delete would remove the slot
+        // first, which is the path under test here).
+        let joined = take_task_for_test(app_id).expect("task").await;
+        assert!(joined.is_err(), "the attempt panicked");
+        assert!(
+            !imports().contains_key(app_id),
+            "the slot is released on unwind"
+        );
+        assert_eq!(
+            crate::host::cancel::CANCELS.cancel(&key),
+            crate::host::cancel::CancelOutcome::Missing,
+            "the stop token is released on unwind"
+        );
     }
 
     /// The task's own end releases its slot and its stop token: nothing is
