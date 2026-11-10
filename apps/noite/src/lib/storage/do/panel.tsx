@@ -4,12 +4,11 @@
 //! celld exposes no generic storage read for a DO instance, so the app's
 //! handler decides what a preview shows — the UI only presents it.
 
-import * as Schema from "effect/Schema";
 import { atom } from "ilha";
 import type { View } from "ilha";
 
 import { errorMessage } from "../../errors";
-import { resourceValue, resourceError } from "../../resource";
+import { resourceValue } from "../../resource";
 import { doPreview } from "../../resources";
 import type { DoPreview } from "../../runner";
 import { searchParam } from "../../search-param";
@@ -21,92 +20,31 @@ import {
   prettyJson,
   StorageBreadcrumb,
 } from "../shared";
+import { doBodyOf, doSummary } from "./body";
 
 type DoInstance = DoPreview["instances"][number];
-
-/** An arbitrary JSON object: an app's `?read=1` response is its own shape,
- * so it is parsed as a record at this boundary and rendered generically. */
-const PreviewRecord = Schema.Record(Schema.String, Schema.Unknown);
-
-/** One preview row per top-level key; `null` when the response is not a JSON
- * object (a string, an array, a scalar or not JSON at all). */
-const previewEntries = (
-  preview: string
-): { key: string; value: string }[] | null => {
-  let raw: unknown;
-
-  try {
-    raw = JSON.parse(preview);
-  } catch {
-    return null;
-  }
-
-  const decoded = Schema.decodeUnknownResult(PreviewRecord)(raw);
-
-  if (decoded._tag === "Failure") {
-    return null;
-  }
-
-  return Object.entries(decoded.success).map(([key, value]) => ({
-    key,
-    value: JSON.stringify(value, null, 2) ?? String(value),
-  }));
-};
-
-/** The one-line state summary the list shows for a probed instance. */
-const summarizePreview = (preview: string | null): string => {
-  if (preview === null) {
-    return "unavailable";
-  }
-
-  const entries = previewEntries(preview);
-
-  if (entries === null) {
-    return preview.replaceAll(/\s+/gu, " ").trim().slice(0, 80);
-  }
-
-  if (entries.length === 0) {
-    return "{} (empty)";
-  }
-
-  return entries
-    .map((entry) => `${entry.key}=${entry.value.replaceAll(/\s+/gu, " ")}`)
-    .join(" · ")
-    .slice(0, 80);
-};
 
 /** The selected instance's storage preview: a key/value table for a JSON
  * object, the pretty body for anything else, and an explanation when the
  * probe came back empty. Keyed by instance id in DoBrowser. */
 const DoInstancePanel = ({ instance }: { instance: DoInstance }) => {
-  const entries =
-    instance.preview === null ? null : previewEntries(instance.preview);
+  const { preview } = instance;
+  const body = doBodyOf(preview);
 
-  let body: View;
+  if (body._tag === "Silent") {
+    return (
+      <DetailPanel title={instance.id}>
+        <p class="m-0 text-sm opacity-60">
+          The object reported no storage preview. That happens when it is not
+          running, when it has no <code>?read=1</code> handler, or when the
+          probe failed — celld does not tell the UI which.
+        </p>
+      </DetailPanel>
+    );
+  }
 
-  if (instance.preview === null) {
-    body = (
-      <p class="m-0 text-sm opacity-60">
-        Preview unavailable — the instance is not running, or the object has no{" "}
-        <code>?read=1</code> handler.
-      </p>
-    );
-  } else if (entries === null) {
-    body = (
-      <>
-        <div class="flex justify-end">
-          <CopyButton
-            label="Copy the instance preview"
-            value={instance.preview}
-          />
-        </div>
-        <pre class="bg-base-200 dark:bg-base-300/50 m-0 max-h-[32rem] overflow-auto rounded-lg p-2 text-xs whitespace-pre-wrap">
-          {prettyJson(instance.preview)}
-        </pre>
-      </>
-    );
-  } else {
-    body = (
+  const table =
+    body._tag === "Json" ? (
       <table class="table-xs table">
         <thead>
           <tr>
@@ -116,7 +54,7 @@ const DoInstancePanel = ({ instance }: { instance: DoInstance }) => {
           </tr>
         </thead>
         <tbody>
-          {entries.map((entry) => (
+          {body.entries.map((entry) => (
             <tr key={entry.key}>
               <td class="align-top font-mono text-xs whitespace-nowrap">
                 {entry.key}
@@ -131,7 +69,7 @@ const DoInstancePanel = ({ instance }: { instance: DoInstance }) => {
               </td>
             </tr>
           ))}
-          {entries.length === 0 ? (
+          {body.entries.length === 0 ? (
             <tr>
               <td class="opacity-60" colspan={3}>
                 The object reports an empty state.
@@ -140,8 +78,7 @@ const DoInstancePanel = ({ instance }: { instance: DoInstance }) => {
           ) : null}
         </tbody>
       </table>
-    );
-  }
+    ) : null;
 
   return (
     <DetailPanel title={instance.id}>
@@ -151,7 +88,17 @@ const DoInstancePanel = ({ instance }: { instance: DoInstance }) => {
           {instance.scope}
         </span>
       </p>
-      {body}
+      {table}
+      {body._tag === "Text" ? (
+        <>
+          <div class="flex justify-end">
+            <CopyButton label="Copy the instance preview" value={body.body} />
+          </div>
+          <pre class="bg-base-200 dark:bg-base-300/50 m-0 max-h-[32rem] overflow-auto rounded-lg p-2 text-xs whitespace-pre-wrap">
+            {prettyJson(body.body)}
+          </pre>
+        </>
+      ) : null}
       <p class="m-0 mt-auto text-xs opacity-60">
         Read-only. celld keeps an instance's storage in its cell; this preview
         is the app's own <code>?read=1</code> response.
@@ -174,14 +121,16 @@ export const DoBrowser = ({
   const res = doPreview(appId, className);
   const query = searchParam("q", { default: "" });
   const selected = atom<string | null>(null);
-  const data = resourceValue(res.state());
-  const loadError = resourceError(res.state());
+  const state = res.state();
+  const data = resourceValue(state);
 
-  if (loadError && data === undefined) {
-    return <p class="text-error m-0 p-4 text-sm">{errorMessage(loadError)}</p>;
-  }
+  if (data === undefined) {
+    if (state._tag === "Failed") {
+      return (
+        <p class="text-error m-0 p-4 text-sm">{errorMessage(state.error)}</p>
+      );
+    }
 
-  if (!data) {
     return (
       <div class="flex flex-col gap-2 p-4">
         <span class="skeleton h-8 w-full" />
@@ -251,7 +200,7 @@ export const DoBrowser = ({
                   class={`max-w-md truncate text-xs ${instance.preview === null ? "opacity-50" : ""}`}
                   title={instance.preview ?? undefined}
                 >
-                  {summarizePreview(instance.preview)}
+                  {doSummary(doBodyOf(instance.preview))}
                 </td>
               </tr>
             ))}
@@ -263,6 +212,11 @@ export const DoBrowser = ({
 
   return (
     <div class="flex h-full min-h-0 w-full flex-col overflow-hidden">
+      {state._tag === "Failed" ? (
+        <p class="text-error m-0 px-3 py-1 text-sm" role="alert">
+          {errorMessage(state.error)} — showing the last loaded instances.
+        </p>
+      ) : null}
       <div class="border-base-300 flex flex-wrap items-center gap-x-3 gap-y-1 border-b px-3 py-2">
         <StorageBreadcrumb
           crumbs={[
@@ -310,7 +264,9 @@ export const DoBrowser = ({
         {selectedInstance === null ? (
           <DetailPanel title="Details">
             <p class="m-0 text-sm opacity-60">
-              Select an instance to read the state its handler reports.
+              {selected() === null
+                ? "Select an instance to read the state its handler reports."
+                : "The selected instance is gone. Pick another one."}
             </p>
           </DetailPanel>
         ) : (

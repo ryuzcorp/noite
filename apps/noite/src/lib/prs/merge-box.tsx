@@ -2,7 +2,13 @@
  * approval count) and the Close/Reopen and Merge actions — Merge opens the
  * squash form in a dropdown, like the app header's Deploy. The side box keeps
  * what a reviewer reads and does: the closed/merged note, conflicts and the
- * review buttons. */
+ * review buttons.
+ *
+ * Every enabled/disabled decision comes from `prCapabilities` (./status) and
+ * every write from the one `PrMutation` value (./mutation) the detail body
+ * owns, so Close, Merge and a review cannot run at once and a button is never
+ * offered for a transition the runner refuses. */
+import type { AtomHandle } from "ilha";
 import { atom, watch } from "ilha";
 
 import { api } from "../api";
@@ -13,68 +19,63 @@ import { resourceValue } from "../resource";
 import { environments } from "../resources";
 import type { AppRole } from "../roles";
 import type { PrDetail } from "../runner";
-import { latestReviews } from "./data";
+import { mutationProblem, mutationRunning, nextMutation } from "./mutation";
+import type { PrMutation, PrMutationKind } from "./mutation";
 import { invalidatePr } from "./resources";
+import type { MyVerdict } from "./status";
+import {
+  mergeStateFacts,
+  myVerdict,
+  prCapabilities,
+  switchStateAction,
+} from "./status";
 
-const MERGE_STATES = [
-  { badge: "badge-success", id: "mergeable", label: "Ready to merge" },
-  { badge: "badge-error", id: "conflicts", label: "Merge conflicts" },
-  {
-    badge: "badge-warning",
-    id: "blocked_approvals",
-    label: "Waiting for approvals",
-  },
-  { badge: "badge-ghost", id: "closed", label: "Closed" },
-  { badge: "badge-info", id: "merged", label: "Merged" },
-  { badge: "badge-error", id: "head_missing", label: "Head branch is gone" },
-] as const;
+/** Run one PR mutation through the shared machine: refused while another is
+ * in flight, refetches the pull once it lands, and reports the outcome. */
+const runMutation = async (
+  mutation: AtomHandle<PrMutation>,
+  kind: PrMutationKind,
+  appId: string,
+  number: number,
+  work: () => Promise<void>
+): Promise<boolean> => {
+  if (mutationRunning(mutation())) {
+    return false;
+  }
 
-/** A mutation's busy flag and error, and the runner that refetches the pull
- * once it lands. Each control group has its own, so an error shows where its
- * action was taken. */
-const prAction = (appId: string, number: number) => {
-  const busy = atom(false);
-  const notice = atom("");
+  mutation.set(nextMutation(mutation(), { kind: "start", mutation: kind }));
 
-  const run = async (work: () => Promise<void>): Promise<void> => {
-    busy.set(true);
-    notice.set("");
+  try {
+    await work();
+    invalidatePr(appId, number);
+    mutation.set(nextMutation(mutation(), { kind: "done" }));
 
-    try {
-      await work();
-      invalidatePr(appId, number);
-    } catch (error) {
-      notice.set(errorMessage(error));
-    } finally {
-      busy.set(false);
-    }
-  };
+    return true;
+  } catch (error) {
+    mutation.set(
+      nextMutation(mutation(), { kind: "failed", message: errorMessage(error) })
+    );
 
-  return { busy, notice, run };
+    return false;
+  }
 };
 
 /** The merge state for the header: the approval count when approvals gate the
  * merge (never a bare "0/0"), then what it means. */
 export const PrMergeState = ({ detail }: { detail: PrDetail }) => {
-  const info = MERGE_STATES.find((entry) => entry.id === detail.mergeState);
-
-  const gated =
-    detail.mergeState === "mergeable" ||
-    detail.mergeState === "blocked_approvals";
+  const facts = mergeStateFacts(detail.mergeState);
 
   const approvals =
-    gated && detail.requiredApprovals > 0
+    facts.gated && detail.requiredApprovals > 0
       ? `${detail.approvals} of ${detail.requiredApprovals} approvals`
       : null;
 
-  const label = info?.label ?? detail.mergeState;
-
   return (
     <span
-      class={`badge badge-sm ${info?.badge ?? "badge-ghost"}`}
+      class={`badge badge-sm ${facts.badge}`}
       title={`${detail.approvals} of ${detail.requiredApprovals} required approvals`}
     >
-      {approvals === null ? label : `${approvals} · ${label}`}
+      {approvals === null ? facts.label : `${approvals} · ${facts.label}`}
     </span>
   );
 };
@@ -84,24 +85,25 @@ export const PrMergeState = ({ detail }: { detail: PrDetail }) => {
  * down its preview environment, which the checkbox says. */
 const MergeDropdown = ({
   appId,
+  canMerge,
   detail,
+  mutation,
 }: {
   appId: string;
+  canMerge: boolean;
   detail: PrDetail;
+  mutation: AtomHandle<PrMutation>;
 }) => {
   const { pullRequest } = detail;
-  const { busy, notice, run } = prAction(appId, pullRequest.number);
+  const notice = mutationProblem(mutation(), ["merge"]);
+  const busy = mutationRunning(mutation());
   const title = atom(pullRequest.title);
   const message = atom("");
   const deleteBranch = atom(false);
   const open = atom(false);
   const box = atom.lazy(() => newLiveRef<HTMLElement>())();
   const trigger = atom.lazy(() => newLiveRef<HTMLButtonElement>())();
-  const canMerge = detail.mergeState === "mergeable";
-
-  const reason = MERGE_STATES.find(
-    (entry) => entry.id === detail.mergeState
-  )?.label;
+  const reason = mergeStateFacts(detail.mergeState).label;
 
   // The head branch's own environment, when it has one: deleting the branch
   // deletes the environment and everything it stored.
@@ -219,41 +221,50 @@ const MergeDropdown = ({
                 {reason ?? "This pull request cannot merge"}.
               </p>
             )}
-            {notice() ? (
+            {notice === null ? null : (
               <p class="text-error m-0 text-sm" role="alert">
-                {notice()}
+                {notice}
               </p>
-            ) : null}
+            )}
             <button
               type="button"
               class="btn btn-sm btn-neutral"
-              disabled={!canMerge || busy()}
-              onclick={() => {
-                void run(async () => {
-                  const args: PrMergeInput = {
-                    appId,
-                    deleteBranch: deleteBranch(),
-                    number: pullRequest.number,
-                  };
+              disabled={!canMerge || busy}
+              onclick={async () => {
+                const ok = await runMutation(
+                  mutation,
+                  "merge",
+                  appId,
+                  pullRequest.number,
+                  async () => {
+                    const args: PrMergeInput = {
+                      appId,
+                      deleteBranch: deleteBranch(),
+                      number: pullRequest.number,
+                    };
 
-                  const squashTitle = title().trim();
+                    const squashTitle = title().trim();
 
-                  if (squashTitle !== "") {
-                    args.title = squashTitle;
+                    if (squashTitle !== "") {
+                      args.title = squashTitle;
+                    }
+
+                    const squashMessage = message().trim();
+
+                    if (squashMessage !== "") {
+                      args.message = squashMessage;
+                    }
+
+                    await api<{ ok: true }>("/api/prs/prsMerge", args);
                   }
+                );
 
-                  const squashMessage = message().trim();
-
-                  if (squashMessage !== "") {
-                    args.message = squashMessage;
-                  }
-
-                  await api<{ ok: true }>("/api/prs/prsMerge", args);
+                if (ok) {
                   open.set(false);
-                });
+                }
               }}
             >
-              {busy() ? "Merging…" : "Squash and merge"}
+              {busy ? "Merging…" : "Squash and merge"}
             </button>
           </div>
         </div>
@@ -267,56 +278,67 @@ const MergeDropdown = ({
 export const PrHeaderActions = ({
   appId,
   detail,
+  mutation,
   role,
   viewerId,
 }: {
   appId: string;
   detail: PrDetail;
+  mutation: AtomHandle<PrMutation>;
   role: AppRole | undefined;
   viewerId: string;
 }) => {
   const { pullRequest } = detail;
-  const { busy, notice, run } = prAction(appId, pullRequest.number);
-  const isAuthor = viewerId !== "" && pullRequest.authorId === viewerId;
-  const canPush = role === "push" || role === "admin";
+  const capabilities = prCapabilities({ detail, role, viewerId });
+  const switchAction = switchStateAction(pullRequest.state, capabilities);
+  const busy = mutationRunning(mutation());
+  const notice = mutationProblem(mutation(), ["close", "reopen"]);
 
-  const canClose =
-    canPush && (isAuthor || role === "admin") && pullRequest.state !== "merged";
-
-  const canMerge = canPush && pullRequest.state === "open";
-
-  if (!(canClose || canMerge)) {
+  if (switchAction === null && !capabilities.canMerge) {
     return null;
   }
 
   return (
     <div class="flex shrink-0 flex-col items-end gap-1">
       <div class="flex items-center gap-2">
-        {canClose ? (
+        {switchAction === null ? null : (
           <button
             type="button"
             class="btn btn-sm btn-ghost"
-            disabled={busy()}
+            disabled={busy}
             onclick={() => {
-              void run(async () => {
-                await api<{ ok: true }>("/api/prs/prsUpdate", {
-                  appId,
-                  number: pullRequest.number,
-                  state: pullRequest.state === "open" ? "closed" : "open",
-                });
-              });
+              void runMutation(
+                mutation,
+                switchAction === "closed" ? "close" : "reopen",
+                appId,
+                pullRequest.number,
+                async () => {
+                  await api<{ ok: true }>("/api/prs/prsUpdate", {
+                    appId,
+                    number: pullRequest.number,
+                    state: switchAction,
+                  });
+                }
+              );
             }}
           >
-            {pullRequest.state === "open" ? "Close" : "Reopen"}
+            {switchAction === "closed" ? "Close" : "Reopen"}
           </button>
+        )}
+        {capabilities.canMerge ? (
+          <MergeDropdown
+            appId={appId}
+            canMerge={capabilities.canMerge}
+            detail={detail}
+            mutation={mutation}
+          />
         ) : null}
-        {canMerge ? <MergeDropdown appId={appId} detail={detail} /> : null}
       </div>
-      {notice() ? (
+      {notice === null ? null : (
         <p class="text-error m-0 text-xs" role="alert">
-          {notice()}
+          {notice}
         </p>
-      ) : null}
+      )}
     </div>
   );
 };
@@ -354,122 +376,115 @@ const ConflictList = ({ conflicts }: { conflicts: readonly string[] }) => (
   </div>
 );
 
-/** The reviewer's own dismissed-or-not notices and the two review buttons. */
+/** The reviewer's own verdict state and the two review buttons. The verdict
+ * is one value (`myVerdict`): `current` means it counts at the head sha, so a
+ * dismissed approval offers the action again instead of stacking an
+ * identical review, and a stale cached detail cannot leave a button disabled
+ * for a review the runner no longer counts. */
 const ReviewSection = ({
-  approved,
-  approvedStill,
   busy,
   onReview,
-  requested,
-  requestedStill,
+  verdict,
 }: {
-  approved: boolean;
-  approvedStill: boolean;
-  busy: () => boolean;
+  busy: boolean;
   onReview: (state: "approved" | "changes_requested") => void;
-  requested: boolean;
-  requestedStill: boolean;
-}) => (
-  <div class="flex flex-col gap-2">
-    {approvedStill ? (
-      <p class="m-0 text-xs opacity-70">You approved this pull request.</p>
-    ) : null}
-    {requestedStill ? (
-      <p class="m-0 text-xs opacity-70">
-        You requested changes on this pull request.
-      </p>
-    ) : null}
-    <div class="flex flex-wrap items-center gap-2">
-      <button
-        type="button"
-        class="btn btn-sm btn-success"
-        disabled={busy() || approvedStill}
-        onclick={() => {
-          onReview("approved");
-        }}
-      >
-        {approved ? "Approve again" : "Approve"}
-      </button>
-      <button
-        type="button"
-        class="btn btn-sm btn-error btn-outline"
-        disabled={busy() || requestedStill}
-        onclick={() => {
-          onReview("changes_requested");
-        }}
-      >
-        {requested ? "Change review" : "Request changes"}
-      </button>
+  verdict: MyVerdict;
+}) => {
+  const approved = verdict._tag === "Approved";
+  const requested = verdict._tag === "ChangesRequested";
+  const current = verdict._tag !== "None" && verdict.current;
+
+  return (
+    <div class="flex flex-col gap-2">
+      {approved && current ? (
+        <p class="m-0 text-xs opacity-70">You approved this pull request.</p>
+      ) : null}
+      {requested && current ? (
+        <p class="m-0 text-xs opacity-70">
+          You requested changes on this pull request.
+        </p>
+      ) : null}
+      <div class="flex flex-wrap items-center gap-2">
+        <button
+          type="button"
+          class="btn btn-sm btn-success"
+          disabled={busy || (approved && current)}
+          onclick={() => {
+            onReview("approved");
+          }}
+        >
+          {approved ? "Approve again" : "Approve"}
+        </button>
+        <button
+          type="button"
+          class="btn btn-sm btn-error btn-outline"
+          disabled={busy || (requested && current)}
+          onclick={() => {
+            onReview("changes_requested");
+          }}
+        >
+          {requested ? "Change review" : "Request changes"}
+        </button>
+      </div>
     </div>
-  </div>
-);
+  );
+};
 
 /** The side box: how the pull ended (when it has), its conflicts, and the
  * review buttons for anyone but the author. Nothing to show — no box. */
 export const PrReviewBox = ({
   appId,
   detail,
+  mutation,
   role,
   viewerId,
 }: {
   appId: string;
   detail: PrDetail;
+  mutation: AtomHandle<PrMutation>;
   role: AppRole | undefined;
   viewerId: string;
 }) => {
   const { pullRequest } = detail;
-  const { busy, notice, run } = prAction(appId, pullRequest.number);
-  const isAuthor = viewerId !== "" && pullRequest.authorId === viewerId;
-
-  const canReview =
-    (role === "push" || role === "admin") &&
-    !isAuthor &&
-    pullRequest.state === "open";
-
+  const capabilities = prCapabilities({ detail, role, viewerId });
+  const busy = mutationRunning(mutation());
+  const notice = mutationProblem(mutation(), ["review"]);
   const conflicts = detail.compare?.conflicts ?? [];
   const ended = pullRequest.state !== "open";
-  const latest = latestReviews(detail.reviews);
-  const myLatest = latest.find((review) => review.reviewerId === viewerId);
-  // A review at a superseded head is dismissed but still yours: the button
-  // offers the action again rather than stacking an identical review.
-  const approved = myLatest?.state === "approved";
-  const requested = myLatest?.state === "changes_requested";
-  const approvedStill = approved && !myLatest?.dismissedAt;
-  const requestedStill = requested && !myLatest?.dismissedAt;
+  const verdict = myVerdict(detail, viewerId);
 
-  if (!(canReview || conflicts.length > 0 || ended)) {
+  if (!(capabilities.canReview || conflicts.length > 0 || ended)) {
     return null;
   }
 
   const review = (state: "approved" | "changes_requested") => {
-    void run(async () => {
-      await api<{ ok: true }>("/api/prs/prsReview", {
-        appId,
-        number: pullRequest.number,
-        state,
-      });
-    });
+    void runMutation(
+      mutation,
+      "review",
+      appId,
+      pullRequest.number,
+      async () => {
+        await api<{ ok: true }>("/api/prs/prsReview", {
+          appId,
+          number: pullRequest.number,
+          state,
+        });
+      }
+    );
   };
 
   return (
     <section class="border-base-300 flex flex-col gap-3 rounded-lg border p-3">
       {ended ? <EndedNotice detail={detail} /> : null}
       {conflicts.length > 0 ? <ConflictList conflicts={conflicts} /> : null}
-      {canReview ? (
-        <ReviewSection
-          approved={approved}
-          approvedStill={approvedStill}
-          busy={busy}
-          onReview={review}
-          requested={requested}
-          requestedStill={requestedStill}
-        />
+      {capabilities.canReview ? (
+        <ReviewSection busy={busy} onReview={review} verdict={verdict} />
       ) : null}
-      {notice() ? (
+      {notice === null ? null : (
         <p class="text-error m-0 text-sm" role="alert">
-          {notice()}
+          {notice}
         </p>
-      ) : null}
+      )}
     </section>
   );
 };

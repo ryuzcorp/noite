@@ -2,7 +2,7 @@
 //! refresh and Insert. All state it shows comes from the URL query; applying
 //! a control writes those params (see ./state).
 
-import { atom } from "ilha";
+import { atom, watch } from "ilha";
 
 import { collectRef, liveEl, newLiveRef } from "../../live-ref";
 import type {
@@ -12,7 +12,16 @@ import type {
   D1RowsQuery,
   D1TableCaps,
 } from "../../runner";
-import { ArrowUpDown, Filter, Plus, Refresh, Search, X } from "../../ui/icons";
+import {
+  ArrowUpDown,
+  Filter,
+  Plus,
+  Refresh,
+  Search as SearchIcon,
+  X,
+} from "../../ui/icons";
+import { nextSearch, Search, searchDisplay, searchDraft } from "./search";
+import type { SearchState } from "./search";
 import {
   encodeFilters,
   encodeSort,
@@ -180,6 +189,12 @@ const FilterPopover = ({
             <button
               type="button"
               class="btn btn-sm btn-neutral"
+              disabled={rows().length > MAX_FILTERS}
+              title={
+                rows().length > MAX_FILTERS
+                  ? `At most ${MAX_FILTERS} filters apply`
+                  : "Apply these filters"
+              }
               onclick={() => {
                 onApply(rows());
                 close();
@@ -328,25 +343,36 @@ export const TableToolbar = ({
   onRefresh: () => void;
   onSearch: (needle: string) => void;
 }) => {
-  const typed = atom(applied.search);
+  const search = atom<SearchState>(Search.Synced());
   const timer = atom.lazy(() => ({ id: 0 }))();
+
+  // The debounce owns its timer: unmount clears it, so a stale commit can
+  // never land on the next table's URL.
+  watch.once(() => () => {
+    window.clearTimeout(timer.id);
+  });
 
   return (
     <div class="border-base-300 flex flex-wrap items-center gap-2 border-b px-3 py-2">
       <label class="input input-sm w-56 max-w-full">
-        <Search class="h-4 w-4 opacity-50" />
+        <SearchIcon class="h-4 w-4 opacity-50" />
         <input
           type="search"
           aria-label="Search rows"
           placeholder="Search rows…"
-          value={typed()}
+          value={searchDisplay(search(), applied.search)}
           oninput={(event) => {
-            const { value } = event.currentTarget;
-            typed.set(value);
-            // Debounce: every commit changes the rows resource key, so one
+            // Debounced: every commit changes the rows resource key, so one
             // request per keystroke would remount the grid each time.
+            const { value } = event.currentTarget;
+            search.set(nextSearch(search(), { kind: "type", text: value }));
             window.clearTimeout(timer.id);
             timer.id = window.setTimeout(() => {
+              if (searchDraft(search()) === null) {
+                return;
+              }
+
+              search.set(nextSearch(search(), { kind: "commit" }));
               onSearch(value);
             }, 300);
           }}

@@ -21,11 +21,26 @@ import type { SearchParam } from "../search-param";
 import { LoadError } from "../ui/load-error";
 import { SectionSkeleton } from "../ui/skeletons";
 import { PrConversationTab } from "./conversation";
-import { latestReviews } from "./data";
+import { pendingChangeRequests } from "./data";
 import { PrFilesTab } from "./files";
 import { PrHeaderActions, PrMergeState, PrReviewBox } from "./merge-box";
+import { Mutation } from "./mutation";
+import type { PrMutation } from "./mutation";
 import { prDetail, prNames, prViewer } from "./resources";
 import { nameFor, PrStateBadge } from "./widgets";
+
+/** Every user id a pull request's page names. */
+const nameIds = (detail: PrDetail | undefined): string[] => {
+  if (detail === undefined) {
+    return [];
+  }
+
+  return [
+    detail.pullRequest.authorId,
+    ...detail.comments.map((comment) => comment.authorId),
+    ...detail.reviews.map((review) => review.reviewerId),
+  ];
+};
 
 const VIEWS = ["conversation", "commits", "files"] as const;
 
@@ -228,41 +243,31 @@ export const PrDetailView = ({
   });
 
   const res = prDetail(appId, number);
-  const detail = resourceValue(res.state());
-  const error = resourceError(res.state());
+  const state = res.state();
+  const detail = resourceValue(state);
+  const error = resourceError(state);
+  // One mutation slot for the whole PR: Close, Merge and a review cannot be
+  // in flight together, and each control reads the same answer.
+  const mutation = atom<PrMutation>(Mutation.Idle());
   const viewer = resourceValue(prViewer(appId).state());
   // `myRole` comes from the cached app detail; the viewer action covers a
   // cold cache and the standalone page.
   const role = resourceValue(appDetail(appId).state())?.myRole ?? viewer?.role;
 
-  const names = resourceValue(
-    prNames(
-      appId,
-      detail === undefined
-        ? []
-        : [
-            detail.pullRequest.authorId,
-            ...detail.comments.map((comment) => comment.authorId),
-            ...detail.reviews.map((review) => review.reviewerId),
-          ]
-    ).state()
-  );
+  const names = resourceValue(prNames(appId, nameIds(detail)).state());
 
   if (detail === undefined) {
     return (
       <div class="flex flex-col gap-4">
         <LoadError error={error} label="Failed to load pull request" />
-        {error ? null : <SectionSkeleton lines={5} />}
+        {state._tag === "Failed" ? null : <SectionSkeleton lines={5} />}
       </div>
     );
   }
 
   const { pullRequest } = detail;
 
-  const requesting = latestReviews(detail.reviews).filter(
-    (review) =>
-      review.state === "changes_requested" && review.dismissedAt === null
-  );
+  const requesting = pendingChangeRequests(detail.reviews);
 
   const compareHref = `/apps/${appId}/source/compare?base=${encodeURIComponent(
     pullRequest.base
@@ -270,6 +275,9 @@ export const PrDetailView = ({
 
   return (
     <div class="flex flex-col gap-4">
+      {state._tag === "Failed" ? (
+        <LoadError error={state.error} label="Failed to reload pull request" />
+      ) : null}
       <header class="flex flex-col gap-2">
         <div class="flex flex-wrap items-start justify-between gap-3">
           <h1 class="m-0 flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 text-xl font-semibold break-words">
@@ -282,6 +290,7 @@ export const PrDetailView = ({
           <PrHeaderActions
             appId={appId}
             detail={detail}
+            mutation={mutation}
             role={role}
             viewerId={viewer?.id ?? ""}
           />
@@ -326,6 +335,7 @@ export const PrDetailView = ({
       <PrReviewBox
         appId={appId}
         detail={detail}
+        mutation={mutation}
         role={role}
         viewerId={viewer?.id ?? ""}
       />

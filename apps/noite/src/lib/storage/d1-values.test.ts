@@ -5,6 +5,9 @@ import {
   cellFromDraft,
   draftDiffers,
   draftFromCell,
+  draftIsNull,
+  draftText,
+  fieldDirty,
   formatJson,
   isBlobText,
   isBoolType,
@@ -12,10 +15,12 @@ import {
   isTimestampColumn,
   jsonValid,
   keyFor,
+  markedNull,
   nowValue,
   parseTimestamp,
   prefersTextarea,
   timestampKind,
+  typedText,
   writeValues,
   writtenColumns,
 } from "./d1-values";
@@ -71,7 +76,7 @@ const draftsFrom = (
   );
 
   for (const [name, value] of Object.entries(patch)) {
-    drafts[name] = { isNull: value === null, text: value ?? "", touched: true };
+    drafts[name] = value === null ? markedNull() : typedText(value);
   }
 
   return drafts;
@@ -105,43 +110,53 @@ const insertValues = (
 
 describe("drafts", () => {
   test("NULL and empty string seed distinguishable drafts", () => {
-    expect(draftFromCell(null)).toEqual({
-      isNull: true,
-      text: "",
-      touched: false,
-    });
+    expect(draftFromCell(null)).toEqual({ kind: "null", touched: false });
     expect(draftFromCell("")).toEqual({
-      isNull: false,
+      kind: "text",
       text: "",
       touched: false,
     });
     expect(draftFromCell(EPOCH_MS)).toEqual({
-      isNull: false,
+      kind: "text",
       text: EPOCH_MS,
       touched: false,
     });
   });
 
   test("a draft writes back NULL or the exact text", () => {
-    expect(
-      cellFromDraft({ isNull: true, text: "ignored", touched: true })
-    ).toBeNull();
-    expect(cellFromDraft({ isNull: false, text: "", touched: true })).toBe("");
-    expect(cellFromDraft({ isNull: false, text: ISO, touched: false })).toBe(
+    expect(cellFromDraft(markedNull())).toBeNull();
+    expect(cellFromDraft(typedText(""))).toBe("");
+    expect(cellFromDraft({ kind: "text", text: ISO, touched: false })).toBe(
       ISO
     );
   });
 
+  test("a NULL draft carries no hidden text", () => {
+    // The old `{ isNull: true, text: "x" }` pair was representable: toggling
+    // NULL after typing hid an edit that was never written and reappeared on
+    // un-toggle. A NULL draft has no text at all.
+    const nullish = markedNull();
+    expect(draftIsNull(nullish)).toBe(true);
+    expect(draftText(nullish)).toBe("");
+    // Unchecking NULL gives an empty text draft again: the hidden value does
+    // not come back.
+    expect(typedText("")).toEqual({ kind: "text", text: "", touched: true });
+  });
+
   test("NULL and empty string differ from each other", () => {
-    const empty = { isNull: false, text: "", touched: false };
-    const nullish = { isNull: true, text: "", touched: false };
+    const empty = typedText("");
+    const nullish = markedNull();
     expect(draftDiffers(empty, null)).toBe(true);
     expect(draftDiffers(nullish, "")).toBe(true);
     expect(draftDiffers(nullish, null)).toBe(false);
     expect(draftDiffers(empty, "")).toBe(false);
-    expect(
-      draftDiffers({ isNull: false, text: "x", touched: false }, "x")
-    ).toBe(false);
+    expect(draftDiffers(typedText("x"), "x")).toBe(false);
+  });
+
+  test("INSERT counts a touched field, UPDATE counts a changed one", () => {
+    expect(fieldDirty(typedText(""), "", true)).toBe(false);
+    expect(fieldDirty(typedText(""), "", false)).toBe(true);
+    expect(fieldDirty(markedNull(), null, false)).toBe(true);
   });
 });
 

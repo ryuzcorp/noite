@@ -268,6 +268,15 @@ export const latestReviews = (reviews: readonly PrReview[]): PrReview[] => {
   return [...latest.values()];
 };
 
+/** The reviewers whose latest review still requests changes (undismissed). */
+export const pendingChangeRequests = (
+  reviews: readonly PrReview[]
+): PrReview[] =>
+  latestReviews(reviews).filter(
+    (review) =>
+      review.state === "changes_requested" && review.dismissedAt === null
+  );
+
 // ---- Large diffs ----
 
 /** A file's diff over this many changed lines renders collapsed. */

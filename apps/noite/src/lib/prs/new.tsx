@@ -11,115 +11,45 @@ import { resourceValue } from "../resource";
 /** New-pull-request form: base/head branch pickers (from `gitRefs`), title
  * and body; it explains why Create is off and lands on the detail page on
  * success. */
+import type { ResourceState } from "../resource";
 import type { GitCompare, PrDetail } from "../runner";
+import { createInputOf, reasonText, validateNewPr } from "./new-pr";
+import type { CompareStatus, NewPrInput } from "./new-pr";
 import { invalidatePr, prList } from "./resources";
 
-/** The reasons Create is off, in the order the form reads them. Passed
- * trimmed values so this list and the submit guard agree. */
-const newPrBlockers = ({
-  ahead,
-  base,
-  existingNumber,
-  head,
-  loading,
-  otherBranchCount,
-  title,
-}: {
-  ahead: number | undefined;
-  base: string;
-  existingNumber: number | undefined;
-  head: string;
-  loading: boolean;
-  otherBranchCount: number;
-  title: string;
-}): string[] => {
-  const reasons: string[] = [];
+/** Run the one validation rule set. The form lists `validateNewPr` and the
+ * submit guard uses `createInputOf` on the same input, so they cannot
+ * disagree (the old pair let a duplicate base/head pair disable the button
+ * while the submit guard still posted). */
+const check = (input: NewPrInput) => {
+  const reasons = validateNewPr(input);
 
-  if (!loading) {
-    if (otherBranchCount === 0) {
-      reasons.push("Create a branch first");
-    }
-
-    if (base === "" || head === "") {
-      reasons.push("Pick both a base and a head branch");
-    } else if (base === head) {
-      reasons.push("Head must differ from base");
-    }
-
-    if (existingNumber !== undefined) {
-      reasons.push(
-        `A pull request for this pair is already open (#${existingNumber})`
-      );
-    }
-
-    if (ahead === 0) {
-      reasons.push(`No commits on ${head} over ${base}`);
-    }
-  }
-
-  if (title === "") {
-    reasons.push("Add a title");
-  }
-
-  return reasons;
+  return {
+    message: reasons.length === 0 ? null : reasonText(reasons[0]),
+    reasons: reasons.map((reason) => reasonText(reason)),
+    valid: reasons.length === 0,
+  };
 };
 
-/** The first reason Create can't run, phrased for the alert the form shows. */
-const newPrProblem = ({
-  ahead,
-  base,
-  head,
-  title,
-}: {
-  ahead: number | undefined;
-  base: string;
-  head: string;
-  title: string;
-}): string | null => {
-  if (title === "") {
-    return "Title is required";
-  }
-
-  if (base === "" || head === "") {
-    return "Pick both a base and a head branch";
-  }
-
-  if (base === head) {
-    return "Head must differ from base";
-  }
-
-  if (ahead === 0) {
-    return `No commits on ${head} over ${base}; push a commit first`;
-  }
-
-  return null;
-};
-
-/** Create the pull request and land on its page, or show the first unmet
- * precondition. */
+/** Create the pull request and land on its page. Only a valid form can build
+ * a request body, so an invalid submit posts nothing. */
 const submitNewPr = async ({
   appId,
-  base,
-  body,
   busy,
-  head,
+  input,
   notice,
-  problem,
-  title,
   visit,
 }: {
   appId: string;
-  base: string;
-  body: string;
   busy: AtomHandle<boolean>;
-  head: string;
+  input: NewPrInput & { readonly body: string };
   notice: AtomHandle<string>;
-  problem: string | null;
-  title: string;
   visit: (to: string) => void;
 }): Promise<void> => {
-  if (problem !== null) {
-    notice.set(problem);
+  const body = createInputOf(input);
+
+  if (body === null) {
+    notice.set(check(input).message ?? "This pull request cannot be created");
 
     return;
   }
@@ -128,18 +58,36 @@ const submitNewPr = async ({
   notice.set("");
 
   try {
-    const args: PrCreateInput = { appId, base, head, title };
-
-    if (body !== "") {
-      args.body = body;
-    }
-
+    const args: PrCreateInput = { appId, ...body };
     const detail = await api<PrDetail>("/api/prs/prsCreate", args);
     invalidatePr(appId);
     visit(`/apps/${appId}/pulls/${detail.pullRequest.number}`);
   } catch (error) {
     busy.set(false);
     notice.set(errorMessage(error));
+  }
+};
+
+/** The compare a resource state represents, or null when no compare runs. */
+const compareStatusOf = (
+  state: ResourceState<GitCompare> | null
+): CompareStatus | null => {
+  if (state === null) {
+    return null;
+  }
+
+  switch (state._tag) {
+    case "Loading": {
+      return { kind: "loading" };
+    }
+
+    case "Failed": {
+      return { kind: "failed" };
+    }
+
+    default: {
+      return { ahead: state.value.ahead, kind: "ready" };
+    }
   }
 };
 
@@ -274,11 +222,11 @@ export const NewPrForm = ({
     baseValue.trim() !== headValue.trim();
 
   // Cheap: the compare runs only once both picks are real, distinct branches.
-  const compare = picksDiffer
-    ? resourceValue(
-        forgeCompare(appId, baseValue.trim(), headValue.trim()).state()
-      )
-    : undefined;
+  const compareState = picksDiffer
+    ? forgeCompare(appId, baseValue.trim(), headValue.trim()).state()
+    : null;
+
+  const compare = compareStatusOf(compareState);
 
   const openPulls =
     resourceValue(prList(appId, "open").state())?.pullRequests ?? [];
@@ -287,42 +235,36 @@ export const NewPrForm = ({
     (pull) => pull.base === baseValue.trim() && pull.head === headValue.trim()
   );
 
-  const loading = refs === undefined;
-
-  const reasons = newPrBlockers({
-    ahead: compare?.ahead,
+  const input: NewPrInput = {
     base: baseValue.trim(),
+    branchNames: refs === undefined ? undefined : branchNames,
+    compare,
     existingNumber: existing?.number,
     head: headValue.trim(),
-    loading,
-    otherBranchCount: otherBranches.length,
     title: title().trim(),
-  });
+  };
 
-  const valid = reasons.length === 0;
+  const result = check(input);
+  const loading = refs === undefined;
 
   return (
     <form
       class="flex flex-col gap-4"
       onsubmit={(event) => {
         event.preventDefault();
-        const nextBase = baseValue.trim();
-        const nextHead = headValue.trim();
-        const nextTitle = title().trim();
         void submitNewPr({
           appId,
-          base: nextBase,
-          body: body().trim(),
           busy,
-          head: nextHead,
+          input: {
+            base: baseValue.trim(),
+            body: body(),
+            branchNames: refs === undefined ? undefined : branchNames,
+            compare,
+            existingNumber: existing?.number,
+            head: headValue.trim(),
+            title: title().trim(),
+          },
           notice,
-          problem: newPrProblem({
-            ahead: compare?.ahead,
-            base: nextBase,
-            head: nextHead,
-            title: nextTitle,
-          }),
-          title: nextTitle,
           visit: (to) => router.visit(to),
         });
       }}
@@ -346,7 +288,9 @@ export const NewPrForm = ({
         }}
       />
 
-      {compare === undefined ? null : <CompareSummary compare={compare} />}
+      {compare?.kind === "ready" && compareState?._tag === "Ready" ? (
+        <CompareSummary compare={compareState.value} />
+      ) : null}
 
       <fieldset class="fieldset">
         <label class="label" for="pr-title">
@@ -382,7 +326,9 @@ export const NewPrForm = ({
         />
       </fieldset>
 
-      {reasons.length > 0 ? <ReasonList reasons={reasons} /> : null}
+      {result.reasons.length > 0 ? (
+        <ReasonList reasons={result.reasons} />
+      ) : null}
 
       <FormFooter
         appId={appId}
@@ -390,7 +336,7 @@ export const NewPrForm = ({
         existingNumber={existing?.number}
         loading={loading}
         otherBranchCount={otherBranches.length}
-        valid={valid}
+        valid={result.valid}
       />
     </form>
   );

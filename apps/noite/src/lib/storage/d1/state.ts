@@ -168,7 +168,7 @@ export const validSort = (
 };
 
 export const validFilters = (
-  filters: D1Filter[],
+  filters: readonly D1Filter[],
   schema?: D1TableSchema
 ): D1Filter[] => {
   if (schema === undefined) {
