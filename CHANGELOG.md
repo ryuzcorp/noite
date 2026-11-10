@@ -10,6 +10,28 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 <!-- New entries go in changelog.d/<topic>.md; the release PR assembles them with `bun docker/changelog-release.ts`. -->
 
+## [0.1.0-alpha.31] - 2026-11-10
+
+### Operator action required
+
+- None.
+
+### Added
+
+- **Stop an in-flight deploy.** The Deployments tab's in-flight row has a **Stop** button (push/admin): the step running at that moment is killed with its whole process group, every later phase checks the stop, and the row closes as failed with `cancelled by the operator`. The release serving traffic is untouched, and the app's next push deploys normally.
+- **Roll back a preview environment.** A successful deploy row under a preview environment now offers **Roll back** like production: the sha must have been successful in that environment (a production success never authorizes it), and the rebuild lands in that environment's fleet. The production-only restriction is gone from the Deployments tab's environment groups.
+
+### Changed
+
+- **A deploy that is waiting its turn now says so.** A rollback or an environment redeploy issued while the app is already building lists as **queued** — "queued behind the app's running deploy" — from the moment the request is accepted, instead of appearing only when its build starts (and staying badge-warning like an in-flight run, stoppable from the row).
+- The header's **Deploy** menu now offers **Roll back to `<sha>`**: the newest successful production release that is not the live one, one click from any tab (confirm dialog, then the same rollback the Deployments tab already had). It loads the deploy list when the menu opens, hides itself while there is no earlier release, and says so once it knows. The per-row **Roll back** button on the Deployments tab is unchanged.
+
+### Fixed
+
+- **Code mode loads on a real domain.** The workspace's pod origin moved from `app-0.preview.<slug>.<base>` to `pod-<app id>.<base>` — one label under the base, which the instance's own `*.<base>` certificate covers. Cloudflare's Universal SSL (and DNS wildcards generally) match exactly one label, so the old two-label host had no certificate and the frame never loaded: the source view spun, then reported that the pod host did not answer. The runner routes the new host to the control upstream and the TLS ask admits it for any existing app; `pod-<uuid>` slugs are now refused so the namespace stays clear. Unpushed edits saved by Code mode live in the pod origin's IndexedDB, so drafts made on the old origin are not carried over.
+- Environment hosts (`<label>.<slug>.<base>`) are still two labels and need their own record/certificate behind a proxy; the self-hosting docs now say so instead of claiming a wildcard matches every depth.
+- `apps/noite` pins `void` at `1.3.0` exactly (it was `^1.3.0`), and `docker/check-versions.ts` fails if the pin is a range or if `apps/noite/bun.lock` resolves a dependency differently from the workspace lock. A caret range let a lockfile regeneration pull `void` 1.7.0, whose build emits no root `dist/wrangler.json`: the control deploy was skipped and `/ready` stayed unhealthy with no cause.
+
 ## [0.1.0-alpha.30] - 2026-11-09
 
 ### Operator action required

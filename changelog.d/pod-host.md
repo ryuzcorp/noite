@@ -1,4 +1,0 @@
-### Fixed
-
-- **Code mode loads on a real domain.** The workspace's pod origin moved from `app-0.preview.<slug>.<base>` to `pod-<app id>.<base>` — one label under the base, which the instance's own `*.<base>` certificate covers. Cloudflare's Universal SSL (and DNS wildcards generally) match exactly one label, so the old two-label host had no certificate and the frame never loaded: the source view spun, then reported that the pod host did not answer. The runner routes the new host to the control upstream and the TLS ask admits it for any existing app; `pod-<uuid>` slugs are now refused so the namespace stays clear. Unpushed edits saved by Code mode live in the pod origin's IndexedDB, so drafts made on the old origin are not carried over.
-- Environment hosts (`<label>.<slug>.<base>`) are still two labels and need their own record/certificate behind a proxy; the self-hosting docs now say so instead of claiming a wildcard matches every depth.
