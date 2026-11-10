@@ -18,6 +18,7 @@ import { resetStreamHub } from "./feeds";
 //! `res.refetch()`.
 import {
   invalidate as invalidateKey,
+  resetResource,
   tracked as trackResource,
 } from "./resource";
 import type { Resource, ResourceFetcher } from "./resource";
@@ -73,7 +74,7 @@ export const resetUserCaches = (): void => {
   resetStreamHub();
 
   for (const key of usedKeys) {
-    invalidateKey(key);
+    resetResource(key);
   }
 };
 

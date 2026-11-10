@@ -272,6 +272,27 @@ describe("feed state machine", () => {
     ).toEqual({ _tag: "Live", value: ["frame"] });
   });
 
+  test("an initial snapshot still lands after the stream failed first", () => {
+    const failed = nextFeedState<string[]>(
+      { _tag: "Cold" },
+      {
+        conn: ConnTypes.Retrying({ cause: "lost" }),
+        kind: "conn",
+      }
+    );
+
+    expect(failed._tag).toBe("Reconnecting");
+
+    const painted = nextFeedState<string[]>(failed, {
+      kind: "snapshot",
+      value: ["rows"],
+    });
+
+    // The snapshot fills the panel; the link keeps saying it is retrying.
+    expect(painted._tag).toBe("Reconnecting");
+    expect(feedOf(painted)).toEqual(["rows"]);
+  });
+
   test("a refusal is kept until a new connection replaces it", () => {
     const refused = nextFeedState<string[]>(
       { _tag: "Cold" },

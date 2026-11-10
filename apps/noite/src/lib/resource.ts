@@ -135,6 +135,9 @@ type SettleOutcome =
  * the lookup lands. */
 interface KeySub {
   blank: () => void;
+  /** Drop to a cold `Loading` (auth reset): the previous account's value
+   * must not be painted while the reload runs. */
+  clear: () => void;
   settle: (outcome: SettleOutcome) => void;
 }
 
@@ -223,14 +226,18 @@ const settleKey = (
  * with the fresh value, or rejects so `refetch()` callers can `catch` it
  * like before (the error is also recorded on each reader's `error`). */
 // oxlint-disable-next-line anti-slop/no-unknown-returns -- the reload promise is type-erased across keys; refetch() narrows to its key's T.
-const reload = async (key: string): Promise<unknown> => {
+const reload = async (key: string, clear = false): Promise<unknown> => {
   const generation = (generations.get(key) ?? 0) + 1;
   generations.set(key, generation);
   const readers = subs.get(key);
 
   if (readers !== undefined) {
     for (const sub of readers) {
-      sub.blank();
+      if (clear) {
+        sub.clear();
+      } else {
+        sub.blank();
+      }
     }
   }
 
@@ -272,6 +279,28 @@ const kick = (key: string): void => {
   const generation = (generations.get(key) ?? 0) + 1;
   generations.set(key, generation);
   void settleGet(key, generation);
+};
+
+/** Drop the cached entry for `key` and reload every mounted reader, cold: the
+ * readers blank to `Loading` first, so no previous account's value is painted
+ * (an auth reset uses this; a mutation uses `invalidate`, which keeps the
+ * value visible as `Reloading`). A key with no readers just evicts. */
+export const resetResource = (key: string): void => {
+  const readers = subs.get(key);
+
+  if (readers === undefined || readers.size === 0) {
+    void Effect.runPromise(Cache.invalidate(cache, cacheKey(key)));
+
+    return;
+  }
+
+  void (async (): Promise<void> => {
+    try {
+      await reload(key, true);
+    } catch {
+      // The rejection is already recorded on every reader's state.
+    }
+  })();
 };
 
 /** Drop the cached entry for `key` and reload every mounted reader. A key
@@ -333,6 +362,9 @@ export const tracked = <T>(
         state.update((current) =>
           nextResourceState<T>(current, { kind: "reload" })
         );
+      },
+      clear: (): void => {
+        state.set(State.Loading());
       },
       settle: (outcome: SettleOutcome): void => {
         if (outcome.ok) {

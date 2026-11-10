@@ -9,6 +9,7 @@ import { render } from "ilha/test";
 import {
   invalidate,
   nextResourceState,
+  resetResource,
   resourceError,
   resourceValue,
   tracked,
@@ -288,6 +289,46 @@ describe("account epoch", () => {
       await flush();
 
       expect(readSwr<string[]>(key)).toBeUndefined();
+    } finally {
+      resetSignals();
+      restoreDom();
+    }
+  });
+});
+
+describe("auth reset", () => {
+  test("a reset blanks the reader to cold instead of painting the old value", async () => {
+    const restoreDom = installDomFixture();
+
+    try {
+      const key = nextKey();
+      const slow = Promise.withResolvers<string[]>();
+      let calls = 0;
+      probeKey = key;
+      probeFetch = () => {
+        calls += 1;
+
+        return calls === 1 ? Promise.resolve(["account-a"]) : slow.promise;
+      };
+
+      const painted = nextPainted();
+      const ui = render(ResourceProbe);
+      expect(await painted).toEqual(["account-a"]);
+      await ui.settled();
+
+      const settledAgain = nextSettled();
+      resetResource(key);
+      await ui.settled();
+
+      // Immediately after the reset the reader is cold: no A value, no
+      // "reloading with A" paint while B's fetch is in flight.
+      expect(resourceValue(capturedState())).toBeUndefined();
+      expect(capturedState()._tag).toBe("Loading");
+
+      slow.resolve(["account-b"]);
+      await settledAgain;
+      expect(resourceValue(capturedState())).toEqual(["account-b"]);
+      ui.unmount();
     } finally {
       resetSignals();
       restoreDom();

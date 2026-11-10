@@ -209,9 +209,39 @@ export const nextFeedState = <T>(
     }
 
     case "snapshot": {
-      return state._tag === "Cold" || state._tag === "Cached"
-        ? Feed.Cached({ value: event.value })
-        : state;
+      // A frame (or an earlier snapshot) always wins; otherwise the snapshot
+      // fills the panel without losing what the link is doing (a stream that
+      // failed first must not drop the snapshot the panel fetched instead).
+      if (state._tag === "Live" || feedValue(state) !== undefined) {
+        return state;
+      }
+
+      switch (state._tag) {
+        case "Refused": {
+          return Feed.Refused({ value: event.value });
+        }
+
+        case "Offline": {
+          return Feed.Offline({ value: event.value });
+        }
+
+        case "Paused": {
+          return Feed.Paused({ value: event.value });
+        }
+
+        case "Reconnecting": {
+          return Feed.Reconnecting({ value: event.value });
+        }
+
+        case "Cold":
+        case "Cached": {
+          return Feed.Cached({ value: event.value });
+        }
+
+        default: {
+          return state;
+        }
+      }
     }
 
     case "conn": {

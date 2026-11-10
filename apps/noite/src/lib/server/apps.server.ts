@@ -419,8 +419,21 @@ export const remove = apiAction(AppId, async (appId, { env, request }) => {
 
   try {
     const result = await runnerDeleteApp(appId);
-    // Nothing cascades grants now that the app row lives in the runner.
-    await dropAppCollaborators(appId);
+
+    // The runner accepted the delete: a cleanup failure is logged, never
+    // reported as a failed delete (the app is gone either way). Nothing
+    // cascades grants now that the app row lives in the runner.
+    const cleaned = await dropAppCollaborators(appId).then(
+      () => true,
+      () => false
+    );
+
+    if (!cleaned) {
+      console.error(
+        "[apps] app deleted but collaborator cleanup failed for",
+        appId
+      );
+    }
 
     return outcomeValue(
       result.deleting ? Mutation.Purging() : Mutation.Applied()
