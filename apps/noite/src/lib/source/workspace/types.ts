@@ -265,11 +265,14 @@ export interface WorkspaceFs {
 /** The codes a workspace verb refuses with, so a caller branches on the class
  * of refusal instead of matching its English. They travel the RPC unchanged
  * (`PodError.code`) and reach the panes as `PodCallError.code`. */
-export type WorkspaceErrorCode =
-  | "closed"
-  | "not-open"
-  | "not-saving"
-  | "read-only";
+const WORKSPACE_ERROR_CODES = [
+  "closed",
+  "not-open",
+  "not-saving",
+  "read-only",
+] as const;
+
+export type WorkspaceErrorCode = (typeof WORKSPACE_ERROR_CODES)[number];
 
 /** A refusal from the workspace layer. */
 export class WorkspaceError extends Error {
@@ -281,6 +284,34 @@ export class WorkspaceError extends Error {
     this.name = "WorkspaceError";
   }
 }
+
+/** Whether a wire code names a workspace refusal: the port carries `code` as
+ * a plain string, so a pane decodes it before branching on it. */
+const isWorkspaceErrorCode = (raw: string): raw is WorkspaceErrorCode =>
+  // SAFETY: the list is the union's own definition, so every member is a string.
+  (WORKSPACE_ERROR_CODES as readonly string[]).includes(raw);
+
+/** The refusal code a caught error carries, or null when it carries none (a
+ * runner HTTP refusal is text only). A refusal thrown in the frame is a
+ * `WorkspaceError`; across the port the same code arrives on a `PodCallError`
+ * — matched structurally because it is another realm's class. */
+/* oxlint-disable anti-slop/no-unknown-parameters, anti-slop/no-runtime-typeof -- a catch-site classifier: the thrown value is unknown by construction, and the one field it may carry is checked before use. */
+export const workspaceErrorCodeOf = (
+  error: unknown
+): WorkspaceErrorCode | null => {
+  if (error instanceof WorkspaceError) {
+    return error.code;
+  }
+
+  if (typeof error !== "object" || error === null || !("code" in error)) {
+    return null;
+  }
+
+  const { code } = error;
+
+  return typeof code === "string" && isWorkspaceErrorCode(code) ? code : null;
+};
+/* oxlint-enable anti-slop/no-unknown-parameters, anti-slop/no-runtime-typeof */
 
 /** Where a failed workspace save is reported: the pod retries it on its own,
  * but the page must say that what it shows is not being kept (a full browser

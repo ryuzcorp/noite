@@ -61,6 +61,7 @@ import type {
 import { createEditorPane } from "./editor";
 import { IGNORE_FILE } from "./gitignore";
 import {
+  operationFailure,
   previewView,
   PreviewOps,
   PushOps,
@@ -983,7 +984,7 @@ export const SourceBrowser = ({
         return true;
       } catch (error) {
         pushOp = settlePush(pushOp, {
-          message: errorMessage(error),
+          failure: operationFailure(error),
           ok: false,
         });
 
@@ -1042,7 +1043,7 @@ export const SourceBrowser = ({
         return deployed;
       } catch (error) {
         previewOp = settlePreview(previewOp, {
-          message: errorMessage(error),
+          failure: operationFailure(error),
           ok: false,
         });
 

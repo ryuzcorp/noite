@@ -1,6 +1,7 @@
 import { expect, test } from "bun:test";
 
 import {
+  operationFailure,
   previewView,
   PreviewOps,
   pushView,
@@ -11,6 +12,7 @@ import {
   startPreview,
   startPush,
 } from "./operations";
+import { WorkspaceError } from "./workspace/types";
 
 /** A start the test expects to be accepted (the refusal cases assert on the
  * null directly). */
@@ -24,26 +26,32 @@ const started = <T>(value: T | null): T => {
 
 test("a preview failure never reports as a push failure", () => {
   const preview = settlePreview(started(startPreview(PreviewOps.Idle())), {
-    message: "preview refused",
+    failure: { code: null, message: "preview refused" },
     ok: false,
   });
 
-  expect(previewView(preview).previewError).toBe("preview refused");
+  expect(previewView(preview).previewError).toEqual({
+    code: null,
+    message: "preview refused",
+  });
   // The push slot was never touched.
   const push = pushView(PushOps.Idle());
 
-  expect(push.pushError).toBe("");
+  expect(push.pushError).toBeNull();
   expect(push.pushing).toBe(false);
 });
 
 test("a push failure never reports as a preview failure", () => {
   const push = settlePush(started(startPush(PushOps.Idle())), {
-    message: "push refused",
+    failure: { code: null, message: "push refused" },
     ok: false,
   });
 
-  expect(pushView(push).pushError).toBe("push refused");
-  expect(previewView(PreviewOps.Idle()).previewError).toBe("");
+  expect(pushView(push).pushError).toEqual({
+    code: null,
+    message: "push refused",
+  });
+  expect(previewView(PreviewOps.Idle()).previewError).toBeNull();
 });
 
 test("one push and one preview at a time, and they do not block each other", () => {
@@ -72,4 +80,29 @@ test("a landed push reports where it went, and a change resets it", () => {
 
   expect(pushView(reset.push).pushed).toBeNull();
   expect(pushView(reset.push).pushing).toBe(false);
+});
+
+test("a caught workspace refusal keeps its code in the failure", () => {
+  expect(
+    operationFailure(
+      new WorkspaceError("read-only", "workspace: this checkout is read-only")
+    )
+  ).toEqual({
+    code: "read-only",
+    message: "workspace: this checkout is read-only",
+  });
+});
+
+test("a remote refusal without a code reports only its message", () => {
+  expect(
+    operationFailure(
+      new Error(
+        "commit failed: 409 refs/heads/main is protected; commit to a new branch"
+      )
+    )
+  ).toEqual({
+    code: null,
+    message:
+      "commit failed: 409 refs/heads/main is protected; commit to a new branch",
+  });
 });

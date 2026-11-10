@@ -4,10 +4,12 @@
 //! and one facts table per machine, so no component compares status strings
 //! inline and a new runner variant fails to compile here first.
 //!
-//! `APP_STATUSES`, `DEPLOY_STATUSES` and `ENVIRONMENT_STATUSES` are local
-//! unions today because the runner still exports `status: string`; when the
-//! runner's ts-rs enums land, swap the local union for the imported one — the
-//! `satisfies Record<…>` tables then pin the new variant.
+//! `AppStatus` and `DeployStatus` are the runner's own ts-rs bindings
+//! (`lib/runner-types`), so a variant the runner adds lands here first: the
+//! `satisfies Record<…>` tables below pin every status, and a missing entry
+//! fails the compile. `AppStatusPage.status` stays a plain string because
+//! callers also paint rows whose status the wire did not type; the runtime
+//! decode (`isAppStatus`) turns those into the generated union.
 //!
 //! App lifecycle (`appLifecycle`) — status × desiredState × imported:
 //!
@@ -33,37 +35,20 @@
 
 import { Data } from "effect";
 
+import type { AppStatus } from "../runner-types/AppStatus";
+import type { DeployStatus } from "../runner-types/DeployStatus";
+import type { DesiredState } from "../runner-types/DesiredState";
+
+export type { DesiredState } from "../runner-types/DesiredState";
+
 export interface AppStatusPage {
   readonly desiredState?: string | undefined;
   readonly imported?: boolean | undefined;
   readonly status: string;
 }
 
-/** The app statuses the runner writes (`db/apps.rs`, `host/import.rs`). */
-export type AppStatus =
-  | "provisioned"
-  | "importing"
-  | "building"
-  | "deploying"
-  | "running"
-  | "sleeping"
-  | "stopped"
-  | "failed"
-  | "error";
-
-/** What a deploy row's status is (`db/deploys.rs`). */
-export type DeployStatus =
-  | "queued"
-  | "building"
-  | "deploying"
-  | "success"
-  | "failed";
-
 /** An environment's observed status uses the app vocabulary. */
 export type EnvironmentStatus = AppStatus;
-
-/** `app.desired_state` and `environment.desired_state`. */
-export type DesiredState = "running" | "stopped";
 
 export const parseDesiredState = (raw: string): DesiredState | null => {
   if (raw === "running" || raw === "stopped") {
@@ -127,6 +112,13 @@ const APP_FACTS = {
     inFlight: true,
     label: "Importing",
     retryable: true,
+    tone: "status-warning",
+  },
+  pending: {
+    deployed: false,
+    inFlight: false,
+    label: "pending",
+    retryable: false,
     tone: "status-warning",
   },
   provisioned: {

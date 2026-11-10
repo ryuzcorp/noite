@@ -46,7 +46,8 @@ import { ArrowUpRight, List, Refresh } from "../ui/icons";
 import { LoadError } from "../ui/load-error";
 import { PanelClose } from "../ui/side-panel";
 import { ListSkeleton } from "../ui/skeletons";
-import type { ReadOnlyRef, SourceBrowserState } from "./drafts";
+import type { SourceBrowserState } from "./drafts";
+import { deployErrorCopy, READ_ONLY_DEPLOY } from "./failure-copy";
 import {
   changesFingerprint,
   expiryLabel,
@@ -273,20 +274,6 @@ const BAR = "border-base-300 flex flex-col border-b py-1 pr-1.5 pl-2";
  * is meant to: a wrapped bar must never leave the × alone on a row of its own
  * (every other side panel keeps it at the top-right corner). */
 const BAR_ROW = "flex min-h-7 items-center gap-1";
-
-/** Why Deploy preview is off for a read-only checkout. */
-const READ_ONLY_DEPLOY: Record<Exclude<ReadOnlyRef, "">, string> = {
-  commit: "Read-only — a commit checkout can't be deployed.",
-  role: "Read-only — you need push access to deploy a preview.",
-  tag: "Read-only — a tag checkout can't be deployed.",
-};
-
-/** A failed deploy as the user reads it: the workspace's own read-only refusal
- * gets copy that names the reason, anything else keeps its words. */
-const deployErrorCopy = (raw: string, readOnly: ReadOnlyRef): string =>
-  readOnly !== "" && raw.toLowerCase().includes("read-only")
-    ? READ_ONLY_DEPLOY[readOnly]
-    : raw;
 
 /** Deploy preview / Redeploy in its own button, with the reason it is off in
  * the wrapper's tooltip: a disabled button receives no hover of its own. */
@@ -894,7 +881,7 @@ const DeployError = ({
   attempted: boolean;
   current: SourceBrowserState;
 }) => {
-  if (!attempted || current.previewError === "") {
+  if (!attempted || current.previewError === null) {
     return null;
   }
 

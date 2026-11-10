@@ -77,6 +77,14 @@ describe("appLifecycle", () => {
     ).toBe(true);
   });
 
+  test("the runner's schema-default pending row paints as itself", () => {
+    expect(view("pending", "running")).toMatchObject({
+      action: "stop",
+      label: "pending",
+      tone: "status-warning",
+    });
+  });
+
   test("an unmodelled status is painted as itself, never as Failed", () => {
     expect(view("paused", "running")).toMatchObject({
       label: "paused",
