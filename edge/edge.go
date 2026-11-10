@@ -478,20 +478,21 @@ func (e *EdgeRoutes) ServeHTTP(w http.ResponseWriter, r *http.Request, next cadd
 		http.Error(w, "not found", http.StatusNotFound)
 		return nil
 	}
+	// Both zones are decided in one step: a refusal in the app zone must not
+	// spend the client's budget, and Retry-After reports whichever zone is
+	// still over budget the longest.
+	var client, app RateLimit
 	if route.ClientRPM > 0 {
 		clientIP, _ := caddyhttp.GetVar(r.Context(), caddyhttp.ClientIPVarKey).(string)
-		if allowed, retry := snap.lim.Allow(route.ClientZone, route.ClientRPM, ClientKey(clientIP)); !allowed {
-			w.Header().Set("Retry-After", fmt.Sprintf("%d", int(retry.Seconds())))
-			http.Error(w, "rate limited", http.StatusTooManyRequests)
-			return nil
-		}
+		client = RateLimit{Zone: route.ClientZone, RPM: route.ClientRPM, Key: ClientKey(clientIP)}
 	}
 	if route.AppRPM > 0 {
-		if allowed, retry := snap.lim.Allow(route.AppZone, route.AppRPM, "all"); !allowed {
-			w.Header().Set("Retry-After", fmt.Sprintf("%d", int(retry.Seconds())))
-			http.Error(w, "rate limited", http.StatusTooManyRequests)
-			return nil
-		}
+		app = RateLimit{Zone: route.AppZone, RPM: route.AppRPM, Key: "all"}
+	}
+	if d := snap.lim.AllowRequest(client, app); !d.Allowed {
+		w.Header().Set("Retry-After", fmt.Sprintf("%d", int(d.RetryAfter/time.Second)))
+		http.Error(w, "rate limited", http.StatusTooManyRequests)
+		return nil
 	}
 	caddyhttp.SetVar(r.Context(), VarRoute, mode.Kind())
 	caddyhttp.SetVar(r.Context(), VarUpstream, route.Upstream)

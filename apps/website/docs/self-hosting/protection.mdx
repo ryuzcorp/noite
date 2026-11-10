@@ -15,7 +15,11 @@ Caddy, Noite's edge, limits every public site before a request reaches a worker.
 | `NOITE_EDGE_GIT_RPM` | 120 per minute | Each visitor on `git.` |
 | `NOITE_EDGE_APP_RPM` | none | Each app, across all visitors together |
 
-Set any of them to `0` to turn it off. The edge counts over a sliding 10-second window, so 1800 per minute means up to 300 requests in any 10 seconds. IPv6 visitors are counted per `/64`, the block one subscriber usually holds.
+Set any of them to `0` to turn it off. The edge counts over a sliding window whose whole-event budget never exceeds the configured rate: 1800 per minute means at most 300 requests in any 10 seconds, and 100 per minute means 16 per 10 seconds, because the budget rounds down. Below 6 per minute the window widens so a small limit stays small: 1 per minute is one request per 60 seconds, not one per 10 (which would be six a minute). IPv6 visitors are counted per `/64`, the block one subscriber usually holds.
+
+A refused request gets `Retry-After` with the real remaining time of the limit that refused it, in whole seconds and never less than 1, so a client that honours the header can retry once instead of looping on `429`s. The per-visitor limit and the whole-app ceiling of a request are checked together and only spent when both admit it, so a refusal caused by the app ceiling does not also use up the visitor's own budget.
+
+Each zone remembers up to 65,536 visitors. Under a flood of that many distinct addresses, a visitor still inside their window keeps the budget they have spent, and new addresses are let through uncounted until the flood's windows pass, instead of being let in at the expense of someone else's limit.
 
 The whole-app ceiling stops traffic from many addresses at once from taking the server's CPU away from every other app. It is off by default because a real traffic spike looks the same. Set a platform-wide ceiling with `NOITE_EDGE_APP_RPM`, or set one app's limits in its **Settings → Rate Limits** (app admins only). There, an empty field uses the platform default and `0` means no limit.
 

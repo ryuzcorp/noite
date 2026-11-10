@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -188,30 +189,342 @@ func TestClientKey(t *testing.T) {
 	}
 }
 
-// TestRateLimit pins the sliding window, the shared key and the Retry-After.
-func TestRateLimit(t *testing.T) {
-	now := time.Now()
-	clock := &atomic.Int64{}
-	clock.Store(now.UnixNano())
+// stampCount is how many stamps a key holds, for tests that check what a
+// refusal recorded (or an eviction kept).
+func stampCount(l *Limiter, zone, key string) int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	z := l.zones[zone]
+	if z == nil || z.keys[key] == nil {
+		return 0
+	}
+	return len(z.keys[key].stamps)
+}
+
+// zoneKeys is how many keys a zone holds, for the eviction tests.
+func zoneKeys(l *Limiter, zone string) int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if z := l.zones[zone]; z != nil {
+		return len(z.keys)
+	}
+	return 0
+}
+
+// TestRateLimitMatchesConfiguredRate drives a clock at 10 ms steps through a
+// minute and checks each configured rate admits at most that many requests:
+// a per-minute limit is a ceiling, and the old ceil(rpm/6) budget admitted
+// six a minute for rpm 1 and 12 for rpm 7.
+func TestRateLimitMatchesConfiguredRate(t *testing.T) {
+	for _, rpm := range []uint32{1, 2, 5, 6, 7, 12, 60, 100, 120, 1800} {
+		var clock atomic.Int64
+		l := NewLimiter(func() time.Time { return time.Unix(0, clock.Load()) })
+		admitted := 0
+		for step := time.Duration(0); step < time.Minute; step += 10 * time.Millisecond {
+			clock.Store(int64(step))
+			if ok, _ := l.Allow("z", rpm, "k"); ok {
+				admitted++
+			}
+		}
+		if admitted > int(rpm) {
+			t.Errorf("rpm %d admitted %d requests in a minute, over the configured rate", rpm, admitted)
+		}
+		// The budget is a whole number of events, so it may round down by up
+		// to one event per window (5 a minute); never more.
+		if admitted < int(rpm)-5 {
+			t.Errorf("rpm %d admitted only %d requests in a minute", rpm, admitted)
+		}
+	}
+}
+
+// TestRetryAfterIsTheRemainingWindow pins Retry-After to the real time until
+// the budget frees, rounded up to whole seconds and never below one.
+func TestRetryAfterIsTheRemainingWindow(t *testing.T) {
+	var clock atomic.Int64
 	l := NewLimiter(func() time.Time { return time.Unix(0, clock.Load()) })
-	// rpm 60 -> budget 10 per window.
+	// rpm 60: ten events per 10 s window, all at t=0.
 	for range 10 {
 		if ok, _ := l.Allow("z", 60, "k"); !ok {
 			t.Fatalf("denied inside budget")
 		}
 	}
-	ok, retry := l.Allow("z", 60, "k")
-	if ok || retry < time.Second {
-		t.Fatalf("over budget allowed or no Retry-After: ok=%v retry=%v", ok, retry)
+	cases := []struct {
+		at   time.Duration
+		wait time.Duration
+	}{
+		{0, 10 * time.Second},                      // the whole window
+		{4400 * time.Millisecond, 6 * time.Second}, // 5.6 s left, rounded up
+		{9900 * time.Millisecond, 1 * time.Second}, // 100 ms left, floor of 1
 	}
-	// A different key has its own budget; the shared "all" key is global.
-	if ok, _ := l.Allow("z", 60, "other"); !ok {
-		t.Fatalf("fresh key denied")
+	for _, tc := range cases {
+		clock.Store(int64(tc.at))
+		ok, wait := l.Allow("z", 60, "k")
+		if ok {
+			t.Fatalf("at %v: allowed over budget", tc.at)
+		}
+		if wait != tc.wait {
+			t.Errorf("at %v: Retry-After %v, want %v", tc.at, wait, tc.wait)
+		}
 	}
-	// Window slides: past the oldest stamp, budget frees up.
-	clock.Store(now.Add(RateWindow + time.Second).UnixNano())
+	// Retrying exactly at the reported time is admitted, so a client that
+	// honours the header does not loop on 429s.
+	clock.Store(int64(10 * time.Second))
 	if ok, _ := l.Allow("z", 60, "k"); !ok {
-		t.Fatalf("denied after window slide")
+		t.Fatalf("denied after the reported wait")
+	}
+}
+
+// TestRetryAfterCountsEveryStampALoweredRateMustExpire pins the other half
+// of Retry-After: when the configured rate drops, more than the oldest stamp
+// has to leave the window, so the wait is the time until that one expires.
+func TestRetryAfterCountsEveryStampALoweredRateMustExpire(t *testing.T) {
+	var clock atomic.Int64
+	l := NewLimiter(func() time.Time { return time.Unix(0, clock.Load()) })
+	// Ten stamps, one a second, at the 60/min budget.
+	for i := range 10 {
+		clock.Store(int64(time.Duration(i) * time.Second))
+		if ok, _ := l.Allow("z", 60, "k"); !ok {
+			t.Fatalf("denied inside budget")
+		}
+	}
+	clock.Store(int64(9500 * time.Millisecond))
+	ok, wait := l.Allow("z", 12, "k") // budget 2: nine stamps must expire
+	if ok {
+		t.Fatalf("allowed over the lowered budget")
+	}
+	if wait != 9*time.Second {
+		t.Errorf("Retry-After %v, want 9 s until the ninth stamp leaves", wait)
+	}
+}
+
+// TestAllowRequestSkipsAbsentZones pins the zero value: an absent zone
+// records nothing, so a route with only one limit cannot create a phantom
+// zone or a stamp.
+func TestAllowRequestSkipsAbsentZones(t *testing.T) {
+	var clock atomic.Int64
+	l := NewLimiter(func() time.Time { return time.Unix(0, clock.Load()) })
+	if d := l.AllowRequest(RateLimit{}, RateLimit{Zone: "app", RPM: 60, Key: "all"}); !d.Allowed {
+		t.Fatalf("app-only request refused: %v", d.RetryAfter)
+	}
+	if got := l.Zones(); len(got) != 1 || got[0] != "app" {
+		t.Fatalf("zones = %v, want only the app zone", got)
+	}
+	if got := stampCount(l, "app", "all"); got != 1 {
+		t.Fatalf("app zone kept %d stamps, want 1", got)
+	}
+}
+
+// TestAllowRequestSpendsNoBudgetOnRefusal checks the two-zone decision: when the
+// app zone refuses, the client zone must not keep its stamp, and Retry-After
+// reports the app zone's remaining window.
+func TestAllowRequestSpendsNoBudgetOnRefusal(t *testing.T) {
+	var clock atomic.Int64
+	l := NewLimiter(func() time.Time { return time.Unix(0, clock.Load()) })
+	client := RateLimit{Zone: "client", RPM: 60, Key: "10.0.0.1"} // 10 per 10 s
+	app := RateLimit{Zone: "app", RPM: 6, Key: "all"}             // 1 per 10 s
+	if d := l.AllowRequest(client, app); !d.Allowed {
+		t.Fatalf("first request refused: %v", d.RetryAfter)
+	}
+	d := l.AllowRequest(client, app)
+	if d.Allowed {
+		t.Fatalf("second request admitted past the app budget")
+	}
+	if got := stampCount(l, "client", "10.0.0.1"); got != 1 {
+		t.Errorf("client zone kept %d stamps for a refused request, want 1", got)
+	}
+	if d.RetryAfter != 10*time.Second {
+		t.Errorf("Retry-After %v, want the app zone's 10 s", d.RetryAfter)
+	}
+	clock.Store(int64(10 * time.Second))
+	if d := l.AllowRequest(client, app); !d.Allowed {
+		t.Fatalf("refused after the window: %v", d.RetryAfter)
+	}
+	// The t=0 stamps left the window with it; each zone holds just the new one.
+	if got := stampCount(l, "client", "10.0.0.1"); got != 1 {
+		t.Errorf("client zone kept %d stamps after the window, want 1", got)
+	}
+	if got := stampCount(l, "app", "all"); got != 1 {
+		t.Errorf("app zone kept %d stamps after the window, want 1", got)
+	}
+}
+
+// TestFullZoneKeepsThrottledKey floods a zone to its key cap and checks that
+// nothing evicts the throttled key: cycling keys must not clear a throttle.
+// With every key still inside its window, the request that would add one is
+// admitted uncounted instead of resetting a budget.
+func TestFullZoneKeepsThrottledKey(t *testing.T) {
+	var clock atomic.Int64
+	l := NewLimiter(func() time.Time { return time.Unix(0, clock.Load()) })
+	// rpm 60: ten stamps fill the window, so this key is throttled.
+	for range 10 {
+		if ok, _ := l.Allow("z", 60, "throttled"); !ok {
+			t.Fatalf("denied inside budget")
+		}
+	}
+	if ok, _ := l.Allow("z", 60, "throttled"); ok {
+		t.Fatalf("throttled key admitted")
+	}
+	// One request from every other key, a second later: the throttled key is
+	// now the least recently seen, which plain LRU eviction would pick.
+	clock.Store(int64(time.Second))
+	for i := range maxKeys - 1 {
+		if ok, _ := l.Allow("z", 60, "flood"+strconv.Itoa(i)); !ok {
+			t.Fatalf("flood key %d refused", i)
+		}
+	}
+	if got := zoneKeys(l, "z"); got != maxKeys {
+		t.Fatalf("zone holds %d keys, want the %d cap", got, maxKeys)
+	}
+	// A new key has no room: it is admitted, but not counted.
+	if d := l.AllowRequest(RateLimit{Zone: "z", RPM: 60, Key: "later"}, RateLimit{}); !d.Allowed || d.RetryAfter != 0 {
+		t.Fatalf("new key at cap: allowed=%v retry=%v", d.Allowed, d.RetryAfter)
+	}
+	if got := stampCount(l, "z", "later"); got != 0 {
+		t.Fatalf("unrecorded key kept %d stamps", got)
+	}
+	if got := zoneKeys(l, "z"); got != maxKeys {
+		t.Fatalf("zone holds %d keys after an unrecorded request, want %d", got, maxKeys)
+	}
+	// The throttled key kept its stamps, so the flood did not clear it.
+	if ok, retry := l.Allow("z", 60, "throttled"); ok || retry <= 0 {
+		t.Fatalf("key flood cleared the throttle: allowed=%v retry=%v", ok, retry)
+	}
+}
+
+// TestMakeRoomRefusesWhileEveryKeyIsLive pins the eviction choice: a key with
+// any live stamp holds a budget in force, even below its cap, so nothing is
+// evicted and the zone reports no room.
+func TestMakeRoomRefusesWhileEveryKeyIsLive(t *testing.T) {
+	var clock atomic.Int64
+	l := NewLimiter(func() time.Time { return time.Unix(0, clock.Load()) })
+	if ok, _ := l.Allow("z", 60, "partial"); !ok {
+		t.Fatalf("denied inside budget")
+	}
+	for range 10 {
+		if ok, _ := l.Allow("z", 60, "throttled"); !ok {
+			t.Fatalf("denied inside budget")
+		}
+	}
+	l.mu.Lock()
+	room := l.makeRoomLocked(l.zones["z"], l.nanos(), RateWindow)
+	l.mu.Unlock()
+	if room {
+		t.Fatalf("evicted a key with a live budget")
+	}
+	if got := zoneKeys(l, "z"); got != 2 {
+		t.Fatalf("zone holds %d keys, want 2", got)
+	}
+}
+
+// TestMakeRoomKeepsAKeyThrottledUnderTheCurrentRate covers a rate lowered
+// after the key last ran: its stored window is short, but the current one
+// still charges its stamps, so eviction must not drop it.
+func TestMakeRoomKeepsAKeyThrottledUnderTheCurrentRate(t *testing.T) {
+	var clock atomic.Int64
+	l := NewLimiter(func() time.Time { return time.Unix(0, clock.Load()) })
+	for range 10 {
+		if ok, _ := l.Allow("z", 60, "k"); !ok {
+			t.Fatalf("denied inside budget")
+		}
+	}
+	clock.Store(int64(15 * time.Second))
+	l.mu.Lock()
+	room := l.makeRoomLocked(l.zones["z"], l.nanos(), time.Minute)
+	l.mu.Unlock()
+	if room {
+		t.Fatalf("evicted a key the current rate still throttles")
+	}
+	if ok, retry := l.Allow("z", 1, "k"); ok || retry <= 0 {
+		t.Fatalf("lowered rate not enforced: allowed=%v retry=%v", ok, retry)
+	}
+}
+
+// TestConcurrentStampsStayAscending keeps the invariant the window searches
+// rely on under contention: a stamp log is appended under the same lock the
+// clock is read in, so it stays ordered.
+func TestConcurrentStampsStayAscending(t *testing.T) {
+	l := NewLimiter(time.Now)
+	var wg sync.WaitGroup
+	for range 8 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for range 200 {
+				if ok, _ := l.Allow("z", 1<<30, "k"); !ok {
+					t.Errorf("denied inside a huge budget")
+					return
+				}
+			}
+		}()
+	}
+	wg.Wait()
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	stamps := l.zones["z"].keys["k"].stamps
+	if len(stamps) != 1600 {
+		t.Fatalf("key holds %d stamps, want 1600", len(stamps))
+	}
+	for i := 1; i < len(stamps); i++ {
+		if stamps[i] < stamps[i-1] {
+			t.Fatalf("stamp %d at index %d is before its predecessor", stamps[i], i)
+		}
+	}
+}
+
+// TestFullZoneAdmitsUnrecordedUntilAWindowPasses covers the capacity path: a
+// zone whose every key is inside its window admits new keys uncounted rather
+// than evicting a live budget, and records them again once the flood's
+// windows pass.
+func TestFullZoneAdmitsUnrecordedUntilAWindowPasses(t *testing.T) {
+	var clock atomic.Int64
+	l := NewLimiter(func() time.Time { return time.Unix(0, clock.Load()) })
+	// rpm 6: one stamp fills the window, so every key below is throttled.
+	for i := range maxKeys {
+		if ok, _ := l.Allow("z", 6, "flood"+strconv.Itoa(i)); !ok {
+			t.Fatalf("flood key %d refused", i)
+		}
+	}
+	if d := l.AllowRequest(RateLimit{Zone: "z", RPM: 6, Key: "new"}, RateLimit{}); !d.Allowed {
+		t.Fatalf("new key refused by a full zone: %v", d.RetryAfter)
+	}
+	if got := stampCount(l, "z", "new"); got != 0 {
+		t.Fatalf("unrecorded key kept %d stamps", got)
+	}
+	// The flood stops; one window later its keys are outside their window and
+	// eviction makes room again.
+	clock.Store(int64(RateWindow))
+	if ok, _ := l.Allow("z", 6, "new"); !ok {
+		t.Fatalf("zone did not recover after the flood's window")
+	}
+	if got := stampCount(l, "z", "new"); got != 1 {
+		t.Fatalf("recovered key kept %d stamps, want 1", got)
+	}
+	if got := zoneKeys(l, "z"); got >= maxKeys {
+		t.Fatalf("eviction freed no room: zone holds %d keys", got)
+	}
+}
+
+// TestSweepKeepsLiveThrottle checks Sweep never drops a key still inside its
+// window, whatever idle threshold the table push passes.
+func TestSweepKeepsLiveThrottle(t *testing.T) {
+	var clock atomic.Int64
+	l := NewLimiter(func() time.Time { return time.Unix(0, clock.Load()) })
+	for range 10 {
+		if ok, _ := l.Allow("z", 60, "k"); !ok {
+			t.Fatalf("denied inside budget")
+		}
+	}
+	keep := map[string]bool{"z": true}
+	clock.Store(int64(5 * time.Second))
+	l.Sweep(keep, time.Second)
+	if got := stampCount(l, "z", "k"); got != 10 {
+		t.Fatalf("sweep dropped a live key: %d stamps left, want 10", got)
+	}
+	// Once the widest window has passed, the same key is idle and may go.
+	clock.Store(int64(time.Minute + time.Second))
+	l.Sweep(keep, time.Second)
+	if got := stampCount(l, "z", "k"); got != 0 {
+		t.Fatalf("sweep kept an idle key: %d stamps left", got)
 	}
 }
 
