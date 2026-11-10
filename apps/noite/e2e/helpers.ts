@@ -1,4 +1,5 @@
 import { execFileSync } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { cpSync, existsSync, mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import nodePath from "node:path";
@@ -479,7 +480,10 @@ export const createAppWithKey = async (
  * git CLI. Copies to a temp dir so the checkout's nested sample repo stays
  * clean; the sample's own .gitignore keeps node_modules and build output out.
  * `mutate` edits the copy before the commit, so a spec can push a second
- * revision of the same app. */
+ * revision of the same app. Every call answers a new SHA: the commit message
+ * carries a nonce, because an orphan commit of the same tree, author and
+ * second would otherwise hash identically and name the previous push's
+ * deploy row (stop.spec's third push found its stopped second one). */
 export const pushAppDir = (
   apiKey: string,
   source: URL,
@@ -508,7 +512,7 @@ export const pushAppDir = (
       `http://git:${apiKey}@${gitBase.replace(/^https?:\/\//u, "")}/${slug}`,
     ]);
     git(["add", "-A"]);
-    git(["commit", "-m", `${slug} deploy`], {
+    git(["commit", "-m", `${slug} deploy ${randomUUID()}`], {
       GIT_AUTHOR_EMAIL: E2E_EMAIL,
       GIT_AUTHOR_NAME: E2E_NAME,
       GIT_COMMITTER_EMAIL: E2E_EMAIL,
