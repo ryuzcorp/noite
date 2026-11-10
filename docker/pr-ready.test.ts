@@ -1,5 +1,7 @@
 import { describe, expect, test } from "bun:test";
-import { readFileSync } from "node:fs";
+import { readFileSync, readdirSync, statSync } from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 
 import { detectAreas, matchSensitive, parseSensitiveGlobs } from "./pr-ready";
 
@@ -88,20 +90,28 @@ describe("matchSensitive", () => {
     expect(matchSensitive(["apps/runner/src/host/exec.rs"], [])).toEqual([]);
   });
 
-  test("the shipped list marks the edge module and its runner table sensitive", () => {
+  test("the shipped list covers every file in the edge module", () => {
     const yaml = readFileSync(
       new URL("../.github/security-paths.yml", import.meta.url),
       "utf-8"
     );
 
     const globs = parseSensitiveGlobs(yaml);
+    const edgeRoot = fileURLToPath(new URL("../edge/", import.meta.url));
 
-    const files = [
-      "edge/table.go",
-      "edge/limit.go",
-      "apps/runner/src/host/edge_table.rs",
-    ];
+    // Enumerate the real module: a renamed or split-out file must fail here,
+    // not silently drop out of the gate.
+    const files = readdirSync(edgeRoot, { recursive: true })
+      .map((name) => `edge/${name.toString().replaceAll(path.sep, "/")}`)
+      .filter((file) => statSync(path.join(edgeRoot, "..", file)).isFile());
 
+    expect(files.length).toBeGreaterThan(0);
     expect(matchSensitive(files, globs)).toEqual(files);
+    expect(
+      matchSensitive(["apps/runner/src/host/edge_table.rs"], globs)
+    ).toEqual(["apps/runner/src/host/edge_table.rs"]);
+    expect(matchSensitive(["apps/runner/src/host/caddy.rs"], globs)).toEqual([
+      "apps/runner/src/host/caddy.rs",
+    ]);
   });
 });
