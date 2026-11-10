@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 
+import { readPodBound, readPodReady } from "./pod-client";
 import { Frame, frameFailureMessage, frameTransition } from "./pod-frame";
 import type { FrameState } from "./pod-frame";
 import type { PodReady } from "./pod-protocol";
@@ -86,5 +87,27 @@ describe("frameTransition", () => {
     );
 
     expect(messages.size).toBe(3);
+  });
+});
+
+describe("the handshake messages", () => {
+  const bound = { nonce: "n", t: "bound" as const, v: 1 };
+
+  test("a bound ack is not a ready", () => {
+    // The bug e2e caught: the ready parser accepted any object with a nonce,
+    // a string `t` and a numeric `v`, so the ack was read as a second `ready`
+    // and the page never learned its port had landed.
+    expect(readPodReady(bound)).toBeNull();
+    expect(readPodBound(bound)).toEqual(bound);
+  });
+
+  test("a ready is not a bound ack", () => {
+    expect(readPodBound(READY)).toBeNull();
+    expect(readPodReady(READY)).toEqual(READY);
+  });
+
+  test("neither parser takes a message missing its fields", () => {
+    expect(readPodReady({ t: "ready" })).toBeNull();
+    expect(readPodBound({ t: "bound" })).toBeNull();
   });
 });

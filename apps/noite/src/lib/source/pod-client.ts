@@ -214,8 +214,10 @@ type PortMessage =
   | { ev: string; kind: "event"; payload: EventPayload; text: string };
 
 /* oxlint-disable anti-slop/no-unknown-parameters, anti-slop/no-runtime-typeof -- the port is this page's I/O boundary: a message is read field by field here, and nothing off it is used before it has been checked. */
-/** The frame's `ready`, or null for anything that is not one. */
-const podReady = (value: unknown): PodReady | null => {
+/** The frame's `ready`, or null for anything that is not one. The `t` is part
+ * of the check: a `bound` ack carries the same nonce and revision, and reading
+ * it as a `ready` would swallow the one message that proves the port landed. */
+export const readPodReady = (value: unknown): PodReady | null => {
   if (typeof value !== "object" || value === null) {
     return null;
   }
@@ -225,11 +227,7 @@ const podReady = (value: unknown): PodReady | null => {
   const t = fields.get("t");
   const v = fields.get("v");
 
-  if (
-    typeof nonce !== "string" ||
-    typeof t !== "string" ||
-    typeof v !== "number"
-  ) {
+  if (t !== "ready" || typeof nonce !== "string" || typeof v !== "number") {
     return null;
   }
 
@@ -243,7 +241,7 @@ const podReady = (value: unknown): PodReady | null => {
 };
 
 /** The frame's `bound` ack, or null for anything that is not one. */
-const podBound = (value: unknown): PodBound | null => {
+export const readPodBound = (value: unknown): PodBound | null => {
   if (typeof value !== "object" || value === null) {
     return null;
   }
@@ -670,7 +668,7 @@ export const openPodFrame = async (
       return;
     }
 
-    const ready = podReady(event.data);
+    const ready = readPodReady(event.data);
 
     if (
       ready !== null &&
@@ -685,7 +683,7 @@ export const openPodFrame = async (
       return;
     }
 
-    const ack = podBound(event.data);
+    const ack = readPodBound(event.data);
 
     if (ack !== null && ack.v === POD_PROTOCOL_VERSION && ack.nonce === nonce) {
       settle(frameTransition(state, { t: "bound" }));
