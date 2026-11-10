@@ -172,8 +172,16 @@ const HeaderApp = defineApp({
               <IdentityLine app={app} view={view} />
             </div>
           </div>
+          {/* Keyed, not positional: the row gains a Stop/Start or Retry
+              import control when the app's status lands (a stale snapshot
+              paints "Not deployed" first), and without keys the morph would
+              pair the new button with the Deploy dropdown's div and replace
+              it — closing an open menu and dropping the dropdown's own state.
+              Keys make the morph move the dropdown node instead (ilha's keyed
+              reconciliation), so focus and state survive the re-render. */}
           <div class="flex shrink-0 flex-wrap items-center gap-2">
             <a
+              key="visit"
               href={appUrl(app.subdomain)}
               target="_blank"
               rel="noopener noreferrer"
@@ -186,6 +194,7 @@ const HeaderApp = defineApp({
             </a>
             {caps.push && view.action ? (
               <button
+                key="power"
                 type="button"
                 class="btn btn-sm"
                 disabled={pending}
@@ -205,6 +214,7 @@ const HeaderApp = defineApp({
             ) : null}
             {caps.push && view.retryable ? (
               <button
+                key="retry-import"
                 type="button"
                 class="btn btn-sm"
                 disabled={pending}
@@ -218,7 +228,7 @@ const HeaderApp = defineApp({
                 </span>
               </button>
             ) : null}
-            <DeployDropdown appId={model.appId} />
+            <DeployDropdown key="deploy" appId={model.appId} />
           </div>
         </div>
         {pending ? (
