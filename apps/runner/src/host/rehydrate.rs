@@ -12,12 +12,59 @@ use crate::db;
 use crate::host::{exec, s3, source, tips};
 use sqlx::SqlitePool;
 
+/// Where a deploy mirror is in its lifecycle. `git init --bare` and the tip
+/// fetch are two steps, so a crash between them used to leave a bare repo with
+/// `HEAD` but no objects: the old `HEAD exists` check then reported it
+/// `present` forever and every read of it failed with "unknown revision"
+/// instead of retrying the hydrate.
+///
+/// ```text
+/// stateDiagram-v2
+///     Absent --> Incomplete: git init --bare
+///     Incomplete --> Ready: fetch tip, write marker
+///     Absent --> Ready: deploy wrote the mirror (main ref present)
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MirrorState {
+    /// Nothing on disk.
+    Absent,
+    /// A bare repo exists but never received a `main` ref: the debris of an
+    /// interrupted hydrate, healed by fetching the tip again.
+    Incomplete,
+    /// A usable mirror: it holds the tip's `main` ref.
+    Ready,
+}
+
+/// Marker written after a successful hydrate. Its presence is not required
+/// (the deploy path creates mirrors too), but it makes a completed hydrate
+/// unambiguous and survives a `packed-refs` rewrite.
+const MARKER: &str = "noite-hydrated";
+
+/// Classify one deploy mirror without touching the network.
+pub fn mirror_state(cfg: &Config, slug: &str) -> MirrorState {
+    let bare = source::bare_repo(cfg, slug);
+    if !bare.join("HEAD").exists() {
+        return MirrorState::Absent;
+    }
+    if bare.join(MARKER).exists() {
+        return MirrorState::Ready;
+    }
+    // `git fetch` may write the ref packed instead of loose.
+    if bare.join("refs/heads/main").exists()
+        || std::fs::read_to_string(bare.join("packed-refs"))
+            .is_ok_and(|packed| packed.lines().any(|l| l.ends_with(" refs/heads/main")))
+    {
+        return MirrorState::Ready;
+    }
+    MirrorState::Incomplete
+}
+
 /// Ensure `repos/{slug}.git` exists with at least the tip commit.
 /// Returns true when it fetched something. Missing tip (never pushed) is
 /// success with `false` — callers treat that as "not deployed yet".
 pub async fn ensure_deploy_mirror(cfg: &Config, slug: &str) -> anyhow::Result<bool> {
     let bare = source::bare_repo(cfg, slug);
-    if bare.join("HEAD").exists() {
+    if mirror_state(cfg, slug) == MirrorState::Ready {
         return Ok(false);
     }
     let Some(tip) = tips::head_main_bundle(cfg, slug).await? else {
@@ -26,7 +73,7 @@ pub async fn ensure_deploy_mirror(cfg: &Config, slug: &str) -> anyhow::Result<bo
     let root = exec::work_root(cfg);
     tokio::fs::create_dir_all(&bare).await.ok();
     tokio::fs::create_dir_all(&root).await.ok();
-    if !bare.join("HEAD").exists() {
+    if mirror_state(cfg, slug) == MirrorState::Absent {
         // Work-dir-derived paths are operator-influenced (a non-UTF-8 mount):
         // fail the rehydrate instead of panicking the task.
         let Some(bare_arg) = bare.to_str() else {
@@ -69,6 +116,9 @@ pub async fn ensure_deploy_mirror(cfg: &Config, slug: &str) -> anyhow::Result<bo
     .await;
     let _ = tokio::fs::remove_file(&tmp).await;
     fetched?;
+    // Only now is the mirror complete: the marker is what stops a half-fetched
+    // repo from ever looking present again.
+    let _ = tokio::fs::write(bare.join(MARKER), &tip.sha).await;
     tracing::info!(slug, sha = %&tip.sha[..12.min(tip.sha.len())], "rehydrated deploy mirror from S3 tip");
     Ok(true)
 }
@@ -87,5 +137,53 @@ pub async fn rehydrate_all(pool: &SqlitePool, cfg: &Config) {
         if let Err(e) = ensure_deploy_mirror(cfg, &app.slug).await {
             tracing::warn!(slug = %app.slug, error = %e, "rehydrate deploy mirror failed");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A bare repo with `HEAD` but no `main` ref is the debris of a crash
+    /// between `git init --bare` and the fetch: it must read `Incomplete` so
+    /// the reader retries instead of failing every revision lookup forever.
+    #[test]
+    fn a_half_hydrated_mirror_is_not_ready() {
+        let dir = std::env::temp_dir().join(format!("noite-mirror-{}", crate::models::new_id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let mut cfg = crate::config::config_for_tests();
+        cfg.work_dir = dir.to_string_lossy().into_owned();
+        assert_eq!(mirror_state(&cfg, "shop"), MirrorState::Absent);
+
+        let bare = source::bare_repo(&cfg, "shop");
+        std::fs::create_dir_all(&bare).expect("bare dir");
+        std::fs::write(bare.join("HEAD"), "ref: refs/heads/main\n").expect("head");
+        assert_eq!(
+            mirror_state(&cfg, "shop"),
+            MirrorState::Incomplete,
+            "HEAD alone is an interrupted hydrate"
+        );
+
+        std::fs::create_dir_all(bare.join("refs/heads")).expect("refs");
+        std::fs::write(bare.join("refs/heads/main"), "0".repeat(40)).expect("ref");
+        assert_eq!(mirror_state(&cfg, "shop"), MirrorState::Ready);
+
+        // A packed ref counts too (fetch may pack it).
+        std::fs::remove_file(bare.join("refs/heads/main")).expect("unpack");
+        std::fs::write(
+            bare.join("packed-refs"),
+            format!(
+                "# pack-refs with: peeled\n{} refs/heads/main\n",
+                "0".repeat(40)
+            ),
+        )
+        .expect("packed");
+        assert_eq!(mirror_state(&cfg, "shop"), MirrorState::Ready);
+
+        // The marker is enough on its own.
+        std::fs::remove_file(bare.join("packed-refs")).expect("unpack");
+        std::fs::write(bare.join(MARKER), "abc").expect("marker");
+        assert_eq!(mirror_state(&cfg, "shop"), MirrorState::Ready);
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

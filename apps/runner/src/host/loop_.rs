@@ -60,10 +60,6 @@ pub async fn run_forever(
     // the first tick, then every ten minutes — a full listing on every
     // tick would hammer the store's IAM.
     let mut last_orphan_sweep: Option<Instant> = None;
-    // Fleets with a running-status confirm in flight (host/sleep.rs): one
-    // confirm per transitioning fleet, never blocking the tick.
-    let confirming: crate::host::sleep::Confirming =
-        Arc::new(tokio::sync::Mutex::new(HashSet::new()));
     loop {
         tick.tick().await;
         if shutdown.load(Ordering::Relaxed) {
@@ -152,7 +148,6 @@ pub async fn run_forever(
             &mut tip_rx,
             &mut last_sweep,
             &log_tx,
-            &confirming,
         )
         .await
         {
@@ -175,7 +170,6 @@ async fn reconcile_once(
     tip_rx: &mut TipReceiver,
     last_sweep: &mut Option<Instant>,
     log_tx: &tokio::sync::watch::Sender<u64>,
-    confirming: &crate::host::sleep::Confirming,
 ) -> anyhow::Result<()> {
     let claimed = deploy::snapshot_claimed(deploying).await;
     let swept = db::fail_stuck_deploys(pool, DEPLOY_STUCK_MS, &claimed).await?;
@@ -258,16 +252,11 @@ async fn reconcile_once(
                     // stop-time status stuck until the next deploy flips it.
                     if app.status != AppStatus::Running {
                         if let Some(port) = app.listen_port {
-                            let (pool, cfg, confirming) =
-                                (pool.clone(), cfg.clone(), confirming.clone());
-                            let id = app.id.clone();
+                            let (pool, cfg, procs) = (pool.clone(), cfg.clone(), procs.clone());
+                            let (id, fleet) = (app.id.clone(), app.slug.clone());
                             tokio::spawn(async move {
                                 crate::host::sleep::confirm_app_running(
-                                    &pool,
-                                    &cfg,
-                                    &confirming,
-                                    &id,
-                                    port,
+                                    &pool, &cfg, &procs, &id, &fleet, port,
                                 )
                                 .await;
                             });
@@ -348,16 +337,11 @@ async fn reconcile_once(
                     // Same truthful order as the app branch above.
                     if env.status != AppStatus::Running {
                         if let Some(port) = env.listen_port {
-                            let (pool, cfg, confirming) =
-                                (pool.clone(), cfg.clone(), confirming.clone());
-                            let id = env.id.clone();
+                            let (pool, cfg, procs) = (pool.clone(), cfg.clone(), procs.clone());
+                            let (id, ring) = (env.id.clone(), fleet.clone());
                             tokio::spawn(async move {
                                 crate::host::sleep::confirm_environment_running(
-                                    &pool,
-                                    &cfg,
-                                    &confirming,
-                                    &id,
-                                    port,
+                                    &pool, &cfg, &procs, &id, &ring, port,
                                 )
                                 .await;
                             });

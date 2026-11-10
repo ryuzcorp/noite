@@ -423,7 +423,7 @@ async fn main() -> anyhow::Result<()> {
         config.build_concurrency,
     );
     let isolation = host::isolation::self_check(&config, nft_installed).await;
-    if isolation.blocked {
+    if isolation.blocked() {
         tracing::error!(detail = %isolation.detail, "multi-tenant isolation checks failed; /ready stays 503");
     }
 

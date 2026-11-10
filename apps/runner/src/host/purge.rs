@@ -181,7 +181,7 @@ mod tests {
         let pid = child.id().expect("pid");
         procs.lock().await.insert(
             crate::host::supervisor::env_fleet_key("purge", "feature"),
-            child,
+            crate::host::supervisor::FleetEntry::test_entry(child),
         );
 
         // The production contract: callers hold the slug's push guard across

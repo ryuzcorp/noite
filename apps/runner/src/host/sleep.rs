@@ -7,7 +7,28 @@
 //! Every transition (sleep, wake) for one app runs under that app's lock, so
 //! a request arriving while the sweep parks the app waits for the park to
 //! finish and then wakes it, instead of racing the fleet shutdown.
-use std::collections::{HashMap, HashSet};
+//!
+//! ## The scale-to-zero machine
+//!
+//! The persisted half of "is it up?" is one row plus one route flag; the
+//! in-memory half is [`supervisor::FleetState`]. Both are written here in one
+//! order, and only here:
+//!
+//! ```text
+//! stateDiagram-v2
+//!     Awake --> Parking: sweep / operator sleep / pressure
+//!     Parking --> Asleep: routes wake-enabled, fleet stopped
+//!     Asleep --> Waking: held request (lock, slot, spawn)
+//!     Waking --> Awake: health gate 200 -> running, wake hop dropped
+//!     Waking --> Asleep: any failure (row and route untouched)
+//!     Awake --> Awake: request / deploy (activity)
+//! ```
+//!
+//! `status = 'sleeping'` and `asleep_since` are written together (both db
+//! helpers do), the flag is cleared only after the fleet answers, and the
+//! route's `asleep` flag is derived from the row by `edge_table::build_table`.
+//! A wake that fails therefore changes nothing at all.
+use std::collections::HashMap;
 use std::sync::{Arc, LazyLock, OnceLock};
 use std::time::Duration;
 
@@ -21,12 +42,6 @@ use crate::host::edge_table;
 use crate::host::logs::LogState;
 use crate::host::supervisor::{self, ProcMap};
 use crate::models::{parse_time, App, AppStatus, Environment};
-
-/// Fleets with a running-status confirm in flight (`app:{id}` / `env:{id}`):
-/// the reconcile loop spawns one confirm per transitioning fleet instead of
-/// blocking behind a health gate, and the set keeps one tick from piling a
-/// second confirm onto the first.
-pub type Confirming = Arc<Mutex<HashSet<String>>>;
 
 /// Per-app transition locks (keyed by app id, which survives renames).
 static LOCKS: LazyLock<std::sync::Mutex<HashMap<String, Arc<Mutex<()>>>>> =
@@ -291,7 +306,19 @@ pub async fn sleep_app(
         return Ok(false);
     }
     edge_table::push_routes(pool, cfg).await?;
-    supervisor::stop_fleet(procs, &app.slug, supervisor::StopGrace::NORMAL).await;
+    // The fleet map keeps the park (so a confirm in the window sees a parked
+    // fleet rather than a missing one) and hands back the child, which is
+    // stopped here: a parked fleet holding a live child is unrepresentable.
+    if let Some((child, epoch)) = supervisor::park(procs, &app.slug).await {
+        supervisor::stop_child(
+            procs,
+            &app.slug,
+            child,
+            supervisor::StopGrace::NORMAL,
+            epoch,
+        )
+        .await;
+    }
     crate::host::stats::record_sleep();
     tracing::info!(slug = %app.slug, force, after_s = after_s.unwrap_or(0), "app asleep");
     Ok(true)
@@ -459,25 +486,47 @@ pub(crate) async fn wait_healthy(cfg: &Config, port: i64, timeout: Duration) -> 
 
 /// Mark one app running once its fleet answers the health gate. The
 /// reconcile loop spawns this per transitioning fleet instead of blocking
-/// behind the gate; a stop or delete in the window wins through the
-/// conditional write, and an unhealthy fleet simply never flips (its deploy
-/// row says why).
+/// behind the gate; the fleet's own state decides the outcome, so a stop or a
+/// park in the window wins — a confirm that raced a park can never flip a
+/// parked row back to `running`.
 pub async fn confirm_app_running(
     pool: &SqlitePool,
     cfg: &Config,
-    confirming: &Confirming,
+    procs: &ProcMap,
     app_id: &str,
+    fleet: &str,
     port: i64,
 ) {
-    let key = format!("app:{}", app_id);
-    if !confirming.lock().await.insert(key.clone()) {
+    let budget = Duration::from_secs(cfg.wake_timeout_s.max(1));
+    if !supervisor::probe_started(procs, fleet, budget).await {
         return;
     }
-    let budget = Duration::from_secs(cfg.wake_timeout_s.max(1));
     let healthy = wait_healthy(cfg, port, budget).await;
-    confirming.lock().await.remove(&key);
     if !healthy {
+        // The probe reported "not yet": back to `Spawning` so the next tick
+        // retries, instead of the status sticking at `building` forever.
+        supervisor::probe_gave_up(procs, fleet).await;
         tracing::warn!(app_id, "fleet never passed its health gate; leaving status");
+        return;
+    }
+    if !supervisor::confirmed(procs, fleet).await {
+        tracing::info!(
+            app_id,
+            "health gate passed after the fleet was parked or stopped"
+        );
+        return;
+    }
+    // The park path holds this lock across "flag asleep → push routes → park".
+    // Taking it is what makes a confirm that raced a park lose: either the
+    // park finished (the fleet is gone, so the state re-check refuses the
+    // write) or it has not started (and it re-reads a `running` row, which is
+    // still parkable).
+    let lock = lock_for(app_id);
+    let _held = lock.lock().await;
+    if !matches!(
+        supervisor::state_of(procs, fleet).await,
+        supervisor::FleetState::Healthy { .. }
+    ) {
         return;
     }
     if let Err(e) = db::write_app_status(
@@ -498,19 +547,34 @@ pub async fn confirm_app_running(
 pub async fn confirm_environment_running(
     pool: &SqlitePool,
     cfg: &Config,
-    confirming: &Confirming,
+    procs: &ProcMap,
     env_id: &str,
+    fleet: &str,
     port: i64,
 ) {
-    let key = format!("env:{}", env_id);
-    if !confirming.lock().await.insert(key.clone()) {
+    let budget = Duration::from_secs(cfg.wake_timeout_s.max(1));
+    if !supervisor::probe_started(procs, fleet, budget).await {
         return;
     }
-    let budget = Duration::from_secs(cfg.wake_timeout_s.max(1));
     let healthy = wait_healthy(cfg, port, budget).await;
-    confirming.lock().await.remove(&key);
     if !healthy {
+        supervisor::probe_gave_up(procs, fleet).await;
         tracing::warn!(env_id, "fleet never passed its health gate; leaving status");
+        return;
+    }
+    if !supervisor::confirmed(procs, fleet).await {
+        tracing::info!(
+            env_id,
+            "health gate passed after the fleet was parked or stopped"
+        );
+        return;
+    }
+    let lock = lock_for(env_id);
+    let _held = lock.lock().await;
+    if !matches!(
+        supervisor::state_of(procs, fleet).await,
+        supervisor::FleetState::Healthy { .. }
+    ) {
         return;
     }
     if let Err(e) = db::write_environment_status(
@@ -526,10 +590,19 @@ pub async fn confirm_environment_running(
     }
 }
 
-/// Wake an app for a held request: clear the flag, spawn its fleet, wait for
-/// the health gate, restore the plain proxy route. Concurrent callers queue
-/// on the app's lock; the first does the work, the rest find it awake and
-/// only confirm health. Errors mean the request cannot be served (503).
+/// Wake an app for a held request: spawn its fleet, wait for the health gate,
+/// and only then clear the asleep flag and restore the plain proxy route.
+///
+/// That order is the whole point. The row and the route used to be flipped
+/// awake *before* the spawn, so a wake that failed (no slot, a spawn error, a
+/// health timeout) left an "awake" app with no fleet whose next reconcile tick
+/// pushed a route straight at a dead port — every request hit the retrying 502
+/// page instead of the wake hop. Now a failed wake leaves the app exactly as
+/// parked as it was, and the next request simply tries again.
+///
+/// Concurrent callers queue on the app's lock; the first does the work, the
+/// rest find it awake and only confirm health. Errors mean the request cannot
+/// be served (503).
 pub async fn wake_app(
     pool: &SqlitePool,
     cfg: &Config,
@@ -549,6 +622,19 @@ pub async fn wake_app(
         anyhow::bail!("app has no port");
     };
     let was_asleep = app.is_asleep();
+    // A fleet held after a crash or an OOM kill is not respawned on a
+    // request: the whole point of the hold is that a crash-looping app does
+    // not spawn once per request. The held request answers the wake-failure
+    // status and the next one after the hold retries.
+    if let Some(until) = supervisor::hold_until(procs, &app.slug).await {
+        let now = std::time::Instant::now();
+        if until > now {
+            anyhow::bail!(
+                "fleet is restarting after a crash; retry in {}s",
+                (until - now).as_secs().max(1)
+            );
+        }
+    }
     // One budget for queueing behind other apps' cold starts and for the
     // health gate: Caddy stops waiting at `wake_timeout_s` + 15 s.
     let budget = Duration::from_secs(cfg.wake_timeout_s.max(1));
@@ -556,27 +642,57 @@ pub async fn wake_app(
     let _slot = if was_asleep {
         match tokio::time::timeout(budget, wake_slots(cfg).acquire()).await {
             Ok(Ok(permit)) => Some(permit),
-            Ok(Err(_)) => anyhow::bail!("wake slots closed"),
-            Err(_) => anyhow::bail!(
-                "too many apps starting at once; waited {}s",
-                budget.as_secs()
-            ),
+            Ok(Err(_)) => {
+                supervisor::note_event(procs, &app.slug, supervisor::FleetEvent::Parked).await;
+                anyhow::bail!("wake slots closed");
+            }
+            Err(_) => {
+                supervisor::note_event(procs, &app.slug, supervisor::FleetEvent::Parked).await;
+                anyhow::bail!(
+                    "too many apps starting at once; waited {}s",
+                    budget.as_secs()
+                );
+            }
         }
     } else {
         None
     };
     if was_asleep {
-        db::set_app_awake(pool, &app.id).await?;
-        crate::host::stats::record_wake();
+        // In memory only: the row keeps saying asleep until the gate opens.
+        supervisor::note_event(
+            procs,
+            &app.slug,
+            supervisor::FleetEvent::Woke {
+                at: std::time::Instant::now(),
+            },
+        )
+        .await;
         tracing::info!(slug = %app.slug, "waking app for a request");
     }
     // Spawn (or confirm) the fleet now rather than on the next reconcile
     // tick: the request is waiting.
     let app = db::get_app(pool, app_id).await?.unwrap_or(app);
-    supervisor::ensure_fleet(pool, cfg, procs, logs, &app).await?;
-    let left = deadline.saturating_duration_since(tokio::time::Instant::now());
-    if !wait_healthy(cfg, port, left.max(Duration::from_secs(1))).await {
-        anyhow::bail!("fleet not healthy within {}s", cfg.wake_timeout_s);
+    let woke = async {
+        supervisor::ensure_fleet(pool, cfg, procs, logs, &app).await?;
+        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if !wait_healthy(cfg, port, left.max(Duration::from_secs(1))).await {
+            anyhow::bail!("fleet not healthy within {}s", cfg.wake_timeout_s);
+        }
+        if !supervisor::confirmed(procs, &app.slug).await {
+            anyhow::bail!("fleet stopped while waking");
+        }
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
+    if let Err(e) = woke {
+        // The app stays parked: row and route are untouched, so the next
+        // request takes the wake path again instead of the edge proxying to a
+        // port nothing serves. The same rollback as `wake_environment` — a
+        // cold start that died keeps its crash/OOM hold.
+        if was_asleep {
+            park_after_failed_wake(pool, cfg, procs, &app.slug, &app.id).await;
+        }
+        return Err(e);
     }
     // "Running" means the fleet answered the gate above: the write lands
     // after it, and still loses to a stop in the window.
@@ -592,7 +708,10 @@ pub async fn wake_app(
         .await?;
     }
     if was_asleep {
-        // Back to the plain proxy route: later requests skip the wake hop.
+        // The app serves now: clear the flag, then let the route table drop
+        // the wake hop.
+        db::set_app_awake(pool, &app.id).await?;
+        crate::host::stats::record_wake();
         edge_table::push_routes(pool, cfg).await?;
     }
     Ok(())
@@ -648,7 +767,10 @@ pub async fn sleep_environment(
         return Ok(false);
     }
     edge_table::push_routes(pool, cfg).await?;
-    supervisor::stop_environment_fleet(procs, &env.app_slug, &env.label).await;
+    let fleet = supervisor::env_fleet_key(&env.app_slug, &env.label);
+    if let Some((child, epoch)) = supervisor::park(procs, &fleet).await {
+        supervisor::stop_child(procs, &fleet, child, supervisor::StopGrace::NORMAL, epoch).await;
+    }
     crate::host::stats::record_sleep();
     tracing::info!(
         fleet = %format!("{}.{}", env.app_slug, env.label),
@@ -681,38 +803,77 @@ pub async fn wake_environment(
         anyhow::bail!("environment has no port");
     };
     let was_asleep = env.is_asleep();
+    let fleet = supervisor::env_fleet_key(&env.app_slug, &env.label);
+    // Same hold rule as `wake_app`: a crash-looping fleet is not respawned
+    // once per request.
+    if let Some(until) = supervisor::hold_until(procs, &fleet).await {
+        let now = std::time::Instant::now();
+        if until > now {
+            anyhow::bail!(
+                "fleet is restarting after a crash; retry in {}s",
+                (until - now).as_secs().max(1)
+            );
+        }
+    }
     let budget = Duration::from_secs(cfg.wake_timeout_s.max(1));
     let deadline = tokio::time::Instant::now() + budget;
     let _slot = if was_asleep {
         match tokio::time::timeout(budget, wake_slots(cfg).acquire()).await {
             Ok(Ok(permit)) => Some(permit),
-            Ok(Err(_)) => anyhow::bail!("wake slots closed"),
-            Err(_) => anyhow::bail!(
-                "too many fleets starting at once; waited {}s",
-                budget.as_secs()
-            ),
+            Ok(Err(_)) => {
+                supervisor::note_event(procs, &fleet, supervisor::FleetEvent::Parked).await;
+                anyhow::bail!("wake slots closed");
+            }
+            Err(_) => {
+                supervisor::note_event(procs, &fleet, supervisor::FleetEvent::Parked).await;
+                anyhow::bail!(
+                    "too many fleets starting at once; waited {}s",
+                    budget.as_secs()
+                );
+            }
         }
     } else {
         None
     };
     if was_asleep {
-        db::set_environment_awake(pool, &env.id).await?;
-        crate::host::stats::record_wake();
-        tracing::info!(
-            fleet = %format!("{}.{}", env.app_slug, env.label),
-            "waking environment for a request"
-        );
+        // In memory only: the row keeps saying asleep until the gate opens,
+        // so a failed wake leaves the environment as parked as it was.
+        supervisor::note_event(
+            procs,
+            &fleet,
+            supervisor::FleetEvent::Woke {
+                at: std::time::Instant::now(),
+            },
+        )
+        .await;
+        tracing::info!(fleet = %fleet, "waking environment for a request");
     }
     let env = db::get_environment(pool, env_id).await?.unwrap_or(env);
-    supervisor::ensure_environment_fleet(pool, cfg, procs, logs, &env).await?;
-    let left = deadline.saturating_duration_since(tokio::time::Instant::now());
-    if !wait_healthy(cfg, port, left.max(Duration::from_secs(1))).await {
-        anyhow::bail!(
-            "environment fleet not healthy within {}s",
-            cfg.wake_timeout_s
-        );
+    let woke = async {
+        supervisor::ensure_environment_fleet(pool, cfg, procs, logs, &env).await?;
+        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if !wait_healthy(cfg, port, left.max(Duration::from_secs(1))).await {
+            anyhow::bail!(
+                "environment fleet not healthy within {}s",
+                cfg.wake_timeout_s
+            );
+        }
+        if !supervisor::confirmed(procs, &fleet).await {
+            anyhow::bail!("environment fleet stopped while waking");
+        }
+        Ok::<(), anyhow::Error>(())
     }
-    // Same truthful order as `wake_app`.
+    .await;
+    if let Err(e) = woke {
+        // Same rollback as `wake_app`: a fleet this wake started and left
+        // running is stopped, and one that died keeps its crash/OOM hold.
+        if was_asleep {
+            park_after_failed_wake(pool, cfg, procs, &fleet, &env.app_id).await;
+        }
+        return Err(e);
+    }
+    // Same truthful order as `wake_app`: the row is only cleared once the
+    // fleet answers, and the route keeps its wake hop until then.
     if env.status != AppStatus::Running {
         db::write_environment_status(
             pool,
@@ -724,19 +885,83 @@ pub async fn wake_environment(
         .await?;
     }
     if was_asleep {
+        db::set_environment_awake(pool, &env.id).await?;
+        crate::host::stats::record_wake();
         edge_table::push_routes(pool, cfg).await?;
     }
     Ok(())
 }
 
+/// Put a fleet back where a failed wake found it. Three outcomes, and the
+/// difference matters:
+///
+/// - the cold start never spawned a child: nothing to do but record the park;
+/// - the child it started is still running: stop it (nobody would confirm or
+///   park a live child behind a parked row — the sweep only sees awake apps);
+/// - the child it started has died: **keep the crash/OOM hold**, so the parked
+///   app is not spawned again on the very next request. Stopping the chain
+///   with `stop_fleet` here is what turned a board-boot crash loop into one
+///   spawn per held request.
+async fn park_after_failed_wake(
+    pool: &SqlitePool,
+    cfg: &Config,
+    procs: &ProcMap,
+    fleet: &str,
+    app_id: &str,
+) {
+    // The hold may already be in place — either from before the wake or from
+    // the reaping `ensure_fleet` did while it looked for a child. Either way it
+    // is what keeps the next request from spawning a crash loop again.
+    let now = std::time::Instant::now();
+    if supervisor::hold_until(procs, fleet)
+        .await
+        .is_some_and(|until| until > now)
+    {
+        return;
+    }
+    let memory_mb = supervisor::fleet_memory_mb(pool, cfg, app_id).await;
+    match supervisor::note_exit(procs, fleet, memory_mb).await {
+        Some(state) if state.hold_until().is_some() => {
+            // It crashed on the way up: the hold is the park's memory of that.
+            debug_assert!(!state.is_live(), "a held fleet has no child");
+        }
+        _ => {
+            if let Some((child, epoch)) = supervisor::park(procs, fleet).await {
+                // Graceful, not `FOR_DELETE`: this fleet is not being deleted,
+                // its data stays, and a SIGKILL would leave the leases it holds
+                // for the next wake to wait out.
+                supervisor::stop_child(
+                    procs,
+                    fleet,
+                    child,
+                    supervisor::StopGrace::FAILED_WAKE,
+                    epoch,
+                )
+                .await;
+            }
+        }
+    }
+}
+
 /// A deploy is activity: wake an asleep environment before its pipeline runs,
 /// so the reconcile loop spawns the fleet the new release lands in.
-pub async fn wake_environment_for_deploy(pool: &SqlitePool, env: &Environment) {
+pub async fn wake_environment_for_deploy(pool: &SqlitePool, procs: &ProcMap, env: &Environment) {
     if !env.is_asleep() {
         return;
     }
     let lock = lock_for(&env.id);
     let _held = lock.lock().await;
+    // The in-memory half has to wake too: leaving the entry `Asleep` makes the
+    // deploy's own `ensure_environment_fleet` see a parked fleet and refuse to
+    // spawn it.
+    supervisor::note_event(
+        procs,
+        &supervisor::env_fleet_key(&env.app_slug, &env.label),
+        supervisor::FleetEvent::Woke {
+            at: std::time::Instant::now(),
+        },
+    )
+    .await;
     if let Err(e) = db::set_environment_awake(pool, &env.id).await {
         tracing::warn!(
             fleet = %format!("{}.{}", env.app_slug, env.label),
@@ -748,12 +973,22 @@ pub async fn wake_environment_for_deploy(pool: &SqlitePool, env: &Environment) {
 
 /// A deploy is activity: wake an asleep app before its pipeline runs so the
 /// reconcile loop spawns the fleet the new release lands in.
-pub async fn wake_for_deploy(pool: &SqlitePool, app: &App) {
+pub async fn wake_for_deploy(pool: &SqlitePool, procs: &ProcMap, app: &App) {
     if !app.is_asleep() {
         return;
     }
     let lock = lock_for(&app.id);
     let _held = lock.lock().await;
+    // Same as the environment: a deploy needs the fleet to spawn, so the
+    // state machine must not still say `Asleep`.
+    supervisor::note_event(
+        procs,
+        &app.slug,
+        supervisor::FleetEvent::Woke {
+            at: std::time::Instant::now(),
+        },
+    )
+    .await;
     if let Err(e) = db::set_app_awake(pool, &app.id).await {
         tracing::warn!(slug = %app.slug, error = %e, "wake for deploy");
     }
@@ -839,6 +1074,584 @@ mod tests {
         i64::from(port)
     }
 
+    /// A parked app whose fleet is gone must never be flipped back to
+    /// `running` by a health confirm: that is the confirm-vs-park race, which
+    /// used to leave `status='running'` + `asleep_since` on the same row (a
+    /// badge that says running while nothing serves, and a parked app the
+    /// sweep no longer considers as sleeping). The confirm now asks the fleet
+    /// state before it writes, so a park that won the race refuses the write.
+    #[tokio::test]
+    async fn a_park_that_won_the_race_is_never_flipped_back_to_running() {
+        let mut cfg = crate::config::config_for_tests();
+        cfg.wake_timeout_s = 1;
+        let pool = crate::db::connect("sqlite::memory:")
+            .await
+            .expect("memory db");
+        let app = seed_confirm_app(&pool, &cfg, "raced").await;
+        let procs = supervisor::new_procs();
+        let fleet = app.slug.clone();
+        // The park side, exactly as `sleep_app` leaves it: row asleep, fleet
+        // stopped, fleet map parked.
+        park_row(&pool, &app.id).await;
+        supervisor::stop_fleet(&procs, &fleet, supervisor::StopGrace::NORMAL).await;
+        supervisor::note_event(&procs, &fleet, supervisor::FleetEvent::Parked).await;
+
+        // A healthy gate on a port that really serves: only the fleet state
+        // can refuse the write below.
+        confirm_app_running(&pool, &cfg, &procs, &app.id, &fleet, healthy_port().await).await;
+
+        let fresh = crate::db::get_app(&pool, &app.id)
+            .await
+            .expect("get")
+            .expect("row");
+        assert!(
+            fresh.asleep_since.is_some(),
+            "a parked app stays asleep after a late confirm"
+        );
+        assert_eq!(
+            fresh.status,
+            AppStatus::Sleeping,
+            "and its badge keeps saying so: `running` + asleep is the bad state"
+        );
+    }
+
+    /// The same invariant under the real interleaving: a confirm is mid-probe
+    /// while the park runs, and the two are serialized by the app's lock.
+    #[tokio::test]
+    async fn a_confirm_in_flight_loses_to_a_park() {
+        let mut cfg = crate::config::config_for_tests();
+        cfg.wake_timeout_s = 5;
+        let pool = crate::db::connect("sqlite::memory:")
+            .await
+            .expect("memory db");
+        let app = seed_confirm_app(&pool, &cfg, "inflight").await;
+        let procs = supervisor::new_procs();
+        let fleet = app.slug.clone();
+        supervisor::note_event(
+            &procs,
+            &fleet,
+            supervisor::FleetEvent::Spawned {
+                at: std::time::Instant::now(),
+            },
+        )
+        .await;
+        let (port, release) = held_health().await;
+        let (done, finished) = tokio::sync::oneshot::channel();
+        let (pool2, cfg2, procs2, id) = (pool.clone(), cfg.clone(), procs.clone(), app.id.clone());
+        let fleet2 = fleet.clone();
+        tokio::spawn(async move {
+            confirm_app_running(&pool2, &cfg2, &procs2, &id, &fleet2, port).await;
+            let _ = done.send(());
+        });
+        // Park while the probe is still open, then let the gate answer.
+        park_row(&pool, &app.id).await;
+        supervisor::stop_fleet(&procs, &fleet, supervisor::StopGrace::NORMAL).await;
+        supervisor::note_event(&procs, &fleet, supervisor::FleetEvent::Parked).await;
+        let _ = release.send(());
+
+        tokio::time::timeout(Duration::from_secs(10), finished)
+            .await
+            .expect("the confirm finishes")
+            .expect("confirm task");
+        let fresh = crate::db::get_app(&pool, &app.id)
+            .await
+            .expect("get")
+            .expect("row");
+        assert!(fresh.asleep_since.is_some(), "still parked");
+        assert_eq!(
+            fresh.status,
+            AppStatus::Sleeping,
+            "never flipped to running"
+        );
+    }
+
+    /// A wake that fails changes nothing: the row keeps its asleep flag and
+    /// the route keeps its wake hop, so the next request retries the wake
+    /// instead of the edge proxying at a port nothing serves.
+    #[tokio::test]
+    async fn a_failed_wake_leaves_the_app_parked() {
+        let mut cfg = crate::config::config_for_tests();
+        cfg.wake_timeout_s = 1;
+        // The spawn cannot succeed: no celld binary at this path.
+        cfg.celld_bin = "/nonexistent/celld".into();
+        let pool = crate::db::connect("sqlite::memory:")
+            .await
+            .expect("memory db");
+        let app = seed_confirm_app(&pool, &cfg, "wake").await;
+        park_row(&pool, &app.id).await;
+        park_row(&pool, &app.id).await;
+        let procs = supervisor::new_procs();
+        let logs = crate::host::logs::new_state();
+
+        let woke = wake_app(&pool, &cfg, &procs, &logs, &app.id).await;
+
+        assert!(woke.is_err(), "a fleet that cannot spawn does not wake");
+        let fresh = crate::db::get_app(&pool, &app.id)
+            .await
+            .expect("get")
+            .expect("row");
+        assert!(
+            fresh.asleep_since.is_some(),
+            "the app is still parked: its route keeps the wake hop"
+        );
+        assert_eq!(fresh.status, AppStatus::Sleeping);
+        assert_eq!(
+            supervisor::state_of(&procs, &app.slug).await,
+            supervisor::FleetState::Asleep { until: None },
+            "the fleet state agrees with the row"
+        );
+    }
+
+    /// Park the row the way a running app is parked: `set_app_asleep` only
+    /// applies from `running` now (its `status IN (…)` guard), and a test that
+    /// parks a `deploying` row would describe a state the runner cannot reach.
+    async fn park_row(pool: &SqlitePool, id: &str) {
+        crate::db::write_app_status(
+            pool,
+            id,
+            AppStatus::Running,
+            None,
+            None,
+            crate::models::WriteGuard::Table,
+        )
+        .await
+        .expect("running row before the park");
+        assert!(
+            crate::db::set_app_asleep(pool, id)
+                .await
+                .expect("park")
+                .is_applied(),
+            "a running row parks"
+        );
+    }
+
+    /// Leave `slug` in the state a crashed fleet reaches: a real child that has
+    /// exited, observed through the supervisor's own exit path (no pre-seeded
+    /// hold, no direct state poke).
+    async fn crash_the_child(procs: &ProcMap, slug: &str) {
+        let child = tokio::process::Command::new("true")
+            .kill_on_drop(true)
+            .spawn()
+            .expect("a child that exits at once");
+        procs
+            .lock()
+            .await
+            .insert(slug.to_string(), supervisor::FleetEntry::test_entry(child));
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            if supervisor::note_exit(procs, slug, 256).await.is_some() {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("the child never exited");
+    }
+
+    /// A fleet held after a crash is not respawned by a request: that hold is
+    /// exactly what stops a crash-looping app from spawning once per held
+    /// request. The request answers the wake-failure status instead.
+    #[tokio::test]
+    async fn a_wake_fails_fast_while_the_crash_hold_stands() {
+        let mut cfg = crate::config::config_for_tests();
+        cfg.wake_timeout_s = 1;
+        let pool = crate::db::connect("sqlite::memory:")
+            .await
+            .expect("memory db");
+        let app = seed_confirm_app(&pool, &cfg, "held").await;
+        park_row(&pool, &app.id).await;
+        let procs = supervisor::new_procs();
+        crash_the_child(&procs, &app.slug).await;
+        assert!(supervisor::hold_until(&procs, &app.slug).await.is_some());
+        let logs = crate::host::logs::new_state();
+
+        let woke = wake_app(&pool, &cfg, &procs, &logs, &app.id).await;
+
+        let err = format!("{:#}", woke.expect_err("the hold refuses the wake"));
+        assert!(
+            err.contains("restarting after a crash"),
+            "the failure names the hold: {err}"
+        );
+        assert!(
+            supervisor::live_keys(&procs).await.is_empty(),
+            "and nothing was spawned for the request"
+        );
+    }
+
+    /// A failed wake stops the cold start it created gracefully, so celld can
+    /// release the leases its cells hold. `FOR_DELETE` (SIGKILL) left the next
+    /// wake waiting out the lease TTL and timing out again.
+    #[tokio::test]
+    async fn a_failed_wake_stops_its_cold_start_gracefully() {
+        let dir = std::env::temp_dir().join(format!("noite-term-{}", crate::models::new_id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let marker = dir.join("term");
+        let mut cfg = crate::config::config_for_tests();
+        cfg.wake_timeout_s = 1;
+        let pool = crate::db::connect("sqlite::memory:")
+            .await
+            .expect("memory db");
+        let app = seed_confirm_app(&pool, &cfg, "graceful").await;
+        park_row(&pool, &app.id).await;
+        let app = crate::db::get_app(&pool, &app.id)
+            .await
+            .expect("get")
+            .expect("row");
+        // A child that records SIGTERM: only a graceful stop writes it.
+        let script = format!(
+            "trap 'echo term > {}; exit 0' TERM; while :; do sleep 0.02; done",
+            marker.display()
+        );
+        let child = tokio::process::Command::new("sh")
+            .arg("-c")
+            .arg(script)
+            .kill_on_drop(true)
+            .spawn()
+            .expect("child that traps SIGTERM");
+        let procs = supervisor::new_procs();
+        procs
+            .lock()
+            .await
+            .insert(app.slug.clone(), supervisor::FleetEntry::test_entry(child));
+        // A port nothing answers: the wake fails at its health gate.
+        let dead = dead_port().await;
+        sqlx::query("UPDATE app SET listen_port = ? WHERE id = ?")
+            .bind(dead)
+            .bind(&app.id)
+            .execute(&pool)
+            .await
+            .expect("dead port");
+        let app = crate::db::get_app(&pool, &app.id)
+            .await
+            .expect("get")
+            .expect("row");
+        let logs = crate::host::logs::new_state();
+
+        let woke = wake_app(&pool, &cfg, &procs, &logs, &app.id).await;
+
+        assert!(woke.is_err(), "the gate never opens");
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !marker.exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the cold start was killed without its SIGTERM"
+            );
+            tokio::task::yield_now().await;
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A cold start that died on the way up keeps its hold instead of being
+    /// stopped into a plain park: a board-boot crash loop must not respawn on
+    /// every request.
+    #[tokio::test]
+    async fn a_died_cold_start_keeps_its_hold_instead_of_parking() {
+        let mut cfg = crate::config::config_for_tests();
+        cfg.wake_timeout_s = 1;
+        let pool = crate::db::connect("sqlite::memory:")
+            .await
+            .expect("memory db");
+        let app = seed_confirm_app(&pool, &cfg, "died").await;
+        park_row(&pool, &app.id).await;
+        let procs = supervisor::new_procs();
+        crash_the_child(&procs, &app.slug).await;
+
+        park_after_failed_wake(&pool, &cfg, &procs, &app.slug, &app.id).await;
+
+        let state = supervisor::state_of(&procs, &app.slug).await;
+        assert!(
+            matches!(state, supervisor::FleetState::CrashHeld { .. }),
+            "the hold survives the park: {state:?}"
+        );
+        assert!(
+            supervisor::hold_until(&procs, &app.slug).await.is_some(),
+            "and the next request is still held off"
+        );
+    }
+
+    /// A deploy wake has to move the fleet state out of `Asleep`, or the
+    /// deploy's own `ensure_fleet` sees a parked fleet and refuses to spawn.
+    #[tokio::test]
+    async fn a_deploy_wake_leaves_no_asleep_entry_behind() {
+        let pool = crate::db::connect("sqlite::memory:")
+            .await
+            .expect("memory db");
+        let cfg = crate::config::config_for_tests();
+        let app = seed_confirm_app(&pool, &cfg, "deploywake").await;
+        park_row(&pool, &app.id).await;
+        let app = crate::db::get_app(&pool, &app.id)
+            .await
+            .expect("get")
+            .expect("row");
+        let procs = supervisor::new_procs();
+        supervisor::note_event(&procs, &app.slug, supervisor::FleetEvent::Parked).await;
+        assert_eq!(
+            supervisor::state_of(&procs, &app.slug).await,
+            supervisor::FleetState::Asleep { until: None }
+        );
+
+        wake_for_deploy(&pool, &procs, &app).await;
+
+        assert!(
+            matches!(
+                supervisor::state_of(&procs, &app.slug).await,
+                supervisor::FleetState::Waking { .. }
+            ),
+            "the state machine woke with the row"
+        );
+    }
+
+    /// The real cold start: a parked app (`Asleep`, no child anywhere) wakes
+    /// and `ensure_fleet` spawns its fleet. No pre-inserted child, no poke at
+    /// the state beyond the park the sleep path records — this is the path the
+    /// e2e sleep spec drives, and the one a claim bug broke by making `Waking`
+    /// look like a spawn already in flight.
+    #[tokio::test]
+    async fn a_parked_app_wakes_and_spawns_its_fleet() {
+        let dir = std::env::temp_dir().join(format!("noite-wake-{}", crate::models::new_id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        // A stand-in celld: the real binary is not in the test image, but the
+        // spawn path only needs an executable that stays alive.
+        let fake = dir.join("celld");
+        std::fs::write(&fake, "#!/bin/sh\nsleep 60\n").expect("write fake celld");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        }
+        let mut cfg = crate::config::config_for_tests();
+        cfg.wake_timeout_s = 5;
+        cfg.celld_bin = fake.to_string_lossy().into_owned();
+        cfg.work_dir = dir.join("work").to_string_lossy().into_owned();
+        // Root keys: the spawn needs credentials, and this test is about the
+        // wake → spawn path, not about the store's IAM.
+        cfg.credentials = crate::host::credentials::Credentials::Root {
+            reason: "test".into(),
+        };
+        let pool = crate::db::connect("sqlite::memory:")
+            .await
+            .expect("memory db");
+        let app = seed_confirm_app(&pool, &cfg, "coldstart").await;
+        park_row(&pool, &app.id).await;
+        let app = crate::db::get_app(&pool, &app.id)
+            .await
+            .expect("get")
+            .expect("row");
+        let procs = supervisor::new_procs();
+        // The park the sleep path records: Asleep, no child.
+        supervisor::note_event(&procs, &app.slug, supervisor::FleetEvent::Parked).await;
+        assert_eq!(
+            supervisor::state_of(&procs, &app.slug).await,
+            supervisor::FleetState::Asleep { until: None }
+        );
+        // The row points at a port that answers, so the wake's own gate opens.
+        let port = healthy_port().await;
+        sqlx::query("UPDATE app SET listen_port = ? WHERE id = ?")
+            .bind(port)
+            .bind(&app.id)
+            .execute(&pool)
+            .await
+            .expect("listen port");
+        let logs = crate::host::logs::new_state();
+
+        wake_app(&pool, &cfg, &procs, &logs, &app.id)
+            .await
+            .expect("the parked app wakes");
+
+        assert_eq!(
+            supervisor::live_keys(&procs).await,
+            vec![app.slug.clone()],
+            "the wake spawned the fleet"
+        );
+        assert!(
+            matches!(
+                supervisor::state_of(&procs, &app.slug).await,
+                supervisor::FleetState::Healthy { .. }
+            ),
+            "and it is healthy"
+        );
+        let fresh = crate::db::get_app(&pool, &app.id)
+            .await
+            .expect("get")
+            .expect("row");
+        assert!(fresh.asleep_since.is_none(), "and the row is awake");
+        supervisor::stop_fleet(&procs, &app.slug, supervisor::StopGrace::FOR_DELETE).await;
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A child that dies *during* the wake keeps its hold: `wake_app`'s own
+    /// rollback is what had been clearing it (through the deliberate-stop
+    /// path), so a board that crashes on boot was respawned by every held
+    /// request and never backed off.
+    #[tokio::test]
+    async fn a_child_that_dies_during_the_wake_keeps_its_hold() {
+        let mut cfg = crate::config::config_for_tests();
+        cfg.wake_timeout_s = 1;
+        let pool = crate::db::connect("sqlite::memory:")
+            .await
+            .expect("memory db");
+        let app = seed_confirm_app(&pool, &cfg, "diedlive").await;
+        park_row(&pool, &app.id).await;
+        // The fleet's cold start is alive when the wake begins and dies while
+        // the health gate waits: 50 ms inside the child, then exit 1.
+        let child = tokio::process::Command::new("sh")
+            .arg("-c")
+            .arg("sleep 0.05; exit 1")
+            .kill_on_drop(true)
+            .spawn()
+            .expect("a child that dies mid-wake");
+        let procs = supervisor::new_procs();
+        procs
+            .lock()
+            .await
+            .insert(app.slug.clone(), supervisor::FleetEntry::test_entry(child));
+        let logs = crate::host::logs::new_state();
+        let dead = dead_port().await;
+        sqlx::query("UPDATE app SET listen_port = ? WHERE id = ?")
+            .bind(dead)
+            .bind(&app.id)
+            .execute(&pool)
+            .await
+            .expect("point the app at the dead port");
+        let app = crate::db::get_app(&pool, &app.id)
+            .await
+            .expect("get")
+            .expect("row");
+
+        let woke = wake_app(&pool, &cfg, &procs, &logs, &app.id).await;
+
+        assert!(woke.is_err(), "the gate never opens");
+        assert!(
+            supervisor::hold_until(&procs, &app.slug).await.is_some(),
+            "the crash hold survives the failed wake"
+        );
+        // And the next request does not spawn it again.
+        let again = wake_app(&pool, &cfg, &procs, &logs, &app.id).await;
+        let err = format!("{:#}", again.expect_err("the hold refuses the wake"));
+        assert!(
+            err.contains("restarting after a crash"),
+            "the next wake fails fast: {err}"
+        );
+    }
+
+    /// A wake whose cold start succeeded but whose health gate never opened
+    /// must not leave that fleets running behind a parked row: nothing would
+    /// confirm it or park it again (the sweep only sees awake apps), so it
+    /// would sit in memory until the next request.
+    #[tokio::test]
+    async fn a_wake_that_times_out_stops_the_fleet_it_started() {
+        let mut cfg = crate::config::config_for_tests();
+        cfg.wake_timeout_s = 1;
+        let pool = crate::db::connect("sqlite::memory:")
+            .await
+            .expect("memory db");
+        let app = seed_confirm_app(&pool, &cfg, "timeout").await;
+        park_row(&pool, &app.id).await;
+        let procs = supervisor::new_procs();
+        // A live child for the fleet, and a port nothing serves on: the spawn
+        // side succeeds, the gate cannot.
+        procs.lock().await.insert(
+            app.slug.clone(),
+            supervisor::FleetEntry::test_entry(
+                tokio::process::Command::new("sleep")
+                    .arg("60")
+                    .kill_on_drop(true)
+                    .spawn()
+                    .expect("spawn a live child"),
+            ),
+        );
+        supervisor::note_event(&procs, &app.slug, supervisor::FleetEvent::Parked).await;
+        let dead = dead_port().await;
+        // The row points at the port the test controls (a fileless `:memory:`
+        // pool still shares one connection, so the update is visible).
+        sqlx::query("UPDATE app SET listen_port = ? WHERE id = ?")
+            .bind(dead)
+            .bind(&app.id)
+            .execute(&pool)
+            .await
+            .expect("point the app at the dead port");
+        let app = crate::db::get_app(&pool, &app.id)
+            .await
+            .expect("get")
+            .expect("row");
+        let logs = crate::host::logs::new_state();
+
+        let woke = wake_app(&pool, &cfg, &procs, &logs, &app.id).await;
+
+        assert!(woke.is_err(), "the gate never opens");
+        assert!(
+            supervisor::live_keys(&procs).await.is_empty(),
+            "the fleet this wake started is stopped again"
+        );
+        assert_eq!(
+            supervisor::state_of(&procs, &app.slug).await,
+            supervisor::FleetState::Asleep { until: None },
+            "and the fleet state says parked"
+        );
+        let fresh = crate::db::get_app(&pool, &app.id)
+            .await
+            .expect("get")
+            .expect("row");
+        assert!(fresh.asleep_since.is_some(), "the row stays asleep");
+    }
+
+    /// An app row a confirm can act on: ports assigned, not asleep, deployed.
+    async fn seed_confirm_app(pool: &SqlitePool, cfg: &Config, slug: &str) -> App {
+        let app = crate::db::create_app(
+            pool,
+            cfg,
+            crate::db::NewApp {
+                name: slug,
+                slug,
+                user_id: "local",
+                subdomain: &format!("{slug}.localhost"),
+                listen: 30100,
+                internal: 30101,
+            },
+        )
+        .await
+        .expect("seed app");
+        crate::db::write_app_status(
+            pool,
+            &app.id,
+            AppStatus::Deploying,
+            None,
+            None,
+            crate::models::WriteGuard::Table,
+        )
+        .await
+        .expect("deploying");
+        crate::db::get_app(pool, &app.id)
+            .await
+            .expect("get")
+            .expect("row")
+    }
+
+    /// A health gate that accepts the probe and answers only once the test
+    /// says so: the barrier the park/confirm race needs.
+    async fn held_health() -> (i64, tokio::sync::oneshot::Sender<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let (release, mut wait) = tokio::sync::oneshot::channel::<()>();
+        let (arrived, arrived_rx) = tokio::sync::oneshot::channel::<()>();
+        tokio::spawn(async move {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let mut buf = [0u8; 2048];
+            let _ = stream.read(&mut buf).await;
+            let _ = arrived.send(());
+            let _ = (&mut wait).await;
+            let _ = stream
+                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok")
+                .await;
+        });
+        let _ = tokio::time::timeout(Duration::from_secs(5), arrived_rx).await;
+        (i64::from(port), release)
+    }
+
     /// The gate opens for a serving fleet and stays shut for a dead one.
     #[tokio::test]
     async fn health_gate_tracks_the_fleet() {
@@ -882,9 +1695,18 @@ mod tests {
         )
         .await
         .expect("deploying");
-        let confirming: Confirming = Arc::new(Mutex::new(std::collections::HashSet::new()));
+        let procs = supervisor::new_procs();
+        let fleet = "confirm";
+        supervisor::note_event(
+            &procs,
+            fleet,
+            supervisor::FleetEvent::Spawned {
+                at: std::time::Instant::now(),
+            },
+        )
+        .await;
 
-        confirm_app_running(&pool, &cfg, &confirming, &app.id, healthy_port().await).await;
+        confirm_app_running(&pool, &cfg, &procs, &app.id, fleet, healthy_port().await).await;
         let fresh = crate::db::get_app(&pool, &app.id)
             .await
             .expect("get")
@@ -904,7 +1726,7 @@ mod tests {
         )
         .await
         .expect("building again");
-        confirm_app_running(&pool, &cfg, &confirming, &app.id, dead_port().await).await;
+        confirm_app_running(&pool, &cfg, &procs, &app.id, fleet, dead_port().await).await;
         let fresh = crate::db::get_app(&pool, &app.id)
             .await
             .expect("get")

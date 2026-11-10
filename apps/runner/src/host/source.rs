@@ -105,15 +105,21 @@ pub async fn checkout_worktree(
     dest: &std::path::Path,
 ) -> anyhow::Result<()> {
     let bare = bare_repo(cfg, slug);
-    if !bare.join("HEAD").exists() {
-        // Ephemeral disk: pull tip bundle then retry once.
-        let _ = rehydrate::ensure_deploy_mirror(cfg, slug).await;
+    // Ephemeral disk: pull the tip bundle then retry once. The test is the
+    // mirror's state, not `HEAD` alone: a hydrate that crashed between
+    // `git init --bare` and its fetch leaves `HEAD` and no objects, and the
+    // old check then sent every read at a mirror that could never serve
+    // ("unknown revision") instead of finishing the hydrate. A `Ready` mirror
+    // is never touched here, so a live deploy's `main` ref cannot be moved by
+    // a read.
+    if rehydrate::mirror_state(cfg, slug) != rehydrate::MirrorState::Ready {
+        rehydrate::ensure_deploy_mirror(cfg, slug).await?;
     }
-    if !bare.join("HEAD").exists() {
+    if rehydrate::mirror_state(cfg, slug) == rehydrate::MirrorState::Absent {
         anyhow::bail!("no bare mirror for {slug} yet");
     }
     tokio::fs::create_dir_all(dest).await?;
-    exec::run_cmd(
+    let checkout = exec::run_cmd(
         "git",
         &[
             &format!("--git-dir={}", bare.display()),
@@ -126,8 +132,20 @@ pub async fn checkout_worktree(
         &[],
         Duration::from_secs(30),
     )
-    .await?;
-    Ok(())
+    .await;
+    match checkout {
+        Ok(_) => Ok(()),
+        // An `Incomplete` mirror is not rejected up front: it may still hold
+        // the revision being asked for (an environment ref survives a partial
+        // main-tip hydrate). The failure is reported with the mirror's state
+        // so an operator can tell "never hydrated" from "bad revision" — a
+        // debug assertion here used to panic instead, and release builds said
+        // only "unknown revision".
+        Err(error) => anyhow::bail!(
+            "checkout of {rev} from {slug}'s mirror failed ({:?}): {error:#}",
+            rehydrate::mirror_state(cfg, slug)
+        ),
+    }
 }
 
 /// Full recursive listing (git's own tree order — server-sorted, so the UI
@@ -375,6 +393,7 @@ fn read_batch(raw: &[u8], wanted: &[(String, String)], budget: u64) -> (Vec<Sour
 
 #[cfg(test)]
 mod tests {
+
     //! `source.bundle` against a real bare mirror: the extension/vendor
     //! filters, the caps, deterministic order and git ref resolution, driven
     //! through the same function the RPC calls.
@@ -388,6 +407,80 @@ mod tests {
         ("GIT_COMMITTER_NAME", "Test"),
         ("GIT_COMMITTER_EMAIL", "test@example.com"),
     ];
+
+    /// A mirror that cannot serve the requested revision is a runtime error
+    /// naming the mirror's state, never a panic: a debug assertion used to fire
+    /// on an `Incomplete` mirror, and release builds said only "unknown
+    /// revision". An `Incomplete` mirror is still checked out (it may hold an
+    /// environment ref), so the failure has to come from the checkout itself.
+    #[tokio::test]
+    async fn a_checkout_of_a_missing_revision_names_the_mirror_state() {
+        let dir = std::env::temp_dir().join(format!("noite-src2-{}", crate::models::new_id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let mut cfg = crate::config::config_for_tests();
+        cfg.work_dir = dir.to_string_lossy().into_owned();
+        let bare = bare_repo(&cfg, "readybrew");
+        std::fs::create_dir_all(bare.join("refs/heads")).expect("bare dir");
+        std::fs::write(bare.join("HEAD"), "ref: refs/heads/main\n").expect("head");
+        std::fs::write(bare.join("refs/heads/main"), "0".repeat(40)).expect("main ref");
+        assert_eq!(
+            crate::host::rehydrate::mirror_state(&cfg, "readybrew"),
+            crate::host::rehydrate::MirrorState::Ready,
+            "a Ready mirror is never hydrated from a read"
+        );
+        let dest = dir.join("dest");
+
+        let err = checkout_worktree(&cfg, "readybrew", "no-such-rev", &dest)
+            .await
+            .expect_err("the revision does not exist");
+
+        let text = format!("{err:#}");
+        assert!(
+            text.contains("no-such-rev") && text.contains("Ready"),
+            "the error names the revision and the mirror state: {text}"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A checkout against a half-hydrated mirror must try to finish the
+    /// hydrate. It used to look at `HEAD` alone, so a hydrate that crashed
+    /// between `git init --bare` and its fetch made every read fail with
+    /// "unknown revision" — the mirror looked present forever.
+    #[tokio::test]
+    async fn a_checkout_retries_a_half_hydrated_mirror() {
+        let dir = std::env::temp_dir().join(format!("noite-src-{}", crate::models::new_id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let mut cfg = crate::config::config_for_tests();
+        cfg.work_dir = dir.to_string_lossy().into_owned();
+        // The debris: a bare repo with `HEAD` and no `main` ref.
+        let bare = bare_repo(&cfg, "halfbrew");
+        std::fs::create_dir_all(bare.join("refs/heads")).expect("bare dir");
+        std::fs::write(bare.join("HEAD"), "ref: refs/heads/main\n").expect("head");
+        assert_eq!(
+            crate::host::rehydrate::mirror_state(&cfg, "halfbrew"),
+            crate::host::rehydrate::MirrorState::Incomplete
+        );
+        let dest = dir.join("dest");
+
+        let err = checkout_worktree(&cfg, "halfbrew", "main", &dest)
+            .await
+            .expect_err("the hydrate cannot reach the store in a test");
+
+        // The error is the hydrate's, not a checkout of a mirror that has no
+        // objects: the retry happened.
+        let text = format!("{err:#}");
+        assert!(
+            text.contains("s3") || text.contains("transport") || text.contains("tip bundle"),
+            "the checkout tried to finish the hydrate: {text}"
+        );
+        for checkout_error in ["unknown revision", "not a valid object name"] {
+            assert!(
+                !text.contains(checkout_error),
+                "it failed in the hydrate, not in a checkout of an empty mirror: {text}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
 
     async fn git(dir: &Path, args: &[&str]) -> String {
         exec::run_cmd("git", args, Some(dir), GIT_ENV, Duration::from_secs(60))
