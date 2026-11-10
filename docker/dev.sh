@@ -37,6 +37,17 @@ sandbox_build() {
     --source "$SANDBOX_SRC" --work "$SANDBOX_WORK" --bundle "$SANDBOX_BUNDLE" "$@"
 }
 
+# Keep the watcher running: if it dies, the bundle silently stops tracking
+# `apps/void-sandbox` and the session keeps deploying the controller it last
+# published. Restart it after a pause, like `ui_loop`.
+sandbox_loop() {
+  while :; do
+    sandbox_build --watch
+    echo "dev: sandbox bundle watcher exited; restarting in 2s"
+    sleep 2
+  done
+}
+
 ui_install() {
   cd "$UI_DIR"
   # Skip when node_modules is newer than the lockfile: container restarts
@@ -70,7 +81,7 @@ UI_PID=$!
 
 sandbox_build --once ||
   echo "dev: sandbox controller bundle not built; a sandbox app deploy fails until it builds" >&2
-sandbox_build --watch &
+sandbox_loop &
 SANDBOX_PID=$!
 
 cd "$RUNNER_DIR"

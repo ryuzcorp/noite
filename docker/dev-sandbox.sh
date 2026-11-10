@@ -61,6 +61,29 @@ if [ -z "$source_dir" ] || [ -z "$work_dir" ] || [ -z "$bundle_dir" ] || [ -z "$
   exit 2
 fi
 
+# Both paths are ours to create and delete under: refuse anything relative, the
+# filesystem root, or a bundle inside the work tree (the publish renames over
+# `--bundle` and the prune runs under `--work`, so an overlap could delete the
+# published bundle or the build it points at).
+require_dev_path() {
+  if [ "${2#/}" = "$2" ]; then
+    echo "dev-sandbox: $1 must be an absolute path: $2" >&2
+    return 1
+  fi
+  if [ "$2" = / ]; then
+    echo "dev-sandbox: $1 must name a directory this script owns, not /" >&2
+    return 1
+  fi
+}
+require_dev_path --work "$work_dir" || exit 2
+require_dev_path --bundle "$bundle_dir" || exit 2
+case "$bundle_dir/" in
+"$work_dir"/*)
+  echo "dev-sandbox: --bundle must not live inside --work ($bundle_dir in $work_dir)" >&2
+  exit 2
+  ;;
+esac
+
 # The published path is a symlink this script swaps. A real directory there is
 # a stale layout (or someone's bind mount) `mv -T` cannot replace, so refuse
 # instead of deleting what may not be ours.
@@ -101,7 +124,7 @@ deps_digest() {
 }
 
 require_sources() {
-  for path in worker.ts build.ts src package.json bun.lock; do
+  for path in worker.ts build.ts src package.json bun.lock tsconfig.json; do
     if [ ! -e "$source_dir/$path" ]; then
       echo "dev-sandbox: $source_dir/$path is missing; is apps/void-sandbox mounted?" >&2
       return 1
@@ -135,15 +158,25 @@ install_deps() {
 }
 
 # Build into a fresh generation and point the bundle path at it with one
-# rename, then drop the older generations: a deploy reads `worker.js` and
-# `meta.json` from one generation or the other, never from a build in flight.
+# rename, then drop the generations nothing can still be reading: the new one
+# and the one a deploy may have resolved before the swap (`prev`). A deploy
+# reads `worker.js` and `meta.json` from one generation or the other, never from
+# a build in flight and never from a directory this pruned from under it.
+#
+# The rename needs a symlink on both sides (`rename(2)` refuses a directory over
+# a non-directory), and that link carries this writer's PID: a fixed name would
+# let two publishers move each other's link into place.
 publish_bundle() {
-  gen=$(mktemp -d "$gens/gen.XXXXXX") &&
-    cp -a "$work_dir/dist/." "$gen/" &&
-    ln -sfn "$gen" "$gens/next" &&
-    mv -T "$gens/next" "$bundle_dir" || return 1
+  gen=$(mktemp -d "$gens/gen.XXXXXX") || return 1
+  prev=$(readlink "$bundle_dir" 2>/dev/null || :)
+  if ! cp -a "$work_dir/dist/." "$gen/" ||
+    ! ln -s "$gen" "$gens/link.$$" ||
+    ! mv -T "$gens/link.$$" "$bundle_dir"; then
+    rm -rf "$gen" "$gens/link.$$"
+    return 1
+  fi
   for old in "$gens"/gen.*; do
-    if [ -d "$old" ] && [ "$old" != "$gen" ]; then
+    if [ -d "$old" ] && [ "$old" != "$gen" ] && [ "$old" != "$prev" ]; then
       rm -rf "$old"
     fi
   done

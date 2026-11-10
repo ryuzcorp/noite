@@ -9,6 +9,7 @@
 // bundler, so nothing is downloaded) and pin what `docker/dev.sh` relies on.
 import { describe, expect, test } from "bun:test";
 import {
+  existsSync,
   lstatSync,
   mkdirSync,
   mkdtempSync,
@@ -115,18 +116,23 @@ const fixture = (): Fixture => {
   };
 };
 
-const runOnce = (fix: Fixture) =>
-  Bun.spawnSync([
-    "sh",
-    script,
-    "--source",
-    fix.source,
-    "--work",
-    fix.work,
-    "--bundle",
-    fix.bundle,
-    "--once",
-  ]);
+/** The script's arguments, with the paths a test wants to get wrong. */
+const runArgs = (
+  fix: Fixture,
+  overrides: { readonly work?: string; readonly bundle?: string } = {}
+) => [
+  "sh",
+  script,
+  "--source",
+  fix.source,
+  "--work",
+  overrides.work ?? fix.work,
+  "--bundle",
+  overrides.bundle ?? fix.bundle,
+  "--once",
+];
+
+const runOnce = (fix: Fixture) => Bun.spawnSync(runArgs(fix));
 
 /** Overwrite a fixture source atomically, so a watching build never reads a
  * half-written file. */
@@ -216,6 +222,13 @@ describe("dev-sandbox.sh", () => {
         controllerProtocol: 2,
         void: "1.5.0",
       });
+      // The swap link is per-writer and gone once the rename lands: a fixed
+      // name there would be a mutable path two publishes could both move.
+      expect(
+        readdirSync(path.join(fix.work, "gens")).filter((name) =>
+          name.startsWith("link.")
+        )
+      ).toEqual([]);
     } finally {
       rmSync(fix.dir, { force: true, recursive: true });
     }
@@ -259,10 +272,99 @@ describe("dev-sandbox.sh", () => {
       expect(readFileSync(path.join(fix.bundle, "worker.js"), "utf-8")).toBe(
         'export const marker = "two";\n'
       );
-      // Only the generation the bundle points at survives.
-      expect(readdirSync(path.join(fix.work, "gens"))).toEqual([
-        path.basename(next),
-      ]);
+      // The generation a deploy may have resolved before the swap survives;
+      // everything older is gone.
+      expect(readdirSync(path.join(fix.work, "gens")).toSorted()).toEqual(
+        [path.basename(published), path.basename(next)].toSorted()
+      );
+    } finally {
+      rmSync(fix.dir, { force: true, recursive: true });
+    }
+  });
+
+  test("--once keeps the previous generation until the next one replaces it", () => {
+    const fix = fixture();
+
+    try {
+      expect(runOnce(fix).exitCode).toBe(0);
+      const first = readlinkSync(fix.bundle);
+
+      edit(
+        path.join(fix.source, "worker.ts"),
+        'export const marker = "two";\n'
+      );
+      expect(runOnce(fix).exitCode).toBe(0);
+      const second = readlinkSync(fix.bundle);
+
+      // A deploy that resolved `first` just before the swap is still reading
+      // it; deleting it here would fail that deploy with ENOENT.
+      expect(existsSync(first)).toBe(true);
+
+      edit(
+        path.join(fix.source, "worker.ts"),
+        'export const marker = "three";\n'
+      );
+      expect(runOnce(fix).exitCode).toBe(0);
+      const third = readlinkSync(fix.bundle);
+
+      expect(existsSync(second)).toBe(true);
+      expect(existsSync(first)).toBe(false);
+      expect(readdirSync(path.join(fix.work, "gens")).toSorted()).toEqual(
+        [path.basename(second), path.basename(third)].toSorted()
+      );
+    } finally {
+      rmSync(fix.dir, { force: true, recursive: true });
+    }
+  });
+
+  test("--once refuses a bundle path it would have to share or overwrite", () => {
+    const fix = fixture();
+
+    try {
+      // Relative paths land wherever the container's cwd is.
+      for (const overrides of [
+        { work: "relative-work" },
+        { bundle: "relative-bundle" },
+      ]) {
+        const refused = Bun.spawnSync(runArgs(fix, overrides));
+
+        expect(refused.exitCode).toBe(2);
+        expect(refused.stderr.toString()).toContain("absolute path");
+      }
+
+      // A bundle inside the work tree: the publish renames over it and the
+      // prune runs under the work dir.
+      const inside = Bun.spawnSync(
+        runArgs(fix, { bundle: path.join(fix.work, "bundle") })
+      );
+
+      expect(inside.exitCode).toBe(2);
+      expect(inside.stderr.toString()).toContain("inside --work");
+
+      // The filesystem root is never ours to build in or publish over.
+      const atRoot = Bun.spawnSync(runArgs(fix, { bundle: "/" }));
+
+      expect(atRoot.exitCode).toBe(2);
+      expect(atRoot.stderr.toString()).toContain("not /");
+    } finally {
+      rmSync(fix.dir, { force: true, recursive: true });
+    }
+  });
+
+  test("--once fails loudly when the package has no tsconfig.json", () => {
+    const fix = fixture();
+
+    try {
+      rmSync(path.join(fix.source, "tsconfig.json"));
+
+      const missing = runOnce(fix);
+
+      expect(missing.exitCode).not.toBe(0);
+      // The script's own message, not a bare `cp: cannot stat` from the copy.
+      expect(missing.stderr.toString()).toContain(
+        `${path.join(fix.source, "tsconfig.json")} is missing`
+      );
+      expect(lstatSync(fix.bundle, { throwIfNoEntry: false })).toBeUndefined();
     } finally {
       rmSync(fix.dir, { force: true, recursive: true });
     }
@@ -418,14 +520,20 @@ describe("the dev stack wires the build in", () => {
     );
   });
 
-  test("dev.sh builds before the runner starts, then keeps it current", () => {
+  test("dev.sh builds before the runner starts, then supervises the watcher", () => {
     const once = dev.indexOf("sandbox_build --once");
-    const watch = dev.indexOf("sandbox_build --watch &");
+    const loop = dev.indexOf("sandbox_loop &");
+    const watch = dev.indexOf("sandbox_build --watch");
+    const restart = dev.indexOf("sandbox bundle watcher exited");
     const runner = dev.indexOf("cargo watch -q");
 
     expect(once).toBeGreaterThan(-1);
-    expect(watch).toBeGreaterThan(once);
     // The bundle must exist before anything can deploy.
     expect(once).toBeLessThan(runner);
+    // And the watcher is restarted if it dies, or the session ships the last
+    // bundle it published without anyone noticing.
+    expect(loop).toBeGreaterThan(-1);
+    expect(watch).toBeGreaterThan(-1);
+    expect(restart).toBeGreaterThan(watch);
   });
 });
