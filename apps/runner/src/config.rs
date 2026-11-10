@@ -1811,10 +1811,17 @@ impl Config {
         // A 0 memory limit means DuckDB's own 80%-of-RAM default, which is
         // exactly what this knob exists to avoid; a tiny one makes every
         // query spill forever. 64 MiB is the floor DuckDB can run a scan in.
-        // Control hosts must be what a Host header can carry: a bare DNS
-        // name or IP literal. A scheme/port/path value would key a route the
-        // edge can never match while its short form stays a claimable tenant
-        // host (see `normalize_host`).
+        // Every edge-facing domain must be what a Host header can carry: a
+        // bare DNS name or IP literal. A scheme/port/path value would key a
+        // route the edge can never match while its short form stays a
+        // claimable host (see `normalize_host`).
+        let base = normalize_host(&self.base_domain);
+        if !bare_host_ok(&base) {
+            problems.push(format!(
+                "BASE_DOMAIN must be a bare DNS name or IP literal, got {:?}",
+                self.base_domain
+            ));
+        }
         let sub = normalize_host(&self.control_subdomain);
         if !sub.is_empty() && !bare_host_ok(&sub) {
             problems.push(format!(
@@ -3011,6 +3018,12 @@ mod tests {
         assert!(bad.validate().is_err(), "port in CONTROL_EXTRA_HOSTS");
         bad.control_extra_hosts = vec!["192.168.10.62".into()];
         assert!(bad.validate().is_ok(), "an IP literal stays control-only");
+        bad.base_domain = "https://example.com".into();
+        assert!(bad.validate().is_err(), "scheme in BASE_DOMAIN");
+        bad.base_domain = "example.com:443".into();
+        assert!(bad.validate().is_err(), "port in BASE_DOMAIN");
+        bad.base_domain = "example.com".into();
+        assert!(bad.validate().is_ok(), "a bare base validates");
     }
 
     #[test]
