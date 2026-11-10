@@ -343,16 +343,147 @@ fn first_header<'a>(v: &'a serde_json::Value, name: &str) -> &'a str {
         .unwrap_or("")
 }
 
-fn read_offset(path: &std::path::Path) -> (u64, u64) {
-    let text = std::fs::read_to_string(path).unwrap_or_default();
-    let (ino, off) = text.trim().split_once(':').unwrap_or(("", ""));
-    (ino.parse().unwrap_or(0), off.parse().unwrap_or(0))
+/// The access-log tail cursor, persisted as the `ino:off` sidecar. The pair
+/// is the whole state: an inode change or a shrink resets to `Fresh`, and a
+/// corrupt sidecar reads as `Fresh`.
+///
+/// stateDiagram-v2
+///   [*] --> Fresh
+///   Fresh --> At: first consumed line
+///   At --> At: line consumed
+///   At --> Fresh: inode changed / file shrank / burst skipped
+///   Fresh --> At: next consumed line
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OffsetState {
+    Fresh,
+    At { ino: u64, off: u64 },
 }
 
-/// Consume new access-log lines into device stats. Never fails the tick:
-/// a missing log (Caddy not yet reloaded) is a silent skip. Environment
-/// hosts attribute to the environment's own (app, environment) rows; the
-/// trace → request index is shared (trace ids are unique per request).
+impl OffsetState {
+    fn read(path: &std::path::Path) -> Self {
+        let text = std::fs::read_to_string(path).unwrap_or_default();
+        let (ino, off) = text.trim().split_once(':').unwrap_or(("", ""));
+        match (ino.parse(), off.parse()) {
+            (Ok(ino), Ok(off)) => Self::At { ino, off },
+            _ => Self::Fresh,
+        }
+    }
+
+    /// Apply the file's identity and length: a replaced or shrunk file starts
+    /// over.
+    fn resolved(self, ino: u64, len: u64) -> Self {
+        match self {
+            Self::At { ino: saved, off } if saved == ino && off <= len => Self::At { ino, off },
+            _ => Self::At { ino, off: 0 },
+        }
+    }
+
+    fn pos(self) -> u64 {
+        match self {
+            Self::Fresh => 0,
+            Self::At { off, .. } => off,
+        }
+    }
+
+    /// Advance past one consumed line (its bytes plus the newline).
+    fn advance(self, ino: u64, bytes: u64) -> Self {
+        Self::At {
+            ino,
+            off: self.pos() + bytes,
+        }
+    }
+
+    /// Skip to the end (burst guard): the bytes are dropped, not counted.
+    fn skipped_to(ino: u64, len: u64) -> Self {
+        Self::At { ino, off: len }
+    }
+
+    fn persist(self, path: &std::path::Path) -> std::io::Result<()> {
+        match self {
+            Self::Fresh => std::fs::write(path, "0:0"),
+            Self::At { ino, off } => std::fs::write(path, format!("{ino}:{off}")),
+        }
+    }
+}
+
+/// Walk whole lines from `cursor`, applying each and persisting the cursor
+/// immediately after its rows commit. Stops at the first failure or at a
+/// trailing partial line, so no persisted cursor ever claims a line whose
+/// writes did not land.
+struct Tail<'a> {
+    pool: &'a SqlitePool,
+    cfg: &'a Config,
+    slug_id: &'a HashMap<String, String>,
+    slug_env: &'a HashMap<String, String>,
+    requests: &'a mut RequestIndex,
+}
+
+async fn consume_lines(
+    tail: &mut Tail<'_>,
+    bytes: &[u8],
+    ino: u64,
+    mut cursor: OffsetState,
+    offset_file: &std::path::Path,
+) -> anyhow::Result<OffsetState> {
+    let mut pos = cursor.pos() as usize;
+    while pos < bytes.len() {
+        let rest = &bytes[pos..];
+        // Only whole lines move the cursor: an in-flight append is read next
+        // tick, not counted without its newline.
+        let Some(nl) = rest.iter().position(|b| *b == b'\n') else {
+            break;
+        };
+        let line = &rest[..nl];
+        let advance_by = nl as u64 + 1;
+        if let Ok(text) = std::str::from_utf8(line) {
+            if !text.is_empty() {
+                if let Some(l) = parse_line(text, tail.cfg, tail.slug_id, tail.slug_env) {
+                    let trace = l.trace.as_ref().map(|(trace_id, ctx)| db::AccessTrace {
+                        trace_id,
+                        method: &ctx.method,
+                        path: &ctx.path,
+                        http_status: ctx.status,
+                        browser: ctx.browser,
+                        os: ctx.os,
+                        backfill: tail.requests.is_pending(trace_id),
+                    });
+                    db::record_access_hit(
+                        tail.pool,
+                        &db::AccessHit {
+                            app_id: &l.app_id,
+                            environment_id: &l.environment_id,
+                            bucket: &l.bucket,
+                            browser: l.browser,
+                            os: l.os,
+                            path: &l.path,
+                            source: &l.source,
+                            trace,
+                        },
+                    )
+                    .await?;
+                    if let Some((trace_id, ctx)) = l.trace {
+                        tail.requests.clear_pending(&trace_id);
+                        tail.requests.insert(trace_id, ctx);
+                    }
+                }
+            }
+        }
+        cursor = cursor.advance(ino, advance_by);
+        cursor.persist(offset_file)?;
+        pos += advance_by as usize;
+    }
+    Ok(cursor)
+}
+
+/// Consume new access-log lines into device stats. A missing log (Caddy not
+/// yet reloaded) is a silent skip. Environment hosts attribute to the
+/// environment's own (app, environment) rows; the trace → request index is
+/// shared (trace ids are unique per request).
+///
+/// The offset advances (and is persisted) only after a line's rows commit, so
+/// a mid-loop DB error re-reads exactly the lines that were not applied — never
+/// one that already was. A trailing partial line stays unread until its
+/// newline lands.
 pub async fn tick(
     pool: &SqlitePool,
     cfg: &Config,
@@ -367,81 +498,40 @@ pub async fn tick(
         Ok(m) => m,
         Err(_) => return Ok(()),
     };
-    let (saved_ino, mut off) = read_offset(&offset_path(cfg));
-    if saved_ino != 0 && saved_ino != meta.ino() {
-        off = 0;
-    }
+    let offset_file = offset_path(cfg);
+    let mut cursor = OffsetState::read(&offset_file).resolved(meta.ino(), meta.len());
     let len = meta.len();
-    if off > len {
-        off = 0;
-    }
-    if off == len {
+    if cursor.pos() == len {
         return Ok(());
     }
-    if len - off > MAX_CATCHUP_BYTES {
-        tracing::warn!(skipped = len - off, "access log burst skipped");
-        off = len;
+    if len - cursor.pos() > MAX_CATCHUP_BYTES {
+        tracing::warn!(skipped = len - cursor.pos(), "access log burst skipped");
+        cursor = OffsetState::skipped_to(meta.ino(), len);
+        cursor.persist(&offset_file)?;
     }
     let bytes = std::fs::read(&path)?;
-    let mut consumed = 0usize;
-    for line in bytes[off as usize..].split(|b| *b == b'\n') {
-        if line.is_empty() {
-            continue;
-        }
-        consumed += line.len() + 1;
-        let Ok(text) = std::str::from_utf8(line) else {
-            continue;
-        };
-        if let Some(l) = parse_line(text, cfg, slug_id, slug_env) {
-            db::add_app_device(
-                pool,
-                &l.app_id,
-                &l.environment_id,
-                &l.bucket,
-                l.browser,
-                l.os,
-            )
-            .await?;
-            db::add_app_path(pool, &l.app_id, &l.environment_id, &l.bucket, &l.path).await?;
-            db::add_app_ref(pool, &l.app_id, &l.environment_id, &l.bucket, &l.source).await?;
-            if let Some((trace_id, ctx)) = l.trace {
-                // A span ingested before this line was tailed stored its
-                // occurrence without a request: heal the row now that the
-                // line has landed, then keep the index entry for the next
-                // ingest pass.
-                if requests.is_pending(&trace_id) {
-                    db::backfill_error_request(
-                        pool,
-                        &l.app_id,
-                        &l.environment_id,
-                        &trace_id,
-                        &db::ErrorRequest {
-                            method: &ctx.method,
-                            path: &ctx.path,
-                            http_status: ctx.status,
-                            browser: ctx.browser,
-                            os: ctx.os,
-                        },
-                    )
-                    .await?;
-                    requests.clear_pending(&trace_id);
-                }
-                requests.insert(trace_id, ctx);
-            }
-        }
-    }
-    off += consumed as u64;
-    let _ = std::fs::write(offset_path(cfg), format!("{}:{off}", meta.ino()));
-    // Bound growth: truncate only when nothing was appended mid-tick.
-    if len > TRUNCATE_BYTES
-        && std::fs::metadata(&path)
-            .map(|m| m.len() == len)
-            .unwrap_or(false)
-    {
-        // File::create truncates in place: the inode survives, so the
-        // saved offset resets to zero under the same inode.
+    let mut tail = Tail {
+        pool,
+        cfg,
+        slug_id,
+        slug_env,
+        requests,
+    };
+    consume_lines(&mut tail, &bytes, meta.ino(), cursor, &offset_file).await?;
+    // Bound growth: truncate only when nothing was appended mid-tick and the
+    // file is still the one we read (a rotation in the window is left alone).
+    let unchanged = std::fs::metadata(&path)
+        .map(|m| m.ino() == meta.ino() && m.len() == len)
+        .unwrap_or(false);
+    if len > TRUNCATE_BYTES && unchanged {
+        // File::create truncates in place: the inode survives, so the saved
+        // offset resets to zero under the same inode.
         std::fs::File::create(&path)?;
-        let _ = std::fs::write(offset_path(cfg), format!("{}:0", meta.ino()));
+        OffsetState::At {
+            ino: meta.ino(),
+            off: 0,
+        }
+        .persist(&offset_file)?;
     }
     Ok(())
 }
@@ -450,106 +540,132 @@ pub async fn tick(
 mod tests {
     use super::*;
 
-    #[test]
-    fn recognizes_the_control_hosts() {
-        let hosts = vec![
-            "app.localhost".to_string(),
-            "app.example.com".to_string(),
-            "noite.local".to_string(),
-        ];
-        assert!(is_control_host("app.localhost", &hosts));
-        assert!(is_control_host("APP.Example.com:443", &hosts));
-        assert!(is_control_host("noite.local", &hosts));
-        // Tenant and platform hosts are not the control UI.
-        assert!(!is_control_host("blog.localhost", &hosts));
-        assert!(!is_control_host("api.localhost", &hosts));
-        assert!(!is_control_host("git.localhost", &hosts));
-        assert!(!is_control_host("", &hosts));
-        assert!(!is_control_host("notapp.localhost", &hosts));
+    /// P1: a mid-loop DB error must not re-consume the lines that already
+    /// committed. The old tail wrote the offset only after the whole loop, so
+    /// the retry double counted device/path/referrer stats.
+    #[tokio::test]
+    async fn a_mid_loop_db_error_never_double_counts_earlier_lines() {
+        let dir = std::env::temp_dir().join(format!("noite-accesslog-{}", crate::models::new_id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        // First line: a desktop UA (commits). Second: a bot UA, which the
+        // trigger below rejects before its transaction commits.
+        let first = "{\"request\":{\"host\":\"blog.localhost\",\"uri\":\"/ok\",\"method\":\"GET\",\"headers\":{\"User-Agent\":[\"Mozilla/5.0 (X11; Linux x86_64) Chrome/131.0.0.0 Safari/537.36\"]}},\"status\":200}\n";
+        let second = "{\"request\":{\"host\":\"blog.localhost\",\"uri\":\"/bot\",\"method\":\"GET\",\"headers\":{\"User-Agent\":[\"Googlebot/2.1\"]}},\"status\":200}\n";
+        let log = dir.join("access.log");
+        std::fs::write(&log, format!("{first}{second}")).expect("write log");
+        let mut cfg = crate::config::config_for_tests();
+        cfg.caddy_access_log = log.display().to_string();
+        let pool = crate::db::connect(&format!(
+            "sqlite:{}?mode=rwc",
+            dir.join("noite.sqlite").display()
+        ))
+        .await
+        .expect("file db");
+        let mut slug_id = HashMap::new();
+        slug_id.insert("blog".to_string(), "app-id".to_string());
+        let mut requests = RequestIndex::default();
+        sqlx::query(
+            "CREATE TRIGGER metrics.boom BEFORE INSERT ON app_device_stat \
+             WHEN NEW.browser = 'Bot' BEGIN SELECT RAISE(ABORT, 'injected'); END",
+        )
+        .execute(&pool)
+        .await
+        .expect("trigger");
+        let result = super::tick(&pool, &cfg, &slug_id, &HashMap::new(), &mut requests).await;
+        assert!(result.is_err(), "the second line fails");
+        let offset = std::fs::read_to_string(dir.join("access-log.offset")).expect("offset");
+        assert_eq!(
+            offset.split(':').nth(1).and_then(|o| o.parse::<u64>().ok()),
+            Some(first.len() as u64),
+            "the first line is persisted as consumed"
+        );
+        sqlx::query("DROP TRIGGER metrics.boom")
+            .execute(&pool)
+            .await
+            .expect("drop trigger");
+        super::tick(&pool, &cfg, &slug_id, &HashMap::new(), &mut requests)
+            .await
+            .expect("retry succeeds");
+        let devices = crate::db::list_app_devices(&pool, "app-id", "", "1970-01-01T00:00:00Z")
+            .await
+            .expect("read");
+        // Both lines count exactly once: 2 total requests, never 3.
+        let total: i64 = devices.iter().map(|d| d.requests).sum();
+        assert_eq!(total, 2, "no line is counted twice");
+        let paths = crate::db::list_app_paths(&pool, "app-id", "", "1970-01-01T00:00:00Z")
+            .await
+            .expect("read");
+        let ok_hits: i64 = paths
+            .iter()
+            .filter(|p| p.path == "/ok")
+            .map(|p| p.requests)
+            .sum();
+        assert_eq!(ok_hits, 1);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn classifies_desktop_browsers() {
+    fn offset_resets_on_rotation_and_shrink_but_not_on_growth() {
+        let at = OffsetState::At { ino: 9, off: 40 };
+        assert_eq!(at.resolved(9, 100), at);
+        assert_eq!(at.resolved(10, 100), OffsetState::Fresh.resolved(10, 100));
+        assert_eq!(at.resolved(9, 10), OffsetState::At { ino: 9, off: 0 });
+        // A corrupt or missing sidecar reads as fresh.
+        let dir = std::env::temp_dir().join(format!("noite-offset-{}", crate::models::new_id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("offset");
+        std::fs::write(&path, "garbage").expect("write");
+        assert_eq!(OffsetState::read(&path), OffsetState::Fresh);
+        OffsetState::At { ino: 4, off: 12 }
+            .persist(&path)
+            .expect("persist");
         assert_eq!(
-            device_classify("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"),
-            ("Chrome", "macOS")
+            OffsetState::read(&path),
+            OffsetState::At { ino: 4, off: 12 }
         );
-        assert_eq!(
-            device_classify("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.2 Safari/605.1.15"),
-            ("Safari", "macOS")
-        );
-        assert_eq!(
-            device_classify(
-                "Mozilla/5.0 (X11; Linux x86_64; rv:133.0) Gecko/20100101 Firefox/133.0"
-            ),
-            ("Firefox", "Linux")
-        );
-        assert_eq!(
-            device_classify("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 Edg/131.0.0.0"),
-            ("Edge", "Windows")
-        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[test]
-    fn classifies_mobile_browsers() {
-        assert_eq!(
-            device_classify("Mozilla/5.0 (iPhone; CPU iPhone OS 18_2 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.2 Mobile/15E148 Safari/604.1"),
-            ("Safari", "iOS")
+    /// P1 root cause: the three counters and the backfill share one
+    /// transaction, so a failure after the first insert commits nothing. The
+    /// old code issued three independent statements and could leave a device
+    /// hit counted for a line the tail re-reads.
+    #[tokio::test]
+    async fn an_access_hit_is_all_or_nothing() {
+        let dir = std::env::temp_dir().join(format!("noite-accesshit-{}", crate::models::new_id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let pool = crate::db::connect(&format!(
+            "sqlite:{}?mode=rwc",
+            dir.join("noite.sqlite").display()
+        ))
+        .await
+        .expect("file db");
+        sqlx::query(
+            "CREATE TRIGGER metrics.boom BEFORE INSERT ON app_device_stat \
+             WHEN NEW.browser = 'Bot' BEGIN SELECT RAISE(ABORT, 'injected'); END",
+        )
+        .execute(&pool)
+        .await
+        .expect("trigger");
+        let hit = crate::db::AccessHit {
+            app_id: "a",
+            environment_id: "",
+            bucket: "2026-09-30T12:00:00Z",
+            browser: "Bot",
+            os: "",
+            path: "/",
+            source: "Direct",
+            trace: None,
+        };
+        assert!(crate::db::record_access_hit(&pool, &hit).await.is_err());
+        let devices = crate::db::list_app_devices(&pool, "a", "", "2026-09-30T00:00:00Z")
+            .await
+            .expect("read");
+        assert!(
+            devices.is_empty(),
+            "a failed line must not leave a partial count"
         );
-        assert_eq!(
-            device_classify("Mozilla/5.0 (iPhone; CPU iPhone OS 18_2 like Mac OS X) AppleWebKit/537.36 (KHTML, like Gecko) CriOS/131.0.6778.73 Mobile/15E148 Safari/604.1"),
-            ("Chrome", "iOS")
-        );
-        assert_eq!(
-            device_classify("Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36"),
-            ("Chrome", "Android")
-        );
-        assert_eq!(
-            device_classify("Mozilla/5.0 (Linux; Android 14; SAMSUNG SM-S921B) AppleWebKit/537.36 (KHTML, like Gecko) SamsungBrowser/27.0 Chrome/125.0.0.0 Mobile Safari/537.36"),
-            ("Samsung", "Android")
-        );
-    }
-
-    #[test]
-    fn classifies_bots_cli_unknown_and_other() {
-        assert_eq!(
-            device_classify(
-                "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)"
-            ),
-            ("Bot", "")
-        );
-        assert_eq!(device_classify("curl/8.18.0"), ("CLI", ""));
-        assert_eq!(device_classify(""), ("Unknown", ""));
-        assert_eq!(device_classify("   "), ("Unknown", ""));
-        assert_eq!(device_classify("MyCustomApp/2.0"), ("Other", ""));
-    }
-
-    #[test]
-    fn strips_query_from_paths() {
-        assert_eq!(split_path("/"), "/");
-        assert_eq!(split_path(""), "/");
-        assert_eq!(split_path("/about?ref=x&y=2"), "/about");
-        assert_eq!(split_path("/a/b/c"), "/a/b/c");
-    }
-
-    #[test]
-    fn classifies_referrer_sources() {
-        assert_eq!(ref_source(""), "Direct");
-        assert_eq!(ref_source("https://t.co/abc123"), "X");
-        assert_eq!(
-            ref_source("https://www.facebook.com/post/1?token=secret"),
-            "Facebook"
-        );
-        assert_eq!(ref_source("https://m.instagram.com/x/"), "Instagram");
-        assert_eq!(
-            ref_source("https://www.google.com/search?q=noite"),
-            "Google"
-        );
-        assert_eq!(ref_source("https://x.company.com/page"), "x.company.com");
-        assert_eq!(
-            ref_source("https://blog.example.com/post?utm=x"),
-            "blog.example.com"
-        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 

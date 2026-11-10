@@ -7,7 +7,7 @@
 //! [`TelemetryEvent`] below, and only ever counts. Nothing here is on the boot
 //! critical path — the scheduler is spawned after the REST listener binds.
 //!
-//! The decision inputs are pure and testable with no network (`should_send`,
+//! The decision inputs are pure and testable with no network (`TelemetryPhase`,
 //! `Config::telemetry_lock_reason`, `build_event`, `users_bucket`,
 //! `storage_kind`); the two network legs — the control worker's user count and
 //! PostHog itself — have hard timeouts and never fail anything.
@@ -139,22 +139,130 @@ pub fn storage_kind(s3_endpoint: &str) -> &'static str {
     }
 }
 
-/// Whether a tick at `now` should send: the preference is on, nothing locks it,
-/// and the last successful send is absent or at least a day old. Locked beats
-/// everything, including a due window.
-pub fn should_send(
-    now: DateTime<Utc>,
-    last_sent: Option<DateTime<Utc>>,
-    enabled: bool,
-    locked: bool,
-) -> bool {
-    if locked || !enabled {
-        return false;
+/// The heartbeat's gating lifecycle: the same switch shape as the update
+/// check.
+///
+/// stateDiagram-v2
+///   [*] --> Disabled: stored "0"
+///   [*] --> Locked: env/local-domain lock
+///   [*] --> NeverSent: enabled, no successful send
+///   NeverSent --> Sent: SendOk(now)
+///   Sent --> Sent: SendOk(now)
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TelemetryState {
+    Disabled,
+    Locked {
+        reason: String,
+    },
+    NeverSent,
+    /// A successful send was recorded; its timestamp lives in `last_sent_at`.
+    Sent,
+}
+
+/// The switch plus its derived state. `due`, the admin status and the
+/// scheduler all read this one value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TelemetryPhase {
+    switch: crate::host::opt_out::OptOutSwitch,
+    state: TelemetryState,
+    /// The stored `telemetry_last_sent_at`, shown verbatim (the admin status
+    /// reported it even while disabled or locked).
+    last_sent_at: Option<String>,
+}
+
+impl TelemetryPhase {
+    pub fn from_settings(
+        stored: Option<&str>,
+        lock: Option<&str>,
+        last_sent: Option<&str>,
+    ) -> Self {
+        let switch = crate::host::opt_out::OptOutSwitch::from_setting(stored, lock);
+        let state = if let Some(reason) = switch.lock_reason() {
+            TelemetryState::Locked {
+                reason: reason.to_string(),
+            }
+        } else if !switch.setting() {
+            TelemetryState::Disabled
+        } else {
+            match last_sent {
+                Some(raw) if crate::host::opt_out::parse_iso(raw).is_some() => TelemetryState::Sent,
+                _ => TelemetryState::NeverSent,
+            }
+        };
+        Self {
+            switch,
+            state,
+            last_sent_at: last_sent.map(str::to_string),
+        }
     }
-    match last_sent {
-        None => true,
-        Some(at) => now.signed_duration_since(at) >= chrono::Duration::hours(RESEND_AFTER_HOURS),
+
+    pub fn setting(&self) -> bool {
+        self.switch.setting()
     }
+
+    pub fn enabled(&self) -> bool {
+        self.switch.enabled()
+    }
+
+    pub fn locked(&self) -> bool {
+        self.switch.lock_reason().is_some()
+    }
+
+    pub fn lock_reason(&self) -> Option<&str> {
+        self.switch.lock_reason()
+    }
+
+    pub fn last_sent_at(&self) -> Option<&str> {
+        self.last_sent_at.as_deref()
+    }
+
+    #[cfg(test)]
+    pub fn state_label(&self) -> &'static str {
+        match self.state {
+            TelemetryState::Disabled => "disabled",
+            TelemetryState::Locked { .. } => "locked",
+            TelemetryState::NeverSent => "never-sent",
+            TelemetryState::Sent => "sent",
+        }
+    }
+
+    /// Whether a tick at `now` sends: enabled and the last success is absent
+    /// or at least a day old.
+    pub fn due(&self, now: DateTime<Utc>) -> bool {
+        let last = self
+            .last_sent_at
+            .as_deref()
+            .and_then(crate::host::opt_out::parse_iso);
+        self.switch.due(last, now, RESEND_AFTER_HOURS)
+    }
+}
+
+/// The effective state for the admin surface. The preview is the payload a
+/// send right now would POST, so it carries a live user count (bounded).
+pub async fn status(
+    pool: &SqlitePool,
+    cfg: &Config,
+    started_at: DateTime<Utc>,
+) -> anyhow::Result<TelemetryStatus> {
+    let now = Utc::now();
+    let stored = db::get_setting(pool, db::TELEMETRY_ENABLED).await?;
+    let last = db::get_setting(pool, db::TELEMETRY_LAST_SENT_AT).await?;
+    let phase = TelemetryPhase::from_settings(
+        stored.as_deref(),
+        cfg.telemetry_lock_reason(),
+        last.as_deref(),
+    );
+    let users = control_users(cfg).await;
+    let facts = gather(pool, cfg, started_at, now, users).await?;
+    Ok(TelemetryStatus {
+        enabled: phase.enabled(),
+        setting: phase.setting(),
+        locked: phase.locked(),
+        lock_reason: phase.lock_reason().map(str::to_string),
+        last_sent_at: phase.last_sent_at().map(str::to_string),
+        install_id: facts.install_id.clone(),
+        preview: build_event(&facts),
+    })
 }
 
 /// The Noite version baked into the image (`NOITE_BUILD_VERSION` ENV, set by
@@ -209,16 +317,13 @@ pub fn build_event(facts: &Facts) -> TelemetryEvent {
 /// lock, and the last successful send. No network.
 pub async fn due(pool: &SqlitePool, cfg: &Config, now: DateTime<Utc>) -> sqlx::Result<bool> {
     let stored = db::get_setting(pool, db::TELEMETRY_ENABLED).await?;
-    let enabled = stored.as_deref() != Some("0");
-    let last_sent = db::get_setting(pool, db::TELEMETRY_LAST_SENT_AT)
-        .await?
-        .and_then(|raw| parse_iso(&raw));
-    Ok(should_send(
-        now,
-        last_sent,
-        enabled,
-        cfg.telemetry_lock_reason().is_some(),
-    ))
+    let last = db::get_setting(pool, db::TELEMETRY_LAST_SENT_AT).await?;
+    let phase = TelemetryPhase::from_settings(
+        stored.as_deref(),
+        cfg.telemetry_lock_reason(),
+        last.as_deref(),
+    );
+    Ok(phase.due(now))
 }
 
 /// Gather the heartbeat facts: SQLite counts, the clocks, and the env/domain
@@ -233,7 +338,7 @@ pub async fn gather(
 ) -> anyhow::Result<Facts> {
     let (install_id, installed_at) = db::ensure_identity(pool).await?;
     let counts = counts(pool, now).await?;
-    let install_age_days = parse_iso(&installed_at)
+    let install_age_days = crate::host::opt_out::parse_iso(&installed_at)
         .map(|installed| now.signed_duration_since(installed).num_days().max(0))
         .unwrap_or(0);
     Ok(Facts {
@@ -378,13 +483,6 @@ async fn counts(pool: &SqlitePool, now: DateTime<Utc>) -> sqlx::Result<Counts> {
     .await
 }
 
-/// An RFC3339 stamp as UTC; an unparsable one (hand-edited row) reads as never.
-fn parse_iso(raw: &str) -> Option<DateTime<Utc>> {
-    DateTime::parse_from_rfc3339(raw)
-        .ok()
-        .map(|t| t.with_timezone(&Utc))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -429,31 +527,53 @@ mod tests {
         assert_eq!(storage_kind("http://127.0.0.1:9000"), "external");
     }
 
+    /// `lastSentAt` stays visible while disabled or locked, as before.
     #[test]
-    fn should_send_honours_opt_out_lock_and_the_day_window() {
-        let now = DateTime::parse_from_rfc3339("2026-10-06T12:00:00Z")
-            .expect("now")
-            .with_timezone(&Utc);
-        let hours = |h: i64| now - chrono::Duration::hours(h);
+    fn last_sent_survives_disabled_and_locked_states() {
+        let stamp = "2026-10-01T00:00:00.000Z";
+        for phase in [
+            TelemetryPhase::from_settings(Some("0"), None, Some(stamp)),
+            TelemetryPhase::from_settings(None, Some("DO_NOT_TRACK"), Some(stamp)),
+        ] {
+            assert_eq!(phase.last_sent_at(), Some(stamp));
+        }
+    }
 
-        assert!(should_send(now, None, true, false), "never sent, enabled");
+    #[test]
+    fn phase_honours_opt_out_lock_and_the_day_window() {
+        let now = Utc::now();
+        let hours = |h: i64| (now - chrono::Duration::hours(h)).to_rfc3339();
+        let phase = |stored: Option<&str>, lock: Option<&str>, last: Option<&str>| {
+            TelemetryPhase::from_settings(stored, lock, last)
+        };
+        assert!(phase(None, None, None).due(now), "never sent, enabled");
         assert!(
-            should_send(now, Some(hours(24)), true, false),
-            "24 h is due"
+            phase(None, None, Some(&hours(24))).due(now),
+            "a day old is due"
         );
         assert!(
-            should_send(now, Some(hours(30)), true, false),
-            "past the window is due"
+            phase(None, None, Some(&hours(30))).due(now),
+            "overdue is due"
         );
-        assert!(!should_send(now, Some(hours(23)), true, false), "too soon");
+        assert!(!phase(None, None, Some(&hours(23))).due(now), "too soon");
+        assert!(!phase(None, None, Some(&hours(1))).due(now), "too soon");
         assert!(
-            !should_send(now, Some(hours(1)), true, false),
-            "much too soon"
+            !phase(Some("0"), None, None).due(now),
+            "opt-out never sends"
         );
-        assert!(!should_send(now, None, false, false), "opt-out never sends");
-        assert!(!should_send(now, None, true, true), "locked never sends");
-        // The lock beats a due window.
-        assert!(!should_send(now, Some(hours(48)), true, true));
+        assert!(
+            !phase(None, Some("DO_NOT_TRACK"), None).due(now),
+            "locked never sends"
+        );
+        assert!(!phase(None, Some("DO_NOT_TRACK"), Some(&hours(48))).due(now));
+        // The derived states are exhaustive.
+        assert_eq!(phase(None, None, None).state_label(), "never-sent");
+        assert_eq!(phase(None, None, Some(&hours(1))).state_label(), "sent");
+        assert_eq!(
+            phase(None, Some("DO_NOT_TRACK"), None).state_label(),
+            "locked"
+        );
+        assert_eq!(phase(Some("0"), None, None).state_label(), "disabled");
     }
 
     /// The body must match the contract's property keys exactly, including the

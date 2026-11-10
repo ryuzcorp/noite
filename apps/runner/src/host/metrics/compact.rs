@@ -1,6 +1,8 @@
 //! Durable compaction (spec T3.5) of completed hours, and the watermark that
 //! keeps it from running twice.
 
+use std::collections::HashMap;
+
 use sqlx::SqlitePool;
 
 use crate::config::Config;
@@ -182,11 +184,113 @@ async fn copy_union(
     Ok(())
 }
 
-/// Completed, uncompacted hours in `(done, current)`, oldest first.
-/// `done` is the durable watermark (exclusive), `current` the running hour
-/// (exclusive — never compact it). Bounded so one pass cannot name the whole
-/// retention after a long outage; unparseable input compacts nothing.
-pub(super) fn uncompacted_hours(done: Option<&String>, current: &str, cfg: &Config) -> Vec<String> {
+/// One completed hour's durable compaction state. The unit of progress is the
+/// hour, not a per-fleet high-water mark: a failed hour can never be skipped,
+/// because only *that hour* is marked when its fold succeeds.
+///
+/// stateDiagram-v2
+///   [*] --> Pending
+///   Pending --> Compacted: fold ok
+///   Pending --> Failed: fold error
+///   Failed --> Pending: retry window elapsed
+///   Failed --> Compacted: fold ok on retry
+#[derive(Debug, Clone, Default)]
+pub(super) struct CompactionState {
+    hours: HashMap<String, HourState>,
+    /// The newest hour of the contiguous compacted run. Compaction schedules
+    /// from `done + 1` and stops at the first hour that is not ready, so a
+    /// failure can never be jumped over.
+    done: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum HourState {
+    Compacted,
+    /// The fold failed; retried once this instant has passed. An hour in this
+    /// state is never treated as done.
+    Failed {
+        retry_at: std::time::Instant,
+    },
+}
+
+/// How long a failed hour waits before the next attempt. Same shape as the
+/// ingest backoff: long enough that a broken bucket does not burn every pass,
+/// short enough that a transient S3/DuckDB error heals within minutes.
+const COMPACTION_RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_secs(120);
+
+impl CompactionState {
+    /// Restore the durable per-hour marks loaded at boot.
+    pub(super) fn restored(hours: impl IntoIterator<Item = String>) -> Self {
+        let hours: HashMap<String, HourState> = hours
+            .into_iter()
+            .map(|hour| (hour, HourState::Compacted))
+            .collect();
+        let done = hours.keys().max().cloned();
+        Self { hours, done }
+    }
+
+    fn next_after(done: &str) -> Option<String> {
+        chrono::NaiveDateTime::parse_from_str(&format!("{done}:00:00"), "%Y/%m/%d/%H:%M:%S")
+            .ok()
+            .and_then(|at| at.checked_add_signed(chrono::Duration::hours(1)))
+            .map(|at| at.format("%Y/%m/%d/%H").to_string())
+    }
+
+    fn is_due(&self, hour: &str, now: std::time::Instant) -> bool {
+        match self.hours.get(hour) {
+            None => true,
+            Some(HourState::Compacted) => false,
+            Some(HourState::Failed { retry_at }) => retry_at <= &now,
+        }
+    }
+
+    /// Transition `Pending -> Compacted`. The cursor advances only when the
+    /// folded hour is exactly the next one, so a write can never skip an
+    /// earlier hour.
+    fn folded(&mut self, hour: &str) {
+        let earlier = self.hours.keys().any(|h| h.as_str() < hour);
+        self.hours.insert(hour.to_string(), HourState::Compacted);
+        let advances = match &self.done {
+            Some(done) => Self::next_after(done).as_deref() == Some(hour),
+            // A first fold only opens the cursor when nothing earlier is
+            // still tracked (a failed earlier hour must stay ahead of it).
+            None => !earlier,
+        };
+        if advances {
+            self.done = Some(hour.to_string());
+        }
+    }
+
+    /// Transition `Pending -> Failed`. A failed hour is retried after
+    /// [`COMPACTION_RETRY_BACKOFF`]; it never becomes `Compacted`.
+    fn failed(&mut self, hour: &str, now: std::time::Instant) {
+        self.hours.insert(
+            hour.to_string(),
+            HourState::Failed {
+                retry_at: now + COMPACTION_RETRY_BACKOFF,
+            },
+        );
+    }
+
+    /// Drop marks older than the retention window (they can never be due).
+    fn prune_before(&mut self, hour: &str) {
+        self.hours.retain(|h, _| h.as_str() >= hour);
+        if self.done.as_deref().is_some_and(|done| done < hour) {
+            self.done = Some(hour.to_string());
+        }
+    }
+}
+
+/// Completed hours that still need a fold, oldest first. Scheduling starts
+/// after the contiguous `done` cursor (or the last 25 hours on a fresh fleet)
+/// and stops at the first non-ready hour: a failed hour blocks the hours
+/// behind it until its retry, so the cursor can never skip it. Bounded so one
+/// pass cannot name the whole retention; unparseable input compacts nothing.
+pub(super) fn uncompacted_hours(
+    state: &CompactionState,
+    current: &str,
+    cfg: &Config,
+) -> Vec<String> {
     let parse = |h: &str| {
         chrono::NaiveDateTime::parse_from_str(&format!("{h}:00:00"), "%Y/%m/%d/%H:%M:%S").ok()
     };
@@ -195,23 +299,49 @@ pub(super) fn uncompacted_hours(done: Option<&String>, current: &str, cfg: &Conf
     };
     let floor =
         chrono::Utc::now().naive_utc() - chrono::Duration::days(cfg.telemetry_retention_days);
-    let mut start = match done.and_then(|d| parse(d)) {
-        Some(d) => d + chrono::Duration::hours(1),
-        // No watermark: only the recent past, not the whole retention.
+    let mut start = match state.done.as_deref().and_then(parse) {
+        Some(done) => done + chrono::Duration::hours(1),
+        // No mark: only the recent past, not the whole retention.
         None => current_dt - chrono::Duration::hours(25),
     };
     if start < floor {
         start = floor;
     }
+    let now = std::time::Instant::now();
     let mut hours = Vec::new();
     while start < current_dt && hours.len() < 48 {
-        hours.push(start.format("%Y/%m/%d/%H").to_string());
+        let hour = start.format("%Y/%m/%d/%H").to_string();
+        if state.hours.get(&hour) == Some(&HourState::Compacted) {
+            // Already folded (only possible below a restored cursor).
+        } else if state.is_due(&hour, now) {
+            hours.push(hour);
+        } else {
+            // A failed hour is backing off: later hours wait their turn.
+            break;
+        }
         let Some(next) = start.checked_add_signed(chrono::Duration::hours(1)) else {
             break;
         };
         start = next;
     }
     hours
+}
+
+/// Transition `Pending -> Failed` for one hour: it is retried after the
+/// backoff and, crucially, is not marked compacted.
+pub(super) fn mark_failed(state: &mut MetricsState, slug: &str, hour: &str) {
+    state
+        .compacted
+        .entry(slug.to_string())
+        .or_default()
+        .failed(hour, std::time::Instant::now());
+}
+
+/// Drop in-memory marks that fell out of the retention window.
+pub(super) fn prune_marks(state: &mut MetricsState, oldest_hour: &str) {
+    for fleet in state.compacted.values_mut() {
+        fleet.prune_before(oldest_hour);
+    }
 }
 
 pub(super) async fn mark_compacted(
@@ -224,14 +354,11 @@ pub(super) async fn mark_compacted(
         tracing::warn!(error = %e, "compaction mark");
         return;
     }
-    let newer = state
+    state
         .compacted
-        .get(slug)
-        .map(|h| h.as_str() < hour)
-        .unwrap_or(true);
-    if newer {
-        state.compacted.insert(slug.to_string(), hour.to_string());
-    }
+        .entry(slug.to_string())
+        .or_default()
+        .folded(hour);
 }
 
 #[cfg(test)]
@@ -251,12 +378,78 @@ mod tests {
         let hour = |dt: chrono::NaiveDateTime| dt.format("%Y/%m/%d/%H").to_string();
         let current = hour(now);
         let done = hour(now - chrono::Duration::hours(2));
-        // Watermarked two hours back → only the previous hour is pending.
-        let hours = uncompacted_hours(Some(&done), &current, &cfg);
-        assert_eq!(hours, vec![hour(now - chrono::Duration::hours(1))]);
-        // Caught up: nothing pending, and garbage input compacts nothing.
-        assert!(uncompacted_hours(Some(&current), &current, &cfg).is_empty());
-        assert!(uncompacted_hours(None, "not-an-hour", &cfg).is_empty());
+        let mut state = CompactionState::default();
+        state.folded(&done);
+        // Compacted two hours back → only the previous hour is pending; a
+        // marked hour is never named again.
+        assert_eq!(
+            uncompacted_hours(&state, &current, &cfg),
+            vec![hour(now - chrono::Duration::hours(1))]
+        );
+        state.folded(&hour(now - chrono::Duration::hours(1)));
+        assert!(uncompacted_hours(&state, &current, &cfg).is_empty());
+        // Garbage input compacts nothing.
+        assert!(uncompacted_hours(&state, "not-an-hour", &cfg).is_empty());
+    }
+
+    /// P1: a failed hour must never be skipped because a later hour folded.
+    /// The old per-fleet watermark advanced past the failure, so `h` was
+    /// never revisited. Per-hour state keeps `h` due and only marks `h + 1`.
+    #[test]
+    fn a_failed_hour_stays_due_when_a_later_hour_folds() {
+        let _env = crate::config::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let cfg = crate::config::Config::from_env().expect("config");
+        let now = chrono::Utc::now().naive_utc();
+        let hour = |dt: chrono::NaiveDateTime| dt.format("%Y/%m/%d/%H").to_string();
+        let current = hour(now);
+        let failed = hour(now - chrono::Duration::hours(2));
+        let later = hour(now - chrono::Duration::hours(1));
+        let mut state = CompactionState::default();
+        state.failed(&failed, std::time::Instant::now());
+        state.folded(&later);
+        // The failed hour is retried once its backoff elapses; the folded
+        // hour is never named.
+        let pending = uncompacted_hours(&state, &current, &cfg);
+        assert!(!pending.contains(&later), "{pending:?}");
+        // Backoff elapses (injected by rebuilding the failure with a past
+        // retry instant through the same transition).
+        state.hours.insert(
+            failed.clone(),
+            HourState::Failed {
+                retry_at: std::time::Instant::now(),
+            },
+        );
+        assert!(uncompacted_hours(&state, &current, &cfg).contains(&failed));
+    }
+
+    /// Folding an hour only marks that hour: an older failed hour is still
+    /// pending, and a gap below the newest mark is revisited.
+    #[test]
+    fn folding_never_advances_a_watermark_past_a_gap() {
+        let _env = crate::config::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let cfg = crate::config::Config::from_env().expect("config");
+        let now = chrono::Utc::now().naive_utc();
+        let hour = |dt: chrono::NaiveDateTime| dt.format("%Y/%m/%d/%H").to_string();
+        let current = hour(now);
+        let gap = hour(now - chrono::Duration::hours(3));
+        let older = hour(now - chrono::Duration::hours(4));
+        let mut state = CompactionState::default();
+        state.folded(&older);
+        state.folded(&hour(now - chrono::Duration::hours(2)));
+        state.folded(&hour(now - chrono::Duration::hours(1)));
+        let pending = uncompacted_hours(&state, &current, &cfg);
+        assert!(
+            pending.contains(&gap),
+            "the hole below the newest mark is due"
+        );
+        assert!(
+            !pending.contains(&hour(now - chrono::Duration::hours(1))),
+            "a compacted hour is never scheduled again"
+        );
     }
 
     #[test]

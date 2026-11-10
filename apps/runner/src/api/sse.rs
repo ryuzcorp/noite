@@ -32,14 +32,139 @@ pub(crate) const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(10);
 /// the stream.
 const MAX_QUIET_FAILURES: u32 = 3;
 
+/// A stall that lasts this long after frames have flowed ends the stream with
+/// an error (the hub treats it as retrying and reopens). Without it a wedged
+/// snapshot kept the topic open forever with no frames and no terminal state.
+pub(crate) const STALL_BUDGET: Duration = Duration::from_secs(60);
+
+/// The poll loop's explicit lifecycle. One event in, one transition out; the
+/// loop never branches on loose counters.
+///
+/// stateDiagram-v2
+///   [*] --> AwaitingFirst
+///   AwaitingFirst --> Streaming: Frame
+///   AwaitingFirst --> AwaitingFirst: PollFailed
+///   AwaitingFirst --> Ended: first-frame budget spent
+///   Streaming --> Streaming: Frame / PollFailed
+///   Streaming --> Degraded: PollFailed (no frame for MAX_QUIET_FAILURES)
+///   Degraded --> Streaming: Frame
+///   Degraded --> Degraded: PollFailed
+///   Degraded --> Ended: STALL_BUDGET spent with no frame
+///   Ended --> [*]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum StreamPhase {
+    AwaitingFirst { started: Instant },
+    Streaming,
+    Degraded { since: Instant, failures: u32 },
+    Ended,
+}
+
+#[derive(Debug)]
+pub(crate) enum StreamEvent {
+    Snapshot(Option<String>),
+    PollFailed(&'static str),
+    ClientGone,
+}
+
+/// What the loop does with one transition.
+#[derive(Debug, Default)]
+pub(crate) struct Step {
+    pub(crate) frame: Option<String>,
+    pub(crate) end: Option<anyhow::Error>,
+    pub(crate) warn: Option<(u32, &'static str)>,
+}
+
+pub(crate) struct StreamMachine {
+    phase: StreamPhase,
+    last: Option<String>,
+}
+
+impl StreamMachine {
+    pub(crate) fn new() -> Self {
+        Self {
+            phase: StreamPhase::AwaitingFirst {
+                started: Instant::now(),
+            },
+            last: None,
+        }
+    }
+
+    pub(crate) fn on(
+        mut self,
+        event: StreamEvent,
+        now: Instant,
+        first_budget: Duration,
+        stall_budget: Duration,
+    ) -> (Self, Step) {
+        let mut step = Step::default();
+        let phase = match event {
+            StreamEvent::Snapshot(Some(data)) => {
+                if self.last.as_ref() != Some(&data) {
+                    step.frame = Some(data.clone());
+                }
+                self.last = Some(data);
+                StreamPhase::Streaming
+            }
+            ev @ (StreamEvent::Snapshot(None) | StreamEvent::PollFailed(_)) => {
+                let kind = match ev {
+                    StreamEvent::PollFailed(kind) => kind,
+                    _ => "failed",
+                };
+                match self.phase {
+                    StreamPhase::AwaitingFirst { started } => {
+                        step.warn = Some((1, kind));
+                        if now.duration_since(started) >= first_budget {
+                            step.end = Some(anyhow::anyhow!(
+                                "stream: no first frame within {first_budget:?}"
+                            ));
+                            StreamPhase::Ended
+                        } else {
+                            StreamPhase::AwaitingFirst { started }
+                        }
+                    }
+                    StreamPhase::Streaming => StreamPhase::Degraded {
+                        since: now,
+                        failures: 1,
+                    },
+                    StreamPhase::Degraded { since, failures } => {
+                        let failures = failures.saturating_add(1);
+                        step.warn = (failures == MAX_QUIET_FAILURES).then_some((failures, kind));
+                        if now.duration_since(since) >= stall_budget {
+                            step.end = Some(anyhow::anyhow!(
+                                "stream: no frame for {stall_budget:?}; ending so the client reopens"
+                            ));
+                            StreamPhase::Ended
+                        } else {
+                            StreamPhase::Degraded { since, failures }
+                        }
+                    }
+                    StreamPhase::Ended => StreamPhase::Ended,
+                }
+            }
+            StreamEvent::ClientGone => StreamPhase::Ended,
+        };
+        (
+            Self {
+                phase,
+                last: self.last,
+            },
+            step,
+        )
+    }
+
+    pub(crate) fn ended(&self) -> bool {
+        self.phase == StreamPhase::Ended
+    }
+}
+
 /// Spawn the poll loop for `scope` and return the SSE response. `snapshot`
 /// yields `Some(json)` to consider sending (only sent when it changed since
 /// the last frame) or `None` for a transient failure, which is retried on
 /// the next tick. A snapshot that hangs longer than [`SNAPSHOT_TIMEOUT`]
-/// counts as a failed poll; once frames flow, `MAX_QUIET_FAILURES` in a row
-/// warn and keep retrying, but before the first frame the stream ends with
-/// an error once the budget is spent, so a hung first snapshot surfaces as
-/// a visible, self-healing retry instead of an open, frameless stall.
+/// counts as a failed poll; a topic that produces no first frame within that
+/// budget ends with an error, and a topic that stops producing frames for
+/// [`STALL_BUDGET`] after the first one ends the same way — a visible,
+/// self-healing retry instead of an open, frameless stall.
 pub(crate) fn poll_stream<S, F>(scope: &'static str, interval: Duration, snapshot: F) -> Response
 where
     F: FnMut() -> S + Send + 'static,
@@ -61,57 +186,67 @@ where
     F: FnMut() -> S + Send + 'static,
     S: Future<Output = Option<String>> + Send + 'static,
 {
+    poll_stream_with_stall(scope, interval, snapshot_timeout, STALL_BUDGET, snapshot)
+}
+
+/// [`poll_stream_with`] with the post-first-frame stall bound explicit.
+pub(crate) fn poll_stream_with_stall<S, F>(
+    scope: &'static str,
+    interval: Duration,
+    snapshot_timeout: Duration,
+    stall_budget: Duration,
+    snapshot: F,
+) -> Response
+where
+    F: FnMut() -> S + Send + 'static,
+    S: Future<Output = Option<String>> + Send + 'static,
+{
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Event, anyhow::Error>>(16);
     crate::host::stats::sse_enter(scope);
     let mut snapshot = snapshot;
     tokio::spawn(async move {
         // `tokio::time::Instant` (not the wall clock): paused test time
-        // advances it, so the budget below is drivable without sleeps.
-        let started = Instant::now();
-        let mut last: Option<String> = None;
-        let mut sent_first = false;
-        let mut failures: u32 = 0;
+        // advances it, so the budgets below are drivable without sleeps.
+        let mut machine = StreamMachine::new();
         loop {
-            let failure: Option<&str> =
-                match tokio::time::timeout(snapshot_timeout, snapshot()).await {
-                    Ok(Some(data)) => {
-                        failures = 0;
-                        if last.as_ref() != Some(&data) {
-                            if tx
-                                .send(Ok(Event::default().data(data.clone())))
-                                .await
-                                .is_err()
-                            {
-                                break;
-                            }
-                            last = Some(data);
-                        }
-                        sent_first = true;
-                        None
-                    }
-                    Ok(None) => Some("failed"),
-                    Err(_) => Some("timed out"),
-                };
-            if let Some(kind) = failure {
-                failures += 1;
-                if !sent_first || failures == MAX_QUIET_FAILURES {
-                    tracing::warn!(scope, failures, kind, "stream snapshot produced no frame");
-                }
-                if !sent_first && started.elapsed() >= snapshot_timeout {
-                    let _ = tx
-                        .send(Err(anyhow::anyhow!(
-                            "{scope} stream: no first frame within {snapshot_timeout:?}"
-                        )))
-                        .await;
+            let event = match tokio::time::timeout(snapshot_timeout, snapshot()).await {
+                Ok(Some(data)) => StreamEvent::Snapshot(Some(data)),
+                Ok(None) => StreamEvent::PollFailed("failed"),
+                Err(_) => StreamEvent::PollFailed("timed out"),
+            };
+            let (next, step) = machine.on(event, Instant::now(), snapshot_timeout, stall_budget);
+            machine = next;
+            if let Some((failures, kind)) = step.warn {
+                tracing::warn!(scope, failures, kind, "stream snapshot produced no frame");
+            }
+            if let Some(data) = step.frame {
+                // A failed send means the client left; the send error is the
+                // only signal needed, so the loop ends without another event.
+                if tx.send(Ok(Event::default().data(data))).await.is_err() {
                     break;
                 }
+            }
+            if let Some(error) = step.end {
+                let _ = tx.send(Err(error)).await;
+                break;
+            }
+            if machine.ended() {
+                break;
             }
             // Stop promptly when the client leaves (T1.2): the send-failure
             // check above only fires on change, so an idle stream would poll
             // SQLite forever after disconnect.
             tokio::select! {
                 () = tokio::time::sleep(interval) => {}
-                () = tx.closed() => break,
+                () = tx.closed() => {
+                    let _ = machine.on(
+                        StreamEvent::ClientGone,
+                        Instant::now(),
+                        snapshot_timeout,
+                        stall_budget,
+                    );
+                    break;
+                }
             }
         }
         crate::host::stats::sse_exit(scope);
@@ -196,20 +331,47 @@ mod tests {
         );
     }
 
+    /// P1: a stream that delivered a first frame and then stops producing
+    /// frames must reach a terminal state; the old loop retried forever, so
+    /// the topic stayed open and silent.
     #[tokio::test]
-    async fn failures_after_the_first_frame_keep_the_stream_open() {
+    async fn a_stream_that_stops_delivering_ends_after_the_stall_budget() {
         tokio::time::pause();
         let mut calls = 0;
-        let response = poll_stream_with("test", TICK, BUDGET, move || {
-            calls += 1;
-            async move {
-                if calls == 1 {
-                    Some("\"frame\"".to_owned())
-                } else {
-                    None
+        let response =
+            poll_stream_with_stall("test", TICK, BUDGET, Duration::from_millis(40), move || {
+                calls += 1;
+                async move {
+                    if calls == 1 {
+                        Some("\"frame\"".to_owned())
+                    } else {
+                        None
+                    }
                 }
-            }
-        });
+            });
+        assert!(
+            drained(response).await,
+            "a stream stuck after its first frame must end, not stay open and silent"
+        );
+    }
+
+    /// A transient failure after the first frame is retried, not terminal:
+    /// the stall budget has not been spent.
+    #[tokio::test]
+    async fn failures_after_the_first_frame_are_retried() {
+        tokio::time::pause();
+        let mut calls = 0;
+        let response =
+            poll_stream_with_stall("test", TICK, BUDGET, Duration::from_secs(60), move || {
+                calls += 1;
+                async move {
+                    if calls == 1 {
+                        Some("\"frame\"".to_owned())
+                    } else {
+                        None
+                    }
+                }
+            });
         let mut frames = response.into_body().into_data_stream();
         tokio::time::advance(BUDGET + Duration::from_millis(500)).await;
         let first = frames
@@ -222,14 +384,11 @@ mod tests {
             text.contains("frame"),
             "the first frame is delivered: {text}"
         );
-        // Every later poll fails, yet the stream stays open well past the
-        // first-frame budget: `next()` is still pending when the paused
-        // clock passes ten budgets (an ended stream would yield `None`).
         assert!(
             tokio::time::timeout(BUDGET * 10, frames.next())
                 .await
                 .is_err(),
-            "failures after the first frame must keep retrying, not end the stream"
+            "a transient failure after the first frame must keep retrying"
         );
     }
 }

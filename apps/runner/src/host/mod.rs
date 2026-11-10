@@ -29,6 +29,7 @@ pub mod loop_;
 pub mod memory;
 pub mod metrics;
 pub mod netisolation;
+pub mod opt_out;
 pub mod package_manager;
 pub mod prs;
 pub mod purge;

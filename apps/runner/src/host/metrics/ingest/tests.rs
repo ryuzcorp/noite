@@ -1,5 +1,5 @@
 use super::super::new_state;
-use super::super::plan::{back_off_ingest, ingest_backed_off};
+use super::super::plan::back_off_ingest;
 use super::*;
 
 const H: i64 = 1_767_225_600_000_000; // 2026-01-01T00:00:00Z in micros
@@ -327,7 +327,9 @@ async fn a_broken_fleet_does_not_hold_the_healthy_one() {
         "the broken fleet must hold"
     );
     assert!(
-        ingest_backed_off(&state, "bad", H),
+        state
+            .ingest_cursor("bad")
+            .backing_off(std::time::Instant::now()),
         "the broken fleet backs off"
     );
     let written: Vec<(String, i64)> =

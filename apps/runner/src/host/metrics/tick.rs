@@ -16,12 +16,13 @@ use crate::host::accesslog;
 use crate::host::supervisor::{self, ProcMap};
 use crate::models::{App, AppStatus, Environment};
 
-use super::compact::{compact_fleet, hour_dir, mark_compacted, uncompacted_hours};
+use super::compact::{
+    compact_fleet, hour_dir, mark_compacted, mark_failed, prune_marks, uncompacted_hours,
+};
 use super::cpu::{otel_flush_ms, sample_cpu};
 use super::ingest::{collect_chunk_results, commit_chunk, DuckdbPass, FleetKeys};
 use super::plan::{
-    agg_lag_us, back_off_ingest, floor_hour_us, ingest_after, ingest_backed_off, plan_chunks,
-    MAX_CHUNKS_PER_PASS,
+    agg_lag_us, back_off_ingest, floor_hour_us, ingest_after, plan_chunks, MAX_CHUNKS_PER_PASS,
 };
 use super::{minute_bucket_now, now_us, MetricsState};
 
@@ -195,7 +196,7 @@ async fn ingest_step(
         }
     };
     if let Some(r) = &replay {
-        if state.replay_seen.as_deref() != Some(r.requested_at.as_str()) {
+        if state.replay.needs_rewind(&r.requested_at) {
             let floor = if r.floor_us <= 0 {
                 floor_us
             } else {
@@ -214,7 +215,7 @@ async fn ingest_step(
                 requested_at = %r.requested_at,
                 "telemetry replay started"
             );
-            state.replay_seen = Some(r.requested_at.clone());
+            state.replay = std::mem::take(&mut state.replay).rewound(&r.requested_at);
         }
     }
     let replay_slug = replay.as_ref().and_then(|r| r.slug.as_deref());
@@ -243,17 +244,18 @@ async fn ingest_step(
             if done_this_pass.contains(slug) {
                 continue;
             }
-            let Some(after) = ingest_after(
-                live(slug),
-                replay_target(slug),
-                state.watermark.get(slug).copied(),
-                cutoff,
-            ) else {
+            let cursor = state.ingest_cursor(slug);
+            let Some(after) =
+                ingest_after(live(slug), replay_target(slug), cursor.after_us(), cutoff)
+            else {
                 continue;
             };
             if let Some((from, until)) = plan_chunks(after, cutoff, floor_us, 1).into_iter().next()
             {
-                if ingest_backed_off(state, slug, from) {
+                if state
+                    .ingest_cursor(slug)
+                    .backing_off(std::time::Instant::now())
+                {
                     continue;
                 }
                 if until >= cutoff {
@@ -308,11 +310,18 @@ async fn ingest_step(
                 .all(|s| state.watermark.get(s).is_none_or(|w| *w >= hour)),
         };
         if caught_up {
-            match db::clear_telemetry_replay(pool).await {
-                Ok(()) => tracing::info!(fleets = keys.ids.len(), "telemetry replay complete"),
+            // Conditional on the request we actually ran: a replay queued
+            // between the read above and this clear stays pending.
+            match db::clear_telemetry_replay_if(pool, &r.requested_at).await {
+                Ok(true) => {
+                    tracing::info!(fleets = keys.ids.len(), "telemetry replay complete");
+                    state.replay = std::mem::take(&mut state.replay).cleared(&r.requested_at);
+                }
+                Ok(false) => {
+                    tracing::info!("a newer telemetry replay was queued; leaving it pending");
+                }
                 Err(e) => tracing::warn!(error = %e, "telemetry replay clear"),
             }
-            state.replay_seen = None;
         }
     }
     (touched, new_logs)
@@ -348,11 +357,9 @@ async fn compact_step(
     let cur_hour = hour_dir(now_us());
     let mut pending: Vec<(String, String)> = Vec::new();
     for slug in slug_id.keys() {
-        for h in uncompacted_hours(state.compacted.get(slug), &cur_hour, cfg) {
-            if state.attempted.contains(&(slug.clone(), h.clone())) {
-                continue;
-            }
-            pending.push((slug.clone(), h));
+        let fleet = state.compacted.entry(slug.clone()).or_default();
+        for hour in uncompacted_hours(fleet, &cur_hour, cfg) {
+            pending.push((slug.clone(), hour));
         }
     }
     pending.sort();
@@ -369,7 +376,7 @@ async fn compact_step(
             }
             Err(e) => {
                 tracing::warn!(slug = %slug, hour = %hour, error = %e, "telemetry compaction");
-                state.attempted.insert((slug, hour));
+                mark_failed(state, &slug, &hour);
             }
         }
     }
@@ -412,7 +419,6 @@ async fn prune_step(pool: &SqlitePool, cfg: &Config, state: &mut MetricsState) {
     if !state.tick.is_multiple_of(100) {
         return;
     }
-    state.attempted.clear();
     state
         .ingest_backoff
         .retain(|_, at| *at > std::time::Instant::now());
@@ -453,12 +459,9 @@ async fn prune_step(pool: &SqlitePool, cfg: &Config, state: &mut MetricsState) {
             tracing::info!(pruned = n, "pruned old errors");
         }
     }
-    if let Ok(n) = db::prune_compactions(
-        pool,
-        &hour_dir(now_us() - cfg.telemetry_retention_days * 86_400_000_000),
-    )
-    .await
-    {
+    let oldest_hour = hour_dir(now_us() - cfg.telemetry_retention_days * 86_400_000_000);
+    prune_marks(state, &oldest_hour);
+    if let Ok(n) = db::prune_compactions(pool, &oldest_hour).await {
         if n > 0 {
             tracing::info!(pruned = n, "pruned old compaction marks");
         }

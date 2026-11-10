@@ -208,13 +208,6 @@ pub(super) fn back_off_ingest(state: &mut MetricsState, slug: &str, from: i64) {
     );
 }
 
-pub(super) fn ingest_backed_off(state: &MetricsState, slug: &str, from: i64) -> bool {
-    state
-        .ingest_backoff
-        .get(&(slug.to_string(), from))
-        .is_some_and(|at| *at > std::time::Instant::now())
-}
-
 /// Hour-aligned windows covering `[max(after_us, floor_us), cutoff_us)`, at
 /// most `max_chunks` of them. Complete hours are `CATCHUP_CHUNK_HOURS` wide;
 /// the hour the cutoff falls in is always last and may be partial (`until_us`

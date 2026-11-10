@@ -8,7 +8,7 @@
 //! forces it off.
 //!
 //! The decision inputs are pure and unit-tested with no network
-//! (`parse_version`, `is_dev_build`, `select_update`, `should_check`); the
+//! (`parse_version`, `is_dev_build`, `select_update`, `UpdatePhase`); the
 //! one network leg — the release list — goes through `fetch_releases`, and
 //! tests inject the fetch itself (`tick`/`check_now` take it as a closure),
 //! plus the clock.
@@ -256,21 +256,101 @@ pub fn select_update<'a>(current: &str, releases: &'a [Release]) -> Option<&'a R
     best.map(|(release, _)| release)
 }
 
-/// Whether a tick at `now` fetches: the preference is on, nothing locks it,
-/// and the last successful check is absent or at least a day old. Locked
-/// beats everything, including a due window.
-pub fn should_check(
-    now: DateTime<Utc>,
-    last_check: Option<DateTime<Utc>>,
-    enabled: bool,
-    locked: bool,
-) -> bool {
-    if locked || !enabled {
-        return false;
+/// The check's gating lifecycle, derived in one place from the stored switch,
+/// the environment lock and the last successful check.
+///
+/// stateDiagram-v2
+///   [*] --> Disabled: stored "0"
+///   [*] --> Locked: NOITE_UPDATE_CHECK=off
+///   [*] --> NeverChecked: enabled, never fetched
+///   NeverChecked --> Idle: FetchOk(now)
+///   Idle --> Idle: FetchOk(now)
+///   Idle --> NeverChecked: not possible (last_at is durable)
+///   Disabled --> Idle: SetEnabled(true) after a fetch
+///   Locked --> Idle: lock removed
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum UpdateState {
+    Disabled,
+    Locked {
+        reason: String,
+    },
+    NeverChecked,
+    /// A successful check was recorded; its timestamp lives in `checked_at`.
+    Checked,
+}
+
+/// The switch plus its derived state; `due`, `status` and the settings reply
+/// all read this one value instead of re-deriving booleans.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpdatePhase {
+    switch: crate::host::opt_out::OptOutSwitch,
+    state: UpdateState,
+    /// The stored `update_check_last_at`, shown verbatim (it may predate the
+    /// current setting or be hand-edited; `due` parses it separately).
+    checked_at: Option<String>,
+}
+
+impl UpdatePhase {
+    /// Derive the state from the raw settings rows and the config lock.
+    pub fn from_settings(stored: Option<&str>, lock: Option<&str>, last: Option<&str>) -> Self {
+        let switch = crate::host::opt_out::OptOutSwitch::from_setting(stored, lock);
+        let state = if let Some(reason) = switch.lock_reason() {
+            UpdateState::Locked {
+                reason: reason.to_string(),
+            }
+        } else if !switch.setting() {
+            UpdateState::Disabled
+        } else {
+            match last {
+                Some(raw) if crate::host::opt_out::parse_iso(raw).is_some() => UpdateState::Checked,
+                _ => UpdateState::NeverChecked,
+            }
+        };
+        Self {
+            switch,
+            state,
+            checked_at: last.map(str::to_string),
+        }
     }
-    match last_check {
-        None => true,
-        Some(at) => now.signed_duration_since(at) >= chrono::Duration::hours(CHECK_AFTER_HOURS),
+
+    pub fn setting(&self) -> bool {
+        self.switch.setting()
+    }
+
+    pub fn enabled(&self) -> bool {
+        self.switch.enabled()
+    }
+
+    pub fn locked(&self) -> bool {
+        self.switch.lock_reason().is_some()
+    }
+
+    pub fn lock_reason(&self) -> Option<&str> {
+        self.switch.lock_reason()
+    }
+
+    #[cfg(test)]
+    pub fn state_label(&self) -> &'static str {
+        match self.state {
+            UpdateState::Disabled => "disabled",
+            UpdateState::Locked { .. } => "locked",
+            UpdateState::NeverChecked => "never-checked",
+            UpdateState::Checked => "checked",
+        }
+    }
+
+    pub fn checked_at(&self) -> Option<&str> {
+        self.checked_at.as_deref()
+    }
+
+    /// Whether a tick at `now` fetches: enabled and the last success is
+    /// absent or at least a day old.
+    pub fn due(&self, now: DateTime<Utc>) -> bool {
+        let last = self
+            .checked_at
+            .as_deref()
+            .and_then(crate::host::opt_out::parse_iso);
+        self.switch.due(last, now, CHECK_AFTER_HOURS)
     }
 }
 
@@ -278,16 +358,13 @@ pub fn should_check(
 /// check is opt-out), the env lock, and the last successful check. No network.
 pub async fn due(pool: &SqlitePool, cfg: &Config, now: DateTime<Utc>) -> sqlx::Result<bool> {
     let stored = db::get_setting(pool, db::UPDATE_CHECK_ENABLED).await?;
-    let enabled = stored.as_deref() != Some("0");
-    let last_check = db::get_setting(pool, db::UPDATE_CHECK_LAST_AT)
-        .await?
-        .and_then(|raw| parse_iso(&raw));
-    Ok(should_check(
-        now,
-        last_check,
-        enabled,
-        cfg.update_check_lock_reason().is_some(),
-    ))
+    let last = db::get_setting(pool, db::UPDATE_CHECK_LAST_AT).await?;
+    let phase = UpdatePhase::from_settings(
+        stored.as_deref(),
+        cfg.update_check_lock_reason(),
+        last.as_deref(),
+    );
+    Ok(phase.due(now))
 }
 
 /// GET the release list: fixed URL, fixed User-Agent, no auth, no instance
@@ -403,8 +480,12 @@ async fn status_for(
     current: &str,
 ) -> anyhow::Result<UpdateStatus> {
     let stored = db::get_setting(pool, db::UPDATE_CHECK_ENABLED).await?;
-    let setting = stored.as_deref() != Some("0");
-    let lock_reason = cfg.update_check_lock_reason().map(str::to_string);
+    let last = db::get_setting(pool, db::UPDATE_CHECK_LAST_AT).await?;
+    let phase = UpdatePhase::from_settings(
+        stored.as_deref(),
+        cfg.update_check_lock_reason(),
+        last.as_deref(),
+    );
     let cached: Option<CachedResult> = db::get_setting(pool, db::UPDATE_CHECK_RESULT)
         .await?
         .filter(|raw| !raw.is_empty())
@@ -420,13 +501,13 @@ async fn status_for(
         select_update(current, std::slice::from_ref(&probe)).is_some()
     });
     Ok(UpdateStatus {
-        enabled: setting && lock_reason.is_none(),
-        setting,
-        locked: lock_reason.is_some(),
-        lock_reason,
+        enabled: phase.enabled(),
+        setting: phase.setting(),
+        locked: phase.locked(),
+        lock_reason: phase.lock_reason().map(str::to_string),
         current: current.to_string(),
         latest: fresh.as_ref().map(|c| c.latest.clone()),
-        checked_at: db::get_setting(pool, db::UPDATE_CHECK_LAST_AT).await?,
+        checked_at: phase.checked_at().map(str::to_string),
         notes_url: fresh.as_ref().map(|c| c.notes_url.clone()),
         checking: false,
     })
@@ -494,12 +575,6 @@ pub async fn run_scheduler(pool: SqlitePool, cfg: Arc<Config>) {
         tick(&pool, &cfg, now, || fetch_releases(&client, RELEASES_URL)).await;
         tokio::time::sleep(CHECK_INTERVAL).await;
     }
-}
-
-/// An RFC3339 stamp as UTC; an unparsable one (hand-edited row) reads as
-/// never.
-fn parse_iso(raw: &str) -> Option<DateTime<Utc>> {
-    raw.parse::<DateTime<Utc>>().ok()
 }
 
 #[cfg(test)]
@@ -622,26 +697,57 @@ mod tests {
     #[test]
     fn check_gate_is_daily_and_locked_beats_due() {
         let now = Utc::now();
-        assert!(should_check(now, None, true, false), "first check is due");
-        let recent = now - chrono::Duration::hours(23);
+        let recent = (now - chrono::Duration::hours(23)).to_rfc3339();
+        let stale = (now - chrono::Duration::hours(25)).to_rfc3339();
+        let phase = |stored: Option<&str>, lock: Option<&str>, last: Option<&str>| {
+            UpdatePhase::from_settings(stored, lock, last)
+        };
+        assert!(phase(None, None, None).due(now), "first check is due");
+        assert!(!phase(None, None, Some(&recent)).due(now), "23h is not due");
+        assert!(phase(None, None, Some(&stale)).due(now), "25h is due");
         assert!(
-            !should_check(now, Some(recent), true, false),
-            "23h is not due"
-        );
-        let stale = now - chrono::Duration::hours(25);
-        assert!(should_check(now, Some(stale), true, false), "25h is due");
-        assert!(
-            !should_check(now, None, false, false),
+            !phase(Some("0"), None, None).due(now),
             "disabled never fetches"
         );
         assert!(
-            !should_check(now, Some(stale), false, false),
+            !phase(Some("0"), None, Some(&stale)).due(now),
             "disabled never fetches"
         );
         assert!(
-            !should_check(now, None, true, true),
+            !phase(None, Some("NOITE_UPDATE_CHECK=off"), None).due(now),
             "locked beats a due window"
         );
+    }
+
+    /// The wire keeps reporting the stored check time even when the gate is
+    /// off or locked (the pre-machine status read it unconditionally).
+    #[test]
+    fn checked_at_survives_disabled_and_locked_states() {
+        let stamp = "2026-10-01T00:00:00.000Z";
+        for phase in [
+            UpdatePhase::from_settings(Some("0"), None, Some(stamp)),
+            UpdatePhase::from_settings(None, Some("locked"), Some(stamp)),
+        ] {
+            assert_eq!(phase.checked_at(), Some(stamp));
+        }
+    }
+
+    #[test]
+    fn phase_maps_every_gate_to_one_state() {
+        let never = UpdatePhase::from_settings(None, None, None);
+        assert_eq!(never.state_label(), "never-checked");
+        assert!(never.enabled() && !never.locked());
+        assert_eq!(never.checked_at(), None);
+        let idle = UpdatePhase::from_settings(Some("1"), None, Some("2026-10-01T00:00:00.000Z"));
+        assert_eq!(idle.state_label(), "checked");
+        assert_eq!(idle.checked_at(), Some("2026-10-01T00:00:00.000Z"));
+        let disabled = UpdatePhase::from_settings(Some("0"), None, None);
+        assert_eq!(disabled.state_label(), "disabled");
+        assert!(!disabled.setting() && !disabled.enabled());
+        let locked = UpdatePhase::from_settings(None, Some("NOITE_UPDATE_CHECK=off"), None);
+        assert_eq!(locked.state_label(), "locked");
+        assert!(locked.setting() && !locked.enabled());
+        assert_eq!(locked.lock_reason(), Some("NOITE_UPDATE_CHECK=off"));
     }
 
     async fn memory_pool() -> SqlitePool {
