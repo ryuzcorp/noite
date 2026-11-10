@@ -19,6 +19,8 @@ curl -H "Authorization: Bearer $RUNNER_TOKEN" https://api.<domain>/v1/apps
 
 The control UI uses the bearer token server-side; browsers never see it. Git smart-HTTP verifies the API key via the UI's `/internal/git-auth` and enforces the collaborator role per slug. Unknown slugs 404 at auth.
 
+A profile API key stops working the moment its owner is banned: every consumer (git smart-HTTP's `/internal/git-auth`, `/mcp`, and event ingest) refuses a key whose account is banned, and the ban deletes the account's keys. An unban does not restore a deleted key — mint a new one.
+
 Public (no credential): `/health`, `/ready`, `/v1/git/*`, `/v1/edge/*`.
 
 `/v1/edge/*` is internal edge plumbing (fallback page, TLS ask gate, wake hop) — public and credential-less by design; not a client API.

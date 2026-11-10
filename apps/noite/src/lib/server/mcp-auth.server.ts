@@ -14,11 +14,10 @@
 //! deliberately does not tell them apart), so the log names what happened
 //! while the wire keeps its one 401 body.
 import { Data } from "effect";
-import { eq } from "void/db";
 
-import { userTable } from "../../db/schema";
 import { authFromEnv, MissingAuthSecretError } from "../auth";
-import { ensureDb, getDb, withDb } from "../db";
+import { ensureDb } from "../db";
+import { keyOwnerActive } from "./api-keys.server";
 
 /** The credential state behind one MCP request. */
 export type McpAuth = Data.TaggedEnum<{
@@ -82,23 +81,12 @@ export const authenticateMcp = async (
     }
 
     // A API key outlives the sessions `banUser` revokes, and the plugin's
-    // verification never checks the owner's ban flag: read it here so a ban
-    // really does stop this account's machine credentials.
-    const banned = await withDb(async () => {
-      const rows = await getDb()
-        .select({ banned: userTable.banned })
-        .from(userTable)
-        .where(eq(userTable.id, owner))
-        .limit(1);
-
-      const [row] = rows;
-
-      return row === undefined || row.banned === true;
-    });
-
-    return banned
-      ? McpAuthState.OwnerBanned()
-      : McpAuthState.Authed({ userId: owner });
+    // verification never checks the owner's ban flag: the shared owner
+    // predicate (lib/server/api-keys.server) reads it here so a ban really
+    // does stop this account's machine credentials.
+    return (await keyOwnerActive(owner))
+      ? McpAuthState.Authed({ userId: owner })
+      : McpAuthState.OwnerBanned();
   } catch (error) {
     if (error instanceof MissingAuthSecretError) {
       return McpAuthState.Misconfigured({ message: error.message });

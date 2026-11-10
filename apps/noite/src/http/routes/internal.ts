@@ -10,6 +10,7 @@ import {
   runnerFailureMessage,
   runnerFailureOf,
 } from "../../lib/runner";
+import { keyOwnerActive } from "../../lib/server/api-keys.server";
 import { createAppForUser, slugError } from "../../lib/server/apps.server";
 import {
   findRecoveryEmail,
@@ -262,6 +263,16 @@ export const handleGitAuth: RouteHandler = async (request, env) => {
     }
 
     const userId = verified.key.referenceId;
+
+    // Git smart-HTTP is the main machine credential: a ban must stop it now,
+    // not on the next session refresh (the shared owner predicate,
+    // lib/server/api-keys.server). Same uniform answer as a bad key.
+    if (!(await keyOwnerActive(userId))) {
+      return Response.json(
+        { error: "invalid key", ok: false },
+        { status: 401 }
+      );
+    }
 
     if (wanted === "create") {
       return await gitAuthCreate(userId, slug);
