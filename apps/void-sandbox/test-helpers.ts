@@ -135,6 +135,10 @@ export class FakeContainer {
   readonly starts: NoiteStartOptions[] = [];
   readonly execCalls: ExecCall[] = [];
   destroys = 0;
+  /** Resolves when `destroy` is entered, before the container reports gone. */
+  readonly destroyEntered = new Deferred<void>();
+  /** Set to hold a destroy mid-flight (the crash/reap race window). */
+  holdDestroy: Deferred<void> | null = null;
   readonly inactivityTimeouts: number[] = [];
   readonly tcpFetches: { readonly port: number; readonly request: Request }[] =
     [];
@@ -161,6 +165,12 @@ export class FakeContainer {
 
   async destroy(): Promise<void> {
     this.destroys += 1;
+    this.destroyEntered.resolve();
+
+    if (this.holdDestroy !== null) {
+      await this.holdDestroy.promise;
+    }
+
     this.running = false;
   }
 

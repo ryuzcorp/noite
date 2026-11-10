@@ -25,6 +25,7 @@ import {
   FakeProcess,
   FakeSandboxStub,
   FakeStorage,
+  Deferred,
   makeControllerEnv,
   makeCtx,
   makeService,
@@ -899,5 +900,63 @@ describe("lease lifecycle", () => {
     expect(container.destroys).toBe(1);
     expect(admission.calls.some((c) => c.method === "stopped")).toBe(true);
     expect(storage.store.has("__voidSandboxLease")).toBe(false);
+  });
+  test("afterStart refuses a stopped lease and destroys the live container", async () => {
+    const storage = new FakeStorage();
+    const container = new FakeContainer();
+    container.running = true;
+    storage.store.set("__voidSandboxLease", {
+      generation: "gen-old",
+      phase: "stopped",
+    });
+    const { admission, controller } = rig({ container, storage });
+
+    // SAFETY: white-box call into the runtime-visible lifecycle hook.
+    const direct = controller as unknown as {
+      afterStart: () => Promise<void>;
+    };
+
+    await expect(direct.afterStart()).rejects.toThrow(
+      "VOID_SANDBOX_unavailable"
+    );
+    // The refusal must not leave a container the durable record cannot stop.
+    expect(container.destroys).toBe(1);
+    expect(container.running).toBe(false);
+    expect(admission.calls.some((call) => call.method === "stopped")).toBe(
+      true
+    );
+  });
+
+  test("the idle reap refuses a request that arrives mid-teardown", async () => {
+    const storage = new FakeStorage();
+    const container = new FakeContainer();
+    container.running = true;
+    storage.store.set("__voidSandboxLease", {
+      generation: "gen-1",
+      phase: "running",
+    });
+    storage.store.set("__voidSandboxActivity", {
+      idleDeadline: 1,
+      lastActivity: 0,
+    });
+    const { controller } = rig({ container, storage });
+    succeedExec(container);
+
+    const gate = new Deferred<void>();
+    container.holdDestroy = gate;
+
+    const reaping = controller.alarm();
+    await container.destroyEntered.promise;
+
+    // The reap decided already: the request must be refused before it can
+    // touch the container, instead of racing the teardown.
+    await expect(controller.invoke("exec", [["echo", "hi"]])).rejects.toThrow(
+      "VOID_SANDBOX_unavailable"
+    );
+    expect(container.execCalls).toHaveLength(0);
+
+    gate.resolve();
+    await reaping;
+    expect(container.running).toBe(false);
   });
 });
