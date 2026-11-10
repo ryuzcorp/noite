@@ -640,6 +640,7 @@ fn spawn_tip_deploy(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::models::DeployStatus;
 
     /// A tick's `apps` snapshot can be older than the delete that landed in
     /// the middle of it: `still_wanted` re-reads the row (and the delete
@@ -825,12 +826,28 @@ mod tests {
         .expect("app");
         // Deploy sha2, then roll production back to sha1: the app now serves
         // sha1 while the git tip is still sha2.
-        db::upsert_deploy(&pool, None, &app.id, None, "success", Some("sha2"), "")
-            .await
-            .expect("sha2 deploy");
-        db::upsert_deploy(&pool, None, &app.id, None, "success", Some("sha1"), "")
-            .await
-            .expect("sha1 rollback");
+        db::upsert_deploy(
+            &pool,
+            None,
+            &app.id,
+            None,
+            DeployStatus::Success,
+            Some("sha2"),
+            "",
+        )
+        .await
+        .expect("sha2 deploy");
+        db::upsert_deploy(
+            &pool,
+            None,
+            &app.id,
+            None,
+            DeployStatus::Success,
+            Some("sha1"),
+            "",
+        )
+        .await
+        .expect("sha1 rollback");
         let fresh = db::get_app(&pool, &app.id).await.unwrap().expect("app row");
         assert_eq!(fresh.last_deploy_sha.as_deref(), Some("sha1"));
 
@@ -849,9 +866,17 @@ mod tests {
         );
 
         // A failed attempt at the tip is not a release: the sweep retries it.
-        db::upsert_deploy(&pool, None, &app.id, None, "failed", Some("sha4"), "boom")
-            .await
-            .expect("failed deploy");
+        db::upsert_deploy(
+            &pool,
+            None,
+            &app.id,
+            None,
+            DeployStatus::Failed,
+            Some("sha4"),
+            "boom",
+        )
+        .await
+        .expect("failed deploy");
         assert!(sweep_needs_tip(&pool, &fresh, &production, "sha4")
             .await
             .unwrap());
@@ -883,7 +908,7 @@ mod tests {
             None,
             &app.id,
             Some(&env.id),
-            "success",
+            DeployStatus::Success,
             Some("sha2"),
             "",
         )
@@ -894,7 +919,7 @@ mod tests {
             None,
             &app.id,
             Some(&env.id),
-            "success",
+            DeployStatus::Success,
             Some("sha1"),
             "",
         )
