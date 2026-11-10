@@ -475,7 +475,8 @@ async fn counts(pool: &SqlitePool, now: DateTime<Utc>) -> sqlx::Result<Counts> {
              (SELECT COUNT(*) FROM app WHERE desired_state = 'running' AND asleep_since IS NULL) AS apps_running,
              (SELECT COUNT(*) FROM app WHERE asleep_since IS NOT NULL AND desired_state <> 'stopped') AS apps_sleeping,
              (SELECT COUNT(*) FROM deploy WHERE created_at >= ?) AS deploys_24h,
-             (SELECT COUNT(*) FROM deploy WHERE created_at >= ? AND status = 'failed') AS deploys_failed_24h"#,
+             (SELECT COUNT(*) FROM deploy WHERE created_at >= ?
+                AND status IN ('failed', 'cancelled', 'stalled')) AS deploys_failed_24h"#,
     )
     .bind(&cutoff)
     .bind(&cutoff)
@@ -719,6 +720,20 @@ mod tests {
             )
             .await
             .expect("deploy");
+            // A stop and a sweep are terminal non-successes too: the field
+            // keeps counting every deploy that did not land, as `failed` did
+            // before the two got their own statuses.
+            db::upsert_deploy(
+                &pool,
+                None,
+                &apps[1].id,
+                None,
+                crate::models::DeployStatus::Cancelled,
+                Some("sha3"),
+                "",
+            )
+            .await
+            .expect("deploy");
 
             let now = DateTime::parse_from_rfc3339("2026-10-06T12:00:00Z")
                 .expect("now")
@@ -731,8 +746,8 @@ mod tests {
             assert_eq!(gathered.apps, 2);
             assert_eq!(gathered.apps_running, 1);
             assert_eq!(gathered.apps_sleeping, 1);
-            assert_eq!(gathered.deploys_24h, 2);
-            assert_eq!(gathered.deploys_failed_24h, 1);
+            assert_eq!(gathered.deploys_24h, 3);
+            assert_eq!(gathered.deploys_failed_24h, 2);
             assert_eq!(gathered.storage, "external");
             assert_eq!(gathered.tenancy, "single");
             assert_eq!(gathered.uptime_hours, 30);

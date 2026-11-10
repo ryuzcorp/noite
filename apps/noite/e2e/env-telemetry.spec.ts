@@ -14,6 +14,7 @@ import type { APIRequestContext } from "@playwright/test";
 import {
   E2E_EMAIL,
   E2E_NAME,
+  TERMINAL_DEPLOY_PATTERN,
   createAppWithKey,
   deleteApp,
   execGit,
@@ -209,10 +210,12 @@ const waitForEnvDeploy = async (
       },
       { intervals: [1000], timeout: timeoutMs }
     )
-    .toMatch(/^(?<terminal>success|failed)$/u);
+    .toMatch(TERMINAL_DEPLOY_PATTERN);
 
-  if (latest?.status === "failed") {
-    throw new Error(`environment deploy failed: ${JSON.stringify(latest)}`);
+  if (latest !== undefined && latest.status !== "success") {
+    throw new Error(
+      `environment deploy ended ${latest.status}: ${JSON.stringify(latest)}`
+    );
   }
 };
 

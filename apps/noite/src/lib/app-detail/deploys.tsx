@@ -55,9 +55,13 @@ import {
 import { deployBadgeTone, deployStatusFacts, isServing } from "./lifecycle";
 import { RuntimeLogs } from "./logs";
 
-/** The status badge for one deploy row, from the shared deploy facts. */
+/** The status badge for one deploy row, from the shared deploy facts: the
+ * label is the reader's word for the state (`Stopped` for `cancelled`,
+ * `Timed out` for `stalled`), while the wire status stays the runner's. */
 export const deployBadge = (status: string) => (
-  <span class={`badge badge-sm ${deployBadgeTone(status)}`}>{status}</span>
+  <span class={`badge badge-sm ${deployBadgeTone(status)}`}>
+    {deployStatusFacts(status).label}
+  </span>
 );
 
 const DropdownProps = islandProps<{
@@ -399,7 +403,7 @@ const RowApp = defineApp({
                 const ok = await confirmDialog({
                   confirmLabel: "Stop deploy",
                   message:
-                    "The step running now is killed and the deploy is closed as failed. The release serving traffic stays as it is.",
+                    "The step running now is killed and the deploy is closed as stopped. The release serving traffic stays as it is.",
                   title: "Stop this deploy?",
                 });
 

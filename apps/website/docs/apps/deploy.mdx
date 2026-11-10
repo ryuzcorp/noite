@@ -115,6 +115,8 @@ In Actions it writes `url=` + `sha=` to `$GITHUB_OUTPUT` and posts (or updates, 
 
 The **Deployments** tab shows status per push with a build-log pane: one `▸ step: command` line per step and its output tail, and on failure the step that failed. Deploy logs keep a 64 KB tail.
 
+A deploy ends as **success**, **failed**, **Stopped** (`cancelled`: the operator pressed Stop, and `ERROR: cancelled by the operator` is appended) or **Timed out** (`stalled`: the runner was interrupted or a step outlived its bound, logged as `ERROR: deploy stalled (host interrupted or timed out)`). All four are final — a late log line or a second Stop never rewrites a closed row — and only a successful deploy is a rollback target. The runner's API and its type bindings spell the new two `cancelled` and `stalled`; older rows keep `failed`.
+
 ## Rollback
 
 `POST /v1/apps/<id>/rollback {sha}` redeploys a past successful SHA — bundles are immutable per SHA. The UI offers rollback on success rows.

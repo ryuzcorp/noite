@@ -118,11 +118,30 @@ describe("deployStatusFacts", () => {
     expect(deployStatusFacts("deploying").inFlight).toBe(true);
     expect(deployStatusFacts("success").inFlight).toBe(false);
     expect(deployStatusFacts("failed").inFlight).toBe(false);
+    expect(deployStatusFacts("cancelled").inFlight).toBe(false);
+    expect(deployStatusFacts("stalled").inFlight).toBe(false);
+  });
+
+  test("a stopped or timed-out row is finished and never a success", () => {
+    expect(deployStatusFacts("cancelled")).toEqual({
+      finished: true,
+      inFlight: false,
+      label: "Stopped",
+      succeeded: false,
+    });
+    expect(deployStatusFacts("stalled")).toEqual({
+      finished: true,
+      inFlight: false,
+      label: "Timed out",
+      succeeded: false,
+    });
   });
 
   test("an unknown status is never treated as success", () => {
     expect(deployStatusFacts("weird").succeeded).toBe(false);
     expect(deployStatusFacts("weird").inFlight).toBe(false);
+    // A status the UI does not model still shows the runner's own word.
+    expect(deployStatusFacts("weird").label).toBe("weird");
   });
 });
 

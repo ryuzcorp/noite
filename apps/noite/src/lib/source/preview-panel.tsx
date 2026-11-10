@@ -23,6 +23,7 @@ import { atom, watch } from "ilha";
 import type { AtomHandle, View } from "ilha";
 
 import { deployBadge } from "../app-detail/deploys";
+import { deployStatusFacts } from "../app-detail/lifecycle";
 import { appUrl, environmentUrl, presenceTone } from "../apps/identity";
 import {
   decodeDeploys,
@@ -126,10 +127,7 @@ const DeployLog = ({
 
   // A running deploy's log is still in the stream (the row carries it as it
   // arrives); a finished row's is read once.
-  const finished =
-    row.status !== "building" &&
-    row.status !== "deploying" &&
-    row.status !== "queued";
+  const { finished } = deployStatusFacts(row.status);
 
   return finished ? (
     <FinishedLog appId={appId} deployId={row.id} />
@@ -139,14 +137,10 @@ const DeployLog = ({
 };
 
 /** Whether a deploy is still going: the states between the queue and a
- * result. */
-const deployRunning = (status: string): boolean => {
-  if (status === "queued" || status === "building" || status === "deploying") {
-    return true;
-  }
-
-  return false;
-};
+ * result, read from the shared deploy facts so a new terminal status is never
+ * mistaken for a run in progress. */
+const deployRunning = (status: string): boolean =>
+  deployStatusFacts(status).inFlight;
 
 /** What the panel frames: production, a branch environment, or the viewer's
  * own workspace preview. */

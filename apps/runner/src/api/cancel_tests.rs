@@ -55,7 +55,8 @@ async fn stopping_a_stranded_row_closes_it_with_the_operator_line() {
         .await
         .expect("read deploy")
         .expect("deploy row");
-    assert_eq!(row.status, crate::models::DeployStatus::Failed);
+    // `cancelled`, not `failed`: the operator ended it, nothing failed.
+    assert_eq!(row.status, crate::models::DeployStatus::Cancelled);
     assert!(
         row.log.contains("ERROR: cancelled by the operator"),
         "{}",

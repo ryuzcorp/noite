@@ -12,8 +12,10 @@ import {
   CHILD_PROC_TIMEOUT_MS,
   E2E_EMAIL,
   E2E_NAME,
+  TERMINAL_DEPLOY_PATTERN,
   createAppWithKey,
   deleteApp,
+  isTerminalDeploy,
   runnerApi,
   runnerCall,
   waitForDeploy,
@@ -166,10 +168,7 @@ const waitForEnvDeploy = async (
 
         [latest] = deploys;
 
-        if (
-          latest &&
-          (latest.status === "success" || latest.status === "failed")
-        ) {
+        if (latest && isTerminalDeploy(latest.status)) {
           return latest.status;
         }
 
@@ -177,7 +176,7 @@ const waitForEnvDeploy = async (
       },
       { intervals: [500], timeout: timeoutMs }
     )
-    .toMatch(/^(?<terminal>success|failed)$/u);
+    .toMatch(TERMINAL_DEPLOY_PATTERN);
 
   if (latest === undefined) {
     throw new Error(

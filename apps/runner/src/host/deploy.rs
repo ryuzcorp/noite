@@ -233,7 +233,11 @@ pub async fn deploy_app(
                 Some(id),
                 &app.id,
                 target.environment_id(),
-                DeployStatus::Failed,
+                if stopped {
+                    DeployStatus::Cancelled
+                } else {
+                    DeployStatus::Failed
+                },
                 tip_sha,
                 &text,
             )
@@ -444,15 +448,17 @@ impl Progress<'_> {
         }
     }
 
-    /// Write the run's terminal failure line. A row another writer already
-    /// closed keeps its own story, so a refusal is not an error here.
-    async fn close(&mut self, text: &str) -> anyhow::Result<()> {
+    /// Write the run's terminal line: `status` is `failed` for a step that
+    /// failed and `cancelled` for a run the operator stopped. A row another
+    /// writer already closed keeps its own story, so a refusal is not an
+    /// error here.
+    async fn close(&mut self, status: DeployStatus, text: &str) -> anyhow::Result<()> {
         let written = db::upsert_deploy(
             self.pool,
             self.id.as_deref(),
             self.app_id,
             self.environment_id.as_deref(),
-            DeployStatus::Failed,
+            status,
             self.sha.as_deref(),
             text,
         )
@@ -520,36 +526,19 @@ impl Progress<'_> {
         // A stopped run says why and nothing else: the step that was cut
         // short did not fail on its own.
         if self.cancel.as_ref().is_some_and(|c| c.is_cancelled()) {
-            self.close(&format!("ERROR: {CANCELLED}\n")).await?;
-            match self.environment_id.as_deref() {
-                Some(env_id) => {
-                    db::write_environment_status(
-                        self.pool,
-                        env_id,
-                        AppStatus::Failed,
-                        Some(CANCELLED),
-                        WriteGuard::Wanted,
-                    )
-                    .await?;
-                }
-                None => {
-                    db::write_app_status(
-                        self.pool,
-                        self.app_id,
-                        AppStatus::Failed,
-                        Some(CANCELLED),
-                        None,
-                        WriteGuard::Wanted,
-                    )
-                    .await?;
-                }
-            }
+            // `close` writes the target too: `failed` on the chip, with the
+            // stop as its one-line summary (`db::deploys::apply_status`).
+            self.close(DeployStatus::Cancelled, &format!("ERROR: {CANCELLED}\n"))
+                .await?;
             return Ok(());
         }
         let detail = lifecycle::strip_ansi(&format!("{err:#}")).into_owned();
         let detail = lifecycle::tail_utf8(detail.trim_end(), FAILURE_TAIL);
-        self.close(&format!("ERROR: {} failed\n{detail}\n", self.step))
-            .await?;
+        self.close(
+            DeployStatus::Failed,
+            &format!("ERROR: {} failed\n{detail}\n", self.step),
+        )
+        .await?;
         let summary = failure_summary(self.step, detail);
         match self.environment_id.as_deref() {
             // `upsert_deploy` already moved the environment to failed with the
@@ -3986,5 +3975,82 @@ mod tests {
         let sneaky = quoted(&["a\u{2028}b.sql"]);
         assert!(!sneaky.contains('\u{2028}'), "{:?}", sneaky);
         assert_eq!(sneaky.lines().count(), 1);
+    }
+
+    /// A run the operator stopped records `cancelled`, not `failed`: the row
+    /// says who ended it, while the target's chip is `failed` with the stop as
+    /// its one-line summary (nothing is building for it, the previous release
+    /// keeps serving).
+    #[tokio::test]
+    async fn a_stopped_run_closes_its_row_as_cancelled() {
+        let pool = crate::db::connect("sqlite::memory:")
+            .await
+            .expect("memory db");
+        let cfg = crate::config::config_for_tests();
+        let app = crate::db::create_app(
+            &pool,
+            &cfg,
+            crate::db::NewApp {
+                name: "stopped",
+                slug: "stopped",
+                user_id: "local",
+                subdomain: "stopped.localhost",
+                listen: 30110,
+                internal: 30111,
+            },
+        )
+        .await
+        .expect("seed app");
+        let row = crate::db::upsert_deploy(
+            &pool,
+            None,
+            &app.id,
+            None,
+            DeployStatus::Building,
+            Some("abc123"),
+            "▸ build: bun run build\n",
+        )
+        .await
+        .expect("deploy row");
+        let token = crate::host::cancel::CANCELS.register(&row.id);
+        assert_eq!(
+            crate::host::cancel::CANCELS.cancel(&row.id),
+            crate::host::cancel::CancelOutcome::Signalled
+        );
+
+        let mut progress = Progress {
+            cancel: Some(token),
+            environment_id: None,
+            id: Some(row.id.clone()),
+            pool: &pool,
+            app_id: &app.id,
+            sha: Some("abc123".into()),
+            step: "build",
+        };
+        progress
+            .fail(&anyhow::anyhow!(crate::host::cancel::CANCELLED))
+            .await
+            .expect("record the stop");
+
+        let closed = crate::db::get_deploy(&pool, &app.id, &row.id)
+            .await
+            .expect("read deploy")
+            .expect("deploy row");
+        assert_eq!(closed.status, DeployStatus::Cancelled);
+        assert!(
+            closed.log.contains("ERROR: cancelled by the operator"),
+            "{}",
+            closed.log
+        );
+        let stopped = crate::db::get_app(&pool, &app.id)
+            .await
+            .expect("read app")
+            .expect("app row");
+        assert_eq!(stopped.status, crate::models::AppStatus::Failed);
+        assert_eq!(
+            stopped.last_error.as_deref(),
+            Some(crate::host::cancel::CANCELLED)
+        );
+        crate::host::cancel::CANCELS.release(&row.id);
     }
 }

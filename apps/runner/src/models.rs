@@ -202,6 +202,14 @@ pub enum DeployStatus {
     Deploying,
     Success,
     Failed,
+    /// The operator stopped the run before it activated (`host/cancel.rs`).
+    /// Distinct from [`Self::Failed`] so the history says who ended it.
+    Cancelled,
+    /// The stall sweep closed a row whose run stopped reporting
+    /// (`db::deploys::fail_stuck_deploys`): the host was interrupted or the
+    /// step timed out. Distinct from [`Self::Failed`] so a timeout is not
+    /// read as a build error.
+    Stalled,
 }
 
 impl DeployStatus {
@@ -212,6 +220,8 @@ impl DeployStatus {
             Self::Deploying => "deploying",
             Self::Success => "success",
             Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+            Self::Stalled => "stalled",
         }
     }
 
@@ -221,9 +231,9 @@ impl DeployStatus {
 
     /// The states a row may hold immediately before it is written as `self`:
     /// the one transition table for `db::deploys::upsert_deploy`. A terminal
-    /// row (`success`, `failed`) is its own predecessor only, so a stopped,
-    /// failed or succeeded deploy can never be moved again — the late writer
-    /// is refused instead of rewriting history.
+    /// row (`success`, `failed`, `cancelled`, `stalled`) is its own
+    /// predecessor only, so a stopped, failed or succeeded deploy can never be
+    /// moved again — the late writer is refused instead of rewriting history.
     pub fn predecessors(self) -> &'static [DeployStatus] {
         match self {
             Self::Queued => &[Self::Queued],
@@ -231,6 +241,17 @@ impl DeployStatus {
             Self::Deploying => &[Self::Queued, Self::Building, Self::Deploying],
             Self::Success => &[Self::Building, Self::Deploying, Self::Success],
             Self::Failed => &[Self::Queued, Self::Building, Self::Deploying, Self::Failed],
+            // Both terminal closers act on any in-flight row, exactly as the
+            // failure path does: the stop endpoint and the stall sweep close
+            // a queued wait as readily as a running step. Each is its own
+            // predecessor only, so neither can overwrite the other's story.
+            Self::Cancelled => &[
+                Self::Queued,
+                Self::Building,
+                Self::Deploying,
+                Self::Cancelled,
+            ],
+            Self::Stalled => &[Self::Queued, Self::Building, Self::Deploying, Self::Stalled],
         }
     }
 }

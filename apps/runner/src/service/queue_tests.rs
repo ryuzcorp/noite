@@ -139,7 +139,7 @@ async fn the_sweep_spares_a_queued_row_twice_as_long_as_a_building_one() {
     assert_eq!(status_of(&h, &app.id, &queued).await, DeployStatus::Queued);
     assert_eq!(
         status_of(&h, &app.id, &building).await,
-        DeployStatus::Failed
+        DeployStatus::Stalled
     );
 
     // Past twice the bound the queue is dead too (the runner restarted
