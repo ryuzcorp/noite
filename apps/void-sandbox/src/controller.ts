@@ -274,7 +274,16 @@ export class SandboxController extends SandboxContainer<ControllerEnv> {
     this.#activityLoaded = true;
   }
 
-  /** One serialized transition; the record write rides along inside the lock. */
+  /**
+   * One serialized transition; the record write rides along inside the lock.
+   *
+   * A failed write rolls the transition back, so the cell never looks busier
+   * than it is — a stranded count would suppress idle reaping until the
+   * isolate resets. `End` is the one exception: the request is over whatever
+   * the disk did (the old `#busy -= 1` ran in a `finally`), so its count
+   * commits before the write and a failed deadline write only leaves the
+   * stored record stale, never a phantom request.
+   */
   async #activityStep(event: ActivityEvent): Promise<ActivityDecision> {
     return await this.#serializeActivity(async () => {
       await this.#loadActivity();
@@ -285,11 +294,21 @@ export class SandboxController extends SandboxContainer<ControllerEnv> {
         return decision;
       }
 
-      this.#activity = decision.activity;
+      if (event._tag === "End") {
+        this.#activity = decision.activity;
+
+        if (decision.persist !== undefined) {
+          await this.ctx.storage.put(ACTIVITY_KEY, decision.persist);
+        }
+
+        return decision;
+      }
 
       if (decision.persist !== undefined) {
         await this.ctx.storage.put(ACTIVITY_KEY, decision.persist);
       }
+
+      this.#activity = decision.activity;
 
       return decision;
     });

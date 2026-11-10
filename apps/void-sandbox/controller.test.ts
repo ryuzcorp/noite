@@ -974,6 +974,34 @@ describe("lease lifecycle", () => {
     expect(reserved.at(-1)?.generation).toBe(lease?.generation);
   });
 
+  test("a failed activity write does not leave the cell looking busy", async () => {
+    const storage = new FakeStorage();
+    const container = new FakeContainer();
+    container.running = true;
+    storage.store.set("__voidSandboxLease", {
+      generation: "gen-1",
+      phase: "running",
+    });
+    storage.store.set("__voidSandboxActivity", {
+      idleDeadline: 1,
+      lastActivity: 0,
+    });
+    const { controller } = rig({ container, storage });
+    succeedExec(container);
+
+    // The request's Begin cannot persist the deadline it touched.
+    storage.failPut = (): boolean => true;
+    await expect(controller.invoke("exec", [["echo", "hi"]])).rejects.toThrow(
+      "storage boom"
+    );
+    storage.failPut = null;
+
+    // The count must not be stranded: the cell is still idle-expired, so the
+    // alarm reaps it instead of heartbeating a phantom request forever.
+    await controller.alarm();
+    expect(container.destroys).toBe(1);
+  });
+
   test("a direct exec is refused while the alarm is reaping", async () => {
     const storage = new FakeStorage();
     const container = new FakeContainer();
