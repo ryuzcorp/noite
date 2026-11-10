@@ -882,14 +882,201 @@ describe("email idempotency", () => {
     expect(json).toMatchObject({ ok: true });
   });
 
-  test("replays cover partial outcomes too", async () => {
+  test("a failed send is not recorded: the retry reaches the provider again", async () => {
     const kv = new FakeKv();
-    const env = emailEnv(kv, { VOID_PROXY_EMAIL_ALLOWLIST: "" });
-    const body = emailBody({ idempotencyKey: "key-partial" });
-    const r1 = await post("/email/send", body, env, noDial);
-    expect(r1.json).toMatchObject({ ok: false });
-    const r2 = await post("/email/send", body, env, noDial);
+
+    const seen: { hostname: string; port: number; secureTransport?: string }[] =
+      [];
+
+    const env = emailEnv(kv);
+    const body = emailBody({ idempotencyKey: "key-retry" });
+
+    const r1 = await post("/email/send", body, env, {
+      connectSocket: cannedSocketConnect(
+        new CannedSocket([
+          "220 fake ready",
+          "250 fake",
+          "250 2.1.0 ok",
+          "421 4.4.2 try later",
+        ]),
+        seen
+      ),
+    });
+
+    expect(r1.json).toMatchObject({
+      deliveries: [{ ok: false, state: "failed" }],
+      ok: false,
+    });
+    // Nothing was accepted, so nothing is cached for the key.
+    expect(kv.puts).toHaveLength(0);
+
+    const r2 = await post("/email/send", body, env, {
+      connectSocket: cannedSocketConnect(
+        new CannedSocket(HAPPY_TRANSCRIPT),
+        seen
+      ),
+    });
+
+    expect(r2.json).toMatchObject({ ok: true });
+    // The retry really retried: a second SMTP session, not a replay.
+    expect(seen).toHaveLength(2);
+    expect(kv.puts).toHaveLength(1);
+  });
+
+  test("a partial send replays without re-sending to the accepted recipients", async () => {
+    const kv = new FakeKv();
+
+    const seen: { hostname: string; port: number; secureTransport?: string }[] =
+      [];
+
+    const shared: CannedSocketShared = {
+      closed: false,
+      startTlsCalls: [],
+      writes: [],
+    };
+
+    const env = emailEnv(kv);
+
+    const body = emailBody({
+      idempotencyKey: "key-partial",
+      recipients: ["a@example.org", "bad@example.org"],
+    });
+
+    const r1 = await post("/email/send", body, env, {
+      connectSocket: cannedSocketConnect(
+        new CannedSocket(
+          [
+            "220 fake ready",
+            "250 fake",
+            "250 2.1.0 ok",
+            "250 2.1.5 ok",
+            "550 5.1.1 no such user",
+            "354 go",
+            "250 queued",
+          ],
+          shared
+        ),
+        seen
+      ),
+    });
+
+    expect(r1.json).toMatchObject({
+      deliveries: [
+        { ok: true, recipient: "a@example.org" },
+        { ok: false, recipient: "bad@example.org", state: "failed" },
+      ],
+      ok: false,
+    });
+    // A partial accept is recorded, so the accepted recipient is protected.
+    expect(kv.puts).toHaveLength(1);
+    const writesAfterFirst = shared.writes.join("");
+    expect(writesAfterFirst).toContain("RCPT TO:<a@example.org>");
+
+    const r2 = await post("/email/send", body, env, {
+      connectSocket: cannedSocketConnect(
+        new CannedSocket(HAPPY_TRANSCRIPT),
+        seen
+      ),
+    });
+
     expect(r2.json).toEqual(r1.json);
+    // No second session, so no RCPT to the already-accepted recipient.
+    expect(seen).toHaveLength(1);
+    expect(shared.writes.join("")).toBe(writesAfterFirst);
+  });
+
+  test("a rejected-only outcome is not recorded: the retry recomputes it", async () => {
+    const kv = new FakeKv();
+    // Empty allowlist: nobody is admitted, so nothing reaches a provider.
+    const env = emailEnv(kv, { VOID_PROXY_EMAIL_ALLOWLIST: "" });
+    const body = emailBody({ idempotencyKey: "key-rejected" });
+
+    const r1 = await post("/email/send", body, env, noDial);
+
+    expect(r1.json).toMatchObject({
+      deliveries: [{ ok: false, state: "rejected" }],
+      ok: false,
+    });
+    expect(kv.puts).toHaveLength(0);
+
+    const r2 = await post("/email/send", body, env, noDial);
+
+    // A fresh attempt, not a replay: same verdicts, new operation id.
+    expect(r2.json).toMatchObject({
+      deliveries: [
+        { ok: false, recipient: "a@example.org", state: "rejected" },
+      ],
+      ok: false,
+    });
+    expect(r2.json).not.toEqual(r1.json);
+    expect(kv.puts).toHaveLength(0);
+  });
+
+  // The module doc's outcome → record table, one case per variant: only an
+  // attempt that got somebody accepted is replayable for 24 h.
+  test("outcome → record transition table matches the module doc", async () => {
+    const cases = [
+      {
+        name: "Accepted",
+        recipients: ["a@example.org"],
+        recorded: true,
+        transcript: HAPPY_TRANSCRIPT,
+      },
+      {
+        name: "Partial",
+        recipients: ["a@example.org", "bad@example.org"],
+        recorded: true,
+        transcript: [
+          "220 fake ready",
+          "250 fake",
+          "250 2.1.0 ok",
+          "250 2.1.5 ok",
+          "550 5.1.1 no such user",
+          "354 go",
+          "250 queued",
+        ],
+      },
+      {
+        name: "Failed",
+        recipients: ["a@example.org"],
+        recorded: false,
+        transcript: [
+          "220 fake ready",
+          "250 fake",
+          "250 2.1.0 ok",
+          "421 4.4.2 try later",
+        ],
+      },
+      {
+        name: "Unknown",
+        recipients: ["a@example.org"],
+        recorded: false,
+        // EOF after DATA: the message may have been queued.
+        transcript: [
+          "220 fake ready",
+          "250 fake",
+          "250 2.1.0 ok",
+          "250 2.1.5 ok",
+          "354 go",
+        ],
+      },
+    ];
+
+    for (const { name, recipients, recorded, transcript } of cases) {
+      const kv = new FakeKv();
+      const env = emailEnv(kv);
+
+      // oxlint-disable-next-line eslint/no-await-in-loop -- sequential cases, each asserted before the next
+      const { status } = await post(
+        "/email/send",
+        emailBody({ idempotencyKey: `outcome-${name}`, recipients }),
+        env,
+        { connectSocket: cannedSocketConnect(new CannedSocket(transcript)) }
+      );
+
+      expect(status, name).toBe(200);
+      expect(kv.puts.length, name).toBe(recorded ? 1 : 0);
+    }
   });
 });
 
