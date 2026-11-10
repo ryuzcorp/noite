@@ -43,7 +43,10 @@
  *
  * Every transition returns the effects the controller must run, in order;
  * storage writes are one of those effects, so a failed effect leaves the
- * durable record as the recovery point for the next alarm tick.
+ * durable record as the recovery point for the next alarm tick. The
+ * `MarkStopping`, `MarkRunning` and `Clear` effects are compare-and-set on
+ * the generation: a chain computed from an older snapshot never overwrites or
+ * clears a lease a newer start wrote.
  */
 
 /** Closed lease type; every branch mirrors a durable shape the old code wrote. */
