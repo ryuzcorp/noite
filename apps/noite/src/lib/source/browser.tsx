@@ -79,6 +79,7 @@ import { changesFingerprint } from "./preview-env";
 import { previewPayload } from "./preview-payload";
 import {
   failureOf,
+  OPEN_DEADLINE_MS,
   readOnlyOf,
   RefEvents,
   RefViews,
@@ -351,11 +352,10 @@ export const SourceBrowser = ({
     let stopPeers: (() => void) | null = null;
     let stopWatch: { close: () => void } | null = null;
     let resyncTimer = 0;
-    /** The ref the newest request wants, so a repaint (or a click on the
-     * branch already picked) is not a second open. */
-    let wanted: string | null = null;
     /** The requests this browser has started: only the newest installs, and a
-     * superseded one leaves its checkout to the cache. */
+     * superseded one leaves its checkout to the cache. The machine decides
+     * what a new request is (see `request`); a generation only ever follows
+     * one of its `Opening`s. */
     let generation = 0;
     /** Whether the pane is gone: an open still in flight lands on nothing. */
     let closed = false;
@@ -449,12 +449,15 @@ export const SourceBrowser = ({
       void teardown(() => held.checkout.workspace.close());
     };
 
-    /** Store the machine's state and perform what its transition asked for. */
-    const applyRef = (event: RefEvent): void => {
+    /** Store the machine's state and perform what its transition asked for.
+     * Answers whether the machine took the event: a refused one changes
+     * nothing, so a caller that starts work on a decision must read this (see
+     * `request`). */
+    const applyRef = (event: RefEvent): boolean => {
       const decision = stepRef(refView, event);
 
       if (decision.refused) {
-        return;
+        return false;
       }
 
       refView = decision.state;
@@ -469,8 +472,10 @@ export const SourceBrowser = ({
         // and the failure card says what happened.
         treeEl.textContent = "";
         codeEl.textContent =
-          "message" in event ? event.message : "The checkout is not open.";
+          failureOf(refView)?.message ?? "The checkout is not open.";
       }
+
+      return true;
     };
 
     /** A checkout's frame died (its pod stopped): the ref has to be opened
@@ -623,11 +628,11 @@ export const SourceBrowser = ({
         return await opening.checkout;
       }
 
-      const pending = openCheckout(ref);
-      opening = { checkout: pending, ref };
+      const pending = { checkout: openCheckout(ref), ref };
+      opening = pending;
 
       try {
-        const checkout = await pending;
+        const checkout = await pending.checkout;
 
         if (dead.has(checkout.connection)) {
           // A fatal that arrived after the open answered: this checkout must
@@ -641,7 +646,9 @@ export const SourceBrowser = ({
 
         return checkout;
       } finally {
-        if (opening?.ref === ref) {
+        // Identity, not the ref: an abandoned open (see `request`'s deadline)
+        // must not clear the record of a newer one for the same ref.
+        if (opening === pending) {
           opening = null;
         }
       }
@@ -703,8 +710,11 @@ export const SourceBrowser = ({
 
       if (dead.has(next.connection)) {
         // The listing resolved, but the frame behind it stopped: a checkout
-        // whose pod is gone must never become the current one (the fatal
-        // handler already put the failure card up).
+        // whose pod is gone must never become the current one. The fatal's own
+        // report may have landed before the machine was `Opening` this ref, so
+        // the failure is stated here too: a refused one changes nothing.
+        failed(next.ref, "the checkout's pod stopped while it opened");
+
         return;
       }
 
@@ -814,27 +824,50 @@ export const SourceBrowser = ({
     };
 
     /** What the panes should be showing: `ref` is the browser's own read of
-     * `?ref=`, so every navigation asks and only a ref the checkout is not
-     * already on starts anything. `force` is the retry a failure offered: it
-     * drops whatever that attempt left and opens the ref again. */
+     * `?ref=`, so every navigation asks and only a ref the machine is not
+     * already opening or ready on starts anything. `force` is the retry a
+     * failure offered: it drops whatever that attempt left and opens the ref
+     * again.
+     *
+     * The machine, not this function, decides what a new request is. The
+     * generation only ever follows an `Opening` it applied: a request it
+     * refused must not supersede the open in flight, or the machine would stay
+     * `Opening` a ref no request is running for — the spinner that never
+     * cleared (see `./ref-view`). */
     const request = (ref: string, force?: boolean): void => {
-      const forced = force === true;
-
-      if (forced) {
-        wanted = null;
-      } else if (current?.ref === ref || wanted === ref) {
+      if (!applyRef(RefEvents.Requested({ force: force === true, ref }))) {
         return;
       }
 
-      wanted = ref;
       generation += 1;
       const mine = generation;
-      // The machine keeps what the panes show while the new ref opens (a first
-      // open has the panes' own note and nothing to leave standing).
-      applyRef(RefEvents.Requested({ force: forced, ref }));
+
+      // The frame's `open` is the one answer with no deadline of its own (its
+      // work is the archive's untar and the first derive). A frame that took
+      // it and stopped answering would hold the switch — and the overlay over
+      // the panes — forever, so the wait is bounded here.
+      const deadline = setTimeout(() => {
+        if (closed || mine !== generation) {
+          return;
+        }
+
+        // The open is given up, not torn down: its answer is still welcome in
+        // the warm cache, but it must not install anything, and the retry must
+        // open a frame of its own rather than queue behind this one.
+        generation += 1;
+
+        if (opening?.ref === ref) {
+          opening = null;
+        }
+
+        applyRef(RefEvents.TimedOut({ ref }));
+      }, OPEN_DEADLINE_MS);
+
       void (async () => {
         try {
           const checkout = await ensure(ref);
+
+          clearTimeout(deadline);
 
           if (mine !== generation || closed) {
             return;
@@ -852,11 +885,12 @@ export const SourceBrowser = ({
             held.at = Date.now();
           }
         } catch (error) {
+          clearTimeout(deadline);
+
           if (mine !== generation || closed) {
             return;
           }
 
-          wanted = null;
           // A failed switch keeps what the panes show (the machine's
           // `previous`); a failed first open wipes them and says why.
           applyRef(RefEvents.Failed({ message: errorMessage(error), ref }));
