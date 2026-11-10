@@ -80,13 +80,10 @@ const ingest = (key: string): Promise<Response> =>
     { appId: "demo", kind: "events" }
   ) as Promise<Response>;
 
-/** A real better-auth session for an admin account, through the same OTP flow
- * the login panel uses (localhost delivery goes to the console). */
-const adminHeaders = async (): Promise<Headers> => {
-  db.raw.run(
-    `INSERT INTO "user" (id, name, email, emailVerified, role) VALUES ('admin-1', 'Admin', 'admin@example.com', 1, 'admin')`
-  );
-
+/** A real better-auth session cookie for an existing account, through the
+ * same OTP flow the login panel uses (localhost delivery goes to the
+ * console). */
+const signInCookie = async (email: string): Promise<string> => {
   const lines: unknown[][] = [];
 
   const log = spyOn(console, "log").mockImplementation((...args: unknown[]) => {
@@ -97,7 +94,7 @@ const adminHeaders = async (): Promise<Headers> => {
 
   try {
     await auth.api.sendVerificationOTP({
-      body: { email: "admin@example.com", type: "sign-in" },
+      body: { email, type: "sign-in" },
     });
   } finally {
     log.mockRestore();
@@ -105,7 +102,7 @@ const adminHeaders = async (): Promise<Headers> => {
 
   const line = lines
     .map((args) => String(args[0] ?? ""))
-    .find((text) => text.includes("sign-in code for admin@example.com:"));
+    .find((text) => text.includes(`sign-in code for ${email}:`));
 
   const otp = line?.split(":").at(-1)?.trim();
 
@@ -115,7 +112,7 @@ const adminHeaders = async (): Promise<Headers> => {
 
   const signedIn = await auth.handler(
     new Request(`${ENV.BETTER_AUTH_URL}/api/auth/sign-in/email-otp`, {
-      body: JSON.stringify({ email: "admin@example.com", otp }),
+      body: JSON.stringify({ email, otp }),
       headers: { "content-type": "application/json" },
       method: "POST",
     })
@@ -129,7 +126,16 @@ const adminHeaders = async (): Promise<Headers> => {
     throw new Error("better-auth signed in with no session cookie");
   }
 
-  return new Headers({ cookie: cookie.split(";")[0] ?? "" });
+  return cookie.split(";")[0] ?? "";
+};
+
+/** A real better-auth session for an admin account. */
+const adminHeaders = async (): Promise<Headers> => {
+  db.raw.run(
+    `INSERT INTO "user" (id, name, email, emailVerified, role) VALUES ('admin-1', 'Admin', 'admin@example.com', 1, 'admin')`
+  );
+
+  return new Headers({ cookie: await signInCookie("admin@example.com") });
 };
 
 const keyCount = (userId: string): number => {
@@ -203,6 +209,19 @@ describe("the ban endpoint", () => {
     const bannedVerify = await auth.api.verifyApiKey({ body: { key } });
     expect(bannedVerify.valid).toBe(false);
 
+    // A create that raced the ban can insert a key after the ban's deletion:
+    // the unban sweep removes it, so it cannot become a surviving backdoor.
+    const raced = await auth.api.createApiKey({
+      body: {
+        name: "raced",
+        permissions: { apps: ["manage"] },
+        userId: "ban-target",
+      },
+    });
+
+    expect(raced?.key).toBeString();
+    expect(keyCount("ban-target")).toBe(1);
+
     await auth.api.unbanUser({ body: { userId: "ban-target" }, headers });
 
     // Revoked stays revoked: an unban never resurrects a machine credential.
@@ -210,5 +229,31 @@ describe("the ban endpoint", () => {
 
     const unbanedVerify = await auth.api.verifyApiKey({ body: { key } });
     expect(unbanedVerify.valid).toBe(false);
+  });
+
+  test("refuses /api-key/create while the owner is banned", async () => {
+    db.raw.run(
+      `INSERT INTO "user" (id, name, email, emailVerified) VALUES ('survivor', 'Survivor', 'survivor@example.com', 1)`
+    );
+
+    const cookie = await signInCookie("survivor@example.com");
+
+    // A session that survived the ban (the crash window finding 1 closes in
+    // the normal flow) must not be able to mint a credential.
+    db.raw.run(`UPDATE "user" SET banned = 1 WHERE id = 'survivor'`);
+
+    const response = await authFromEnv(
+      ENV as unknown as KitEnv,
+      ENV.BETTER_AUTH_URL
+    ).handler(
+      new Request(`${ENV.BETTER_AUTH_URL}/api/auth/api-key/create`, {
+        body: JSON.stringify({ name: "sneaky" }),
+        headers: { "content-type": "application/json", cookie },
+        method: "POST",
+      })
+    );
+
+    expect(response.status).toBe(403);
+    expect(keyCount("survivor")).toBe(0);
   });
 });

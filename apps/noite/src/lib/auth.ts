@@ -3,7 +3,11 @@
 import { apiKey } from "@better-auth/api-key";
 import { passkey } from "@better-auth/passkey";
 import { betterAuth } from "better-auth";
-import { APIError, getSessionFromCtx } from "better-auth/api";
+import {
+  APIError,
+  createAuthMiddleware,
+  getSessionFromCtx,
+} from "better-auth/api";
 import { admin } from "better-auth/plugins";
 import { emailOTP } from "better-auth/plugins/email-otp";
 import * as Effect from "effect/Effect";
@@ -142,6 +146,9 @@ const requireRegistration = (context: string | null | undefined) => {
   }
 };
 
+/** The admin plugin's unban body, decoded at the hook boundary. */
+const UnbanBody = Schema.Struct({ userId: Schema.String });
+
 /** Deliver a sign-in OTP: POST to the configured webhook (Workers have no
  * SMTP sockets), dev-console fallback on localhost, loud refusal otherwise
  * (a silent no-op would lock every passkey-less user out with no trace). */
@@ -243,17 +250,64 @@ export const createAuth = (env: KitEnv, baseURL: string) =>
     // `internalAdapter.updateUser`, so every ban path lands here. Deleting
     // the keys is deliberate — an unban must not silently revive a key.
     // Consumers still refuse a banned owner's key (lib/server/api-keys.server),
-    // so a failure to delete here can never leave a credential working.
+    // so a failed delete below is logged and left to that predicate; it must
+    // never abort the update, or the plugin would skip `deleteUserSessions`
+    // and leave a banned account with a live session.
     databaseHooks: {
       user: {
         update: {
           after: async (user) => {
-            if (user.banned === true) {
+            if (user.banned !== true) {
+              return;
+            }
+
+            try {
               await revokeApiKeysForUser(user.id);
+            } catch (error) {
+              console.error("[auth] ban key revocation failed", error);
             }
           },
         },
       },
+    },
+    // The plugin's own HTTP endpoints are not covered by the app action's
+    // checks. Key creation refuses a banned owner even if a session survived
+    // the ban (the crash window), and unban sweeps keys a create raced in
+    // during the ban — revoked stays revoked.
+    hooks: {
+      after: createAuthMiddleware(async (ctx) => {
+        if (ctx.path !== "/admin/unban-user") {
+          return;
+        }
+
+        const parsed = Schema.decodeUnknownResult(UnbanBody)(ctx.body);
+
+        if (parsed._tag !== "Success") {
+          return;
+        }
+
+        try {
+          await revokeApiKeysForUser(parsed.success.userId);
+        } catch (error) {
+          console.error("[auth] unban key sweep failed", error);
+        }
+      }),
+      before: createAuthMiddleware(async (ctx) => {
+        if (ctx.path !== "/api-key/create") {
+          return;
+        }
+
+        const read = await getSessionFromCtx(ctx);
+
+        if (read?.user.banned !== true) {
+          return;
+        }
+
+        throw APIError.from("FORBIDDEN", {
+          code: "BANNED_USER",
+          message: "This account is banned",
+        });
+      }),
     },
     plugins: [
       // The admin home impersonates any account (including fellow admins) — the

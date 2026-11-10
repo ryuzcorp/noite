@@ -6,6 +6,7 @@ import { userTable } from "../../db/schema";
 import { authFromEnv, failUnknown, UnauthorizedError } from "../auth";
 import { getDb, withDb } from "../db";
 import { apiAction, apiActionNoInput, fail } from "./api";
+import { keyOwnerActive } from "./api-keys.server";
 import { listUnusedInvitesFor } from "./invites.server";
 import { requestOrigin, sessionUser } from "./session.server";
 
@@ -48,6 +49,13 @@ export const createApiKey = apiAction(
   async ({ appManagement, events, name }, { env, request }) => {
     const user = await sessionUser(request, env);
     const label = name.trim();
+
+    // A banned owner must not mint new machine credentials: the ban's key
+    // revocation only covers the keys that existed then (the plugin's own
+    // `/api-key/create` enforces the same rule for direct calls).
+    if (!(await keyOwnerActive(user.id))) {
+      fail("This account is banned");
+    }
 
     if (!label) {
       fail("Name is required");

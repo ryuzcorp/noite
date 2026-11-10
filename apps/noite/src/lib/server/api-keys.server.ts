@@ -38,7 +38,12 @@ export const keyOwnerActive = (userId: string): Promise<boolean> =>
   });
 
 /** Delete every API key owned by an account. Called when the account is
- * banned. Unban never recreates a key: the user mints a new one. */
+ * banned. Unban never recreates a key: the user mints a new one.
+ *
+ * This deletes the `apikey` rows directly, which is correct because the plugin
+ * uses its default `storage: "database"` — `lib/auth.ts` never overrides it. If
+ * that ever changes to `"secondary-storage"`, revocation must go through the
+ * plugin's storage abstraction instead, or a cached key outlives its row. */
 export const revokeApiKeysForUser = (userId: string): Promise<void> =>
   withDb(async () => {
     await getDb()
