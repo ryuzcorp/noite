@@ -32,16 +32,17 @@ pub use apps::{
     list_app_limits, list_apps, list_domains_for, patch_app_desired, rebind_local_subdomains,
     remove_domain, rename_app, set_app_asleep, set_app_awake, set_app_import_source, set_app_limit,
     set_deployed_config, update_app_status, update_app_status_if_wanted, verified_domain_owner,
-    verify_domain, NewApp,
+    verify_domain, NewApp, VerifyOutcome,
 };
 pub use compaction::{
     bump_metric_version, delete_compactions_for, get_compacted_hours, get_metric_version,
     mark_hour_compacted, prune_compactions,
 };
 pub use credentials::{
-    all_scoped_credential_handles, delete_app_operator_tokens, delete_operator_token,
-    delete_scoped_credential, get_operator_token, insert_operator_token, insert_scoped_credential,
-    live_scoped_credential, mark_app_scoped_credentials_revoking, mark_scoped_credential_revoking,
+    all_scoped_credential_handles, delete_scoped_credential, get_operator_token,
+    insert_operator_token, insert_scoped_credential, live_scoped_credential,
+    mark_app_scoped_credentials_revoking, mark_scoped_credential_revoking,
+    operator_token_scopes_for_app, remove_app_operator_token_rows, remove_operator_token_row,
     revoking_scoped_credentials, scoped_credential_handle_exists, NewScopedCredential,
     ScopedCredential,
 };
@@ -95,9 +96,13 @@ pub(super) const APP_COLS: &str = r#"id, slug, name, user_id, status, subdomain,
                   created_at, updated_at, asleep_since, woke_at, deployed_config, import_source,
                   (import_source IS NOT NULL) AS imported"#;
 
-/// Columns every error-issue query selects, in struct order.
+/// Columns every error-issue query selects, in struct order. `regressed` is
+/// derived on read: the flag only means something for an `open` issue, so a
+/// row that somehow carries it on any other status reads as `false` instead
+/// of leaking a state no writer produces (ROTH-6).
 pub(super) const ISSUE_COLS: &str = "fingerprint, kind, message, culprit, handler, source, count, \
-     first_seen_us, last_seen_us, first_sha, last_sha, status, regressed, status_at_us";
+     first_seen_us, last_seen_us, first_sha, last_sha, status, \
+     CASE WHEN status = 'open' THEN regressed ELSE 0 END AS regressed, status_at_us";
 
 pub async fn connect(database_url: &str) -> anyhow::Result<SqlitePool> {
     if let Some(path) = database_url

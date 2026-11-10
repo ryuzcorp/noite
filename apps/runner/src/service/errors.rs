@@ -7,12 +7,10 @@ use ts_rs::TS;
 use crate::api_error::ApiError;
 use crate::db;
 use crate::host::errors::{ingest_sdk, Frame, SdkEvent};
-use crate::models::ErrorIssue;
+use crate::models::{ErrorIssue, IssueStatus};
 use crate::AppState;
 
 use super::environments::role_ok;
-
-pub const ERROR_STATUSES: &[&str] = &["open", "resolved", "ignored"];
 
 /// Per-status issue counts.
 #[derive(Debug, Serialize, TS)]
@@ -115,7 +113,7 @@ pub async fn list(
     pool: &sqlx::SqlitePool,
     app_id: &str,
     environment_id: &str,
-    status: &str,
+    status: IssueStatus,
 ) -> sqlx::Result<ErrorIssueList> {
     let keys = error_hour_keys();
     let (issues, counts, hours) = tokio::try_join!(
@@ -133,23 +131,27 @@ pub async fn list(
             with_hourly(issue, hourly)
         })
         .collect();
-    let count = |s: &str| counts.iter().find(|(k, _)| k == s).map_or(0, |(_, n)| *n);
+    let count = |wanted: IssueStatus| {
+        counts
+            .iter()
+            .find(|(status, _)| *status == wanted)
+            .map_or(0, |(_, n)| *n)
+    };
     Ok(ErrorIssueList {
         issues,
         counts: ErrorCounts {
-            open: count("open"),
-            resolved: count("resolved"),
-            ignored: count("ignored"),
+            open: count(IssueStatus::Open),
+            resolved: count(IssueStatus::Resolved),
+            ignored: count(IssueStatus::Ignored),
         },
     })
 }
 
-fn validate_status(status: &str) -> Result<(), ApiError> {
-    if ERROR_STATUSES.contains(&status) {
-        Ok(())
-    } else {
-        Err(ApiError::bad("status must be open, resolved or ignored"))
-    }
+/// The RPC's string status → the closed set, with the message the API has
+/// always returned.
+fn parse_status(status: &str) -> Result<IssueStatus, ApiError> {
+    IssueStatus::parse(status)
+        .ok_or_else(|| ApiError::bad("status must be open, resolved or ignored"))
 }
 
 /// `errors.list`: validate, resolve the telemetry scope, then shape.
@@ -159,7 +161,7 @@ pub async fn list_for(
     status: &str,
     environment: Option<&str>,
 ) -> Result<ErrorIssueList, ApiError> {
-    validate_status(status)?;
+    let status = parse_status(status)?;
     let scope = super::observe::telemetry_scope(&state.pool, id, environment).await?;
     list(&state.pool, &scope.app_id, &scope.environment_id, status)
         .await
@@ -261,7 +263,7 @@ pub async fn set_status(
     status: &str,
     environment: Option<&str>,
 ) -> Result<(), ApiError> {
-    validate_status(status)?;
+    let status = parse_status(status)?;
     let scope = super::observe::telemetry_scope(&state.pool, id, environment).await?;
     let now = crate::host::metrics::now_us();
     match db::set_error_status(

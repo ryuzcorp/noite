@@ -29,9 +29,9 @@ pub async fn list_errors_stream(
     Query(q): Query<ErrorsStreamQuery>,
 ) -> Response {
     let status = q.status.unwrap_or_else(|| "open".into());
-    if !service::errors::ERROR_STATUSES.contains(&status.as_str()) {
+    let Some(status) = crate::models::IssueStatus::parse(&status) else {
         return ApiError::bad("status must be open, resolved or ignored").into_response();
-    }
+    };
     let scope = match service::observe::telemetry_scope(
         &state.pool,
         &id,
@@ -47,9 +47,8 @@ pub async fn list_errors_stream(
         let pool = pool.clone();
         let app_id = scope.app_id.clone();
         let environment_id = scope.environment_id.clone();
-        let status = status.clone();
         async move {
-            service::errors::list(&pool, &app_id, &environment_id, &status)
+            service::errors::list(&pool, &app_id, &environment_id, status)
                 .await
                 .ok()
                 .and_then(|list| serde_json::to_string(&list).ok())

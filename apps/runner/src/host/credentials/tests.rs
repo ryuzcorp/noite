@@ -10,10 +10,11 @@ use std::sync::{Arc, Mutex};
 use futures::future::BoxFuture;
 
 use super::{
-    cached_operator_token, decrypt, encrypt, ensure, ensure_operator_token_row, fleet_credentials,
-    mint_operator_token, operator_token, orphan_sweep, orphan_sweep_due, prefix_policy, revoke_app,
-    revoke_environment, sweep, tenant_process_credentials, AppCredentials, CredentialProvider,
-    Credentials, MintedKey, ProviderSetting, Scope, StoreAccess,
+    cached_operator_token, decrypt, delete_app_operator_tokens, delete_operator_token, encrypt,
+    ensure, ensure_operator_token_row, fleet_credentials, mint_operator_token, operator_token,
+    orphan_sweep, orphan_sweep_due, prefix_policy, revoke_app, revoke_environment, sweep,
+    tenant_process_credentials, AppCredentials, CredentialProvider, Credentials, MintedKey,
+    ProviderSetting, Scope, StoreAccess,
 };
 use crate::config::{config_for_tests, Config, Tenancy};
 use crate::db;
@@ -1468,22 +1469,24 @@ async fn token_row_rejects_the_scoped_credential_aad() {
     pool.close().await;
 }
 
-/// Deletes drop the rows: one environment's token, then every token of
-/// the app — so a recreated slug or label mints fresh.
+/// Deletes drop the rows and the cached copies: one environment's token,
+/// then every token of the app — so a recreated slug or label mints fresh and
+/// a pool-less caller can no longer present the dead token.
 #[tokio::test]
-async fn deletes_drop_the_token_rows() {
+async fn deletes_drop_the_token_rows_and_cache() {
     let pool = memory_db().await;
     let cfg = config_for_tests();
     let app_id = format!("app-{}", crate::models::new_id());
     let app_scope = format!("app:{app_id}");
     let env_scope = unique_scope("env");
-    operator_token(&pool, &cfg.runner_token, &app_scope, &app_id)
+    let app_token = operator_token(&pool, &cfg.runner_token, &app_scope, &app_id)
         .await
         .expect("app token");
-    operator_token(&pool, &cfg.runner_token, &env_scope, &app_id)
+    let env_token = operator_token(&pool, &cfg.runner_token, &env_scope, &app_id)
         .await
         .expect("env token");
-    db::delete_operator_token(&pool, &env_scope)
+    assert_eq!(cached_operator_token(&env_scope), Some(env_token.clone()));
+    delete_operator_token(&pool, &env_scope)
         .await
         .expect("drop env row");
     assert!(
@@ -1493,6 +1496,16 @@ async fn deletes_drop_the_token_rows() {
             .is_none(),
         "the environment row is gone"
     );
+    assert_eq!(
+        cached_operator_token(&env_scope),
+        None,
+        "the environment token is evicted with its row"
+    );
+    assert_eq!(
+        cached_operator_token(&app_scope),
+        Some(app_token),
+        "the app's cached token survives an environment delete"
+    );
     assert!(
         db::get_operator_token(&pool, &app_scope)
             .await
@@ -1500,7 +1513,7 @@ async fn deletes_drop_the_token_rows() {
             .is_some(),
         "the app row survives an environment delete"
     );
-    db::delete_app_operator_tokens(&pool, &app_id)
+    delete_app_operator_tokens(&pool, &app_id)
         .await
         .expect("drop app rows");
     assert!(
@@ -1509,6 +1522,11 @@ async fn deletes_drop_the_token_rows() {
             .expect("read")
             .is_none(),
         "the app delete drops every remaining row"
+    );
+    assert_eq!(
+        cached_operator_token(&app_scope),
+        None,
+        "the app delete evicts every scope of the app"
     );
     pool.close().await;
 }

@@ -9,8 +9,42 @@
 
 use sqlx::SqlitePool;
 
+/// A scoped key's lifecycle. `live` is handed to the tenant fleet; `revoking`
+/// is no longer handed out and waits for the store delete (`sweep` retries it
+/// on every pass). The row is deleted when the store accepts the delete, or
+/// immediately when it was minted in a store this runner no longer
+/// administers.
+///
+/// ```text
+/// (none) --mint--> live --supersede/teardown--> revoking --store delete--> (gone)
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, sqlx::Type)]
+#[sqlx(rename_all = "lowercase")]
+pub enum ScopedCredentialState {
+    Live,
+    Revoking,
+}
+
+impl ScopedCredentialState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Live => "live",
+            Self::Revoking => "revoking",
+        }
+    }
+}
+
 /// One `scoped_credential` row, as the two SELECTs below return it.
-type ScopedRow = (String, String, String, String, String, Vec<u8>, Vec<u8>);
+type ScopedRow = (
+    String,
+    String,
+    String,
+    String,
+    String,
+    ScopedCredentialState,
+    Vec<u8>,
+    Vec<u8>,
+);
 
 /// One `scoped_credential` row.
 pub struct ScopedCredential {
@@ -19,11 +53,12 @@ pub struct ScopedCredential {
     pub handle: String,
     pub prefix: String,
     pub store: String,
+    pub state: ScopedCredentialState,
     pub nonce: Vec<u8>,
     pub ciphertext: Vec<u8>,
 }
 
-/// A row to insert: all fields but the timestamp.
+/// A row to insert: all fields but the timestamp and state (always `live`).
 pub struct NewScopedCredential<'a> {
     pub scope: &'a str,
     pub app_id: &'a str,
@@ -34,23 +69,19 @@ pub struct NewScopedCredential<'a> {
     pub ciphertext: &'a [u8],
 }
 
-fn assemble(
-    scope: String,
-    app_id: String,
-    handle: String,
-    prefix: String,
-    store: String,
-    nonce: Vec<u8>,
-    ciphertext: Vec<u8>,
-) -> ScopedCredential {
-    ScopedCredential {
-        scope,
-        app_id,
-        handle,
-        prefix,
-        store,
-        nonce,
-        ciphertext,
+impl ScopedCredential {
+    fn from_row(row: ScopedRow) -> Self {
+        let (scope, app_id, handle, prefix, store, state, nonce, ciphertext) = row;
+        Self {
+            scope,
+            app_id,
+            handle,
+            prefix,
+            store,
+            state,
+            nonce,
+            ciphertext,
+        }
     }
 }
 
@@ -60,17 +91,14 @@ pub async fn live_scoped_credential(
     scope: &str,
 ) -> sqlx::Result<Option<ScopedCredential>> {
     let row: Option<ScopedRow> = sqlx::query_as(
-        "SELECT scope, app_id, handle, prefix, store, nonce, ciphertext \
-             FROM main.scoped_credential WHERE scope = ? AND state = 'live'",
+        "SELECT scope, app_id, handle, prefix, store, state, nonce, ciphertext \
+             FROM main.scoped_credential WHERE scope = ? AND state = ?",
     )
     .bind(scope)
+    .bind(ScopedCredentialState::Live)
     .fetch_optional(pool)
     .await?;
-    Ok(row.map(
-        |(scope, app_id, handle, prefix, store, nonce, ciphertext)| {
-            assemble(scope, app_id, handle, prefix, store, nonce, ciphertext)
-        },
-    ))
+    Ok(row.map(ScopedCredential::from_row))
 }
 
 pub async fn insert_scoped_credential(
@@ -98,10 +126,12 @@ pub async fn insert_scoped_credential(
 /// store delete until it accepts.
 pub async fn mark_scoped_credential_revoking(pool: &SqlitePool, handle: &str) -> sqlx::Result<()> {
     sqlx::query(
-        "UPDATE main.scoped_credential SET state = 'revoking', updated_at = datetime('now') \
-         WHERE handle = ? AND state = 'live'",
+        "UPDATE main.scoped_credential SET state = ?, updated_at = datetime('now') \
+         WHERE handle = ? AND state = ?",
     )
+    .bind(ScopedCredentialState::Revoking)
     .bind(handle)
+    .bind(ScopedCredentialState::Live)
     .execute(pool)
     .await?;
     Ok(())
@@ -114,10 +144,12 @@ pub async fn mark_app_scoped_credentials_revoking(
     app_id: &str,
 ) -> sqlx::Result<()> {
     sqlx::query(
-        "UPDATE main.scoped_credential SET state = 'revoking', updated_at = datetime('now') \
-         WHERE app_id = ? AND state = 'live'",
+        "UPDATE main.scoped_credential SET state = ?, updated_at = datetime('now') \
+         WHERE app_id = ? AND state = ?",
     )
+    .bind(ScopedCredentialState::Revoking)
     .bind(app_id)
+    .bind(ScopedCredentialState::Live)
     .execute(pool)
     .await?;
     Ok(())
@@ -126,19 +158,13 @@ pub async fn mark_app_scoped_credentials_revoking(
 /// Every key still awaiting its store delete.
 pub async fn revoking_scoped_credentials(pool: &SqlitePool) -> sqlx::Result<Vec<ScopedCredential>> {
     let rows: Vec<ScopedRow> = sqlx::query_as(
-        "SELECT scope, app_id, handle, prefix, store, nonce, ciphertext \
-             FROM main.scoped_credential WHERE state = 'revoking' ORDER BY updated_at",
+        "SELECT scope, app_id, handle, prefix, store, state, nonce, ciphertext \
+             FROM main.scoped_credential WHERE state = ? ORDER BY updated_at",
     )
+    .bind(ScopedCredentialState::Revoking)
     .fetch_all(pool)
     .await?;
-    Ok(rows
-        .into_iter()
-        .map(
-            |(scope, app_id, handle, prefix, store, nonce, ciphertext)| {
-                assemble(scope, app_id, handle, prefix, store, nonce, ciphertext)
-            },
-        )
-        .collect())
+    Ok(rows.into_iter().map(ScopedCredential::from_row).collect())
 }
 
 pub async fn delete_scoped_credential(pool: &SqlitePool, handle: &str) -> sqlx::Result<()> {
@@ -209,9 +235,9 @@ pub async fn insert_operator_token(
     Ok(())
 }
 
-/// Drop one fleet's token row: app and environment deletes call it, so a
-/// recreated slug never inherits the previous fleet's token.
-pub async fn delete_operator_token(pool: &SqlitePool, scope: &str) -> sqlx::Result<()> {
+/// Drop one fleet's token row. The caller (`host::credentials`) must also
+/// evict the process cache, or a live caller keeps presenting a dead token.
+pub async fn remove_operator_token_row(pool: &SqlitePool, scope: &str) -> sqlx::Result<()> {
     sqlx::query("DELETE FROM main.fleet_operator_token WHERE scope = ?")
         .bind(scope)
         .execute(pool)
@@ -220,12 +246,24 @@ pub async fn delete_operator_token(pool: &SqlitePool, scope: &str) -> sqlx::Resu
 }
 
 /// Drop every token row of one app and its environments (app delete).
-pub async fn delete_app_operator_tokens(pool: &SqlitePool, app_id: &str) -> sqlx::Result<()> {
+pub async fn remove_app_operator_token_rows(pool: &SqlitePool, app_id: &str) -> sqlx::Result<()> {
     sqlx::query("DELETE FROM main.fleet_operator_token WHERE app_id = ?")
         .bind(app_id)
         .execute(pool)
         .await?;
     Ok(())
+}
+
+/// The scopes whose token rows belong to `app_id`: the cache keys the app
+/// delete has to evict alongside the rows.
+pub async fn operator_token_scopes_for_app(
+    pool: &SqlitePool,
+    app_id: &str,
+) -> sqlx::Result<Vec<String>> {
+    sqlx::query_scalar("SELECT scope FROM main.fleet_operator_token WHERE app_id = ?")
+        .bind(app_id)
+        .fetch_all(pool)
+        .await
 }
 
 #[cfg(test)]

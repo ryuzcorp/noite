@@ -723,7 +723,7 @@ async fn environment_rows_stay_separate_from_production() {
     let env_issues = db::count_error_issues(&pool, "app1", "env-1")
         .await
         .expect("env counts");
-    assert_eq!(env_issues, vec![("open".to_string(), 1)]);
+    assert_eq!(env_issues, vec![(crate::models::IssueStatus::Open, 1)]);
     // Each fleet advances its own watermark from the shared pass.
     assert_eq!(state.watermark.get("blog"), Some(&(H + HOUR_US)));
     assert_eq!(
