@@ -865,8 +865,8 @@ const justDeployedFor = (
   deployed !== null && deployed.branch === branch ? deployed.environment : null;
 
 /** A deploy that failed, above whatever the panel frames. Only a deploy this
- * panel asked for is reported: the state's push error slot is shared with the
- * Changes panel's push, and a push is not this panel's business. */
+ * panel asked for is reported: the state's `previewError` is the preview
+ * slot's own, so a failed push never shows here (and vice versa). */
 const DeployError = ({
   attempted,
   current,
@@ -874,7 +874,7 @@ const DeployError = ({
   attempted: boolean;
   current: SourceBrowserState;
 }) => {
-  if (!attempted || current.pushError === "") {
+  if (!attempted || current.previewError === "") {
     return null;
   }
 
@@ -883,7 +883,7 @@ const DeployError = ({
       class="bg-error/15 text-error border-base-300 m-0 border-b px-3 py-1.5 text-xs"
       role="alert"
     >
-      {deployErrorCopy(current.pushError, current.readOnly)}
+      {deployErrorCopy(current.previewError, current.readOnly)}
     </p>
   );
 };
@@ -902,7 +902,7 @@ export const PreviewPanel = ({
   onClose: () => void;
   /** Snapshot the workspace and deploy its preview environment (null when
    * there is nothing to snapshot, or it failed — the reason then rides the
-   * reported state's `pushError`). */
+   * reported state's `previewError`). */
   onDeployPreview: () => Promise<RunnerEnvironment | null>;
   state: AtomHandle<SourceBrowserState>;
 }) => {

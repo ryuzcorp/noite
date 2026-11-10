@@ -65,10 +65,9 @@ pub use environments::{
     update_environment_status_if_wanted, EnvironmentRoute, NewEnvironment,
 };
 pub use errors::{
-    backfill_error_request, count_error_issues, get_error_issue, insert_error_event,
-    list_error_events, list_error_hours, list_error_issues, prune_error_events, prune_errors,
-    refresh_error_issue_count, set_error_hour, set_error_status, upsert_error_issue, ErrorRequest,
-    NewErrorEvent,
+    count_error_issues, get_error_issue, insert_error_event, list_error_events, list_error_hours,
+    list_error_issues, prune_error_events, prune_errors, refresh_error_issue_count, set_error_hour,
+    set_error_status, upsert_error_issue, ErrorRequest, NewErrorEvent,
 };
 pub use events::{
     get_app_user_props, inc_app_insight, insert_app_event, list_app_channels, list_app_events,
@@ -80,12 +79,13 @@ pub use instance_setting::{
     UPDATE_CHECK_ENABLED, UPDATE_CHECK_LAST_AT, UPDATE_CHECK_RESULT,
 };
 pub use metrics::{
-    add_app_device, add_app_metric_cpu, add_app_path, add_app_ref, clear_telemetry_replay,
-    delete_environment_telemetry, delete_metric_watermarks_for, get_metric_watermarks,
-    get_telemetry_replay, last_request_bucket, list_app_devices, list_app_logs, list_app_metrics,
-    list_app_paths, list_app_refs, list_span_stats, prune_app_devices, prune_app_logs,
-    prune_app_metrics, prune_app_paths, prune_app_refs, prune_span_stats, replace_app_logs,
+    add_app_metric_cpu, clear_telemetry_replay_if, delete_environment_telemetry,
+    delete_metric_watermarks_for, get_metric_watermarks, get_telemetry_replay, last_request_bucket,
+    list_app_devices, list_app_logs, list_app_metrics, list_app_paths, list_app_refs,
+    list_span_stats, prune_app_devices, prune_app_logs, prune_app_metrics, prune_app_paths,
+    prune_app_refs, prune_span_stats, record_access_hit, replace_app_logs,
     replace_app_metric_usage, replace_span_stat, set_metric_watermarks, set_telemetry_replay,
+    AccessHit, AccessTrace,
 };
 pub use void_cohost::{delete_environment_hashes, get_cohost_hash, set_cohost_hash};
 
@@ -272,9 +272,21 @@ mod tests {
             set_metric_watermarks(&pool, &[("test".to_string(), 42)])
                 .await
                 .expect("watermark");
-            add_app_path(&pool, "a", "", "2026-09-30T12:00:00Z", "/")
-                .await
-                .expect("path");
+            record_access_hit(
+                &pool,
+                &AccessHit {
+                    app_id: "a",
+                    environment_id: "",
+                    bucket: "2026-09-30T12:00:00Z",
+                    browser: "Other",
+                    os: "",
+                    path: "/",
+                    source: "Direct",
+                    trace: None,
+                },
+            )
+            .await
+            .expect("path");
             pool.close().await;
         }
         let pool = connect(&url).await.expect("second boot");

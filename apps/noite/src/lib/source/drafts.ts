@@ -4,6 +4,7 @@
 //! this module holds the shapes that cross the boundary.
 
 import type { PreviewResult } from "../runner";
+import type { StaleBase } from "./stale-base";
 import type { WorkspaceChange } from "./workspace/types";
 
 /** Why the browsed checkout is read-only: `""` when it is editable, else
@@ -31,11 +32,16 @@ export interface SourceBrowserState {
   conflicts: readonly string[];
   /** The workspace's changes, as of the last derive. */
   files: readonly WorkspaceChange[];
+  /** Why the last Deploy preview failed ("" = the last one, if any, landed).
+   * Its own field: a preview is not a push, so its failure never renders as
+   * one. */
+  previewError: string;
   /** What this browser last deployed as a preview, or null when it has not
    * deployed one: the Preview panel compares its fingerprint with the
    * checkout's current one to tell whether the framed snapshot holds every
    * edit. */
   previewed: PreviewedSnapshot | null;
+  /** Why the last push failed ("" = it did not): the Changes form's line. */
   pushError: string;
   pushed: PushedTo | null;
   pushing: boolean;
@@ -43,9 +49,10 @@ export interface SourceBrowserState {
   readOnly: ReadOnlyRef;
   /** Bumped on every change: a key for views rebuilt from `files`. */
   revision: number;
-  /** The commit the pod is based on, when the browsed tip has moved on since —
-   * pushing from it may conflict. */
-  stale: string | null;
+  /** The checkout's staleness when the pod's work is based on a commit the
+   * browsed tip has moved past — pushing from it may conflict. Its own entry
+   * carries both commits, never one under the other's name. */
+  stale: StaleBase | null;
 }
 
 /** A push the Changes panel asks for. `branch` names a new branch to commit

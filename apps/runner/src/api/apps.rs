@@ -15,12 +15,13 @@ use crate::db;
 use crate::models::{AppStateFrame, CreateApp, PatchApp, RenameApp};
 use crate::service;
 use crate::AppState;
+use crate::{Readiness, ReadyFailure};
 
 /// Live cgroup contribution to `/ready`: a failed fleet limit trips
 /// install-wide containment after boot, so `multi` refuses exactly like a
 /// boot-time failure while `single` keeps warning.
-fn cgroup_readiness(tenancy: &Tenancy, active: bool, detail: &str) -> Option<String> {
-    (!active && *tenancy == Tenancy::Multi).then(|| format!("cgroups: {detail}"))
+fn cgroup_readiness(tenancy: &Tenancy, active: bool, detail: &str) -> Option<ReadyFailure> {
+    (!active && *tenancy == Tenancy::Multi).then(|| ReadyFailure::Cgroups(detail.to_string()))
 }
 
 pub async fn health(State(state): State<AppState>) -> impl IntoResponse {
@@ -38,25 +39,30 @@ pub async fn health(State(state): State<AppState>) -> impl IntoResponse {
 /// last config load accepted. Body names the failing ones so one healthcheck
 /// fits Compose, Railway, Coolify and Fly.
 pub async fn ready(State(state): State<AppState>) -> impl IntoResponse {
-    let mut failing: Vec<String> = Vec::new();
-    if !state.ready.load(std::sync::atomic::Ordering::Relaxed) {
-        failing.push("reconcile".into());
-    }
+    let reconciled = state.ready.load(std::sync::atomic::Ordering::Relaxed);
+    let mut failures: Vec<ReadyFailure> = Vec::new();
     // Bucket reachable (HEAD on runner/state/, 2 s timeout, cached 5 s).
     {
         let now = std::time::Instant::now();
         let (ok, detail, at) = state.bucket_ok.read().await.clone();
         if now.duration_since(at).as_secs() >= 5 || !ok {
-            let _ = detail;
             // One head-bucket per 5 s: it errors only on transport/auth, which
             // is exactly "unreachable".
             let reachable = bucket_reachable(&state.config).await;
             *state.bucket_ok.write().await = (reachable.0, reachable.1.clone(), now);
             if !reachable.0 {
-                failing.push(format!("bucket: {}", reachable.1));
+                failures.push(ReadyFailure::Bucket(reachable.1));
             }
         } else if !ok {
-            failing.push(format!("bucket: {detail}"));
+            failures.push(ReadyFailure::Bucket(detail));
+        }
+    }
+    // Isolation first, in the pre-machine order of the `failing` array; the
+    // state itself is terminal when it trips.
+    {
+        let iso = state.isolation.read().await;
+        if iso.blocked {
+            failures.push(ReadyFailure::Isolation(iso.detail.clone()));
         }
     }
     // Per-fleet cgroups (SPEC, Tenant isolation): the live status, not the
@@ -65,15 +71,10 @@ pub async fn ready(State(state): State<AppState>) -> impl IntoResponse {
     // while `single` keeps warning. Reported on both answers so
     // `make doctor` and the e2e lane can assert containment is live, not
     // just "not failing".
-    let (cgroups_active, cgroups_detail) = {
-        let iso = state.isolation.read().await;
-        if iso.blocked {
-            failing.push(format!("isolation: {}", iso.detail));
-        }
-        crate::host::cgroups::status()
-    };
-    if let Some(reason) = cgroup_readiness(&state.config.tenancy, cgroups_active, &cgroups_detail) {
-        failing.push(reason);
+    let (cgroups_active, cgroups_detail) = crate::host::cgroups::status();
+    if let Some(failure) = cgroup_readiness(&state.config.tenancy, cgroups_active, &cgroups_detail)
+    {
+        failures.push(failure);
     }
     // Control fleet #0 (absent in the dev image, where vite dev serves it).
     if std::path::Path::new(&state.config.control_bundle_dir).exists() {
@@ -97,18 +98,21 @@ pub async fn ready(State(state): State<AppState>) -> impl IntoResponse {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .clone();
-            failing.push(match cause {
-                Some(reason) => format!("control: fleet not healthy yet ({reason})"),
-                None => "control: fleet not healthy yet".into(),
-            });
+            let detail = match cause {
+                Some(reason) => format!("fleet not healthy yet ({reason})"),
+                None => "fleet not healthy yet".into(),
+            };
+            failures.push(ReadyFailure::Control(detail));
         }
     }
     {
         let (ok, detail) = crate::host::caddy::admin_status();
         if !ok {
-            failing.push(format!("caddy: {detail}"));
+            failures.push(ReadyFailure::Caddy(detail));
         }
     }
+    let readiness = Readiness::resolve(reconciled, failures);
+    let failing = readiness.failing();
     let credentials = state.isolation.read().await.credentials.clone();
     let snapshot = state.state_sync.snapshot_status();
     let credential_sweep = crate::host::credentials::orphan_sweep_status();
@@ -127,7 +131,7 @@ pub async fn ready(State(state): State<AppState>) -> impl IntoResponse {
         // and builds are uncapped, which `cgroups.detail` already explains.
         "build": crate::host::cgroups::build_status(),
         "failing": failing });
-    if failing.is_empty() {
+    if readiness.ok() {
         Json(body).into_response()
     } else {
         (StatusCode::SERVICE_UNAVAILABLE, Json(body)).into_response()
@@ -291,5 +295,42 @@ mod tests {
             cgroup_readiness(&Tenancy::Multi, true, "per-fleet cgroups under /x").is_none(),
             "multi stays ok while containment holds"
         );
+    }
+
+    #[test]
+    fn readiness_keeps_the_failing_order_and_degrades_on_one_probe() {
+        assert_eq!(
+            crate::Readiness::resolve(true, Vec::new()).failing(),
+            Vec::<String>::new()
+        );
+        assert!(crate::Readiness::resolve(true, Vec::new()).ok());
+        // A boot still names the first reconcile pass.
+        let starting = crate::Readiness::resolve(false, Vec::new());
+        assert_eq!(starting.failing(), vec!["reconcile".to_string()]);
+        // Probe failures keep the pre-machine order: reconcile, bucket,
+        // isolation, then the rest.
+        let readiness = crate::Readiness::resolve(
+            false,
+            vec![
+                crate::ReadyFailure::Bucket("head-bucket b unreachable".into()),
+                crate::ReadyFailure::Isolation("cgroups unavailable".into()),
+                crate::ReadyFailure::Caddy("load refused".into()),
+            ],
+        );
+        assert!(!readiness.ok());
+        assert_eq!(
+            readiness.failing(),
+            vec![
+                "reconcile".to_string(),
+                "bucket: head-bucket b unreachable".to_string(),
+                "isolation: cgroups unavailable".to_string(),
+                "caddy: load refused".to_string(),
+            ]
+        );
+        assert!(matches!(readiness, crate::Readiness::Blocked { .. }));
+        assert!(matches!(
+            crate::Readiness::resolve(true, vec![crate::ReadyFailure::Reconcile]),
+            crate::Readiness::Degraded { .. }
+        ));
     }
 }

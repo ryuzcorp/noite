@@ -187,6 +187,67 @@ fn valid_ref(reference: &str) -> bool {
     is_hex_sha(reference) || valid_branch_name(reference)
 }
 
+/// Outcome of trying to materialize a fleet's push mirror from its manifest.
+/// The `Cold`/`Hot` decision and the degraded fallback live here, so the forge
+/// reads and the Git HTTP routes cannot drift.
+///
+/// stateDiagram-v2
+///   [*] --> Cold: no local HEAD
+///   [*] --> Hot: local HEAD present
+///   Cold --> Synced: manifest applied
+///   Cold --> Refused: manifest unreadable (nothing to serve)
+///   Hot --> Synced: manifest applied
+///   Hot --> Degraded: manifest apply failed; serve local mirror
+#[derive(Debug)]
+pub enum MirrorPhase {
+    Synced {
+        bare: std::path::PathBuf,
+    },
+    /// Hot mirror whose refresh failed: reads keep serving what is local.
+    Degraded {
+        bare: std::path::PathBuf,
+    },
+    /// Cold mirror whose hydration failed: there is nothing to serve.
+    Refused(anyhow::Error),
+}
+
+/// One attempt at applying the manifest. The only place that decides whether
+/// a failed sync may be served from local state.
+pub async fn hydrate(wal: &crate::host::git_store::GitWal, slug: &str) -> MirrorPhase {
+    let bare = wal.mirror_path(slug);
+    let cold = !bare.join("HEAD").exists();
+    match wal.ensure_synced(slug).await {
+        Ok(bare) => MirrorPhase::Synced { bare },
+        Err(e) if !cold => {
+            tracing::warn!(slug, error = %format!("{e:#}"), "git manifest refresh");
+            MirrorPhase::Degraded { bare }
+        }
+        Err(e) => MirrorPhase::Refused(e.into()),
+    }
+}
+
+/// A CAS conflict on a server-side ref move. The `Display` text is the
+/// callers' 409 vocabulary (`forge_error`/`repo_error` map "tip moved"), so
+/// typed callers can downcast while the wire stays identical.
+#[derive(Debug)]
+pub struct RefConflict {
+    pub name: String,
+    pub actual: Option<String>,
+}
+
+impl std::fmt::Display for RefConflict {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "tip moved under this update: {} is {}",
+            self.name,
+            self.actual.as_deref().unwrap_or("<absent>")
+        )
+    }
+}
+
+impl std::error::Error for RefConflict {}
+
 /// Materialize the push mirror and apply `MANIFEST.json` exactly, then return
 /// it. Reads and server-side ref moves both start here, so neither ever sees
 /// a branch the manifest dropped.
@@ -195,15 +256,9 @@ fn valid_ref(reference: &str) -> bool {
 /// moved bundles, deleting refs the manifest dropped); a hot mirror whose
 /// rebuild fails still serves from what is local, warn-only.
 pub async fn read_mirror(state: &AppState, slug: &str) -> anyhow::Result<PathBuf> {
-    let bare = state.wal.mirror_path(slug);
-    let cold = !bare.join("HEAD").exists();
-    match state.wal.ensure_synced(slug).await {
-        Ok(bare) => Ok(bare),
-        Err(e) if !cold => {
-            tracing::warn!(slug, error = %format!("{e:#}"), "forge manifest apply");
-            Ok(bare)
-        }
-        Err(e) => Err(anyhow::anyhow!("{e:#}")),
+    match hydrate(&state.wal, slug).await {
+        MirrorPhase::Synced { bare } | MirrorPhase::Degraded { bare, .. } => Ok(bare),
+        MirrorPhase::Refused(e) => Err(anyhow!("{e:#}")),
     }
 }
 
@@ -224,9 +279,14 @@ pub async fn read_mirror_cfg(cfg: &Config, slug: &str) -> anyhow::Result<PathBuf
     let wal = crate::host::git_store::build_wal(cfg);
     let bare = wal.mirror_path(slug);
     if bare.join("HEAD").exists() {
+        // Hot: config discovery deliberately serves local (applying a stale
+        // manifest here could delete a just-created branch).
         return Ok(bare);
     }
-    Ok(wal.ensure_synced(slug).await?)
+    match hydrate(&wal, slug).await {
+        MirrorPhase::Synced { bare } | MirrorPhase::Degraded { bare, .. } => Ok(bare),
+        MirrorPhase::Refused(e) => Err(anyhow!("{e:#}")),
+    }
 }
 
 /// Rev to browse on the read mirror: an explicit `ref` (branch, tag or sha),
@@ -329,13 +389,14 @@ pub async fn publish_refname(
         .publish_locked(&app.slug, &updates)
         .await
         .map_err(|e| {
-            // The CAS precondition is the callers' 409 vocabulary (`forge_error`
-            // maps "tip moved" to Conflict): keep the message shape.
+            // The CAS precondition stays the callers' 409 vocabulary
+            // (`forge_error` maps "tip moved" to Conflict): `RefConflict`'s
+            // Display keeps the message, and the type lets new callers branch.
             if let ryuz_git::WalError::RefConflict { name, actual, .. } = &e {
-                anyhow!(
-                    "tip moved under this update: {name} is {}",
-                    actual.as_deref().unwrap_or("<absent>")
-                )
+                anyhow::Error::new(RefConflict {
+                    name: name.clone(),
+                    actual: actual.clone(),
+                })
             } else {
                 anyhow!("{e:#}")
             }
@@ -1501,6 +1562,12 @@ mod tests {
             .await
             .expect_err("stale");
         assert!(format!("{err:#}").contains("tip moved"), "{err:#}");
+        // The move is a typed conflict, not only an error string.
+        let conflict = err
+            .downcast_ref::<RefConflict>()
+            .expect("a CAS conflict carries its state");
+        assert_eq!(conflict.name, "refs/heads/main");
+        assert_eq!(conflict.actual.as_deref(), Some(first.as_str()));
 
         // The right expectation deletes, and the manifest drops the ref.
         publish_ref(&h.state, &h.app, "main", Some(&first), None)

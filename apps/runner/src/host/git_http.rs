@@ -461,15 +461,10 @@ pub(crate) async fn after_receive(
 /// from what is local when the rebuild fails, same as before manifests
 /// existed.
 async fn synced_bare(state: &AppState, slug: &str) -> Result<PathBuf, String> {
-    let bare = state.wal.mirror_path(slug);
-    let cold = !bare.join("HEAD").exists();
-    match state.wal.ensure_synced(slug).await {
-        Ok(bare) => Ok(bare),
-        Err(e) if !cold => {
-            tracing::warn!(slug = %slug, error = %format!("{e:#}"), "git manifest refresh");
-            Ok(bare)
-        }
-        Err(e) => Err(format!("{e:#}")),
+    match crate::host::forge::hydrate(&state.wal, slug).await {
+        crate::host::forge::MirrorPhase::Synced { bare }
+        | crate::host::forge::MirrorPhase::Degraded { bare, .. } => Ok(bare),
+        crate::host::forge::MirrorPhase::Refused(e) => Err(format!("{e:#}")),
     }
 }
 

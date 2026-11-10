@@ -8,7 +8,9 @@
 
 use sqlx::SqlitePool;
 
-use crate::models::{now_iso, AppDeviceStat, AppMetric, AppPathStat, AppRefStat, AppSpanStat};
+use crate::models::{
+    new_id, now_iso, AppDeviceStat, AppMetric, AppPathStat, AppRefStat, AppSpanStat,
+};
 
 /// Newest minute bucket with at least one request (celld `celld.fetch`
 /// spans), or None when the app never served within retention.
@@ -172,56 +174,135 @@ pub async fn get_telemetry_replay(pool: &SqlitePool) -> sqlx::Result<Option<Repl
     }))
 }
 
+/// Queue a replay. `requested_at` is the request's identity for one tick: it
+/// carries a random suffix on top of the timestamp so two requests (even in
+/// the same millisecond) are never conflated when the tick decides what it
+/// has already rewound.
 pub async fn set_telemetry_replay(
     pool: &SqlitePool,
     floor_us: i64,
     slug: Option<&str>,
 ) -> sqlx::Result<()> {
+    let request = format!("{}#{}", now_iso(), &new_id()[..8]);
+    let mut tx = pool.begin().await?;
     sqlx::query("DELETE FROM main.telemetry_replay")
-        .execute(pool)
+        .execute(&mut *tx)
         .await?;
     sqlx::query(
         "INSERT INTO main.telemetry_replay (id, floor_us, slug, requested_at) VALUES (1, ?, ?, ?)",
     )
     .bind(floor_us)
     .bind(slug)
-    .bind(now_iso())
-    .execute(pool)
+    .bind(&request)
+    .execute(&mut *tx)
     .await?;
+    tx.commit().await?;
     Ok(())
 }
 
-pub async fn clear_telemetry_replay(pool: &SqlitePool) -> sqlx::Result<()> {
-    sqlx::query("DELETE FROM main.telemetry_replay")
+/// Clear the replay row only when it still holds `requested_at`: a request
+/// queued after the tick read the row is left in place for the next pass
+/// instead of being deleted unapplied. Returns whether this request's row
+/// was the one removed.
+pub async fn clear_telemetry_replay_if(
+    pool: &SqlitePool,
+    requested_at: &str,
+) -> sqlx::Result<bool> {
+    let res = sqlx::query("DELETE FROM main.telemetry_replay WHERE id = 1 AND requested_at = ?")
+        .bind(requested_at)
         .execute(pool)
         .await?;
-    Ok(())
+    Ok(res.rows_affected() == 1)
 }
 
-/// Accumulate one device hit into its hour bucket. Called from the
-/// access-log tick; only the classified pair is stored, never IPs or
-/// raw user-agents.
-pub async fn add_app_device(
-    pool: &SqlitePool,
-    app_id: &str,
-    environment_id: &str,
-    bucket_ts: &str,
-    browser: &str,
-    os: &str,
-) -> sqlx::Result<()> {
+/// One parsed access-log line, all fields already classified. Written in one
+/// transaction with its optional trace backfill: a mid-line DB error applies
+/// nothing, so the tail can retry the line without double counting.
+pub struct AccessHit<'a> {
+    pub app_id: &'a str,
+    pub environment_id: &'a str,
+    pub bucket: &'a str,
+    pub browser: &'a str,
+    pub os: &'a str,
+    pub path: &'a str,
+    pub source: &'a str,
+    pub trace: Option<AccessTrace<'a>>,
+}
+
+/// The trace → request join carried by an access-log line. `backfill` is set
+/// when the error ingest stored an occurrence before the line landed.
+pub struct AccessTrace<'a> {
+    pub trace_id: &'a str,
+    pub method: &'a str,
+    pub path: &'a str,
+    pub http_status: i64,
+    pub browser: &'a str,
+    pub os: &'a str,
+    pub backfill: bool,
+}
+
+/// Accumulate one access-log line into the device, path and referrer hour
+/// buckets, and backfill a pending error occurrence, atomically. The caller
+/// persists its log offset only after this returns: a failure leaves the
+/// line unread instead of half-counted.
+pub async fn record_access_hit(pool: &SqlitePool, hit: &AccessHit<'_>) -> sqlx::Result<()> {
+    let mut tx = pool.begin().await?;
     sqlx::query(
         r#"INSERT INTO metrics.app_device_stat (app_id, environment_id, bucket_ts, browser, os, requests)
            VALUES (?, ?, ?, ?, ?, 1)
            ON CONFLICT (app_id, environment_id, bucket_ts, browser, os) DO UPDATE SET
              requests = requests + 1"#,
     )
-    .bind(app_id)
-    .bind(environment_id)
-    .bind(bucket_ts)
-    .bind(browser)
-    .bind(os)
-    .execute(pool)
+    .bind(hit.app_id)
+    .bind(hit.environment_id)
+    .bind(hit.bucket)
+    .bind(hit.browser)
+    .bind(hit.os)
+    .execute(&mut *tx)
     .await?;
+    sqlx::query(
+        r#"INSERT INTO metrics.app_path_stat (app_id, environment_id, bucket_ts, path, requests)
+           VALUES (?, ?, ?, ?, 1)
+           ON CONFLICT (app_id, environment_id, bucket_ts, path) DO UPDATE SET
+             requests = requests + 1"#,
+    )
+    .bind(hit.app_id)
+    .bind(hit.environment_id)
+    .bind(hit.bucket)
+    .bind(hit.path)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(
+        r#"INSERT INTO metrics.app_ref_stat (app_id, environment_id, bucket_ts, source, requests)
+           VALUES (?, ?, ?, ?, 1)
+           ON CONFLICT (app_id, environment_id, bucket_ts, source) DO UPDATE SET
+             requests = requests + 1"#,
+    )
+    .bind(hit.app_id)
+    .bind(hit.environment_id)
+    .bind(hit.bucket)
+    .bind(hit.source)
+    .execute(&mut *tx)
+    .await?;
+    if let Some(trace) = &hit.trace {
+        if trace.backfill {
+            crate::db::errors::backfill_error_request(
+                &mut tx,
+                hit.app_id,
+                hit.environment_id,
+                trace.trace_id,
+                &crate::db::ErrorRequest {
+                    method: trace.method,
+                    path: trace.path,
+                    http_status: trace.http_status,
+                    browser: trace.browser,
+                    os: trace.os,
+                },
+            )
+            .await?;
+        }
+    }
+    tx.commit().await?;
     Ok(())
 }
 
@@ -251,30 +332,6 @@ pub async fn prune_app_devices(pool: &SqlitePool, older_than_ts: &str) -> sqlx::
     Ok(res.rows_affected())
 }
 
-/// Accumulate one pathname hit into its hour bucket. Query strings are
-/// stripped before storing; over-long paths are skipped upstream.
-pub async fn add_app_path(
-    pool: &SqlitePool,
-    app_id: &str,
-    environment_id: &str,
-    bucket_ts: &str,
-    path: &str,
-) -> sqlx::Result<()> {
-    sqlx::query(
-        r#"INSERT INTO metrics.app_path_stat (app_id, environment_id, bucket_ts, path, requests)
-           VALUES (?, ?, ?, ?, 1)
-           ON CONFLICT (app_id, environment_id, bucket_ts, path) DO UPDATE SET
-             requests = requests + 1"#,
-    )
-    .bind(app_id)
-    .bind(environment_id)
-    .bind(bucket_ts)
-    .bind(path)
-    .execute(pool)
-    .await?;
-    Ok(())
-}
-
 pub async fn list_app_paths(
     pool: &SqlitePool,
     app_id: &str,
@@ -299,30 +356,6 @@ pub async fn prune_app_paths(pool: &SqlitePool, older_than_ts: &str) -> sqlx::Re
         .execute(pool)
         .await?;
     Ok(res.rows_affected())
-}
-
-/// Accumulate one referrer hit into its hour bucket. Only the classified
-/// source (network/engine name or bare host) is stored — never full URLs.
-pub async fn add_app_ref(
-    pool: &SqlitePool,
-    app_id: &str,
-    environment_id: &str,
-    bucket_ts: &str,
-    source: &str,
-) -> sqlx::Result<()> {
-    sqlx::query(
-        r#"INSERT INTO metrics.app_ref_stat (app_id, environment_id, bucket_ts, source, requests)
-           VALUES (?, ?, ?, ?, 1)
-           ON CONFLICT (app_id, environment_id, bucket_ts, source) DO UPDATE SET
-             requests = requests + 1"#,
-    )
-    .bind(app_id)
-    .bind(environment_id)
-    .bind(bucket_ts)
-    .bind(source)
-    .execute(pool)
-    .await?;
-    Ok(())
 }
 
 pub async fn list_app_refs(
@@ -547,4 +580,65 @@ pub async fn delete_environment_telemetry(
         n += res.rows_affected();
     }
     Ok(n)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// P1: a replay queued while the tick was reading the row must not be
+    /// deleted by the tick's later clear. The old unconditional `DELETE` did
+    /// exactly that; the conditional clear only removes the request it ran.
+    #[tokio::test]
+    async fn a_replay_queued_between_read_and_clear_survives() {
+        let pool = crate::db::connect("sqlite::memory:")
+            .await
+            .expect("memory db");
+        set_telemetry_replay(&pool, 100, None)
+            .await
+            .expect("first replay");
+        let first = get_telemetry_replay(&pool)
+            .await
+            .expect("readable")
+            .expect("queued");
+        // The CLI queues a second replay after the tick read `first`.
+        set_telemetry_replay(&pool, 200, Some("blog"))
+            .await
+            .expect("second replay");
+        let cleared = clear_telemetry_replay_if(&pool, &first.requested_at)
+            .await
+            .expect("conditional clear");
+        assert!(!cleared, "the row now holds a different request");
+        let pending = get_telemetry_replay(&pool)
+            .await
+            .expect("readable")
+            .expect("the queued replay survives");
+        assert_eq!(pending.floor_us, 200);
+        assert_eq!(pending.slug.as_deref(), Some("blog"));
+        assert_ne!(pending.requested_at, first.requested_at);
+        // The request that did run settles normally.
+        assert!(clear_telemetry_replay_if(&pool, &pending.requested_at)
+            .await
+            .expect("clear"));
+        assert!(get_telemetry_replay(&pool).await.expect("read").is_none());
+    }
+
+    /// Two requests in the same millisecond are still distinct identities.
+    #[tokio::test]
+    async fn replay_requests_have_unique_identities() {
+        let pool = crate::db::connect("sqlite::memory:")
+            .await
+            .expect("memory db");
+        set_telemetry_replay(&pool, 1, None).await.expect("first");
+        let first = get_telemetry_replay(&pool)
+            .await
+            .expect("read")
+            .expect("row");
+        set_telemetry_replay(&pool, 2, None).await.expect("second");
+        let second = get_telemetry_replay(&pool)
+            .await
+            .expect("read")
+            .expect("row");
+        assert_ne!(first.requested_at, second.requested_at);
+    }
 }
