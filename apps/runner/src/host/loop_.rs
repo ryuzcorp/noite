@@ -938,8 +938,8 @@ mod tests {
     }
 
     /// The owner rule (2026-11-10): two consecutive failed deploys of the same
-    /// sha pause the fallback sweep, a new sha is a new budget, a cancel keeps
-    /// the sweep off too, and an explicit deploy still works.
+    /// sha pause the fallback sweep, a new sha is a new budget, and a cancel
+    /// keeps the sweep off too.
     #[tokio::test]
     async fn sweep_pauses_automatic_deploys_after_two_failures() {
         let cfg = crate::config::config_for_tests();
@@ -1017,8 +1017,8 @@ mod tests {
             "a stopped sha is not retried automatically"
         );
 
-        // The state is derived from the rows, so it survives a restart: the
-        // same rows through a fresh handle still pause the sweep.
+        // The newest row decides for the whole target: the stop is what the
+        // UI reports as the pause.
         let state = crate::host::auto_deploy::for_target(&pool, &app.id, None)
             .await
             .expect("auto deploy");

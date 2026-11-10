@@ -315,6 +315,67 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The pause is tenant-visible once: the event lands at the transition
+    /// into the cap, and a later explicit-then-failed attempt (a third
+    /// failure) does not repeat it.
+    #[tokio::test]
+    async fn the_cap_records_one_pause_event() {
+        let cfg = crate::config::config_for_tests();
+        let pool = db::connect("sqlite::memory:").await.expect("memory db");
+        let app = db::create_app(
+            &pool,
+            &cfg,
+            db::NewApp {
+                name: "event",
+                slug: "event",
+                user_id: "local",
+                subdomain: "event.localhost",
+                listen: 30380,
+                internal: 30381,
+            },
+        )
+        .await
+        .expect("app");
+        for _ in 0..2 {
+            db::upsert_deploy(
+                &pool,
+                None,
+                &app.id,
+                None,
+                DeployStatus::Failed,
+                Some("sha1"),
+                "boom",
+            )
+            .await
+            .expect("failed deploy");
+        }
+        note_exhausted(&pool, &app.id, None).await;
+        db::upsert_deploy(
+            &pool,
+            None,
+            &app.id,
+            None,
+            DeployStatus::Failed,
+            Some("sha1"),
+            "boom",
+        )
+        .await
+        .expect("third failure");
+        note_exhausted(&pool, &app.id, None).await;
+
+        let events = db::list_app_events(&pool, &app.id, Some("deploy"), 10)
+            .await
+            .expect("events");
+        assert_eq!(events.len(), 1, "only the transition records an event");
+        assert_eq!(events[0].event, "auto deploy paused");
+        assert!(
+            events[0].description.contains("sha1"),
+            "{}",
+            events[0].description
+        );
+        pool.close().await;
+    }
+
     /// A row with no sha cannot be attributed to a tip; it must never keep a
     /// stale block alive.
     #[test]
