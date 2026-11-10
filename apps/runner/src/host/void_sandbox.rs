@@ -796,6 +796,12 @@ mod tests {
         );
         assert_eq!(bundle.meta.bundle_sha256.len(), 64);
 
+        // The dev stack publishes the bundle by swapping a symlink
+        // (`docker/dev-sandbox.sh`), so the loader must follow one.
+        let link = guard_bundle_ok.path().join("bundle-link");
+        std::os::unix::fs::symlink(&dir, &link).unwrap();
+        assert_eq!(load_bundle(&link).unwrap().worker_js, worker);
+
         std::fs::write(dir.join("worker.js"), b"controller-bundle-tampered").unwrap();
         let err = format!("{:#}", load_bundle(&dir).unwrap_err());
         assert!(err.contains("does not match"), "{}", err);
