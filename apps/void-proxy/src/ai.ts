@@ -10,6 +10,7 @@
 /* oxlint-disable anti-slop/no-runtime-typeof, anti-slop/no-unsafe-dictionary-type, anti-slop/no-unknown-parameters, anti-slop/no-unknown-returns, anti-slop/no-known-value-widening -- untyped-JSON I/O boundary: every handler validates untrusted bodies field-by-field, so typeof-narrowing and open dictionaries are the job, not slop */
 
 import { asRecord, asString, isRecord, json } from "./auth.ts";
+import type { AiConfig } from "./config.ts";
 import type { Env, ProxyDeps } from "./env.ts";
 
 /**
@@ -75,15 +76,18 @@ type SerializedFileInput = Readonly<{
   type?: string;
 }>;
 
+/**
+ * The serializer's envelope, tagged by `type`. Payload fields stay `unknown`:
+ * the pre-machine code forwarded them straight to `fetch`/`Headers`/`FormData`,
+ * whose WebIDL conversion is the coercion contract, so decoding must not
+ * pre-coerce or reject them.
+ */
 type SerializedProviderBody = Readonly<
   | { type: "none" }
   | { type: "json"; value: unknown }
-  | { type: "text"; data: string; contentType?: string }
-  | { type: "base64"; data: string; contentType?: string }
-  | {
-      type: "form";
-      entries: { name: string; value: string | SerializedFileInput }[];
-    }
+  | { type: "text"; data: unknown; contentType?: unknown }
+  | { type: "base64"; data: unknown; contentType?: unknown }
+  | { type: "form"; entries: unknown }
 >;
 
 class BadRequestError extends Error {
@@ -111,11 +115,13 @@ const isSerializedFileInput = (
   );
 };
 
-const base64ToBytes = (base64: string): Uint8Array => {
+const base64ToBytes = (base64: unknown): Uint8Array => {
   let binary: string;
 
   try {
-    binary = atob(base64);
+    // SAFETY: `atob` applies the same WebIDL string coercion the old cast
+    // relied on; an unusable value still becomes BadRequestError below.
+    binary = atob(base64 as string);
   } catch {
     throw new BadRequestError("invalid file data");
   }
@@ -161,30 +167,65 @@ const isUnsafeProviderPath = (path: string): boolean => {
   return false;
 };
 
+/**
+ * Provider envelope states, decoded from the runtime's serializer output:
+ * `none` / `json` / `text` / `base64` / `form`, with an unknown tag degrading
+ * to `none` (the historical, wire-stable behavior: it sends no body).
+ *
+ * ```mermaid
+ * stateDiagram-v2
+ *     [*] --> None: missing tag / unknown tag
+ *     [*] --> Json: type=json
+ *     [*] --> Text: type=text
+ *     [*] --> Base64: type=base64
+ *     [*] --> Form: type=form
+ * ```
+ *
+ * Payload fields are forwarded unchanged and coerced by the same sinks as
+ * before (`fetch` body, `Headers.set`, `FormData.append`), so every input
+ * produces the old upstream request: `{type:"text",data:5}` still sends "5",
+ * a truthy non-string `contentType` is stringified, and form `name`/`value`
+ * are coerced. A non-iterable `entries` or a null entry still throws here
+ * (mapped to 502), and bad file data stays the 400 it always was.
+ */
 const providerBody = (value: unknown): SerializedProviderBody => {
   const record = asRecord(value);
-  const type = asString(record.type);
 
-  if (
-    type === "none" ||
-    type === "json" ||
-    type === "text" ||
-    type === "base64" ||
-    type === "form"
-  ) {
-    // SAFETY: only the `type` tag is checked; the envelope fields are trusted
-    // per the framework's serializer contract, and a malformed envelope throws
-    // inside providerRequestBody, which the caller maps to a 502 like Void.
-    return record as SerializedProviderBody;
+  switch (asString(record.type)) {
+    case "base64": {
+      return {
+        contentType: record.contentType,
+        data: record.data,
+        type: "base64",
+      };
+    }
+
+    case "form": {
+      return { entries: record.entries, type: "form" };
+    }
+
+    case "json": {
+      return { type: "json", value: record.value };
+    }
+
+    case "text": {
+      return {
+        contentType: record.contentType,
+        data: record.data,
+        type: "text",
+      };
+    }
+
+    default: {
+      return { type: "none" };
+    }
   }
-
-  return { type: "none" };
 };
 
 const appendSerializedFormValue = (
   form: FormData,
-  name: string,
-  value: string | SerializedFileInput
+  name: unknown,
+  value: unknown
 ): void => {
   if (isSerializedFileInput(value)) {
     const bytes = base64ToBytes(value.data);
@@ -194,19 +235,22 @@ const appendSerializedFormValue = (
       type: value.type ?? "application/octet-stream",
     });
 
-    form.append(name, blob, value.name ?? name);
+    // SAFETY: `FormData.append` applies the same WebIDL string coercion to the
+    // field name and filename that the old raw cast relied on.
+    form.append(name as string, blob, (value.name ?? name) as string);
 
     return;
   }
 
-  form.append(name, value);
+  // SAFETY: `FormData.append` coerces name and value to strings, as before.
+  form.append(name as string, value as string);
 };
 
 const providerRequestBody = (
   body: SerializedProviderBody
 ): {
-  body?: BodyInit;
-  contentType?: string;
+  body?: BodyInit | null;
+  contentType?: unknown;
 } => {
   if (body.type === "none") {
     return {};
@@ -220,7 +264,12 @@ const providerRequestBody = (
   }
 
   if (body.type === "text") {
-    return { body: body.data, contentType: body.contentType };
+    // SAFETY: `fetch` coerces the body exactly as the old cast did (String for
+    // primitives, no body for null/undefined).
+    return {
+      body: body.data as BodyInit | null | undefined,
+      contentType: body.contentType,
+    };
   }
 
   if (body.type === "base64") {
@@ -232,8 +281,14 @@ const providerRequestBody = (
 
   const form = new FormData();
 
-  for (const entry of body.entries) {
-    appendSerializedFormValue(form, entry.name, entry.value);
+  // SAFETY: `entries` is the serializer's array; a non-iterable value throws
+  // here exactly as the old `for…of` did (the handler maps that to 502).
+  for (const entry of body.entries as readonly unknown[]) {
+    // SAFETY: raw property access reproduces the old coercion: a primitive
+    // entry yields undefined fields, null/undefined entries throw (502).
+    const { name, value } = entry as { name?: unknown; value?: unknown };
+
+    appendSerializedFormValue(form, name, value);
   }
 
   return { body: form };
@@ -275,7 +330,7 @@ const applyProviderHeaders = ({
   providerKey: string;
   apiKeyHeader?: string | null;
   apiKeyPrefix?: string | null;
-  contentType?: string;
+  contentType?: unknown;
 }): Headers => {
   const defaults = providerAuthDefaults(provider);
   const keyHeader = apiKeyHeader ?? defaults.header;
@@ -284,7 +339,9 @@ const applyProviderHeaders = ({
   headers.set(keyHeader, `${keyPrefix}${providerKey}`);
 
   if (contentType && !headers.has("content-type")) {
-    headers.set("content-type", contentType);
+    // SAFETY: `Headers.set` applies the same WebIDL string coercion the old
+    // raw `contentType` relied on.
+    headers.set("content-type", contentType as string);
   }
 
   return headers;
@@ -402,49 +459,22 @@ export const handleAiProvider = async (
   }
 };
 
-interface AiModelMapping {
-  endpoint: string;
-  model: string;
-}
-
-export const readAiModelMap = (
-  env: Env
-): Record<string, AiModelMapping> | null => {
-  const raw = (env.VOID_PROXY_AI_MODELS ?? "").trim();
-
-  if (!raw) {
-    return {};
-  }
-
-  let parsed: unknown;
-
-  try {
-    parsed = JSON.parse(raw);
-  } catch {
-    return null;
-  }
-
-  if (!isRecord(parsed)) {
-    return null;
-  }
-
-  const map: Record<string, AiModelMapping> = {};
-
-  for (const [key, value] of Object.entries(parsed)) {
-    if (
-      isRecord(value) &&
-      typeof value.endpoint === "string" &&
-      typeof value.model === "string"
-    ) {
-      map[key] = { endpoint: value.endpoint, model: value.model };
-    }
-  }
-
-  return map;
-};
+/**
+ * `/ai/run` response modes. `Sse` requires all three: the upstream succeeded,
+ * the caller asked to stream, and a body exists. Anything else is a
+ * passthrough, so an upstream error is never rewritten as a 200 event stream.
+ *
+ * ```mermaid
+ * stateDiagram-v2
+ *     [*] --> Passthrough: !ok or !stream or no body
+ *     [*] --> Sse: ok and stream and body
+ * ```
+ */
+type AiRunMode = { readonly _tag: "Passthrough" } | { readonly _tag: "Sse" };
 
 export const handleAiRun = async (
   env: Env,
+  aiConfig: AiConfig,
   body: Record<string, unknown>,
   deps: ProxyDeps
 ): Promise<Response> => {
@@ -454,13 +484,11 @@ export const handleAiRun = async (
     return json({ error: "model required" }, 400);
   }
 
-  const map = readAiModelMap(env);
-
-  if (map === null) {
-    return json({ error: "ai model map invalid" }, 502);
+  if (aiConfig.models._tag === "Misconfigured") {
+    return json({ error: aiConfig.models.detail }, 502);
   }
 
-  const mapping = map[model];
+  const mapping = aiConfig.models.models[model];
 
   if (!mapping) {
     // Loud, never a silent substitute.
@@ -505,7 +533,12 @@ export const handleAiRun = async (
     // Upstream errors ride the JSON error path even when the caller asked to
     // stream — piping a 401/429/500 body as 200 SSE would mask auth/quota
     // failures from the caller.
-    if (!response.ok || !stream || !response.body) {
+    const mode: AiRunMode =
+      response.ok && stream && response.body !== null
+        ? { _tag: "Sse" }
+        : { _tag: "Passthrough" };
+
+    if (mode._tag === "Passthrough") {
       // Endpoint-native shape (documented, not translated to Workers AI shapes).
       return new Response(response.body, {
         headers: filteredResponseHeaders(response),

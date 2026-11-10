@@ -17,6 +17,10 @@
  * note in SPEC.md "Void platform proxy") carry their attribution in the
  * module where they live.
  *
+ * Routing is one state machine (`src/routes.ts`): a request is a `Route`
+ * (health, revalidate, email send, one of the AI operations, or the removed
+ * relay tombstone), a 405, or a 404 — decided before the body is read.
+ *
  * Globals used: `fetch`, `crypto`, KV bindings, `cloudflare:sockets`, and
  * `caches.default` for the ISR edge purge (`CELLD_CACHE_SCOPE=deployment`
  * shares one cache across the fleet's deployment, like a Cloudflare zone, so
@@ -27,9 +31,10 @@
 
 /* oxlint-disable anti-slop/no-runtime-typeof, anti-slop/no-unsafe-dictionary-type, anti-slop/no-unknown-parameters, anti-slop/no-unknown-returns, anti-slop/no-known-value-widening -- untyped-JSON I/O boundary: every handler validates untrusted bodies field-by-field, so typeof-narrowing and open dictionaries are the job, not slop */
 
-import { handleAiProvider, handleAiRun, readAiModelMap } from "./src/ai.ts";
+import { handleAiProvider, handleAiRun } from "./src/ai.ts";
 import {
   asString,
+  assertNever,
   isRecord,
   json,
   readRequestJson,
@@ -37,38 +42,29 @@ import {
   requestBodyMaxBytes,
   timingSafeEqual,
 } from "./src/auth.ts";
+import type { ProxyConfig } from "./src/config.ts";
+import { readProxyConfig } from "./src/config.ts";
 import { handleEmailSend } from "./src/email/send.ts";
-import { readSenderDomain } from "./src/email/validate.ts";
 import type { Env, ProxyDeps } from "./src/env.ts";
 import { handleRevalidate } from "./src/revalidate.ts";
+import { matchRoute } from "./src/routes.ts";
 
-const POST_ROUTES = new Set([
-  "/revalidate",
-  "/email/send",
-  "/email/relay",
-  "/ai/run",
-  "/ai/provider",
-  "/ai/models",
-  "/ai/toMarkdown",
-]);
-
-const handleHealth = (env: Env): Response => {
-  const smtpHost = (env.VOID_PROXY_SMTP_HOST ?? "").trim();
-
-  return json({
+const handleHealth = (config: ProxyConfig): Response =>
+  json({
     bindings: {
-      ai: env.VOID_PROXY_AI_ENABLED === "1",
+      ai: config.ai.enabled,
       aiRun:
-        readAiModelMap(env) !== null &&
-        Object.keys(readAiModelMap(env) ?? {}).length > 0,
-      email: smtpHost.length > 0,
-      emailDomain: readSenderDomain(env) !== null,
-      isrCache: !!env.ISR_CACHE,
-      mailKv: !!env.MAIL_IDEMPOTENCY,
+        config.ai.models._tag === "Ready" &&
+        Object.keys(config.ai.models.models).length > 0,
+      // Agrees with what `readSmtpConfig` would accept, so a green probe can
+      // never precede a 100 % send failure.
+      email: config.email._tag === "Ready",
+      emailDomain: config.senderDomain._tag === "Ready",
+      isrCache: config.isr._tag === "Ready",
+      mailKv: config.mailKv._tag === "Ready",
     },
     ok: true,
   });
-};
 
 /**
  * Service-binding auth only (the proxy is not publicly routable, so Void's
@@ -76,6 +72,10 @@ const handleHealth = (env: Env): Response => {
  * against the proxy's own configured id. The token is tenant-visible, which is
  * harmless — isolation comes from the transport (service bindings resolve only
  * within the fleet process), not from the token.
+ *
+ * States: `Authed` (the project id), or one refusal response — 400 (missing
+ * or non-string credentials), 500 (proxy not configured), 403 (mismatch).
+ * Every refusal is terminal; nothing is cached.
  */
 const authenticateProxyRequest = (
   env: Env,
@@ -105,9 +105,20 @@ const authenticateProxyRequest = (
   return { projectId };
 };
 
+const AI_UNAVAILABLE = {
+  error: "not available",
+  message:
+    "This operation requires the Workers AI binding, which Noite does not provide.",
+};
+
 /**
  * Proxy entry point. `deps` injects the platform edges (sockets, upstream
  * fetch, timeouts) for tests; production passes none.
+ *
+ * Order is the security contract: route decision → tombstone → bounded body
+ * parse → auth → per-group capability gate → handler. `/email/relay` and any
+ * other unknown path answer before auth so an untrusted payload is never
+ * buffered.
  */
 export const handleFetch = async (
   request: Request,
@@ -115,34 +126,29 @@ export const handleFetch = async (
   deps: ProxyDeps = {}
 ): Promise<Response> => {
   const url = new URL(request.url);
-  const path = url.pathname;
+  const decision = matchRoute(url.pathname, request.method);
 
-  if (path === "/health") {
-    if (request.method !== "GET") {
-      return json({ error: "method not allowed" }, 405);
-    }
-
-    return handleHealth(env);
+  if (decision._tag !== "Route") {
+    return decision._tag === "MethodNotAllowed"
+      ? json({ error: "method not allowed" }, 405)
+      : json({ error: "not found" }, 404);
   }
 
-  if (!POST_ROUTES.has(path)) {
-    return json({ error: "not found" }, 404);
+  const { route } = decision;
+  const config = readProxyConfig(env);
+
+  if (route._tag === "Health") {
+    return handleHealth(config);
   }
 
-  if (request.method !== "POST") {
-    return json({ error: "method not allowed" }, 405);
-  }
-
-  // The former relay endpoint is gone. Reject it before auth so an untrusted
-  // MIME stream is never parsed or buffered here.
-  if (path === "/email/relay") {
+  if (route._tag === "Removed") {
     return json({ error: "not found" }, 404);
   }
 
   let parsed: unknown;
 
   try {
-    parsed = await readRequestJson(request, requestBodyMaxBytes(path));
+    parsed = await readRequestJson(request, requestBodyMaxBytes(url.pathname));
   } catch (error) {
     if (error instanceof RequestBodyError) {
       return json({ error: error.message }, error.status);
@@ -164,48 +170,47 @@ export const handleFetch = async (
 
   const { projectId } = auth;
 
-  // Per-group capability gates.
-  if (path.startsWith("/email/")) {
-    if ((env.VOID_PROXY_SMTP_HOST ?? "").trim().length === 0) {
-      return json({ error: "email not configured" }, 501);
+  switch (route._tag) {
+    case "EmailSend": {
+      if (config.email._tag === "Off") {
+        return json({ error: "email not configured" }, 501);
+      }
+
+      return handleEmailSend(env, config, body, projectId, deps);
     }
 
-    return handleEmailSend(env, body, projectId, deps);
+    case "AiProvider": {
+      if (!config.ai.enabled) {
+        return json({ error: "ai not configured" }, 501);
+      }
+
+      return handleAiProvider(body, deps);
+    }
+
+    case "AiRun": {
+      if (!config.ai.enabled) {
+        return json({ error: "ai not configured" }, 501);
+      }
+
+      return handleAiRun(env, config.ai, body, deps);
+    }
+
+    case "AiUnavailable": {
+      if (!config.ai.enabled) {
+        return json({ error: "ai not configured" }, 501);
+      }
+
+      return json(AI_UNAVAILABLE, 501);
+    }
+
+    case "Revalidate": {
+      return handleRevalidate(config.isr, body, deps);
+    }
+
+    default: {
+      return assertNever(route);
+    }
   }
-
-  if (path.startsWith("/ai/")) {
-    if (env.VOID_PROXY_AI_ENABLED !== "1") {
-      return json({ error: "ai not configured" }, 501);
-    }
-
-    switch (path) {
-      case "/ai/provider": {
-        return handleAiProvider(body, deps);
-      }
-
-      case "/ai/run": {
-        return handleAiRun(env, body, deps);
-      }
-
-      case "/ai/models":
-      case "/ai/toMarkdown": {
-        return json(
-          {
-            error: "not available",
-            message:
-              "This operation requires the Workers AI binding, which Noite does not provide.",
-          },
-          501
-        );
-      }
-
-      default: {
-        return json({ error: "not found" }, 404);
-      }
-    }
-  }
-
-  return handleRevalidate(env, body, deps);
 };
 
 export default {

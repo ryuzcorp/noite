@@ -111,6 +111,14 @@ const PROXY_SOURCES: &[CohostSource] = &[
         path: "src/email/send.ts",
         contents: include_str!("../../../void-proxy/src/email/send.ts"),
     },
+    CohostSource {
+        path: "src/config.ts",
+        contents: include_str!("../../../void-proxy/src/config.ts"),
+    },
+    CohostSource {
+        path: "src/routes.ts",
+        contents: include_str!("../../../void-proxy/src/routes.ts"),
+    },
 ];
 
 /// The proxy as a cohosted script.
@@ -291,6 +299,8 @@ mod tests {
                 "src/email/validate.ts",
                 "src/email/smtp.ts",
                 "src/email/send.ts",
+                "src/config.ts",
+                "src/routes.ts",
             ]
         );
         assert!(
