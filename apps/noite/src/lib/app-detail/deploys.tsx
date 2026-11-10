@@ -51,7 +51,7 @@ import {
   DeployGroupMeta,
   EnvironmentGroup,
 } from "./environments";
-import { appLifecycle, deployBadgeTone, deployStatusFacts } from "./lifecycle";
+import { deployBadgeTone, deployStatusFacts, isServing } from "./lifecycle";
 import { RuntimeLogs } from "./logs";
 
 /** The status badge for one deploy row, from the shared deploy facts. */
@@ -501,11 +501,6 @@ const RowApp = defineApp({
 
 const DeployRowIsland = RowProps.wrap(RowApp);
 
-/** Whether an app/environment is actually serving: a stopped (desired or
- * observed) row has no "live release", even if its history has a success. */
-const serving = (row: { desiredState: string; status: string }): boolean =>
-  appLifecycle(row)._tag === "Live";
-
 /** One environment's deploy history over SSE: skeleton until the first frame,
  * then the event stream pushes updates — no polling, and rows never remount
  * underneath an open log. `environmentId` is `""` for production. */
@@ -557,7 +552,7 @@ const DeployFeedList = ({
 
   const liveId = (): string | null => {
     if (environmentId === "") {
-      if (!app || !serving(app) || currentSha === null) {
+      if (!app || !isServing(app) || currentSha === null) {
         return null;
       }
 
@@ -568,7 +563,7 @@ const DeployFeedList = ({
       );
     }
 
-    if (!env || !serving(env)) {
+    if (!env || !isServing(env)) {
       return null;
     }
 

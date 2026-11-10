@@ -236,6 +236,15 @@ export const deployStatusFacts = (raw: string): DeployStatusFacts =>
 export const isProductionRow = (environmentId: string | null): boolean =>
   environmentId === null || environmentId === "";
 
+/** Whether an app or environment is serving traffic at all. A deliberate
+ * stop (desired or observed) means its history has no live release; a build
+ * in flight or a failed deploy keeps the previous release up. */
+export const isServing = (row: {
+  readonly desiredState: string;
+  readonly status: string;
+}): boolean =>
+  parseDesiredState(row.desiredState) !== "stopped" && row.status !== "stopped";
+
 /** Badge style for one deploy status row. */
 export const deployBadgeTone = (raw: string): string => {
   const facts = deployStatusFacts(raw);

@@ -6,6 +6,7 @@ import {
   domainClaim,
   environmentHeaderState,
   isProductionRow,
+  isServing,
   issueActions,
   issueState,
   lifecycleView,
@@ -81,6 +82,24 @@ describe("appLifecycle", () => {
       label: "paused",
       tone: "status-warning",
     });
+  });
+});
+
+describe("isServing", () => {
+  test("a deploy in flight or a failed one keeps the last release serving", () => {
+    expect(isServing({ desiredState: "running", status: "deploying" })).toBe(
+      true
+    );
+    expect(isServing({ desiredState: "running", status: "failed" })).toBe(true);
+  });
+
+  test("a deliberate or observed stop serves nothing", () => {
+    expect(isServing({ desiredState: "stopped", status: "running" })).toBe(
+      false
+    );
+    expect(isServing({ desiredState: "running", status: "stopped" })).toBe(
+      false
+    );
   });
 });
 
