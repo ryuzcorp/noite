@@ -111,6 +111,21 @@ struct AppRoutes<'a> {
     limits: &'a [AppLimit],
 }
 
+/// The per-visitor zone name of a platform host. Platform zones live under
+/// `platform:` and app zones under `app:<slug>:`, so no slug can name a
+/// platform zone: a tenant slug `control` used to get `client_control`, the
+/// control host's own zone, and the two shared one per-visitor budget.
+fn platform_client_zone(kind: &str) -> String {
+    format!("platform:client:{kind}")
+}
+
+/// The zone name of an app's own limit: `client` (per visitor) or `all`
+/// (across every visitor). Slugs are lowercase DNS labels, so the name can
+/// never contain `:`, and the fixed prefix/suffix make it unique per app.
+fn app_zone(slug: &str, scope: &str) -> String {
+    format!("app:{slug}:{scope}")
+}
+
 fn fleet_route(
     ctx: &AppRoutes,
     kind: EdgeKind,
@@ -126,13 +141,13 @@ fn fleet_route(
         rewrite,
         client_rpm,
         client_zone: if client_rpm > 0 {
-            format!("client_{}", ctx.app.slug)
+            app_zone(&ctx.app.slug, "client")
         } else {
             String::new()
         },
         app_rpm,
         app_zone: if app_rpm > 0 {
-            format!("app_{}", ctx.app.slug)
+            app_zone(&ctx.app.slug, "all")
         } else {
             String::new()
         },
@@ -177,7 +192,7 @@ fn fallback_route(cfg: &Config) -> EdgeRoute {
             cfg,
             EdgeKind::Fallback,
             cfg.caddy_api_upstream.clone(),
-            "client_fallback",
+            &platform_client_zone("fallback"),
             cfg.edge.client_rpm,
         )
     }
@@ -213,7 +228,7 @@ pub fn build_table(
                 cfg,
                 EdgeKind::Control,
                 cfg.caddy_control_upstream.clone(),
-                "client_control",
+                &platform_client_zone("control"),
                 cfg.edge.client_rpm,
             ),
         );
@@ -229,7 +244,7 @@ pub fn build_table(
             cfg,
             EdgeKind::Api,
             cfg.caddy_api_upstream.clone(),
-            "client_api",
+            &platform_client_zone("api"),
             cfg.edge.client_rpm,
         ),
     );
@@ -242,7 +257,7 @@ pub fn build_table(
                 cfg,
                 EdgeKind::Git,
                 cfg.caddy_api_upstream.clone(),
-                "client_git",
+                &platform_client_zone("git"),
                 cfg.edge.git_rpm,
             )
         },
@@ -309,7 +324,7 @@ pub fn build_table(
                     cfg,
                     EdgeKind::Preview,
                     cfg.caddy_control_upstream.clone(),
-                    "client_preview",
+                    &platform_client_zone("preview"),
                     cfg.edge.client_rpm,
                 ),
             );
@@ -562,7 +577,7 @@ mod tests {
         let tenant = t.exact.get("myapp.localhost").expect("tenant route");
         assert_eq!(tenant.kind, EdgeKind::Tenant);
         assert_eq!(tenant.upstream, "127.0.0.1:20011");
-        assert_eq!(tenant.client_zone, "client_myapp");
+        assert_eq!(tenant.client_zone, "app:myapp:client");
         assert_eq!(tenant.client_rpm, cfg.edge.client_rpm);
         assert!(!tenant.asleep && !tenant.gated);
 
@@ -592,6 +607,53 @@ mod tests {
             .max_by_key(|w| w.suffix.len())
             .expect("unknown host matches");
         assert_eq!(unknown.route.kind, EdgeKind::Fallback);
+    }
+
+    /// Zone names are namespaced by owner, so a slug that spells a platform
+    /// name (`control`, `preview`, `fallback`) cannot share that host's
+    /// per-visitor budget.
+    #[test]
+    fn app_slugs_never_share_a_platform_zone() {
+        let cfg = config_for_tests();
+        let apps: Vec<App> = ["control", "preview", "fallback"]
+            .iter()
+            .map(|slug| test_app(slug))
+            .collect();
+        let t = build_table(&cfg, &apps, &[], &[], &[]);
+        let mut platform = std::collections::HashSet::new();
+        let wildcard_routes = t.wildcards.iter().map(|w| &w.route);
+        for route in t.exact.values().chain(wildcard_routes) {
+            let platform_route = matches!(
+                route.kind,
+                EdgeKind::Control
+                    | EdgeKind::Api
+                    | EdgeKind::Git
+                    | EdgeKind::Preview
+                    | EdgeKind::Fallback
+            );
+            if platform_route && !route.client_zone.is_empty() {
+                platform.insert(route.client_zone.clone());
+            }
+        }
+        for kind in ["control", "api", "git", "preview", "fallback"] {
+            assert!(
+                platform.contains(&format!("platform:client:{kind}")),
+                "platform zone {kind} missing from {platform:?}"
+            );
+        }
+        let mut app_zones = std::collections::HashSet::new();
+        for app in &apps {
+            let host = format!("{}.localhost", app.slug);
+            let route = t.exact.get(&host).expect("tenant route");
+            assert!(
+                !platform.contains(&route.client_zone),
+                "{} shares the platform zone {:?}",
+                app.slug,
+                route.client_zone
+            );
+            assert_eq!(route.client_zone, format!("app:{}:client", app.slug));
+            assert!(app_zones.insert(route.client_zone.clone()));
+        }
     }
 
     #[test]
@@ -711,7 +773,7 @@ mod tests {
         assert_eq!(tenant.client_rpm, 0);
         assert_eq!(tenant.client_zone, "");
         assert_eq!(tenant.app_rpm, 6);
-        assert_eq!(tenant.app_zone, "app_myapp");
+        assert_eq!(tenant.app_zone, "app:myapp:all");
     }
 
     #[test]
