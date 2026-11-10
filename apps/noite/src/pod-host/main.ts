@@ -4,7 +4,9 @@
 //! This file is the frame's front door and nothing else. It reads what the
 //! frame was opened for off its own URL, answers the handshake of the one
 //! window that may talk to it, hands the port it is given to the RPC server —
-//! which owns the pod from then on — and stays out of the way.
+//! which owns the pod from then on — and stays out of the way. Its own state
+//! is `frame-state.ts`: inert, listening, bound or broken, one transition
+//! function, and a `bound` ack the page waits for.
 //!
 //! Why the pod lives here: Nodepod shares one `MemoryVolume` with its workers
 //! through a `SharedArrayBuffer`, and an agent cluster is keyed by origin, so a
@@ -17,6 +19,8 @@
 
 import { POD_PROTOCOL_VERSION } from "../lib/source/pod-protocol";
 import type { PodReady } from "../lib/source/pod-protocol";
+import { Frame, boundMessage, frameTransition } from "./frame-state";
+import type { FrameState } from "./frame-state";
 import { frameAddress, handshakeMessage } from "./handshake";
 import type { PodAddress } from "./handshake";
 import { createPodServer } from "./rpc-server";
@@ -27,9 +31,7 @@ import type { PodServer } from "./rpc-server";
 const serve = (address: PodAddress): void => {
   const { appId, branch, nonce, parentOrigin } = address;
   let server: PodServer | null = null;
-  /** The port is bound once. A second `connect` — the same page opening a
-   * second channel, or a document on this origin trying its luck — is not. */
-  let bound = false;
+  let state: FrameState = Frame.Listening({ address });
 
   const answerHandshake = (): void => {
     const ready: PodReady = {
@@ -62,22 +64,38 @@ const serve = (address: PodAddress): void => {
     }
 
     if (message.t === "hello") {
-      answerHandshake();
+      if (Frame.$is("Listening")(state)) {
+        answerHandshake();
+      }
 
       return;
     }
 
-    if (bound) {
+    const bound = frameTransition(state, { t: "bind" });
+
+    if (!Frame.$is("Bound")(bound)) {
       return;
     }
 
-    bound = true;
-    window.removeEventListener("message", onMessage);
-    server = createPodServer({
-      appId,
-      branch,
-      port: message.port,
-    });
+    try {
+      server = createPodServer({
+        appId,
+        branch,
+        port: message.port,
+      });
+    } catch (error) {
+      // The page must not sit on a port nothing serves: it learns through the
+      // missing `bound` ack and its own deadline.
+      state = frameTransition(bound, {
+        error: error instanceof Error ? error.message : "the pod failed",
+        t: "bind-failed",
+      });
+
+      return;
+    }
+
+    state = bound;
+    window.parent.postMessage(boundMessage(nonce), parentOrigin);
   };
 
   window.addEventListener("message", onMessage);

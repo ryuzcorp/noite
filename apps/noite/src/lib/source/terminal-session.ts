@@ -7,6 +7,7 @@
  * arrives. Hiding the panel therefore never touches the shell, its scrollback
  * or its processes. */
 
+import { Data } from "effect";
 import type { FitAddon, ITheme, Terminal, init } from "ghostty-web";
 
 import { errorMessage } from "../errors";
@@ -24,7 +25,113 @@ export interface TerminalLink {
   detach: (connection: PodConnection) => Promise<void>;
 }
 
-/** What the panel draws: whether the shell is up, and why not. */
+/** The shell's own lifecycle.
+ *
+ * ```mermaid
+ * stateDiagram-v2
+ *   [*] --> idle
+ *   idle --> attached: attach (a checkout opened)
+ *   attached --> building: mount (the panel is up)
+ *   building --> ready: terminal.open answered
+ *   building --> failed: ghostty or the frame refused
+ *   ready --> failed: the frame died (fatal)
+ *   ready --> idle: detach (the checkout went)
+ *   failed --> attached: attach (another checkout)
+ *   attached --> idle: detach
+ * ```
+ *
+ * `ready` is only reachable after the frame's `terminal.open` answered, and a
+ * dead frame moves it to `failed` — a prompt that looks alive while every
+ * keystroke rejects is the state this removes. `idle` is the one state with no
+ * connection; the shell's div, its scrollback and its processes stay when the
+ * panel unmounts (`ready` survives a hide). */
+export type SessionState = Data.TaggedEnum<{
+  Attached: Record<never, never>;
+  Building: Record<never, never>;
+  Failed: { message: string };
+  Idle: Record<never, never>;
+  Ready: Record<never, never>;
+}>;
+
+export type SessionEvent =
+  | { t: "attach" }
+  | { t: "build" }
+  | { t: "built" }
+  | { message: string; t: "failed" }
+  | { t: "detach" };
+
+export const Session = Data.taggedEnum<SessionState>();
+
+/** The one shell transition. `failed` and `idle` are the only states a new
+ * attach can revive. */
+export const sessionTransition = (
+  state: SessionState,
+  event: SessionEvent
+): SessionState => {
+  if (event.t === "failed") {
+    return Session.Failed({ message: event.message });
+  }
+
+  if (event.t === "detach") {
+    return Session.Idle();
+  }
+
+  return Session.$match(state, {
+    Attached: () => (event.t === "build" ? Session.Building() : state),
+    Building: () => (event.t === "built" ? Session.Ready() : state),
+    Failed: () => {
+      switch (event.t) {
+        case "attach": {
+          return Session.Attached();
+        }
+
+        case "build": {
+          return Session.Building();
+        }
+
+        default: {
+          return state;
+        }
+      }
+    },
+    Idle: () => {
+      switch (event.t) {
+        case "attach": {
+          return Session.Attached();
+        }
+
+        case "build": {
+          return Session.Building();
+        }
+
+        case "built": {
+          return Session.Ready();
+        }
+
+        default: {
+          return state;
+        }
+      }
+    },
+    Ready: () => {
+      switch (event.t) {
+        case "attach": {
+          return Session.Attached();
+        }
+
+        case "build": {
+          return Session.Building();
+        }
+
+        default: {
+          return state;
+        }
+      }
+    },
+  });
+};
+
+/** What the panel draws, from the session's state. */
 export interface TerminalView {
   error: string;
   ready: boolean;
@@ -158,8 +265,8 @@ export const createTerminalSession = (): TerminalSession => {
   let epoch = 0;
   let creating: Promise<void> | null = null;
   let observer: ResizeObserver | null = null;
-  let ready = false;
-  let failure = "";
+  /** The shell's own state (see `SessionState`); `view()` is its rendering. */
+  let state: SessionState = Session.Idle();
   /** What the frame's terminal wrote and the canvas has not drawn yet: one
    * write per animation frame, never one per chunk. */
   let pending = "";
@@ -174,7 +281,14 @@ export const createTerminalSession = (): TerminalSession => {
     }
   };
 
-  const view = (): TerminalView => ({ error: failure, ready });
+  const view = (): TerminalView =>
+    Session.$match(state, {
+      Attached: () => ({ error: "", ready: false }),
+      Building: () => ({ error: "", ready: false }),
+      Failed: ({ message }) => ({ error: message, ready: false }),
+      Idle: () => ({ error: "", ready: false }),
+      Ready: () => ({ error: "", ready: true }),
+    });
 
   /** Measure the shell's box and draw the grid, now. The fit addon leaves the
    * grid alone when its container cannot be measured (`clientWidth`/
@@ -256,7 +370,6 @@ export const createTerminalSession = (): TerminalSession => {
     terminal = null;
     shell?.remove();
     shell = null;
-    ready = false;
   };
 
   /** Build the shell on `mine`'s frame and put it in `panel`. A frame that
@@ -272,6 +385,7 @@ export const createTerminalSession = (): TerminalSession => {
     }
 
     try {
+      state = sessionTransition(state, { t: "build" });
       const ghostty = await ensureGhostty();
 
       if (mine !== epoch || connection !== opened || panel !== host) {
@@ -312,16 +426,27 @@ export const createTerminalSession = (): TerminalSession => {
       await opened.call("terminal.open", { cols: next.cols, rows: next.rows });
 
       if (mine !== epoch || connection !== opened) {
+        // Superseded while the frame was creating the shell: it exists on the
+        // frame with no renderer here, so it is closed rather than leaked
+        // until the next open.
+        /* oxlint-disable promise/prefer-await-to-then, unicorn/no-useless-undefined -- this runs after the superseded check returned (awaiting it would hold the abandoned build, not fix it), and the protocol's paramless kinds still take their (undefined) params slot. */
+        opened.call("terminal.close", undefined).catch(() => {
+          // The frame is gone: its own teardown closes the terminal.
+        });
+        /* oxlint-enable promise/prefer-await-to-then, unicorn/no-useless-undefined */
+        disposeShell();
+
         return;
       }
 
-      ready = true;
-      failure = "";
+      state = sessionTransition(state, { t: "built" });
       // The panel may still be laying out: fit again on the next frame.
       refitSoon();
     } catch (error) {
-      failure = errorMessage(error);
-      ready = false;
+      state = sessionTransition(state, {
+        message: errorMessage(error),
+        t: "failed",
+      });
     }
 
     notify();
@@ -350,13 +475,24 @@ export const createTerminalSession = (): TerminalSession => {
     });
 
   let unwatch: (() => void) | null = null;
+  let unhearFatal: (() => void) | null = null;
 
   return {
     attach: (opened) => {
       unwatch?.();
+      unhearFatal?.();
       connection = opened;
+      state = sessionTransition(state, { t: "attach" });
       unwatch = stopWrites(opened);
-      failure = "";
+      // A frame that dies leaves the canvas showing a prompt nothing answers:
+      // the session says so instead of pretending the shell is alive.
+      unhearFatal = opened.on("fatal", () => {
+        state = sessionTransition(state, {
+          message: "the workspace stopped; the terminal is gone",
+          t: "failed",
+        });
+        notify();
+      });
 
       // A frame that lands while mounted (a ref change remounts the browser
       // under a standing panel) rebuilds the shell in place: the old frame,
@@ -383,8 +519,11 @@ export const createTerminalSession = (): TerminalSession => {
       connection = null;
       unwatch?.();
       unwatch = null;
+      unhearFatal?.();
+      unhearFatal = null;
       creating = null;
       disposeShell();
+      state = sessionTransition(state, { t: "detach" });
       notify();
 
       try {

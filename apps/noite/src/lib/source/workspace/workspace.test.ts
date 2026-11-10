@@ -6,7 +6,7 @@ import type { NodepodFS } from "@r1ck404/nodepod/headless";
 
 import { readBase, readJournal, writeBase, writeObject } from "./checkout";
 import { gitBlobSha } from "./git";
-import { parentDir, projectPath } from "./types";
+import { WorkspaceError, parentDir, projectPath } from "./types";
 import type {
   BaseEntry,
   BaseIndex,
@@ -18,7 +18,7 @@ import type {
   WorkspaceChange,
   WorkspaceOptions,
 } from "./types";
-import { createWorkspace } from "./workspace";
+import { createWorkspace, openDecision } from "./workspace";
 
 const ENCODER = new TextEncoder();
 
@@ -496,6 +496,106 @@ describe("finishing with the changes", () => {
       await ws.close();
       expect(pod.persistence.log).toEqual(["saved"]);
       expect(pod.closed()).toBe(true);
+    });
+  });
+});
+
+const baseAt = (baseSha: string): BaseIndex => ({ baseSha, entries: {} });
+
+describe("openDecision", () => {
+  test("no saved base is a fresh checkout", () => {
+    expect(openDecision({ base: null, held: 0, sha: "tip" })).toBe("fresh");
+  });
+
+  test("the saved base on the browsed commit is restored", () => {
+    expect(openDecision({ base: baseAt("tip"), held: 3, sha: "tip" })).toBe(
+      "restored"
+    );
+  });
+
+  test("another commit with unpushed rows is kept and marked", () => {
+    expect(openDecision({ base: baseAt("old"), held: 1, sha: "tip" })).toBe(
+      "diverged"
+    );
+  });
+
+  test("another commit with nothing unpushed is replaced", () => {
+    expect(openDecision({ base: baseAt("old"), held: 0, sha: "tip" })).toBe(
+      "replaced"
+    );
+  });
+});
+
+describe("the derive loop answers the request, not the pass before it", () => {
+  test("a refresh that lands mid-pass is answered after that pass", async () => {
+    await withPod(async (pod) => {
+      await seed(pod.fs, { "a.txt": "one\n" });
+      const ws = await pod.workspace();
+      const gate = Promise.withResolvers<undefined>();
+      let holding = true;
+      const stat = pod.fs.stat.bind(pod.fs);
+      // Hold the first pass after it listed the tree, so a file written while
+      // it runs is not in its snapshot.
+      // SAFETY: the facade only ever calls `stat(path)`, which is exactly what
+      // this wrapper answers.
+      pod.fs.stat = async (path: string) => {
+        if (holding) {
+          holding = false;
+          await gate.promise;
+        }
+
+        return await stat(path);
+      };
+
+      const first = ws.refresh();
+
+      await put(pod.fs, "b.txt", "two\n");
+      // The request arrives while the first pass is still walking: the old
+      // loop answered it with the pass that started before it, so `b.txt` was
+      // missing from `changes()` here.
+      const second = ws.refresh();
+      gate.resolve();
+      await first;
+      await second;
+
+      expect(ws.changes().map((row) => row.path)).toEqual(["b.txt"]);
+    });
+  });
+
+  test("a closed workspace refuses a new pass with a typed code", async () => {
+    await withPod(async (pod) => {
+      const ws = await pod.workspace();
+      await ws.close();
+      // oxlint-disable-next-line anti-slop/no-unknown-parameters -- a refusal is unknown by construction; the test only has to read what it carries.
+      const refused = await ws.refresh().catch((error: unknown) => error);
+
+      expect(refused).toBeInstanceOf(WorkspaceError);
+
+      if (!(refused instanceof WorkspaceError)) {
+        throw new TypeError("the refusal was not a WorkspaceError");
+      }
+
+      expect(refused.code).toBe("closed");
+    });
+  });
+
+  test("a read-only refusal carries its code", async () => {
+    await withPod(async (pod) => {
+      const ws = await pod.workspace({ editable: false });
+
+      /* oxlint-disable anti-slop/no-unknown-parameters -- a refusal is unknown by construction; the test only has to read what it carries. */
+      const refused = await ws
+        .writeText("a.txt", "x")
+        .catch((error: unknown) => error);
+      /* oxlint-enable anti-slop/no-unknown-parameters */
+
+      expect(refused).toBeInstanceOf(WorkspaceError);
+
+      if (!(refused instanceof WorkspaceError)) {
+        throw new TypeError("the refusal was not a WorkspaceError");
+      }
+
+      expect(refused.code).toBe("read-only");
     });
   });
 });

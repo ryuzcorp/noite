@@ -24,6 +24,7 @@ import type {
   PodOptions,
 } from "../lib/source/workspace/types";
 import { installDomFixture } from "../testing/dom";
+import type { PushLease } from "./pod-state";
 import { createPodServer } from "./rpc-server";
 
 beforeAll(() => {
@@ -335,7 +336,8 @@ interface Harness {
 
 /** Boot the pod the server serves, open the port, and tear it all down. */
 const withServer = async (
-  run: (harness: Harness) => Promise<void>
+  run: (harness: Harness) => Promise<void>,
+  options: { lease?: PushLease } = {}
 ): Promise<void> => {
   const pod = await Nodepod.boot();
   // SAFETY: `Object.create` keeps the pod's own prototype methods and lets the
@@ -415,6 +417,7 @@ const withServer = async (
   createPodServer({
     appId: APP_ID,
     branch: BRANCH,
+    lease: options.lease,
     openPod: opener,
     port: port2,
   });
@@ -744,6 +747,81 @@ describe("the frame's RPC server", () => {
         await page.waitFor("changes", (rows) => rows.baseSha === "commit2")
       ).toMatchObject({ baseSha: "commit2" });
     });
+  });
+
+  test("a settle without a commit is refused without losing the push", async () => {
+    await withServer(async ({ control: page, fs }) => {
+      await seed(fs, { "a.txt": "one\n" });
+      await page.request("open", opening());
+      await page.next("changes");
+      await page.request("writeText", { path: "a.txt", text: "pushed\n" });
+      await page.waitFor("changes", (payload) => payload.changes.length === 1);
+      await page.request("push.prepare", { message: "a push", target: BRANCH });
+
+      // The page answered `ok` with no commit id. The old code cleared the
+      // push first and threw after, so the facade's continuation waited
+      // forever and every later push answered `busy`.
+      await expect(
+        page.request("push.settle", { ok: true, target: BRANCH })
+      ).rejects.toThrow("needs the commit it landed");
+
+      await page.request("push.settle", {
+        ok: true,
+        sha: "commit2",
+        target: BRANCH,
+      });
+      expect(
+        await page.waitFor("changes", (rows) => rows.baseSha === "commit2")
+      ).toMatchObject({ baseSha: "commit2", changes: [] });
+    });
+  });
+
+  test("a push the page never settles expires, so the slot frees", async () => {
+    const expiries: (() => void)[] = [];
+
+    await withServer(
+      async ({ control: page, fs }) => {
+        await seed(fs, { "a.txt": "one\n" });
+        await page.request("open", opening());
+        await page.next("changes");
+        await page.request("writeText", { path: "a.txt", text: "pushed\n" });
+        await page.waitFor(
+          "changes",
+          (payload) => payload.changes.length === 1
+        );
+        await page.request("push.prepare", {
+          message: "a push",
+          target: BRANCH,
+        });
+
+        // The page's commit hung and its `push.settle` never came: without the
+        // lease the slot stayed taken for the frame's whole life, so every
+        // later push answered `busy`.
+        for (const expire of expiries) {
+          expire();
+        }
+
+        expect(await page.next("fatal")).toEqual({
+          message:
+            "The push was never confirmed, so the workspace could not be settled on it. Reload to continue.",
+        });
+        await page.request("push.prepare", {
+          message: "after the lease",
+          target: BRANCH,
+        });
+      },
+      {
+        lease: {
+          after: (expire) => {
+            expiries.push(expire);
+
+            return () => {
+              // Nothing to cancel in this test: the expiry is fired by hand.
+            };
+          },
+        },
+      }
+    );
   });
 
   test("says so in the page's words when a committed push cannot settle", async () => {

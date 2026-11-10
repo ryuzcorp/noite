@@ -41,9 +41,11 @@ import {
   startMirror,
 } from "./state-mirror";
 import type { MirrorMutation, MirrorVolume } from "./state-mirror";
+import { LOST_LOCK_MESSAGE, Role, maySave, roleTransition } from "./tab-role";
+import type { TabRole } from "./tab-role";
 import { syncChannelName, syncTabs } from "./tab-sync";
 import type { TabSync } from "./tab-sync";
-import { PROJECT_ROOT } from "./types";
+import { PROJECT_ROOT, WorkspaceError } from "./types";
 import type { OpenPod, PodOptions, SaveErrorReporter } from "./types";
 
 export type { OpenPod, PodOptions } from "./types";
@@ -126,10 +128,11 @@ const PEER_FLUSH_WAIT_MS = 1500;
 interface HeldPod {
   editable: boolean;
   persistence: WorkspacePersistence | null;
-  /** Whether this tab saves the workspace now. A following tab's saves are
-   * refused until it is granted the lock (see `gatedStore`), and a refusal is
-   * not this tab's error to report. Absent: always. */
-  saves?: () => boolean;
+  /** This tab's role in the saved copy (see `tab-role.ts`). A following tab's
+   * saves are refused until it is granted the lock, and a tab that loses it
+   * goes back to following — reported, so the page knows nothing is being
+   * kept. */
+  role?: () => TabRole;
   /** Ends the synchronous write-through mirrors (see `startMirrors`). */
   stopMirror?: () => void;
   sync?: TabSync;
@@ -138,14 +141,22 @@ interface HeldPod {
 /** A booted pod as the workspace layer wants it: the filesystem, the way to
  * make a save land right now, and the way back out. */
 const hold = (pod: Nodepod, held: HeldPod): OpenPod => {
-  const { editable, persistence, saves = () => true, stopMirror, sync } = held;
+  const {
+    editable,
+    persistence,
+    role = () => Role.Readonly(),
+    stopMirror,
+    sync,
+  } = held;
 
-  // A refused save is not this tab's error to report (see `gatedStore`).
+  // A refused save is only this tab's error while it is the one that saves
+  // (see `gatedStore`): a following tab's refusal is the lock it does not hold,
+  // and a tab that just lost the lock has already said so.
   const save = async (run: () => Promise<void>): Promise<void> => {
     try {
       await run();
     } catch (error) {
-      if (saves()) {
+      if (maySave(role())) {
         throw error;
       }
     }
@@ -228,13 +239,24 @@ const restoreMirrors = (pod: Nodepod, id: string, editable: boolean): void => {
 const startMirrors = (
   pod: Nodepod,
   id: string,
-  persistence: WorkspacePersistence | null
+  persistence: WorkspacePersistence | null,
+  onSaveError: SaveErrorReporter
 ): (() => void) => {
   const project = startMirror(
     mirrorVolume(pod),
     UNSAVED_PROJECT,
     id,
-    mirrorStorage()
+    mirrorStorage(),
+    (reason) => {
+      // A browser store that refused the mirror's write: the reload window it
+      // exists for is unprotected, which the page has to say (it is the same
+      // channel a failed save uses).
+      onSaveError(
+        new Error(
+          `the unsaved-edit mirror could not be written (${reason}); a reload may lose the last edits`
+        )
+      );
+    }
   );
 
   const onSaved = (): void => {
@@ -272,7 +294,9 @@ const queueForLock = (id: string) => {
   };
 
   const lock = {
-    onLost: null,
+    // SAFETY: `onLost` is assigned once this tab holds the lock (see
+    // `holdFollowing`); null before then is the SDK's own "no loss to report".
+    onLost: null as (() => void) | null,
     release,
     releaseAfter: async (done: Promise<unknown>) => {
       try {
@@ -321,15 +345,18 @@ const ignoreRefusedSave = (): void => {
  * that died never got to save. */
 const gatedStore = (
   store: WorkspaceStore,
-  saves: () => boolean
+  role: () => TabRole
 ): WorkspaceStore => ({
   clear: () => store.clear(),
   close: () => {
     store.close?.();
   },
   commit: async (batch) => {
-    if (!saves()) {
-      throw new Error("workspace: another tab saves this workspace");
+    if (!maySave(role())) {
+      throw new WorkspaceError(
+        "not-saving",
+        "workspace: another tab saves this workspace"
+      );
     }
 
     await store.commit(batch);
@@ -337,25 +364,27 @@ const gatedStore = (
   load: () => store.load(),
   readBlobs: (ids) => store.readBlobs(ids),
   sweep: async () => {
-    if (saves()) {
+    if (maySave(role())) {
       await store.sweep?.();
     }
   },
 });
 
 /** Take over saving once this tab is granted the lock: the tab that saved
- * has gone. What piled up while following is saved right away. */
+ * has gone. What piled up while following is saved right away, and only once
+ * that flush has landed does the role become `saving` (see `tab-role.ts`). */
 const saveWhenGranted = async (
   granted: Promise<boolean>,
   persistence: WorkspacePersistence,
   sync: TabSync,
-  takeOver: () => void
+  grant: () => void,
+  tookOver: () => void
 ): Promise<void> => {
   if (!(await granted) || persistence.status === "closed") {
     return;
   }
 
-  takeOver();
+  grant();
   sync.serveFlush(() => persistence.flush());
 
   try {
@@ -363,6 +392,8 @@ const saveWhenGranted = async (
   } catch {
     // The pod retries a failed save on its own.
   }
+
+  tookOver();
 };
 
 /** The tab that holds the saved workspace: it restored it in its boot, saves
@@ -378,6 +409,7 @@ const holdSaving = (
   restoreMirrors(pod, id, true);
   const sync = openSync(pod, id);
   const { persistence } = pod;
+  const role = Role.Saving();
 
   if (persistence) {
     sync.serveFlush(() => persistence.flush());
@@ -389,7 +421,8 @@ const holdSaving = (
   return hold(pod, {
     editable: true,
     persistence,
-    stopMirror: startMirrors(pod, id, persistence),
+    role: () => role,
+    stopMirror: startMirrors(pod, id, persistence, onSaveError),
     sync,
   });
 };
@@ -405,8 +438,8 @@ const holdFollowing = async (
   const sync = openSync(pod, id);
   await sync.flushPeers(PEER_FLUSH_WAIT_MS);
   const store = createIndexedDBWorkspaceStore(id);
-  let saving = false;
-  const saves = (): boolean => saving;
+  let role: TabRole = Role.Following();
+  const roleOf = (): TabRole => role;
   let persistence: WorkspacePersistence | null = null;
 
   if (store !== null) {
@@ -414,7 +447,7 @@ const holdFollowing = async (
     persistence = new WorkspacePersistence(
       id,
       pod.fs.volume,
-      gatedStore(store, saves),
+      gatedStore(store, roleOf),
       { debounceMs: PERSIST_DEBOUNCE_MS, excludeDirNames: UNPERSISTED_DIRS },
       queued.lock
     );
@@ -427,11 +460,31 @@ const holdFollowing = async (
     // Tracking starts after the restore (which must not be saved back) and
     // before the peers' changes are applied.
     persistence.attach();
-    void saveWhenGranted(queued.granted, persistence, sync, () => {
-      saving = true;
-      held.off("error", ignoreRefusedSave);
-      held.on("error", onSaveError);
-    });
+    // A lock taken from this tab leaves it editable with nothing kept: the
+    // role goes back to following and the page is told, rather than every
+    // later commit throwing a refusal that `saves()` called a real failure.
+    queued.lock.onLost = () => {
+      if (!maySave(role)) {
+        return;
+      }
+
+      role = roleTransition(role, { t: "lock-lost" });
+      onSaveError(new Error(LOST_LOCK_MESSAGE));
+    };
+
+    void saveWhenGranted(
+      queued.granted,
+      persistence,
+      sync,
+      () => {
+        role = roleTransition(role, { t: "granted" });
+        held.off("error", ignoreRefusedSave);
+        held.on("error", onSaveError);
+      },
+      () => {
+        role = roleTransition(role, { t: "took-over" });
+      }
+    );
   }
 
   restoreMirrors(pod, id, true);
@@ -440,8 +493,8 @@ const holdFollowing = async (
   return hold(pod, {
     editable: true,
     persistence,
-    saves,
-    stopMirror: startMirrors(pod, id, persistence),
+    role: roleOf,
+    stopMirror: startMirrors(pod, id, persistence, onSaveError),
     sync,
   });
 };
@@ -458,7 +511,11 @@ export const openPod = async (options: PodOptions): Promise<OpenPod> => {
     const pod = await Nodepod.boot(boot);
     restoreMirrors(pod, id, false);
 
-    return hold(pod, { editable: false, persistence: null });
+    return hold(pod, {
+      editable: false,
+      persistence: null,
+      role: () => Role.Readonly(),
+    });
   }
 
   try {

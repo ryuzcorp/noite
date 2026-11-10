@@ -12,6 +12,8 @@
 //! Nothing here may import `typescript-ls` (that would put the compiler in the
 //! main bundle) or touch the DOM.
 
+import { Data } from "effect";
+
 /** esm.sh, the one origin package declarations come from. */
 export const ESM_ORIGIN = "https://esm.sh";
 
@@ -26,9 +28,62 @@ export const ESM_TYPES_DIR = "/__esm";
  * effect, a UI kit — is a thousand files and tens of megabytes, so these caps
  * are sized for the largest real graph: they stop a pathological one from
  * filling the worker, not a real one. */
+
 export const MAX_TYPES_FILES = 2000;
 export const MAX_TYPES_FILE = 8 * 1024 * 1024;
 export const MAX_TYPES_BYTES = 48 * 1024 * 1024;
+
+/** The round's declaration budget.
+ *
+ * ```mermaid
+ * stateDiagram-v2
+ *   [*] --> open
+ *   open --> open: a declaration landed
+ *   open --> capped: a file or the round passed the caps
+ *   capped --> open: reset (a new repository snapshot)
+ * ```
+ *
+ * `capped` used to be a one-way boolean for the worker's whole life, so after
+ * one large branch every later snapshot warned about caps it never hit. It is
+ * reset with the filesystem it describes (`ts-worker`'s `install`). */
+export type BudgetState = Data.TaggedEnum<{
+  Capped: { bytes: number; files: number };
+  Open: { bytes: number; files: number };
+}>;
+
+export type BudgetEvent =
+  | { bytes: number; files: number; t: "cap" }
+  | { t: "reset" }
+  | { bytes: number; t: "spend" };
+
+export const Budget = Data.taggedEnum<BudgetState>();
+
+/** The one budget transition. Spending counts what landed and caps the round
+ * when it passes either limit. */
+export const budgetTransition = (
+  state: BudgetState,
+  event: BudgetEvent
+): BudgetState => {
+  if (event.t === "reset") {
+    return Budget.Open({ bytes: 0, files: 0 });
+  }
+
+  return Budget.$match(state, {
+    Capped: () => state,
+    Open: ({ bytes, files }) => {
+      if (event.t === "cap") {
+        return Budget.Capped({ bytes, files });
+      }
+
+      const nextBytes = bytes + event.bytes;
+      const nextFiles = files + 1;
+
+      return nextBytes >= MAX_TYPES_BYTES || nextFiles >= MAX_TYPES_FILES
+        ? Budget.Capped({ bytes: nextBytes, files: nextFiles })
+        : Budget.Open({ bytes: nextBytes, files: nextFiles });
+    },
+  });
+};
 
 /** Concurrent fetches: enough to hide the round trips — a declaration graph is
  * discovered in waves (a file, then what it imports), and the entry probes are

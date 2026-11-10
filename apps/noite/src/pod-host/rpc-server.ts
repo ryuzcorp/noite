@@ -20,6 +20,14 @@
 //! path from this side to the page's own authority: the frame *asks* the page
 //! for the one ref's archive while that ref is opening (`archive`), and for
 //! nothing else, ever.
+//!
+//! # State
+//!
+//! The pod's lifecycles are `pod-state.ts`: the pod itself (`closed`,
+//! `booting`, `open`, `closing`), the one in-flight push (`idle`, `prepared`,
+//! `handed`, `settling`, `refused`, with a lease that returns it to `idle`),
+//! and the shell (`closed`, `open`). Each is one value moved by one transition;
+//! this module only performs the effects and answers the protocol.
 
 import { errorMessage } from "../lib/errors";
 import type {
@@ -40,8 +48,22 @@ import { parentDir } from "../lib/source/workspace/types";
 import type { OpenPodOpener } from "../lib/source/workspace/types";
 import { createWorkspace } from "../lib/source/workspace/workspace";
 import type { FrameWorkspace } from "../lib/source/workspace/workspace";
+import {
+  Pod,
+  Push,
+  Terminal,
+  defaultPushLease,
+  podTransition,
+  pushTransition,
+  terminalTransition,
+} from "./pod-state";
+import type {
+  PodPhase,
+  PushLease,
+  PushState,
+  TerminalState,
+} from "./pod-state";
 import { createTerminalBackend } from "./terminal-backend";
-import type { TerminalBackend } from "./terminal-backend";
 
 /** A request the frame refuses: the code lets the page tell "you asked before
  * opening" from "that work threw". */
@@ -71,16 +93,20 @@ type PodAnyResult = PodRequestMap[PodRequestKind]["r"];
 /** One message off the port: a request to serve, or the page's answer to an
  * ask this frame made. */
 type Incoming =
-  | { failed: string | null; kind: "answer"; value: unknown; answer: number }
-  | { kind: "request"; request: string; i: number; params: unknown };
+  | { answer: number; failed: string | null; kind: "answer"; value: unknown }
+  | { i: number; kind: "request"; params: unknown; request: string };
 
 /** The push the page is committing: `push.prepare` built the payload and this
  * is what the page's own commit answers. Both halves are the facade's one
  * `push`, split at the call the page has to make. */
 interface OpenPush {
+  /** Set when the lease expired: the page never said how its commit went. */
+  expired: boolean;
   /** The push's continuation: `markPushed` (or `revertToBase`) and the derive,
    * which run once the commit has answered. */
   finishing: Promise<void> | null;
+  /** The lease this push holds; a stale timer cannot move a newer push. */
+  lease: number;
   /** Whether the payload reached the page (see `pushPrepare`). */
   handed: boolean;
   /** The page's commit failed, which its own POST already told it. */
@@ -168,22 +194,48 @@ export interface PodServer {
   flushPending: () => void;
 }
 
+/** The wire's failure code for one thrown value: a request the frame refused
+ * names its own, and the facade's typed refusals (`workspace/types.ts`) carry
+ * theirs, so the page never has to match the message. */
+/* oxlint-disable anti-slop/no-unknown-parameters, anti-slop/no-runtime-typeof -- a caught value is unknown by construction: this is the boundary that turns it into the wire's code, after the shape check. */
+const requestCode = (error: unknown): string | undefined => {
+  if (error instanceof PodRequestError) {
+    return error.code;
+  }
+
+  if (typeof error === "object" && error !== null && "code" in error) {
+    const { code } = error;
+
+    return typeof code === "string" && code !== "" ? code : undefined;
+  }
+
+  return undefined;
+};
+/* oxlint-enable anti-slop/no-unknown-parameters, anti-slop/no-runtime-typeof */
+
 /** Serve the whole pod over `port`, for the ref this frame was opened for.
  * The frame's URL and the `open` request both name the app and the branch, and
  * they have to agree: a port that crossed origins by accident serves nothing. */
 export const createPodServer = (options: {
   appId: string;
   branch: string;
+  /** The push lease's timer; a test replaces it to expire the lease itself. */
+  lease?: PushLease;
   openPod?: OpenPodOpener;
   port: MessagePort;
 }): PodServer => {
-  const { appId, branch, openPod, port } = options;
-  /** The open checkout. Null until `open` has answered, and again once `close`
-   * has: every other request is refused in between. */
-  let workspace: FrameWorkspace | null = null;
-  /** The boot in flight, so a second `open` cannot boot a second pod. */
-  let opening: Promise<PodOpenResult> | null = null;
-  let terminal: TerminalBackend | null = null;
+  const { appId, branch, lease = defaultPushLease(), openPod, port } = options;
+  /** The pod: closed until `open`, booting while it boots, open with the
+   * workspace inside the state, closing on teardown. */
+  let phase: PodPhase = Pod.Closed();
+  /** The one push the page may have in flight. */
+  let push: PushState = Push.Idle();
+  /** The shell on the open pod. */
+  let terminal: TerminalState = Terminal.Closed();
+  let pushLeaseId = 0;
+  let cancelLease: (() => void) | null = null;
+  /** The push the page is committing right now; owned by the push's lease. */
+  let openPush: OpenPush | null = null;
   /** Bumped by every publish, so the page can order the rows it keeps. */
   let revision = 0;
   /** The page's watches, by the id its own handle names. */
@@ -192,8 +244,6 @@ export const createPodServer = (options: {
   /** The asks this frame has out, by their id — `archive` is the only one. */
   let nextAskId = 1;
   const asks = new Map<number, PromiseWithResolvers<unknown>>();
-  /** The push the page is committing right now. */
-  let push: OpenPush | null = null;
   let nextSessionId = 0;
   /** What the page's own subscriptions stop: the pod's own events are not for
    * a closed frame. */
@@ -208,11 +258,11 @@ export const createPodServer = (options: {
   };
 
   const requireWorkspace = (): FrameWorkspace => {
-    if (workspace === null) {
+    if (!Pod.$is("Open")(phase)) {
       throw new PodRequestError("not-open", "pod: no workspace is open");
     }
 
-    return workspace;
+    return phase.workspace;
   };
 
   /** The open checkout, with the ref's own permission: every mutation the page
@@ -261,17 +311,13 @@ export const createPodServer = (options: {
   };
 
   /** Boot (or restore) the pod for the ref `open` named, and wire everything
-   * the page will drive to it. */
+   * the page will drive to it. `install` moves the phase to `open` with the
+   * workspace, or tears the workspace down when the page closed under the
+   * boot (see `openWorkspace`). */
   const bootWorkspace = async (
-    params: PodOpenParams
+    params: PodOpenParams,
+    install: (open: FrameWorkspace) => void
   ): Promise<PodOpenResult> => {
-    if (workspace !== null) {
-      throw new PodRequestError(
-        "already-open",
-        "pod: this frame already holds a workspace"
-      );
-    }
-
     if (params.appId !== appId || params.branch !== branch) {
       throw new PodRequestError(
         "forbidden",
@@ -300,7 +346,7 @@ export const createPodServer = (options: {
       sha: params.sha,
     });
 
-    workspace = open;
+    install(open);
     stops.push(
       open.onChanges(() => {
         publishChanges();
@@ -321,26 +367,44 @@ export const createPodServer = (options: {
   };
 
   const openWorkspace = (params: PodOpenParams): Promise<PodOpenResult> => {
-    if (opening !== null) {
+    if (!Pod.$is("Closed")(phase)) {
       throw new PodRequestError(
         "already-open",
         "pod: this frame already holds a workspace"
       );
     }
 
-    const booting = bootWorkspace(params);
-    opening = booting;
-    // oxlint-disable-next-line promise/prefer-await-to-then -- the boot's own promise is the request's answer; this only clears the in-flight marker, whichever way it settles.
-    void booting.then(
+    const settled = Promise.withResolvers<undefined>();
+
+    const installing = bootWorkspace(params, (open) => {
+      const next = podTransition(phase, { t: "booted", workspace: open });
+
+      if (Pod.$is("Open")(next)) {
+        phase = next;
+
+        return;
+      }
+
+      // The page closed while the boot was still running: the workspace must
+      // not outlive the request that gave up on it (it holds the saved copy's
+      // lock). `closeWorkspace` finishes the phase.
+      void open.close();
+    });
+
+    phase = podTransition(phase, { boot: settled.promise, t: "open" });
+
+    // oxlint-disable-next-line promise/prefer-await-to-then -- the boot's own promise is the request's answer; this only settles the phase marker, whichever way it ended.
+    void installing.then(
       () => {
-        opening = null;
+        settled.resolve();
       },
       () => {
-        opening = null;
+        phase = podTransition(phase, { t: "boot-failed" });
+        settled.resolve();
       }
     );
 
-    return booting;
+    return installing;
   };
 
   /** Tear the pod down. The page sends `terminal.close` first; doing it again
@@ -349,23 +413,22 @@ export const createPodServer = (options: {
    * the page gave up on) lands a live workspace: it is waited for and torn
    * down too, rather than left holding the saved copy's lock. */
   const closeWorkspace = async (): Promise<void> => {
-    const booting = opening;
-
-    if (booting !== null) {
-      try {
-        await booting;
-      } catch {
-        // The boot's own failure is its request's to report.
-      }
+    if (Pod.$is("Booting")(phase)) {
+      await phase.boot;
     }
 
-    const open = workspace;
+    if (!Pod.$is("Open")(phase)) {
+      // A boot that was still running when this close arrived is torn down by
+      // the boot's own install; the phase only has to be finished here.
+      if (Pod.$is("Closing")(phase)) {
+        phase = podTransition(phase, { t: "closed" });
+      }
 
-    if (open === null) {
       return;
     }
 
-    workspace = null;
+    const open = phase.workspace;
+    phase = podTransition(phase, { t: "close" });
 
     for (const stop of stops.splice(0)) {
       stop();
@@ -376,10 +439,44 @@ export const createPodServer = (options: {
     }
 
     watches.clear();
-    terminal?.close();
-    terminal = null;
-    push = null;
+    terminal = terminalTransition(terminal, { t: "close" });
+    cancelLease?.();
+    cancelLease = null;
+    openPush = null;
+    push = Push.Idle();
     await open.close();
+    phase = podTransition(phase, { t: "closed" });
+  };
+
+  /** Return the push slot to `idle` when the page never settled: the commit's
+   * outcome is unknown, so the pod is left exactly as it was and the page is
+   * told to reload (which restores the saved copy and re-derives). */
+  const abandonPush = (pending: OpenPush): void => {
+    pending.expired = true;
+    openPush = null;
+    push = Push.Idle();
+    pending.settled.reject(
+      new Error("workspace: the page never reported how the commit went")
+    );
+  };
+
+  /** Take the next lease id for one push, and arm it. A stale timer (an older
+   * push's id) does nothing. */
+  const armLease = (pending: OpenPush): void => {
+    pushLeaseId += 1;
+    pending.lease = pushLeaseId;
+    cancelLease?.();
+    cancelLease = lease.after(() => {
+      if (openPush !== pending || push === Push.Idle()) {
+        return;
+      }
+
+      abandonPush(pending);
+      emit("fatal", {
+        message:
+          "The push was never confirmed, so the workspace could not be settled on it. Reload to continue.",
+      });
+    });
   };
 
   /** Build the payload the page will commit, and hold the push open until
@@ -391,7 +488,7 @@ export const createPodServer = (options: {
   ): Promise<{ payload: PushPayload }> => {
     const open = requireWorkspace();
 
-    if (push !== null) {
+    if (!Push.$is("Idle")(push)) {
       throw new PodRequestError(
         "busy",
         "workspace: a push is already in flight"
@@ -400,21 +497,25 @@ export const createPodServer = (options: {
 
     const settled = Promise.withResolvers<{ sha: string }>();
     const built = Promise.withResolvers<PushPayload>();
-    let handed = false;
 
     const pending: OpenPush = {
+      expired: false,
       finishing: null,
       handed: false,
+      lease: 0,
       refused: false,
       settled,
     };
 
-    push = pending;
+    openPush = pending;
+    armLease(pending);
+    push = pushTransition(push, { lease: pending.lease, t: "prepare" });
+
     pending.finishing = open.push(
       { branch: params.branch, message: params.message, target: params.target },
       async (payload) => {
-        handed = true;
         pending.handed = true;
+        push = pushTransition(push, { lease: pending.lease, t: "hand" });
         built.resolve(payload);
 
         return await settled.promise;
@@ -422,16 +523,19 @@ export const createPodServer = (options: {
     );
     // oxlint-disable-next-line promise/prefer-await-to-then, promise/prefer-await-to-callbacks, anti-slop/no-unknown-parameters -- the continuation outlives the response the page is waiting for; this only observes how it ended, and a rejection is unknown by construction.
     void pending.finishing.catch((error: unknown) => {
-      if (pending.refused) {
-        // The page's own commit failed; its POST said so, and the pod is
-        // exactly as it was.
+      if (pending.refused || pending.expired) {
+        // The page's own commit failed (its POST said so), or its lease
+        // expired: the pod is exactly as it was, and `fatal` already spoke.
         return;
       }
 
-      if (!handed) {
+      if (!pending.handed) {
         // The push never reached the page's commit at all: this request's own
         // failure (a read-only ref, a journal that would not read).
-        push = null;
+        openPush = null;
+        push = Push.Idle();
+        cancelLease?.();
+        cancelLease = null;
         built.reject(error);
 
         return;
@@ -448,27 +552,29 @@ export const createPodServer = (options: {
   };
 
   /** How the page's commit went: a sha settles the pod on it (which is what
-   * publishes the post-push rows), and a failure leaves the pod untouched. */
+   * publishes the post-push rows), and a failure leaves the pod untouched.
+   * A settle that names no commit is refused *before* the push is released, so
+   * the page can answer again instead of leaving the facade's continuation
+   * waiting forever. */
   const pushSettle = async (params: PushSettleParams): Promise<void> => {
-    const pending = push;
+    const pending = openPush;
 
-    if (pending === null) {
+    if (pending === null || !Push.$is("Handed")(push)) {
       throw new PodRequestError(
         "busy",
         "workspace: no push is waiting to settle"
       );
     }
 
-    push = null;
-
     if (params.ok !== true) {
+      push = pushTransition(push, { lease: pending.lease, t: "refuse" });
       pending.refused = true;
       pending.settled.reject(new Error(params.error ?? "the commit failed"));
 
       return;
     }
 
-    // oxlint-disable-next-line anti-slop/no-runtime-typeof -- the params came off the port; a settled push without a commit id is refused here.
+    // oxlint-disable-next-line anti-slop/no-runtime-typeof -- the params came off the port; a settled push without a commit id is refused here, while `push` still holds the page's slot.
     if (typeof params.sha !== "string" || params.sha === "") {
       throw new PodRequestError(
         "bad-params",
@@ -476,6 +582,7 @@ export const createPodServer = (options: {
       );
     }
 
+    push = pushTransition(push, { lease: pending.lease, t: "settle" });
     pending.settled.resolve({ sha: params.sha });
     // The answer waits for the continuation, so a push that resolved on the
     // page's side means the pod has re-derived. A failure there is the
@@ -483,6 +590,10 @@ export const createPodServer = (options: {
     await pending.finishing?.catch(() => {
       // Reported as `fatal` when it happened.
     });
+    cancelLease?.();
+    cancelLease = null;
+    openPush = null;
+    push = pushTransition(push, { t: "finish" });
   };
 
   const handlers = {
@@ -546,15 +657,23 @@ export const createPodServer = (options: {
     rename: ({ from, to }) => requireWorkspace().rename(from, to),
     restore: ({ path }) => requireWorkspace().restore(path),
     "terminal.close": () => {
-      terminal?.close();
-      terminal = null;
+      if (Terminal.$is("Open")(terminal)) {
+        terminal.backend.close();
+      }
+
+      terminal = terminalTransition(terminal, { t: "close" });
     },
     "terminal.input": ({ data }) => {
-      terminal?.input(data);
+      if (Terminal.$is("Open")(terminal)) {
+        terminal.backend.input(data);
+      }
     },
     "terminal.open": ({ cols, rows }) => {
       const open = requireWorkspace();
-      terminal?.close();
+
+      if (Terminal.$is("Open")(terminal)) {
+        terminal.backend.close();
+      }
 
       const backend = createTerminalBackend({
         onWrite: (data) => {
@@ -564,13 +683,22 @@ export const createPodServer = (options: {
       });
 
       backend.open(cols, rows);
-      terminal = backend;
       nextSessionId += 1;
+      terminal = terminalTransition(terminal, {
+        backend,
+        cols,
+        rows,
+        sessionId: nextSessionId,
+        t: "open",
+      });
 
       return { sessionId: nextSessionId };
     },
     "terminal.resize": ({ cols, rows }) => {
-      terminal?.resize(cols, rows);
+      if (Terminal.$is("Open")(terminal)) {
+        terminal.backend.resize(cols, rows);
+        terminal = terminalTransition(terminal, { cols, rows, t: "resize" });
+      }
     },
     writeBytes: ({ bytes, path }) => requireWorkspace().writeBytes(path, bytes),
     writeText: ({ path, text }) => requireWorkspace().writeText(path, text),
@@ -616,9 +744,8 @@ export const createPodServer = (options: {
       const value = await run(request.params);
       port.postMessage({ i, ok: true, v: value } satisfies PodResponse);
     } catch (error) {
-      const code = error instanceof PodRequestError ? error.code : undefined;
       port.postMessage({
-        e: { code, message: errorMessage(error) },
+        e: { code: requestCode(error), message: errorMessage(error) },
         i,
         ok: false,
       } satisfies PodResponse);
@@ -656,8 +783,13 @@ export const createPodServer = (options: {
 
   return {
     flushPending: () => {
+      if (!Pod.$is("Open")(phase)) {
+        return;
+      }
+
+      const open = phase.workspace;
       // oxlint-disable-next-line promise/prefer-await-to-then -- `pagehide` cannot await: the save is started, and the pod's own retry is all that is left after it.
-      void workspace?.flush().catch(() => {
+      void open.flush().catch(() => {
         // The frame is going away: the pod's own retry is all that is left.
       });
     },

@@ -21,12 +21,27 @@
 //! refused response leaves an error page that will never answer) until the
 //! `HANDSHAKE_TIMEOUT_MS` deadline — a new app's pod host only starts
 //! answering once the edge has picked the app up.
+//!
+//! # State
+//!
+//! The frame's own lifecycle is the machine in `./pod-frame` (idle → loading →
+//! answered → connected | failed): this page only translates window messages
+//! and timers into its events, and `connected` is reached on the frame's
+//! `PodBound` ack rather than on having posted the port. The port's lifecycle
+//! is the small machine below (`portTransition`): `open` until one of the
+//! frame's own terminal signals (`fatal`, the page's `close`, the frame
+//! document going away) closes it, and every request carries its own deadline.
+
+import { Data } from "effect";
 
 import { NO_POD_HOST_MESSAGE, POD_HOST_HTML_PATH } from "../preview-host";
+import { Frame, frameFailureMessage, frameTransition } from "./pod-frame";
+import type { FrameState } from "./pod-frame";
 import { POD_PROTOCOL_VERSION } from "./pod-protocol";
 import type {
   PodAskMap,
   PodAskMessage,
+  PodBound,
   PodConnect,
   PodEventMap,
   PodHello,
@@ -36,6 +51,11 @@ import type {
 
 /** How long the frame has to load and answer its handshake, in total. */
 const HANDSHAKE_TIMEOUT_MS = 30_000;
+
+/** How long the frame has to acknowledge the port after it answered the
+ * handshake. It is a window post on a document that has already answered, so
+ * anything slower than this is a frame that navigated or died. */
+const BIND_TIMEOUT_MS = 5000;
 
 /** How often a frame that has not answered is loaded again. */
 const HANDSHAKE_RETRY_MS = 2000;
@@ -54,6 +74,54 @@ export interface CallOptions {
 /** A pending timer, however this environment names it: a browser number, a
  * Bun handle. */
 type TimerHandle = ReturnType<typeof setTimeout>;
+
+/** The failure class every request fails with: the frame's own `code` when it
+ * refused, and this page's for the transport's three (a call's deadline, a
+ * closed port, the frame's `fatal`). Callers branch on `code`, never on the
+ * message. */
+export class PodCallError extends Error {
+  readonly code: string;
+
+  constructor(code: string, message: string) {
+    super(message);
+    this.code = code;
+    this.name = "PodCallError";
+  }
+}
+
+/** Why the port is closed: the page's own `close`, the frame's `fatal`, or the
+ * frame's document going away. */
+export type PortCloseReason = "fatal" | "page" | "unbound";
+
+/** The port's lifecycle.
+ *
+ * ```mermaid
+ * stateDiagram-v2
+ *   [*] --> open
+ *   open --> closed: fatal | close | dispose
+ *   closed --> [*]
+ * ```
+ *
+ * `closed` is terminal and carries the first reason, so a request issued from
+ * inside a `fatal` listener is refused by the same state that refused the ones
+ * in flight — never queued into a port nobody reads. */
+export type PortState = Data.TaggedEnum<{
+  Closed: { code: "closed" | "fatal"; message: string };
+  Open: Record<never, never>;
+}>;
+
+export const Port = Data.taggedEnum<PortState>();
+
+/** The one port transition: closing is one-way, and the first close is the one
+ * a caller sees. */
+export const portTransition = (
+  state: PortState,
+  event: { code: "closed" | "fatal"; message: string; t: "close" }
+): PortState =>
+  Port.$match(state, {
+    Closed: () => state,
+    Open: () => Port.Closed({ code: event.code, message: event.message }),
+  });
 
 /** The frame's answer to a reverse ask — the value, plus what crosses with it
  * rather than being copied. */
@@ -134,14 +202,22 @@ type DispatchListener = (payload: EventPayload) => void;
 /** One message off the port, split into the shapes there are: an answer (an id
  * this page minted), an event (a kind), or a reverse ask (`ask`). */
 type PortMessage =
-  | { i: number; kind: "answer"; ok: false; failure: string }
+  | {
+      code: string | undefined;
+      failure: string;
+      i: number;
+      kind: "answer";
+      ok: false;
+    }
   | { i: number; kind: "answer"; ok: true; value: AnsweredValue }
   | { i: number; kind: "ask"; message: PodAskMessage }
   | { ev: string; kind: "event"; payload: EventPayload; text: string };
 
 /* oxlint-disable anti-slop/no-unknown-parameters, anti-slop/no-runtime-typeof -- the port is this page's I/O boundary: a message is read field by field here, and nothing off it is used before it has been checked. */
-/** The frame's `ready`, or null for anything that is not one. */
-const podReady = (value: unknown): PodReady | null => {
+/** The frame's `ready`, or null for anything that is not one. The `t` is part
+ * of the check: a `bound` ack carries the same nonce and revision, and reading
+ * it as a `ready` would swallow the one message that proves the port landed. */
+export const readPodReady = (value: unknown): PodReady | null => {
   if (typeof value !== "object" || value === null) {
     return null;
   }
@@ -151,11 +227,7 @@ const podReady = (value: unknown): PodReady | null => {
   const t = fields.get("t");
   const v = fields.get("v");
 
-  if (
-    typeof nonce !== "string" ||
-    typeof t !== "string" ||
-    typeof v !== "number"
-  ) {
+  if (t !== "ready" || typeof nonce !== "string" || typeof v !== "number") {
     return null;
   }
 
@@ -166,6 +238,27 @@ const podReady = (value: unknown): PodReady | null => {
     t: "ready",
     v,
   };
+};
+
+/** The frame's `bound` ack, or null for anything that is not one. */
+export const readPodBound = (value: unknown): PodBound | null => {
+  if (typeof value !== "object" || value === null) {
+    return null;
+  }
+
+  const fields = new Map<string, Carried>(Object.entries(value));
+  const nonce = fields.get("nonce");
+  const v = fields.get("v");
+
+  if (
+    fields.get("t") !== "bound" ||
+    typeof nonce !== "string" ||
+    typeof v !== "number"
+  ) {
+    return null;
+  }
+
+  return { nonce, t: "bound", v };
 };
 
 /** One field of an untrusted message, if it is a string. */
@@ -192,12 +285,20 @@ const objectField = (
   return new Map<string, Carried>(Object.entries(value));
 };
 
-/** The `e: {message}` one failure carries. */
-const failureField = (fields: Map<string, Carried>): string | null => {
+/** The `e: {code?, message}` one failure carries. */
+const failureField = (
+  fields: Map<string, Carried>
+): { code?: string; message: string } | null => {
   const error = objectField(fields, "e");
   const message = error === null ? null : error.get("message");
 
-  return typeof message === "string" ? message : null;
+  if (typeof message !== "string") {
+    return null;
+  }
+
+  const code = error === null ? null : stringField(error, "code");
+
+  return code === null ? { message } : { code, message };
 };
 
 /** A message off the port, or null for anything that is not the protocol's
@@ -226,8 +327,11 @@ const portMessage = (value: unknown): PortMessage | null => {
     }
 
     if (ok === false) {
+      const failure = failureField(fields);
+
       return {
-        failure: failureField(fields) ?? "the pod frame failed",
+        code: failure?.code,
+        failure: failure?.message ?? "the pod frame failed",
         i,
         kind: "answer",
         ok: false,
@@ -286,12 +390,18 @@ export const bindPodPort = (options: PodPortOptions): PodConnection => {
   const pending = new Map<number, PendingCall>();
   const listeners = new Map<string, Set<DispatchListener>>();
   let nextId = 1;
-  let closed = false;
+  let state: PortState = Port.Open();
 
   /** Every request in flight fails with `message`, and the connection is done:
-   * there is no half-dead state where a caller waits forever. */
-  const stop = (message: string): void => {
-    closed = true;
+   * there is no half-dead state where a caller waits forever. The first close
+   * is the one that stands (see `portTransition`). */
+  const stop = (code: "closed" | "fatal", message: string): void => {
+    state = portTransition(state, { code, message, t: "close" });
+
+    if (!Port.$is("Closed")(state)) {
+      return;
+    }
+
     port.close();
 
     for (const call of pending.values()) {
@@ -344,7 +454,13 @@ export const bindPodPort = (options: PodPortOptions): PodConnection => {
       if (message.ok) {
         call.resolve(message.value);
       } else {
-        call.reject(new Error(message.failure));
+        // The frame's own refusal keeps its `code` on the error: callers
+        // branch on the class of failure, never on its English.
+        call.reject(
+          message.code === undefined
+            ? new Error(message.failure)
+            : new PodCallError(message.code, message.failure)
+        );
       }
 
       return;
@@ -358,8 +474,14 @@ export const bindPodPort = (options: PodPortOptions): PodConnection => {
     if (ev === "fatal") {
       const reason = text === "" ? "the workspace stopped unexpectedly" : text;
       onFatal?.(reason);
-      stop(reason);
+      stop("fatal", reason);
       dispose();
+
+      // A pane that holds this connection (the terminal) hears the same thing
+      // the workspace's own handler does: the port behind it is gone.
+      for (const listener of listeners.get("fatal") ?? []) {
+        listener(payload);
+      }
 
       return;
     }
@@ -390,8 +512,10 @@ export const bindPodPort = (options: PodPortOptions): PodConnection => {
   ): Promise<PodRequestMap[K]["r"]> => {
     const answeredCall = Promise.withResolvers<PodRequestMap[K]["r"]>();
 
-    if (closed) {
-      answeredCall.reject(new Error("the pod frame is closed"));
+    if (Port.$is("Closed")(state)) {
+      answeredCall.reject(
+        new PodCallError(state.code, "the pod frame is closed")
+      );
 
       return answeredCall.promise;
     }
@@ -406,7 +530,8 @@ export const bindPodPort = (options: PodPortOptions): PodConnection => {
         : setTimeout(() => {
             pending.delete(id);
             answeredCall.reject(
-              new Error(
+              new PodCallError(
+                "timeout",
                 `${String(kind)}: the pod frame did not answer within ${timeout / 1000}s`
               )
             );
@@ -453,7 +578,7 @@ export const bindPodPort = (options: PodPortOptions): PodConnection => {
   return {
     call,
     close: () => {
-      stop("the pod frame was closed");
+      stop("closed", "the pod frame was closed");
       dispose();
 
       return Promise.resolve();
@@ -463,9 +588,10 @@ export const bindPodPort = (options: PodPortOptions): PodConnection => {
 };
 
 /** Open the pod frame `previewOrigin` and bind a port to it. Resolves once the
- * frame has answered the handshake, proven cross-origin isolated, and taken
- * the port; rejects (and removes the frame) for anything less — never a silent
- * fallback that would run the pod's code in this page's agent cluster. */
+ * frame has answered the handshake, proven cross-origin isolated, and
+ * acknowledged the port (`PodBound`); rejects (and removes the frame) for
+ * anything less — never a silent fallback that would run the pod's code in
+ * this page's agent cluster. */
 export const openPodFrame = async (
   options: PodFrameOptions
 ): Promise<PodConnection> => {
@@ -497,17 +623,41 @@ export const openPodFrame = async (
   const frameUrl = `${previewOrigin}${POD_HOST_HTML_PATH}?${query}`;
   frame.src = frameUrl;
   const answered = Promise.withResolvers<PodReady>();
+  const bound = Promise.withResolvers<undefined>();
+  let state: FrameState = Frame.Idle();
   const frameWindow = (): Window | null => frame.contentWindow;
+
+  /** Move the machine on; a failure state rejects the waiting step it applies
+   * to, with the reason's own message. */
+  const settle = (next: ReturnType<typeof frameTransition>): void => {
+    state = next;
+
+    Frame.$match(state, {
+      Answered: () => {
+        // Waiting for the ack now.
+      },
+      Connected: () => {
+        bound.resolve();
+      },
+      Failed: ({ reason }) => {
+        const failure = new Error(frameFailureMessage(reason, previewOrigin));
+        answered.reject(failure);
+        bound.reject(failure);
+      },
+      Idle: () => {
+        // Nothing opened yet.
+      },
+      Loading: () => {
+        // The retry loop owns this state.
+      },
+    });
+  };
 
   const say = (
     message: PodConnect | PodHello,
     transfer: Transferable[] = []
   ): void => {
     frameWindow()?.postMessage(message, previewOrigin, transfer);
-  };
-
-  const hello = (): void => {
-    say({ nonce, t: "hello", v: POD_PROTOCOL_VERSION });
   };
 
   const onWindowMessage = (event: MessageEvent): void => {
@@ -518,17 +668,26 @@ export const openPodFrame = async (
       return;
     }
 
-    const reply = podReady(event.data);
+    const ready = readPodReady(event.data);
 
     if (
-      reply === null ||
-      reply.v !== POD_PROTOCOL_VERSION ||
-      reply.nonce !== nonce
+      ready !== null &&
+      ready.v === POD_PROTOCOL_VERSION &&
+      ready.nonce === nonce
     ) {
+      if (Frame.$is("Loading")(state)) {
+        settle(frameTransition(state, { ready, t: "ready" }));
+        answered.resolve(ready);
+      }
+
       return;
     }
 
-    answered.resolve(reply);
+    const ack = readPodBound(event.data);
+
+    if (ack !== null && ack.v === POD_PROTOCOL_VERSION && ack.nonce === nonce) {
+      settle(frameTransition(state, { t: "bound" }));
+    }
   };
 
   window.addEventListener("message", onWindowMessage);
@@ -540,7 +699,8 @@ export const openPodFrame = async (
     // origin and drops a message targeted at the pod host origin. The frame
     // also answers its handshake unsolicited, so this is a second ask —
     // repeated on every load, including the retry's own reload.
-    hello();
+    say({ nonce, t: "hello", v: POD_PROTOCOL_VERSION });
+    settle(frameTransition(state, { t: "load" }));
     clearTimeout(retry);
     retry = setTimeout(() => {
       frame.src = frameUrl;
@@ -549,13 +709,10 @@ export const openPodFrame = async (
 
   frame.addEventListener("load", onFrameLoad);
   document.body.append(frame);
+  settle(frameTransition(state, { t: "mount" }));
 
   const deadline = setTimeout(() => {
-    answered.reject(
-      new Error(
-        `Could not start the workspace: the pod host at ${previewOrigin} did not answer. Reload the page to try again.`
-      )
-    );
+    settle(frameTransition(state, { t: "deadline" }));
   }, HANDSHAKE_TIMEOUT_MS);
 
   let replied: PodReady;
@@ -578,17 +735,35 @@ export const openPodFrame = async (
   // that quietly runs half of what it promises is worse than one that says why
   // it cannot run.
   if (!(replied.isolated && replied.sharedArrayBuffer)) {
+    settle(frameTransition(state, { t: "not-isolated" }));
     window.removeEventListener("message", onWindowMessage);
     frame.remove();
-    throw new Error(
-      `Pod host ${previewOrigin} is not cross-origin isolated, so the workspace cannot run with SharedArrayBuffer`
-    );
+    throw new Error(frameFailureMessage("isolation", previewOrigin));
   }
 
   const channel = new MessageChannel();
   say({ nonce, port: channel.port2, t: "connect", v: POD_PROTOCOL_VERSION }, [
     channel.port2,
   ]);
+
+  // The port is only proven by the frame's own ack: a `postMessage` into the
+  // frame's window can land nowhere (a navigation in between, a listener not
+  // attached yet), and a page that assumed it had bound would answer every
+  // request with a 30 s deadline instead of saying the frame never took it.
+  const bindDeadline = setTimeout(() => {
+    settle(frameTransition(state, { t: "unbound" }));
+  }, BIND_TIMEOUT_MS);
+
+  try {
+    await bound.promise;
+  } catch (error) {
+    channel.port1.close();
+    window.removeEventListener("message", onWindowMessage);
+    frame.remove();
+    throw error;
+  } finally {
+    clearTimeout(bindDeadline);
+  }
 
   return bindPodPort({
     dispose: () => {
