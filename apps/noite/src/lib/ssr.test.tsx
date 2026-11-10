@@ -11,6 +11,7 @@ import { renderHtml } from "ilha/test";
 
 import type { AppDetail } from "./api-types";
 import { CreateAppForm } from "./apps/create-form";
+import { AppsList } from "./apps/list";
 import { Onboarding } from "./auth/onboarding";
 import { keys } from "./resources";
 import type { SourceBrowserState } from "./source/drafts";
@@ -85,6 +86,15 @@ describe("ssr", () => {
   test("onboarding renders without browser globals", async () => {
     const html = await renderHtml(Onboarding);
     expect(html).not.toContain("data-ilha-error");
+  });
+
+  test("a live panel with no stream says so instead of an endless skeleton", async () => {
+    // SSR has no EventSource, so the feed is `Offline`: the list must say
+    // live updates are unavailable rather than render a skeleton forever.
+    const html = await renderHtml(AppsList);
+
+    expect(html).not.toContain("data-ilha-error");
+    expect(html).toContain("Live updates are unavailable");
   });
 
   test("the preview panel renders without browser globals", async () => {

@@ -9,6 +9,7 @@ import type { AdminUserRow } from "../api-types";
 import { authClient } from "../auth-client";
 import { invalidateSession } from "../auth/session";
 import { errorMessage } from "../errors";
+import { resourceValue, resourceError } from "../resource";
 import { listUsers } from "../resources";
 import { searchParam } from "../search-param";
 import { Avatar } from "../ui/avatar";
@@ -128,9 +129,9 @@ const AdminUsersRows = ({
   const busy = atom(false);
   const impersonating = atom(false);
   const res = listUsers(query, page);
-  const users = res.data()?.users ?? [];
-  const hasMore = res.data()?.hasMore ?? false;
-  const loadError = res.error();
+  const users = resourceValue(res.state())?.users ?? [];
+  const hasMore = resourceValue(res.state())?.hasMore ?? false;
+  const loadError = resourceError(res.state());
   const panelError = atom("");
 
   const reload = () => res.refetch();
@@ -220,7 +221,7 @@ const AdminUsersRows = ({
     await mutate(() => api<{ ok: true }>("/api/admin/deleteUser", user.id));
   };
 
-  const loading = res.loading() && res.data() === undefined;
+  const loading = res.state()._tag === "Loading";
   let body: View;
 
   if (loading) {

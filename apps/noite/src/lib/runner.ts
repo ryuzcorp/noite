@@ -1,3 +1,4 @@
+/* oxlint-disable eslint/max-classes-per-file -- the two runner error classes are the transport contract: a caught runner error is one of them. */
 import { controlEnv, hydrateControlEnv } from "./control-env";
 // Wire types, generated from the Rust structs in apps/runner into
 // ./runner-types (never edit those files by hand). Regenerate with `cargo
@@ -233,6 +234,109 @@ const runnerToken = () => {
   return token;
 };
 
+/** A JSON-RPC error from the runner, with its numeric code kept on the
+ * error instead of only inside the message: envelope ingest tells a wrong
+ * key from a transport failure by matching `code`, never message text. */
+export class RunnerRpcError extends Error {
+  readonly code: number;
+  readonly method: string;
+
+  constructor(method: string, code: number, message: string) {
+    super(`runner rpc ${method}: ${code} ${message}`);
+    this.name = "RunnerRpcError";
+    this.code = code;
+    this.method = method;
+  }
+}
+
+/** A non-ok HTTP answer from the runner, kept typed so callers never parse
+ * the message for the status. */
+export class RunnerHttpError extends Error {
+  readonly body: string;
+  readonly path: string;
+  readonly status: number;
+
+  constructor(path: string, status: number, body: string) {
+    // The body stays in the field only: this message reaches `failUnknown`
+    // and therefore a client, and an upstream body is not ours to forward.
+    super(`runner ${path}: ${status}`);
+    this.name = "RunnerHttpError";
+    this.path = path;
+    this.status = status;
+    this.body = body;
+  }
+}
+
+/** Every way a runner call fails, as one closed type. `runnerFailureOf` is
+ * the only classifier: callers branch on this, never on `error.name` or on
+ * English text. */
+export type RunnerFailure =
+  | { readonly kind: "http"; readonly path: string; readonly status: number }
+  | { readonly kind: "rpc"; readonly code: number; readonly message: string }
+  | { readonly kind: "timeout"; readonly message: string }
+  | { readonly kind: "unreachable"; readonly message: string };
+
+/** Classify a caught runner error. `runnerFetch`/`runnerRpc` already threw a
+ * typed error for an RPC rejection or a non-ok answer; a fetch-level throw is
+ * a timeout when it is the abort signal's, otherwise unreachable. */
+// oxlint-disable-next-line anti-slop/no-unknown-parameters -- catch-site classifier: the thrown value is unknown by construction, and this is the one place it becomes a domain type.
+export const runnerFailureOf = (error: unknown): RunnerFailure => {
+  if (error instanceof RunnerRpcError) {
+    return { code: error.code, kind: "rpc", message: error.message };
+  }
+
+  if (error instanceof RunnerHttpError) {
+    return { kind: "http", path: error.path, status: error.status };
+  }
+
+  const message = error instanceof Error ? error.message : String(error);
+
+  return error instanceof Error &&
+    (error.name === "TimeoutError" || error.name === "AbortError")
+    ? { kind: "timeout", message }
+    : { kind: "unreachable", message };
+};
+
+/** A create conflict for a slug that already exists. The runner answers 409
+ * with this message (there is no machine-readable sub-code yet), so this is
+ * the one place the control UI names it. */
+export const isSlugTaken = (failure: RunnerFailure): boolean =>
+  failure.kind === "rpc" &&
+  failure.code === 409 &&
+  failure.message.includes("slug already taken");
+
+/** The account's app limit, from the runner's 409 text (see `isSlugTaken`). */
+export const isAppLimitReached = (failure: RunnerFailure): boolean =>
+  failure.kind === "rpc" &&
+  failure.code === 409 &&
+  failure.message.includes("app limit reached");
+
+/** The runner's error text without the RPC envelope. */
+export const runnerFailureMessage = (failure: RunnerFailure): string => {
+  switch (failure.kind) {
+    case "http": {
+      return `runner ${failure.path}: ${failure.status}`;
+    }
+
+    case "rpc":
+    case "timeout":
+    case "unreachable": {
+      return failure.message;
+    }
+
+    default: {
+      return "runner call failed";
+    }
+  }
+};
+
+interface JsonRpcEnvelope<T> {
+  error?: { code: number; message: string };
+  id: number;
+  jsonrpc: string;
+  result?: T;
+}
+
 /** Bound every runner call: a hung upstream must fail with the path in the
  * message, never hang into the platform request deadline. Healthy calls
  * measure ~70ms through the public edge (a Railway worker cell cannot resolve
@@ -248,6 +352,13 @@ const RUNNER_TIMEOUT_MS = 5000;
  * the control UI's 15 s route bound (`middleware/01-timeout.ts`): past it the
  * route answers a 504 and the runner fetch is abandoned anyway. */
 const LIFECYCLE_TIMEOUT_MS = 14_000;
+
+/** Create's own bound, shorter than {@link LIFECYCLE_TIMEOUT_MS}: a create
+ * that outlives it is recovered by `adoptSlowCreate`, so create plus adopt
+ * must fit inside the route bound. 8 s + a 4 s adopt poll + the grant and the
+ * response stay under 15 s; with the 14 s lifecycle bound the adopt could
+ * never run inside the route's life. */
+export const CREATE_TIMEOUT_MS = 8000;
 
 /** Log anything slower than this, with the path and the base URL: when the
  * deployed worker is the only thing we can observe, this is what attributes
@@ -284,8 +395,10 @@ export const runnerFetch = async <T = unknown>(
 
   if (!res.ok) {
     const text = await res.text().catch(() => res.statusText);
-    throw new Error(
-      `runner ${init.method ?? "GET"} ${path}: ${res.status} ${text}`
+    throw new RunnerHttpError(
+      `${init.method ?? "GET"} ${path}`,
+      res.status,
+      text
     );
   }
 
@@ -300,26 +413,6 @@ export const runnerFetch = async <T = unknown>(
   // SAFETY: the runner returns the response object directly (no `{ body }` envelope); the JSON already matches the caller's requested `T`.
   return payload as T;
 };
-
-interface JsonRpcEnvelope<T> {
-  error?: { code: number; message: string };
-  id: number;
-  jsonrpc: string;
-  result?: T;
-}
-
-/** A JSON-RPC error from the runner, with its numeric code kept on the
- * error instead of only inside the message: envelope ingest tells a wrong
- * key from a transport failure by matching `code`, never message text. */
-export class RunnerRpcError extends Error {
-  readonly code: number;
-
-  constructor(method: string, code: number, message: string) {
-    super(`runner rpc ${method}: ${code} ${message}`);
-    this.name = "RunnerRpcError";
-    this.code = code;
-  }
-}
 
 let rpcId = 0;
 
@@ -474,7 +567,7 @@ export const runnerCreateApp = (body: {
       source: body.source,
       user_id: body.userId,
     },
-    { timeoutMs: LIFECYCLE_TIMEOUT_MS }
+    { timeoutMs: CREATE_TIMEOUT_MS }
   );
 
 /** Retry the import an app was created from (A2): only meaningful when its
@@ -485,8 +578,12 @@ export const runnerRetryImport = (id: string) =>
 export const runnerGetApp = (id: string) =>
   runnerRpc<RunnerApp>("apps.get", { id });
 
-export const runnerGetAppBySlug = (slug: string) =>
-  runnerRpc<RunnerApp>("apps.get_by_slug", { slug });
+export const runnerGetAppBySlug = (slug: string, timeoutMs?: number) =>
+  runnerRpc<RunnerApp>(
+    "apps.get_by_slug",
+    { slug },
+    timeoutMs === undefined ? undefined : { timeoutMs }
+  );
 
 // `apps.patch` takes camelCase params (like the REST PATCH body), unlike most
 // RPC methods; the runner rejects unknown keys so a mismatch fails loudly.

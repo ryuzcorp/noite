@@ -4,6 +4,7 @@ import { atom } from "ilha";
 
 import { api } from "../../api";
 import { errorMessage } from "../../errors";
+import { resourceValue, resourceError } from "../../resource";
 import { ingestKey } from "../../resources";
 import type { AppRole } from "../../roles";
 import type { RunnerIngestKey } from "../../runner";
@@ -27,9 +28,9 @@ export const ErrorReportingPanel = ({
   const busy = atom(false);
   const isAdmin = myRole === "admin";
 
-  const current = res.data();
+  const current = resourceValue(res.state());
 
-  if (res.loading() && current === undefined) {
+  if (res.state()._tag === "Loading") {
     return <SectionSkeleton lines={2} />;
   }
 
@@ -37,7 +38,7 @@ export const ErrorReportingPanel = ({
     return (
       <SettingsSection>
         <h3 class="m-0 text-lg font-semibold">Error reporting</h3>
-        <LoadError error={res.error()} />
+        <LoadError error={resourceError(res.state())} />
       </SettingsSection>
     );
   }

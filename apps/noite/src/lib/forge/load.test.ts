@@ -2,32 +2,39 @@ import { expect, test } from "bun:test";
 
 import { loadState } from "./load";
 
-const message = (cause: unknown): string =>
-  cause instanceof Error ? cause.message : "unknown";
-
-test("no value and no error is a load", () => {
-  expect(loadState<string>(undefined, null)).toEqual({ _tag: "Loading" });
+test("a cold reader is loading", () => {
+  expect(loadState<string>({ _tag: "Loading" })).toEqual({ _tag: "Loading" });
 });
 
-test("a value is ready whether or not an earlier error is still set", () => {
-  expect(loadState("rows", new Error("stale"))).toEqual({
+test("ready and reloading both paint their value", () => {
+  expect(loadState<string>({ _tag: "Ready", value: "rows" })).toEqual({
+    _tag: "Ready",
+    value: "rows",
+  });
+  // A reload keeps the last value visible: it is not a skeleton.
+  expect(loadState<string>({ _tag: "Reloading", value: "rows" })).toEqual({
     _tag: "Ready",
     value: "rows",
   });
 });
 
 test("a failure carries its message", () => {
-  expect(loadState(undefined, new Error("no such ref"))).toEqual({
-    _tag: "Failed",
-    message: "no such ref",
-  });
+  expect(
+    loadState<string>({
+      _tag: "Failed",
+      error: new Error("no such ref"),
+      value: undefined,
+    })
+  ).toEqual({ _tag: "Failed", message: "no such ref" });
 });
 
 test("a caught non-Error still yields text", () => {
-  const loaded = loadState(undefined, "boom");
+  const loaded = loadState<string>({
+    _tag: "Failed",
+    error: "boom",
+    value: undefined,
+  });
 
   expect(loaded._tag).toBe("Failed");
   expect(loaded._tag === "Failed" ? loaded.message : "").not.toBe("");
-  // The helper the views use keeps the same shape.
-  expect(message(new Error("x"))).toBe("x");
 });

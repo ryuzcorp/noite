@@ -34,6 +34,8 @@ import * as Equal from "effect/Equal";
 import { atom, watch } from "ilha";
 import type { AtomHandle, View } from "ilha";
 
+import { resourceValue } from "../../../lib/resource";
+
 /** Keep a component atom in step with a value derived from props/resources
  * (an `atom(init)` only seeds on the first render). */
 const syncAtom = <T,>(handle: AtomHandle<T>, value: T): void => {
@@ -321,7 +323,7 @@ const SourceBody = ({ appId }: { appId: string }) => {
   });
 
   const refsRes = forgeRefs(appId);
-  const refs = refsRes.data();
+  const refs = resourceValue(refsRes.state());
   const defaultBranch = refs?.defaultBranch ?? "main";
   // The ref every read is keyed by; no `?ref=` browses the default branch. The
   // handle goes to the browser, which switches its checkout in place on every
@@ -433,9 +435,9 @@ const SourceBody = ({ appId }: { appId: string }) => {
 
   // main is protected when `require_pr` is on and the caller is below admin;
   // the Changes panel then only commits to a new branch.
-  const rules = branchRules(appId).data();
+  const rules = resourceValue(branchRules(appId).state());
   const detailRes = appDetail(appId);
-  const myRole = detailRes.data()?.myRole;
+  const myRole = resourceValue(detailRes.state())?.myRole;
   const browsing = gitRef();
 
   /** Why the browsed ref opens read-only ("" = editable — see
@@ -447,13 +449,19 @@ const SourceBody = ({ appId }: { appId: string }) => {
    * is the one answer that is certainly stale (a tag or a raw commit is simply
    * absent again, and stays read-only). */
   const canEditRef = async (ref: string): Promise<ReadOnlyRef> => {
-    const loaded = refsRes.data();
+    const loaded = resourceValue(refsRes.state());
 
     const stale =
       loaded === undefined ||
       !loaded.branches.some((branch) => branch.name === ref);
 
-    const known = stale || refsRes.loading() ? await refsRes.refetch() : loaded;
+    const known =
+      stale ||
+      refsRes.state()._tag === "Loading" ||
+      refsRes.state()._tag === "Reloading"
+        ? await refsRes.refetch()
+        : loaded;
+
     let role = myRole;
 
     if (role === undefined) {

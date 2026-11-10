@@ -13,8 +13,8 @@ import {
 } from "../lib/feeds";
 import { testRouteContext } from "../testing/context";
 import defaultTimeoutMiddleware, {
+  routeTimeout,
   TIMEOUT_MS,
-  timeoutExempt,
   timeoutMiddleware as withTimeout,
 } from "./01-timeout";
 
@@ -27,17 +27,42 @@ const contextFor = (path: string) =>
     ENV as unknown as never
   );
 
-describe("timeoutExempt", () => {
+const exempt = (path: string): boolean => routeTimeout(path).kind === "exempt";
+
+describe("routeTimeout", () => {
   test("spares streams, R2 objects, and the source archive", () => {
-    expect(timeoutExempt("/api/apps/a/logs/stream")).toBe(true);
-    expect(timeoutExempt("/api/apps/stream")).toBe(true);
-    expect(timeoutExempt("/storage/a/r2/b/raw?key=k")).toBe(true);
-    expect(timeoutExempt("/storage/a/r2/b/upload?key=k")).toBe(true);
-    expect(timeoutExempt("/api/apps/a/source/archive")).toBe(true);
-    expect(timeoutExempt("/api/apps/a/source/commit")).toBe(false);
-    expect(timeoutExempt("/api/auth/session")).toBe(false);
-    expect(timeoutExempt("/health")).toBe(false);
-    expect(timeoutExempt("/mcp")).toBe(false);
+    expect(exempt("/api/apps/a/logs/stream")).toBe(true);
+    expect(exempt("/api/apps/stream")).toBe(true);
+    expect(exempt("/api/streams")).toBe(true);
+    expect(exempt("/storage/a/r2/b/raw?key=k")).toBe(true);
+    expect(exempt("/storage/a/r2/b/upload?key=k")).toBe(true);
+    expect(exempt("/api/apps/a/source/archive")).toBe(true);
+    expect(exempt("/api/apps/a/source/commit")).toBe(false);
+    expect(exempt("/api/auth/session")).toBe(false);
+    expect(exempt("/health")).toBe(false);
+    expect(exempt("/mcp")).toBe(false);
+  });
+
+  test("a bounded route carries the bound; an exempt one states why", () => {
+    expect(routeTimeout("/api/auth/session")).toEqual({
+      kind: "bounded",
+      ms: TIMEOUT_MS,
+    });
+    expect(routeTimeout("/api/apps/a/logs/stream")).toEqual({
+      kind: "exempt",
+      why: "stream",
+    });
+    expect(routeTimeout("/api/apps/a/source/archive")).toEqual({
+      kind: "exempt",
+      why: "download",
+    });
+  });
+
+  test("a JSON action merely containing /stream is still bounded", () => {
+    // The old substring rule spared this path, so a hung action here could
+    // outlive the platform deadline.
+    expect(exempt("/api/x/streamSomething")).toBe(false);
+    expect(exempt("/api/apps/streaming-info")).toBe(false);
   });
 
   test("spares every live-feed stream (a 15 s bound would cut them)", () => {
@@ -59,9 +84,7 @@ describe("timeoutExempt", () => {
     expect(streams.length).toBeGreaterThan(0);
 
     for (const url of streams) {
-      expect(timeoutExempt(new URL(url, "http://localhost").pathname)).toBe(
-        true
-      );
+      expect(exempt(new URL(url, "http://localhost").pathname)).toBe(true);
     }
   });
 });

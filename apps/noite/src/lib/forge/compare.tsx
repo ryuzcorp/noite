@@ -59,7 +59,7 @@ export const CompareView = ({
   onPick: (base: string, head: string) => void;
 }) => {
   const res = forgeCompare(appId, base, head);
-  const load = loadState(res.data(), res.error());
+  const load = loadState(res.state());
 
   if (load._tag !== "Ready") {
     return (

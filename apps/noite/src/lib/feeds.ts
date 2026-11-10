@@ -3,6 +3,7 @@
 //! Each decoder parses one `message` frame and throws on a bad frame (so
 //! `liveFeed` skips it). Shape checks are `Array.isArray` guards —
 //! the runner ships no effect/Schema codecs for these payloads.
+import { Data } from "effect";
 import { atom, watch } from "ilha";
 import type { AtomHandle } from "ilha";
 
@@ -15,29 +16,277 @@ import type {
   RunnerInsight,
   RunnerApp,
 } from "./runner";
-import { readSwr, withSnapshot, writeSwr } from "./swr-store";
+import { readSwr, swrEpoch, writeSwr } from "./swr-store";
 
-/** Connection state of a `liveFeed` event stream (ilha 0.15's
- * `EventSourceStatus`, removed with `fromEventSource`; this feed manages its
- * own `EventSource`). */
-export type EventSourceStatus = "connecting" | "open" | "retrying" | "closed";
+/** One stream's connection state, shared by the EventSource manager and the
+ * hub's per-topic view. One closed type; {@link nextConn} is the only
+ * transition function, and an event that is illegal for the current state
+ * leaves it unchanged.
+ *
+ * ```mermaid
+ * stateDiagram-v2
+ *   [*] --> Idle
+ *   Idle --> Connecting: connect
+ *   Connecting --> Open: opened | frame
+ *   Open --> Retrying: transport-lost | source-dead
+ *   Connecting --> Retrying: transport-lost | source-dead
+ *   Retrying --> Connecting: connect (backoff elapsed)
+ *   Connecting --> Refused: refused (4xx from the hub)
+ *   any --> Paused: hide
+ *   Paused --> Connecting: show
+ *   any --> Closed: dispose
+ * ```
+ *
+ * `Open` means a frame arrived, not merely that the HTTP response opened:
+ * the hub marks a topic open on its bare `+` marker before any payload, and
+ * "open without data" must stay distinguishable from "loaded". */
+export type Conn = Data.TaggedEnum<{
+  Idle: Record<never, never>;
+  Connecting: Record<never, never>;
+  Open: Record<never, never>;
+  Retrying: { readonly cause: "transport" | "lost" };
+  Refused: Record<never, never>;
+  Paused: Record<never, never>;
+  Closed: Record<never, never>;
+}>;
 
-/** Live SSE panel state with stale-while-revalidate: `latest` paints the
- * last good frame for `key` (lib/swr-store) until the stream's first frame
- * lands, so revisits and reloads skip the skeleton. Every decoded frame
- * writes the snapshot through. Call unconditionally at the top level of a
- * component. */
-/** What a live panel reads: last frame (or snapshot) and connection state. */
-export interface LiveFeed<T> {
-  latest: AtomHandle<T | undefined>;
-  status: AtomHandle<EventSourceStatus>;
+export const ConnTypes = Data.taggedEnum<Conn>();
+
+/** What moves a {@link Conn}. */
+export type ConnEvent =
+  | { readonly kind: "connect" }
+  | { readonly kind: "dispose" }
+  | { readonly kind: "frame" }
+  | { readonly kind: "hide" }
+  | { readonly kind: "opened" }
+  | { readonly kind: "refused" }
+  | { readonly kind: "show" }
+  | { readonly kind: "source-dead" }
+  | { readonly kind: "transport-lost" };
+
+/** The one transition function for {@link Conn}. */
+export const nextConn = (state: Conn, event: ConnEvent): Conn => {
+  switch (event.kind) {
+    case "connect": {
+      return state._tag === "Connecting" || state._tag === "Open"
+        ? state
+        : ConnTypes.Connecting();
+    }
+
+    case "frame":
+    case "opened": {
+      return state._tag === "Closed" || state._tag === "Paused"
+        ? state
+        : ConnTypes.Open();
+    }
+
+    case "refused": {
+      return ConnTypes.Refused();
+    }
+
+    case "transport-lost": {
+      return ConnTypes.Retrying({ cause: "transport" });
+    }
+
+    case "source-dead": {
+      return ConnTypes.Retrying({ cause: "lost" });
+    }
+
+    case "hide": {
+      return ConnTypes.Paused();
+    }
+
+    case "show": {
+      return ConnTypes.Connecting();
+    }
+
+    case "dispose": {
+      return ConnTypes.Closed();
+    }
+
+    default: {
+      return state;
+    }
+  }
+};
+
+/** What one live panel paints. One closed type: `Cold` is the only state
+ * that renders a skeleton, and it only happens on a key with no snapshot and
+ * no frame. `Cached` is the swr-store snapshot (a previous visit), `Live` is
+ * at least one frame from the current stream, and the last four carry the
+ * best value so far while the link is down, refused, paused or gone.
+ *
+ * ```mermaid
+ * stateDiagram-v2
+ *   [*] --> Cold: no snapshot
+ *   [*] --> Cached: snapshot on disk
+ *   Cold --> Cached: initial snapshot
+ *   Cold --> Live: first frame
+ *   Cached --> Live: first frame
+ *   Cold --> Reconnecting: link retrying
+ *   Cached --> Reconnecting: link retrying
+ *   Live --> Reconnecting: link retrying
+ *   Reconnecting --> Live: next frame
+ *   Reconnecting --> Refused: 4xx
+ *   any --> Paused: tab hidden
+ *   any --> Offline: no EventSource / disposed
+ * ```
+ */
+export type FeedState<T> = Data.TaggedEnum<{
+  Cached: { readonly value: T };
+  Cold: Record<never, never>;
+  Live: { readonly value: T };
+  Offline: { readonly value: T | undefined };
+  Paused: { readonly value: T | undefined };
+  Reconnecting: { readonly value: T | undefined };
+  Refused: { readonly value: T | undefined };
+}>;
+
+interface FeedStateDef extends Data.TaggedEnum.WithGenerics<1> {
+  readonly taggedEnum: FeedState<this["A"]>;
 }
+
+const Feed = Data.taggedEnum<FeedStateDef>();
+
+/** What a live panel reads: its state. `feedValue` is the one value reader. */
+export interface LiveFeed<T> {
+  readonly state: AtomHandle<FeedState<T>>;
+}
+
+/** The value a panel paints, or undefined while the key is cold. */
+export const feedValue = <T>(state: FeedState<T>): T | undefined =>
+  state._tag === "Cold" ? undefined : state.value;
+
+/** Whether a panel has anything real to paint (`Cold` is the only state
+ * without a value: a settled snapshot or frame always carries one). */
+export const feedLoaded = <T>(state: FeedState<T>): boolean =>
+  feedValue(state) !== undefined;
+
+/** Whether the link is retrying: the value (when there is one) is stale. */
+export const feedRetrying = (state: FeedState<unknown>): boolean =>
+  state._tag === "Reconnecting";
+
+/** Whether the panel is still waiting for any data: the only skeleton. A
+ * refused or offline feed is not loading, it is not coming. */
+export const feedLoading = <T>(state: FeedState<T>): boolean =>
+  state._tag === "Cold";
+
+/** A short reason the feed cannot deliver data (terminal refusal, no
+ * transport), or null while it can. Panels render this instead of an endless
+ * skeleton or a misleading empty state. */
+export const feedProblem = <T>(state: FeedState<T>): string | null => {
+  switch (state._tag) {
+    case "Refused": {
+      return "This feed was refused. Reload the page to try again.";
+    }
+
+    case "Offline": {
+      return "Live updates are unavailable. Reload the page to try again.";
+    }
+
+    default: {
+      return null;
+    }
+  }
+};
+
+/** What moves a {@link FeedState}. */
+export type FeedEvent<T> =
+  | { readonly kind: "conn"; readonly conn: Conn }
+  | { readonly kind: "frame"; readonly value: T }
+  | { readonly kind: "snapshot"; readonly value: T };
+
+/** The one transition function for {@link FeedState}. A frame always wins; a
+ * snapshot only fills a cold or cached panel (the stream stays the live
+ * source, and `paintInitial` guards the write anyway). */
+export const nextFeedState = <T>(
+  state: FeedState<T>,
+  event: FeedEvent<T>
+): FeedState<T> => {
+  switch (event.kind) {
+    case "frame": {
+      return Feed.Live({ value: event.value });
+    }
+
+    case "snapshot": {
+      // A frame (or an earlier snapshot) always wins; otherwise the snapshot
+      // fills the panel without losing what the link is doing (a stream that
+      // failed first must not drop the snapshot the panel fetched instead).
+      if (state._tag === "Live" || feedValue(state) !== undefined) {
+        return state;
+      }
+
+      switch (state._tag) {
+        case "Refused": {
+          return Feed.Refused({ value: event.value });
+        }
+
+        case "Offline": {
+          return Feed.Offline({ value: event.value });
+        }
+
+        case "Paused": {
+          return Feed.Paused({ value: event.value });
+        }
+
+        case "Reconnecting": {
+          return Feed.Reconnecting({ value: event.value });
+        }
+
+        case "Cold":
+        case "Cached": {
+          return Feed.Cached({ value: event.value });
+        }
+
+        default: {
+          return state;
+        }
+      }
+    }
+
+    case "conn": {
+      if (state._tag === "Refused") {
+        return state;
+      }
+
+      const value = feedValue(state);
+
+      switch (event.conn._tag) {
+        case "Refused": {
+          return Feed.Refused({ value });
+        }
+
+        case "Paused": {
+          return Feed.Paused({ value });
+        }
+
+        case "Closed": {
+          return Feed.Offline({ value });
+        }
+
+        case "Retrying": {
+          return Feed.Reconnecting({ value });
+        }
+
+        // Idle/Connecting/Open say nothing about the data: keep painting
+        // what we have until a frame arrives.
+        default: {
+          return state;
+        }
+      }
+    }
+
+    default: {
+      return state;
+    }
+  }
+};
 
 /** What a reconnecting stream reports back to its owner (ilha atoms in
  * `liveFeed`, plain collectors in the unit tests). */
 export interface StreamHooks {
+  onConn: (conn: Conn) => void;
   onMessage: (data: string) => void;
-  onStatus: (status: EventSourceStatus) => void;
 }
 
 /** Reconnect tuning for {@link connectStream} (tests pass millisecond
@@ -63,11 +312,12 @@ const SOURCE_CLOSED = 2;
  * reopens a CLOSED source itself with capped exponential backoff plus jitter
  * (resetting on `open`), closes on hidden tabs and reopens on visible, never
  * holds two live sources, and tears down timers and listeners on dispose.
- * Native `EventSource` retries transport drops on its own — but after an HTTP
- * error response (any non-2xx, or a wrong content-type such as a 404 page,
- * or a 500/502/503 while the control fleet or runner restarts) `readyState`
- * goes CLOSED and it gives up for good; without this the panel would show
- * "retrying" forever without retrying. Returns the dispose function. */
+ * Every state change goes through {@link nextConn}. Native `EventSource`
+ * retries transport drops on its own — but after an HTTP error response (any
+ * non-2xx, or a wrong content-type such as a 404 page, or a 500/502/503
+ * while the control fleet or runner restarts) `readyState` goes CLOSED and it
+ * gives up for good; without this the panel would show "retrying" forever
+ * without retrying. Returns the dispose function. */
 export const connectStream = (
   url: string,
   hooks: StreamHooks,
@@ -78,23 +328,47 @@ export const connectStream = (
   const random = options.random ?? Math.random;
   const Source = options.source ?? globalThis.EventSource;
 
-  if (Source === undefined) {
-    hooks.onStatus("closed");
-
-    return () => {
-      // No source exists, so there is nothing to dispose.
-    };
-  }
-
+  let conn: Conn = ConnTypes.Idle();
   let source: EventSource | undefined;
+  /** Listeners on `source`; removed before it is closed, so a task the
+   * browser queued before `close()` cannot deliver a stale account's frame. */
+  let listeners: { fn: (event: Event) => void; type: string }[] = [];
   // Pending-reopen generation: scheduling bumps it and each timer only fires
   // for its own generation, so a stale timer can never open a second source.
   let pending = 0;
   let attempts = 0;
   let disposed = false;
 
+  const emit = (event: ConnEvent): void => {
+    conn = nextConn(conn, event);
+    hooks.onConn(conn);
+  };
+
+  if (Source === undefined) {
+    // No EventSource at all: terminal, not retrying.
+    emit({ kind: "dispose" });
+
+    return () => {
+      // No source exists, so there is nothing to dispose.
+    };
+  }
+
   const clearTimer = (): void => {
     pending += 1;
+  };
+
+  const schedule = (): void => {
+    const backoff = Math.min(capMs, baseMs * 2 ** attempts);
+    attempts += 1;
+    const delay = Math.min(capMs, backoff + Math.floor(random() * baseMs));
+    pending += 1;
+    const seen = pending;
+    setTimeout(() => {
+      if (seen === pending) {
+        // oxlint-disable-next-line eslint/no-use-before-define -- open/schedule are mutually recursive (a reopen schedules the next open).
+        open();
+      }
+    }, delay);
   };
 
   const open = (): void => {
@@ -105,46 +379,84 @@ export const connectStream = (
     // T1.9: background tabs hold no connection. The SWR snapshot keeps the
     // panel painted while away.
     if (typeof document !== "undefined" && document.hidden) {
-      hooks.onStatus("closed");
+      emit({ kind: "hide" });
 
       return;
     }
 
-    hooks.onStatus("connecting");
+    emit({ kind: "connect" });
     const next = new Source(url);
     source = next;
-    next.addEventListener("open", () => {
+
+    const onOpen = (): void => {
+      if (source !== next) {
+        return;
+      }
+
       attempts = 0;
-      hooks.onStatus("open");
-    });
-    next.addEventListener("error", () => {
-      hooks.onStatus("retrying");
+      emit({ kind: "opened" });
+    };
+
+    const onError = (): void => {
+      if (source !== next) {
+        return;
+      }
 
       if (next.readyState === SOURCE_CLOSED) {
-        if (source === next) {
-          source = undefined;
-        }
+        source = undefined;
 
-        const backoff = Math.min(capMs, baseMs * 2 ** attempts);
-        attempts += 1;
-        const delay = Math.min(capMs, backoff + Math.floor(random() * baseMs));
-        pending += 1;
-        const seen = pending;
-        setTimeout(() => {
-          if (seen === pending) {
-            open();
-          }
-        }, delay);
+        emit({ kind: "source-dead" });
+        schedule();
+      } else {
+        emit({ kind: "transport-lost" });
       }
-    });
-    next.addEventListener("message", (event) => {
+    };
+
+    const onMessage = (event: MessageEvent<string>): void => {
+      if (source !== next) {
+        return;
+      }
+
+      // A frame proves the stream is open even when the browser has not
+      // dispatched `open` yet: dropping that distinction made a frame that
+      // landed before `open` paint as "connecting" (not loaded) while its
+      // data was already there.
+      if (conn._tag !== "Open") {
+        emit({ kind: "frame" });
+      }
+
       hooks.onMessage(event.data);
-    });
+    };
+
+    // SAFETY: `addEventListener` accepts a listener typed for the event it is
+    // registered for; these narrow it back to their own event type inside.
+    const onErrorEvent = onError as (event: Event) => void;
+    // SAFETY: same as above — the "message" listener receives a MessageEvent.
+    const onMessageEvent = onMessage as (event: Event) => void;
+
+    listeners = [
+      { fn: onErrorEvent, type: "error" },
+      { fn: onMessageEvent, type: "message" },
+      { fn: onOpen, type: "open" },
+    ];
+
+    for (const { fn, type } of listeners) {
+      next.addEventListener(type, fn);
+    }
   };
 
   const close = (): void => {
     clearTimer();
-    source?.close();
+
+    if (source !== undefined) {
+      for (const { fn, type } of listeners) {
+        source.removeEventListener(type, fn);
+      }
+
+      source.close();
+    }
+
+    listeners = [];
     source = undefined;
   };
 
@@ -155,7 +467,7 @@ export const connectStream = (
 
     if (document.hidden) {
       close();
-      hooks.onStatus("closed");
+      emit({ kind: "hide" });
     } else {
       open();
     }
@@ -175,6 +487,7 @@ export const connectStream = (
     }
 
     close();
+    emit({ kind: "dispose" });
   };
 };
 
@@ -186,6 +499,10 @@ export const streamHubUrl = (topics: readonly string[]): string =>
 
 /** A page's feed subscriptions, multiplexed onto one EventSource. */
 export interface StreamHub {
+  /** Forget every retained frame and reopen the connection: one account's
+   * frame must never replay into the next account's panels (see
+   * `resetStreamHub`). Subscribers stay subscribed. */
+  reset: () => void;
   /** Start receiving `topic`; answers the unsubscribe. A topic two panels
    * share is streamed once, and a late subscriber gets its last frame. */
   subscribe: (topic: string, hooks: StreamHooks) => () => void;
@@ -200,11 +517,16 @@ export interface StreamHubOptions extends StreamRetryOptions {
   settle?: (reopen: () => void) => void;
 }
 
+/** What the shared connection has said about one topic. `live` only after a
+ * data frame: the hub's `+` marker opens the topic without payload, and a
+ * panel must not read that as loaded. */
+type TopicPhase = "pending" | "live" | "refused" | "retrying";
+
 interface HubTopic {
   /** The last frame, replayed to a subscriber that joins later. */
   last: string | undefined;
-  /** This topic's own state while the connection is open. */
-  state: EventSourceStatus;
+  /** This topic's own state on the current connection. */
+  phase: TopicPhase;
   subs: Set<StreamHooks>;
 }
 
@@ -213,7 +535,10 @@ interface HubTopic {
  * six feeds of its own navigation and fetches (the Deployments tab with an
  * environment froze on plain-HTTP installs). The hub keeps one connection
  * for all of them: subscribing or leaving reopens it with the new topic set
- * once the set settles, and the server re-sends each topic's snapshot. */
+ * once the set settles, and the server re-sends each topic's snapshot.
+ *
+ * The topic table is the whole state: `connection` (the link), `connected`
+ * (the topic order on the wire), each topic's `phase` and `last` frame. */
 export const createStreamHub = (options: StreamHubOptions = {}): StreamHub => {
   const schedule =
     options.settle ??
@@ -224,30 +549,61 @@ export const createStreamHub = (options: StreamHubOptions = {}): StreamHub => {
   const topics = new Map<string, HubTopic>();
   /** The topics the open connection carries, in its frames' index order. */
   let connected: string[] = [];
-  let connection: EventSourceStatus = "closed";
+  let connection: Conn = ConnTypes.Closed();
   let dispose: (() => void) | undefined;
   let settling = false;
 
-  // No connection yet (the set is still settling): the topic is on its way.
-  const statusOf = (topic: HubTopic): EventSourceStatus => {
-    if (dispose === undefined) {
-      return "connecting";
+  // The link's state except that a topic only counts as open once a frame
+  // landed; a `+` (opened, no frame) stays `connecting`.
+  const statusOf = (topic: HubTopic): Conn => {
+    if (topic.phase === "refused") {
+      return ConnTypes.Refused();
     }
 
-    return connection === "open" ? topic.state : connection;
+    if (dispose === undefined) {
+      return ConnTypes.Connecting();
+    }
+
+    if (connection._tag !== "Open") {
+      return connection;
+    }
+
+    switch (topic.phase) {
+      case "live": {
+        return connection;
+      }
+
+      case "retrying": {
+        return ConnTypes.Retrying({ cause: "lost" });
+      }
+
+      default: {
+        return ConnTypes.Connecting();
+      }
+    }
   };
 
   const announce = (topic: HubTopic): void => {
-    const status = statusOf(topic);
+    const conn = statusOf(topic);
 
     for (const sub of topic.subs) {
-      sub.onStatus(status);
+      sub.onConn(conn);
     }
   };
 
+  const setPhase = (topic: HubTopic, phase: TopicPhase): void => {
+    if (topic.phase === phase) {
+      return;
+    }
+
+    topic.phase = phase;
+    announce(topic);
+  };
+
   const onMessage = (data: string): void => {
-    // `<index>:<frame>`, or `<index>:+` / `<index>:!` for a topic that
-    // opened / dropped (see `http/routes/stream-hub.ts`).
+    // `<index>:<frame>`, or `<index>:+` / `<index>:!` / `<index>:~<status>`
+    // for a topic that opened / dropped / was refused (see
+    // `http/routes/stream-hub.ts`).
     const colon = data.indexOf(":");
 
     const name =
@@ -260,18 +616,27 @@ export const createStreamHub = (options: StreamHubOptions = {}): StreamHub => {
     }
 
     const payload = data.slice(colon + 1);
-    const state = payload === "!" ? "retrying" : "open";
 
-    if (topic.state !== state) {
-      topic.state = state;
-      announce(topic);
+    if (payload === "+") {
+      setPhase(topic, "pending");
+
+      return;
     }
 
-    if (payload === "!" || payload === "+") {
+    if (payload === "!") {
+      setPhase(topic, "retrying");
+
+      return;
+    }
+
+    if (payload.startsWith("~")) {
+      setPhase(topic, "refused");
+
       return;
     }
 
     topic.last = payload;
+    setPhase(topic, "live");
 
     for (const sub of topic.subs) {
       sub.onMessage(payload);
@@ -302,11 +667,12 @@ export const createStreamHub = (options: StreamHubOptions = {}): StreamHub => {
     connected = wanted;
 
     for (const topic of topics.values()) {
-      topic.state = "connecting";
+      // A fresh connection replays every topic: no frame yet.
+      topic.phase = "pending";
     }
 
     if (wanted.length === 0) {
-      connection = "closed";
+      connection = ConnTypes.Closed();
 
       return;
     }
@@ -314,14 +680,14 @@ export const createStreamHub = (options: StreamHubOptions = {}): StreamHub => {
     dispose = connectStream(
       streamHubUrl(wanted),
       {
-        onMessage,
-        onStatus: (status) => {
-          connection = status;
+        onConn: (next) => {
+          connection = next;
 
           for (const topic of topics.values()) {
             announce(topic);
           }
         },
+        onMessage,
       },
       options
     );
@@ -335,11 +701,24 @@ export const createStreamHub = (options: StreamHubOptions = {}): StreamHub => {
   };
 
   return {
+    reset: () => {
+      for (const topic of topics.values()) {
+        topic.last = undefined;
+      }
+
+      dispose?.();
+      dispose = undefined;
+      reconcile();
+    },
     subscribe: (name, hooks) => {
       let topic = topics.get(name);
 
       if (topic === undefined) {
-        topic = { last: undefined, state: "connecting", subs: new Set() };
+        topic = {
+          last: undefined,
+          phase: "pending",
+          subs: new Set<StreamHooks>(),
+        };
         topics.set(name, topic);
       }
 
@@ -348,7 +727,7 @@ export const createStreamHub = (options: StreamHubOptions = {}): StreamHub => {
       }
 
       topic.subs.add(hooks);
-      hooks.onStatus(statusOf(topic));
+      hooks.onConn(statusOf(topic));
 
       if (topic.last !== undefined) {
         hooks.onMessage(topic.last);
@@ -391,6 +770,13 @@ export interface LiveFeedOptions<T> {
   timeoutMs?: number;
 }
 
+/** The write half of a panel's feed state: `liveFeed` applies to its atom,
+ * unit tests collect the events. */
+export interface FeedSink<T> {
+  apply: (event: FeedEvent<T>) => void;
+  current: () => FeedState<T>;
+}
+
 /** Fetch the current snapshot for a cold key (no stored snapshot): the
  * panel paints it unless a stream frame landed first. Shared per key, so
  * panels on one key (a tab badge and its list) fetch once. Failures are
@@ -399,7 +785,7 @@ export interface LiveFeedOptions<T> {
  * unit tests. */
 export const paintInitial = async <T>(
   key: string,
-  latest: AtomHandle<T | undefined>,
+  sink: FeedSink<T>,
   opts: LiveFeedOptions<T> | undefined
 ): Promise<void> => {
   const initial = opts?.initial;
@@ -407,6 +793,11 @@ export const paintInitial = async <T>(
   if (initial === undefined || readSwr<T>(key) !== undefined) {
     return;
   }
+
+  // Capture the account epoch before fetching: an auth change while the
+  // fetch is in flight makes its result the previous account's, and the feed
+  // keys carry no account id.
+  const startedAt = swrEpoch();
 
   let pending = initialInflight.get(key);
 
@@ -440,14 +831,29 @@ export const paintInitial = async <T>(
 
   const frame = await pending;
 
-  if (frame !== undefined && latest() === undefined) {
+  if (
+    frame !== undefined &&
+    startedAt === swrEpoch() &&
+    feedValue(sink.current()) === undefined
+  ) {
     writeSwr(key, frame, opts);
     // SAFETY: one key carries one T (see `writeSwr`); an empty fetch is a failure, never a frame.
-    latest.set(frame as T);
+    sink.apply({ kind: "snapshot", value: frame as T });
   }
 };
 
 let pageHub: StreamHub | undefined;
+
+/** Forget every account-scoped frame in the page hub and reconnect it. The
+ * hub is a module singleton that outlives an SPA auth change (sign-in,
+ * sign-out, impersonation), so a topic another subscriber keeps alive would
+ * otherwise replay the previous account's frame into the next one's panels
+ * (see `resetUserCaches`). */
+export const resetStreamHub = (): void => {
+  // The in-flight initial snapshots belong to the previous account too.
+  initialInflight.clear();
+  pageHub?.reset();
+};
 
 /** A live panel's feed. `initial` paints one current snapshot on a cold key
  * (see `writeSwr`); `persist: false` keeps its snapshots in memory only,
@@ -458,9 +864,18 @@ export const liveFeed = <T>(
   decode: (raw: string) => T,
   opts?: LiveFeedOptions<T>
 ): LiveFeed<T> => {
-  // oxlint-disable-next-line unicorn/no-useless-undefined -- the feed starts valueless; undefined is the seed
-  const latest = atom<T | undefined>(undefined);
-  const status = atom<EventSourceStatus>("connecting");
+  const seed = readSwr<T>(key);
+
+  // SAFETY: readSwr owns this key's T; an absent entry is the only undefined.
+  const initial: FeedState<T> =
+    seed === undefined ? Feed.Cold() : Feed.Cached({ value: seed as T });
+
+  const state = atom<FeedState<T>>(initial);
+
+  const apply = (event: FeedEvent<T>): void => {
+    state.update((current: FeedState<T>) => nextFeedState<T>(current, event));
+  };
+
   // One connection per page, shared by every feed (see `createStreamHub`).
   // T1.9: background tabs hold no connection; the SWR snapshot keeps the
   // panel painted while away.
@@ -469,31 +884,31 @@ export const liveFeed = <T>(
       typeof document === "undefined" ||
       globalThis.EventSource === undefined
     ) {
-      status.set("closed");
+      apply({ conn: ConnTypes.Closed(), kind: "conn" });
 
       return;
     }
 
-    void paintInitial(key, latest, opts);
+    void paintInitial(key, { apply, current: state }, opts);
     pageHub ??= createStreamHub();
 
     return pageHub.subscribe(url, {
+      onConn: (conn) => {
+        apply({ conn, kind: "conn" });
+      },
       onMessage: (data) => {
         try {
           const frame = decode(data);
           writeSwr(key, frame, opts);
-          latest.set(frame);
+          apply({ kind: "frame", value: frame });
         } catch {
           // Bad frame: skip, like fromEventSource's throwing schema.
         }
       },
-      onStatus: (next) => {
-        status.set(next);
-      },
     });
   });
 
-  return { latest: withSnapshot(key, latest), status };
+  return { state };
 };
 
 /** Snapshot keys for the live panels (one per app / channel / environment:

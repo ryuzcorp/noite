@@ -9,6 +9,7 @@ import type {
 } from "./api-types";
 import { authClient } from "./auth-client";
 import type { CollaboratorRow, PendingInvite } from "./collaborators";
+import { resetStreamHub } from "./feeds";
 //! Shared async data: every resource key and fetcher in one module so
 //! keys can't drift between components. All hooks wrap the shared Effect
 //! Cache in lib/resource (deduped lookups, abort signal) and paint the last
@@ -17,6 +18,7 @@ import type { CollaboratorRow, PendingInvite } from "./collaborators";
 //! `res.refetch()`.
 import {
   invalidate as invalidateKey,
+  resetResource,
   tracked as trackResource,
 } from "./resource";
 import type { Resource, ResourceFetcher } from "./resource";
@@ -47,11 +49,10 @@ export { invalidate } from "./resource";
 const usedKeys = new Set<string>();
 
 /** One mounted reader of `key` (lib/resource) with stale-while-revalidate
- * across remounts *and* reloads: `data` paints the last good snapshot
- * (lib/swr-store) until the fresh fetch lands, so panels skip skeletons
- * whenever this key loaded before. Each successful fetch writes the snapshot
- * through. Consumers keep the usual `loading() && data() === undefined`
- * skeleton check — it now only fires on a genuinely cold key. */
+ * across remounts *and* reloads: its `ResourceState` paints the last good
+ * snapshot (lib/swr-store) until the fresh fetch lands, so panels skip
+ * skeletons whenever this key loaded before. Each successful fetch writes
+ * the snapshot through. Only `Loading` (a cold key) is a skeleton. */
 const tracked = <T>(
   key: string,
   fetcher: ResourceFetcher<T>,
@@ -68,9 +69,12 @@ const tracked = <T>(
  * data — and stored snapshots belong to the previous user. */
 export const resetUserCaches = (): void => {
   clearSwrStore();
+  // The page hub is a module singleton that outlives the layout, so its
+  // retained frames and in-flight snapshots belong to the previous account.
+  resetStreamHub();
 
   for (const key of usedKeys) {
-    invalidateKey(key);
+    resetResource(key);
   }
 };
 

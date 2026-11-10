@@ -2,11 +2,20 @@
 /* eslint-disable eslint/max-classes-per-file, eslint/no-use-before-define -- test doubles reference each other circularly, like the fixture in feeds.test.tsx */
 import { describe, expect, test } from "bun:test";
 
-import { watch } from "ilha";
+import * as Atom from "effect/reactivity/Atom";
+import { atom, watch } from "ilha";
 import { render } from "ilha/test";
 
-import { tracked } from "./resource";
-import type { Resource } from "./resource";
+import {
+  invalidate,
+  nextResourceState,
+  resetResource,
+  resourceError,
+  resourceValue,
+  tracked,
+} from "./resource";
+import type { Resource, ResourceState } from "./resource";
+import { clearSwrStore, readSwr } from "./swr-store";
 
 class FakeNode {
   children: FakeNode[] = [];
@@ -166,14 +175,21 @@ let probeFetch: () => Promise<string[]> = () => Promise.resolve([]);
 const ResourceProbe = () => {
   const res = tracked<string[]>(probeKey, probeFetch);
   captured = res;
-  watch(res.data, (value) => {
+  watch(res.value, (value) => {
     if (value !== undefined) {
       signalPainted?.(value);
     }
   });
+
+  // ilha's `watch` only takes WatchValues, and a resource state carries an
+  // `unknown` error; the settled bit is the one reactive projection needed.
+  const settled = atom(
+    Atom.readable((get) => get(res.state.atom)._tag !== "Loading")
+  );
+
   // oxlint-disable-next-line promise/prefer-await-to-callbacks -- the probe reports the settle through a reactive subscription, not a deferred callback
-  watch(res.loading, (loading) => {
-    if (!loading) {
+  watch(settled, (done) => {
+    if (done) {
       signalSettled?.();
     }
   });
@@ -193,10 +209,160 @@ const nextSettled = (): Promise<void> =>
     signalSettled = resolve;
   });
 
+const capturedState = (): ResourceState<string[]> => {
+  if (captured === undefined) {
+    throw new Error("the probe captured no resource");
+  }
+
+  return captured.state();
+};
+
 const resetSignals = (): void => {
   signalPainted = undefined;
   signalSettled = undefined;
 };
+
+/** Let the Effect runtime's promises settle (microtasks, not a wall clock). */
+const flush = async (): Promise<void> => {
+  for (let i = 0; i < 20; i += 1) {
+    // oxlint-disable-next-line eslint/no-await-in-loop -- draining microtasks in order
+    await Promise.resolve();
+  }
+};
+
+describe("account epoch", () => {
+  test("a lookup that started before an auth reset never writes the old account's snapshot", async () => {
+    const restoreDom = installDomFixture();
+
+    try {
+      const key = nextKey();
+      const slow = Promise.withResolvers<string[]>();
+      let calls = 0;
+      probeKey = key;
+      probeFetch = () => {
+        calls += 1;
+
+        return calls === 1 ? slow.promise : Promise.resolve(["account-b"]);
+      };
+
+      const ui = render(ResourceProbe);
+      await ui.settled();
+      expect(calls).toBe(1);
+
+      // The account changes while account A's fetch is still in flight:
+      // resetUserCaches() forgets the store and reloads every key.
+      clearSwrStore();
+      const settledAgain = nextSettled();
+      invalidate(key);
+      await settledAgain;
+      await ui.settled();
+      expect(calls).toBe(2);
+
+      // Account A's response lands late: it must not overwrite B's snapshot.
+      slow.resolve(["account-a"]);
+      await flush();
+
+      expect(readSwr<string[]>(key)).toEqual(["account-b"]);
+      ui.unmount();
+    } finally {
+      resetSignals();
+      restoreDom();
+    }
+  });
+
+  test("a late lookup writes nothing once the store was forgotten", async () => {
+    const restoreDom = installDomFixture();
+
+    try {
+      const key = nextKey();
+      const slow = Promise.withResolvers<string[]>();
+      probeKey = key;
+      probeFetch = () => slow.promise;
+
+      const ui = render(ResourceProbe);
+      await ui.settled();
+
+      // No reload: only the store reset (the panel is gone with the user).
+      clearSwrStore();
+      ui.unmount();
+      slow.resolve(["account-a"]);
+      await flush();
+
+      expect(readSwr<string[]>(key)).toBeUndefined();
+    } finally {
+      resetSignals();
+      restoreDom();
+    }
+  });
+});
+
+describe("auth reset", () => {
+  test("a reset blanks the reader to cold instead of painting the old value", async () => {
+    const restoreDom = installDomFixture();
+
+    try {
+      const key = nextKey();
+      const slow = Promise.withResolvers<string[]>();
+      let calls = 0;
+      probeKey = key;
+      probeFetch = () => {
+        calls += 1;
+
+        return calls === 1 ? Promise.resolve(["account-a"]) : slow.promise;
+      };
+
+      const painted = nextPainted();
+      const ui = render(ResourceProbe);
+      expect(await painted).toEqual(["account-a"]);
+      await ui.settled();
+
+      const settledAgain = nextSettled();
+      resetResource(key);
+      await ui.settled();
+
+      // Immediately after the reset the reader is cold: no A value, no
+      // "reloading with A" paint while B's fetch is in flight.
+      expect(resourceValue(capturedState())).toBeUndefined();
+      expect(capturedState()._tag).toBe("Loading");
+
+      slow.resolve(["account-b"]);
+      await settledAgain;
+      expect(resourceValue(capturedState())).toEqual(["account-b"]);
+      ui.unmount();
+    } finally {
+      resetSignals();
+      restoreDom();
+    }
+  });
+});
+
+describe("resource state machine", () => {
+  test("a reload and a failure keep the last value; only a cold load is Loading", () => {
+    const loaded = nextResourceState<string[]>(
+      { _tag: "Loading" },
+      { kind: "loaded", value: ["a"] }
+    );
+
+    expect(loaded._tag).toBe("Ready");
+
+    const reloading = nextResourceState(loaded, { kind: "reload" });
+    expect(reloading).toEqual({ _tag: "Reloading", value: ["a"] });
+
+    const failed = nextResourceState<string[]>(reloading, {
+      error: new Error("D1 is down"),
+      kind: "failed",
+    });
+
+    expect(failed._tag).toBe("Failed");
+    expect(resourceValue(failed)).toEqual(["a"]);
+    expect(resourceError(failed)).toBeInstanceOf(Error);
+
+    // A cold reload is the only skeleton.
+    expect(
+      nextResourceState<string[]>({ _tag: "Loading" }, { kind: "reload" })._tag
+    ).toBe("Loading");
+  });
+});
 
 describe("tracked mount failures", () => {
   test("a failed mount load surfaces the error and never retries on its own", async () => {
@@ -219,9 +385,9 @@ describe("tracked mount failures", () => {
         await settledOnce;
         await ui.settled();
         expect(calls).toBe(1);
-        expect(captured?.data()).toBeUndefined();
-        expect(captured?.error()).toBeInstanceOf(Error);
-        expect(captured?.loading()).toBe(false);
+        expect(resourceValue(capturedState())).toBeUndefined();
+        expect(resourceError(capturedState())).toBeInstanceOf(Error);
+        expect(capturedState()._tag).not.toBe("Loading");
       } finally {
         ui.unmount();
       }
@@ -253,7 +419,7 @@ describe("tracked mount failures", () => {
         await settledOnce;
         await first.settled();
         expect(calls).toBe(1);
-        expect(captured?.error()).toBeInstanceOf(Error);
+        expect(resourceError(capturedState())).toBeInstanceOf(Error);
       } finally {
         first.unmount();
       }
@@ -268,9 +434,9 @@ describe("tracked mount failures", () => {
         expect(await painted).toEqual(["fresh"]);
         await second.settled();
         expect(calls).toBe(2);
-        expect(captured?.data()).toEqual(["fresh"]);
-        expect(captured?.error()).toBeUndefined();
-        expect(captured?.loading()).toBe(false);
+        expect(resourceValue(capturedState())).toEqual(["fresh"]);
+        expect(resourceError(capturedState())).toBeUndefined();
+        expect(capturedState()._tag).not.toBe("Loading");
       } finally {
         second.unmount();
       }

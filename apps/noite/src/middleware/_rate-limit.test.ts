@@ -1,12 +1,12 @@
 /* oxlint-disable anti-slop/no-chained-type-assertions, anti-slop/require-safety-comment-for-type-assertion -- test doubles: a minimal KitEnv stands in for the Worker env */
 import { beforeEach, describe, expect, test } from "bun:test";
 
-import { platformLimiter } from "../lib/rate-limit";
+import { resetPlatformLimits } from "../lib/rate-limit";
 import { testRouteContext } from "../testing/context";
 import rateLimit from "./04-rate-limit";
 
 beforeEach(() => {
-  platformLimiter.reset();
+  resetPlatformLimits();
 });
 
 const limited = (host: string, env: KitEnv = {}) =>

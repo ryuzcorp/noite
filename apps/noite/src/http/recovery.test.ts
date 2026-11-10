@@ -3,7 +3,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 
 import { authFromEnv } from "../lib/auth";
 import { ensureDb, setD1Binding } from "../lib/db";
-import { platformLimiter } from "../lib/rate-limit";
+import { resetPlatformLimits } from "../lib/rate-limit";
 import rateLimitMiddleware from "../middleware/04-rate-limit";
 import { testRouteContext } from "../testing/context";
 import { createTestD1 } from "../testing/d1";
@@ -20,7 +20,7 @@ const ENV = {
 let db: TestD1;
 
 beforeEach(async () => {
-  platformLimiter.reset();
+  resetPlatformLimits();
   db = createTestD1();
   setD1Binding(db.d1);
   await ensureDb();
@@ -116,7 +116,7 @@ describe("POST /internal/recovery", () => {
   test("is rate limited like the other public machine routes", async () => {
     // The limiter is a middleware now, not part of the route logic: drive
     // it with the recovery path and count pass-throughs vs refusals.
-    platformLimiter.reset();
+    resetPlatformLimits();
     const env = { ...ENV, NOITE_RATE_LIMIT_RPM: "2" };
     const statuses: (number | undefined)[] = [];
 

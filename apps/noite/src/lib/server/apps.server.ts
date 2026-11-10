@@ -1,3 +1,4 @@
+import { Data } from "effect";
 import * as Schema from "effect/Schema";
 
 import type { AppDetail, SlugCheck } from "../api-types";
@@ -10,6 +11,8 @@ import {
   requireAppRole,
 } from "../collaborators";
 import {
+  CREATE_TIMEOUT_MS,
+  isSlugTaken,
   runnerCreateApp,
   runnerGetAppBySlug,
   runnerDeleteApp,
@@ -21,13 +24,59 @@ import {
   runnerPatchApp,
   runnerRenameApp,
   runnerRetryImport,
+  runnerFailureMessage,
+  runnerFailureOf,
   runnerRollback,
-  RunnerRpcError,
 } from "../runner";
-import type { RunnerApp, RunnerCreateSource, RunnerDeploy } from "../runner";
+import type {
+  RunnerFailure,
+  RunnerApp,
+  RunnerCreateSource,
+  RunnerDeploy,
+} from "../runner";
 import { apiAction, fail } from "./api";
 import { requireTelemetryRole } from "./errors.server";
 import { requireViewApp, sessionUser } from "./session.server";
+
+/** A runner failure as the action's 422 text: the runner's own RPC text
+ * (e.g. the app limit) or a status line, never an upstream HTTP body. */
+// oxlint-disable-next-line anti-slop/no-unknown-parameters -- catch-site mapper: the thrown value is unknown by construction and becomes the safe runner text here.
+const failRunner = (error: unknown): never =>
+  failUnknown(runnerFailureMessage(runnerFailureOf(error)));
+
+/** A lifecycle mutation's outcome, as the action answers it. One closed
+ * type: `Purging` is a real state (the row is gone from every list, storage
+ * still deletes in the background), never a plain success. */
+export type MutationOutcome = Data.TaggedEnum<{
+  Applied: Record<never, never>;
+  Purging: Record<never, never>;
+}>;
+
+const Mutation = Data.taggedEnum<MutationOutcome>();
+
+/** The wire value for an outcome. `Applied` stays exactly `{ok:true}` (the
+ * shape every action has always answered); `Purging` adds `deleting`. */
+const outcomeValue = (
+  outcome: MutationOutcome
+): { deleting?: true; ok: true } =>
+  outcome._tag === "Purging" ? { deleting: true, ok: true } : { ok: true };
+
+/** The two legal desired states. `App.desiredState` is an untyped string from
+ * the runner, so it is validated into this union at the one entry point. */
+export type DesiredState = "running" | "stopped";
+
+const desiredState = (raw: string): DesiredState | null => {
+  switch (raw) {
+    case "running":
+    case "stopped": {
+      return raw;
+    }
+
+    default: {
+      return null;
+    }
+  }
+};
 
 const CreateSource = Schema.Union([
   Schema.Struct({ kind: Schema.Literal("blank") }),
@@ -122,7 +171,7 @@ export const slugCheck = apiAction(
         result.suggestion = freeVariant(normalized, taken);
       }
     } catch (error) {
-      failUnknown(error);
+      failRunner(error);
     }
 
     return result;
@@ -176,35 +225,52 @@ const toRunnerSource = (
   };
 };
 
+/** The adopt poll after a create's own bound: 4 s, so create (8 s) plus the
+ * recovery (4 s) plus the grant and the response fit inside the route's 15 s
+ * bound. Past that the route answers a 504 for an app that is still being
+ * granted, which is the bug this budget removes. */
+const CREATE_ADOPT_MS = 4000;
+
+/** One create's recovery deadline (create RPC + adopt poll), measured from
+ * before the create RPC. Exported so a test pins it under the route bound:
+ * this whole path used to run up to ~24 s inside a 15 s route. */
+export const CREATE_RECOVERY_MS = CREATE_TIMEOUT_MS + CREATE_ADOPT_MS;
+
 /** Adopt the row of a create that outlived the control plane's bound: the
  * runner runs create detached, so the app lands after the RPC was aborted
  * and the grant below never ran — an app with no grant is invisible to every
- * list. Poll by slug for up to 10 s. `null` when it never appeared or was
+ * list. Polls by slug until `deadline` (the whole create's recovery budget),
+ * each lookup bounded by the time left. `null` when it never appeared or was
  * created for someone else. */
 const adoptSlowCreate = async (
   slug: string,
-  userId: string
+  userId: string,
+  deadline: number
 ): Promise<RunnerApp | null> => {
-  // A deadline, not an attempt count: this path runs exactly when the runner
-  // is slow, and each lookup can itself take RUNNER_TIMEOUT_MS (5 s).
-  const deadline = Date.now() + 10_000;
-
   for (;;) {
+    const left = deadline - Date.now();
+
+    if (left <= 0) {
+      return null;
+    }
+
     // oxlint-disable-next-line eslint/no-await-in-loop -- polling: each attempt must observe the row the last one missed
-    const existing = await runnerGetAppBySlug(slug).catch(() => null);
+    const existing = await runnerGetAppBySlug(slug, left).catch(() => null);
 
     if (existing) {
       return existing.userId === userId ? existing : null;
     }
 
-    if (Date.now() >= deadline) {
+    const wait = Math.min(500, deadline - Date.now());
+
+    if (wait <= 0) {
       return null;
     }
 
     const { promise, resolve } = Promise.withResolvers<null>();
     setTimeout(() => {
       resolve(null);
-    }, 500);
+    }, wait);
     // oxlint-disable-next-line eslint/no-await-in-loop -- the next poll waits this interval
     await promise;
   }
@@ -221,6 +287,7 @@ export const createAppForUser = async (input: {
   source?: CreateSourceInput;
 }): Promise<RunnerApp> => {
   let app: RunnerApp;
+  const deadline = Date.now() + CREATE_RECOVERY_MS;
 
   try {
     app = await runnerCreateApp({
@@ -230,15 +297,15 @@ export const createAppForUser = async (input: {
       userId: input.account.id,
     });
   } catch (error) {
-    // A create that outlived the control plane's lifecycle bound still runs
-    // in the runner (it is detached), so a retry can find the slug taken by
-    // the caller's own first attempt. Treat that as the same create instead
-    // of failing the retry, and grant the account below as usual.
-    if (
-      error instanceof RunnerRpcError &&
-      error.code === 409 &&
-      error.message.includes("slug already taken")
-    ) {
+    // One classifier for every runner failure (never `error.name` or English
+    // text at the call site).
+    const failure: RunnerFailure = runnerFailureOf(error);
+
+    // A create that outlived the control plane's bound still runs in the
+    // runner (it is detached), so a retry can find the slug taken by the
+    // caller's own first attempt. Treat that as the same create instead of
+    // failing the retry, and grant the account below as usual.
+    if (isSlugTaken(failure)) {
       const existing = await runnerGetAppBySlug(input.slug).catch(() => null);
 
       if (existing?.userId !== input.account.id) {
@@ -246,15 +313,24 @@ export const createAppForUser = async (input: {
       }
 
       app = existing;
-    } else if (
+    } else if (failure.kind === "timeout") {
       // The same detached create, but the caller saw the abort: adopt the
-      // row when it lands instead of leaving the app un-granted.
-      error instanceof Error &&
-      (error.name === "TimeoutError" || error.name === "AbortError")
-    ) {
-      const existing = await adoptSlowCreate(input.slug, input.account.id);
+      // row when it lands (inside the create's recovery budget) instead of
+      // leaving the app un-granted.
+      const existing = await adoptSlowCreate(
+        input.slug,
+        input.account.id,
+        deadline
+      );
 
       if (!existing) {
+        // The runner runs create detached: a row can still land after the
+        // recovery budget, un-granted and therefore invisible in every list.
+        // Nothing in-band can fix that; leave an operator signal.
+        console.error(
+          "[apps] detached create may have landed un-granted for slug",
+          input.slug
+        );
         throw error;
       }
 
@@ -267,7 +343,21 @@ export const createAppForUser = async (input: {
   try {
     await grantCollaborator(app.id, input.account.id, "admin");
   } catch (grantError) {
-    await runnerDeleteApp(app.id).catch(() => null);
+    // Rollback is best-effort, but a failed rollback is its own state: an app
+    // exists with no collaborator grant, so say so instead of swallowing it.
+    const rolledBack = await runnerDeleteApp(app.id).then(
+      () => true,
+      () => false
+    );
+
+    if (!rolledBack) {
+      console.error(
+        "[apps] grant failed and the rollback failed: app",
+        app.id,
+        "has no collaborator grant"
+      );
+    }
+
     failUnknown(grantError);
   }
 
@@ -305,7 +395,7 @@ export const create = apiAction(
         throw error;
       }
 
-      return failUnknown(error);
+      return failRunner(error);
     }
   }
 );
@@ -319,7 +409,7 @@ export const retryImport = apiAction(AppId, async (appId, { env, request }) => {
   try {
     return await runnerRetryImport(appId);
   } catch (error) {
-    failUnknown(error);
+    failRunner(error);
   }
 });
 
@@ -328,39 +418,54 @@ export const remove = apiAction(AppId, async (appId, { env, request }) => {
   await requireAppRole(appId, user.id, "admin");
 
   try {
-    await runnerDeleteApp(appId);
-    // Nothing cascades grants now that the app row lives in the runner.
-    await dropAppCollaborators(appId);
+    const result = await runnerDeleteApp(appId);
+
+    // The runner accepted the delete: a cleanup failure is logged, never
+    // reported as a failed delete (the app is gone either way). Nothing
+    // cascades grants now that the app row lives in the runner.
+    const cleaned = await dropAppCollaborators(appId).then(
+      () => true,
+      () => false
+    );
+
+    if (!cleaned) {
+      console.error(
+        "[apps] app deleted but collaborator cleanup failed for",
+        appId
+      );
+    }
+
+    return outcomeValue(
+      result.deleting ? Mutation.Purging() : Mutation.Applied()
+    );
   } catch (error) {
     if (error instanceof UnauthorizedError) {
       throw error;
     }
 
-    failUnknown(error);
+    failRunner(error);
   }
 });
 
 export const setDesired = apiAction(
   Schema.Struct({ desiredState: Schema.String, id: Schema.String }),
-  async ({ id, desiredState }, { env, request }) => {
-    if (desiredState !== "running" && desiredState !== "stopped") {
-      fail("desiredState must be running or stopped");
-    }
+  async ({ id, desiredState: raw }, { env, request }) => {
+    // `?? fail()` (not an `if` guard): this toolchain does not narrow on
+    // never-returning calls, but does narrow a `never`-typed `??` branch.
+    const next =
+      desiredState(raw) ?? fail("desiredState must be running or stopped");
 
     const user = await sessionUser(request, env);
     await requireAppRole(id, user.id, "push");
 
     try {
-      // SAFETY: desiredState is validated above to be exactly "running" | "stopped" before this cast.
-      await runnerPatchApp(id, {
-        desiredState: desiredState as "running" | "stopped",
-      });
+      await runnerPatchApp(id, { desiredState: next });
     } catch (error) {
       if (error instanceof UnauthorizedError) {
         throw error;
       }
 
-      failUnknown(error);
+      failRunner(error);
     }
   }
 );
@@ -399,7 +504,7 @@ export const renameApp = apiAction(
         throw error;
       }
 
-      failUnknown(error);
+      failRunner(error);
     }
   }
 );
@@ -442,7 +547,7 @@ export const rollback = apiAction(
     try {
       return await runnerRollback(appId, sha, environmentId ?? "", role);
     } catch (error) {
-      failUnknown(error);
+      failRunner(error);
     }
   }
 );
@@ -464,7 +569,7 @@ export const cancelDeploy = apiAction(
     try {
       return await runnerCancelDeploy(appId, deployId);
     } catch (error) {
-      failUnknown(error);
+      failRunner(error);
     }
   }
 );
@@ -484,7 +589,7 @@ export const deployLog = apiAction(
     try {
       return await runnerDeployLog(appId, deployId);
     } catch (error) {
-      failUnknown(error);
+      failRunner(error);
     }
   }
 );
@@ -521,7 +626,7 @@ export const listDeploys = apiAction(
 
       return leanDeployRows(rows);
     } catch (error) {
-      failUnknown(error);
+      failRunner(error);
     }
   }
 );

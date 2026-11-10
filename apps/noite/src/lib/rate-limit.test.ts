@@ -3,9 +3,9 @@ import { beforeEach, describe, expect, test } from "bun:test";
 import {
   clientKey,
   createRateLimiter,
-  envelopeLimiter,
   limitedClass,
-  platformLimiter,
+  limiterFor,
+  resetPlatformLimits,
   withTrustedClientAddress,
 } from "./rate-limit";
 import type { RateLimiter } from "./rate-limit";
@@ -17,65 +17,63 @@ let limiter: RateLimiter;
 
 beforeEach(() => {
   limiter = createRateLimiter();
-  platformLimiter.reset();
-  envelopeLimiter.reset();
+  resetPlatformLimits();
 });
 
 describe("rateLimiter decision", () => {
   test("allows up to the limit, then refuses with a retry-after", () => {
     const now = 1_000_000;
-    expect(limiter.decision("k", 2, now).allowed).toBe(true);
-    expect(limiter.decision("k", 2, now).allowed).toBe(true);
+    expect(limiter.decision("k", 2, now)._tag).toBe("Allowed");
+    expect(limiter.decision("k", 2, now)._tag).toBe("Allowed");
     const third = limiter.decision("k", 2, now);
-    expect(third.allowed).toBe(false);
-    expect(third.retryAfter).toBeGreaterThanOrEqual(1);
+    expect(third._tag).toBe("Denied");
+    expect(
+      third._tag === "Denied" ? third.retryAfter : 0
+    ).toBeGreaterThanOrEqual(1);
   });
 
   test("starts a fresh window once the old one expires", () => {
     const now = 1_000_000;
     limiter.decision("k", 1, now);
-    expect(limiter.decision("k", 1, now).allowed).toBe(false);
-    expect(limiter.decision("k", 1, now + 61_000).allowed).toBe(true);
+    expect(limiter.decision("k", 1, now)._tag).toBe("Denied");
+    expect(limiter.decision("k", 1, now + 61_000)._tag).toBe("Allowed");
   });
 
   test("keys are independent", () => {
     limiter.decision("a", 1, 0);
-    expect(limiter.decision("b", 1, 0).allowed).toBe(true);
+    expect(limiter.decision("b", 1, 0)._tag).toBe("Allowed");
   });
 
   test("a non-positive limit disables the limiter", () => {
     for (let i = 0; i < 5; i += 1) {
-      expect(limiter.decision("k", 0, 0).allowed).toBe(true);
+      expect(limiter.decision("k", 0, 0)._tag).toBe("Disabled");
     }
   });
 
   test("reset forgets every bucket", () => {
     limiter.decision("k", 1, 0);
-    expect(limiter.decision("k", 1, 0).allowed).toBe(false);
+    expect(limiter.decision("k", 1, 0)._tag).toBe("Denied");
     limiter.reset();
-    expect(limiter.decision("k", 1, 0).allowed).toBe(true);
+    expect(limiter.decision("k", 1, 0)._tag).toBe("Allowed");
   });
 
-  test("one instance's flood cannot evict another instance's buckets", () => {
+  test("one class's flood cannot evict another class's buckets", () => {
     const now = 1_000_000;
+    const auth = limiterFor("auth");
     // An auth bucket at its limit refuses.
-    expect(platformLimiter.decision("auth:203.0.113.9", 1, now).allowed).toBe(
-      true
-    );
-    expect(platformLimiter.decision("auth:203.0.113.9", 1, now).allowed).toBe(
-      false
-    );
+    expect(auth.decision("203.0.113.9", 1, now)._tag).toBe("Allowed");
+    expect(auth.decision("203.0.113.9", 1, now)._tag).toBe("Denied");
 
-    // The envelope store absorbs more distinct keys than the shared cap ever
-    // held: with one module-level map this flood would evict the auth
-    // bucket above and reset the login brute-force counter.
+    // Another class absorbs more distinct keys than one store's cap holds:
+    // with one shared map this flood would evict the auth bucket above and
+    // reset the login brute-force counter.
+    const invite = limiterFor("invite");
+
     for (let i = 0; i < 5000; i += 1) {
-      envelopeLimiter.decision(`key-${i}`, 600, now);
+      invite.decision(`key-${i}`, 600, now);
     }
 
-    expect(platformLimiter.decision("auth:203.0.113.9", 1, now).allowed).toBe(
-      false
-    );
+    expect(auth.decision("203.0.113.9", 1, now)._tag).toBe("Denied");
   });
 });
 
@@ -131,6 +129,7 @@ describe("limitedClass", () => {
     expect(limitedClass("/internal/recovery")).toBe("recovery");
     expect(limitedClass("/api/42/envelope")).toBe("envelope");
     expect(limitedClass("/api/42/envelope/")).toBe("envelope");
+    expect(limitedClass("/api/streams")).toBe("stream");
     expect(limitedClass("/api/apps/stream")).toBeNull();
     expect(limitedClass("/api/apps/envelope")).toBeNull();
   });

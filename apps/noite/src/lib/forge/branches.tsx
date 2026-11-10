@@ -4,6 +4,7 @@ import { atom } from "ilha";
 import { api } from "../api";
 import { errorMessage } from "../errors";
 import { collectRef, liveEl, newLiveRef } from "../live-ref";
+import { resourceValue, resourceError } from "../resource";
 /** Branch UI: the compare/new-PR ref select, and the source page's branch
  * picker — a dropdown listing the branches, with the branch creator at its
  * foot (per contract: create needs `push`, delete needs `admin`). */
@@ -87,7 +88,7 @@ export const RefSelect = ({
   onChange: (ref: string) => void;
   value: string;
 }) => {
-  const refs = forgeRefs(appId).data();
+  const refs = resourceValue(forgeRefs(appId).state());
   const branches = refs?.branches ?? [];
   const known = branches.some((branch) => branch.name === value);
 
@@ -305,8 +306,8 @@ export const BranchPicker = ({
 }) => {
   const router = useRouter();
   const refsRes = forgeRefs(appId);
-  const refs = refsRes.data();
-  const role = appDetail(appId).data()?.myRole;
+  const refs = resourceValue(refsRes.state());
+  const role = resourceValue(appDetail(appId).state())?.myRole;
   const details = atom.lazy(newLiveRef<HTMLDetailsElement>)();
   // The dropdown's open state lives on the element alone: `data-morph-preserve`
   // keeps ilha's morph off the `open` attribute, which a render does not name.
@@ -320,7 +321,7 @@ export const BranchPicker = ({
   const branches = refs?.branches ?? [];
   const defaultBranch = refs?.defaultBranch ?? "main";
   const deployed = refs?.deployedSha ?? null;
-  const envs = environments(appId).data() ?? [];
+  const envs = resourceValue(environments(appId).state()) ?? [];
 
   const known =
     value === deployed || branches.some((branch) => branch.name === value);
@@ -378,7 +379,7 @@ export const BranchPicker = ({
       }}
     >
       <summary
-        class={`btn btn-sm max-w-64 gap-1 font-mono font-normal ${refsRes.error() === undefined ? "" : "border-error text-error"}`}
+        class={`btn btn-sm max-w-64 gap-1 font-mono font-normal ${resourceError(refsRes.state()) === undefined ? "" : "border-error text-error"}`}
         aria-label={`Branch or ref: ${refLabel(value)}`}
         title={`Branch: ${refLabel(value)}`}
       >
@@ -508,7 +509,7 @@ export const BranchPicker = ({
             </li>
           )}
         </ul>
-        {refsRes.error() === undefined ? null : (
+        {resourceError(refsRes.state()) === undefined ? null : (
           <p class="text-error m-0 flex items-center gap-2 text-xs">
             Failed to load branches
             <button

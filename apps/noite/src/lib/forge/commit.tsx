@@ -24,7 +24,7 @@ export const CommitView = ({
   sha: string;
 }) => {
   const res = forgeCommit(appId, sha);
-  const load = loadState(res.data(), res.error());
+  const load = loadState(res.state());
 
   if (load._tag !== "Ready") {
     return (

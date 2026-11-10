@@ -4,6 +4,7 @@ import { atom } from "ilha";
 
 import { api } from "../../api";
 import { errorMessage } from "../../errors";
+import { resourceValue, resourceError } from "../../resource";
 import { collaborators, pendingInvitations } from "../../resources";
 import { parseAppRole } from "../../roles";
 import type { AppRole } from "../../roles";
@@ -22,8 +23,8 @@ export const CollaboratorsPanel = ({
   const isAdmin = myRole === "admin";
   const res = collaborators(appId);
   const pending = pendingInvitations(appId, isAdmin);
-  const rows = res.data() ?? [];
-  const pendingRows = pending.data() ?? [];
+  const rows = resourceValue(res.state()) ?? [];
+  const pendingRows = resourceValue(pending.state()) ?? [];
   const dialogOpen = atom(false);
   const err = atom("");
   const note = atom("");
@@ -107,11 +108,9 @@ export const CollaboratorsPanel = ({
         code, write data · <code>admin</code> members, variables, delete.
       </p>
       {err() ? <p class="text-error m-0 text-sm">{err()}</p> : null}
-      {err() ? null : <LoadError error={res.error()} />}
+      {err() ? null : <LoadError error={resourceError(res.state())} />}
       {note() ? <p class="m-0 text-sm opacity-80">{note()}</p> : null}
-      {res.loading() && res.data() === undefined ? (
-        <ListSkeleton rows={2} />
-      ) : null}
+      {res.state()._tag === "Loading" ? <ListSkeleton rows={2} /> : null}
       <ul class="m-0 flex list-none flex-col gap-1 p-0 text-sm">
         {rows.map((c) => (
           <li

@@ -1,18 +1,22 @@
 /* oxlint-disable anti-slop/no-chained-type-assertions, anti-slop/no-unsafe-dictionary-type, anti-slop/require-safety-comment-for-type-assertion, eslint/max-classes-per-file -- test doubles: a fake EventSource, document and mounted DOM stand in for the browser globals liveFeed reads, like the fixture in testing/dom */
 import { afterEach, describe, expect, test } from "bun:test";
 
-import { atom } from "ilha";
-import type { AtomHandle } from "ilha";
 import { render } from "ilha/test";
 
 import {
+  ConnTypes,
   connectStream,
   createStreamHub,
+  feedLoading,
+  feedProblem,
+  feedValue,
   liveFeed,
+  nextConn,
+  nextFeedState,
   paintInitial,
   streamHubUrl,
 } from "./feeds";
-import type { EventSourceStatus, LiveFeed, StreamHooks } from "./feeds";
+import type { FeedSink, FeedState, LiveFeed, StreamHooks } from "./feeds";
 import { readSwr, writeSwr } from "./swr-store";
 
 type Listener = (event: { data?: string }) => void;
@@ -42,6 +46,13 @@ class FakeSource {
     const list = this.listeners.get(type) ?? [];
     list.push(listener);
     this.listeners.set(type, list);
+  }
+
+  removeEventListener(type: string, listener: Listener): void {
+    this.listeners.set(
+      type,
+      (this.listeners.get(type) ?? []).filter((live) => live !== listener)
+    );
   }
 
   close(): void {
@@ -138,15 +149,15 @@ const installManualClock = () => {
 };
 
 const collect = () => {
-  const statuses: EventSourceStatus[] = [];
+  const statuses: string[] = [];
   const messages: string[] = [];
 
   const hooks: StreamHooks = {
+    onConn: (conn) => {
+      statuses.push(conn._tag);
+    },
     onMessage: (data) => {
       messages.push(data);
-    },
-    onStatus: (status) => {
-      statuses.push(status);
     },
   };
 
@@ -166,6 +177,143 @@ const connect = (hooks: StreamHooks, document_: FakeDocument): (() => void) => {
   });
 };
 
+const feedOf = (state: FeedState<string[]>): string[] | undefined =>
+  feedValue(state);
+
+describe("feed problem", () => {
+  test("only a refused or offline feed has a problem; neither is loading", () => {
+    expect(feedProblem<string[]>({ _tag: "Cold" })).toBeNull();
+    expect(feedProblem<string[]>({ _tag: "Cached", value: [] })).toBeNull();
+    expect(feedProblem<string[]>({ _tag: "Live", value: [] })).toBeNull();
+    expect(
+      feedProblem<string[]>({ _tag: "Reconnecting", value: [] })
+    ).toBeNull();
+
+    expect(
+      feedProblem<string[]>({ _tag: "Refused", value: undefined })
+    ).toContain("refused");
+    expect(
+      feedProblem<string[]>({ _tag: "Offline", value: undefined })
+    ).toContain("unavailable");
+
+    // Only a cold panel is loading: a dead feed must not paint a skeleton.
+    expect(feedLoading<string[]>({ _tag: "Cold" })).toBe(true);
+    expect(feedLoading<string[]>({ _tag: "Offline", value: undefined })).toBe(
+      false
+    );
+    expect(feedLoading<string[]>({ _tag: "Refused", value: undefined })).toBe(
+      false
+    );
+  });
+});
+
+describe("feed state machine", () => {
+  test("a bare open with no frame is not loaded", () => {
+    const cold = nextConn(ConnTypes.Idle(), { kind: "connect" });
+    expect(cold._tag).toBe("Connecting");
+
+    const connecting = nextFeedState<string[]>(
+      { _tag: "Cold" },
+      {
+        conn: cold,
+        kind: "conn",
+      }
+    );
+
+    expect(connecting._tag).toBe("Cold");
+    expect(feedOf(connecting)).toBeUndefined();
+
+    // `open` (the HTTP response) alone still paints the skeleton: only a
+    // frame makes the panel loaded.
+    const open = nextFeedState<string[]>(connecting, {
+      conn: nextConn(cold, { kind: "frame" }),
+      kind: "conn",
+    });
+
+    expect(feedOf(open)).toBeUndefined();
+
+    const live = nextFeedState<string[]>(open, {
+      kind: "frame",
+      value: ["row"],
+    });
+
+    expect(live._tag).toBe("Live");
+    expect(feedOf(live)).toEqual(["row"]);
+  });
+
+  test("a snapshot fills a cold panel, and reconnecting keeps it", () => {
+    const cached = nextFeedState<string[]>(
+      { _tag: "Cold" },
+      {
+        kind: "snapshot",
+        value: ["cached"],
+      }
+    );
+
+    expect(cached._tag).toBe("Cached");
+
+    const retrying = nextFeedState<string[]>(cached, {
+      conn: ConnTypes.Retrying({ cause: "lost" }),
+      kind: "conn",
+    });
+
+    expect(retrying._tag).toBe("Reconnecting");
+    expect(feedOf(retrying)).toEqual(["cached"]);
+
+    // A snapshot never overwrites a frame.
+    expect(
+      nextFeedState<string[]>(
+        nextFeedState<string[]>(cached, {
+          kind: "frame",
+          value: ["frame"],
+        }),
+        { kind: "snapshot", value: ["stale"] }
+      )
+    ).toEqual({ _tag: "Live", value: ["frame"] });
+  });
+
+  test("an initial snapshot still lands after the stream failed first", () => {
+    const failed = nextFeedState<string[]>(
+      { _tag: "Cold" },
+      {
+        conn: ConnTypes.Retrying({ cause: "lost" }),
+        kind: "conn",
+      }
+    );
+
+    expect(failed._tag).toBe("Reconnecting");
+
+    const painted = nextFeedState<string[]>(failed, {
+      kind: "snapshot",
+      value: ["rows"],
+    });
+
+    // The snapshot fills the panel; the link keeps saying it is retrying.
+    expect(painted._tag).toBe("Reconnecting");
+    expect(feedOf(painted)).toEqual(["rows"]);
+  });
+
+  test("a refusal is kept until a new connection replaces it", () => {
+    const refused = nextFeedState<string[]>(
+      { _tag: "Cold" },
+      {
+        conn: ConnTypes.Refused(),
+        kind: "conn",
+      }
+    );
+
+    expect(refused._tag).toBe("Refused");
+
+    // A refusal is terminal for the topic: later link events do not clear it.
+    const stillRefused = nextFeedState<string[]>(refused, {
+      conn: ConnTypes.Open(),
+      kind: "conn",
+    });
+
+    expect(stillRefused).toEqual(refused);
+  });
+});
+
 describe("connectStream", () => {
   test("recovers from a CLOSED source with capped backoff, reset on open", () => {
     const clock = installManualClock();
@@ -174,15 +322,15 @@ describe("connectStream", () => {
     const dispose = connect(hooks, document_);
 
     expect(FakeSource.instances).toHaveLength(1);
-    expect(statuses).toEqual(["connecting"]);
+    expect(statuses).toEqual(["Connecting"]);
 
     FakeSource.instances[0]?.emit("open");
-    expect(statuses).toEqual(["connecting", "open"]);
+    expect(statuses).toEqual(["Connecting", "Open"]);
 
     // Transient 404: the source dies CLOSED; the connector schedules a
     // reopen instead of waiting on a native retry that never comes.
     FakeSource.instances[0]?.fail();
-    expect(statuses).toEqual(["connecting", "open", "retrying"]);
+    expect(statuses).toEqual(["Connecting", "Open", "Retrying"]);
     expect(clock.delays).toEqual([10]);
 
     // Firing the scheduled reopen connects the next source.
@@ -214,7 +362,7 @@ describe("connectStream", () => {
     expect(FakeSource.instances).toHaveLength(6);
     FakeSource.instances[5]?.emit("open");
     FakeSource.instances[5]?.emit("message", '{"ok":true}');
-    expect(statuses).toContain("open");
+    expect(statuses).toContain("Open");
     expect(messages).toEqual(['{"ok":true}']);
 
     // At most one live source throughout the whole dance.
@@ -235,7 +383,7 @@ describe("connectStream", () => {
     // Transport blip: readyState stays open, so the native retry owns it —
     // no scheduled reopen, no second source.
     FakeSource.instances[0]?.blip();
-    expect(statuses).toEqual(["connecting", "open", "retrying"]);
+    expect(statuses).toEqual(["Connecting", "Open", "Retrying"]);
     expect(clock.delays).toEqual([]);
     expect(clock.queue).toHaveLength(0);
     expect(FakeSource.instances).toHaveLength(1);
@@ -253,7 +401,8 @@ describe("connectStream", () => {
 
     document_.setHidden(true);
     expect(FakeSource.instances[0]?.closed).toBe(true);
-    expect(statuses).toEqual(["connecting", "open", "closed"]);
+    // `Paused` says the tab is hidden (it resumes); `Closed` means gone.
+    expect(statuses).toEqual(["Connecting", "Open", "Paused"]);
 
     // No reconnect while hidden: nothing is scheduled, so there is nothing
     // a backoff could fire.
@@ -262,7 +411,7 @@ describe("connectStream", () => {
 
     document_.setHidden(false);
     expect(FakeSource.instances).toHaveLength(2);
-    expect(statuses).toEqual(["connecting", "open", "closed", "connecting"]);
+    expect(statuses).toEqual(["Connecting", "Open", "Paused", "Connecting"]);
 
     dispose();
   });
@@ -301,14 +450,28 @@ describe("connectStream", () => {
     dispose();
   });
 
-  test("answers closed when no EventSource exists", () => {
+  test("a frame before the open event marks the connection open", () => {
+    const document_ = new FakeDocument();
+    const { hooks, messages, statuses } = collect();
+    const dispose = connect(hooks, document_);
+
+    // The browser can deliver data before it dispatches `open`; treating
+    // that call as "connecting" made a loaded panel paint as not-loaded.
+    FakeSource.instances[0]?.emit("message", '["early"]');
+    expect(messages).toEqual(['["early"]']);
+    expect(statuses).toEqual(["Connecting", "Open"]);
+
+    dispose();
+  });
+
+  test("answers Closed when no EventSource exists", () => {
     const { hooks, statuses } = collect();
 
     const dispose = connectStream("http://localhost/api/apps/stream", hooks, {
       source: undefined,
     });
 
-    expect(statuses).toEqual(["closed"]);
+    expect(statuses).toEqual(["Closed"]);
 
     dispose();
   });
@@ -365,7 +528,7 @@ describe("createStreamHub", () => {
     source?.emit("message", "1:[]");
     expect(logs.messages).toEqual(['["celld listening"]']);
     expect(deploys.messages).toEqual(["[]"]);
-    expect(logs.statuses.at(-1)).toBe("open");
+    expect(logs.statuses.at(-1)).toBe("Open");
 
     // A second panel on a topic already streaming gets its last frame at
     // once and reuses the connection.
@@ -386,14 +549,16 @@ describe("createStreamHub", () => {
     const [source] = liveSources();
     source?.emit("open");
     source?.emit("message", "0:+");
+    source?.emit("message", '0:["line"]');
     source?.emit("message", "1:+");
+    expect(logs.statuses.at(-1)).toBe("Open");
 
     source?.emit("message", "1:!");
-    expect(deploys.statuses.at(-1)).toBe("retrying");
-    expect(logs.statuses.at(-1)).toBe("open");
+    expect(deploys.statuses.at(-1)).toBe("Retrying");
+    expect(logs.statuses.at(-1)).toBe("Open");
 
     source?.emit("message", "1:[]");
-    expect(deploys.statuses.at(-1)).toBe("open");
+    expect(deploys.statuses.at(-1)).toBe("Open");
     expect(deploys.messages).toEqual(["[]"]);
   });
 
@@ -433,7 +598,49 @@ describe("createStreamHub", () => {
     expect(FakeSource.instances).toHaveLength(1);
     expect(source?.closed).toBe(false);
     expect(again.messages).toEqual(['["line"]']);
-    expect(again.statuses.at(-1)).toBe("open");
+    expect(again.statuses.at(-1)).toBe("Open");
+  });
+
+  test("a refused topic reports Refused and is never reopened", () => {
+    const { flush, streams } = manualHub();
+    const logs = collect();
+    streams.subscribe(LOGS, logs.hooks);
+    flush();
+    const [source] = liveSources();
+    source?.emit("open");
+    source?.emit("message", "0:+");
+    source?.emit("message", "0:~403");
+
+    expect(logs.statuses.at(-1)).toBe("Refused");
+    expect(logs.messages).toEqual([]);
+  });
+
+  test("reset drops a retained frame and reconnects the same subscribers", () => {
+    const { flush, streams } = manualHub();
+    const logs = collect();
+    streams.subscribe(LOGS, logs.hooks);
+    flush();
+    const [source] = liveSources();
+    source?.emit("open");
+    source?.emit("message", '0:["old account"]');
+
+    streams.reset();
+    // The same topic set reconnects on a fresh source; the old frame must
+    // not replay into the next subscriber (an auth change in one tab).
+    flush();
+
+    expect(source?.closed).toBe(true);
+    expect(FakeSource.instances).toHaveLength(2);
+
+    const [replacement] = liveSources();
+    replacement?.emit("open");
+
+    const again = collect();
+    streams.subscribe(LOGS, again.hooks);
+    flush();
+
+    expect(again.messages).toEqual([]);
+    expect(again.statuses.at(-1)).toBe("Connecting");
   });
 
   test("a CLOSED hub source is replaced once with the identical topics, replaying first frames", () => {
@@ -480,8 +687,8 @@ describe("createStreamHub", () => {
       '["celld listening"]',
     ]);
     expect(deploys.messages).toEqual(["[]", "[]"]);
-    expect(logs.statuses.at(-1)).toBe("open");
-    expect(deploys.statuses.at(-1)).toBe("open");
+    expect(logs.statuses.at(-1)).toBe("Open");
+    expect(deploys.statuses.at(-1)).toBe("Open");
   });
 });
 
@@ -698,34 +905,17 @@ const FeedProbe = () => {
   return <span />;
 };
 
-let capturedAtoms: AtomHandle<string[] | undefined>[] = [];
-
-const AtomProbe = () => {
-  // oxlint-disable-next-line unicorn/no-useless-undefined -- the probe starts valueless; undefined is the seed
-  capturedAtoms.push(atom<string[] | undefined>(undefined));
-
-  return <span />;
-};
-
-const captureAtom = async (): Promise<{
-  latest: AtomHandle<string[] | undefined>;
-  unmount: () => void;
-}> => {
-  capturedAtoms = [];
-  const ui = render(AtomProbe);
-  await ui.settled();
-
-  const [latest] = capturedAtoms;
-
-  if (latest === undefined) {
-    throw new Error("the probe did not capture an atom");
-  }
+/** Collects the events a panel's feed applies, with the same transition
+ * function `liveFeed` runs (so a sink here behaves exactly like a panel). */
+const feedSink = <T,>(initial?: FeedState<T>): FeedSink<T> => {
+  // SAFETY: `Cold` carries no value, so it is a valid FeedState<T> for any T.
+  let state = initial ?? ({ _tag: "Cold" } as FeedState<T>);
 
   return {
-    latest,
-    unmount: () => {
-      ui.unmount();
+    apply: (event) => {
+      state = nextFeedState<T>(state, event);
     },
+    current: () => state,
   };
 };
 
@@ -751,7 +941,7 @@ describe("liveFeed initial snapshot", () => {
         throw new Error("the probe did not capture a feed");
       }
 
-      expect(feed.latest()).toEqual(["a", "b"]);
+      expect(feedValue(feed.state())).toEqual(["a", "b"]);
       expect(readSwr<string[]>(probeKey)).toEqual(["a", "b"]);
       ui.unmount();
     } finally {
@@ -764,12 +954,12 @@ describe("liveFeed initial snapshot", () => {
 
     try {
       const key = nextInitialKey();
-      const { latest, unmount } = await captureAtom();
-      // The stream already delivered: the atom holds its frame.
-      latest.set(["stream"]);
+      const sink = feedSink<string[]>();
+      // The stream already delivered: the sink holds its frame.
+      sink.apply({ kind: "frame", value: ["stream"] });
 
       let calls = 0;
-      await paintInitial(key, latest, {
+      await paintInitial(key, sink, {
         initial: () => {
           calls += 1;
 
@@ -778,9 +968,8 @@ describe("liveFeed initial snapshot", () => {
       });
 
       expect(calls).toBe(1);
-      expect(latest()).toEqual(["stream"]);
+      expect(feedValue(sink.current())).toEqual(["stream"]);
       expect(readSwr<string[]>(key)).toBeUndefined();
-      unmount();
     } finally {
       restore();
     }
@@ -791,15 +980,14 @@ describe("liveFeed initial snapshot", () => {
 
     try {
       const key = nextInitialKey();
-      const { latest, unmount } = await captureAtom();
+      const sink = feedSink<string[]>();
 
-      await paintInitial(key, latest, {
+      await paintInitial(key, sink, {
         initial: () => Promise.reject(new Error("runner away")),
       });
 
-      expect(latest()).toBeUndefined();
+      expect(feedValue(sink.current())).toBeUndefined();
       expect(readSwr<string[]>(key)).toBeUndefined();
-      unmount();
     } finally {
       restore();
     }
@@ -811,10 +999,10 @@ describe("liveFeed initial snapshot", () => {
     try {
       const key = nextInitialKey();
       writeSwr(key, ["cached"]);
-      const { latest, unmount } = await captureAtom();
+      const sink = feedSink<string[]>();
 
       let calls = 0;
-      await paintInitial(key, latest, {
+      await paintInitial(key, sink, {
         initial: () => {
           calls += 1;
 
@@ -823,8 +1011,7 @@ describe("liveFeed initial snapshot", () => {
       });
 
       expect(calls).toBe(0);
-      expect(latest()).toBeUndefined();
-      unmount();
+      expect(feedValue(sink.current())).toBeUndefined();
     } finally {
       restore();
     }
@@ -835,8 +1022,8 @@ describe("liveFeed initial snapshot", () => {
 
     try {
       const key = nextInitialKey();
-      const { latest: first, unmount: unmountFirst } = await captureAtom();
-      const { latest: second, unmount: unmountSecond } = await captureAtom();
+      const first = feedSink<string[]>();
+      const second = feedSink<string[]>();
 
       let calls = 0;
       // One pending fetch both panels attach to: the second sees the
@@ -855,10 +1042,8 @@ describe("liveFeed initial snapshot", () => {
       ]);
 
       expect(calls).toBe(1);
-      expect(first()).toEqual(["shared"]);
-      expect(second()).toEqual(["shared"]);
-      unmountFirst();
-      unmountSecond();
+      expect(feedValue(first.current())).toEqual(["shared"]);
+      expect(feedValue(second.current())).toEqual(["shared"]);
     } finally {
       restore();
     }
@@ -869,7 +1054,7 @@ describe("liveFeed initial snapshot", () => {
 
     try {
       const key = nextInitialKey();
-      const { latest, unmount } = await captureAtom();
+      const sink = feedSink<string[]>();
 
       let calls = 0;
 
@@ -879,17 +1064,16 @@ describe("liveFeed initial snapshot", () => {
         return calls === 1 ? neverFetch() : Promise.resolve(["fresh"]);
       };
 
-      await paintInitial(key, latest, { initial, timeoutMs: 20 });
+      await paintInitial(key, sink, { initial, timeoutMs: 20 });
       expect(calls).toBe(1);
-      expect(latest()).toBeUndefined();
+      expect(feedValue(sink.current())).toBeUndefined();
       expect(readSwr<string[]>(key)).toBeUndefined();
 
       // The timed-out fetch left no in-flight entry behind: the next paint
       // retries instead of attaching to a fetch that never settles.
-      await paintInitial(key, latest, { initial, timeoutMs: 1000 });
+      await paintInitial(key, sink, { initial, timeoutMs: 1000 });
       expect(calls).toBe(2);
-      expect(latest()).toEqual(["fresh"]);
-      unmount();
+      expect(feedValue(sink.current())).toEqual(["fresh"]);
     } finally {
       restore();
     }

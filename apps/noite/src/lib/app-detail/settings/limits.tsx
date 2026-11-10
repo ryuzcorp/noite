@@ -5,6 +5,7 @@ import { atom } from "ilha";
 
 import { api } from "../../api";
 import { errorMessage } from "../../errors";
+import { resourceValue, resourceError } from "../../resource";
 import { limits } from "../../resources";
 import type { AppRole } from "../../roles";
 import { LoadError } from "../../ui/load-error";
@@ -57,9 +58,9 @@ export const RateLimitsPanel = ({
   const busy = atom(false);
   const isAdmin = myRole === "admin";
 
-  const current = res.data();
+  const current = resourceValue(res.state());
 
-  if (res.loading() && current === undefined) {
+  if (res.state()._tag === "Loading") {
     return <SectionSkeleton lines={2} />;
   }
 
@@ -67,7 +68,7 @@ export const RateLimitsPanel = ({
     return (
       <SettingsSection>
         <h3 class="m-0 text-lg font-semibold">Limits</h3>
-        <LoadError error={res.error()} />
+        <LoadError error={resourceError(res.state())} />
       </SettingsSection>
     );
   }

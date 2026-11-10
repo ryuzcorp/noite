@@ -7,6 +7,8 @@ import { prList } from "$lib/prs/resources";
 import { parseSkip, searchParam } from "$lib/search-param";
 import { Link, useParams } from "@ilha/void";
 
+import { resourceValue } from "../../../lib/resource";
+
 /** The app's pull requests (`/apps/[id]/pulls`), laid out like the app's own
  * pages: a title row, the state tabs (`?state=`, every count shown) under it,
  * and the list below. */
@@ -24,7 +26,7 @@ export default function PullsListPage() {
     return <p class="text-error m-0 p-4 text-sm">Missing app id.</p>;
   }
 
-  const counts = prList(appId, state(), skip()).data()?.counts;
+  const counts = resourceValue(prList(appId, state(), skip()).state())?.counts;
   const active = state();
 
   return (

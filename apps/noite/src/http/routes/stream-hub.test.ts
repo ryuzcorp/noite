@@ -12,7 +12,9 @@ import {
 } from "../../lib/feeds";
 import type { RouteHandler } from "../config";
 import {
+  MAX_FRAME_BYTES,
   MAX_TOPICS,
+  SseFrameTooLargeError,
   TOPIC_ROUTES,
   matchTopic,
   readSseData,
@@ -167,6 +169,46 @@ describe("readSseData", () => {
   });
 });
 
+describe("readSseData bounds", () => {
+  test("an unterminated line over the cap rejects instead of buffering forever", async () => {
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(encoder.encode("data: "));
+        controller.enqueue(encoder.encode("x".repeat(MAX_FRAME_BYTES)));
+
+        // No newline ever arrives.
+      },
+    });
+
+    await expect(
+      readSseData(body, () => {}, new AbortController().signal)
+    ).rejects.toBeInstanceOf(SseFrameTooLargeError);
+  });
+
+  test("a frame at the cap still parses", async () => {
+    const line = "x".repeat(MAX_FRAME_BYTES - 10);
+
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(encoder.encode(`data: ${line}\n\n`));
+        controller.close();
+      },
+    });
+
+    const seen: string[] = [];
+
+    await readSseData(
+      body,
+      (data) => {
+        seen.push(data);
+      },
+      new AbortController().signal
+    );
+
+    expect(seen).toEqual([line]);
+  });
+});
+
 describe("streamHub", () => {
   test("relays every topic by index, with the browser's cookies and params", async () => {
     const seen: { cookie: string | null; appId: string | undefined }[] = [];
@@ -211,17 +253,15 @@ describe("streamHub", () => {
     expect(seen).toEqual([{ appId: "app_1", cookie: "session=abc" }]);
   });
 
-  test("a refused topic reports a drop and reopens while the others stream", async () => {
+  test("a 4xx topic is refused once and never reopened; the others keep streaming", async () => {
     let opens = 0;
 
     const routes: TopicRoute[] = [
       {
-        handler: (request) => {
+        handler: () => {
           opens += 1;
 
-          return opens === 1
-            ? new Response("forbidden", { status: 403 })
-            : liveSse(request, ['["back"]']);
+          return new Response("forbidden", { status: 403 });
         },
         pattern: /^\/api\/apps\/(?<appId>[^/]+)\/logs\/stream$/u,
       },
@@ -240,15 +280,60 @@ describe("streamHub", () => {
         routes,
         { baseMs: 10, capMs: 40 }
       ),
-      (got) => got.includes('0:["back"]')
+      (got) => got.includes("1:[]") && got.includes("0:~403")
     );
 
     page.abort();
 
-    expect(frames.indexOf("0:!")).toBeLessThan(frames.indexOf('0:["back"]'));
+    // Terminal refusal, not a retry loop: a revoked role or a deleted app
+    // answers 4xx forever, and retrying it only hides the refusal.
+    expect(frames).toContain("0:~403");
+    expect(frames).not.toContain("0:!");
     expect(frames).toContain("1:[]");
     expect(frames).not.toContain("1:!");
-    expect(opens).toBe(2);
+    expect(opens).toBe(1);
+  });
+
+  test("a dropped topic aborts its own handler before the reopen", async () => {
+    const aborted: boolean[] = [];
+
+    const routes: TopicRoute[] = [
+      {
+        handler: (request) => {
+          aborted.push(request.signal.aborted);
+          const index = aborted.length - 1;
+
+          // The handler's own request signal must abort when the hub drops
+          // it (a stall or an end); the hub-wide signal would leave its
+          // in-process poll loop running after the topic reopened.
+          request.signal.addEventListener("abort", () => {
+            aborted[index] = true;
+          });
+
+          return liveSse(request, []);
+        },
+        pattern: /^\/api\/apps\/(?<appId>[^/]+)\/logs\/stream$/u,
+      },
+    ];
+
+    const page = new AbortController();
+
+    const frames = await readFrames(
+      streamHub(hubRequest([logsUrl("app_1")], page.signal), env, routes, {
+        baseMs: 10,
+        capMs: 40,
+        firstFrameMs: 20,
+      }),
+      (got) => got.filter((frame) => frame === "0:+").length >= 2
+    );
+
+    page.abort();
+
+    // The first attempt (the stalled one) was aborted before the second
+    // opened: no orphaned poller behind the retry.
+    expect(aborted[0]).toBe(true);
+    expect(aborted).toHaveLength(2);
+    expect(frames).toContain("0:!");
   });
 
   test("a topic that never sends a first frame leaves open for retrying within the bound", async () => {
@@ -330,7 +415,7 @@ describe("streamHub", () => {
     expect(frames.indexOf("0:!")).toBeLessThan(frames.indexOf('0:["back"]'));
     expect(opens).toBe(2);
   });
-  test("an unknown topic is refused once; the rest still stream", async () => {
+  test("an unknown topic is refused once, terminally; the rest still stream", async () => {
     const routes: TopicRoute[] = [
       {
         handler: (request) => liveSse(request, ["[]"]),
@@ -351,7 +436,7 @@ describe("streamHub", () => {
 
     page.abort();
 
-    expect(frames.filter((frame) => frame === "0:!")).toHaveLength(1);
+    expect(frames.filter((frame) => frame === "0:~404")).toHaveLength(1);
   });
 
   test("the page leaving stops every topic", async () => {
@@ -385,6 +470,80 @@ describe("streamHub", () => {
     // Resolves only if the topic's own request is aborted (the test times
     // out otherwise).
     await stopped.promise;
+  });
+
+  test("an oversized frame refuses its topic terminally instead of retrying", async () => {
+    let opens = 0;
+
+    const routes: TopicRoute[] = [
+      {
+        handler: (request) => {
+          opens += 1;
+
+          return new Response(
+            new ReadableStream<Uint8Array>({
+              start(controller) {
+                controller.enqueue(
+                  encoder.encode(`data: ${"x".repeat(MAX_FRAME_BYTES)}`)
+                );
+
+                request.signal.addEventListener("abort", () => {
+                  try {
+                    controller.close();
+                  } catch {
+                    // Already cancelled by the relay.
+                  }
+                });
+              },
+            }),
+            { headers: { "content-type": "text/event-stream" } }
+          );
+        },
+        pattern: /^\/api\/apps\/(?<appId>[^/]+)\/logs\/stream$/u,
+      },
+    ];
+
+    const page = new AbortController();
+
+    const frames = await readFrames(
+      streamHub(hubRequest([logsUrl("app_1")], page.signal), env, routes),
+      (got) => got.includes("0:~502")
+    );
+
+    page.abort();
+
+    expect(frames).toContain("0:~502");
+    expect(frames).not.toContain("0:!");
+    expect(opens).toBe(1);
+  });
+
+  test("a duplicate topic opens once and mirrors its frames to both indexes", async () => {
+    let opens = 0;
+
+    const routes: TopicRoute[] = [
+      {
+        handler: (request) => {
+          opens += 1;
+
+          return liveSse(request, ['["row"]']);
+        },
+        pattern: /^\/api\/apps\/(?<appId>[^/]+)\/logs\/stream$/u,
+      },
+    ];
+
+    const page = new AbortController();
+    const topic = logsUrl("app_1");
+
+    const frames = await readFrames(
+      streamHub(hubRequest([topic, topic], page.signal), env, routes),
+      (got) => got.includes('0:["row"]') && got.includes('1:["row"]')
+    );
+
+    page.abort();
+
+    expect(opens).toBe(1);
+    expect(frames.filter((frame) => frame === "0:+")).toHaveLength(1);
+    expect(frames.filter((frame) => frame === "1:+")).toHaveLength(1);
   });
 
   test("asks for between one and MAX_TOPICS topics", () => {

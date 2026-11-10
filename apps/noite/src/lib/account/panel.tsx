@@ -4,6 +4,7 @@ import { api } from "../api";
 import { authClient } from "../auth-client";
 import { formatDateTime } from "../dates";
 import { errorMessage } from "../errors";
+import { resourceValue, resourceError } from "../resource";
 import {
   apiKeys,
   invalidate,
@@ -60,9 +61,9 @@ const scopeBadges = (
  * read them, so it is part of the invite flow rather than a nicety. */
 const MyInvitesCard = () => {
   const res = inviteCodes();
-  const codes = res.data() ?? [];
+  const codes = resourceValue(res.state()) ?? [];
 
-  if (res.loading() && res.data() === undefined) {
+  if (res.state()._tag === "Loading") {
     return <SectionSkeleton lines={2} />;
   }
 
@@ -105,7 +106,7 @@ const MyInvitesCard = () => {
  * lost) registers a replacement. */
 const PasskeysCard = () => {
   const res = passkeys();
-  const rows = res.data() ?? [];
+  const rows = resourceValue(res.state()) ?? [];
   const busy = atom(false);
   const error = atom("");
   const nameDraft = atom("");
@@ -195,14 +196,14 @@ const PasskeysCard = () => {
     await reload();
   };
 
-  if (res.loading() && res.data() === undefined) {
+  if (res.state()._tag === "Loading") {
     return <SectionSkeleton lines={2} />;
   }
 
   return (
     <section class="border-base-300 bg-base-100 dark:bg-base-200 rounded-box flex flex-col gap-4 border p-4 shadow-md">
       <h2 class="m-0 text-lg font-semibold">Passkeys</h2>
-      {rows.length === 0 && !res.error() ? (
+      {rows.length === 0 && !resourceError(res.state()) ? (
         <p class="text-warning m-0 text-sm">
           This account has no passkey — you are signing in with emailed codes.
           Add one below so you don't need them.
@@ -215,7 +216,10 @@ const PasskeysCard = () => {
       )}
       {error() ? <p class="text-error m-0 text-sm">{error()}</p> : null}
       {error() ? null : (
-        <LoadError error={res.error()} label="Failed to list passkeys" />
+        <LoadError
+          error={resourceError(res.state())}
+          label="Failed to list passkeys"
+        />
       )}
       <ul class="m-0 flex list-none flex-col gap-2 p-0">
         {rows.map((row) => (
@@ -285,7 +289,7 @@ const PasskeysCard = () => {
 /** Create / list / revoke Better Auth API keys (Git push password). */
 export const AccountPanel = () => {
   const keysRes = apiKeys();
-  const keys: ApiKeyRow[] = keysRes.data() ?? [];
+  const keys: ApiKeyRow[] = resourceValue(keysRes.state()) ?? [];
   const sessionRes = session();
   const busy = atom(false);
   const keyError = atom("");
@@ -312,7 +316,7 @@ export const AccountPanel = () => {
     }
   };
 
-  const user = sessionRes.data()?.user;
+  const user = resourceValue(sessionRes.state())?.user;
   const nameValue = nameDraft() ?? user?.name ?? "";
 
   const createKey = async (event: SubmitEvent) => {
@@ -401,7 +405,7 @@ export const AccountPanel = () => {
     }
   };
 
-  if (keysRes.loading() && keysRes.data() === undefined) {
+  if (keysRes.state()._tag === "Loading") {
     return <SectionSkeleton lines={4} />;
   }
 
@@ -568,7 +572,10 @@ export const AccountPanel = () => {
         ) : null}
         {keyError() ? <p class="text-error m-0 text-sm">{keyError()}</p> : null}
         {keyError() ? null : (
-          <LoadError error={keysRes.error()} label="Failed to list API keys" />
+          <LoadError
+            error={resourceError(keysRes.state())}
+            label="Failed to list API keys"
+          />
         )}
         {keys.length === 0 ? (
           <p class="m-0 text-sm opacity-70">No API keys yet.</p>

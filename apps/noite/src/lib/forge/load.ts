@@ -1,31 +1,38 @@
-//! What a forge resource view is showing: loading, a value, or a failure —
-//! one closed union, so history, commit and compare cannot each invent their
-//! own `data === undefined && error === undefined` test.
-//!
-//! There is deliberately no "refreshing with a stale snapshot" state: a reload
-//! blanks `tracked`'s `data` while it runs (see `../resource`), so a stale
-//! value and a load never coexist.
+//! What a forge resource view is showing, derived from the reader's one
+//! `ResourceState` — never from separate `data`/`error` cells. `Load` is a
+//! presentation projection of that state (the error becomes display text and
+//! `Reloading` keeps painting the value); it holds no state of its own.
 
 import { errorMessage } from "../errors";
+import type { ResourceState } from "../resource";
 
-/** One resource view's state. */
+/** One resource view's state, projected from `ResourceState`. */
 export type Load<T> =
   | { readonly _tag: "Failed"; readonly message: string }
   | { readonly _tag: "Loading" }
   | { readonly _tag: "Ready"; readonly value: T };
 
-/** Derive the state from a `tracked` reader's cells. */
-// oxlint-disable-next-line anti-slop/no-unknown-parameters -- resource().error() is unknown by contract; errorMessage narrows it.
-export const loadState = <T>(data: T | undefined, error: unknown): Load<T> => {
-  if (data !== undefined) {
-    return { _tag: "Ready", value: data };
-  }
+/** Project a reader's state for a view: only a cold key is `Loading`, a
+ * failure is text, and both `Ready` and `Reloading` paint their value. */
+export const loadState = <T>(state: ResourceState<T>): Load<T> => {
+  switch (state._tag) {
+    case "Failed": {
+      return { _tag: "Failed", message: errorMessage(state.error) };
+    }
 
-  if (error !== undefined && error !== null) {
-    return { _tag: "Failed", message: errorMessage(error) };
-  }
+    case "Loading": {
+      return { _tag: "Loading" };
+    }
 
-  return { _tag: "Loading" };
+    case "Ready":
+    case "Reloading": {
+      return { _tag: "Ready", value: state.value };
+    }
+
+    default: {
+      return { _tag: "Loading" };
+    }
+  }
 };
 
 /** The value, or undefined — for the parts of a view that fold `Load` into

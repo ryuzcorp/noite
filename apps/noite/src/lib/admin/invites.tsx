@@ -5,6 +5,7 @@ import type { View } from "ilha";
 
 import { api } from "../api";
 import { errorMessage } from "../errors";
+import { resourceValue, resourceError } from "../resource";
 import { adminListInvites } from "../resources";
 import { searchParam } from "../search-param";
 import { Avatar } from "../ui/avatar";
@@ -101,8 +102,8 @@ const InviteRow = (props: {
 export const AdminInvitesPanel = () => {
   const busy = atom(false);
   const res = adminListInvites();
-  const invites = res.data() ?? [];
-  const loadError = res.error();
+  const invites = resourceValue(res.state()) ?? [];
+  const loadError = resourceError(res.state());
   const panelError = atom("");
   const mintCount = atom(3);
   const search = searchParam("iq", { default: "" });
@@ -148,7 +149,7 @@ export const AdminInvitesPanel = () => {
     busy.set(false);
   };
 
-  const loading = res.loading() && res.data() === undefined;
+  const loading = res.state()._tag === "Loading";
   let body: View;
 
   if (loading) {

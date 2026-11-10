@@ -15,6 +15,14 @@ import type { AtomHandle } from "ilha";
 const PREFIX = "swr:";
 const memory = new Map<string, unknown>();
 
+/** Bumped whenever the store is forgotten (an auth change). A fetch that
+ * started under an older epoch must not write its result: it was scoped to
+ * the previous account, and the feed keys carry no account id. */
+let epoch = 0;
+
+/** The current store epoch (see `clearSwrStore`). */
+export const swrEpoch = (): number => epoch;
+
 const storage = (): Storage | null => {
   try {
     return globalThis.sessionStorage ?? null;
@@ -73,6 +81,7 @@ export const writeSwr = (
 
 /** Forget every snapshot (auth changed: they belong to the previous user). */
 export const clearSwrStore = (): void => {
+  epoch += 1;
   memory.clear();
   const store = storage();
 

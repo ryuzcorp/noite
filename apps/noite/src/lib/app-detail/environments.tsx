@@ -21,6 +21,7 @@ import { errorMessage } from "../errors";
 import { forgeRefs } from "../forge/data";
 import { commitHref, shortSha } from "../forge/format";
 import { collectRef, newLiveRef, whenLive } from "../live-ref";
+import { resourceValue, resourceError } from "../resource";
 import { environments, environmentVars, invalidate, keys } from "../resources";
 import type { AppRole } from "../roles";
 import type { RunnerEnvironment } from "../runner";
@@ -123,7 +124,7 @@ const EnvironmentVars = ({
   myRole: AppRole | undefined;
 }) => {
   const res = environmentVars(appId, envId);
-  const rows: EnvironmentVarView[] = res.data() ?? [];
+  const rows: EnvironmentVarView[] = resourceValue(res.state()) ?? [];
   const err = atom("");
   const savedNote = atom(false);
   const busy = atom(false);
@@ -239,11 +240,9 @@ const EnvironmentVars = ({
         </p>
       ) : null}
       {err() ? <p class="text-error m-0 text-xs">{err()}</p> : null}
-      <LoadError error={res.error()} />
-      {res.loading() && res.data() === undefined ? (
-        <ListSkeleton rows={2} />
-      ) : null}
-      {rows.length === 0 && res.data() !== undefined ? (
+      <LoadError error={resourceError(res.state())} />
+      {res.state()._tag === "Loading" ? <ListSkeleton rows={2} /> : null}
+      {rows.length === 0 && resourceValue(res.state()) !== undefined ? (
         <p class="m-0 text-xs opacity-70">No overrides.</p>
       ) : null}
       {rows.length > 0 ? (
@@ -581,8 +580,8 @@ export const CreateEnvironmentDialog = ({
   onCreated?: (env: RunnerEnvironment) => void;
   open: AtomHandle<boolean>;
 }) => {
-  const refs = forgeRefs(appId).data();
-  const envs = environments(appId).data() ?? [];
+  const refs = resourceValue(forgeRefs(appId).state());
+  const envs = resourceValue(environments(appId).state()) ?? [];
   const branch = atom(initialBranch);
   const busy = atom(false);
   const err = atom("");

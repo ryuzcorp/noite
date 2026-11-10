@@ -46,6 +46,7 @@ import { errorMessage } from "../errors";
 import { forgeRefs, invalidateForge } from "../forge/data";
 import { collectRef, newLiveRef, whenLive } from "../live-ref";
 import type { LiveRef } from "../live-ref";
+import { resourceValue } from "../resource";
 import type { RunnerTree } from "../runner";
 import type { SearchParam } from "../search-param";
 import { fetchSourceArchive } from "../source-archive";
@@ -941,7 +942,9 @@ export const SourceBrowser = ({
       // the refs already hold is grown from its own tip, never created.
       const created =
         branch !== undefined &&
-        refs.data()?.branches.some((known) => known.name === branch) !== true;
+        resourceValue(refs.state())?.branches.some(
+          (known) => known.name === branch
+        ) !== true;
 
       const push: WorkspacePush = { message, target };
 

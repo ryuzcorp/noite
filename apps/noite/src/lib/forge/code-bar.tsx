@@ -5,6 +5,7 @@
 import { Link } from "@ilha/void";
 import type { View } from "ilha";
 
+import { resourceValue } from "../resource";
 import { appDetail } from "../resources";
 import { ArrowLeft, FileDiff, HistoryIcon, Monitor } from "../ui/icons";
 import { sourceQuery } from "./format";
@@ -138,7 +139,7 @@ const CodeBackLink = ({ appId, from }: { appId: string; from: SourceFrom }) => (
     class="link link-hover inline-flex w-fit shrink-0 items-center gap-1 text-sm opacity-70"
   >
     <ArrowLeft class="h-4 w-4" />
-    <span>{appDetail(appId).data()?.app.name ?? "…"}</span>
+    <span>{resourceValue(appDetail(appId).state())?.app.name ?? "…"}</span>
   </Link>
 );
 

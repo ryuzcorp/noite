@@ -8,6 +8,8 @@ import { searchParam } from "$lib/search-param";
 import { Avatar } from "$lib/ui/avatar";
 import { Link } from "@ilha/void";
 
+import { resourceValue } from "../lib/resource";
+
 const TABS = [
   { id: "account", label: "Account" },
   { id: "admin", label: "Admin" },
@@ -21,7 +23,7 @@ const toTabId = (raw: string): TabId =>
 
 /** Shaped like an app's header: avatar, name, then one line of facts. */
 const Header = ({ admin }: { admin: boolean }) => {
-  const user = session().data()?.user;
+  const user = resourceValue(session().state())?.user;
   const name = user?.name || user?.email || "Account";
 
   return (

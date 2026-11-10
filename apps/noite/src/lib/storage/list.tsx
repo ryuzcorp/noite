@@ -2,6 +2,7 @@
 import { Link } from "@ilha/void";
 
 import { errorMessage } from "../errors";
+import { resourceValue, resourceError } from "../resource";
 import { appStorage } from "../resources";
 import type { StorageItem } from "../runner";
 import { ChevronRight } from "../ui/icons";
@@ -55,11 +56,11 @@ const StorageRow = ({ item: s }: { item: StorageItem }) => (
 /** One app's storage resources, shown on the app overview tab. */
 export const AppStorageList = ({ appId }: { appId: string }) => {
   const res = appStorage(appId);
-  const items = res.data() ?? [];
-  const loadError = res.error();
+  const items = resourceValue(res.state()) ?? [];
+  const loadError = resourceError(res.state());
 
   const emptyView =
-    res.loading() && res.data() === undefined ? (
+    res.state()._tag === "Loading" ? (
       <li class="px-4 pt-2 pb-4">
         <ListSkeleton rows={2} />
       </li>

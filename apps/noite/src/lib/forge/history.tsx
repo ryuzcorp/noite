@@ -23,7 +23,7 @@ export const HistoryView = ({
   skip: SearchParam<number>;
 }) => {
   const res = forgeLog(appId, gitRef, path, skip());
-  const load = loadState(res.data(), res.error());
+  const load = loadState(res.state());
   const current = skip();
 
   if (load._tag === "Loading") {

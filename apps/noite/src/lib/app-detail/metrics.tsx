@@ -4,7 +4,16 @@ import { atom } from "ilha";
 
 import { api } from "../api";
 import { formatDateTime, formatHour } from "../dates";
-import { decodeMetrics, feedKeys, liveFeed, metricsUrl } from "../feeds";
+import {
+  decodeMetrics,
+  feedKeys,
+  feedLoaded,
+  feedProblem,
+  feedRetrying,
+  feedValue,
+  liveFeed,
+  metricsUrl,
+} from "../feeds";
 import type { MetricsFrame } from "../feeds";
 import type {
   RunnerDevice,
@@ -643,25 +652,29 @@ export const MetricsCard = ({
 
   // Read the frame (or its stored snapshot) directly: no copy into atoms,
   // so a revisit paints the last numbers in the very first render.
-  const rows = (): MetricsFrame["metrics"] => feed.latest()?.metrics ?? [];
-  const spans = (): MetricsFrame["spans"] => feed.latest()?.spans ?? [];
+  const rows = (): MetricsFrame["metrics"] =>
+    feedValue(feed.state())?.metrics ?? [];
+
+  const spans = (): MetricsFrame["spans"] =>
+    feedValue(feed.state())?.spans ?? [];
 
   const devices = (): NonNullable<MetricsFrame["devices"]> =>
-    feed.latest()?.devices ?? [];
+    feedValue(feed.state())?.devices ?? [];
 
   const paths = (): NonNullable<MetricsFrame["paths"]> =>
-    feed.latest()?.paths ?? [];
+    feedValue(feed.state())?.paths ?? [];
 
   const refs = (): NonNullable<MetricsFrame["refs"]> =>
-    feed.latest()?.refs ?? [];
+    feedValue(feed.state())?.refs ?? [];
 
   const spansError = atom("");
 
-  const loaded = (): boolean =>
-    feed.latest() !== undefined || feed.status() === "open";
+  const loaded = (): boolean => feedLoaded(feed.state());
 
   const loadError = (): string =>
-    feed.status() === "retrying" ? "Usage stream disconnected — retrying…" : "";
+    feedRetrying(feed.state())
+      ? "Usage stream disconnected — retrying…"
+      : (feedProblem(feed.state()) ?? "");
 
   const pickers = {
     cpuMs: (r: RunnerMetric) => r.cpuMs,

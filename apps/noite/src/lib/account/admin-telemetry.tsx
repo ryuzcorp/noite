@@ -4,6 +4,7 @@ import type { AtomHandle } from "ilha";
 import { api } from "../api";
 import { formatDateTime } from "../dates";
 import { errorMessage } from "../errors";
+import { resourceValue, resourceError } from "../resource";
 import {
   adminStatus,
   invalidate,
@@ -138,12 +139,12 @@ const TelemetrySettings = ({
 /** The `/account` Admin tab's card: the anonymous instance-telemetry opt-out. */
 export const TelemetryCard = () => {
   const res = telemetry();
-  const status = res.data();
+  const status = resourceValue(res.state());
   // Lives here, not in the body: the invalidate below blanks `status` for a
   // beat and remounts the body, which must keep the save confirmation.
   const saved = atom(false);
 
-  if (res.loading() && status === undefined) {
+  if (res.state()._tag === "Loading") {
     return <SectionSkeleton lines={3} />;
   }
 
@@ -152,7 +153,7 @@ export const TelemetryCard = () => {
       <section class="border-base-300 bg-base-100 dark:bg-base-200 rounded-box flex flex-col gap-4 border p-4 shadow-md">
         <h2 class="m-0 text-lg font-semibold">Telemetry</h2>
         <LoadError
-          error={res.error()}
+          error={resourceError(res.state())}
           label="Failed to load telemetry settings"
         />
       </section>
@@ -166,8 +167,8 @@ export const TelemetryCard = () => {
  * the `/account` Admin tab; the actions behind it re-check the same gate
  * server-side, so hiding the tab is presentation, not security. */
 export const isInstanceAdmin = (): boolean => {
-  const admin = adminStatus().data();
-  const sess = session().data();
+  const admin = resourceValue(adminStatus().state());
+  const sess = resourceValue(session().state());
 
   return (admin?.isAdmin ?? false) && sess?.session.impersonatedBy === null;
 };

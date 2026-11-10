@@ -9,6 +9,7 @@ import { api } from "../api";
 import type { PrMergeInput } from "../api-types";
 import { errorMessage } from "../errors";
 import { collectRef, liveEl, newLiveRef } from "../live-ref";
+import { resourceValue } from "../resource";
 import { environments } from "../resources";
 import type { AppRole } from "../roles";
 import type { PrDetail } from "../runner";
@@ -104,7 +105,7 @@ const MergeDropdown = ({
 
   // The head branch's own environment, when it has one: deleting the branch
   // deletes the environment and everything it stored.
-  const environment = (environments(appId).data() ?? []).find(
+  const environment = (resourceValue(environments(appId).state()) ?? []).find(
     (row) => row.gitRef === `refs/heads/${pullRequest.head}`
   );
 

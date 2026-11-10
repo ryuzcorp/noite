@@ -9,6 +9,7 @@ import type { View } from "ilha";
 
 import { api } from "../../api";
 import { errorMessage } from "../../errors";
+import { resourceValue, resourceError } from "../../resource";
 import { d1Rows } from "../../resources";
 import type { D1Cell, D1RowsQuery, D1TableSchema } from "../../runner";
 import { ChevronLeft, ChevronRight, Key } from "../../ui/icons";
@@ -177,8 +178,8 @@ export const RowsGrid = ({
   const confirming = atom(false);
   const busy = atom(false);
   const failure = atom("");
-  const data = resource.data();
-  const loadError = resource.error();
+  const data = resourceValue(resource.state());
+  const loadError = resourceError(resource.state());
 
   if (loadError && data === undefined) {
     return <p class="text-error m-0 p-4 text-sm">{errorMessage(loadError)}</p>;

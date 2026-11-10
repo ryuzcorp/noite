@@ -3,7 +3,7 @@ import { beforeEach, describe, expect, spyOn, test } from "bun:test";
 
 import { authFromEnv } from "../lib/auth";
 import { ensureDb, setD1Binding } from "../lib/db";
-import { platformLimiter } from "../lib/rate-limit";
+import { resetPlatformLimits } from "../lib/rate-limit";
 import { createTestD1 } from "../testing/d1";
 import type { TestD1 } from "../testing/d1";
 import { MAX_BODY_BYTES } from "./body";
@@ -21,7 +21,7 @@ const MCP_URL = "http://localhost:9080/mcp";
 let db: TestD1;
 
 beforeEach(async () => {
-  platformLimiter.reset();
+  resetPlatformLimits();
   db = createTestD1();
   setD1Binding(db.d1);
   await ensureDb();
