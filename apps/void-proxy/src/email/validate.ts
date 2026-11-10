@@ -9,7 +9,7 @@
 
 /* oxlint-disable anti-slop/no-runtime-typeof, anti-slop/no-unsafe-dictionary-type, anti-slop/no-unknown-parameters, anti-slop/no-unknown-returns, anti-slop/no-known-value-widening -- untyped-JSON I/O boundary: every handler validates untrusted bodies field-by-field, so typeof-narrowing and open dictionaries are the job, not slop */
 
-import { json, sanitizeForLog } from "../auth.ts";
+import { sanitizeForLog } from "../auth.ts";
 import type { Env } from "../env.ts";
 
 const MAX_CUSTOM_HEADER_BYTES = 16 * 1024;
@@ -413,11 +413,14 @@ export const readMimeFromAddrSpec = (raw: Uint8Array): MimeFrom => {
     : { addrSpec, ok: true };
 };
 
-/** Refuse a message whose MIME `From:` is not exactly the envelope sender. */
-export const refuseMimeFromMismatch = (
+/**
+ * The refusal detail when a message's MIME `From:` is not the envelope
+ * sender, or `null` when it is. The caller maps it into its one refusal table.
+ */
+export const mimeFromRefusalDetail = (
   raw: Uint8Array,
   from: string
-): Response | null => {
+): string | null => {
   const mimeFrom = readMimeFromAddrSpec(raw);
 
   if (mimeFrom.ok && mimeFrom.addrSpec.toLowerCase() === from.toLowerCase()) {
@@ -428,16 +431,7 @@ export const refuseMimeFromMismatch = (
     ? "the From header address does not match the envelope sender"
     : MIME_FROM_REFUSALS[mimeFrom.reason];
 
-  return json(
-    {
-      error: {
-        code: "INVALID_FROM",
-        message: `mime From must be the envelope sender ${from}: ${detail}`,
-      },
-      ok: false,
-    },
-    403
-  );
+  return `mime From must be the envelope sender ${from}: ${detail}`;
 };
 
 export class EmailProviderTimeoutError extends Error {

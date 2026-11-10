@@ -3,7 +3,8 @@
 /* oxlint-disable anti-slop/no-runtime-typeof, anti-slop/no-unsafe-dictionary-type, anti-slop/no-unknown-parameters, anti-slop/no-unknown-returns, anti-slop/no-known-value-widening -- untyped-JSON I/O boundary: every handler validates untrusted bodies field-by-field, so typeof-narrowing and open dictionaries are the job, not slop */
 
 import { errorMessage, json, sanitizeForLog } from "./auth.ts";
-import type { EdgeCache, Env, IsrKvNamespace, ProxyDeps } from "./env.ts";
+import type { Subsystem } from "./config.ts";
+import type { EdgeCache, IsrKvNamespace, ProxyDeps } from "./env.ts";
 import {
   denormalizeIsrPath,
   ISR_HOST_REGISTRY_PREFIX,
@@ -180,27 +181,57 @@ const isrKeyMatchesPaths = (
   return wanted.has(splitIsrCacheKey(split.keyPath).normalizedPath);
 };
 
-export const handleRevalidate = async (
-  env: Env,
-  body: Record<string, unknown>,
-  deps: ProxyDeps = {}
-): Promise<Response> => {
-  const kv = env.ISR_CACHE;
+/**
+ * The purge request as one closed union, decoded once before any KV work.
+ *
+ * ```mermaid
+ * stateDiagram-v2
+ *     [*] --> All: body.all === true
+ *     [*] --> Empty: no usable paths
+ *     [*] --> Paths: at least one normalized path
+ *     All --> done: purge ISR + host registry prefixes
+ *     Paths --> done: scan and purge matching keys
+ *     Empty --> done: { ok: true, purged: 0 } (no-op success)
+ * ```
+ *
+ * `All` wins over `paths` (the historical behavior): `all: true` with paths
+ * purges everything. Non-string paths are dropped; unparseable-but-string
+ * paths still normalize and simply match nothing.
+ */
+type PurgeRequest =
+  | { readonly _tag: "All" }
+  | { readonly _tag: "Empty" }
+  | { readonly _tag: "Paths"; readonly paths: ReadonlySet<string> };
 
-  if (!kv) {
-    return json({ error: "isr cache not configured" }, 502);
+const readPurgeRequest = (body: Record<string, unknown>): PurgeRequest => {
+  if (body.all === true) {
+    return { _tag: "All" };
   }
 
-  const all = body.all === true;
   const pathsRaw = Array.isArray(body.paths) ? body.paths : [];
 
-  const wanted = new Set(
+  const paths = new Set(
     pathsRaw
       .filter((p): p is string => typeof p === "string")
       .map(normalizeIsrPath)
   );
 
-  if (!all && wanted.size === 0) {
+  return paths.size === 0 ? { _tag: "Empty" } : { _tag: "Paths", paths };
+};
+
+export const handleRevalidate = async (
+  isr: Subsystem<IsrKvNamespace>,
+  body: Record<string, unknown>,
+  deps: ProxyDeps = {}
+): Promise<Response> => {
+  if (isr._tag !== "Ready") {
+    return json({ error: "isr cache not configured" }, 502);
+  }
+
+  const kv = isr.value;
+  const request = readPurgeRequest(body);
+
+  if (request._tag === "Empty") {
     return json({ ok: true, purged: 0 });
   }
 
@@ -209,7 +240,7 @@ export const handleRevalidate = async (
   try {
     let purged = 0;
 
-    if (all) {
+    if (request._tag === "All") {
       purged += await deletePrefix(kv, cache, ISR_V3_PREFIX);
       purged += await deletePrefix(kv, cache, ISR_HOST_REGISTRY_PREFIX);
     } else {
@@ -220,7 +251,7 @@ export const handleRevalidate = async (
         const page = await kv.list({ cursor, prefix: ISR_V3_PREFIX });
 
         const matched = page.keys.filter((key) =>
-          isrKeyMatchesPaths(key.name, wanted)
+          isrKeyMatchesPaths(key.name, request.paths)
         );
 
         // Matched keys are independent: delete them concurrently.

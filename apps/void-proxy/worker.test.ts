@@ -14,10 +14,13 @@ import {
   splitIsrCacheKey,
 } from "./src/isr-keys.ts";
 import {
+  buildMime,
   FakeCache,
   FakeKv,
   makeEnv,
+  mimeBase64,
   post,
+  TEST_FROM,
   TEST_PROJECT_ID,
   TEST_TOKEN,
 } from "./test-helpers.ts";
@@ -188,6 +191,40 @@ describe("routing", () => {
         mailKv: false,
       },
       ok: true,
+    });
+  });
+
+  test("GET /health email agrees with the SMTP config the handler accepts", async () => {
+    // Host present but plaintext without the operator allowance: `readSmtpConfig`
+    // refuses, so `/health` must not advertise email as ready.
+    const env = makeEnv({
+      MAIL_IDEMPOTENCY: new FakeKv(),
+      VOID_PROXY_EMAIL_ALLOWLIST: "@example.org",
+      VOID_PROXY_SMTP_HOST: "smtp.example.com",
+      VOID_PROXY_SMTP_MODE: "plain",
+    });
+
+    const health = await handleFetch(new Request("https://proxy/health"), env);
+    expect(await health.json()).toMatchObject({
+      bindings: { email: false },
+      ok: true,
+    });
+
+    const { status, json } = await post(
+      "/email/send",
+      {
+        from: TEST_FROM,
+        mimeBase64: mimeBase64(buildMime(TEST_FROM)),
+        recipients: ["a@example.org"],
+        requestId: "req-health",
+      },
+      env
+    );
+
+    expect(status).toBe(502);
+    expect(json).toMatchObject({
+      error: { code: "UPSTREAM_ERROR" },
+      ok: false,
     });
   });
 
