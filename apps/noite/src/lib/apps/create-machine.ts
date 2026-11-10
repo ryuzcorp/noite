@@ -650,6 +650,9 @@ const step = (model: CreateModel, message: Message): Step =>
       const previous =
         model.source.t === "Folder" ? model.source.upload.name : "";
 
+      // A dropped folder starts a fresh flow: a stranded app from an earlier
+      // upload is abandoned here (its notice goes away with it), because the
+      // new files were not the ones that failed to upload.
       const next = withSource(
         {
           // The folder replaces the picker; `mode` goes back to its default so
