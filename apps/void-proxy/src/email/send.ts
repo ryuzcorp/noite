@@ -28,18 +28,25 @@
  * Per-recipient outcomes are the `Delivery` union below; one attempt folds
  * into the `SendOutcome` union, which is what decides idempotency storage:
  *
- * | outcome  | meaning                                       | 24 h record    |
- * | -------- | --------------------------------------------- | -------------- |
- * | Accepted | every recipient was accepted by the provider  | yes — replay   |
- * | Partial  | at least one accepted, at least one not       | yes — replay   |
- * | Failed   | none accepted; every refusal definitive       | no — retryable |
- * | Unknown  | none accepted; at least one `outcome_unknown` | no — retryable |
+ * | outcome  | meaning                                        | 24 h record    |
+ * | -------- | ---------------------------------------------- | -------------- |
+ * | Accepted | every recipient was accepted by the provider   | yes — replay   |
+ * | Partial  | at least one accepted, at least one not        | yes — replay   |
+ * | Failed   | no acceptance observed; every refusal definite | no — retryable |
+ * | Unknown  | no acceptance observed; ≥1 `outcome_unknown`   | no — retryable |
  *
  * A record replays the earlier attempt's response byte-identically and
  * submits nothing, so recording a `Partial` outcome is what guarantees a
  * retry with the same key never re-sends to the recipients the provider
  * already accepted. A `Failed` / `Unknown` / rejected-only attempt is
- * deliberately not recorded, so a retry with the same key really retries.
+ * deliberately not recorded, so a retry with the same key really retries (and
+ * the key stays free, so that retry may carry different content).
+ *
+ * `Unknown` means acceptance was never *observed*, not that the provider
+ * refused: the data bytes left and no reply arrived, so the message may
+ * already be queued and a retry can duplicate it. The per-recipient error
+ * says so; inspect the relay log before retrying.
+ *
  * The record keeps its `{ digest, status, body }` shape and always stores
  * `status: 200` — internal, so the `/email/send` JSON stays unchanged.
  *
@@ -434,12 +441,15 @@ const classifyOutcome = (deliveries: readonly DeliveryEntry[]): SendOutcome => {
     }
   }
 
-  if (accepted === deliveries.length) {
-    return { _tag: "Accepted", deliveries };
-  }
-
+  // `accepted > 0` first: zero deliveries cannot be reached through the
+  // envelope (it refuses an empty recipient list), and if that invariant ever
+  // broke, the safe answer is "nothing to record", not a replayable empty
+  // success.
   if (accepted > 0) {
-    return { _tag: "Partial", deliveries };
+    return {
+      _tag: accepted === deliveries.length ? "Accepted" : "Partial",
+      deliveries,
+    };
   }
 
   return { _tag: unknown > 0 ? "Unknown" : "Failed", deliveries };
