@@ -117,7 +117,7 @@ describe("Start", () => {
     );
 
     expect(tags(decision.effects)).toEqual([
-      "Persist:Stopping",
+      "MarkStopping",
       "Arm",
       "ReleaseAdmission",
       "Clear",
@@ -235,7 +235,7 @@ describe("Use and Release", () => {
 
     expect(decision).toMatchObject({ lease: { _tag: "Stopped" } });
     expect(tags(decision.effects)).toEqual([
-      "Persist:Stopping",
+      "MarkStopping",
       "Arm",
       "ReleaseAdmission",
       "Clear",
@@ -318,11 +318,7 @@ describe("Recover", () => {
     );
 
     expect(decision).toMatchObject({ lease: { _tag: "Stopped" } });
-    expect(tags(decision.effects)).toEqual([
-      "Arm",
-      "ReleaseAdmission",
-      "Clear",
-    ]);
+    expect(tags(decision.effects)).toEqual(["ReleaseNow"]);
   });
 
   test("an absent lease recovers to nothing", () => {

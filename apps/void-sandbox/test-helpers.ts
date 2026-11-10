@@ -31,6 +31,11 @@ export class FakeStorage {
   alarmAt: number | null = null;
   gets = 0;
   puts = 0;
+  /** Resolves when the first gated `delete` is reached. */
+  readonly deleteEntered = new Deferred<void>();
+  /** When set, the first `delete` of this key waits for the gate. */
+  holdDelete: { readonly gate: Deferred<void>; readonly key: string } | null =
+    null;
   /** Crash-window scripting: puts whose 1-based index matches throw. */
   failPut: ((putIndex: number) => boolean) | null = null;
 
@@ -54,6 +59,14 @@ export class FakeStorage {
 
   async delete(key: string): Promise<boolean> {
     await Promise.resolve();
+
+    const held = this.holdDelete;
+
+    if (held !== null && held.key === key) {
+      this.holdDelete = null;
+      this.deleteEntered.resolve();
+      await held.gate.promise;
+    }
 
     return this.store.delete(key);
   }

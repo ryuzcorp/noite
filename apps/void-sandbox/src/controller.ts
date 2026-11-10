@@ -543,7 +543,24 @@ export class SandboxController extends SandboxContainer<ControllerEnv> {
   ): Promise<BaseExecProcess> {
     await this.#guardExec();
 
-    return this.container.exec(argv, { ...options });
+    // A direct `execProcess` (tenant RPC) never goes through
+    // `waitForProcessExit`, so it must enter the activity machine itself:
+    // `Begin` refuses a cell the alarm is reaping, and the exit settles the
+    // count even when nothing waits on the process.
+    const finish = await this.#active();
+
+    try {
+      const process = await this.container.exec(argv, { ...options });
+
+      // oxlint-disable-next-line promise/prefer-await-to-then -- a lifetime listener, not a wait: the spawn must return while the process runs.
+      void process.exitCode.then(finish, finish);
+
+      return process;
+    } catch (error) {
+      await finish();
+
+      throw error;
+    }
   }
 
   /**
@@ -644,10 +661,31 @@ export class SandboxController extends SandboxContainer<ControllerEnv> {
     await this.ctx.storage.put(LEASE_KEY, stored);
   }
 
-  async #clearLease(): Promise<void> {
+  /**
+   * Compare-and-clear: a release computed from an older snapshot must never
+   * delete a newer lease (that would orphan the newer admission row).
+   */
+  async #clearLease(generation: string): Promise<void> {
+    const lease = await this.#readLease();
+
+    if (lease._tag === "Absent" || lease.generation !== generation) {
+      return;
+    }
+
     await this.ctx.storage.delete(LEASE_KEY);
     await this.#resetActivity();
     await this.ctx.storage.deleteAlarm();
+  }
+
+  /** Compare-and-set the durable stop mark, for the same reason. */
+  async #markStopping(generation: string): Promise<void> {
+    const lease = await this.#readLease();
+
+    if (lease._tag === "Absent" || lease.generation !== generation) {
+      return;
+    }
+
+    await this.#saveLease({ _tag: "Stopping", generation });
   }
 
   /** Run a lease transition's effects in order; a failure leaves the durable state as the recovery point. */
@@ -676,6 +714,12 @@ export class SandboxController extends SandboxContainer<ControllerEnv> {
       return;
     }
 
+    if (effect._tag === "MarkStopping") {
+      await this.#markStopping(effect.generation);
+
+      return;
+    }
+
     if (effect._tag === "ReleaseAdmission") {
       await bounded(
         this.#admission().stopped(this.ctx.id.toString(), effect.generation)
@@ -685,7 +729,13 @@ export class SandboxController extends SandboxContainer<ControllerEnv> {
     }
 
     if (effect._tag === "Clear") {
-      await this.#clearLease();
+      await this.#clearLease(effect.generation);
+
+      return;
+    }
+
+    if (effect._tag === "ReleaseNow") {
+      await this.stopped();
 
       return;
     }
@@ -707,14 +757,20 @@ export class SandboxController extends SandboxContainer<ControllerEnv> {
   }
 
   /**
-   * Noite: serialize the lease-reserve sequence per cell. The `invoke` path
-   * already funnels through one `#setup`, but direct `beforeStart` calls
-   * would interleave: two starts could both mint generations, race at
-   * `reserve`, and leave the winner's admission entry with no controller
-   * lease to ever stop it. Queued, a second start cleanly supersedes the
-   * first (`Release` frees its reservation before the new one mints).
+   * Noite: serialize every lease mutation per cell. The `invoke` path already
+   * funnels through one `#setup`, but direct `beforeStart` calls would
+   * interleave: two starts could both mint generations, race at `reserve`,
+   * and leave the winner's admission entry with no controller lease to ever
+   * stop it. The same lock keeps a release from interleaving with a start, so
+   * a teardown can never clear a lease a newer start just wrote. Queued, a
+   * second start cleanly supersedes the first (`Release` frees its
+   * reservation before the new one mints).
+   *
+   * Not re-entrant: a transition run under this lock must never emit
+   * `Destroy` or `ReleaseNow` (both re-enter `stopped()`); only `beforeStart`
+   * and `stopped()` take the lock, and neither emits them.
    */
-  #serializeStart<T>(operation: () => Promise<T>): Promise<T> {
+  #serializeLease<T>(operation: () => Promise<T>): Promise<T> {
     // oxlint-disable-next-line promise/prefer-await-to-then -- the queue links continuations; awaiting here would serialize the caller instead of the work.
     const result = this.#startTail.then(operation);
     // oxlint-disable-next-line promise/prefer-await-to-then -- see above: the tail must advance without blocking this call.
@@ -724,7 +780,7 @@ export class SandboxController extends SandboxContainer<ControllerEnv> {
   }
 
   protected override async beforeStart(): Promise<void> {
-    return await this.#serializeStart(async () => {
+    return await this.#serializeLease(async () => {
       // Noite: no `instanceType` assignment — celld sizes from config, and the
       // `container` wrapper strips the `instance` start arg.
       const decision = stepLease(
@@ -796,7 +852,7 @@ export class SandboxController extends SandboxContainer<ControllerEnv> {
       return this.#finishing;
     }
 
-    const pending = (async () => {
+    const pending = this.#serializeLease(async () => {
       const decision = stepLease(
         await this.#readLease(),
         { _tag: "Release" },
@@ -808,7 +864,7 @@ export class SandboxController extends SandboxContainer<ControllerEnv> {
       }
 
       await this.#runLease(decision);
-    })();
+    });
 
     this.#finishing = pending;
 

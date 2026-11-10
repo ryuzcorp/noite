@@ -88,8 +88,13 @@ export type LeaseEffect =
       readonly method: AdmissionMethod;
     }
   | { readonly _tag: "Persist"; readonly lease: Lease }
+  /** Compare-and-set the durable stop mark; a newer lease is left alone. */
+  | { readonly _tag: "MarkStopping"; readonly generation: string }
   | { readonly _tag: "ReleaseAdmission"; readonly generation: string }
-  | { readonly _tag: "Clear" }
+  /** Compare-and-clear: only clears when the record still names `generation`. */
+  | { readonly _tag: "Clear"; readonly generation: string }
+  /** Run the full release transition (serialized, idempotent). */
+  | { readonly _tag: "ReleaseNow" }
   | { readonly _tag: "Arm" }
   | { readonly _tag: "Touch" };
 
@@ -168,16 +173,13 @@ const releaseEffects = (
   const effects: LeaseEffect[] = [];
 
   if (!marked) {
-    effects.push({
-      _tag: "Persist",
-      lease: { _tag: "Stopping", generation: lease.generation },
-    });
+    effects.push({ _tag: "MarkStopping", generation: lease.generation });
   }
 
   effects.push(
     { _tag: "Arm" },
     { _tag: "ReleaseAdmission", generation: lease.generation },
-    { _tag: "Clear" }
+    { _tag: "Clear", generation: lease.generation }
   );
 
   return effects;
@@ -246,8 +248,10 @@ const recover = (lease: Lease, facts: LeaseFacts): LeaseDecision => {
   }
 
   if (lease._tag === "Stopping" || lease._tag === "Stopped") {
+    // Re-read and re-step under the lease lock: a release computed from this
+    // snapshot must never finish the teardown of a newer generation.
     return next({ _tag: "Stopped", generation: lease.generation }, [
-      ...releaseEffects(lease, true),
+      { _tag: "ReleaseNow" },
     ]);
   }
 
