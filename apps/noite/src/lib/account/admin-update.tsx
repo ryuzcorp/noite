@@ -90,6 +90,7 @@ export const UpdateCard = () => {
       id="update-check-enabled"
       label="Check for new Noite releases"
       onSave={save}
+      savedMessage="Release check setting saved."
       onToggle={(value) => {
         machine.set(transition(model, Evt.Toggled({ value })));
       }}

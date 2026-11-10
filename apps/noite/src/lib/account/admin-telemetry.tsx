@@ -105,6 +105,7 @@ export const TelemetryCard = () => {
       id="telemetry-enabled"
       label="Share anonymous instance telemetry"
       onSave={save}
+      savedMessage="Telemetry setting saved."
       onToggle={(value) => {
         machine.set(transition(model, Evt.Toggled({ value })));
       }}

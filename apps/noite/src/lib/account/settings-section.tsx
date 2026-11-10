@@ -23,6 +23,8 @@ export interface SettingsSectionProps {
   /** Persist `value`; the caller dispatches SaveStarted/SaveSucceeded/
    * SaveFailed on its machine around its request. */
   readonly onSave: (value: boolean) => void;
+  /** The confirmation line, per card (the e2e specs assert it verbatim). */
+  readonly savedMessage: string;
   /** The machine's current model (see `syncStatus`). */
   readonly state: SettingsState;
   readonly title: string;
@@ -37,6 +39,7 @@ export const SettingsSection = ({
   label,
   onSave,
   onToggle,
+  savedMessage,
   state,
   title,
 }: SettingsSectionProps) => {
@@ -110,7 +113,7 @@ export const SettingsSection = ({
       {extra}
       {state.error ? <p class="text-error m-0 text-sm">{state.error}</p> : null}
       {state.save === "saved" ? (
-        <p class="text-success m-0 text-sm">Setting saved.</p>
+        <p class="text-success m-0 text-sm">{savedMessage}</p>
       ) : null}
       {state.check === "running" ? check : null}
       <div>
