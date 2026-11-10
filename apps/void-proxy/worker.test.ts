@@ -825,6 +825,8 @@ describe("/revalidate edge purge", () => {
       "src/env.ts",
       "src/isr-keys.ts",
       "src/auth.ts",
+      "src/config.ts",
+      "src/routes.ts",
       "src/revalidate.ts",
       "src/email/validate.ts",
       "src/email/smtp.ts",
