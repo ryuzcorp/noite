@@ -1,21 +1,29 @@
-import { isInstanceAdmin } from "../lib/collaborators";
+import { mayAdministerInstance } from "../lib/authority";
+import type { InstanceAuthority } from "../lib/authority";
 import { controlAccessRefusal } from "../lib/server/control-d1.server";
-import { getSessionOrNull, requestOrigin } from "../lib/server/session.server";
+import {
+  readSession,
+  requestOrigin,
+  sessionAuthority,
+} from "../lib/server/session.server";
 
 /** Pure decision half of the control stream gate: the status and message a
  * `_control` stream answers with, or null to proceed. Signed out is 401;
- * impersonated or not an instance admin is 403 (the same policy as the
- * control D1, `lib/server/control-d1.server`). Exported for the unit test. */
-export const controlStreamRefusalDecision = (access: {
-  signedIn: boolean;
-  impersonatedBy: string | null;
-  isAdmin: boolean;
-}): { status: 401 | 403; message: string } | null => {
-  if (!access.signedIn) {
+ * impersonated, banned or not an instance admin is 403 (the same policy as the
+ * control D1, `lib/server/control-d1.server`). It reads the one authority
+ * union (`lib/authority.ts`), never a hand-rolled role check, so the gate
+ * cannot drift from `requireControlAdmin`. Exported for the unit test. */
+export const controlStreamRefusalDecision = (
+  authority: InstanceAuthority | null
+): { status: 401 | 403; message: string } | null => {
+  if (authority === null || authority._tag === "Anonymous") {
     return { message: "Sign in required", status: 401 };
   }
 
-  const refusal = controlAccessRefusal(access);
+  const refusal = controlAccessRefusal({
+    impersonatedBy: authority._tag === "Impersonating" ? authority.by : null,
+    isAdmin: mayAdministerInstance(authority),
+  });
 
   return refusal === null ? null : { message: refusal, status: 403 };
 };
@@ -32,19 +40,14 @@ export const controlStreamRefusal = async (
     return new Response("bad request", { status: 400 });
   }
 
-  const session = await getSessionOrNull(request, env).catch(() => null);
-  const user = session?.user;
+  // One predicate: the session's authority folds role, the env anchor, the
+  // ban flag and impersonation together (lib/server/session.server).
+  const read = await readSession(request, env).catch(() => null);
 
-  const isAdmin =
-    user !== undefined &&
-    session?.impersonatedBy === null &&
-    (await isInstanceAdmin(user.id, user.email));
+  const authority =
+    read?._tag === "Session" ? await sessionAuthority(read.session) : null;
 
-  const refusal = controlStreamRefusalDecision({
-    impersonatedBy: session?.impersonatedBy ?? null,
-    isAdmin,
-    signedIn: user !== undefined,
-  });
+  const refusal = controlStreamRefusalDecision(authority);
 
   return refusal === null
     ? undefined
@@ -58,7 +61,7 @@ export const routeUserId = async (
   request: Request,
   env: KitEnv
 ): Promise<string | undefined> => {
-  const session = await getSessionOrNull(request, env).catch(() => null);
+  const read = await readSession(request, env).catch(() => null);
 
-  return session?.user.id;
+  return read?._tag === "Session" ? read.session.user.id : undefined;
 };

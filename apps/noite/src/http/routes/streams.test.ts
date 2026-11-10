@@ -2,6 +2,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 /* oxlint-disable eslint/require-await, anti-slop/no-unknown-returns, anti-slop/no-chained-type-assertions, anti-slop/require-safety-comment-for-type-assertion -- test doubles: they mirror async platform interfaces and stand in for bindings they only partly implement */
 import { setImmediate } from "node:timers/promises";
 
+import { Authority } from "../../lib/authority";
 import { controlStreamRefusalDecision } from "../session";
 import { sleepUnlessAborted } from "../sse";
 import { metricsWindowHours, proxyRunnerFetch, streamMetrics } from "./streams";
@@ -142,36 +143,28 @@ const runMetricsStream = async (versionFor: (call: number) => number) => {
 };
 
 describe("control stream gate", () => {
-  test("admits only a signed-in, non-impersonated instance admin", () => {
+  test("admits only a signed-in, non-impersonated, non-banned instance admin", () => {
     expect(
-      controlStreamRefusalDecision({
-        impersonatedBy: null,
-        isAdmin: true,
-        signedIn: true,
-      })
+      controlStreamRefusalDecision(Authority.InstanceAdmin({ via: "role" }))
     ).toBeNull();
-    expect(
-      controlStreamRefusalDecision({
-        impersonatedBy: null,
-        isAdmin: true,
-        signedIn: false,
-      })
-    ).toMatchObject({ status: 401 });
+    expect(controlStreamRefusalDecision(Authority.Anonymous())).toMatchObject({
+      status: 401,
+    });
+    expect(controlStreamRefusalDecision(null)).toMatchObject({ status: 401 });
     // An admin touring as another user must not watch the control plane.
     expect(
-      controlStreamRefusalDecision({
-        impersonatedBy: "admin1",
-        isAdmin: true,
-        signedIn: true,
-      })
-    ).toMatchObject({ status: 403 });
-    expect(
-      controlStreamRefusalDecision({
-        impersonatedBy: null,
-        isAdmin: false,
-        signedIn: true,
-      })
-    ).toMatchObject({ status: 403 });
+      controlStreamRefusalDecision(Authority.Impersonating({ by: "admin1" }))
+    ).toMatchObject({
+      message: "The control database is not available while impersonating",
+      status: 403,
+    });
+    expect(controlStreamRefusalDecision(Authority.Plain())).toMatchObject({
+      status: 403,
+    });
+    // Banned is refused through the same predicate, not a separate check.
+    expect(controlStreamRefusalDecision(Authority.Banned())).toMatchObject({
+      status: 403,
+    });
   });
 });
 
