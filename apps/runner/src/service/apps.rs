@@ -81,7 +81,7 @@ pub async fn create(
 ) -> Result<App, ApiError> {
     let name = name.trim().to_string();
     let slug = slug.trim().to_lowercase();
-    if name.is_empty() || !slug_ok(&slug) {
+    if name.is_empty() || !slug_ok(&state.config, &slug) {
         return Err(ApiError::bad("invalid name/slug"));
     }
     // The purge of a reused slug can outlast the control plane's lifecycle
@@ -353,7 +353,7 @@ async fn rename_inner(
         None
     };
     if let Some(s) = &slug {
-        if !slug_ok(s) {
+        if !slug_ok(&state.config, s) {
             return Err(ApiError::bad("invalid slug"));
         }
         match db::get_app_by_slug(&state.pool, s).await {

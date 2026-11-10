@@ -1,5 +1,7 @@
 //! App lifecycle constants and pure helpers shared by API, reconcile, and deploy.
 
+use crate::config::Config;
+
 /// Default install/build step bound is 300s (`RUNNER_BUILD_TIMEOUT_S`). The
 /// reconcile sweep skips apps whose deploy is claimed in this process, so a
 /// raised bound never fails a working deploy; the boot sweep only finds rows
@@ -41,18 +43,33 @@ pub fn sha_same(a: &str, b: &str) -> bool {
     !a.is_empty() && a == b
 }
 
-/// Slug rules for create: letters plus hyphens only, not a reserved route.
-/// Slugs that would collide with edge routes and must never become apps.
-const RESERVED_SLUGS: &[&str] = &["_control", "app", "api", "git"];
-
-pub fn slug_ok(slug: &str) -> bool {
-    if RESERVED_SLUGS.contains(&slug) {
+/// Slug rules for create, rename and import: lowercase letters, digits and
+/// hyphens, and never a label the edge routes as a platform host. The
+/// reserved labels are derived from the edge table's own
+/// [`crate::host::edge_table::platform_routes`], so a non-default
+/// `CONTROL_SUBDOMAIN` (or an extra control host sitting under a tenant base)
+/// reserves exactly what the edge serves — the two cannot drift.
+pub fn slug_ok(cfg: &Config, slug: &str) -> bool {
+    // `_control` is the control plane's telemetry/cgroup key, not a host:
+    // no app may take it even if a future slug grammar would allow it.
+    if slug == crate::host::control::SLUG {
         return false;
     }
     // `pod-<uuid>` is a pod host label (`host::edge::POD_HOST_PREFIX`): an app
     // with that slug would collide with the Code-mode origin of the app whose
     // id it spells.
     if crate::host::edge::pod_label_id(slug).is_some() {
+        return false;
+    }
+    let platform: std::collections::HashSet<String> = crate::host::edge_table::platform_routes(cfg)
+        .into_iter()
+        .map(|(host, _)| host)
+        .collect();
+    if cfg
+        .tenant_bases()
+        .iter()
+        .any(|base| platform.contains(&format!("{slug}.{base}").to_lowercase()))
+    {
         return false;
     }
     static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
@@ -92,6 +109,7 @@ pub fn hostname_ok(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::config_for_tests;
 
     #[test]
     fn tail_utf8_never_splits_a_char() {
@@ -104,10 +122,13 @@ mod tests {
     #[test]
     fn pod_host_labels_are_not_slugs() {
         // The Code-mode origin of the app whose id this spells.
-        assert!(!slug_ok("pod-0f4b0f6e-5a8e-4a0e-9c3f-2b1d0c9e8f7a"));
+        assert!(!slug_ok(
+            &config_for_tests(),
+            "pod-0f4b0f6e-5a8e-4a0e-9c3f-2b1d0c9e8f7a"
+        ));
         // Ordinary slugs and near misses stay available.
         for ok in ["pod", "podcast", "pod-123", "mypod-x"] {
-            assert!(slug_ok(ok), "should accept {ok}");
+            assert!(slug_ok(&config_for_tests(), ok), "should accept {ok}");
         }
     }
 
@@ -158,20 +179,47 @@ mod tests {
 
     #[test]
     fn slug_rules() {
-        assert!(slug_ok("test"));
-        assert!(slug_ok("a"));
-        assert!(slug_ok("my-app"));
-        assert!(slug_ok("my-app-1"));
-        assert!(slug_ok("app2"));
-        assert!(slug_ok("2fast"));
-        assert!(!slug_ok("_control"));
-        assert!(!slug_ok("app"));
-        assert!(!slug_ok("api"));
-        assert!(!slug_ok("git"));
-        assert!(!slug_ok("-bad"));
-        assert!(!slug_ok("bad-"));
-        assert!(!slug_ok("under_score"));
-        assert!(!slug_ok("Bad"));
-        assert!(!slug_ok(""));
+        let cfg = config_for_tests();
+        assert!(slug_ok(&cfg, "test"));
+        assert!(slug_ok(&cfg, "a"));
+        assert!(slug_ok(&cfg, "my-app"));
+        assert!(slug_ok(&cfg, "my-app-1"));
+        assert!(slug_ok(&cfg, "app2"));
+        assert!(slug_ok(&cfg, "2fast"));
+        assert!(!slug_ok(&cfg, "_control"));
+        // The API and Git hosts exist under every tenant base.
+        assert!(!slug_ok(&cfg, "api"));
+        assert!(!slug_ok(&cfg, "git"));
+        // A default install serves control on the bare base, so `app` is a
+        // free tenant label there (prod sets CONTROL_SUBDOMAIN=app).
+        assert!(slug_ok(&cfg, "app"));
+        assert!(!slug_ok(&cfg, "-bad"));
+        assert!(!slug_ok(&cfg, "bad-"));
+        assert!(!slug_ok(&cfg, "under_score"));
+        assert!(!slug_ok(&cfg, "Bad"));
+        assert!(!slug_ok(&cfg, ""));
+    }
+
+    /// The slug gate reads the live config, so a custom control subdomain is
+    /// reserved exactly as the edge table serves it.
+    #[test]
+    fn control_host_labels_are_reserved() {
+        let mut cfg = config_for_tests();
+        assert!(slug_ok(&cfg, "console"));
+        cfg.control_subdomain = "console".into();
+        assert!(!slug_ok(&cfg, "console"));
+        assert!(slug_ok(&cfg, "console2"));
+        // An extra control host under a tenant base reserves its own label,
+        // even when the operator wrote it dotted or uppercase.
+        cfg.control_extra_hosts = vec!["Panel.Localhost.".into()];
+        assert!(!slug_ok(&cfg, "panel"));
+        // Tenant bases gain API and Git hosts too.
+        assert!(!slug_ok(&cfg, "git"));
+        assert!(!slug_ok(&cfg, "api"));
+        // A dotted base domain is canonicalized before both sides compare.
+        let mut dotted = config_for_tests();
+        dotted.base_domain = "example.com.".into();
+        dotted.control_subdomain = "console".into();
+        assert!(!slug_ok(&dotted, "console"));
     }
 }

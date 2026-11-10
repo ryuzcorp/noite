@@ -21,6 +21,36 @@ fn parse_host_list(raw: &str) -> Vec<String> {
         .collect()
 }
 
+/// A hostname in the one shape the edge matches: no surrounding whitespace,
+/// no trailing dot, lowercase. The Go table normalizes `Host` headers this
+/// way, so every configured host and every comparison must agree — a dotted
+/// or uppercase `BASE_DOMAIN`/`CONTROL_*` value would otherwise leave keys
+/// the edge can never match (and a tenant could take the reachable form).
+pub(crate) fn normalize_host(raw: &str) -> String {
+    raw.trim().trim_matches('.').to_lowercase()
+}
+
+/// Whether a configured control host is a bare DNS name or IP literal — the
+/// only shapes a `Host` header can carry. A scheme, port or path would leave
+/// a table key the edge can never match while the short host stays claimable.
+fn bare_host_ok(host: &str) -> bool {
+    if host.is_empty() || host.len() > 253 {
+        return false;
+    }
+    if host.parse::<std::net::IpAddr>().is_ok() {
+        return true;
+    }
+    host.split('.').all(|label| {
+        !label.is_empty()
+            && label.len() <= 63
+            && !label.starts_with('-')
+            && !label.ends_with('-')
+            && label
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+    })
+}
+
 fn parse_auto_https(raw: Option<&str>, base_domain: &str) -> bool {
     // An empty value means "not configured" (compose renders
     // `CADDY_AUTO_HTTPS: ""` when the operator leaves it unset), so trim and
@@ -1245,8 +1275,9 @@ impl Config {
         if runner_token.is_empty() {
             anyhow::bail!("RUNNER_TOKEN must not be empty");
         }
-        let base_domain = env::var("BASE_DOMAIN").unwrap_or_else(|_| "localhost".into());
-        if base_domain.trim().is_empty() {
+        let base_domain =
+            normalize_host(&env::var("BASE_DOMAIN").unwrap_or_else(|_| "localhost".into()));
+        if base_domain.is_empty() {
             anyhow::bail!(
                 "BASE_DOMAIN must not be empty (got blank); set it to your domain, e.g. noite.now"
             );
@@ -1380,9 +1411,14 @@ impl Config {
                 .or_else(|_| env::var("RUSTFS_SECRET_KEY"))
                 .unwrap_or_else(|_| "noitesecretnoitesecretnoite12".into()),
             base_domain: base_domain.clone(),
-            control_subdomain: env::var("CONTROL_SUBDOMAIN").unwrap_or_default(),
+            control_subdomain: normalize_host(&env::var("CONTROL_SUBDOMAIN").unwrap_or_default()),
             control_extra_hosts: env::var("CONTROL_EXTRA_HOSTS")
-                .map(|v| parse_host_list(&v))
+                .map(|v| {
+                    parse_host_list(&v)
+                        .into_iter()
+                        .map(|host| normalize_host(&host))
+                        .collect()
+                })
                 .unwrap_or_default(),
             work_dir: env_or(&["RUNNER_WORK_DIR"], "/data/runner"),
             caddyfile_path: env::var("CADDYFILE_PATH")
@@ -1772,6 +1808,50 @@ impl Config {
         if self.otel_flush_ms < 1000 {
             problems.push("RUNNER_OTEL_FLUSH_MS must be >= 1000".into());
         }
+        // Every edge-facing domain must be what a Host header can carry: a
+        // bare DNS name or IP literal. A scheme/port/path value would key a
+        // route the edge can never match while its short form stays a
+        // claimable host (see `normalize_host`).
+        let base = normalize_host(&self.base_domain);
+        if !bare_host_ok(&base) {
+            problems.push(format!(
+                "BASE_DOMAIN must be a bare DNS name or IP literal, got {:?}",
+                self.base_domain
+            ));
+        }
+        let sub = normalize_host(&self.control_subdomain);
+        if !sub.is_empty() && !bare_host_ok(&sub) {
+            problems.push(format!(
+                "CONTROL_SUBDOMAIN must be a bare DNS name, got {:?}",
+                self.control_subdomain
+            ));
+        }
+        // A control host may not spell an api/git route: the collision would
+        // be resolved first-wins by `build_table`, but the operator's intent
+        // (control on that host) and the api/git host are contradictory.
+        let bases = self.tenant_bases();
+        if sub == "api" || sub == "git" {
+            problems.push(format!(
+                "CONTROL_SUBDOMAIN {sub:?} collides with the platform's {sub}.{{base}} route"
+            ));
+        }
+        for raw in &self.control_extra_hosts {
+            let host = normalize_host(raw);
+            if !host.is_empty() && !bare_host_ok(&host) {
+                problems.push(format!(
+                    "CONTROL_EXTRA_HOSTS entries must be bare DNS names or IP literals, got {raw:?}"
+                ));
+                continue;
+            }
+            if bases
+                .iter()
+                .any(|base| host == format!("api.{base}") || host == format!("git.{base}"))
+            {
+                problems.push(format!(
+                    "CONTROL_EXTRA_HOSTS entry {host:?} collides with an api./git. platform route"
+                ));
+            }
+        }
         // A 0 memory limit means DuckDB's own 80%-of-RAM default, which is
         // exactly what this knob exists to avoid; a tiny one makes every
         // query spill forever. 64 MiB is the floor DuckDB can run a scan in.
@@ -1847,14 +1927,22 @@ impl Config {
         }
     }
 
-    /// Hostnames serving the control UI (bare/sub + extras).
+    /// Hostnames serving the control UI (bare/sub + extras), canonicalized
+    /// to the shape the edge matches.
     pub fn control_hosts(&self) -> Vec<String> {
-        let mut out = vec![if self.control_subdomain.is_empty() {
-            self.base_domain.clone()
+        let base = normalize_host(&self.base_domain);
+        let sub = normalize_host(&self.control_subdomain);
+        let mut out = vec![if sub.is_empty() {
+            base
         } else {
-            format!("{}.{}", self.control_subdomain, self.base_domain)
+            format!("{sub}.{base}")
         }];
-        out.extend(self.control_extra_hosts.iter().cloned());
+        out.extend(
+            self.control_extra_hosts
+                .iter()
+                .map(|host| normalize_host(host))
+                .filter(|host| !host.is_empty()),
+        );
         out
     }
 
@@ -1962,9 +2050,14 @@ impl Config {
     /// matches) so they're control-only; entries with ports/paths are
     /// operator error — skipped rather than rendered half-working.
     pub fn tenant_bases(&self) -> Vec<String> {
-        let mut bases = vec![self.base_domain.clone()];
+        let base = normalize_host(&self.base_domain);
+        let mut bases = if base.is_empty() {
+            Vec::new()
+        } else {
+            vec![base]
+        };
         for raw in &self.control_extra_hosts {
-            let host = raw.trim().trim_matches('.');
+            let host = normalize_host(raw);
             if host.is_empty()
                 || host.parse::<std::net::IpAddr>().is_ok()
                 || host.contains(':')
@@ -1972,8 +2065,8 @@ impl Config {
             {
                 continue;
             }
-            if !bases.iter().any(|b| b.eq_ignore_ascii_case(host)) {
-                bases.push(host.to_string());
+            if !bases.iter().any(|b| b == &host) {
+                bases.push(host);
             }
         }
         bases
@@ -2919,6 +3012,52 @@ mod tests {
             "".into(),
         ];
         assert_eq!(cfg.tenant_bases(), vec!["localhost", "noite.local"]);
+    }
+
+    #[test]
+    fn configured_hosts_are_canonical() {
+        let mut cfg = config_for_tests();
+        cfg.base_domain = "Example.COM.".into();
+        cfg.control_extra_hosts = vec!["Panel.Example.COM.".into(), "".into()];
+        assert_eq!(
+            cfg.control_hosts(),
+            vec!["example.com", "panel.example.com"]
+        );
+        assert_eq!(cfg.tenant_bases(), vec!["example.com", "panel.example.com"]);
+        cfg.control_subdomain = "Console.".into();
+        assert_eq!(cfg.control_hosts()[0], "console.example.com");
+        // A scheme/port/path is not a Host header: refuse it at boot instead
+        // of keying a route the edge never matches.
+        let mut bad = config_for_tests();
+        bad.control_subdomain = "https://app".into();
+        assert!(bad.validate().is_err(), "scheme in CONTROL_SUBDOMAIN");
+        bad.control_subdomain = "app".into();
+        bad.control_extra_hosts = vec!["panel.localhost:443".into()];
+        assert!(bad.validate().is_err(), "port in CONTROL_EXTRA_HOSTS");
+        bad.control_extra_hosts = vec!["192.168.10.62".into()];
+        assert!(bad.validate().is_ok(), "an IP literal stays control-only");
+        bad.base_domain = "https://example.com".into();
+        assert!(bad.validate().is_err(), "scheme in BASE_DOMAIN");
+        bad.base_domain = "example.com:443".into();
+        assert!(bad.validate().is_err(), "port in BASE_DOMAIN");
+        bad.base_domain = "example.com".into();
+        assert!(bad.validate().is_ok(), "a bare base validates");
+    }
+
+    #[test]
+    fn control_hosts_cannot_claim_an_api_or_git_route() {
+        let mut cfg = config_for_tests();
+        for sub in ["api", "git"] {
+            cfg.control_subdomain = sub.into();
+            assert!(cfg.validate().is_err(), "CONTROL_SUBDOMAIN={sub}");
+        }
+        cfg.control_subdomain = "console".into();
+        for host in ["api.localhost", "git.localhost"] {
+            cfg.control_extra_hosts = vec![host.into()];
+            assert!(cfg.validate().is_err(), "CONTROL_EXTRA_HOSTS={host}");
+        }
+        cfg.control_extra_hosts = vec!["panel.localhost".into()];
+        assert!(cfg.validate().is_ok());
     }
 
     #[test]

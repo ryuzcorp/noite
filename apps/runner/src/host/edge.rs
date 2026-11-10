@@ -588,7 +588,7 @@ pub async fn tls_ask(
     // a name this fleet does not serve. A pending claim mints nothing.
     match parse_edge_slug(domain, &cfg.tenant_bases(), &cfg.control_subdomain) {
         Some(slug) => {
-            if !crate::lifecycle::slug_ok(&slug) {
+            if !crate::lifecycle::slug_ok(cfg, &slug) {
                 return StatusCode::NOT_FOUND;
             }
             match crate::db::get_app_by_slug(&state.pool, &slug).await {

@@ -150,7 +150,7 @@ pub async fn rename_app(
             .await?
             .ok_or_else(|| anyhow::anyhow!("app not found"));
     }
-    if !crate::lifecycle::slug_ok(new_slug) {
+    if !crate::lifecycle::slug_ok(cfg, new_slug) {
         anyhow::bail!("invalid slug");
     }
     let Some(_claim) = deploy::claim_wait_owned(deploying, app_id, Duration::from_secs(120)).await
