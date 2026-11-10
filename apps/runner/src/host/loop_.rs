@@ -300,11 +300,7 @@ async fn reconcile_once(
         match tips::head_main_bundle(cfg, &app.slug).await {
             Ok(Some(tip)) => {
                 let target = deploy::DeployTarget::Production;
-                let already = target
-                    .last_deploy_sha(app)
-                    .as_deref()
-                    .is_some_and(|s| sha_same(s, &tip.sha));
-                if already {
+                if !sweep_needs_tip(pool, app, &target, &tip.sha).await? {
                     continue;
                 }
                 tracing::info!(slug = %app.slug, sha = %&tip.sha[..12.min(tip.sha.len())], "git tip changed");
@@ -395,11 +391,7 @@ async fn reconcile_once(
                     continue;
                 };
                 let target = deploy::DeployTarget::Environment(Box::new(env.clone()));
-                let already = target
-                    .last_deploy_sha(&app)
-                    .as_deref()
-                    .is_some_and(|s| sha_same(s, &tip.sha));
-                if already {
+                if !sweep_needs_tip(pool, &app, &target, &tip.sha).await? {
                     continue;
                 }
                 tracing::info!(fleet = %fleet, sha = %&tip.sha[..12.min(tip.sha.len())], "git tip changed");
@@ -594,6 +586,33 @@ async fn drain_tip(
     spawn_tip_deploy(pool, cfg, procs, logs, deploying, app, target, notify.tip);
 }
 
+/// Whether the fallback tip sweep must deploy `tip`: the target does not serve
+/// it yet, and nothing here ever built it.
+///
+/// A sha the history holds a successful deploy for is not the out-of-band
+/// write this sweep exists for: the live release moved off it on purpose — a
+/// rollback, or a redeploy of an older release — and pulling the git tip back
+/// would silently undo that within one sweep interval. Pushes and explicit
+/// redeploys deploy on their own trigger, so only a tip nothing here built (a
+/// bundle written by another runner or by hand) needs the sweep.
+async fn sweep_needs_tip(
+    pool: &SqlitePool,
+    app: &App,
+    target: &deploy::DeployTarget,
+    tip_sha: &str,
+) -> sqlx::Result<bool> {
+    let live = target.last_deploy_sha(app);
+    if live.as_deref().is_some_and(|s| sha_same(s, tip_sha)) {
+        return Ok(false);
+    }
+
+    Ok(
+        db::get_success_deploy(pool, &app.id, tip_sha, target.environment_id())
+            .await?
+            .is_none(),
+    )
+}
+
 /// Hand a fresh tip to the deploy pipeline on its own task: the loop must
 /// never block behind a build. `deploy_tip` re-checks the sha, so a tip that
 /// went stale between the check above and the spawn is still safe.
@@ -779,5 +798,116 @@ mod tests {
             .is_some());
         pool.close().await;
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The fallback tip sweep must not undo a rollback. A sha the history holds
+    /// a success for is a release the operator moved off on purpose; only a tip
+    /// nothing here built (an out-of-band bundle write) needs the sweep, and a
+    /// failed row is not a build to stand on.
+    #[tokio::test]
+    async fn sweep_skips_a_tip_that_is_already_built() {
+        use crate::models::EnvironmentKind;
+        let cfg = crate::config::config_for_tests();
+        let pool = db::connect("sqlite::memory:").await.expect("memory db");
+        let app = db::create_app(
+            &pool,
+            &cfg,
+            db::NewApp {
+                name: "rollback",
+                slug: "rollback",
+                user_id: "local",
+                subdomain: "rollback.localhost",
+                listen: 30340,
+                internal: 30341,
+            },
+        )
+        .await
+        .expect("app");
+        // Deploy sha2, then roll production back to sha1: the app now serves
+        // sha1 while the git tip is still sha2.
+        db::upsert_deploy(&pool, None, &app.id, None, "success", Some("sha2"), "")
+            .await
+            .expect("sha2 deploy");
+        db::upsert_deploy(&pool, None, &app.id, None, "success", Some("sha1"), "")
+            .await
+            .expect("sha1 rollback");
+        let fresh = db::get_app(&pool, &app.id).await.unwrap().expect("app row");
+        assert_eq!(fresh.last_deploy_sha.as_deref(), Some("sha1"));
+
+        let production = deploy::DeployTarget::Production;
+        assert!(
+            !sweep_needs_tip(&pool, &fresh, &production, "sha2")
+                .await
+                .unwrap(),
+            "the rollback target is still the built tip: the sweep must not undo it"
+        );
+        assert!(
+            sweep_needs_tip(&pool, &fresh, &production, "sha3")
+                .await
+                .unwrap(),
+            "a tip nothing built needs the fallback sweep"
+        );
+
+        // A failed attempt at the tip is not a release: the sweep retries it.
+        db::upsert_deploy(&pool, None, &app.id, None, "failed", Some("sha4"), "boom")
+            .await
+            .expect("failed deploy");
+        assert!(sweep_needs_tip(&pool, &fresh, &production, "sha4")
+            .await
+            .unwrap());
+
+        // An environment's history is its own: production's success for sha2
+        // says nothing about a preview's sha2.
+        let env = db::create_environment(
+            &pool,
+            &cfg,
+            db::NewEnvironment {
+                app_id: &app.id,
+                slug: "rollback",
+                label: "wip",
+                kind: EnvironmentKind::Workspace,
+                git_ref: "refs/previews/user/wip",
+                created_by: "user",
+                listen: 30350,
+                internal: 30351,
+            },
+        )
+        .await
+        .expect("environment");
+        let preview = deploy::DeployTarget::Environment(Box::new(env.clone()));
+        assert!(sweep_needs_tip(&pool, &fresh, &preview, "sha2")
+            .await
+            .unwrap());
+        db::upsert_deploy(
+            &pool,
+            None,
+            &app.id,
+            Some(&env.id),
+            "success",
+            Some("sha2"),
+            "",
+        )
+        .await
+        .expect("preview sha2 deploy");
+        db::upsert_deploy(
+            &pool,
+            None,
+            &app.id,
+            Some(&env.id),
+            "success",
+            Some("sha1"),
+            "",
+        )
+        .await
+        .expect("preview sha1 deploy");
+        let fresh_env = db::get_environment(&pool, &env.id)
+            .await
+            .unwrap()
+            .expect("env row");
+        let preview = deploy::DeployTarget::Environment(Box::new(fresh_env));
+        assert!(!sweep_needs_tip(&pool, &fresh, &preview, "sha2")
+            .await
+            .unwrap());
+        pool.close().await;
     }
 }
