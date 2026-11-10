@@ -37,14 +37,16 @@ use std::collections::HashSet;
 use sqlx::SqlitePool;
 
 use crate::models::{
-    new_id, now_iso, AppStatus, Deploy, DeployStatus, DeployWrite, StatusWrite, WriteGuard,
+    new_id, now_iso, AppStatus, Deploy, DeployIntent, DeployStatus, DeployWrite, StatusWrite,
+    WriteGuard,
 };
 
 use super::apps::{record_app_deploy_sha, status_list, write_app_status};
 use super::environments::{mark_environment_deployed, write_environment_status};
 
 /// Columns every `deploy` query selects, in [`Deploy`] order.
-const DEPLOY_COLS: &str = "id, app_id, environment_id, sha, status, log, created_at, updated_at";
+const DEPLOY_COLS: &str =
+    "id, app_id, environment_id, sha, status, intent, log, created_at, updated_at";
 
 /// The target's `last_error` when the sweep, not the run, closed a deploy.
 const STALLED_SUMMARY: &str = "deploy stalled (host interrupted or timed out)";
@@ -111,7 +113,7 @@ pub async fn list_deploys_lean(
     // flight: reading 20 full build logs to blank 19 of them costs the same
     // SQLite work as the fat query this replaced.
     let sql = format!(
-        r#"SELECT id, app_id, environment_id, sha, status,
+        r#"SELECT id, app_id, environment_id, sha, status, intent,
                   CASE WHEN rn = 1 AND status IN ('building', 'deploying') THEN log ELSE '' END AS log,
                   created_at, updated_at
            FROM (SELECT d.*, ROW_NUMBER() OVER (ORDER BY created_at DESC) AS rn
@@ -296,25 +298,97 @@ pub async fn upsert_deploy(
         }
     }
     let id = new_id();
-    sqlx::query(
-        "INSERT INTO deploy (id, app_id, environment_id, sha, status, log, created_at, updated_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+    insert_deploy(
+        pool,
+        NewDeploy {
+            app_id,
+            environment_id,
+            id: &id,
+            intent: DeployIntent::Deploy,
+            log: append_log,
+            sha,
+            status,
+        },
     )
-    .bind(&id)
-    .bind(app_id)
-    .bind(environment_id)
-    .bind(sha)
-    .bind(status.as_str())
-    .bind(append_log)
-    .bind(&ts)
-    .bind(&ts)
-    .execute(pool)
     .await?;
     apply_status(pool, app_id, environment_id, status, sha, append_log).await?;
     Ok(DeployUpsert {
         id,
         outcome: DeployWrite::Applied,
     })
+}
+
+/// One row's first write: what `upsert_deploy`'s create path and
+/// [`queue_deploy`] both need, which differs only in the intent recorded.
+struct NewDeploy<'a> {
+    id: &'a str,
+    app_id: &'a str,
+    environment_id: Option<&'a str>,
+    status: DeployStatus,
+    intent: DeployIntent,
+    sha: Option<&'a str>,
+    log: &'a str,
+}
+
+/// The one INSERT of a deploy row.
+async fn insert_deploy(pool: &SqlitePool, row: NewDeploy<'_>) -> sqlx::Result<()> {
+    let ts = now_iso();
+    sqlx::query(
+        "INSERT INTO deploy (id, app_id, environment_id, sha, status, intent, log, created_at, \
+         updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(row.id)
+    .bind(row.app_id)
+    .bind(row.environment_id)
+    .bind(row.sha)
+    .bind(row.status.as_str())
+    .bind(row.intent.as_str())
+    .bind(row.log)
+    .bind(&ts)
+    .bind(&ts)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Pre-create the queued row a caller watches, recording *why* the run
+/// exists: a rollback or an environment redeploy. The pipeline continues the
+/// same row (`upsert_deploy`) and never rewrites its intent — the reason a
+/// deploy exists is settled when the row is created. A row created by
+/// `upsert_deploy` itself is a plain [`DeployIntent::Deploy`]: a push, a web
+/// commit or the tip sweep.
+pub async fn queue_deploy(
+    pool: &SqlitePool,
+    app_id: &str,
+    environment_id: Option<&str>,
+    intent: DeployIntent,
+    sha: &str,
+) -> sqlx::Result<String> {
+    let id = new_id();
+    let log = "▸ queued behind the app's running deploy\n";
+    insert_deploy(
+        pool,
+        NewDeploy {
+            app_id,
+            environment_id,
+            id: &id,
+            intent,
+            log,
+            sha: Some(sha),
+            status: DeployStatus::Queued,
+        },
+    )
+    .await?;
+    apply_status(
+        pool,
+        app_id,
+        environment_id,
+        DeployStatus::Queued,
+        Some(sha),
+        log,
+    )
+    .await?;
+    Ok(id)
 }
 
 /// The success transition of a deploy's target: the sha it now serves, and
@@ -521,7 +595,7 @@ fn utc_cutoff(older_than_ms: i64) -> chrono::DateTime<chrono::Utc> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::App;
+    use crate::models::{App, DeployIntent};
 
     async fn seed_app(pool: &SqlitePool, id: &str) -> App {
         let cfg = crate::config::config_for_tests();
@@ -702,6 +776,60 @@ mod tests {
             fresh.log
         );
         assert!(!fresh.log.contains("stalled"), "{}", fresh.log);
+    }
+
+    /// A row's intent is settled when the row is created: `queue_deploy`
+    /// records the trigger, and the pipeline continuing the same row never
+    /// rewrites it. A row the pipeline creates itself is a plain deploy.
+    #[tokio::test]
+    async fn a_deploy_intent_is_set_once_and_never_rewritten() {
+        let pool = crate::db::connect("sqlite::memory:").await.expect("db");
+        let app = seed_app(&pool, "intent").await;
+        let id = queue_deploy(&pool, &app.id, None, DeployIntent::Rollback, "abc1234")
+            .await
+            .expect("queue the rollback");
+        let queued = get_deploy(&pool, &app.id, &id)
+            .await
+            .expect("read")
+            .expect("row");
+        assert_eq!(queued.intent, DeployIntent::Rollback);
+        assert_eq!(queued.status, DeployStatus::Queued);
+
+        upsert_deploy(
+            &pool,
+            Some(&id),
+            &app.id,
+            None,
+            DeployStatus::Building,
+            Some("abc1234"),
+            "▸ build\n",
+        )
+        .await
+        .expect("the pipeline continues the row");
+        let building = get_deploy(&pool, &app.id, &id)
+            .await
+            .expect("read")
+            .expect("row");
+        assert_eq!(building.intent, DeployIntent::Rollback, "intent is history");
+
+        // A push, a web commit or the tip sweep creates its own row: a plain
+        // deploy.
+        let pushed = upsert_deploy(
+            &pool,
+            None,
+            &app.id,
+            None,
+            DeployStatus::Building,
+            Some("abc1234"),
+            "▸ queued\n",
+        )
+        .await
+        .expect("push row");
+        let row = get_deploy(&pool, &app.id, &pushed.id)
+            .await
+            .expect("read")
+            .expect("row");
+        assert_eq!(row.intent, DeployIntent::Deploy);
     }
 
     /// The sweep closes a dead row as `stalled` — the host interrupted it or a

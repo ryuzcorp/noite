@@ -294,18 +294,17 @@ async fn spawn_deploy(
     // Mirror the hidden-ref shape: `git/<slug>/<ref>/<sha>.bundle`, written by
     // `after_receive` for every ref a write moved.
     let key = format!("git/{}/{}/{sha}.bundle", app.slug, env.git_ref);
-    let deploy_id = db::upsert_deploy(
+    // An environment deploy is the Redeploy action (UI, MCP
+    // `deploy_environment`): the row records that trigger.
+    let deploy_id = db::queue_deploy(
         &state.pool,
-        None,
         &app.id,
         Some(&env.id),
-        crate::models::DeployStatus::Queued,
-        Some(sha),
-        "▸ queued behind the app's running deploy\n",
+        crate::models::DeployIntent::Redeploy,
+        sha,
     )
     .await
-    .map_err(|e| ApiError::internal(e.to_string()))?
-    .id;
+    .map_err(|e| ApiError::internal(e.to_string()))?;
     let pool = state.pool.clone();
     let cfg = state.config.clone();
     let procs = state.procs.clone();

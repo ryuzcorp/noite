@@ -110,6 +110,13 @@ test(
     expect(live.status, live.log).toBe("success");
     expect(live.sha).toBe(sha1);
 
+    // The history says why the row exists: a rollback names the release it
+    // re-ran instead of reading like a plain push.
+    await page.goto(`/apps/${appId}?t=deployments`);
+    await expect(
+      page.getByText(`Rollback to ${sha1.slice(0, 12)}`, { exact: true })
+    ).toBeVisible();
+
     // The earlier revision serves traffic again, not just a matching row.
     expect(await readMarker(request, port)).toBe(V1_MARKER);
     const sample = await readSampleApp(request, port);

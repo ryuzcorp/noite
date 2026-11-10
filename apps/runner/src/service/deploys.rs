@@ -197,18 +197,17 @@ pub async fn prepare_rollback(
     // ok, and the watcher waits on a deploy that never started. A background
     // tip deploy has no row and skips; the next reconcile tick picks the tip
     // up again.
-    let deploy_id = db::upsert_deploy(
+    // The row records why it exists: `rollback`, so the history and the API
+    // can tell it apart from a push.
+    let deploy_id = db::queue_deploy(
         &state.pool,
-        None,
         &app.id,
         target.environment_id(),
-        crate::models::DeployStatus::Queued,
-        Some(&sha),
-        "▸ queued behind the app's running deploy\n",
+        crate::models::DeployIntent::Rollback,
+        &sha,
     )
     .await
-    .map_err(|e| ApiError::internal(e.to_string()))?
-    .id;
+    .map_err(|e| ApiError::internal(e.to_string()))?;
     Ok(PreparedRollback {
         deploy_id,
         sha,

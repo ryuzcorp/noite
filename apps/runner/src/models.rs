@@ -386,9 +386,52 @@ pub struct Deploy {
     pub environment_id: Option<String>,
     pub sha: Option<String>,
     pub status: DeployStatus,
+    /// Why the run exists ([`DeployIntent`]); settled when the row is created
+    /// and never rewritten.
+    pub intent: DeployIntent,
     pub log: String,
     pub created_at: String,
     pub updated_at: String,
+}
+
+/// Why one deploy row exists: its trigger, not its outcome. Stored as TEXT
+/// with a `'deploy'` default (schema version 101), so a row written before the
+/// column existed reads as a plain deploy.
+///
+/// ```mermaid
+/// stateDiagram-v2
+///   [*] --> Deploy: a push, a web commit or the tip sweep
+///   [*] --> Rollback: an operator re-runs an old successful sha
+///   [*] --> Redeploy: an environment deploy at its ref's head
+/// ```
+///
+/// The intent is set once, when the row is created, and never changes: it
+/// describes the request that started the run, so a rollback whose pipeline
+/// then fails is still a rollback.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type, TS)]
+#[serde(rename_all = "lowercase")]
+#[sqlx(rename_all = "lowercase")]
+#[ts(export)]
+pub enum DeployIntent {
+    /// A push to the app's branch, a web commit, or the reconcile sweep
+    /// catching up with the tip.
+    Deploy,
+    /// The operator re-ran a past successful sha (`POST /v1/apps/{id}/rollback`,
+    /// `deploys.rollback`).
+    Rollback,
+    /// An environment deployed at its ref's current head
+    /// (`environments.deploy`, the UI's Redeploy).
+    Redeploy,
+}
+
+impl DeployIntent {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Deploy => "deploy",
+            Self::Rollback => "rollback",
+            Self::Redeploy => "redeploy",
+        }
+    }
 }
 
 /// Who wrote one `app_env` / `environment_env` row: the operator, or one of

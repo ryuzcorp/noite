@@ -3,10 +3,9 @@
 //! `schema.sql` is the complete shape of a fresh database, applied on every
 //! boot. Alpha databases stamped 1..16 predate the 2026-11-09 compaction and
 //! are refused, not migrated: they predate the compaction and cannot be reshaped in place. This build's
-//! baseline is [`SCHEMA_VERSION`] with an empty [`MIGRATIONS`]; a future shape
-//! change appends a `(version, sql)` above the baseline and bumps the constant,
-//! and a database stamped at the baseline is migrated forward. A database
-//! stamped by a newer build is refused.
+//! baseline is [`SCHEMA_VERSION`]; a shape change appends a `(version, sql)`
+//! above the baseline and bumps the constant, and a database stamped below it
+//! is migrated forward. A database stamped by a newer build is refused.
 
 use anyhow::{bail, Context};
 use sqlx::SqliteConnection;
@@ -16,7 +15,7 @@ use sqlx::SqliteConnection;
 pub const FIRST_COMPACTED_VERSION: i64 = 100;
 
 /// Version a database has after every migration ran.
-pub const SCHEMA_VERSION: i64 = FIRST_COMPACTED_VERSION;
+pub const SCHEMA_VERSION: i64 = FIRST_COMPACTED_VERSION + 1;
 
 /// One upgrade step: the statements that take a database from `version - 1`
 /// to `version`. Empty at the compacted baseline; append above it to change
@@ -27,7 +26,13 @@ pub struct Migration {
 }
 
 /// Steps above the baseline, ascending and contiguous.
-pub const MIGRATIONS: &[Migration] = &[];
+pub const MIGRATIONS: &[Migration] = &[Migration {
+    // 101: why a deploy ran (`DeployIntent`). Every existing row is a plain
+    // deploy — the column's default says so — and the API serves the field
+    // from then on.
+    version: FIRST_COMPACTED_VERSION + 1,
+    sql: "ALTER TABLE main.deploy ADD COLUMN intent TEXT NOT NULL DEFAULT 'deploy';",
+}];
 
 /// What boot must do to bring a database to the latest version.
 #[derive(Debug, PartialEq, Eq)]
@@ -232,13 +237,44 @@ mod tests {
         assert_eq!(columns, 1);
     }
 
+    /// The 101 step is the live one: a database stamped at the previous
+    /// baseline gains `deploy.intent`, and every row it already holds reads
+    /// `deploy` (the column default), so no backfill is needed.
+    #[tokio::test]
+    async fn the_intent_step_upgrades_a_stamped_database() {
+        let mut conn = memory().await;
+        sqlx::raw_sql(
+            "CREATE TABLE main.deploy (id TEXT PRIMARY KEY, status TEXT NOT NULL); \
+             INSERT INTO main.deploy (id, status) VALUES ('d1', 'failed'); \
+             CREATE TABLE main.app (id TEXT PRIMARY KEY, slug TEXT); \
+             PRAGMA main.user_version = 100;",
+        )
+        .execute(&mut conn)
+        .await
+        .expect("seed a baseline database");
+        apply(
+            &mut conn,
+            "CREATE TABLE IF NOT EXISTS main.app (id TEXT PRIMARY KEY, slug TEXT);",
+            SCHEMA_VERSION,
+            MIGRATIONS,
+        )
+        .await
+        .expect("migrate forward");
+        assert_eq!(version(&mut conn).await, SCHEMA_VERSION);
+        let intent: String = sqlx::query_scalar("SELECT intent FROM main.deploy WHERE id = 'd1'")
+            .fetch_one(&mut conn)
+            .await
+            .expect("intent column");
+        assert_eq!(intent, "deploy");
+    }
+
     #[tokio::test]
     async fn a_step_above_the_baseline_migrates_forward() {
         let mut conn = memory().await;
         apply(&mut conn, BASELINE, SCHEMA_VERSION, MIGRATIONS)
             .await
             .expect("baseline");
-        let next = FIRST_COMPACTED_VERSION + 1;
+        let next = SCHEMA_VERSION + 1;
         let steps = [Migration {
             version: next,
             sql: "ALTER TABLE main.app ADD COLUMN note TEXT;",
