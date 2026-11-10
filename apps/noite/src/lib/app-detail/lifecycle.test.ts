@@ -13,8 +13,15 @@ import {
   lifecycleView,
 } from "./lifecycle";
 
-const view = (status: string, desiredState: string) =>
-  lifecycleView(appLifecycle({ desiredState, status }), desiredState);
+const view = (
+  status: string,
+  desiredState: string,
+  fleetHold?: { hold: "crash" | "oom"; retryAt: string } | null
+) =>
+  lifecycleView(
+    appLifecycle({ desiredState, fleetHold, status }),
+    desiredState
+  );
 
 describe("appLifecycle", () => {
   test("a stop beats a failed status: the dot and the button agree", () => {
@@ -76,6 +83,69 @@ describe("appLifecycle", () => {
         "running"
       ).retryable
     ).toBe(true);
+  });
+
+  // The badge table for a fleet the supervisor is retrying: the row still
+  // says `running`, and the UI must not paint a green dot over a fleet that
+  // crashed or was OOM-killed.
+  test("a crash-held fleet reads as crashed, retrying, with its retry time", () => {
+    const retryAt = "2026-11-10T16:40:05.000Z";
+
+    expect(
+      appLifecycle({
+        desiredState: "running",
+        fleetHold: { hold: "crash", retryAt },
+        status: "running",
+      })._tag
+    ).toBe("Held");
+    expect(view("running", "running", { hold: "crash", retryAt })).toEqual({
+      action: "stop",
+      label: "Crashed, retrying",
+      retryAt,
+      retryable: false,
+      tone: "status-error",
+    });
+  });
+
+  test("an OOM-held fleet names the memory kill", () => {
+    const retryAt = "2026-11-10T16:40:05.000Z";
+
+    expect(
+      lifecycleView(
+        appLifecycle({
+          desiredState: "running",
+          fleetHold: { hold: "oom", retryAt },
+          status: "running",
+        }),
+        "running"
+      )
+    ).toMatchObject({ label: "Out of memory, retrying", retryAt });
+  });
+
+  test("a hold leaves the states that are not a live fleet alone", () => {
+    const fleetHold = {
+      hold: "crash" as const,
+      retryAt: "2026-11-10T16:40:05.000Z",
+    };
+
+    // A deliberate stop still reads Stopped (a stopped app is not retried).
+    expect(
+      appLifecycle({ desiredState: "stopped", fleetHold, status: "stopped" })
+        ._tag
+    ).toBe("Stopped");
+    // A deploy in flight owns the label while its pipeline runs.
+    expect(
+      appLifecycle({ desiredState: "running", fleetHold, status: "building" })
+        ._tag
+    ).toBe("Deploying");
+    // And no hold at all is the plain running row.
+    expect(
+      appLifecycle({
+        desiredState: "running",
+        fleetHold: null,
+        status: "running",
+      })._tag
+    ).toBe("Live");
   });
 
   test("the runner's schema-default pending row paints as itself", () => {

@@ -6,6 +6,7 @@ import { kebabCase } from "scule";
 
 import { appLifecycle, lifecycleView } from "../app-detail/lifecycle";
 import { isLocalhostDomain } from "../local-host";
+import type { FleetHoldInfo } from "../runner-types/FleetHoldInfo";
 
 // Letters, digits, plus hyphens: fold whitespace, drop other symbols,
 // and trim edge hyphens so live slugs match the create/rename gate.
@@ -36,12 +37,17 @@ export const initials = (name: string): string => {
 
 /** Presence dot tone, one source (`lifecycle.ts`): running = green, error =
  * red, sleeping (scale to zero: healthy, parked until its next request) or
- * stopped = neutral, mid-pipeline = yellow. Pass `desiredState` when the row
- * has it, so a deliberate stop paints neutral before the observed status has
- * converged. */
-export const presenceTone = (status: string, desiredState?: string): string =>
+ * stopped = neutral, mid-pipeline = yellow, a held (crash/OOM) fleet = red
+ * like the header's badge. Pass `desiredState` when the row has it, so a
+ * deliberate stop paints neutral before the observed status has converged,
+ * and `fleetHold` so the dot agrees with the "crashed, retrying" label. */
+export const presenceTone = (
+  status: string,
+  desiredState?: string,
+  fleetHold?: FleetHoldInfo | null
+): string =>
   lifecycleView(
-    appLifecycle({ desiredState, status }),
+    appLifecycle({ desiredState, fleetHold, status }),
     desiredState ?? "running"
   ).tone;
 

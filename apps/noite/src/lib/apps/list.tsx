@@ -282,8 +282,14 @@ export const AppsList = () => {
               <div>
                 <Avatar
                   label={app.name}
-                  status={app.status}
-                  tone={presenceTone(app.status)}
+                  status={
+                    app.fleetHold ? `${app.status} (retrying)` : app.status
+                  }
+                  tone={presenceTone(
+                    app.status,
+                    app.desiredState,
+                    app.fleetHold
+                  )}
                 />
               </div>
               <div>

@@ -244,14 +244,16 @@ pub async fn app_state_stream(State(state): State<AppState>, Path(id): Path<Stri
         Err(e) => return e.into_response(),
     };
     let pool = state.pool.clone();
+    let procs = state.procs.clone();
     let app_id = app.id;
     poll_stream("state", Duration::from_secs(2), move || {
         let pool = pool.clone();
+        let procs = procs.clone();
         let app_id = app_id.clone();
         async move {
             // A deleted app has nothing left to show: skip the tick, the page
             // that holds the stream navigates away.
-            let app = match db::get_app(&pool, &app_id).await {
+            let mut app = match db::get_app(&pool, &app_id).await {
                 Ok(Some(app)) => app,
                 Ok(None) => return None,
                 Err(e) => {
@@ -259,6 +261,9 @@ pub async fn app_state_stream(State(state): State<AppState>, Path(id): Path<Stri
                     return None;
                 }
             };
+            // The frame carries the hold too, so a badge that flips to
+            // "crashed, retrying" no longer waits for a refetch.
+            crate::host::supervisor::annotate_holds(&procs, std::slice::from_mut(&mut app)).await;
             let environments = match db::list_environments(&pool, &app_id).await {
                 Ok(rows) => rows,
                 Err(e) => {

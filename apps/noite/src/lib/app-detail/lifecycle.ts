@@ -11,7 +11,8 @@
 //! callers also paint rows whose status the wire did not type; the runtime
 //! decode (`isAppStatus`) turns those into the generated union.
 //!
-//! App lifecycle (`appLifecycle`) — status × desiredState × imported:
+//! App lifecycle (`appLifecycle`) — status × desiredState × imported × the
+//! fleet's hold:
 //!
 //! ```mermaid
 //! stateDiagram-v2
@@ -19,6 +20,7 @@
 //!   [*] --> Importing: status importing
 //!   [*] --> ImportFailed: status error
 //!   [*] --> Deploying: status building | deploying
+//!   [*] --> Held: status running + fleetHold (crash | oom)
 //!   [*] --> Live: status running
 //!   [*] --> Live: status sleeping (asleep)
 //!   [*] --> Stopping: desired stopped, not yet stopped
@@ -27,6 +29,11 @@
 //!   [*] --> Failed: status failed
 //!   [*] --> Unknown: any other string
 //! ```
+//!
+//! `Held` is the runner's crash/OOM backoff for a fleet whose row still reads
+//! `running` (`AppStatusPage.fleetHold`): the app is not serving, and the badge
+//! says so with the instant the next attempt is due. It never changes the
+//! status the runner wrote, only how the UI paints it.
 //!
 //! Every transition is a pure re-derivation: the runner is the only writer,
 //! the UI paints one function of its row. `canStart`/`canStop` and `action`
@@ -39,11 +46,14 @@ import type { AppStatus } from "../runner-types/AppStatus";
 import type { DeployIntent } from "../runner-types/DeployIntent";
 import type { DeployStatus } from "../runner-types/DeployStatus";
 import type { DesiredState } from "../runner-types/DesiredState";
+import type { FleetHoldInfo } from "../runner-types/FleetHoldInfo";
 
 export type { DesiredState } from "../runner-types/DesiredState";
 
 export interface AppStatusPage {
   readonly desiredState?: string | undefined;
+  /** The supervisor's crash/OOM backoff, when the wire carried one. */
+  readonly fleetHold?: FleetHoldInfo | null | undefined;
   readonly imported?: boolean | undefined;
   readonly status: string;
 }
@@ -345,6 +355,7 @@ export type AppLifecycle = Data.TaggedEnum<{
   ImportFailed: { readonly retryable: boolean };
   Deploying: Record<never, never>;
   Live: { readonly asleep: boolean };
+  Held: { readonly hold: FleetHoldInfo["hold"]; readonly retryAt: string };
   Starting: Record<never, never>;
   Stopping: Record<never, never>;
   Stopped: Record<never, never>;
@@ -379,6 +390,22 @@ export const appLifecycle = (app: AppStatusPage): AppLifecycle => {
       : AppLifecycleTypes.Stopping();
   }
 
+  // A held fleet's row says `running` (the supervisor only holds a live
+  // fleet), and the backoff is the reason it is not serving: paint that
+  // instead of a green dot, with the instant the next attempt is due. A row
+  // that is stopped, deploying or failed keeps its own state — the hold is
+  // about the fleet, not about the pipeline.
+  if (
+    app.status === "running" &&
+    app.fleetHold !== null &&
+    app.fleetHold !== undefined
+  ) {
+    return AppLifecycleTypes.Held({
+      hold: app.fleetHold.hold,
+      retryAt: app.fleetHold.retryAt,
+    });
+  }
+
   if (app.status === "running") {
     return AppLifecycleTypes.Live({ asleep: false });
   }
@@ -406,6 +433,8 @@ export interface LifecycleView {
   /** The header's one toggle, or null when the app has nothing to run yet. */
   readonly action: "start" | "stop" | null;
   readonly retryable: boolean;
+  /** A held fleet's next attempt (RFC 3339), for the badge beside the label. */
+  readonly retryAt?: string | undefined;
 }
 
 /** Derive the header's paint from {@link appLifecycle}: the toggle follows
@@ -461,6 +490,19 @@ export const lifecycleView = (
         label: lifecycle.asleep ? "Sleeping" : "Running",
         retryable: false,
         tone: lifecycle.asleep ? "status-neutral" : "status-success",
+      };
+    }
+
+    case "Held": {
+      return {
+        action,
+        label:
+          lifecycle.hold === "oom"
+            ? "Out of memory, retrying"
+            : "Crashed, retrying",
+        retryAt: lifecycle.retryAt,
+        retryable: false,
+        tone: "status-error",
       };
     }
 

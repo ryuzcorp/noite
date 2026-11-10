@@ -12,7 +12,7 @@ use crate::config::Config;
 use crate::db;
 use crate::host::logs::LogState;
 use crate::host::{credentials, logs};
-use crate::models::App;
+use crate::models::{App, FleetHold, FleetHoldInfo};
 use sqlx::SqlitePool;
 
 /// Send SIGTERM to a pid (replaces the `/bin/sh -c kill` workaround; the
@@ -1113,6 +1113,33 @@ async fn spawn_failed(procs: &ProcMap, key: &str, epoch: u64) {
         return;
     }
     entry.state = entry.state.on(FleetEvent::SpawnFailed);
+}
+
+/// Fill every app's [`crate::models::App::fleet_hold`] from the supervisor's
+/// state, in one pass under the map lock: the one thing about a fleet the row
+/// cannot carry, and the reason a crash-looping app no longer has to look
+/// `running` in the UI. A fleet that is not in a crash/OOM hold — healthy,
+/// spawning, parked, stopped — has no hold to report.
+pub async fn annotate_holds(procs: &ProcMap, apps: &mut [App]) {
+    let map = procs.lock().await;
+    for app in apps.iter_mut() {
+        app.fleet_hold = map.get(&app.slug).and_then(|entry| match entry.state {
+            FleetState::CrashHeld { until, .. } => Some(hold_info(FleetHold::Crash, until)),
+            FleetState::OomHeld { until, .. } => Some(hold_info(FleetHold::Oom, until)),
+            _ => None,
+        });
+    }
+}
+
+/// The API shape of one hold: the reason plus the wall-clock instant the next
+/// spawn is due (the state keeps a monotonic `Instant`).
+fn hold_info(hold: FleetHold, until: Instant) -> FleetHoldInfo {
+    let wait = until.saturating_duration_since(Instant::now());
+    FleetHoldInfo {
+        hold,
+        retry_at: (chrono::Utc::now() + chrono::Duration::from_std(wait).unwrap_or_default())
+            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+    }
 }
 
 /// When `key`'s next spawn is held back (a crash or OOM backoff), the instant
@@ -2509,6 +2536,102 @@ mod tests {
             "a stop clears the chain and its window with it"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A held fleet is visible on the app row without touching its status: the
+    /// crash/OOM backoff (what makes a crash-looping app stop reading
+    /// `running`) and the instant the next attempt is due. A fleet that is not
+    /// held — parked, healthy, spawning, stopped — reports nothing, so the
+    /// field cannot be read as "not running yet".
+    #[tokio::test]
+    async fn a_held_fleet_reports_its_hold() {
+        use crate::models::FleetHold as Hold;
+        let procs = new_procs();
+        let until = Instant::now() + Duration::from_secs(30);
+        let mut apps = vec![
+            app_row("crash-held"),
+            app_row("oom-held"),
+            app_row("parked"),
+            app_row("healthy"),
+            app_row("stopped"),
+        ];
+        {
+            let mut map = procs.lock().await;
+            map.insert(
+                "crash-held".into(),
+                FleetEntry::new(None, FleetState::CrashHeld { crashes: 2, until }),
+            );
+            map.insert(
+                "oom-held".into(),
+                FleetEntry::new(None, FleetState::OomHeld { crashes: 3, until }),
+            );
+            map.insert(
+                "parked".into(),
+                FleetEntry::new(None, FleetState::Asleep { until: Some(until) }),
+            );
+            map.insert(
+                "healthy".into(),
+                FleetEntry::new(
+                    None,
+                    FleetState::Healthy {
+                        since: Instant::now(),
+                        crashes: 0,
+                    },
+                ),
+            );
+            map.insert("stopped".into(), FleetEntry::new(None, FleetState::Stopped));
+        }
+        annotate_holds(&procs, &mut apps).await;
+        let crash = apps[0]
+            .fleet_hold
+            .as_ref()
+            .expect("the crash hold is served");
+        assert_eq!(crash.hold, Hold::Crash);
+        let retry = chrono::DateTime::parse_from_rfc3339(&crash.retry_at).expect("RFC 3339");
+        let wait = retry
+            .signed_duration_since(chrono::Utc::now())
+            .num_seconds();
+        assert!(
+            (25..=31).contains(&wait),
+            "retryAt is the hold's deadline, got {wait}s"
+        );
+        assert_eq!(apps[1].fleet_hold.as_ref().map(|h| h.hold), Some(Hold::Oom));
+        for app in &apps[2..] {
+            assert!(
+                app.fleet_hold.is_none(),
+                "{} is not held: {:?}",
+                app.slug,
+                app.fleet_hold
+            );
+        }
+    }
+
+    /// A bare row for the hold tests: nothing outside `slug` and `status`
+    /// matters to `annotate_holds`.
+    fn app_row(slug: &str) -> App {
+        App {
+            id: format!("app-{slug}"),
+            slug: slug.into(),
+            name: slug.into(),
+            user_id: "u".into(),
+            status: crate::models::AppStatus::Running,
+            subdomain: format!("{slug}.localhost"),
+            git_prefix: format!("git/{slug}"),
+            fleet_bucket: format!("s3://noite/fleets/{slug}"),
+            listen_port: Some(20011),
+            internal_port: Some(20012),
+            last_deploy_sha: Some("abc".into()),
+            last_error: None,
+            desired_state: crate::models::DesiredState::Running,
+            created_at: "t".into(),
+            updated_at: "t".into(),
+            asleep_since: None,
+            woke_at: None,
+            deployed_config: None,
+            import_source: None,
+            imported: false,
+            fleet_hold: None,
+        }
     }
 
     /// A late probe or confirm for a fleet that is gone must not create an
