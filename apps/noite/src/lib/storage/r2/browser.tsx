@@ -26,6 +26,7 @@ import {
   nextFolder,
   nextSelection as nextSelectionState,
   prevFolder,
+  r2Confirming,
   R2Sel,
   startFolder,
 } from "./folder";
@@ -64,6 +65,60 @@ const ViewSwitch = ({
         {R2_VIEW_LABELS[candidate]}
       </button>
     ))}
+  </div>
+);
+
+/** The bulk-delete bar. One persistent Delete button arms the delete on the
+ * first click and confirms it on the second; keeping the same node (and its
+ * box) is what makes the two clicks deterministic for the e2e lane. */
+const BulkDeleteBar = ({
+  confirming,
+  count,
+  deleting: busy,
+  onCancel,
+  onClear,
+  onDelete,
+}: {
+  confirming: boolean;
+  count: number;
+  deleting: boolean;
+  onCancel: () => void;
+  onClear: () => void;
+  onDelete: () => void;
+}) => (
+  <div class="bg-base-200 dark:bg-base-300/50 flex flex-wrap items-center gap-2 px-3 py-1.5 text-sm">
+    <span class="font-medium">{count} selected</span>
+    <button
+      type="button"
+      class="btn btn-sm btn-error"
+      disabled={busy}
+      onclick={onDelete}
+    >
+      {busy ? "Deleting…" : "Delete"}
+    </button>
+    {confirming ? (
+      <button
+        type="button"
+        class="btn btn-sm btn-ghost"
+        disabled={busy}
+        onclick={onCancel}
+      >
+        Cancel
+      </button>
+    ) : null}
+    {confirming ? (
+      <span class="text-error">
+        Delete {count} object(s)? This cannot be undone.
+      </span>
+    ) : null}
+    <button
+      type="button"
+      class="btn btn-sm btn-ghost ml-auto"
+      disabled={busy}
+      onclick={onClear}
+    >
+      Clear
+    </button>
   </div>
 );
 
@@ -375,32 +430,26 @@ const R2Page = ({
         </p>
       )}
       {checkedKeys.length > 0 && canWrite ? (
-        <div class="bg-base-200 dark:bg-base-300/50 flex flex-wrap items-center gap-2 px-3 py-1.5 text-sm">
-          <span class="font-medium">{checkedKeys.length} selected</span>
-          <span class="text-error">
-            Delete {checkedKeys.length} object(s)? This cannot be undone.
-          </span>
-          <button
-            type="button"
-            class="btn btn-sm btn-error"
-            disabled={deleting(write())}
-            onclick={() => {
+        <BulkDeleteBar
+          confirming={r2Confirming(selection())}
+          count={checkedKeys.length}
+          deleting={deleting(write())}
+          onCancel={() => {
+            selection.set(nextSelectionState(selection(), R2Sel.CancelArm()));
+          }}
+          onClear={() => {
+            selection.set(nextSelectionState(selection(), R2Sel.Clear()));
+          }}
+          onDelete={() => {
+            if (r2Confirming(selection())) {
               void runDelete(checkedKeys);
-            }}
-          >
-            {deleting(write()) ? "Deleting…" : "Delete"}
-          </button>
-          <button
-            type="button"
-            class="btn btn-sm btn-ghost ml-auto"
-            disabled={deleting(write())}
-            onclick={() => {
-              selection.set(nextSelectionState(selection(), R2Sel.Clear()));
-            }}
-          >
-            Clear
-          </button>
-        </div>
+
+              return;
+            }
+
+            selection.set(nextSelectionState(selection(), R2Sel.Arm()));
+          }}
+        />
       ) : null}
       <div class="flex min-h-0 flex-1 flex-col lg:flex-row">
         <div class="flex min-h-0 min-w-0 flex-1 flex-col">

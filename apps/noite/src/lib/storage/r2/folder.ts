@@ -55,11 +55,17 @@ export const prevFolder = (state: FolderCursors): FolderCursors => ({
 
 // ---- Selection -----------------------------------------------------------
 
+/** Where the bulk bar is: picking objects, or asking whether to delete the
+ * checked ones. Deleting itself belongs to the write machine (./write). */
+export type R2SelectionPhase = "confirming" | "selecting";
+
 export interface R2Selection {
   /** The object the detail panel shows. */
   readonly focused: string | null;
   /** The objects a bulk delete would remove. */
   readonly checked: readonly string[];
+  /** `confirming` once Delete was clicked; any selection change drops it. */
+  readonly phase: R2SelectionPhase;
 }
 
 export type R2SelectionEvent = Data.TaggedEnum<{
@@ -73,6 +79,10 @@ export type R2SelectionEvent = Data.TaggedEnum<{
   Sync: { readonly visible: readonly string[] };
   /** Clear the checks (the bulk bar's Clear, or a finished delete). */
   Clear: Record<never, never>;
+  /** Arm the bulk delete: the bar asks for a second, confirming click. */
+  Arm: Record<never, never>;
+  /** Drop the armed confirmation without touching the checks. */
+  CancelArm: Record<never, never>;
 }>;
 
 export const R2Sel = Data.taggedEnum<R2SelectionEvent>();
@@ -80,7 +90,12 @@ export const R2Sel = Data.taggedEnum<R2SelectionEvent>();
 export const emptySelection = (): R2Selection => ({
   checked: [],
   focused: null,
+  phase: "selecting",
 });
+
+/** Whether the bulk bar is asking for the confirming click. */
+export const r2Confirming = (selection: R2Selection): boolean =>
+  selection.phase === "confirming";
 
 /** The checked keys that are visible right now: exactly what a delete may
  * remove. */
@@ -119,6 +134,7 @@ export const nextSelection = (
       return {
         ...selection,
         checked: toggleKey(selection.checked, event.key, event.on),
+        phase: "selecting",
       };
     }
 
@@ -127,18 +143,33 @@ export const nextSelection = (
         event.visible.length > 0 &&
         event.visible.every((key) => selection.checked.includes(key));
 
-      return { ...selection, checked: all ? [] : [...event.visible] };
+      return {
+        ...selection,
+        checked: all ? [] : [...event.visible],
+        phase: "selecting",
+      };
     }
 
     case "Sync": {
       return {
         ...selection,
         checked: checkedVisible(selection, event.visible),
+        phase: "selecting",
       };
     }
 
     case "Clear": {
-      return { ...selection, checked: [] };
+      return { ...selection, checked: [], phase: "selecting" };
+    }
+
+    case "Arm": {
+      return selection.checked.length === 0
+        ? selection
+        : { ...selection, phase: "confirming" };
+    }
+
+    case "CancelArm": {
+      return { ...selection, phase: "selecting" };
     }
 
     default: {

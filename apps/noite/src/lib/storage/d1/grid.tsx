@@ -302,51 +302,51 @@ const GridIsland = defineApp({
         {selected.length > 0 ? (
           <div class="bg-base-200 dark:bg-base-300/50 flex flex-wrap items-center gap-2 px-3 py-1.5 text-sm">
             <span class="font-medium">{selected.length} selected</span>
+            {/* One persistent Delete button: the first click arms the delete
+                (./selection's `Confirm`), the second confirms it. Keeping the
+                same node and box is what makes the two clicks deterministic
+                for the e2e lane. */}
+            <button
+              type="button"
+              class="btn btn-sm btn-error"
+              disabled={model._tag === "Deleting"}
+              onclick={() => {
+                if (armed) {
+                  dispatch(
+                    Msg.DeleteRequested({
+                      appId,
+                      databaseId,
+                      keys: selected,
+                      notify: onToast,
+                      table: data.table,
+                    })
+                  );
+
+                  return;
+                }
+
+                dispatch(Msg.Armed());
+              }}
+            >
+              {model._tag === "Deleting" ? "Deleting…" : "Delete"}
+            </button>
             {armed ? (
-              <>
-                <span class="text-error">
-                  Delete {selected.length} row(s)? This cannot be undone.
-                </span>
-                <button
-                  type="button"
-                  class="btn btn-sm btn-error"
-                  disabled={model._tag === "Deleting"}
-                  onclick={() => {
-                    dispatch(
-                      Msg.DeleteRequested({
-                        appId,
-                        databaseId,
-                        keys: selected,
-                        notify: onToast,
-                        table: data.table,
-                      })
-                    );
-                  }}
-                >
-                  {model._tag === "Deleting" ? "Deleting…" : "Delete"}
-                </button>
-                <button
-                  type="button"
-                  class="btn btn-sm btn-ghost"
-                  disabled={model._tag === "Deleting"}
-                  onclick={() => {
-                    dispatch(Msg.Cancelled());
-                  }}
-                >
-                  Cancel
-                </button>
-              </>
-            ) : (
               <button
                 type="button"
                 class="btn btn-sm btn-ghost"
+                disabled={model._tag === "Deleting"}
                 onclick={() => {
-                  dispatch(Msg.Armed());
+                  dispatch(Msg.Cancelled());
                 }}
               >
-                Delete
+                Cancel
               </button>
-            )}
+            ) : null}
+            {armed ? (
+              <span class="text-error">
+                Delete {selected.length} row(s)? This cannot be undone.
+              </span>
+            ) : null}
             <button
               type="button"
               class="btn btn-sm btn-ghost ml-auto"
