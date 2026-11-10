@@ -1,0 +1,3 @@
+### Fixed
+
+- Code mode: typing into the editor could be cut short when the pod's own change feed arrived mid-keystroke. The pane's sync takes a read of the pod, and a keystroke that landed while that read was in flight kept its token, so the read's older bytes were painted over the typing: the repaint rebuilt the document, pierre dropped the keys after it, and both the editor and the pod kept only the prefix that was typed before the read landed (`source-tree.spec.ts` "two tabs on one branch edit the same workspace", "a change survives a tab restart" and "the tree menu adds and deletes a file"). A keystroke now spends the token of any read the pod is still answering, so only bytes the surface has not moved past can paint it.
