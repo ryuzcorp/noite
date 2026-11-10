@@ -1,7 +1,8 @@
 //! Observability: metrics, spans, logs (thin adapters over
 //! `service::observe`) + the notify-driven live log tail.
-use std::future::Future;
 use std::time::Duration;
+
+use tokio::time::Instant;
 
 use axum::{
     extract::{Path, Query, State},
@@ -14,6 +15,7 @@ use axum::{
 use serde::Deserialize;
 use tokio_stream::wrappers::ReceiverStream;
 
+use crate::api::sse::{StreamEvent, StreamMachine, SNAPSHOT_TIMEOUT, STALL_BUDGET};
 use crate::service;
 use crate::AppState;
 
@@ -105,28 +107,16 @@ pub async fn app_logs(
         .map(Json)
 }
 
-/// First log snapshot under a bound. `None` means the snapshot hung past
-/// `timeout` (warned here); the caller must end the stream with an error
-/// instead of holding an open, frameless stream. Split out so tests can
-/// drive it with a future that never answers on paused time.
-async fn first_lines<F>(lines: F, timeout: Duration) -> Option<Vec<String>>
-where
-    F: Future<Output = Vec<String>> + Send,
-{
-    match tokio::time::timeout(timeout, lines).await {
-        Ok(lines) => Some(lines),
-        Err(_) => {
-            tracing::warn!("logs stream: snapshot timed out before the first frame");
-            None
-        }
-    }
-}
-
 /// Live log tail as server-sent events: one JSON array per message, sent
 /// only when the snapshot changed (plus keep-alive comments). Wakes on the
 /// ingest tick's "new logs" signal (spec T3.3) instead of polling DuckDB, and
 /// ends when the client disconnects. `?environmentId=` serves that
 /// environment's own ring and its ingested OTel logs, never production's.
+///
+/// The loop shares [`StreamMachine`] with the poll-driven streams: a snapshot
+/// that hangs past the first-frame budget (or a run of failures past the
+/// stall budget) ends the stream with an error, which the hub reports as
+/// retrying, instead of leaving an open, frameless topic.
 pub async fn app_logs_stream(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -143,46 +133,39 @@ pub async fn app_logs_stream(
     // Mark seen so snapshots that predate the subscription don't replay.
     let _ = notify.borrow_and_update();
     tokio::spawn(async move {
-        let mut last: Option<Vec<String>> = None;
-        // The first snapshot drives the stream's first frame, so it runs
-        // under the same bound as the poll-driven streams: a hung snapshot
-        // ends the stream with an error instead of holding an open, frameless
-        // stream (the hub reports the drop as retrying and reopens the
-        // topic). Later snapshots ride the notify/heartbeat loop and keep
-        // retrying silently, like the poll streams do once framed.
-        let mut first = true;
+        let mut machine = StreamMachine::new();
         loop {
-            let lines = if first {
-                first = false;
-                match first_lines(source.lines(&state), super::sse::SNAPSHOT_TIMEOUT).await {
-                    Some(lines) => lines,
-                    None => {
-                        let _ = tx
-                            .send(Err(anyhow::anyhow!(
-                                "logs stream: no first frame within {:?}",
-                                super::sse::SNAPSHOT_TIMEOUT
-                            )))
-                            .await;
-                        break;
-                    }
-                }
-            } else {
-                source.lines(&state).await
-            };
-            if last.as_ref() != Some(&lines) {
-                // A blank event would paint a fake empty tail; skip the tick
-                // instead so the next one retries.
-                match serde_json::to_string(&lines) {
-                    Ok(data) => {
-                        if tx.send(Ok(Event::default().data(data))).await.is_err() {
-                            break;
-                        }
-                        last = Some(lines);
-                    }
+            let event = match tokio::time::timeout(SNAPSHOT_TIMEOUT, source.lines(&state)).await {
+                Ok(lines) => match serde_json::to_string(&lines) {
+                    Ok(data) => StreamEvent::Snapshot(Some(data)),
                     Err(e) => {
                         tracing::warn!(error = %e, "logs stream: dropping unserializable snapshot");
+                        StreamEvent::PollFailed("unserializable")
                     }
+                },
+                Err(_) => StreamEvent::PollFailed("timed out"),
+            };
+            let (next, step) = machine.on(event, Instant::now(), SNAPSHOT_TIMEOUT, STALL_BUDGET);
+            machine = next;
+            if let Some((failures, kind)) = step.warn {
+                tracing::warn!(
+                    scope = "logs",
+                    failures,
+                    kind,
+                    "logs stream produced no frame"
+                );
+            }
+            if let Some(data) = step.frame {
+                if tx.send(Ok(Event::default().data(data))).await.is_err() {
+                    break;
                 }
+            }
+            if let Some(error) = step.end {
+                let _ = tx.send(Err(error)).await;
+                break;
+            }
+            if machine.ended() {
+                break;
             }
             // Wake on new ingested logs, on a 30 s heartbeat cadence, or stop
             // promptly when the client leaves (T1.2): the send-failure check
@@ -199,33 +182,4 @@ pub async fn app_logs_stream(
     Sse::new(ReceiverStream::new(rx))
         .keep_alive(KeepAlive::default())
         .into_response()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn a_hung_first_snapshot_resolves_to_no_frame() {
-        tokio::time::pause();
-        let hung = first_lines(
-            std::future::pending::<Vec<String>>(),
-            Duration::from_millis(50),
-        );
-        tokio::time::advance(Duration::from_secs(1)).await;
-        assert!(
-            hung.await.is_none(),
-            "a hung logs snapshot must resolve within its bound instead of hanging the stream open"
-        );
-    }
-
-    #[tokio::test]
-    async fn a_ready_first_snapshot_passes_through() {
-        let lines = first_lines(
-            async { vec!["booted".to_owned()] },
-            Duration::from_millis(50),
-        )
-        .await;
-        assert_eq!(lines, Some(vec!["booted".to_owned()]));
-    }
 }

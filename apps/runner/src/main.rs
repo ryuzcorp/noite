@@ -32,6 +32,89 @@ use crate::host::logs::LogState;
 use crate::host::supervisor::ProcMap;
 use crate::lifecycle::DEPLOY_STUCK_MS;
 
+/// Why `/ready` answers 503. One closed type so the four independent signals
+/// cannot be combined into an unrepresentable mix: the gate is `Ready` only
+/// when every producer succeeded.
+///
+/// stateDiagram-v2
+///   [*] --> Degraded: boot (reconcile has not passed yet)
+///   Degraded --> Ready: every probe passes
+///   Ready --> Degraded: a probe fails
+///   Degraded --> Blocked: isolation refused
+///   Blocked --> Degraded: isolation restored
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Readiness {
+    Ready,
+    Degraded {
+        failures: Vec<ReadyFailure>,
+    },
+    /// Multi-tenant containment failed: `/ready` never recovers on its own.
+    Blocked {
+        failures: Vec<ReadyFailure>,
+    },
+}
+
+/// One reason `/ready` is not green. The rendered text is the wire contract
+/// (`failing` array), so each variant keeps today's wording.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReadyFailure {
+    Reconcile,
+    Bucket(String),
+    Isolation(String),
+    Cgroups(String),
+    Control(String),
+    Caddy(String),
+}
+
+impl ReadyFailure {
+    pub fn message(&self) -> String {
+        match self {
+            Self::Reconcile => "reconcile".to_string(),
+            Self::Bucket(detail) => format!("bucket: {detail}"),
+            Self::Isolation(detail) => format!("isolation: {detail}"),
+            Self::Cgroups(detail) => format!("cgroups: {detail}"),
+            Self::Control(detail) => format!("control: {detail}"),
+            Self::Caddy(detail) => format!("caddy: {detail}"),
+        }
+    }
+}
+
+impl Readiness {
+    /// The one transition: resolve the current outputs into a state. An
+    /// isolation block is terminal (`Blocked`) regardless of the other
+    /// probes; the first reconcile pass is prefixed to the failures so the
+    /// `failing` array keeps the pre-machine order and wording.
+    pub fn resolve(reconciled: bool, mut failures: Vec<ReadyFailure>) -> Self {
+        if !reconciled {
+            failures.insert(0, ReadyFailure::Reconcile);
+        }
+        if failures
+            .iter()
+            .any(|f| matches!(f, ReadyFailure::Isolation(_)))
+        {
+            return Self::Blocked { failures };
+        }
+        match failures.len() {
+            0 => Self::Ready,
+            _ => Self::Degraded { failures },
+        }
+    }
+
+    pub fn ok(&self) -> bool {
+        matches!(self, Self::Ready)
+    }
+
+    /// The `failing` array, byte-identical to the pre-machine response.
+    pub fn failing(&self) -> Vec<String> {
+        match self {
+            Self::Ready => Vec::new(),
+            Self::Degraded { failures } | Self::Blocked { failures } => {
+                failures.iter().map(ReadyFailure::message).collect()
+            }
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct AppState {
     pub pool: SqlitePool,

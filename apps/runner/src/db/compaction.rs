@@ -4,17 +4,23 @@ use sqlx::SqlitePool;
 
 use crate::models::now_iso;
 
-/// Durable compaction watermark (spec T3.5): the last compacted hour per
-/// slug, so an hour due while the runner was down is still folded later.
+/// Durable compaction marks (spec T3.5): every compacted hour per slug, so
+/// an hour due while the runner was down is still folded later, and a hole
+/// left by a failed fold is visible instead of hidden behind a high-water
+/// mark.
 pub async fn get_compacted_hours(
     pool: &SqlitePool,
-) -> sqlx::Result<std::collections::HashMap<String, String>> {
-    // One row per (slug, hour); the max hour per slug is the watermark.
+) -> sqlx::Result<std::collections::HashMap<String, Vec<String>>> {
     let rows: Vec<(String, String)> =
-        sqlx::query_as("SELECT slug, MAX(hour) FROM metrics.metric_compaction GROUP BY slug")
+        sqlx::query_as("SELECT slug, hour FROM metrics.metric_compaction ORDER BY slug, hour")
             .fetch_all(pool)
             .await?;
-    Ok(rows.into_iter().collect())
+    let mut marks: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
+    for (slug, hour) in rows {
+        marks.entry(slug).or_default().push(hour);
+    }
+    Ok(marks)
 }
 
 pub async fn mark_hour_compacted(pool: &SqlitePool, slug: &str, hour: &str) -> sqlx::Result<()> {

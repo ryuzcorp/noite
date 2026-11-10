@@ -218,8 +218,9 @@ pub struct ErrorRequest<'a> {
 /// caller-supplied trace id and its own URL-derived path, and another
 /// app's occurrence sharing the trace id must never receive this app's
 /// request.
-pub async fn backfill_error_request(
-    pool: &SqlitePool,
+/// Backfill inside an existing transaction/connection.
+pub(crate) async fn backfill_error_request(
+    conn: &mut sqlx::SqliteConnection,
     app_id: &str,
     environment_id: &str,
     trace_id: &str,
@@ -239,7 +240,7 @@ pub async fn backfill_error_request(
     .bind(app_id)
     .bind(environment_id)
     .bind(trace_id)
-    .execute(pool)
+    .execute(&mut *conn)
     .await?;
     Ok(res.rows_affected())
 }
