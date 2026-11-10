@@ -151,7 +151,7 @@ describe("Started", () => {
     });
     expect(tags(decision.effects)).toEqual([
       "Admit:started",
-      "Persist:Running",
+      "MarkRunning",
       "Touch",
       "Arm",
     ]);

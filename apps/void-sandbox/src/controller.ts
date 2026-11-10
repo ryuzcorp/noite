@@ -677,6 +677,20 @@ export class SandboxController extends SandboxContainer<ControllerEnv> {
     await this.ctx.storage.deleteAlarm();
   }
 
+  /**
+   * Compare-and-set `pending` → `running`. `afterStart` runs outside the lease
+   * lock, so a supersede or a stop must win over this write.
+   */
+  async #markRunning(generation: string): Promise<void> {
+    const lease = await this.#readLease();
+
+    if (lease._tag !== "Pending" || lease.generation !== generation) {
+      return;
+    }
+
+    await this.#saveLease({ _tag: "Running", generation });
+  }
+
   /** Compare-and-set the durable stop mark, for the same reason. */
   async #markStopping(generation: string): Promise<void> {
     const lease = await this.#readLease();
@@ -716,6 +730,12 @@ export class SandboxController extends SandboxContainer<ControllerEnv> {
 
     if (effect._tag === "MarkStopping") {
       await this.#markStopping(effect.generation);
+
+      return;
+    }
+
+    if (effect._tag === "MarkRunning") {
+      await this.#markRunning(effect.generation);
 
       return;
     }

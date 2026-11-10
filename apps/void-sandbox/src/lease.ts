@@ -90,6 +90,8 @@ export type LeaseEffect =
   | { readonly _tag: "Persist"; readonly lease: Lease }
   /** Compare-and-set the durable stop mark; a newer lease is left alone. */
   | { readonly _tag: "MarkStopping"; readonly generation: string }
+  /** Compare-and-set `pending` → `running`; a newer lease is left alone. */
+  | { readonly _tag: "MarkRunning"; readonly generation: string }
   | { readonly _tag: "ReleaseAdmission"; readonly generation: string }
   /** Compare-and-clear: only clears when the record still names `generation`. */
   | { readonly _tag: "Clear"; readonly generation: string }
@@ -229,7 +231,7 @@ const started = (lease: Lease, facts: LeaseFacts): LeaseDecision => {
 
     return next(running, [
       admit("started", lease.generation),
-      { _tag: "Persist", lease: running },
+      { _tag: "MarkRunning", generation: lease.generation },
       { _tag: "Touch" },
       { _tag: "Arm" },
     ]);
