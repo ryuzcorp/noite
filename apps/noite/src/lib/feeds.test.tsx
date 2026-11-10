@@ -312,6 +312,56 @@ describe("feed state machine", () => {
 
     expect(stillRefused).toEqual(refused);
   });
+
+  test("a link that connects again clears a dead panel instead of keeping the error", () => {
+    const offline = nextFeedState<string[]>(
+      { _tag: "Cold" },
+      {
+        conn: ConnTypes.Closed(),
+        kind: "conn",
+      }
+    );
+
+    expect(offline).toEqual({ _tag: "Offline", value: undefined });
+    expect(feedProblem(offline)).not.toBeNull();
+
+    // A replaced stream's teardown, or a hidden tab that comes back: the
+    // panel is loading again, so it paints the skeleton — never the problem
+    // it may already have left behind.
+    expect(
+      nextFeedState<string[]>(offline, {
+        conn: ConnTypes.Connecting(),
+        kind: "conn",
+      })
+    ).toEqual({ _tag: "Cold" });
+
+    // A panel with data keeps it (no skeleton, no error text).
+    const deadWithValue = nextFeedState<string[]>(
+      { _tag: "Cached", value: ["rows"] },
+      { conn: ConnTypes.Closed(), kind: "conn" }
+    );
+
+    expect(feedProblem(deadWithValue)).not.toBeNull();
+    expect(
+      nextFeedState<string[]>(deadWithValue, {
+        conn: ConnTypes.Connecting(),
+        kind: "conn",
+      })
+    ).toEqual({ _tag: "Cached", value: ["rows"] });
+
+    // A paused panel (hidden tab) recovers the same way when it reconnects.
+    const paused = nextFeedState<string[]>(
+      { _tag: "Cold" },
+      { conn: ConnTypes.Paused(), kind: "conn" }
+    );
+
+    expect(
+      nextFeedState<string[]>(paused, {
+        conn: ConnTypes.Connecting(),
+        kind: "conn",
+      })
+    ).toEqual({ _tag: "Cold" });
+  });
 });
 
 describe("connectStream", () => {
@@ -579,6 +629,31 @@ describe("createStreamHub", () => {
     leaveLogs();
     flush();
     expect(liveSources()).toEqual([]);
+  });
+
+  test("a topic-set change never tells a panel its link closed", () => {
+    const { flush, streams } = manualHub();
+    const logs = collect();
+    streams.subscribe(LOGS, logs.hooks);
+    flush();
+    const [first] = liveSources();
+    first?.emit("open");
+    first?.emit("message", '0:["line"]');
+    expect(logs.statuses.at(-1)).toBe("Open");
+
+    const before = logs.statuses.length;
+    const deploys = collect();
+    streams.subscribe(DEPLOYS, deploys.hooks);
+    flush();
+
+    // The replacement announces itself (`Connecting`); the teardown of the
+    // link it replaced does not — `Closed` paints "Live updates are
+    // unavailable" on every panel of the page until the new stream's first
+    // frame lands, on every tab or page switch.
+    expect(logs.statuses.slice(before)).not.toContain("Closed");
+    expect(deploys.statuses).not.toContain("Closed");
+    expect(logs.statuses.at(-1)).toBe("Connecting");
+    expect(deploys.statuses.at(-1)).toBe("Connecting");
   });
 
   test("a remount before the set settles keeps the connection and the frame", () => {
