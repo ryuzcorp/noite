@@ -30,6 +30,12 @@ pub(crate) struct Harness {
 
 impl Harness {
     pub(crate) async fn new() -> Self {
+        Self::with_config(|_| {}).await
+    }
+
+    /// A harness whose config the test tweaks before it is shared. Config is
+    /// frozen in an `Arc` for the router's lifetime, so overrides happen here.
+    pub(crate) async fn with_config(tweak: impl FnOnce(&mut crate::config::Config)) -> Self {
         let dir = std::env::temp_dir().join(format!("noite-api-tests-{}", new_id()));
         std::fs::create_dir_all(&dir).expect("temp dir");
         let s3 = crate::testutil::spawn_s3_stub().await;
@@ -40,6 +46,7 @@ impl Harness {
         cfg.work_dir = dir.join("work").to_string_lossy().into_owned();
         cfg.caddyfile_path = dir.join("Caddyfile").to_string_lossy().into_owned();
         cfg.caddy_access_log = dir.join("access.log").to_string_lossy().into_owned();
+        tweak(&mut cfg);
         let config = Arc::new(cfg);
         let pool = crate::db::connect(&config.database_url)
             .await
@@ -899,6 +906,74 @@ async fn validation_statuses_agree() {
             "rpc {hostname}"
         );
     }
+    h.finish().await;
+}
+
+/// A custom `CONTROL_SUBDOMAIN` is a platform host: no app may take it as a
+/// slug (create or rename), and no custom domain may claim it.
+#[tokio::test]
+async fn custom_control_subdomain_is_never_a_tenant_host() {
+    let h = Harness::with_config(|cfg| cfg.control_subdomain = "console".into()).await;
+
+    let (status, _) = h
+        .rest(
+            "POST",
+            "/v1/apps",
+            Some(json!({ "name": "Console", "slug": "console" })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(matches!(
+        h.rpc(
+            "apps.create",
+            json!({ "name": "Console", "slug": "console" })
+        )
+        .await,
+        Err((400, _))
+    ));
+
+    let app = h.seed_app("keep").await;
+    let (status, _) = h
+        .rest(
+            "POST",
+            &format!("/v1/apps/{}/rename", app.id),
+            Some(json!({ "slug": "console" })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(matches!(
+        h.rpc("apps.rename", json!({ "id": app.id, "slug": "console" }))
+            .await,
+        Err((400, _))
+    ));
+
+    let (status, _) = h
+        .rest(
+            "POST",
+            &format!("/v1/apps/{}/domains?role=admin", app.id),
+            Some(json!({ "hostname": "console.localhost" })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(matches!(
+        h.rpc(
+            "domains.add",
+            json!({ "id": app.id, "hostname": "console.localhost", "role": "admin" })
+        )
+        .await,
+        Err((400, _))
+    ));
+
+    // The gate is the derived host, not a blanket ban: a near miss still
+    // creates.
+    let created = h
+        .rpc(
+            "apps.create",
+            json!({ "name": "Console Two", "slug": "console2" }),
+        )
+        .await
+        .expect("apps.create");
+    assert_eq!(created["slug"], "console2");
     h.finish().await;
 }
 

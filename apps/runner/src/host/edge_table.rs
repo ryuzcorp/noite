@@ -209,6 +209,78 @@ fn upstream(cfg: &Config, port: i64) -> String {
     format!("{}:{port}", cfg.caddy_upstream_host)
 }
 
+/// Every hostname the platform itself routes, with its route: the control
+/// hosts, then the API and Git hosts under every tenant base. The route
+/// table inserts this list before any app route, and `lifecycle::slug_ok`
+/// refuses a slug whose tenant host lands on one — so the two cannot drift
+/// when `CONTROL_SUBDOMAIN` or `CONTROL_EXTRA_HOSTS` changes.
+pub fn platform_routes(cfg: &Config) -> Vec<(String, EdgeRoute)> {
+    let mut out: Vec<(String, EdgeRoute)> = cfg
+        .control_hosts()
+        .into_iter()
+        .map(|host| {
+            (
+                host.to_lowercase(),
+                client_zoned(
+                    cfg,
+                    EdgeKind::Control,
+                    cfg.caddy_control_upstream.clone(),
+                    &platform_client_zone("control"),
+                    cfg.edge.client_rpm,
+                ),
+            )
+        })
+        .collect();
+    for base in cfg.tenant_bases() {
+        out.push((
+            format!("api.{base}").to_lowercase(),
+            client_zoned(
+                cfg,
+                EdgeKind::Api,
+                cfg.caddy_api_upstream.clone(),
+                &platform_client_zone("api"),
+                cfg.edge.client_rpm,
+            ),
+        ));
+        out.push((
+            format!("git.{base}").to_lowercase(),
+            EdgeRoute {
+                rewrite: Some("/v1/git{uri}".into()),
+                ..client_zoned(
+                    cfg,
+                    EdgeKind::Git,
+                    cfg.caddy_api_upstream.clone(),
+                    &platform_client_zone("git"),
+                    cfg.edge.git_rpm,
+                )
+            },
+        ));
+    }
+    out
+}
+
+/// Insert an app-owned route unless the host is a platform host. A collision
+/// means a slug (or a custom claim) spells a platform hostname: the platform
+/// keeps the host, the tenant loses that route but keeps its row.
+fn insert_app_route(
+    exact: &mut HashMap<String, EdgeRoute>,
+    platform: &HashMap<String, EdgeRoute>,
+    host: String,
+    route: EdgeRoute,
+    source: &'static str,
+) {
+    if let Some(owned) = platform.get(&host) {
+        tracing::warn!(
+            %host,
+            source,
+            platform = ?owned.kind,
+            "app route dropped: the host belongs to the platform"
+        );
+        return;
+    }
+    exact.insert(host, route);
+}
+
 /// Build the route table from the same DB rows `rewrite_caddy` rendered.
 pub fn build_table(
     cfg: &Config,
@@ -217,51 +289,17 @@ pub fn build_table(
     limits: &[AppLimit],
     envs: &[EnvironmentRoute],
 ) -> EdgeTable {
-    let mut exact = HashMap::new();
-    let mut wildcards = Vec::new();
-    // Control plane: every control hostname plus the loopback healthcheck.
-    // The loopback carries no zones (it never had a guard).
-    for host in cfg.control_hosts() {
-        exact.insert(
-            host.to_lowercase(),
-            client_zoned(
-                cfg,
-                EdgeKind::Control,
-                cfg.caddy_control_upstream.clone(),
-                &platform_client_zone("control"),
-                cfg.edge.client_rpm,
-            ),
-        );
-    }
+    let mut exact: HashMap<String, EdgeRoute> = platform_routes(cfg).into_iter().collect();
+    // The loopback healthcheck carries no zones (it never had a guard).
     exact.insert(
         "127.0.0.1".into(),
         unzoned(EdgeKind::Control, cfg.caddy_control_upstream.clone()),
     );
-    // API → runner (Bearer-protected REST).
-    exact.insert(
-        format!("api.{}", cfg.base_domain).to_lowercase(),
-        client_zoned(
-            cfg,
-            EdgeKind::Api,
-            cfg.caddy_api_upstream.clone(),
-            &platform_client_zone("api"),
-            cfg.edge.client_rpm,
-        ),
-    );
-    // Git smart-HTTP → runner `/v1/git/{slug}/…` (Basic auth inside runner).
-    exact.insert(
-        format!("git.{}", cfg.base_domain).to_lowercase(),
-        EdgeRoute {
-            rewrite: Some("/v1/git{uri}".into()),
-            ..client_zoned(
-                cfg,
-                EdgeKind::Git,
-                cfg.caddy_api_upstream.clone(),
-                &platform_client_zone("git"),
-                cfg.edge.git_rpm,
-            )
-        },
-    );
+    // Platform routes win every host collision below: a tenant slug or a
+    // custom claim that spells one of these hosts is dropped (warned), never
+    // allowed to overwrite the control/API/Git backend.
+    let platform = exact.clone();
+    let mut wildcards = Vec::new();
     // Tenants serve under every DNS base; custom domains when verified.
     for base in cfg.tenant_bases() {
         for app in apps {
@@ -272,7 +310,9 @@ pub fn build_table(
                 continue;
             }
             let ctx = AppRoutes { cfg, app, limits };
-            exact.insert(
+            insert_app_route(
+                &mut exact,
+                &platform,
                 format!("{}.{}", app.slug, base).to_lowercase(),
                 fleet_route(
                     &ctx,
@@ -282,6 +322,7 @@ pub fn build_table(
                     app.is_asleep(),
                     false,
                 ),
+                "tenant",
             );
         }
     }
@@ -299,7 +340,9 @@ pub fn build_table(
             continue;
         }
         let ctx = AppRoutes { cfg, app, limits };
-        exact.insert(
+        insert_app_route(
+            &mut exact,
+            &platform,
             domain.hostname.to_lowercase(),
             fleet_route(
                 &ctx,
@@ -309,6 +352,7 @@ pub fn build_table(
                 app.is_asleep(),
                 false,
             ),
+            "custom domain",
         );
     }
     // Preview + environment hosts, under every tenant base.
@@ -318,7 +362,9 @@ pub fn build_table(
             // (`pod-<app id>.<base>`), so the instance's own `*.<base>`
             // certificate covers it — the old `app-0.preview.<slug>` needed a
             // certificate no standard wildcard provides.
-            exact.insert(
+            insert_app_route(
+                &mut exact,
+                &platform,
                 format!("{POD_HOST_PREFIX}{}.{base}", app.id).to_lowercase(),
                 client_zoned(
                     cfg,
@@ -327,6 +373,7 @@ pub fn build_table(
                     &platform_client_zone("preview"),
                     cfg.edge.client_rpm,
                 ),
+                "pod host",
             );
         }
         for env in envs {
@@ -352,10 +399,18 @@ pub fn build_table(
                     ),
                 };
                 let ctx = AppRoutes { cfg, app, limits };
-                exact.insert(host, fleet_route(&ctx, kind, up, rewrite, asleep, gated));
+                insert_app_route(
+                    &mut exact,
+                    &platform,
+                    host,
+                    fleet_route(&ctx, kind, up, rewrite, asleep, gated),
+                    "environment",
+                );
             } else {
                 let ctx = AppRoutes { cfg, app, limits };
-                exact.insert(
+                insert_app_route(
+                    &mut exact,
+                    &platform,
                     host,
                     fleet_route(
                         &ctx,
@@ -365,6 +420,7 @@ pub fn build_table(
                         false,
                         false,
                     ),
+                    "environment",
                 );
             }
         }
@@ -653,6 +709,62 @@ mod tests {
             );
             assert_eq!(route.client_zone, format!("app:{}:client", app.slug));
             assert!(app_zones.insert(route.client_zone.clone()));
+        }
+    }
+
+    /// A tenant slug that spells a custom `CONTROL_SUBDOMAIN` must never take
+    /// the control host: the platform route is inserted first and the tenant
+    /// route is dropped (the app row survives, only its route is lost).
+    #[test]
+    fn platform_host_wins_a_tenant_slug_collision() {
+        let mut cfg = config_for_tests();
+        cfg.control_subdomain = "console".into();
+        let app = test_app("console");
+        let t = build_table(&cfg, std::slice::from_ref(&app), &[], &[], &[]);
+        let control = t.exact.get("console.localhost").expect("control host");
+        assert_eq!(control.kind, EdgeKind::Control);
+        assert_eq!(control.upstream, cfg.caddy_control_upstream);
+        assert!(
+            !t.exact.values().any(|r| r.kind == EdgeKind::Tenant),
+            "the colliding tenant route must be dropped"
+        );
+    }
+
+    /// Defense in depth: even a verified custom claim (which `domains.add`
+    /// refuses) cannot overwrite a platform host in the table.
+    #[test]
+    fn platform_host_wins_a_custom_domain_collision() {
+        let mut cfg = config_for_tests();
+        cfg.control_subdomain = "console".into();
+        let app = test_app("shop");
+        let domain = AppDomain {
+            app_id: app.id.clone(),
+            hostname: "console.localhost".into(),
+            status: DomainStatus::Verified,
+            token: "t".into(),
+            verified_at: Some("t".into()),
+            created_at: "t".into(),
+        };
+        let t = build_table(&cfg, &[app], &[domain], &[], &[]);
+        let control = t.exact.get("console.localhost").expect("control host");
+        assert_eq!(control.kind, EdgeKind::Control);
+        assert!(!t.exact.values().any(|r| r.kind == EdgeKind::Custom));
+    }
+
+    /// The platform routes cover every tenant base, so slug validation and
+    /// the table agree when `CONTROL_EXTRA_HOSTS` adds a DNS base.
+    #[test]
+    fn platform_routes_cover_every_tenant_base() {
+        let mut cfg = config_for_tests();
+        cfg.control_extra_hosts = vec!["noite.local".into()];
+        let hosts: Vec<String> = platform_routes(&cfg).into_iter().map(|(h, _)| h).collect();
+        for host in [
+            "api.localhost",
+            "git.localhost",
+            "api.noite.local",
+            "git.noite.local",
+        ] {
+            assert!(hosts.contains(&host.to_string()), "missing {host}");
         }
     }
 

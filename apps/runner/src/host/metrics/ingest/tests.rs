@@ -530,7 +530,10 @@ async fn control_telemetry_is_keyed_on_the_reserved_slug_without_an_app_row() {
     // The reserved key has NO app row: every path that iterates apps
     // (reconcile, Caddy, sleep, purge, list_apps) stays blind to it.
     assert!(db::list_apps(&pool).await.expect("list_apps").is_empty());
-    assert!(!crate::lifecycle::slug_ok(crate::host::control::SLUG));
+    assert!(!crate::lifecycle::slug_ok(
+        &crate::config::config_for_tests(),
+        crate::host::control::SLUG
+    ));
     // A replay (the retry/reingest path) is exact, never additive.
     commit_chunk(
         &pool,
