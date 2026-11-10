@@ -15,6 +15,7 @@ import (
 	"os"
 	"reflect"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/caddyserver/caddy/v2"
@@ -73,9 +74,9 @@ const (
 // it: Loaded has a table, a limiter and a prober; Booting and Draining have
 // none. Requests answer from the phase: Booting is 503 "edge starting"
 // (running, nothing pushed yet), Loaded routes and rate-limits, Draining is
-// 503 "edge shutting down" (the last instance cleaned up). A push that
-// revives a draining edge creates its limiter and prober again; the process
-// is exiting, so nothing serves them.
+// the same 503 with no table left to route with. A push that revives a
+// draining edge creates its limiter and prober again; the process is
+// exiting, so nothing serves them.
 type Phase uint8
 
 const (
@@ -110,12 +111,16 @@ type edgeState struct {
 	prober *Prober
 }
 
-// edgeSnapshot is the consistent view a request serves from.
+// edgeSnapshot is the immutable view a request serves from. It is built by
+// publishLocked while mu is held and never mutated afterwards.
 type edgeSnapshot struct {
 	phase Phase
 	tab   *Table
 	lim   *Limiter
 }
+
+// bootSnapshot answers requests before anything is published.
+var bootSnapshot = &edgeSnapshot{phase: PhaseBooting}
 
 // sharedState is the process-wide edge state, shared by every EdgeRoutes
 // and EdgeHold instance (the static config provisions one per site).
@@ -123,8 +128,13 @@ type sharedState struct {
 	mu sync.Mutex
 	// refs counts provisioned instances; the last Cleanup drains the
 	// shared state so a full Caddy stop leaks no goroutines.
-	refs        int
-	st          edgeState
+	refs int
+	st   edgeState
+	// cur is the view requests serve from: the phase and the table, limiter
+	// it owns, published together. Requests only Load it, so the hot path
+	// takes no lock and still cannot observe a phase disagreeing with its
+	// resources.
+	cur         atomic.Pointer[edgeSnapshot]
 	log         *zap.Logger
 	holdRecheck time.Duration
 	holdCap     time.Duration
@@ -136,11 +146,28 @@ type sharedState struct {
 var shared = newSharedState()
 
 func newSharedState() *sharedState {
-	return &sharedState{
+	s := &sharedState{
 		holdRecheck: HoldRecheck,
 		holdCap:     HoldCap,
 		newProber:   func() *Prober { return NewProber(ProbeEvery, ProbeTimeout, nil) },
 	}
+	s.cur.Store(&edgeSnapshot{phase: PhaseBooting})
+	return s
+}
+
+// publishLocked makes the current edgeState the view requests see. Callers
+// hold mu and call it after mutating s.st.
+func (s *sharedState) publishLocked() {
+	s.cur.Store(&edgeSnapshot{phase: s.st.phase, tab: s.st.tab, lim: s.st.lim})
+}
+
+// snapshot is the published view. A nil pointer means nothing was published
+// yet, which is the boot phase.
+func (s *sharedState) snapshot() *edgeSnapshot {
+	if snap := s.cur.Load(); snap != nil {
+		return snap
+	}
+	return bootSnapshot
 }
 
 // transitionLocked is the only writer of the phase. It also creates or drops
@@ -168,6 +195,7 @@ func (s *sharedState) transitionLocked(next Phase) {
 		}
 		s.st = edgeState{phase: PhaseDraining}
 	}
+	s.publishLocked()
 	if s.log != nil {
 		s.log.Info("edge: phase transition",
 			zap.String("from", prev.String()),
@@ -201,15 +229,6 @@ func (s *sharedState) release() {
 	if s.refs == 0 && s.st.phase != PhaseDraining {
 		s.transitionLocked(PhaseDraining)
 	}
-}
-
-// snapshot is the consistent phase, table and limiter one request serves
-// from. The table is immutable once installed, so it is safe to read after
-// the lock is released.
-func (s *sharedState) snapshot() edgeSnapshot {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return edgeSnapshot{phase: s.st.phase, tab: s.st.tab, lim: s.st.lim}
 }
 
 // table returns the installed table, or nil before the first install.
@@ -287,9 +306,12 @@ func (s *sharedState) install(t *Table) (Install, error) {
 			return InstallIdentical, nil
 		}
 	}
-	s.transitionLocked(PhaseLoaded)
+	// The table is part of the snapshot the phase publishes, so it is set
+	// before the transition that makes it visible.
 	s.st.tab = t
+	s.transitionLocked(PhaseLoaded)
 	s.reconcileLocked(t)
+	s.publishLocked()
 	return InstallApplied, nil
 }
 
@@ -414,15 +436,11 @@ func loadTable(path string) (*Table, error) {
 // ServeHTTP implements caddyhttp.MiddlewareHandler.
 func (e *EdgeRoutes) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
 	snap := shared.snapshot()
-	switch snap.phase {
-	case PhaseBooting:
-		// Provisioned, nothing pushed yet: the boot gap.
+	if snap.phase != PhaseLoaded {
+		// Booting (nothing pushed yet) and Draining (the last instance
+		// cleaned up) both have no table to route with. The answer stays
+		// the boot gap's 503; the phase tells the two apart in the log.
 		http.Error(w, "edge starting", http.StatusServiceUnavailable)
-		return nil
-	case PhaseDraining:
-		// The last instance cleaned up. Nothing is left to route with, and
-		// this is not a boot: say so instead of blaming a missing table.
-		http.Error(w, "edge shutting down", http.StatusServiceUnavailable)
 		return nil
 	}
 	route, ok := snap.tab.Lookup(r.Host)

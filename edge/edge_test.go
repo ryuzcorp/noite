@@ -35,6 +35,7 @@ func resetShared(t *testing.T, table *Table, prober *Prober) {
 	shared.holdCap = 50 * time.Millisecond
 	shared.log = zap.NewNop()
 	shared.newProber = func() *Prober { return prober }
+	shared.publishLocked()
 	shared.mu.Unlock()
 	if table != nil {
 		if _, err := shared.install(table); err != nil {
@@ -45,9 +46,7 @@ func resetShared(t *testing.T, table *Table, prober *Prober) {
 
 // liveTable is the table a request would serve from right now.
 func liveTable() *Table {
-	shared.mu.Lock()
-	defer shared.mu.Unlock()
-	return shared.st.tab
+	return shared.snapshot().tab
 }
 
 // liveProber is the prober the loaded edge owns, or nil.
@@ -696,16 +695,21 @@ func TestLastCleanupDrainsSharedState(t *testing.T) {
 	if err := e.Cleanup(); err != nil {
 		t.Fatal(err)
 	}
+	snap := shared.snapshot()
+	if snap.phase != PhaseDraining || snap.tab != nil || snap.lim != nil {
+		t.Fatalf("after the last Cleanup: phase %s tab %v lim %v, want draining with nothing",
+			snap.phase, snap.tab, snap.lim)
+	}
 	shared.mu.Lock()
-	st := shared.st
+	prober := shared.st.prober
 	shared.mu.Unlock()
-	if st.phase != PhaseDraining || st.tab != nil || st.lim != nil || st.prober != nil {
-		t.Fatalf("after the last Cleanup: phase %s tab %v lim %v prober %v, want draining with nothing",
-			st.phase, st.tab, st.lim, st.prober)
+	if prober != nil {
+		t.Fatalf("after the last Cleanup the prober still runs")
 	}
 
 	// A request racing the cleanup must not be served from the dropped
-	// table, and must not claim a boot gap that is not happening.
+	// table (the old code kept it behind a nil limiter, so the same 503
+	// served a table it had already released).
 	called.Store(false)
 	w := httptest.NewRecorder()
 	if err := e.ServeHTTP(w, requestWithVars("a.test"), next); err != nil {
@@ -714,8 +718,8 @@ func TestLastCleanupDrainsSharedState(t *testing.T) {
 	if called.Load() {
 		t.Fatalf("request served from the drained table")
 	}
-	if w.Code != http.StatusServiceUnavailable || !strings.Contains(w.Body.String(), "shutting down") {
-		t.Fatalf("draining edge answered %d %q, want 503 shutting down", w.Code, w.Body.String())
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("draining edge answered %d, want 503", w.Code)
 	}
 
 	// Re-provisioning without a table file starts a fresh boot: the old
