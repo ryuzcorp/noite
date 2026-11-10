@@ -113,7 +113,7 @@ const InvitationsBanner = () => {
     }
   };
 
-  const state = action;
+  const current = action();
 
   return (
     <section
@@ -124,8 +124,6 @@ const InvitationsBanner = () => {
         <h2 class="m-0 text-lg font-semibold">Invitations</h2>
         <ul class="m-0 flex list-none flex-col gap-2 p-0">
           {invites.map((invite) => {
-            const current = state();
-
             const mine =
               current._tag === "Answering" && current.id === invite.id
                 ? current
@@ -150,7 +148,6 @@ const InvitationsBanner = () => {
                     type="button"
                     class="btn btn-sm btn-neutral"
                     disabled={current._tag === "Answering"}
-                    aria-busy={mine?.accept === true ? "true" : "false"}
                     onclick={() => {
                       void answer(invite.id, true);
                     }}
@@ -161,7 +158,6 @@ const InvitationsBanner = () => {
                     type="button"
                     class="btn btn-sm btn-ghost"
                     disabled={current._tag === "Answering"}
-                    aria-busy={mine?.accept === false ? "true" : "false"}
                     onclick={() => {
                       void answer(invite.id, false);
                     }}
