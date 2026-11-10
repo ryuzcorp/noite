@@ -1,5 +1,7 @@
 //! Settings panel: the edge rate limits (per visitor and whole app) and the
-//! fleet's memory cap.
+//! fleet's memory cap. One draft-over-saved form (`draft.ts`): the draft
+//! survives an edit, a save makes it the baseline, and a failure keeps the
+//! user's input while painting why.
 
 import { atom } from "ilha";
 
@@ -10,6 +12,18 @@ import { limits } from "../../resources";
 import type { AppRole } from "../../roles";
 import { LoadError } from "../../ui/load-error";
 import { SectionSkeleton } from "../../ui/skeletons";
+import { capabilities } from "../capabilities";
+import { watchResource } from "../watch-resource";
+import {
+  draftForm,
+  editDraft,
+  failedDraft,
+  formBusy,
+  formCanSave,
+  savedDraft,
+  savingDraft,
+} from "./draft";
+import type { DraftForm } from "./draft";
 import { SettingsSection } from "./section";
 
 /** How a limit reads when it is left at the platform default. */
@@ -32,9 +46,76 @@ const parseRpm = (raw: string): number | null | undefined => {
   return Number(value);
 };
 
-/** An input's text: the unsaved edit, else the saved limit (empty = default). */
-const shownRpm = (draft: string | null, saved: number | null) =>
-  draft ?? (saved === null ? "" : String(saved));
+/** The sleep default's placeholder, in the largest exact unit. */
+const sleepPlaceholder = (seconds: number): string => {
+  if (seconds === 0) {
+    return "Default: never";
+  }
+
+  if (seconds % 3600 === 0) {
+    return `Default: ${seconds / 3600} h`;
+  }
+
+  return `Default: ${seconds} s`;
+};
+
+/** The four inputs parsed, or the one validation sentence an invalid input
+ * paints (all four fields are checked at once, like the form shows them). */
+const parseLimits = (
+  draft: LimitsDraft
+):
+  | { readonly ok: false }
+  | {
+      readonly ok: true;
+      readonly value: {
+        appRpm: number | null;
+        clientRpm: number | null;
+        memoryMb: number | null;
+        sleepAfterS: number | null;
+      };
+    } => {
+  const clientRpm = parseRpm(draft.clientRpm);
+  const appRpm = parseRpm(draft.appRpm);
+  const memoryMb = parseRpm(draft.memoryMb);
+  const sleepAfterS = parseRpm(draft.sleepAfterS);
+
+  if (
+    clientRpm === undefined ||
+    appRpm === undefined ||
+    memoryMb === undefined ||
+    sleepAfterS === undefined
+  ) {
+    return { ok: false };
+  }
+
+  return { ok: true, value: { appRpm, clientRpm, memoryMb, sleepAfterS } };
+};
+
+/** The four inputs as one draft; saves compare drafts, never atoms. */
+interface LimitsDraft {
+  readonly appRpm: string;
+  readonly clientRpm: string;
+  readonly memoryMb: string;
+  readonly sleepAfterS: string;
+}
+
+const toDraft = (saved: {
+  appRpm: number | null;
+  clientRpm: number | null;
+  memoryMb: number | null;
+  sleepAfterS: number | null;
+}): LimitsDraft => ({
+  appRpm: saved.appRpm === null ? "" : String(saved.appRpm),
+  clientRpm: saved.clientRpm === null ? "" : String(saved.clientRpm),
+  memoryMb: saved.memoryMb === null ? "" : String(saved.memoryMb),
+  sleepAfterS: saved.sleepAfterS === null ? "" : String(saved.sleepAfterS),
+});
+
+const sameDraft = (a: LimitsDraft, b: LimitsDraft): boolean =>
+  a.appRpm === b.appRpm &&
+  a.clientRpm === b.clientRpm &&
+  a.memoryMb === b.memoryMb &&
+  a.sleepAfterS === b.sleepAfterS;
 
 /** Limits (SPEC, Edge limits and Tenant isolation): requests per minute the
  * edge lets through to this app, per visitor and in total, before answering
@@ -49,16 +130,36 @@ export const RateLimitsPanel = ({
   myRole: AppRole;
 }) => {
   const res = limits(appId);
-  const clientDraft = atom<string | null>(null);
-  const appDraft = atom<string | null>(null);
-  const memoryDraft = atom<string | null>(null);
-  const sleepDraft = atom<string | null>(null);
-  const err = atom("");
-  const note = atom("");
-  const busy = atom(false);
-  const isAdmin = myRole === "admin";
-
   const current = resourceValue(res.state());
+
+  const blank: LimitsDraft = {
+    appRpm: "",
+    clientRpm: "",
+    memoryMb: "",
+    sleepAfterS: "",
+  };
+
+  const form = atom<DraftForm<LimitsDraft>>(
+    draftForm(current ? toDraft(current) : blank)
+  );
+
+  const isAdmin = capabilities(myRole).admin;
+
+  // A refetch after a save (or a concurrent change) moves the baseline; a
+  // dirty form keeps the user's edits.
+  watchResource(res.state, (state) => {
+    const fresh = resourceValue(state);
+
+    if (!fresh) {
+      return;
+    }
+
+    const next = toDraft(fresh);
+
+    if (form().status._tag !== "Dirty") {
+      form.set(draftForm(next));
+    }
+  });
 
   if (res.state()._tag === "Loading") {
     return <SectionSkeleton lines={2} />;
@@ -73,42 +174,31 @@ export const RateLimitsPanel = ({
     );
   }
 
-  const clientText = shownRpm(clientDraft(), current.clientRpm);
-  const appText = shownRpm(appDraft(), current.appRpm);
-  const memoryText = shownRpm(memoryDraft(), current.memoryMb);
-  const sleepText = shownRpm(sleepDraft(), current.sleepAfterS);
-  const sleepDefault = current.defaults.defaultSleepAfterS;
-  let sleepPlaceholder = `Default: ${sleepDefault} s`;
+  const { draft } = form();
+  const busy = formBusy(form());
 
-  if (sleepDefault === 0) {
-    sleepPlaceholder = "Default: never";
-  } else if (sleepDefault % 3600 === 0) {
-    sleepPlaceholder = `Default: ${sleepDefault / 3600} h`;
-  }
+  const edit = (patch: Partial<LimitsDraft>): void => {
+    form.set(editDraft(form(), { ...draft, ...patch }, sameDraft));
+  };
 
   const save = async (event: SubmitEvent) => {
     event.preventDefault();
-    const clientRpm = parseRpm(clientText);
-    const appRpm = parseRpm(appText);
-    const memoryMb = parseRpm(memoryText);
-    const sleepAfterS = parseRpm(sleepText);
+    const parsed = parseLimits(draft);
 
-    if (
-      clientRpm === undefined ||
-      appRpm === undefined ||
-      memoryMb === undefined ||
-      sleepAfterS === undefined
-    ) {
-      err.set(
-        "Limits are whole numbers — requests per minute, MiB for memory, seconds for sleep."
+    if (!parsed.ok) {
+      form.set(
+        failedDraft(
+          form(),
+          "Limits are whole numbers — requests per minute, MiB for memory, seconds for sleep."
+        )
       );
 
       return;
     }
 
-    busy.set(true);
-    err.set("");
-    note.set("");
+    const { appRpm, clientRpm, memoryMb, sleepAfterS } = parsed.value;
+
+    form.set(savingDraft(form()));
 
     try {
       await api<{ ok: true }>("/api/limits/setLimits", {
@@ -118,20 +208,21 @@ export const RateLimitsPanel = ({
         memoryMb,
         sleepAfterS,
       });
-      clientDraft.set(null);
-      appDraft.set(null);
-      memoryDraft.set(null);
-      sleepDraft.set(null);
-      await res.refetch();
-      note.set(
-        "Saved. Rate limits apply within seconds; memory applies when the fleet next spawns."
+      form.set(
+        savedDraft(form(), {
+          appRpm: appRpm === null ? "" : String(appRpm),
+          clientRpm: clientRpm === null ? "" : String(clientRpm),
+          memoryMb: memoryMb === null ? "" : String(memoryMb),
+          sleepAfterS: sleepAfterS === null ? "" : String(sleepAfterS),
+        })
       );
+      await res.refetch();
     } catch (error) {
-      err.set(errorMessage(error));
+      form.set(failedDraft(form(), errorMessage(error)));
     }
-
-    busy.set(false);
   };
+
+  const failure = form().status;
 
   return (
     <SettingsSection>
@@ -145,7 +236,9 @@ export const RateLimitsPanel = ({
         default. Sleep after parks this app after that many idle seconds (
         <code>0</code> = never); leave it empty for the install default.
       </p>
-      {err() ? <p class="text-error m-0 text-sm">{err()}</p> : null}
+      {failure._tag === "Failed" ? (
+        <p class="text-error m-0 text-sm">{failure.error}</p>
+      ) : null}
       <form class="flex flex-wrap items-end gap-2" onsubmit={save}>
         <fieldset class="fieldset min-w-40 flex-1">
           <label class="label" for="limit-client">
@@ -157,15 +250,15 @@ export const RateLimitsPanel = ({
             type="number"
             min="0"
             step="1"
-            value={clientText}
+            value={draft.clientRpm}
             placeholder={
               current.perClient
                 ? defaultLabel(current.defaults.clientRpm)
                 : "Off on this install"
             }
-            disabled={!isAdmin || busy() || !current.perClient}
+            disabled={!isAdmin || busy || !current.perClient}
             oninput={(e) => {
-              clientDraft.set(e.currentTarget.value);
+              edit({ clientRpm: e.currentTarget.value });
             }}
           />
         </fieldset>
@@ -179,11 +272,11 @@ export const RateLimitsPanel = ({
             type="number"
             min="0"
             step="1"
-            value={appText}
+            value={draft.appRpm}
             placeholder={defaultLabel(current.defaults.appRpm)}
-            disabled={!isAdmin || busy()}
+            disabled={!isAdmin || busy}
             oninput={(e) => {
-              appDraft.set(e.currentTarget.value);
+              edit({ appRpm: e.currentTarget.value });
             }}
           />
         </fieldset>
@@ -198,15 +291,15 @@ export const RateLimitsPanel = ({
             min="64"
             max={current.defaults.memoryMaxMb ?? undefined}
             step="1"
-            value={memoryText}
+            value={draft.memoryMb}
             placeholder={
               current.defaults.memoryMaxMb === null
                 ? `Default: ${current.defaults.memoryMb} MiB`
                 : `Default: ${current.defaults.memoryMb} MiB (max ${current.defaults.memoryMaxMb})`
             }
-            disabled={!isAdmin || busy()}
+            disabled={!isAdmin || busy}
             oninput={(e) => {
-              memoryDraft.set(e.currentTarget.value);
+              edit({ memoryMb: e.currentTarget.value });
             }}
           />
         </fieldset>
@@ -220,17 +313,21 @@ export const RateLimitsPanel = ({
             type="number"
             min="0"
             step="1"
-            value={sleepText}
-            placeholder={sleepPlaceholder}
-            disabled={!isAdmin || busy()}
+            value={draft.sleepAfterS}
+            placeholder={sleepPlaceholder(current.defaults.defaultSleepAfterS)}
+            disabled={!isAdmin || busy}
             oninput={(e) => {
-              sleepDraft.set(e.currentTarget.value);
+              edit({ sleepAfterS: e.currentTarget.value });
             }}
           />
         </fieldset>
         {isAdmin ? (
-          <button type="submit" class="btn btn-sm" disabled={busy()}>
-            {busy() ? "Saving…" : "Save limits"}
+          <button
+            type="submit"
+            class="btn btn-sm"
+            disabled={busy || !formCanSave(form())}
+          >
+            {busy ? "Saving…" : "Save limits"}
           </button>
         ) : null}
       </form>
@@ -247,7 +344,12 @@ export const RateLimitsPanel = ({
           fleet next spawns.
         </p>
       )}
-      {note() ? <p class="m-0 text-sm opacity-70">{note()}</p> : null}
+      {failure._tag === "Saved" ? (
+        <p class="m-0 text-sm opacity-70">
+          Saved. Rate limits apply within seconds; memory applies when the fleet
+          next spawns.
+        </p>
+      ) : null}
     </SettingsSection>
   );
 };

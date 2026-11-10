@@ -12,6 +12,7 @@ import { confirmDialog } from "../../ui/confirm";
 import { Dialog } from "../../ui/dialog";
 import { LoadError } from "../../ui/load-error";
 import { ListSkeleton } from "../../ui/skeletons";
+import { capabilities } from "../capabilities";
 import { SettingsSection } from "./section";
 
 /** Tenant env vars (`.dev.vars` model): UI-set vars reach build, release
@@ -39,7 +40,7 @@ export const EnvVarsPanel = ({
   const dialogOpen = atom(false);
   const newVarName = atom("");
   const newVarValue = atom("");
-  const isAdmin = myRole === "admin";
+  const isAdmin = capabilities(myRole).admin;
 
   const reload = async () => {
     try {

@@ -8,6 +8,7 @@ import { errorMessage } from "../../errors";
 import { resourceValue, resourceError } from "../../resource";
 import { appDetail, invalidate, keys } from "../../resources";
 import { SectionSkeleton } from "../../ui/skeletons";
+import { capabilities } from "../capabilities";
 import { BranchProtectionPanel } from "./branch-protection";
 import { CollaboratorsPanel } from "./collaborators";
 import { AppDangerZone } from "./danger";
@@ -57,7 +58,7 @@ export const AppSettingsPanel = () => {
     subdomain: info.app.subdomain,
   };
 
-  const isAdmin = gate.myRole === "admin";
+  const isAdmin = capabilities(gate.myRole).admin;
 
   return (
     <div class="divide-base-300 flex flex-col divide-y px-4">

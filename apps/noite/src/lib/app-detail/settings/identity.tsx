@@ -5,6 +5,17 @@ import { atom } from "ilha";
 import { api } from "../../api";
 import { errorMessage } from "../../errors";
 import type { AppRole } from "../../roles";
+import { capabilities } from "../capabilities";
+import {
+  draftForm,
+  editDraft,
+  failedDraft,
+  formBusy,
+  formCanSave,
+  savedDraft,
+  savingDraft,
+} from "./draft";
+import type { DraftForm } from "./draft";
 import { SettingsSection } from "./section";
 
 /** Identity form: the display name. Admin-only; everyone else sees the
@@ -21,41 +32,41 @@ export const AppIdentityForm = ({
   myRole: AppRole;
   onSaved: () => void;
 }) => {
-  const draftName = atom(name);
-  const err = atom("");
-  const busy = atom(false);
-  const isAdmin = myRole === "admin";
+  const form = atom<DraftForm<string>>(draftForm(name));
+  const isAdmin = capabilities(myRole).admin;
 
   const saveName = async () => {
-    if (!isAdmin || busy()) {
+    if (!isAdmin || formBusy(form())) {
       return;
     }
 
-    const next = draftName().trim();
+    const next = form().draft.trim();
 
     if (!next) {
-      err.set("Name is required");
+      form.set(failedDraft(form(), "Name is required"));
 
       return;
     }
 
-    busy.set(true);
+    form.set(savingDraft(form()));
 
     try {
       await api<{ ok: true }>("/api/apps/renameApp", { id: appId, name: next });
-      err.set("");
+      form.set(savedDraft(form(), next));
       onSaved();
     } catch (error) {
-      err.set(errorMessage(error));
-    } finally {
-      busy.set(false);
+      form.set(failedDraft(form(), errorMessage(error)));
     }
   };
+
+  const failure = form().status;
 
   return (
     <SettingsSection>
       <h3 class="m-0 text-lg font-semibold">Identity</h3>
-      {err() ? <p class="text-error m-0 text-sm">{err()}</p> : null}
+      {failure._tag === "Failed" ? (
+        <p class="text-error m-0 text-sm">{failure.error}</p>
+      ) : null}
       <fieldset class="fieldset w-full">
         <label class="label" for="identity-name">
           Name
@@ -63,11 +74,11 @@ export const AppIdentityForm = ({
         <input
           id="identity-name"
           class="input input-sm"
-          value={draftName()}
-          disabled={!isAdmin || busy()}
+          value={form().draft}
+          disabled={!isAdmin || formBusy(form())}
           placeholder="My Service"
           oninput={(e) => {
-            draftName.set(e.currentTarget.value);
+            form.set(editDraft(form(), e.currentTarget.value));
           }}
         />
       </fieldset>
@@ -76,12 +87,12 @@ export const AppIdentityForm = ({
           <button
             type="button"
             class="btn btn-sm"
-            disabled={busy()}
+            disabled={formBusy(form()) || !formCanSave(form())}
             onclick={() => {
               void saveName();
             }}
           >
-            {busy() ? "Saving…" : "Save name"}
+            {formBusy(form()) ? "Saving…" : "Save name"}
           </button>
         </div>
       ) : (

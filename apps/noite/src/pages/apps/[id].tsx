@@ -1,5 +1,5 @@
 import { DeployList } from "$lib/app-detail/deploys";
-import { EnvPicker, validEnvId } from "$lib/app-detail/env-picker";
+import { EnvPicker, StaleEnvNotice } from "$lib/app-detail/env-picker";
 import { ErrorsPanel, liveErrors } from "$lib/app-detail/errors";
 import { EventsPanel, liveEventCount } from "$lib/app-detail/events";
 import {
@@ -9,6 +9,13 @@ import {
   toMetricsHours,
 } from "$lib/app-detail/metrics";
 import { AppDetailPanel, AppHeader } from "$lib/app-detail/panel";
+import {
+  parseAppRoute,
+  parseAppTab,
+  parseScope,
+  scopeId,
+} from "$lib/app-detail/route.machine";
+import type { AppTab } from "$lib/app-detail/route.machine";
 import { AppSettingsPanel } from "$lib/app-detail/settings/panel";
 import { DetailShell, DetailTabs } from "$lib/app-detail/shell";
 import { ControlAppDetail } from "$lib/apps/control-panel";
@@ -31,18 +38,7 @@ const TABS = [
   { id: "events", label: "Events" },
 ] as const;
 
-type TabId = (typeof TABS)[number]["id"];
-
-/** Parse `?t=`: unknown tabs fall back to overview. */
-const toTabId = (raw: string): TabId =>
-  TABS.find((tab) => tab.id === raw)?.id ?? "overview";
-
-/** The right panel beside the tabs: Settings, or closed (`""`). */
-type AppPanel = "settings" | "";
-
-/** Parse `?panel=`: anything but `settings` closes the panel. */
-const toAppPanel = (raw: string): AppPanel =>
-  raw === "settings" ? "settings" : "";
+type TabId = AppTab;
 
 /** Metrics tab: the window lives in `?r=` (24 / 168 / 720 hours) and the
  * scope in `?env=` (production or one preview environment, the Deployments
@@ -57,7 +53,7 @@ const MetricsTab = ({ appId }: { appId: string }) => {
 
   const env = searchParam("env", { default: "" });
   const envs = resourceValue(environments(appId).state()) ?? [];
-  const environmentId = validEnvId(envs, env());
+  const environmentId = scopeId(parseScope(env(), envs).scope);
 
   return (
     <div class="flex flex-col gap-4">
@@ -146,14 +142,14 @@ const AppPageBody = ({ appId }: { appId: string }) => {
     );
   }
 
-  const tab = searchParam<TabId>("t", { default: "overview", parse: toTabId });
+  const tab = searchParam<TabId>("t", {
+    default: "overview",
+    parse: parseAppTab,
+  });
 
   // Settings opens beside the tabs (`?panel=settings`), so it stays open
   // while they switch.
-  const panel = searchParam<AppPanel>("panel", {
-    default: "",
-    parse: toAppPanel,
-  });
+  const panel = searchParam("panel", { default: "" });
 
   // The open error (ErrorsPanel's `?e=`): a tab click always lands on the
   // tab's top level, so the Errors tab shows the list, not a stale detail.
@@ -169,12 +165,14 @@ const AppPageBody = ({ appId }: { appId: string }) => {
   // the Events badge is always app-wide.
   const env = searchParam("env", { default: "" });
 
-  const environmentId = validEnvId(
-    resourceValue(environments(appId).state()) ?? [],
-    env()
+  const route = parseAppRoute(
+    { env: env(), panel: panel(), t: tab() },
+    resourceValue(environments(appId).state()) ?? []
   );
 
-  const settingsOpen = panel() === "settings";
+  const environmentId = scopeId(route.scope);
+
+  const settingsOpen = route.panel === "settings";
 
   return (
     <>
@@ -185,12 +183,12 @@ const AppPageBody = ({ appId }: { appId: string }) => {
             <AppHeader appId={appId} />
             <TabBar
               key={environmentId}
-              active={tab()}
+              active={route.tab}
               appId={appId}
               environmentId={environmentId}
               onSelect={(next) => {
                 openError.set("");
-                tab.set(toTabId(next));
+                tab.set(parseAppTab(next));
               }}
               trailing={
                 <button
@@ -218,17 +216,18 @@ const AppPageBody = ({ appId }: { appId: string }) => {
           ) : null
         }
       >
-        {tab() === "overview" ? <AppDetailPanel appId={appId} /> : null}
-        {tab() === "deployments" ? (
+        <StaleEnvNotice notice={route.notice} />
+        {route.tab === "overview" ? <AppDetailPanel appId={appId} /> : null}
+        {route.tab === "deployments" ? (
           <DeployList
             appId={appId}
             myRole={detail?.myRole}
             subdomain={detail?.app.subdomain ?? ""}
           />
         ) : null}
-        {tab() === "metrics" ? <MetricsTab appId={appId} /> : null}
-        {tab() === "errors" ? <ErrorsPanel appId={appId} /> : null}
-        {tab() === "events" ? <EventsPanel appId={appId} /> : null}
+        {route.tab === "metrics" ? <MetricsTab appId={appId} /> : null}
+        {route.tab === "errors" ? <ErrorsPanel appId={appId} /> : null}
+        {route.tab === "events" ? <EventsPanel appId={appId} /> : null}
       </DetailShell>
     </>
   );

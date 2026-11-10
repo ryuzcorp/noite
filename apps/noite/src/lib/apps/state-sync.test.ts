@@ -127,4 +127,16 @@ describe("staleKeys", () => {
   test("a cache never fetched is left to its own first fetch", () => {
     expect(staleKeys("app_1", frame({ status: "running" }))).toEqual([]);
   });
+
+  test("a role change in the frame invalidates the detail (demoted users lose admin buttons)", () => {
+    const demoted = { ...frame(), myRole: "view" as const };
+
+    expect(staleKeys("app_1", demoted, detail(), [env()])).toEqual([
+      keys.appDetail("app_1"),
+    ]);
+  });
+
+  test("a frame without a role never counts as a role change", () => {
+    expect(staleKeys("app_1", frame(), detail(), [env()])).toEqual([]);
+  });
 });

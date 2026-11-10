@@ -11,6 +11,7 @@ import type { AppRole } from "../../roles";
 import { Dialog } from "../../ui/dialog";
 import { LoadError } from "../../ui/load-error";
 import { ListSkeleton } from "../../ui/skeletons";
+import { capabilities } from "../capabilities";
 import { SettingsSection } from "./section";
 
 export const CollaboratorsPanel = ({
@@ -20,7 +21,7 @@ export const CollaboratorsPanel = ({
   appId: string;
   myRole: AppRole;
 }) => {
-  const isAdmin = myRole === "admin";
+  const isAdmin = capabilities(myRole).admin;
   const res = collaborators(appId);
   const pending = pendingInvitations(appId, isAdmin);
   const rows = resourceValue(res.state()) ?? [];

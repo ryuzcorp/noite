@@ -1,6 +1,8 @@
 import { AdminAppsPanel } from "../admin/apps";
 import { AdminInvitesPanel } from "../admin/invites";
 import { AdminUsersPanel } from "../admin/users";
+import { fleetState, telemetryAvailable } from "../app-detail/control-fleet";
+import type { FleetState } from "../app-detail/control-fleet";
 import { ErrorsPanel, ErrorsSummary, liveErrors } from "../app-detail/errors";
 import { RuntimeLogs } from "../app-detail/logs";
 import {
@@ -145,31 +147,47 @@ const NoControlFleetNotice = () => (
   </section>
 );
 
+/** The runner has not answered `control_fleet` yet: neither claim it is
+ * managed (telemetry tabs would hang on a stream that never opens) nor that
+ * it is absent. */
+const FleetUnknownNotice = () => (
+  <section class="card bg-base-100 dark:bg-base-200 border-base-300 w-full border shadow-md">
+    <div class="card-body gap-2">
+      <h2 class="m-0 text-lg font-semibold">
+        Control-plane telemetry is not available yet
+      </h2>
+      <p class="m-0 text-sm opacity-70">
+        The runner has not reported whether it supervises the control fleet.
+        Storage and the admin panels still work; telemetry tabs appear once it
+        answers.
+      </p>
+    </div>
+  </section>
+);
+
 const ControlAppDetailBody = ({
-  controlFleet,
+  fleet,
   email,
 }: {
-  controlFleet: boolean;
+  fleet: FleetState;
   email: string;
 }) => {
   const tab = searchParam<TabId>("t", { default: "overview", parse: toTabId });
   const requested = tab();
+  const telemetry = telemetryAvailable(fleet);
 
   // A stale `?t=metrics` on an install without the control fleet falls back
   // to Overview rather than rendering an empty panel.
-  const active =
-    controlFleet || !NEEDS_FLEET[requested] ? requested : "overview";
+  const active = telemetry || !NEEDS_FLEET[requested] ? requested : "overview";
 
-  const tabs = controlFleet
-    ? TABS
-    : TABS.filter((item) => !NEEDS_FLEET[item.id]);
+  const tabs = TABS.filter((item) => telemetry || !NEEDS_FLEET[item.id]);
 
   // The open error (ErrorsPanel's `?e=`) lives in the URL too: a tab click
   // lands on the tab's top level, so Errors shows the list, not a stale
   // detail. Same live feed as the Errors tab, so the badge never lags it.
   const openError = searchParam("e", { default: "" });
 
-  const openErrors = controlFleet
+  const openErrors = telemetry
     ? (liveErrors(CONTROL_APP_ID, "open").data()?.counts.open ?? 0)
     : 0;
 
@@ -178,7 +196,7 @@ const ControlAppDetailBody = ({
       panel={null}
       header={
         <>
-          <Header controlFleet={controlFleet} />
+          <Header controlFleet={telemetry} />
           <DetailTabs
             active={active}
             counts={{ errors: openErrors }}
@@ -191,7 +209,7 @@ const ControlAppDetailBody = ({
         </>
       }
     >
-      {active === "overview" && controlFleet ? (
+      {active === "overview" && telemetry ? (
         <>
           <MetricsCard
             appId={CONTROL_APP_ID}
@@ -200,7 +218,12 @@ const ControlAppDetailBody = ({
           <ErrorsSummary appId={CONTROL_APP_ID} />
         </>
       ) : null}
-      {active === "overview" && !controlFleet ? <NoControlFleetNotice /> : null}
+      {active === "overview" && fleet._tag === "Absent" ? (
+        <NoControlFleetNotice />
+      ) : null}
+      {active === "overview" && fleet._tag === "Unknown" ? (
+        <FleetUnknownNotice />
+      ) : null}
       {active === "overview" ? <AppStorageList appId={CONTROL_APP_ID} /> : null}
       {active === "metrics" ? <ControlMetricsTab /> : null}
       {active === "errors" ? (
@@ -247,14 +270,12 @@ export const ControlAppDetail = () => {
     );
   }
 
-  // `controlFleet` is false only when the runner says it supervises no
-  // control fleet (the dev image: vite dev serves the UI) — then there is no
-  // telemetry to chart and the body hides those tabs. Unknown/loading (the
-  // runner could not answer) reads as managed: a healthy release install
-  // must never show the dev notice.
+  // Three states, never two: `Managed` shows telemetry, `Absent` (the dev
+  // image: vite dev serves the UI) shows the dev notice, and `Unknown` (the
+  // runner has not answered) shows a neutral notice rather than guessing.
   return (
     <ControlAppDetailBody
-      controlFleet={resourceValue(admin.state())?.controlFleet !== false}
+      fleet={fleetState(resourceValue(admin.state())?.controlFleet)}
       email={resourceValue(sess.state())?.user.email ?? ""}
     />
   );
