@@ -15,14 +15,18 @@ services:
       # The Void proxy sources `src/host/void_proxy.rs` embeds via
       # `include_str!("../../../void-proxy/...")`: `/void-proxy` from `/src`.
       - ../apps/void-proxy:/void-proxy:z
-      # The sandbox controller bundle the runner reads at deploy time
-      # (`VOID_SANDBOX_BUNDLE_DIR` below): build it on the host with
-      # `bun run build` in `apps/void-sandbox` before deploying a sandbox
-      # app. The package dir mounts (it always exists); the missing
-      # `dist/` fails only sandbox-app deploys, naming the build.
-      - ../apps/void-sandbox:/opt/noite/void-sandbox-src:z
+      # The Void sandbox controller package (SPEC, Void sandbox controller).
+      # The runner loads its built bundle (`worker.js` + `meta.json`) on every
+      # deploy, and only the release image bakes one, so `docker/dev.sh` runs
+      # `dev-sandbox.sh` to compile it into the container before the runner
+      # starts and again whenever these sources change. Read-only: the source
+      # copy, its node_modules and the published bundle all stay in the
+      # container, so a dev session never writes into the checkout and needs no
+      # manual `bun run build`.
+      - ../apps/void-sandbox:/opt/noite/void-sandbox-src:ro,z
       - ../apps/noite:/app:z
       - ../docker/dev.sh:/opt/noite/dev.sh:ro,z
+      - ../docker/dev-sandbox.sh:/opt/noite/dev-sandbox.sh:ro,z
       - cargo-registry:/usr/local/cargo/registry
       - cargo-git:/usr/local/cargo/git
       - runner-target:/src/target
@@ -34,9 +38,10 @@ services:
       RUST_LOG: ${RUST_LOG:-noite_runner=debug,tower_http=info}
       # Dev stacks never report (SPEC, telemetry).
       NOITE_TELEMETRY: "0"
-      # The sandbox controller bundle lives in the mounted package's
-      # `dist/`, not at the image path (SPEC, Void sandbox controller).
-      VOID_SANDBOX_BUNDLE_DIR: /opt/noite/void-sandbox-src/dist
+      # Where dev.sh publishes the compiled controller bundle (`dev-sandbox.sh`
+      # owns the path and keeps it a symlink to the current build). Same path
+      # the release image bakes, so dev deploys read exactly what prod does.
+      VOID_SANDBOX_BUNDLE_DIR: /opt/noite/void-sandbox
       RUNNER_DEV_RELEASE: ${RUNNER_DEV_RELEASE:-0}
       # 1 = polling file watcher (flaky rootless inotify).
       VITE_USE_POLLING: ${VITE_USE_POLLING:-0}

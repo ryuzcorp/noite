@@ -170,10 +170,11 @@ pub struct BundleMeta {
     pub bundle_sha256: String,
 }
 
-/// The fixed controller bundle: `dist/worker.js` plus its meta. Read from
-/// disk at deploy time (the image build compiles it; a dev checkout runs
-/// `bun run build` in `apps/void-sandbox`), verified against its own
-/// digest before anything deploys it.
+/// The fixed controller bundle: `worker.js` plus its meta. Read from disk at
+/// deploy time — the image build compiles it, and the dev stack
+/// (`docker/dev-sandbox.sh`) compiles it at container start and on every
+/// source change — and verified against its own digest before anything
+/// deploys it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Bundle {
     pub worker_js: Vec<u8>,
@@ -189,7 +190,7 @@ pub fn load_bundle(dir: &Path) -> anyhow::Result<Bundle> {
     for path in [&worker, &meta_path] {
         if !path.is_file() {
             anyhow::bail!(
-                "sandbox controller bundle incomplete at {}: {} is missing (the image ships the bundle at /opt/noite/void-sandbox; a dev checkout builds it with `bun run build` in apps/void-sandbox)",
+                "sandbox controller bundle incomplete at {}: {} is missing (the image bakes the bundle into /opt/noite/void-sandbox at build time, so a release container without it runs an image built without it — re-run the installer to refresh the image; a dev stack compiles apps/void-sandbox into the same path at container start and after every source change, and withdraws it while that build fails — its log holds the error, and `make dev` or `make dev-host` restarts it)",
                 dir.display(),
                 path.display()
             );
@@ -228,7 +229,7 @@ pub fn load_bundle(dir: &Path) -> anyhow::Result<Bundle> {
         .collect();
     if sha256 != meta.bundle_sha256 {
         anyhow::bail!(
-            "sandbox controller bundle at {} is inconsistent: worker.js does not match meta.json's bundleSha256 (rebuild the controller bundle)",
+            "sandbox controller bundle at {} is inconsistent: worker.js does not match meta.json's bundleSha256 (the build writes both files together and nothing else may — re-run the installer to refresh a release image, or `make dev`/`make dev-host` to rebuild a dev stack)",
             dir.display()
         );
     }
@@ -795,15 +796,27 @@ mod tests {
         );
         assert_eq!(bundle.meta.bundle_sha256.len(), 64);
 
+        // The dev stack publishes the bundle by swapping a symlink
+        // (`docker/dev-sandbox.sh`), so the loader must follow one.
+        let link = guard_bundle_ok.path().join("bundle-link");
+        std::os::unix::fs::symlink(&dir, &link).unwrap();
+        assert_eq!(load_bundle(&link).unwrap().worker_js, worker);
+
         std::fs::write(dir.join("worker.js"), b"controller-bundle-tampered").unwrap();
         let err = format!("{:#}", load_bundle(&dir).unwrap_err());
         assert!(err.contains("does not match"), "{}", err);
-        assert!(err.contains("rebuild the controller bundle"), "{}", err);
+        // The message names the fix an operator or a dev can actually run, and
+        // keeps the two recoveries apart: a dev-stack command never repairs a
+        // release container.
+        assert!(err.contains("installer"), "{}", err);
+        assert!(err.contains("make dev-host"), "{}", err);
 
         std::fs::remove_file(dir.join("worker.js")).unwrap();
         let err = format!("{:#}", load_bundle(&dir).unwrap_err());
         assert!(err.contains("is missing"), "{}", err);
-        assert!(err.contains("bun run build"), "{}", err);
+        assert!(err.contains("installer"), "{}", err);
+        assert!(err.contains("make dev"), "{}", err);
+        assert!(!err.contains("bun run build"), "{}", err);
 
         let (guard_bundle_broken, _) = bundle_dir("bundle-broken", b"x");
 

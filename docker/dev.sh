@@ -7,6 +7,10 @@
 #               bundle, so the runner does not start fleet #0.
 #   runner      `cargo watch` on the bind-mounted source; the runner then
 #               supervises Caddy and the tenant fleets exactly as in prod.
+#   sandbox     `dev-sandbox.sh` compiles the Void sandbox controller bundle
+#               before the runner starts and again on every change to the
+#               mounted `apps/void-sandbox`, so a sandbox app deploys with no
+#               manual `bun run build`.
 #
 # `celld dev` cannot serve the control app: it bundles `main` with raw
 # esbuild, which cannot resolve the Void plugin's `virtual:void-routes`
@@ -15,6 +19,34 @@ set -eu
 
 UI_DIR=/app
 RUNNER_DIR=/src
+# The sandbox controller bundle: the package mount is read-only, so the build
+# tree and the published bundle live in the container (compose.dev.yaml sets
+# VOID_SANDBOX_BUNDLE_DIR to SANDBOX_BUNDLE). dev-sandbox.sh owns both.
+SANDBOX_SRC=/opt/noite/void-sandbox-src
+SANDBOX_WORK=/opt/noite/void-sandbox-build
+SANDBOX_BUNDLE=/opt/noite/void-sandbox
+
+# The runner reads the bundle on every deploy and the dev image bakes none:
+# build it before the runner starts so the first sandbox app deploy works, and
+# keep it current while the session runs (a mid-session edit of
+# apps/void-sandbox reaches the next deploy). A failed build must not take the
+# dev stack down: it is logged here, and the runner's "bundle incomplete" error
+# names the same fix.
+sandbox_build() {
+  sh /opt/noite/dev-sandbox.sh \
+    --source "$SANDBOX_SRC" --work "$SANDBOX_WORK" --bundle "$SANDBOX_BUNDLE" "$@"
+}
+
+# Keep the watcher running: if it dies, the bundle silently stops tracking
+# `apps/void-sandbox` and the session keeps deploying the controller it last
+# published. Restart it after a pause, like `ui_loop`.
+sandbox_loop() {
+  while :; do
+    sandbox_build --watch
+    echo "dev: sandbox bundle watcher exited; restarting in 2s"
+    sleep 2
+  done
+}
 
 ui_install() {
   cd "$UI_DIR"
@@ -47,6 +79,11 @@ ui_install
 ui_loop &
 UI_PID=$!
 
+sandbox_build --once ||
+  echo "dev: sandbox controller bundle not built; a sandbox app deploy fails until it builds" >&2
+sandbox_loop &
+SANDBOX_PID=$!
+
 cd "$RUNNER_DIR"
 if [ "${RUNNER_DEV_RELEASE:-0}" = 1 ]; then
   run="cargo run --release"
@@ -57,9 +94,9 @@ echo "dev: runner via cargo watch ($run)"
 cargo watch -q -w src -w Cargo.toml -w Cargo.lock -w schema.sql -w /void-proxy -s "$run" &
 RUNNER_PID=$!
 
-# docker stop → SIGTERM to tini → this shell: stop both. The runner handles
-# SIGTERM itself (fleets, Caddy, final state snapshot).
-trap 'kill -TERM "$RUNNER_PID" "$UI_PID" 2>/dev/null || true' TERM INT
+# docker stop → SIGTERM to tini → this shell: stop all three. The runner
+# handles SIGTERM itself (fleets, Caddy, final state snapshot).
+trap 'kill -TERM "$RUNNER_PID" "$UI_PID" "$SANDBOX_PID" 2>/dev/null || true' TERM INT
 wait "$RUNNER_PID" || true
-kill -TERM "$UI_PID" 2>/dev/null || true
+kill -TERM "$UI_PID" "$SANDBOX_PID" 2>/dev/null || true
 wait "$UI_PID" 2>/dev/null || true
