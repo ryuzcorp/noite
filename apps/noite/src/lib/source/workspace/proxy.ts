@@ -18,6 +18,8 @@
 //!   this page POSTs it, with the viewer's session cookies, on the user's Push
 //!   click alone, and tells the frame how that went.
 
+import { Data } from "effect";
+
 import { errorMessage } from "../../errors";
 import type { TreeEntry } from "../../runner";
 import { openPodFrame } from "../pod-client";
@@ -78,23 +80,91 @@ export interface SourceCheckout {
   workspace: Workspace;
 }
 
-/** One path's writes, as the frame receives them: at most one in flight, one
- * latest value behind it, and the callers waiting for a value to land. */
-interface PathWrites {
-  /** The text of the next write, or null while only the in-flight one is
-   * left. A later call replaces it (latest wins). */
-  pending: string | null;
-  /** The callers whose text this pending value carries (or supersedes). */
-  waiting: WaitingWrite[];
-  writing: boolean;
-}
-
 /** One caller waiting for the pod to hold its text. */
 interface WaitingWrite {
   // oxlint-disable-next-line anti-slop/no-unknown-parameters -- a refused write is the frame's own answer, unknown by construction; the caller narrows it to text.
   reject: (error: unknown) => void;
   resolve: () => void;
 }
+
+/** One write, and every caller whose text it carries (or supersedes). */
+interface Batch {
+  text: string;
+  waiting: WaitingWrite[];
+}
+
+/** One path's writes, as the frame receives them: at most one in flight, one
+ * latest value behind it, and the callers waiting for a value to land.
+ *
+ * ```mermaid
+ * stateDiagram-v2
+ *   [*] --> idle
+ *   idle --> writing: a caller's text
+ *   writing --> writing: another text (replaces the queued one)
+ *   writing --> writing: the flight answered, the queued text goes out
+ *   writing --> idle: the flight answered, nothing queued
+ *   writing --> idle: the flight failed (every caller is refused)
+ * ```
+ *
+ * `writing.current` is what the frame holds; `writing.queued` is the one value
+ * behind it (a later keystroke replaces its text and inherits its callers, so
+ * a burst is two writes at most). Every transition goes through
+ * `writeTransition`; the effects (the `fs.write` calls) stay in `drain`. */
+export type WriteSlotState = Data.TaggedEnum<{
+  Idle: Record<never, never>;
+  Writing: { current: Batch; queued: Batch | null };
+}>;
+
+export type WriteEvent =
+  | { batch: Batch; t: "queue" }
+  | { batch: Batch; t: "start" }
+  | { t: "finish" }
+  | { t: "next" };
+
+export const WriteSlot = Data.taggedEnum<WriteSlotState>();
+
+/** The one write-slot transition. A `start` while writing, or a `queue` while
+ * idle, leaves the state alone: the caller's own flow decides which one it
+ * means, and the slot refuses the other rather than dropping text. */
+export const writeTransition = (
+  state: WriteSlotState,
+  event: WriteEvent
+): WriteSlotState =>
+  WriteSlot.$match(state, {
+    Idle: () =>
+      event.t === "start"
+        ? WriteSlot.Writing({ current: event.batch, queued: null })
+        : state,
+    Writing: ({ current, queued }) => {
+      switch (event.t) {
+        case "finish": {
+          return WriteSlot.Idle();
+        }
+
+        case "next": {
+          return queued === null
+            ? state
+            : WriteSlot.Writing({ current: queued, queued: null });
+        }
+
+        case "queue": {
+          // Latest wins: the new text replaces the queued one, and every
+          // caller the replaced value carried is answered by this text.
+          return WriteSlot.Writing({
+            current,
+            queued: {
+              text: event.batch.text,
+              waiting: [...(queued?.waiting ?? []), ...event.batch.waiting],
+            },
+          });
+        }
+
+        default: {
+          return state;
+        }
+      }
+    },
+  });
 
 /** Close `connection` when `signal` aborts, and answer the way to stop
  * listening: the frame is removed with it (see `PodConnection.close`), and an
@@ -184,6 +254,10 @@ export const openSourceWorkspace = async (
   // against, and the fs watches the page holds.
   let changes: WorkspaceChange[] = [];
   let base = "";
+  /** The newest rows' revision the frame published: a lower one is a pass that
+   * was already in flight when a newer one published, and applying it would
+   * roll the panel back. */
+  let revision = 0;
   const subscribers = new Set<(next: WorkspaceChange[]) => void>();
 
   const peerSubscribers = new Set<
@@ -196,7 +270,13 @@ export const openSourceWorkspace = async (
   >();
 
   connection.on("changes", (event) => {
-    const { changes: rows, baseSha } = event;
+    const { baseSha, changes: rows, revision: published } = event;
+
+    if (published <= revision) {
+      return;
+    }
+
+    revision = published;
     changes = rows;
     base = baseSha;
 
@@ -239,62 +319,87 @@ export const openSourceWorkspace = async (
 
   /** Every path's write slot, so a keystroke burst is one write in flight and
    * one latest value behind it. */
-  const writers = new Map<string, PathWrites>();
+  const slots = new Map<string, WriteSlotState>();
 
-  /** Push one path's writes through: each value is written once, and every
-   * caller waiting when the write started learns how it went. A value that
-   * arrived while a write was in flight is the next one, so the last text a
-   * burst typed is always the text the pod ends up with. */
-  const drain = (path: string): void => {
-    const writer = writers.get(path);
+  const slotOf = (path: string): WriteSlotState =>
+    slots.get(path) ?? WriteSlot.Idle();
 
-    if (writer === undefined || writer.writing) {
+  const holdSlot = (path: string, state: WriteSlotState): void => {
+    if (WriteSlot.$is("Idle")(state)) {
+      slots.delete(path);
+
       return;
     }
 
-    writer.writing = true;
-    void (async () => {
-      while (writer.pending !== null) {
-        const text = writer.pending;
-        const { waiting } = writer;
-        writer.pending = null;
-        writer.waiting = [];
+    slots.set(path, state);
+  };
 
-        try {
-          // The keystroke path is the facade's own: the page speaks checkout
-          // paths, and the frame's `fs.write` is one of the pod-path kinds
-          // (`fs.read`, `fs.stat`, …), so the mapping happens here.
-          // oxlint-disable-next-line eslint/no-await-in-loop -- the writes for one path are sequential by design: each answer is what lets the next value (or the caller's promise) settle.
-          await connection.call("fs.write", {
-            data: text,
-            path: projectPath(path),
-          });
+  /** Write one batch, and settle every caller whose text it carries. */
+  const land = async (path: string, batch: Batch): Promise<boolean> => {
+    try {
+      // The keystroke path is the facade's own: the page speaks checkout
+      // paths, and the frame's `fs.write` is one of the pod-path kinds
+      // (`fs.read`, `fs.stat`, …), so the mapping happens here.
+      await connection.call("fs.write", {
+        data: batch.text,
+        path: projectPath(path),
+      });
 
-          for (const call of waiting) {
-            call.resolve();
-          }
-        } catch (error) {
-          writer.writing = false;
-          writers.delete(path);
-          // Everything the slot still holds goes with the failed write: the
-          // callers this value carried, and the waiters a later keystroke
-          // queued behind it. A caller whose promise never settles would hold
-          // the editor's own write queue for that path forever.
-          const stranded = [...waiting, ...writer.waiting];
-          writer.pending = null;
-          writer.waiting = [];
-
-          for (const call of stranded) {
-            call.reject(error);
-          }
-
-          return;
-        }
+      for (const call of batch.waiting) {
+        call.resolve();
       }
 
-      writer.writing = false;
-      writers.delete(path);
-    })();
+      return true;
+    } catch (error) {
+      for (const call of batch.waiting) {
+        call.reject(error);
+      }
+
+      return false;
+    }
+  };
+
+  /** Push one path's writes through: each value is written once, and every
+   * caller waiting when the write started learns how it went. A failed write
+   * refuses everything the slot still holds (the callers this value carried,
+   * and the waiters a later keystroke queued behind it): a caller whose promise
+   * never settles would hold the editor's own write queue forever. */
+  const drain = async (path: string): Promise<void> => {
+    for (;;) {
+      const state = slotOf(path);
+
+      if (!WriteSlot.$is("Writing")(state)) {
+        return;
+      }
+
+      // oxlint-disable-next-line eslint/no-await-in-loop -- the writes for one path are sequential by design: each answer is what lets the next value (or the caller's promise) settle.
+      const landed = await land(path, state.current);
+
+      if (!landed) {
+        for (const call of state.queued?.waiting ?? []) {
+          call.reject(new Error("workspace: the write before this one failed"));
+        }
+
+        holdSlot(path, WriteSlot.Idle());
+
+        return;
+      }
+
+      // The slot may have gained a queued value while the write was in
+      // flight, so the transition applies to what the slot holds *now*.
+      const held = slotOf(path);
+
+      if (!WriteSlot.$is("Writing")(held)) {
+        return;
+      }
+
+      const next =
+        held.queued === null
+          ? writeTransition(held, { t: "finish" })
+          : writeTransition(held, { t: "next" });
+
+      holdSlot(path, next);
+    }
   };
 
   /** Ship the text `drain` is still holding, one write per path, without
@@ -303,28 +408,30 @@ export const openSourceWorkspace = async (
    * on this write's own answer (a promise that may never settle if the page
    * goes right away, which is what unload looks like). */
   const shipPending = (): void => {
-    for (const [path, writer] of writers) {
-      const text = writer.pending;
-
-      if (text === null) {
+    for (const [path, state] of slots) {
+      if (!WriteSlot.$is("Writing")(state) || state.queued === null) {
         continue;
       }
 
-      writer.pending = null;
-      const { waiting } = writer;
-      writer.waiting = [];
+      const batch = state.queued;
+      // Taken out of the slot first: the write already in flight answers into
+      // a slot with nothing queued, so this text goes out exactly once.
+      holdSlot(
+        path,
+        WriteSlot.Writing({ current: state.current, queued: null })
+      );
       void (async () => {
         try {
           await connection.call("fs.write", {
-            data: text,
+            data: batch.text,
             path: projectPath(path),
           });
 
-          for (const call of waiting) {
+          for (const call of batch.waiting) {
             call.resolve();
           }
         } catch (error) {
-          for (const call of waiting) {
+          for (const call of batch.waiting) {
             call.reject(error);
           }
         }
@@ -335,18 +442,25 @@ export const openSourceWorkspace = async (
   /** The write behind `writeText`: the caller's promise lands when the pod
    * holds its text or a later one. */
   const writeText = (path: string, text: string): Promise<void> => {
-    const writer = writers.get(path) ?? {
-      pending: null,
-      waiting: [],
-      writing: false,
-    };
-
-    writers.set(path, writer);
     // oxlint-disable-next-line typescript/no-invalid-void-type -- the write answers nothing, so `void` is its honest result; the rule reads the generic argument as a declaration.
     const written = Promise.withResolvers<void>();
-    writer.pending = text;
-    writer.waiting.push({ reject: written.reject, resolve: written.resolve });
-    drain(path);
+
+    const batch: Batch = {
+      text,
+      waiting: [{ reject: written.reject, resolve: written.resolve }],
+    };
+
+    const state = slotOf(path);
+    const started = WriteSlot.$is("Idle")(state);
+
+    holdSlot(
+      path,
+      writeTransition(state, { batch, t: started ? "start" : "queue" })
+    );
+
+    if (started) {
+      void drain(path);
+    }
 
     return written.promise;
   };

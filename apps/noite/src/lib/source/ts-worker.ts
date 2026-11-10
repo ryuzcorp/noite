@@ -472,7 +472,10 @@ const install = (request: Extract<IntelRequest, { kind: "sync" }>): void => {
 
   // The declarations are fetched, not received: the versions come from the
   // lockfile the bundle carries, and the fetch runs detached so the pane
-  // answers from the repo's own sources meanwhile.
+  // answers from the repo's own sources meanwhile. The registry and its
+  // budget describe the declarations the clear above removed, so they start
+  // over with it — a branch that is small is not capped by one that was big.
+  esm.reset();
   esm.setVersions(collectVersions(request.bundle.files));
 };
 

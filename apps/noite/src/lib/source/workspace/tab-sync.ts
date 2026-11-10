@@ -15,6 +15,8 @@
 //! This module never imports the pod SDK (see `pod.ts`): the volume is the
 //! structural slice it needs, and mutations arrive already classified.
 
+import { Data } from "effect";
+
 import {
   BASE_FILE,
   JOURNAL_FILE,
@@ -61,6 +63,9 @@ type SyncOp =
 type SyncMessage =
   | { from: string; kind: "flush" }
   | { kind: "flushed"; to: string }
+  /** No tab here saves the workspace: stop waiting for a flush that will
+   * never come (a following tab's honest answer). */
+  | { kind: "refused"; to: string }
   | { from: string; kind: "op"; op: SyncOp };
 
 /** The channel the tabs talk over (`BroadcastChannel` in the page). */
@@ -124,7 +129,7 @@ const isMessage = (value: unknown): value is SyncMessage => {
     return false;
   }
 
-  if (value.kind === "flushed") {
+  if (value.kind === "flushed" || value.kind === "refused") {
     return "to" in value && typeof value.to === "string";
   }
 
@@ -248,6 +253,81 @@ const apply = (volume: SyncVolume, op: SyncOp): boolean => {
   }
 };
 
+/** What this tab is doing with its channel.
+ *
+ * ```mermaid
+ * stateDiagram-v2
+ *   [*] --> buffering
+ *   buffering --> live: start (the restore has landed)
+ *   live --> live: serveFlush (this tab saves)
+ *   buffering --> closed: close
+ *   live --> closed: close
+ * ```
+ *
+ * `buffering` holds every peer op that arrived before the restore finished, so
+ * start applies them in arrival order and none is lost. `live` carries the one
+ * thing the tab can do for its peers — flush the saved copy, or nothing when it
+ * is not the tab that saves (which then answers `refused`, not silence). */
+export type SyncState = Data.TaggedEnum<{
+  Buffering: { pending: SyncOp[] };
+  Closed: Record<never, never>;
+  Live: { serving: (() => Promise<void>) | null };
+}>;
+
+export type SyncEvent =
+  | { flush: () => Promise<void>; t: "serve" }
+  | { op: SyncOp; t: "buffer" }
+  | { t: "close" }
+  | { t: "start" };
+
+export const Sync = Data.taggedEnum<SyncState>();
+
+/** The one channel transition. `close` is terminal; an op that arrives after
+ * it is dropped rather than buffered. */
+export const syncTransition = (
+  state: SyncState,
+  event: SyncEvent
+): SyncState => {
+  if (event.t === "close") {
+    return Sync.Closed();
+  }
+
+  return Sync.$match(state, {
+    Buffering: ({ pending }) => {
+      switch (event.t) {
+        case "buffer": {
+          return Sync.Buffering({ pending: [...pending, event.op] });
+        }
+
+        case "start": {
+          return Sync.Live({ serving: null });
+        }
+
+        default: {
+          return state;
+        }
+      }
+    },
+    Closed: () => state,
+    Live: () => {
+      switch (event.t) {
+        case "buffer": {
+          // Live tabs apply at once; the state carries no buffer.
+          return state;
+        }
+
+        case "serve": {
+          return Sync.Live({ serving: event.flush });
+        }
+
+        default: {
+          return state;
+        }
+      }
+    },
+  });
+};
+
 export const syncTabs = (
   volume: SyncVolume,
   channel: SyncChannel,
@@ -257,14 +337,11 @@ export const syncTabs = (
     (structural: boolean, paths: readonly string[]) => void
   >();
 
-  const pending: SyncOp[] = [];
   const flushWaiters = new Set<() => void>();
-  let started = false;
   /** Set while a peer's mutation is applied: the volume reports it like any
    * other, and it must not echo back. */
   let applying = false;
-  let serving: (() => Promise<void>) | null = null;
-  let closed = false;
+  let state: SyncState = Sync.Buffering({ pending: [] });
 
   const send = (message: SyncMessage): void => {
     // oxlint-disable-next-line unicorn/require-post-message-target-origin -- a BroadcastChannel has no target origin (it reaches same-origin tabs only)
@@ -294,17 +371,23 @@ export const syncTabs = (
   };
 
   const answerFlush = async (to: string): Promise<void> => {
-    if (serving === null) {
+    if (!Sync.$is("Live")(state) || state.serving === null) {
+      // This tab does not save: say so, rather than leaving the peer to its
+      // full wait for an answer that will never come.
+      if (Sync.$is("Live")(state)) {
+        send({ kind: "refused", to });
+      }
+
       return;
     }
 
     try {
-      await serving();
+      await state.serving();
     } catch {
       // The saving tab retries its own save; the peer restores what landed.
     }
 
-    if (!closed) {
+    if (Sync.$is("Live")(state)) {
       send({ kind: "flushed", to });
     }
   };
@@ -312,11 +395,11 @@ export const syncTabs = (
   const onMessage = (event: MessageEvent): void => {
     const message: unknown = event.data;
 
-    if (closed || !isMessage(message)) {
+    if (Sync.$is("Closed")(state) || !isMessage(message)) {
       return;
     }
 
-    if (message.kind === "flushed") {
+    if (message.kind === "flushed" || message.kind === "refused") {
       if (message.to === self) {
         for (const resolve of flushWaiters) {
           resolve();
@@ -334,17 +417,19 @@ export const syncTabs = (
       return;
     }
 
-    if (started) {
+    if (Sync.$is("Live")(state)) {
       applyAll([message.op]);
-    } else {
-      pending.push(message.op);
+
+      return;
     }
+
+    state = syncTransition(state, { op: message.op, t: "buffer" });
   };
 
   channel.addEventListener("message", onMessage);
 
   const stopWatching = volume.onMutation((mutation) => {
-    if (applying || !started || closed) {
+    if (applying || !Sync.$is("Live")(state)) {
       return;
     }
 
@@ -357,7 +442,7 @@ export const syncTabs = (
 
   return {
     close: () => {
-      closed = true;
+      state = syncTransition(state, { t: "close" });
       stopWatching();
       channel.close();
 
@@ -397,15 +482,16 @@ export const syncTabs = (
       };
     },
     serveFlush: (flush) => {
-      serving = flush;
+      state = syncTransition(state, { flush, t: "serve" });
     },
     start: () => {
-      if (started) {
+      if (!Sync.$is("Buffering")(state)) {
         return;
       }
 
-      started = true;
-      applyAll(pending.splice(0));
+      const { pending } = state;
+      state = syncTransition(state, { t: "start" });
+      applyAll(pending);
     },
   };
 };

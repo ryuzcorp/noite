@@ -20,6 +20,8 @@
 import ts from "typescript-ls";
 
 import {
+  Budget,
+  budgetTransition,
   canonicalUrl,
   declarationTargets,
   entryTypeCandidates,
@@ -27,9 +29,7 @@ import {
   ESM_TYPES_DIR,
   FETCH_CONCURRENCY,
   isCodeSubpath,
-  MAX_TYPES_BYTES,
   MAX_TYPES_FILE,
-  MAX_TYPES_FILES,
   MISS_CACHE_NAME,
   MISS_EXPIRY_HEADER,
   missExpiry,
@@ -37,7 +37,7 @@ import {
   typesUrlOfPath,
   typesVirtualPath,
 } from "./esm-types";
-import type { PackageVersions } from "./esm-types";
+import type { BudgetState, PackageVersions } from "./esm-types";
 
 /** Cache storage names; bump them to drop everything an older version of this
  * module cached. */
@@ -140,9 +140,7 @@ export class EsmTypes {
   readonly #caches = new Map<string, Promise<Cache | undefined>>();
   readonly #host: EsmTypesHost;
   #versions: PackageVersions = new Map();
-  #capped = false;
-  #files = 0;
-  #bytes = 0;
+  #budget: BudgetState = Budget.Open({ bytes: 0, files: 0 });
   #stored = 0;
   /** How many times a specifier's resolution has moved — gained one, or lost
    * one to a lockfile that stopped pinning it. A round compares this to know
@@ -637,7 +635,18 @@ export class EsmTypes {
       return known;
     }
 
-    if (text.length > MAX_TYPES_FILE || this.#atCapacity()) {
+    if (text.length > MAX_TYPES_FILE) {
+      this.#budget = budgetTransition(this.#budget, {
+        bytes: text.length,
+        files: 0,
+        t: "cap",
+      });
+      this.#capsReached();
+
+      return undefined;
+    }
+
+    if (this.#atCapacity()) {
       this.#capsReached();
 
       return undefined;
@@ -645,8 +654,10 @@ export class EsmTypes {
 
     const path = typesVirtualPath(url);
     this.#urls.set(url, path);
-    this.#files += 1;
-    this.#bytes += text.length;
+    this.#budget = budgetTransition(this.#budget, {
+      bytes: text.length,
+      t: "spend",
+    });
     this.#stored += 1;
     this.#host.write(path, text);
 
@@ -777,7 +788,28 @@ export class EsmTypes {
   }
 
   #atCapacity(): boolean {
-    return this.#files >= MAX_TYPES_FILES || this.#bytes >= MAX_TYPES_BYTES;
+    return Budget.$is("Capped")(this.#budget);
+  }
+
+  /** A new repository snapshot: the FS the counts described was cleared
+   * (`ts-worker`'s `install`), so the registry and the budget go with it. A
+   * later branch starts from `open` rather than inheriting a cap its own graph
+   * never reached. */
+  reset(): void {
+    this.#bare.clear();
+    this.#urls.clear();
+    this.#modules.clear();
+    this.#declarations.clear();
+    this.#moduleLookups.clear();
+    this.#failed.clear();
+    this.#requested.clear();
+    this.#unresolved.clear();
+    this.#judged.clear();
+    this.#misses.length = 0;
+    this.#caches.clear();
+    this.#budget = budgetTransition(this.#budget, { t: "reset" });
+    this.#stored = 0;
+    this.#resolutions = 0;
   }
 
   #enqueue(task: () => Promise<void>): void {
@@ -823,11 +855,6 @@ export class EsmTypes {
    * the one failure the user can act on (a repository too big to type in the
    * browser), and it never fires for an ordinary one. */
   #capsReached(): void {
-    if (this.#capped) {
-      return;
-    }
-
-    this.#capped = true;
     this.#host.warn(
       "[esm.sh] declaration files hit the acquisition caps — some imports stay unresolved"
     );

@@ -7,6 +7,8 @@
 //! protocol in `intel-protocol.ts`. Importing `typescript-ls` from here would
 //! drag ~13 MB into the main bundle, so nothing in this file may.
 
+import { Data } from "effect";
+
 import type {
   IntelBundle,
   IntelCompletion,
@@ -19,6 +21,81 @@ import type {
   IntelResult,
 } from "./intel-protocol";
 import { createIntelWorker } from "./ts-worker-client";
+
+/** What the intelligence client is doing.
+ *
+ * ```mermaid
+ * stateDiagram-v2
+ *   [*] --> idle
+ *   idle --> loading: sync / reset
+ *   loading --> ready: the snapshot was installed
+ *   loading --> idle: the bundle or the worker failed (retry on next open)
+ *   ready --> broken: the worker died
+ *   broken --> loading: the next request restarts it
+ *   idle --> disposed: dispose
+ *   ready --> disposed: dispose
+ *   broken --> disposed: dispose
+ * ```
+ *
+ * `broken` used to be permanent: the error handler dropped the worker but left
+ * the started promise resolved, so every later request answered `null` and the
+ * pane silently lost diagnostics, hover and definition for the rest of the
+ * mount. A broken client now restarts from its last inputs on the next
+ * request. */
+export type IntelState = Data.TaggedEnum<{
+  Broken: { message: string };
+  Disposed: Record<never, never>;
+  Idle: Record<never, never>;
+  Loading: Record<never, never>;
+  Ready: Record<never, never>;
+}>;
+
+export type IntelEvent =
+  | { message: string; t: "broken" }
+  | { t: "dispose" }
+  | { message: string; t: "failed" }
+  | { t: "loaded" }
+  | { t: "start" };
+
+export const Intel = Data.taggedEnum<IntelState>();
+
+/** The one client transition. `disposed` is terminal; `ready` is only reached
+ * after the worker acknowledged the snapshot. */
+export const intelTransition = (
+  state: IntelState,
+  event: IntelEvent
+): IntelState => {
+  if (event.t === "dispose") {
+    return Intel.Disposed();
+  }
+
+  return Intel.$match(state, {
+    Broken: () => (event.t === "start" ? Intel.Loading() : state),
+    Disposed: () => state,
+    Idle: () => (event.t === "start" ? Intel.Loading() : state),
+    Loading: () => {
+      switch (event.t) {
+        case "broken": {
+          return Intel.Broken({ message: event.message });
+        }
+
+        case "failed": {
+          return Intel.Idle();
+        }
+
+        case "loaded": {
+          return Intel.Ready();
+        }
+
+        default: {
+          return state;
+        }
+      }
+    },
+    Ready: () =>
+      event.t === "broken" ? Intel.Broken({ message: event.message }) : state,
+  });
+};
 
 interface IntelPending {
   reject: (error: Error) => void;
@@ -42,6 +119,12 @@ export class SourceIntel {
    * to date with one small message instead of shipping the file every call. */
   #sent = new Map<string, string>();
   #started: Promise<void> | undefined;
+  /** The last inputs a restart needs (a worker that died mid-mount). */
+  #last: {
+    drafts: readonly IntelFile[];
+    load: () => Promise<IntelBundle>;
+  } | null = null;
+  #state: IntelState = Intel.Idle();
   #worker: Worker | undefined;
   readonly #onTypesChanged: (() => void) | undefined;
 
@@ -57,9 +140,21 @@ export class SourceIntel {
     load: () => Promise<IntelBundle>,
     drafts: readonly IntelFile[]
   ): Promise<void> {
+    this.#last = { drafts, load };
+
+    if (Intel.$is("Broken")(this.#state)) {
+      this.#sent.clear();
+      this.#started = undefined;
+    }
+
     this.#started ??= this.#start(load, drafts);
 
     return this.#started;
+  }
+
+  /** The client's state now (see `IntelState`). */
+  state(): IntelState {
+    return this.#state;
   }
 
   /** Re-sync from scratch (a push changed the repo): the replies still in
@@ -68,6 +163,7 @@ export class SourceIntel {
     load: () => Promise<IntelBundle>,
     drafts: readonly IntelFile[]
   ): Promise<void> {
+    this.#last = { drafts, load };
     this.#generation += 1;
     this.#failPending(new Error("source intelligence reset"));
     this.#sent.clear();
@@ -78,6 +174,7 @@ export class SourceIntel {
 
   /** Stop the worker and reject whatever is in flight. */
   dispose(): void {
+    this.#state = intelTransition(this.#state, { t: "dispose" });
     this.#generation += 1;
     this.#failPending(new Error("source intelligence disposed"));
     this.#worker?.terminate();
@@ -142,6 +239,14 @@ export class SourceIntel {
     text: string,
     build: (id: number) => Exclude<IntelRequest, { kind: "update" }>
   ): Promise<T | null> {
+    // A worker that died is restarted from the last inputs rather than left
+    // broken: diagnostics, hover and definition must come back on their own.
+    if (Intel.$is("Broken")(this.#state) && this.#last !== null) {
+      this.#generation += 1;
+      this.#sent.clear();
+      this.#started = this.#start(this.#last.load, this.#last.drafts);
+    }
+
     const generation = this.#generation;
     const ready = this.#started;
 
@@ -211,6 +316,7 @@ export class SourceIntel {
     load: () => Promise<IntelBundle>,
     drafts: readonly IntelFile[]
   ): Promise<void> {
+    this.#state = intelTransition(this.#state, { t: "start" });
     // A reset or a dispose mid-sync supersedes this attempt: the catch below
     // must not clear the `#started` the newer one installed.
     const generation = this.#generation;
@@ -224,6 +330,10 @@ export class SourceIntel {
       // cannot fix (auth, network). Forget the attempt so the next file the
       // user opens retries; until then every request answers null.
       if (generation === this.#generation) {
+        this.#state = intelTransition(this.#state, {
+          message: "the bundle did not load",
+          t: "failed",
+        });
         this.#started = undefined;
       }
 
@@ -239,6 +349,10 @@ export class SourceIntel {
         id: this.#nextId(),
         kind: "sync",
       });
+
+      if (generation === this.#generation) {
+        this.#state = intelTransition(this.#state, { t: "loaded" });
+      }
     } catch {
       // The worker died installing the snapshot (only reachable through its
       // own failure): same recovery as a failed load, and the worker itself is
@@ -247,6 +361,10 @@ export class SourceIntel {
       this.#drop(worker);
 
       if (generation === this.#generation) {
+        this.#state = intelTransition(this.#state, {
+          message: "the language worker failed to install the sources",
+          t: "failed",
+        });
         this.#started = undefined;
       }
     }
@@ -291,8 +409,14 @@ export class SourceIntel {
     });
     worker.addEventListener("error", (event) => {
       // A worker that failed (a bad chunk, an evaluation error) never answers
-      // again, so it is dropped here and the next sync builds a new one.
+      // again: it is dropped, its pending requests are refused, and the client
+      // remembers it is broken so the next request restarts it.
       this.#drop(worker);
+      this.#state = intelTransition(this.#state, {
+        message: event.message || "language worker failed",
+        t: "broken",
+      });
+      this.#started = undefined;
       this.#failPending(new Error(event.message || "language worker failed"));
     });
     this.#worker = worker;

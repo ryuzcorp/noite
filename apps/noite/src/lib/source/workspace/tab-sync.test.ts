@@ -167,6 +167,15 @@ describe("tabs on one workspace", () => {
     expect(flushed).toBe(1);
   });
 
+  test("a tab that does not save answers a flush instead of staying silent", async () => {
+    const { b } = tabs();
+
+    // `a` never called `serveFlush`: without the `refused` arm this waits the
+    // whole minute for an answer that cannot come, which fails the test's own
+    // deadline instead of hanging the tab that opens second.
+    await b.sync.flushPeers(60_000);
+  });
+
   test("an applied batch reports the paths it touched, a rename its destination", async () => {
     const { a, b } = tabs();
     const file = `${PROJECT_ROOT}/a.ts`;

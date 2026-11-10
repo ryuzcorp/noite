@@ -19,6 +19,8 @@
 //! This module never imports the pod SDK (see `pod.ts`): the volume is the
 //! structural slice it needs, and mutations arrive already classified.
 
+import { Data } from "effect";
+
 import { base64ToBytes, bytesToBase64 } from "../../bytes";
 import { PROJECT_ROOT } from "./types";
 
@@ -79,10 +81,64 @@ export type MirrorMutation =
   | { op: "remove"; path: string }
   | { op: "write"; path: string };
 
+/** What the mirror is doing.
+ *
+ * ```mermaid
+ * stateDiagram-v2
+ *   [*] --> off: no sessionStorage
+ *   [*] --> recording
+ *   recording --> dropped: past the size cap
+ *   recording --> dropped: setItem threw
+ *   dropped --> recording: clear (a save left nothing pending)
+ * ```
+ *
+ * `off` is a browser with no usable sessionStorage (IndexedDB is the only
+ * copy). `dropped` is a document that outgrew the cap or a store that refused
+ * the write: the stored mirror was emptied, and only `clear` arms it again.
+ * `cap` is a designed fallback (a fresh checkout's first save outgrows it), so
+ * it is not reported; `storage` is a real failure and is. */
+export type MirrorState = Data.TaggedEnum<{
+  Dropped: { reason: "cap" | "storage" };
+  Off: Record<never, never>;
+  Recording: Record<never, never>;
+}>;
+
+export type MirrorEvent =
+  | { reason: "cap" | "storage"; t: "drop" }
+  | { t: "clear" }
+  | { t: "record" };
+
+export const Mirror = Data.taggedEnum<MirrorState>();
+
+/** The one mirror transition. A dropped mirror records nothing until it is
+ * cleared; an off one never records at all. */
+export const mirrorTransition = (
+  state: MirrorState,
+  event: MirrorEvent
+): MirrorState => {
+  switch (event.t) {
+    case "drop": {
+      return Mirror.$is("Recording")(state)
+        ? Mirror.Dropped({ reason: event.reason })
+        : state;
+    }
+
+    case "record": {
+      return state;
+    }
+
+    default: {
+      return Mirror.$is("Off")(state) ? state : Mirror.Recording();
+    }
+  }
+};
+
 /** A running mirror: `stop` ends the recording, `clear` empties it (and lets
  * a mirror that outgrew the cap record again). */
-export interface Mirror {
+export interface Mirrored {
   clear: () => void;
+  /** The mirror's state now (see `MirrorState`). */
+  state: () => MirrorState;
   stop: () => void;
 }
 
@@ -248,10 +304,11 @@ const clearMirror = (
   }
 };
 
-const NO_MIRROR: Mirror = {
+const NO_MIRROR: Mirrored = {
   clear: () => {
     // No storage, no mirror: nothing to clear.
   },
+  state: () => Mirror.Off(),
   stop: () => {
     // No storage, no subscription: nothing to stop.
   },
@@ -265,8 +322,11 @@ export const startMirror = (
   volume: MirrorVolume,
   scope: MirrorScope,
   id: string,
-  storage: MirrorStorage | null
-): Mirror => {
+  storage: MirrorStorage | null,
+  /** Told when the mirror dropped for a reason the user should know about
+   * (see `MirrorState`: `cap` is a designed fallback and is not reported). */
+  onDropped?: (reason: "storage") => void
+): Mirrored => {
   if (storage === null) {
     return NO_MIRROR;
   }
@@ -274,7 +334,16 @@ export const startMirror = (
   const stored = readDocument(storage, scope, id);
   const files = new Map<string, string>(Object.entries(stored?.files ?? {}));
   const removed = new Set<string>(stored?.removed);
-  let suspended = false;
+  let state: MirrorState = Mirror.Recording();
+
+  const drop = (reason: "cap" | "storage"): void => {
+    state = mirrorTransition(state, { reason, t: "drop" });
+    clearMirror(scope, id, storage);
+
+    if (reason === "storage") {
+      onDropped?.(reason);
+    }
+  };
 
   const store = (): void => {
     const document: MirrorDocument = {
@@ -286,8 +355,7 @@ export const startMirror = (
     const raw = JSON.stringify(document);
 
     if (raw.length > MAX_MIRROR_CHARS) {
-      suspended = true;
-      clearMirror(scope, id, storage);
+      drop("cap");
 
       return;
     }
@@ -295,8 +363,7 @@ export const startMirror = (
     try {
       storage.setItem(mirrorKey(scope, id), raw);
     } catch {
-      suspended = true;
-      clearMirror(scope, id, storage);
+      drop("storage");
     }
   };
 
@@ -367,7 +434,7 @@ export const startMirror = (
 
   // oxlint-disable-next-line promise/prefer-await-to-callbacks -- volume mutations arrive as events, not promises
   const unsubscribe = volume.onMutation((mutation) => {
-    if (suspended) {
+    if (!Mirror.$is("Recording")(state)) {
       return;
     }
 
@@ -389,9 +456,10 @@ export const startMirror = (
     clear: () => {
       files.clear();
       removed.clear();
-      suspended = false;
+      state = mirrorTransition(state, { t: "clear" });
       clearMirror(scope, id, storage);
     },
+    state: () => state,
     stop: unsubscribe,
   };
 };
