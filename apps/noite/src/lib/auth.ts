@@ -153,9 +153,11 @@ const AdminUpdateBody = Schema.Struct({
   userId: Schema.String,
 });
 
-const AdminUserResult = Schema.Struct({
+const AdminUnbanResult = Schema.Struct({
   user: Schema.Struct({ id: Schema.String }),
 });
+
+const AdminUser = Schema.Struct({ id: Schema.String });
 
 /** Deliver a sign-in OTP: POST to the configured webhook (Workers have no
  * SMTP sockets), dev-console fallback on localhost, loud refusal otherwise
@@ -310,16 +312,22 @@ export const createAuth = (env: KitEnv, baseURL: string) =>
           }
         }
 
-        const result = Schema.decodeUnknownResult(AdminUserResult)(
-          ctx.context.returned
-        );
+        // `/admin/unban-user` answers `{user}`, `/admin/update-user` answers
+        // the user object directly; decode the shape of the path that ran.
+        const result =
+          ctx.path === "/admin/unban-user"
+            ? Schema.decodeUnknownResult(AdminUnbanResult)(ctx.context.returned)
+            : Schema.decodeUnknownResult(AdminUser)(ctx.context.returned);
 
         if (result._tag !== "Success") {
           return;
         }
 
+        const userId =
+          "user" in result.success ? result.success.user.id : result.success.id;
+
         try {
-          await revokeApiKeysForUser(result.success.user.id);
+          await revokeApiKeysForUser(userId);
         } catch (error) {
           console.error("[auth] unban key sweep failed", error);
         }

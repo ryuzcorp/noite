@@ -123,7 +123,9 @@ const signInCookie = async (email: string): Promise<string> => {
     .find((entry) => entry.startsWith("better-auth.session_token="));
 
   if (!cookie) {
-    throw new Error("better-auth signed in with no session cookie");
+    throw new Error(
+      `better-auth signed in with no session cookie (status ${signedIn.status}: ${await signedIn.text()})`
+    );
   }
 
   return cookie.split(";")[0] ?? "";
@@ -229,6 +231,30 @@ describe("the ban endpoint", () => {
 
     const unbanedVerify = await auth.api.verifyApiKey({ body: { key } });
     expect(unbanedVerify.valid).toBe(false);
+
+    // `/admin/update-user` with `banned: false` is the other unban path; its
+    // sweep must run too, or a raced key survives there instead.
+    await mintKey("update-target");
+    await auth.api.banUser({ body: { userId: "update-target" }, headers });
+    expect(keyCount("update-target")).toBe(0);
+
+    const racedUpdate = await auth.api.createApiKey({
+      body: {
+        name: "raced-update",
+        permissions: { apps: ["manage"] },
+        userId: "update-target",
+      },
+    });
+
+    expect(racedUpdate?.key).toBeString();
+    expect(keyCount("update-target")).toBe(1);
+
+    await auth.api.adminUpdateUser({
+      body: { data: { banned: false }, userId: "update-target" },
+      headers,
+    });
+
+    expect(keyCount("update-target")).toBe(0);
   });
 
   test("refuses /api-key/create while the owner is banned", async () => {
