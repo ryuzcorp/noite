@@ -36,6 +36,9 @@ import * as Effect from "effect/Effect";
 
 import { api } from "../api";
 import { errorMessage } from "../errors";
+import type { AppStatus } from "../runner-types/AppStatus";
+import type { DesiredState } from "../runner-types/DesiredState";
+import { appLifecycle, appStatusFacts } from "./lifecycle";
 import type { Step } from "./step";
 
 /** How long a Start/Stop may take to show up on the state stream before the
@@ -71,8 +74,8 @@ export interface HeaderModel {
 
 export type HeaderMessage = Data.TaggedEnum<{
   FrameReceived: {
-    readonly desiredState: string;
-    readonly status: string;
+    readonly desiredState: DesiredState;
+    readonly status: AppStatus;
   };
   NoticeDismissed: Record<never, never>;
   RetryFailed: { readonly error: string };
@@ -151,27 +154,28 @@ const pendingKind = (pending: Pending): "retry" | "start" | "stop" | null => {
   }
 };
 
-/** Whether a state frame proves the current pending action finished. */
+/** Whether a state frame proves the current pending action finished. A
+ * `Starting` app is converged once its row can serve (or someone else set
+ * `desiredState=stopped`); a `Stopping` app once the lifecycle observes the
+ * stop; a retry once the import is no longer the row's state. */
 export const converged = (
   pending: Pending,
-  status: string,
-  desiredState: string
+  status: AppStatus,
+  desiredState: DesiredState
 ): boolean => {
+  const lifecycle = appLifecycle({ desiredState, status });
+
   switch (pending._tag) {
     case "Starting": {
-      return (
-        desiredState === "stopped" ||
-        (desiredState === "running" &&
-          (status === "running" || status === "sleeping"))
-      );
+      return desiredState === "stopped" || appStatusFacts(status).live;
     }
 
     case "Stopping": {
-      return desiredState === "stopped" && status === "stopped";
+      return lifecycle._tag === "Stopped";
     }
 
     case "Retrying": {
-      return status !== "importing";
+      return lifecycle._tag !== "Importing";
     }
 
     default: {

@@ -2,6 +2,7 @@ import { Data } from "effect";
 import * as Schema from "effect/Schema";
 
 import type { AppDetail, SlugCheck } from "../api-types";
+import { deployStatusFacts, parseDesiredState } from "../app-detail/lifecycle";
 import type { CreateSourceInput } from "../apps/create-source";
 import { TEMPLATES } from "../apps/templates";
 import { failUnknown, UnauthorizedError } from "../auth";
@@ -60,23 +61,6 @@ const outcomeValue = (
   outcome: MutationOutcome
 ): { deleting?: true; ok: true } =>
   outcome._tag === "Purging" ? { deleting: true, ok: true } : { ok: true };
-
-/** The two legal desired states. `App.desiredState` is an untyped string from
- * the runner, so it is validated into this union at the one entry point. */
-export type DesiredState = "running" | "stopped";
-
-const desiredState = (raw: string): DesiredState | null => {
-  switch (raw) {
-    case "running":
-    case "stopped": {
-      return raw;
-    }
-
-    default: {
-      return null;
-    }
-  }
-};
 
 const CreateSource = Schema.Union([
   Schema.Struct({ kind: Schema.Literal("blank") }),
@@ -453,7 +437,7 @@ export const setDesired = apiAction(
     // `?? fail()` (not an `if` guard): this toolchain does not narrow on
     // never-returning calls, but does narrow a `never`-typed `??` branch.
     const next =
-      desiredState(raw) ?? fail("desiredState must be running or stopped");
+      parseDesiredState(raw) ?? fail("desiredState must be running or stopped");
 
     const user = await sessionUser(request, env);
     await requireAppRole(id, user.id, "push");
@@ -601,13 +585,12 @@ const ListDeploysArgs = Schema.Struct({
 
 /** Lean rows like the deploys stream (newest first): finished rows carry no
  * build log (fetch it from `deployLog` on demand) — only the newest row
- * keeps its live log while in flight. Exported for the unit tests. */
+ * keeps its live log while in flight. "In flight" is the shared deploy facts,
+ * so a cancelled or stalled row is finished like any other. Exported for the
+ * unit tests. */
 export const leanDeployRows = (rows: RunnerDeploy[]): RunnerDeploy[] =>
   rows.map((deploy, index) =>
-    index === 0 &&
-    (deploy.status === "queued" ||
-      deploy.status === "building" ||
-      deploy.status === "deploying")
+    index === 0 && deployStatusFacts(deploy.status).inFlight
       ? deploy
       : { ...deploy, log: "" }
   );

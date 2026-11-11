@@ -59,9 +59,6 @@ export interface AppStatusPage {
   readonly status: string;
 }
 
-/** An environment's observed status uses the app vocabulary. */
-export type EnvironmentStatus = AppStatus;
-
 export const parseDesiredState = (raw: string): DesiredState | null => {
   if (raw === "running" || raw === "stopped") {
     return raw;
@@ -77,7 +74,7 @@ export type StatusTone =
   | "status-error"
   | "status-neutral";
 
-export interface AppStatusFacts {
+interface AppStatusFacts {
   readonly label: string;
   readonly tone: StatusTone;
   /** The runner is mid-pipeline: a Start/Stop is pointless, a deploy row is
@@ -88,6 +85,10 @@ export interface AppStatusFacts {
   /** A retry of the import is accepted (failed, or an import with a stored
    * source that a restart interrupted). */
   readonly retryable: boolean;
+  /** Serving now, or asleep and started by the next request. Status-only: a
+   * crash-held fleet still carries `running`, and the hold (`appLifecycle`)
+   * is what says it is not serving. */
+  readonly live: boolean;
 }
 
 const APP_FACTS = {
@@ -95,6 +96,7 @@ const APP_FACTS = {
     deployed: true,
     inFlight: true,
     label: "Building",
+    live: false,
     retryable: false,
     tone: "status-warning",
   },
@@ -102,6 +104,7 @@ const APP_FACTS = {
     deployed: true,
     inFlight: true,
     label: "Deploying",
+    live: false,
     retryable: false,
     tone: "status-warning",
   },
@@ -109,6 +112,7 @@ const APP_FACTS = {
     deployed: false,
     inFlight: false,
     label: "Error",
+    live: false,
     retryable: true,
     tone: "status-error",
   },
@@ -116,6 +120,7 @@ const APP_FACTS = {
     deployed: true,
     inFlight: false,
     label: "Failed",
+    live: false,
     retryable: false,
     tone: "status-error",
   },
@@ -123,6 +128,7 @@ const APP_FACTS = {
     deployed: false,
     inFlight: true,
     label: "Importing",
+    live: false,
     retryable: true,
     tone: "status-warning",
   },
@@ -130,6 +136,7 @@ const APP_FACTS = {
     deployed: false,
     inFlight: false,
     label: "pending",
+    live: false,
     retryable: false,
     tone: "status-warning",
   },
@@ -137,6 +144,7 @@ const APP_FACTS = {
     deployed: false,
     inFlight: false,
     label: "Provisioned",
+    live: false,
     retryable: false,
     tone: "status-warning",
   },
@@ -144,6 +152,7 @@ const APP_FACTS = {
     deployed: true,
     inFlight: false,
     label: "Running",
+    live: true,
     retryable: false,
     tone: "status-success",
   },
@@ -151,6 +160,7 @@ const APP_FACTS = {
     deployed: true,
     inFlight: false,
     label: "Sleeping",
+    live: true,
     retryable: false,
     tone: "status-neutral",
   },
@@ -158,6 +168,7 @@ const APP_FACTS = {
     deployed: true,
     inFlight: false,
     label: "Stopped",
+    live: false,
     retryable: false,
     tone: "status-neutral",
   },
@@ -167,11 +178,12 @@ const UNKNOWN_APP: AppStatusFacts = {
   deployed: true,
   inFlight: false,
   label: "Unknown",
+  live: false,
   retryable: false,
   tone: "status-warning",
 };
 
-export const isAppStatus = (raw: string): raw is AppStatus =>
+const isAppStatus = (raw: string): raw is AppStatus =>
   Object.hasOwn(APP_FACTS, raw);
 
 /** Facts for one status string; an unmodelled string reads as warning and
@@ -179,7 +191,7 @@ export const isAppStatus = (raw: string): raw is AppStatus =>
 export const appStatusFacts = (raw: string): AppStatusFacts =>
   isAppStatus(raw) ? APP_FACTS[raw] : { ...UNKNOWN_APP, label: raw };
 
-export interface DeployStatusFacts {
+interface DeployStatusFacts {
   readonly label: string;
   /** A row the runner can still stop: it is holding (or waiting for) the
    * app's deploy claim. */
@@ -241,7 +253,7 @@ const DEPLOY_FACTS = {
 /** What the history says about why a row exists. `deploy` is a plain push,
  * the sweep or a web commit — nothing to add to the row — while a rollback
  * names the release it re-runs and a redeploy names the action. */
-export interface DeployIntentFacts {
+interface DeployIntentFacts {
   readonly label: (sha: string | null) => string | null;
 }
 
@@ -254,7 +266,7 @@ const DEPLOY_INTENTS: Record<DeployIntent, DeployIntentFacts> = {
   },
 };
 
-export const isDeployIntent = (raw: string): raw is DeployIntent =>
+const isDeployIntent = (raw: string): raw is DeployIntent =>
   Object.hasOwn(DEPLOY_INTENTS, raw);
 
 /** The history label for one deploy row: `null` for a plain deploy. An
@@ -265,7 +277,7 @@ export const deployIntentLabel = (
 ): string | null =>
   isDeployIntent(raw) ? DEPLOY_INTENTS[raw].label(sha) : null;
 
-export const isDeployStatus = (raw: string): raw is DeployStatus =>
+const isDeployStatus = (raw: string): raw is DeployStatus =>
   Object.hasOwn(DEPLOY_FACTS, raw);
 
 const UNKNOWN_DEPLOY: DeployStatusFacts = {
@@ -338,7 +350,7 @@ export const deployBadgeTone = (raw: string): string => {
 /** What the environment header must surface beyond the status dot: a
  * deliberate stop (`desired_state = 'stopped'`) outranks a stale observed
  * status, and a stopped environment is not serving traffic. */
-export interface EnvironmentHeaderState {
+interface EnvironmentHeaderState {
   readonly desiredState: DesiredState;
   readonly label: string;
   readonly tone: StatusTone;
@@ -378,7 +390,7 @@ export const environmentHeaderState = (env: {
 
 /** The one app-header lifecycle: one closed union derived from the runner's
  * row, so the dot, the label and the Start/Stop action agree. */
-export type AppLifecycle = Data.TaggedEnum<{
+type AppLifecycle = Data.TaggedEnum<{
   NeverDeployed: Record<never, never>;
   Importing: { readonly retryable: boolean };
   ImportFailed: { readonly retryable: boolean };
@@ -392,7 +404,7 @@ export type AppLifecycle = Data.TaggedEnum<{
   Unknown: { readonly status: string };
 }>;
 
-export const AppLifecycleTypes = Data.taggedEnum<AppLifecycle>();
+const AppLifecycleTypes = Data.taggedEnum<AppLifecycle>();
 
 export const appLifecycle = (app: AppStatusPage): AppLifecycle => {
   const desiredState = parseDesiredState(app.desiredState ?? "") ?? "running";
@@ -594,13 +606,13 @@ export const lifecycleView = (
 /** The error-issue lifecycle the runner documents (`db/errors.rs`): an
  * ignored issue never reopens; a resolved one does, and then carries
  * `regressed = 1`. */
-export type IssueState = Data.TaggedEnum<{
+type IssueState = Data.TaggedEnum<{
   Open: { readonly regressed: boolean };
   Resolved: { readonly regressed: boolean };
   Ignored: Record<never, never>;
 }>;
 
-export const IssueStateTypes = Data.taggedEnum<IssueState>();
+const IssueStateTypes = Data.taggedEnum<IssueState>();
 
 export const issueState = (issue: {
   readonly regressed: boolean;
@@ -640,12 +652,12 @@ export const issueNote = (state: IssueState): string => {
 };
 
 /** A custom domain's claim: `pending` until the TXT token is verified. */
-export type DomainClaim = Data.TaggedEnum<{
+type DomainClaim = Data.TaggedEnum<{
   Pending: { readonly token: string };
   Verified: Record<never, never>;
 }>;
 
-export const DomainClaimTypes = Data.taggedEnum<DomainClaim>();
+const DomainClaimTypes = Data.taggedEnum<DomainClaim>();
 
 export const domainClaim = (row: {
   readonly status: string;

@@ -3,16 +3,7 @@ import { environments } from "../resources";
 //! Environment picker shared by the telemetry tabs: Production first, then
 //! each preview environment by label. The tabs deep-link it through `?env=`
 //! (the Deployments tab's convention); absent/unknown is production.
-import type { RunnerEnvironment } from "../runner";
-import { parseScope, scopeId } from "./route.machine";
 import type { RouteNotice } from "./route.machine";
-
-/** `?env=` validated against the app's environments: unknown ids (a deleted
- * environment, a stale link) fall back to production. */
-export const validEnvId = (
-  envs: readonly RunnerEnvironment[],
-  raw: string
-): string => scopeId(parseScope(raw, envs).scope);
 
 /** A `?env=` that names an environment the app no longer has: the page shows
  * production, and says so, instead of pretending this is a preview. */
