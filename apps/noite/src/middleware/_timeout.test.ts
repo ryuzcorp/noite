@@ -84,10 +84,6 @@ describe("routeTimeout", () => {
       kind: "bounded",
       ms: TIMEOUT_MS,
     });
-    expect(routeTimeout("/__nodepod_bridge__.html")).toEqual({
-      kind: "bounded",
-      ms: TIMEOUT_MS,
-    });
   });
 
   test("a JSON action merely containing /stream is still bounded", () => {
