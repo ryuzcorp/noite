@@ -40,16 +40,24 @@ const globsBelow = (lines: string[], start: number): string[] => {
   return globs;
 };
 
-/** Glob list items directly under the first line matching `anchor`. */
-const globsAfter = (yaml: string, anchor: RegExp): string[] => {
+/** The `paths:` globs of `images.yml`'s `push` trigger, not another block. */
+const imagePushPaths = (yaml: string): string[] => {
   const lines = yaml.split("\n");
-  const start = lines.findIndex((line) => anchor.test(line));
+  const push = lines.findIndex((line) => /^\s*push:\s*$/u.test(line));
 
-  if (start === -1) {
-    throw new Error(`no line matches ${anchor}`);
+  if (push === -1) {
+    throw new Error("images.yml has no push trigger");
   }
 
-  return globsBelow(lines, start);
+  const paths = lines.findIndex(
+    (line, index) => index > push && /^\s*paths:\s*$/u.test(line)
+  );
+
+  if (paths === -1) {
+    throw new Error("images.yml has no push paths block");
+  }
+
+  return globsBelow(lines, paths);
 };
 
 /** The `code:` globs inside the `filters: |` block of `ci.yml`. */
@@ -72,21 +80,32 @@ const codeFilterGlobs = (yaml: string): string[] => {
   return globsBelow(lines, code);
 };
 
-/** Every build-context source `docker/Dockerfile` copies in, in order. */
+/**
+ * Every build-context source `docker/Dockerfile` copies in, in order. `ADD`
+ * counts too; JSON-array and line-continued forms are unsupported here, so
+ * they throw instead of silently dropping a source.
+ */
 const dockerfileCopySources = (dockerfile: string): string[] =>
-  dockerfile.split("\n").flatMap((line) => {
-    const fields = line.trim().split(/\s+/u);
+  dockerfile.split("\n").flatMap((rawLine) => {
+    const line = rawLine.trim();
 
-    // `COPY --from=<stage>` reads another stage, never the build context.
-    if (
-      fields[0] !== "COPY" ||
-      fields.slice(1).some((f) => f.startsWith("--"))
-    ) {
+    if (!/^(?:ADD|COPY)\s/iu.test(line)) {
       return [];
     }
 
-    // Last field is the destination; the rest are context sources.
-    return fields.slice(1, -1);
+    if (line.endsWith("\\") || line.includes("[")) {
+      throw new Error(`unsupported build-context instruction: ${line}`);
+    }
+
+    const fields = line.split(/\s+/u);
+
+    // `--from=<stage>` reads another stage's output, never the context.
+    if (fields.slice(1).some((f) => /^--from(?:=|$)/u.test(f))) {
+      return [];
+    }
+
+    // Last field is the destination; the rest (minus flags) are sources.
+    return fields.slice(1, -1).filter((f) => !f.startsWith("--"));
   });
 
 /** Git-tracked files under `source`, so a directory is checked as a whole. */
@@ -218,14 +237,18 @@ describe("matchSensitive", () => {
       "apps/runner/src/dns.rs",
       "apps/runner/src/host/env_label.rs",
       "apps/runner/src/service/environments.rs",
+      "apps/runner/src/host/git_http.rs",
       "apps/noite/src/lib/collaborators.ts",
       "apps/noite/src/lib/server/collaborators.server.ts",
       "apps/noite/src/lib/roles.ts",
       "apps/noite/src/lib/membership.ts",
+      "apps/noite/src/lib/authority.ts",
+      "apps/noite/src/lib/server/admin.server.tsx",
       "apps/noite/src/lib/server/api-keys.server.ts",
       "apps/noite/src/lib/server/mcp-auth.server.ts",
       "apps/noite/src/http/routes/internal.ts",
       "apps/noite/src/lib/server/recovery.server.ts",
+      "apps/noite/src/http/config.ts",
     ];
 
     // A renamed file must fail here instead of silently leaving the gate.
@@ -243,9 +266,8 @@ describe("image build context coverage", () => {
   const dockerfile = readRepoFile("docker/Dockerfile");
   const sources = dockerfileCopySources(dockerfile);
 
-  const imagePaths = globsAfter(
-    readRepoFile(".github/workflows/images.yml"),
-    /^\s*paths:\s*$/u
+  const imagePaths = imagePushPaths(
+    readRepoFile(".github/workflows/images.yml")
   );
 
   const codePaths = codeFilterGlobs(readRepoFile(".github/workflows/ci.yml"));
@@ -259,6 +281,9 @@ describe("image build context coverage", () => {
     // `COPY --from=<stage>` sources are outputs, not build context.
     expect(sources).not.toContain("/out/caddy");
     expect(sources).not.toContain("/usr/local/bin/node");
+    // The push block parsed is the real one, not another `paths:` list.
+    expect(imagePaths).toContain("docker/Dockerfile");
+    expect(imagePaths).toContain("edge/**");
   });
 
   test("every copied source is covered by both gate filters", () => {

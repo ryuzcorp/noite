@@ -23,6 +23,9 @@ sensitive:
   - "apps/runner/src/api/router.rs"
   - "apps/runner/src/host/git_identity.rs"
   - "apps/runner/src/host/git_policy.rs"
+  # The adapter that makes the git allow/deny decision: Basic-credential
+  # verification, the role check and the force-push/delete policy.
+  - "apps/runner/src/host/git_http.rs"
   - "apps/runner/src/host/env_gate.rs"
   # The admin-role gate on per-app limits (#79).
   - "apps/runner/src/service/limits.rs"
@@ -62,6 +65,11 @@ sensitive:
   - "apps/noite/src/lib/server/collaborators.server.ts"
   - "apps/noite/src/lib/roles.ts"
   - "apps/noite/src/lib/membership.ts"
+  # The one admin predicate every UI admin gate calls: widening it widens all
+  # of them at once.
+  - "apps/noite/src/lib/authority.ts"
+  # `requireAdmin`, ban/unban, role changes and the impersonation check.
+  - "apps/noite/src/lib/server/admin.server.tsx"
   # Profile API keys are git, ingest and MCP credentials: the owner check that
   # refuses a banned or missing owner, and the ban-triggered revocation.
   - "apps/noite/src/lib/server/api-keys.server.ts"
@@ -71,6 +79,8 @@ sensitive:
   # can bypass the session and role checks the public routes rely on.
   - "apps/noite/src/http/routes/internal.ts"
   - "apps/noite/src/lib/server/recovery.server.ts"
+  # `runnerTokenOk`, the bearer check behind the whole internal surface.
+  - "apps/noite/src/http/config.ts"
 
   # Sandboxed execution and tenant isolation: what a build or fleet process
   # can reach, and the uid/cgroup/memory containment around it.
