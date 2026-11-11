@@ -74,7 +74,7 @@ const pushBranch = (apiKey: string, source: URL, slug: string): void => {
 };
 
 test(
-  "a branch becomes an environment and Code mode frames it",
+  "a branch becomes an environment and serves its own host",
   { tag: "@fast" },
   async ({ page, request }) => {
     createdApps.push(SLUG);
