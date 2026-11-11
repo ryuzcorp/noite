@@ -181,11 +181,32 @@ pub async fn note_stalled(pool: &SqlitePool, targets: &[db::StalledDeploy]) {
     }
 }
 
-/// Record the tenant-visible `deploy` event at the moment the budget runs out:
-/// the target reads `Exhausted`. Best effort — a lost event never changes the
-/// deploy's own outcome, and the notice is emitted once per sha (the sweep can
-/// close several dead rows of one target in a single pass, and a later failure
-/// keeps the same exhausted state).
+/// The phrase that names `environment_id`'s target in the pause notice, and
+/// the marker the dedup looks for: production is the unmarked case, an
+/// environment is named by its label. The label is unique per app, and an
+/// environment's deploy rows go with its row, so the marker identifies one
+/// budget. A read race that leaves no row falls back to the id rather than
+/// suppressing the notice.
+async fn target_phrase(pool: &SqlitePool, environment_id: Option<&str>) -> String {
+    let Some(id) = environment_id else {
+        return String::new();
+    };
+    let label = db::get_environment(pool, id)
+        .await
+        .ok()
+        .flatten()
+        .map(|env| env.label)
+        .unwrap_or_else(|| id.to_string());
+    format!(" for environment {label}")
+}
+
+/// Record the tenant-visible `deploy` event at the moment a target's budget
+/// runs out: the target reads `Exhausted`. Best effort — a lost event never
+/// changes the deploy's own outcome. The notice is per target and per sha:
+/// production and an environment exhausting the same sha are two budgets, so
+/// each gets its own event, while the sweep closing several dead rows of one
+/// target in a single pass (or a later failure keeping the same exhausted
+/// state) adds nothing.
 pub async fn note_exhausted(pool: &SqlitePool, app_id: &str, environment_id: Option<&str>) {
     let Ok(AutoDeploy::Exhausted { sha, failures }) =
         for_target(pool, app_id, environment_id).await
@@ -196,7 +217,8 @@ pub async fn note_exhausted(pool: &SqlitePool, app_id: &str, environment_id: Opt
         return;
     }
     let short = &sha[..12.min(sha.len())];
-    let marker = format!("of {short};");
+    let target = target_phrase(pool, environment_id).await;
+    let marker = format!("of {short}{target};");
     if let Ok(events) = db::list_app_events(pool, app_id, Some("deploy"), 50).await {
         if events
             .iter()
@@ -206,7 +228,7 @@ pub async fn note_exhausted(pool: &SqlitePool, app_id: &str, environment_id: Opt
         }
     }
     let detail = format!(
-        "automatic deploys are paused after {failures} failed attempts of {short}; \
+        "automatic deploys are paused after {failures} failed attempts of {short}{target}; \
          push a fix or deploy manually"
     );
     let _ = db::insert_app_event(
@@ -443,6 +465,88 @@ mod tests {
             events[0].description.contains("sha1"),
             "{}",
             events[0].description
+        );
+        pool.close().await;
+    }
+
+    /// The pause notice is per target: production and an environment that
+    /// exhaust the same sha are two independent budgets, so each records its
+    /// own event, and a repeat for one target records nothing.
+    #[tokio::test]
+    async fn each_target_records_its_own_pause_event() {
+        let cfg = crate::config::config_for_tests();
+        let pool = db::connect("sqlite::memory:").await.expect("memory db");
+        let app = db::create_app(
+            &pool,
+            &cfg,
+            db::NewApp {
+                name: "targets",
+                slug: "targets",
+                user_id: "local",
+                subdomain: "targets.localhost",
+                listen: 30400,
+                internal: 30401,
+            },
+        )
+        .await
+        .expect("app");
+        let env = db::create_environment(
+            &pool,
+            &cfg,
+            db::NewEnvironment {
+                app_id: &app.id,
+                slug: "targets",
+                label: "preview-x",
+                kind: crate::models::EnvironmentKind::Branch,
+                git_ref: "refs/heads/preview-x",
+                created_by: "local",
+                listen: 30402,
+                internal: 30403,
+            },
+        )
+        .await
+        .expect("environment");
+        for environment_id in [None, Some(env.id.as_str())] {
+            for _ in 0..2 {
+                db::upsert_deploy(
+                    &pool,
+                    None,
+                    &app.id,
+                    environment_id,
+                    DeployStatus::Failed,
+                    Some("sha1"),
+                    "boom",
+                )
+                .await
+                .expect("failed deploy");
+            }
+        }
+        note_exhausted(&pool, &app.id, None).await;
+        note_exhausted(&pool, &app.id, Some(&env.id)).await;
+        // The close and stall paths can note a target again: a repeat of an
+        // already announced target is not a new transition.
+        note_exhausted(&pool, &app.id, None).await;
+        note_exhausted(&pool, &app.id, Some(&env.id)).await;
+
+        let events = db::list_app_events(&pool, &app.id, Some("deploy"), 10)
+            .await
+            .expect("events");
+        assert_eq!(events.len(), 2, "one notice per target, not per app");
+        let descriptions: Vec<&str> = events
+            .iter()
+            .map(|event| event.description.as_str())
+            .collect();
+        assert!(
+            descriptions
+                .iter()
+                .any(|detail| detail.contains("sha1") && detail.contains("preview-x")),
+            "the environment notice names its target: {descriptions:?}"
+        );
+        assert!(
+            descriptions
+                .iter()
+                .any(|detail| detail.contains("sha1") && !detail.contains("preview-x")),
+            "the production notice stays: {descriptions:?}"
         );
         pool.close().await;
     }
