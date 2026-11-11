@@ -59,7 +59,7 @@ The edge also bounds each request before a worker sees it: request headers past 
 
 ## Sleep (scale to zero)
 
-An app idle past its threshold stops costing anything; the next request brings it back transparently. The platform threshold is `RUNNER_SLEEP_AFTER_H` hours — unset, it derives from detected memory (`1` at ≤ 2 GiB, `6` at ≤ 4 GiB, else `24`); `0` disables sleeping install-wide and no per-app override re-enables it.
+An app idle past its threshold stops costing anything; the next request brings it back transparently (a cold wake measures ~1.3 s). The platform threshold is `RUNNER_SLEEP_AFTER_MIN` minutes, or `RUNNER_SLEEP_AFTER_H` hours — minutes win when both are set. Unset, it derives from detected memory: `15` minutes at ≤ 2 GiB, `6` hours at ≤ 4 GiB, else `24` hours. `0` on either disables sleeping install-wide and no per-app override re-enables it. The sweep runs a quarter of the threshold apart (5 minutes on a ≤ 2 GiB host, an hour on the longer tiers), so an app parks close to its threshold.
 
 **Per-app override.** Settings → Limits → Sleep after sets this app's threshold in seconds (`0` = never, valid range `60`–`2592000` = 30 days); empty falls back to the install default. Preview environments use their owning app's override.
 

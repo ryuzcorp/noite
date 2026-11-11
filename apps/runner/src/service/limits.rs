@@ -67,8 +67,8 @@ pub struct LimitDefaults {
     /// `Some` ceiling in `multi` (a tenant can only lower its cap);
     /// `None` in `single`, where the operator is the only admin.
     pub memory_max_mb: Option<u32>,
-    /// Platform idle-sleep threshold in seconds (`RUNNER_SLEEP_AFTER_H`,
-    /// derived from detected memory when unset).
+    /// Platform idle-sleep threshold in seconds (`RUNNER_SLEEP_AFTER_MIN`
+    /// or `RUNNER_SLEEP_AFTER_H`, derived from detected memory when unset).
     pub default_sleep_after_s: u64,
 }
 
@@ -103,7 +103,7 @@ fn limits_view(cfg: &Config, limit: &AppLimit) -> LimitsView {
             memory_mb: cfg.fleet_memory_mb,
             memory_max_mb: matches!(cfg.tenancy, crate::config::Tenancy::Multi)
                 .then_some(cfg.fleet_memory_max_mb),
-            default_sleep_after_s: cfg.sleep_after_h.saturating_mul(3600),
+            default_sleep_after_s: cfg.sleep_after_s,
         },
     }
 }
@@ -274,7 +274,7 @@ mod tests {
         assert_eq!(view.sleep_after_s, None);
         assert_eq!(
             view.defaults.default_sleep_after_s,
-            state.config.sleep_after_h.saturating_mul(3600)
+            state.config.sleep_after_s
         );
         let reread = get(&state, &app.id).await.expect("get stays role-free");
         assert_eq!(reread.client_rpm, Some(100));

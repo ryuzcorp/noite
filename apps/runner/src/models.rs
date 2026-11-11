@@ -833,8 +833,8 @@ pub struct AppLimit {
     pub app_rpm: Option<i64>,
     /// Fleet `memory.max` in MiB (`None` = `RUNNER_FLEET_MEMORY_MB`).
     pub memory_mb: Option<i64>,
-    /// Idle seconds before the sweep parks this app (`None` =
-    /// `RUNNER_SLEEP_AFTER_H`; `Some(0)` = never).
+    /// Idle seconds before the sweep parks this app (`None` = the install
+    /// threshold; `Some(0)` = never).
     pub sleep_after_s: Option<i64>,
 }
 

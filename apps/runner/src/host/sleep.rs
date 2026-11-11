@@ -1,8 +1,8 @@
 //! Scale to zero (SPEC, Scale to zero): a scheduled sweep parks apps that
-//! served no request for `RUNNER_SLEEP_AFTER_H`, and the edge wakes them on
-//! the next request — Caddy holds that request (`forward_auth` to
-//! `/v1/edge/wake`) until the fleet is healthy, then proxies it as if the app
-//! had never slept.
+//! served no request for `RUNNER_SLEEP_AFTER_MIN`/`RUNNER_SLEEP_AFTER_H`, and
+//! the edge wakes them on the next request — Caddy holds that request
+//! (`forward_auth` to `/v1/edge/wake`) until the fleet is healthy, then
+//! proxies it as if the app had never slept.
 //!
 //! Every transition (sleep, wake) for one app runs under that app's lock, so
 //! a request arriving while the sweep parks the app waits for the park to
@@ -117,7 +117,7 @@ pub fn has_scheduled_work(deployed_config: Option<&str>) -> bool {
 pub fn auto_sleep_after_s(
     own_sleep_after_s: Option<i64>,
     deployed_config: Option<&str>,
-    default_h: u64,
+    default_s: u64,
 ) -> Option<u64> {
     if own_sleep_after_s == Some(0) {
         return None;
@@ -127,7 +127,7 @@ pub fn auto_sleep_after_s(
     }
     Some(match own_sleep_after_s {
         Some(s) if s > 0 => s as u64,
-        _ => default_h.saturating_mul(3600),
+        _ => default_s,
     })
 }
 
@@ -179,7 +179,7 @@ fn sleep_candidate_env(env: &Environment) -> bool {
 pub async fn sweep(pool: &SqlitePool, cfg: &Config, procs: &ProcMap) -> usize {
     // The platform `0` is a master off: no app override re-enables a
     // feature the operator disabled outright.
-    if cfg.sleep_after_h == 0 {
+    if cfg.sleep_after_s == 0 {
         return 0;
     }
     let limits = match db::list_app_limits(pool).await {
@@ -205,7 +205,7 @@ pub async fn sweep(pool: &SqlitePool, cfg: &Config, procs: &ProcMap) -> usize {
     for app in apps.iter().filter(|a| sleep_candidate(a)) {
         let own = own_of(&app.id);
         let Some(after_s) =
-            auto_sleep_after_s(own, app.deployed_config.as_deref(), cfg.sleep_after_h)
+            auto_sleep_after_s(own, app.deployed_config.as_deref(), cfg.sleep_after_s)
         else {
             continue;
         };
@@ -227,7 +227,7 @@ pub async fn sweep(pool: &SqlitePool, cfg: &Config, procs: &ProcMap) -> usize {
             .iter()
             .find(|a| a.id == env.app_id)
             .and_then(|a| a.deployed_config.as_deref());
-        let Some(after_s) = auto_sleep_after_s(own, owner_config, cfg.sleep_after_h) else {
+        let Some(after_s) = auto_sleep_after_s(own, owner_config, cfg.sleep_after_s) else {
             continue;
         };
         if !should_sleep_s(now, &environment_activity(pool, env).await, after_s) {
@@ -291,10 +291,10 @@ pub async fn sleep_app(
     } else {
         let own = db::get_app_limit(pool, &app.id).await?.sleep_after_s;
         // The platform `0` is a master off (see `sweep`).
-        if cfg.sleep_after_h == 0 && own.is_none() {
+        if cfg.sleep_after_s == 0 && own.is_none() {
             return Ok(false);
         }
-        match auto_sleep_after_s(own, app.deployed_config.as_deref(), cfg.sleep_after_h) {
+        match auto_sleep_after_s(own, app.deployed_config.as_deref(), cfg.sleep_after_s) {
             Some(after_s) => Some(after_s),
             None => return Ok(false),
         }
@@ -747,11 +747,11 @@ pub async fn sleep_environment(
     if !force {
         let owner = db::get_app(pool, &env.app_id).await?;
         let own = db::get_app_limit(pool, &env.app_id).await?.sleep_after_s;
-        if cfg.sleep_after_h == 0 && own.is_none() {
+        if cfg.sleep_after_s == 0 && own.is_none() {
             return Ok(false);
         }
         let owner_config = owner.as_ref().and_then(|a| a.deployed_config.as_deref());
-        match auto_sleep_after_s(own, owner_config, cfg.sleep_after_h) {
+        match auto_sleep_after_s(own, owner_config, cfg.sleep_after_s) {
             Some(after_s) => {
                 if !should_sleep_s(Utc::now(), &environment_activity(pool, &env).await, after_s) {
                     return Ok(false);
@@ -1913,23 +1913,23 @@ mod policy_tests {
     fn explicit_override_wins_over_scheduled_work() {
         // Scheduled work without an override never auto-sleeps.
         assert_eq!(
-            auto_sleep_after_s(None, Some(CRON_CONFIG), 24),
+            auto_sleep_after_s(None, Some(CRON_CONFIG), 24 * 3600),
             None,
             "cron app without override skips"
         );
         assert_eq!(
-            auto_sleep_after_s(None, Some(QUEUE_CONFIG), 24),
+            auto_sleep_after_s(None, Some(QUEUE_CONFIG), 24 * 3600),
             None,
             "queue app without override skips"
         );
         // An explicit override re-enables auto-sleep for scheduled apps.
         assert_eq!(
-            auto_sleep_after_s(Some(3600), Some(CRON_CONFIG), 24),
+            auto_sleep_after_s(Some(3600), Some(CRON_CONFIG), 24 * 3600),
             Some(3600),
             "explicit override wins"
         );
         assert_eq!(
-            auto_sleep_after_s(Some(0), Some(CRON_CONFIG), 24),
+            auto_sleep_after_s(Some(0), Some(CRON_CONFIG), 24 * 3600),
             None,
             "0 means never, even with an override-shaped value"
         );
@@ -1939,23 +1939,23 @@ mod policy_tests {
     fn threshold_override_and_never() {
         // No override: the platform default in seconds.
         assert_eq!(
-            auto_sleep_after_s(None, Some(PLAIN_CONFIG), 24),
+            auto_sleep_after_s(None, Some(PLAIN_CONFIG), 86_400),
             Some(86_400)
         );
-        assert_eq!(auto_sleep_after_s(None, None, 6), Some(21_600));
+        assert_eq!(auto_sleep_after_s(None, None, 6 * 3600), Some(21_600));
         // An explicit threshold overrides the global one in both directions.
         assert_eq!(
-            auto_sleep_after_s(Some(60), Some(PLAIN_CONFIG), 24),
+            auto_sleep_after_s(Some(60), Some(PLAIN_CONFIG), 86_400),
             Some(60),
             "shorter than default"
         );
         assert_eq!(
-            auto_sleep_after_s(Some(2_592_000), Some(PLAIN_CONFIG), 24),
+            auto_sleep_after_s(Some(2_592_000), Some(PLAIN_CONFIG), 86_400),
             Some(2_592_000),
             "longer than default"
         );
         // Explicit 0 is never, even for a plain app.
-        assert_eq!(auto_sleep_after_s(Some(0), None, 24), None);
+        assert_eq!(auto_sleep_after_s(Some(0), None, 86_400), None);
     }
 
     #[test]

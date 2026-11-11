@@ -67,7 +67,7 @@ pub async fn run_forever(
         }
         // Off the tick: parking waits on a fleet's SIGTERM drain, which must
         // not stall reconciliation. One sweep at a time.
-        if cfg.sleep_after_h > 0
+        if cfg.sleep_after_s > 0
             && last_sleep_sweep.elapsed() >= Duration::from_secs(cfg.sleep_sweep_s.max(60))
             && !sleep_sweeping.swap(true, Ordering::SeqCst)
         {

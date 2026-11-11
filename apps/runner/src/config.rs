@@ -164,18 +164,60 @@ fn duckdb_memory_default_mb(total_bytes: Option<u64>) -> u64 {
     (total / 10 / (1024 * 1024)).clamp(128, 1024)
 }
 
-/// Scale-to-zero's derived idle threshold in hours: a small box cannot afford
-/// a day-idle fleet sitting resident, so <= 2 GiB sleeps after 1 h and
-/// <= 4 GiB after 6 h; bigger hosts (or unreadable memory) keep 24 h. Only
-/// the unset var derives — an explicit `RUNNER_SLEEP_AFTER_H` (including 0,
-/// which disables) always wins.
-fn sleep_after_default_h(total_bytes: Option<u64>) -> u64 {
+/// Scale-to-zero's derived idle threshold in seconds: a small box cannot
+/// afford resident fleets — a measured tenant fleet is ~40-50 MB, so a dozen
+/// idle apps take a gigabyte of a 2 GiB host, and a cold wake costs ~1.33 s —
+/// so <= 2 GiB sleeps after 15 min. Bigger hosts keep the previous tiers: a
+/// 4 GiB box can hold the fleet of a small install, and 24 h is the least
+/// surprising default where memory is not the constraint. Only an unset
+/// threshold derives — an explicit `RUNNER_SLEEP_AFTER_MIN` or
+/// `RUNNER_SLEEP_AFTER_H` (including 0, which disables) always wins.
+fn sleep_after_default_s(total_bytes: Option<u64>) -> u64 {
     const GIB: u64 = 1024 * 1024 * 1024;
     match total_bytes {
-        Some(total) if total <= 2 * GIB => 1,
-        Some(total) if total <= 4 * GIB => 6,
-        _ => 24,
+        Some(total) if total <= 2 * GIB => 15 * 60,
+        Some(total) if total <= 4 * GIB => 6 * 3600,
+        _ => 24 * 3600,
     }
+}
+
+/// How often the sleep sweep runs by default (`RUNNER_SLEEP_SWEEP_S`): a
+/// quarter of the threshold, so an idle app parks within a quarter of its
+/// window of the threshold rather than up to an hour late (an hourly sweep
+/// over 15 min would park between 15 and 75 min), floored at five minutes so
+/// a tiny threshold does not turn the tick into a hot loop, and capped at the
+/// previous hour for the long tiers.
+fn sleep_sweep_default_s(sleep_after_s: u64) -> u64 {
+    (sleep_after_s / 4).clamp(5 * 60, 3600)
+}
+
+/// The operator's idle threshold in seconds: `RUNNER_SLEEP_AFTER_MIN` (minutes)
+/// if set, else `RUNNER_SLEEP_AFTER_H` (hours), else the derived default.
+/// Minutes are the finer knob the 15-minute default needs, so they win when
+/// both are set (compose installs may carry an hours value from an older
+/// install); either knob set to `0` disables sleeping install-wide. Blank
+/// counts as unset.
+fn sleep_after_setting_s(default_s: u64, problems: &mut Vec<String>) -> u64 {
+    let set = |key: &str| env::var(key).map(|v| !v.trim().is_empty()).unwrap_or(false);
+    if set("RUNNER_SLEEP_AFTER_MIN") {
+        return env_num(
+            "RUNNER_SLEEP_AFTER_MIN",
+            default_s / 60,
+            "a non-negative integer",
+            problems,
+        )
+        .saturating_mul(60);
+    }
+    if set("RUNNER_SLEEP_AFTER_H") {
+        return env_num(
+            "RUNNER_SLEEP_AFTER_H",
+            default_s / 3600,
+            "a non-negative integer",
+            problems,
+        )
+        .saturating_mul(3600);
+    }
+    default_s
 }
 
 /// Telemetry DuckDB's derived worker count: the cores this container may
@@ -1099,11 +1141,13 @@ pub struct Config {
     /// (`CELLD_DEPLOY_POLL_S`). The runner POSTs /reload after every deploy,
     /// so this only covers a missed reload — 300 keeps the fleet quiet.
     pub fleet_deploy_poll_s: u64,
-    /// Scale to zero: park an app after this many hours without a request
-    /// (`RUNNER_SLEEP_AFTER_H`; `0` disables). Unset derives from detected
-    /// memory (<= 2 GiB: 1 h, <= 4 GiB: 6 h, else 24 h). SPEC, Scale to zero.
-    pub sleep_after_h: u64,
-    /// How often the sleep sweep runs (`RUNNER_SLEEP_SWEEP_S`, 3600).
+    /// Scale to zero: park an app after this many seconds without a request
+    /// (`RUNNER_SLEEP_AFTER_MIN` minutes or `RUNNER_SLEEP_AFTER_H` hours;
+    /// `0` disables). Unset derives from detected memory (<= 2 GiB: 15 min,
+    /// <= 4 GiB: 6 h, else 24 h); minutes win over hours. SPEC, Scale to zero.
+    pub sleep_after_s: u64,
+    /// How often the sleep sweep runs (`RUNNER_SLEEP_SWEEP_S`). Derived when
+    /// unset: a quarter of the idle threshold, clamped 300..3600 s.
     pub sleep_sweep_s: u64,
     /// Upper bound a woken request waits for the fleet's health gate
     /// (`RUNNER_WAKE_TIMEOUT_S`, 120: covers celld's ready gate).
@@ -1356,23 +1400,11 @@ impl Config {
         let build_memory_default = build_memory_default_mb(total_memory, build_concurrency);
         let build_swap_default =
             build_swap_default_mb(crate::host::memory::swap_total_bytes(), build_concurrency);
-        // An explicit `RUNNER_SLEEP_AFTER_H` (including 0 = never) always
-        // wins; only an unset/blank var derives from detected memory, so a
-        // small host sleeps sooner without the operator sizing anything.
-        let sleep_default_h = sleep_after_default_h(total_memory);
-        let sleep_after_h: u64 = if env::var("RUNNER_SLEEP_AFTER_H")
-            .map(|v| v.trim().is_empty())
-            .unwrap_or(true)
-        {
-            sleep_default_h
-        } else {
-            env_num(
-                "RUNNER_SLEEP_AFTER_H",
-                sleep_default_h,
-                "a non-negative integer",
-                &mut env_problems,
-            )
-        };
+        // An explicit threshold (minutes or hours, including 0 = never)
+        // always wins; only an unset/blank pair derives from detected memory,
+        // so a small host sleeps sooner without the operator sizing anything.
+        let sleep_default_s = sleep_after_default_s(total_memory);
+        let sleep_after_s = sleep_after_setting_s(sleep_default_s, &mut env_problems);
         // Noite CI (SPEC): a repo's `noite.ci.yaml` runs in containers. The
         // default image is always in the allowlist, so a config that names
         // nothing still runs; `RUNNER_CI_IMAGES` replaces the rest.
@@ -1513,10 +1545,10 @@ impl Config {
                 "a non-negative integer",
                 &mut env_problems,
             ),
-            sleep_after_h,
+            sleep_after_s,
             sleep_sweep_s: env_num(
                 "RUNNER_SLEEP_SWEEP_S",
-                3600,
+                sleep_sweep_default_s(sleep_after_s),
                 "a non-negative integer",
                 &mut env_problems,
             ),
@@ -2122,7 +2154,7 @@ pub(crate) fn config_for_tests() -> Config {
         fleet_idle_evict_s: 120,
         fleet_lease_ttl_ms: 60_000,
         fleet_deploy_poll_s: 300,
-        sleep_after_h: 24,
+        sleep_after_s: 24 * 3600,
         sleep_sweep_s: 3600,
         wake_timeout_s: 120,
         fleet_asset_cache_mb: 64,
@@ -2312,6 +2344,7 @@ mod tests {
         "RUNNER_FLEET_LEASE_TTL_MS",
         "RUNNER_FLEET_DEPLOY_POLL_S",
         "RUNNER_SLEEP_AFTER_H",
+        "RUNNER_SLEEP_AFTER_MIN",
         "RUNNER_SLEEP_SWEEP_S",
         "RUNNER_WAKE_TIMEOUT_S",
         "RUNNER_FLEET_ASSET_CACHE_MB",
@@ -2608,10 +2641,10 @@ mod tests {
             assert_eq!(cfg.fleet_deploy_poll_s, 300);
             // Derived from detected memory, like the other machine-sized knobs.
             assert_eq!(
-                cfg.sleep_after_h,
-                sleep_after_default_h(crate::host::memory::total_bytes())
+                cfg.sleep_after_s,
+                sleep_after_default_s(crate::host::memory::total_bytes())
             );
-            assert_eq!(cfg.sleep_sweep_s, 3600);
+            assert_eq!(cfg.sleep_sweep_s, sleep_sweep_default_s(cfg.sleep_after_s));
             assert_eq!(cfg.wake_timeout_s, 120);
             assert_eq!(cfg.deploy_probe_path, "/");
             assert_eq!(cfg.deploy_probe_timeout_s, 30);
@@ -2688,7 +2721,7 @@ mod tests {
                 assert_eq!(cfg.edge.wake_concurrency, 2);
                 assert_eq!(cfg.build_uid_base, Some(20000));
                 assert_eq!(cfg.fleet_uid, Some(10020));
-                assert_eq!(cfg.sleep_after_h, 0);
+                assert_eq!(cfg.sleep_after_s, 0);
                 assert_eq!(cfg.deploy_probe_timeout_s, 5);
             },
         );
@@ -2733,27 +2766,102 @@ mod tests {
     #[test]
     fn sleep_default_derives_from_detected_memory() {
         const GIB: u64 = 1024 * 1024 * 1024;
-        assert_eq!(sleep_after_default_h(Some(2 * GIB)), 1);
-        assert_eq!(sleep_after_default_h(Some(GIB)), 1);
-        assert_eq!(sleep_after_default_h(Some(3 * GIB)), 6);
-        assert_eq!(sleep_after_default_h(Some(4 * GIB)), 6);
-        assert_eq!(sleep_after_default_h(Some(8 * GIB)), 24);
-        assert_eq!(sleep_after_default_h(None), 24);
+        // A small host cannot afford resident fleets: a quarter hour, not an
+        // hour. Bigger hosts keep the old tiers.
+        assert_eq!(sleep_after_default_s(Some(2 * GIB)), 15 * 60);
+        assert_eq!(sleep_after_default_s(Some(GIB)), 15 * 60);
+        assert_eq!(sleep_after_default_s(Some(3 * GIB)), 6 * 3600);
+        assert_eq!(sleep_after_default_s(Some(4 * GIB)), 6 * 3600);
+        assert_eq!(sleep_after_default_s(Some(8 * GIB)), 24 * 3600);
+        assert_eq!(sleep_after_default_s(None), 24 * 3600);
     }
 
     #[test]
-    fn sleep_after_h_explicit_zero_still_disables() {
-        // An explicit `0` disables even on a small host whose derived
-        // default would sleep after an hour.
+    fn sleep_sweep_follows_the_threshold() {
+        // An hourly sweep over a 15-minute threshold parks up to 75 minutes
+        // late, so the cadence follows the threshold, floored at five minutes.
+        assert_eq!(sleep_sweep_default_s(15 * 60), 300);
+        assert_eq!(sleep_sweep_default_s(3600), 900);
+        assert_eq!(sleep_sweep_default_s(6 * 3600), 3600);
+        assert_eq!(sleep_sweep_default_s(24 * 3600), 3600);
+    }
+
+    #[test]
+    fn sleep_after_settings_beat_the_derived_default() {
+        let derived = sleep_after_default_s(crate::host::memory::total_bytes());
         with_env(&[("RUNNER_SLEEP_AFTER_H", "0")], || {
             let cfg = Config::from_env().expect("explicit zero must boot");
             assert!(cfg.env_problems.is_empty());
-            assert_eq!(cfg.sleep_after_h, 0);
+            assert_eq!(cfg.sleep_after_s, 0);
         });
         with_env(&[("RUNNER_SLEEP_AFTER_H", "48")], || {
-            let cfg = Config::from_env().expect("explicit value must boot");
+            let cfg = Config::from_env().expect("explicit hours must boot");
             assert!(cfg.env_problems.is_empty());
-            assert_eq!(cfg.sleep_after_h, 48);
+            assert_eq!(cfg.sleep_after_s, 48 * 3600);
+        });
+        // Minutes express what hours cannot, and win when both are set:
+        // compose passes an hours value down by default, so the precise knob
+        // must not lose to it.
+        with_env(&[("RUNNER_SLEEP_AFTER_MIN", "15")], || {
+            let cfg = Config::from_env().expect("explicit minutes must boot");
+            assert!(cfg.env_problems.is_empty());
+            assert_eq!(cfg.sleep_after_s, 15 * 60);
+        });
+        with_env(
+            &[
+                ("RUNNER_SLEEP_AFTER_H", "6"),
+                ("RUNNER_SLEEP_AFTER_MIN", "20"),
+            ],
+            || {
+                let cfg = Config::from_env().expect("both knobs must boot");
+                assert!(cfg.env_problems.is_empty());
+                assert_eq!(cfg.sleep_after_s, 20 * 60);
+            },
+        );
+        // `0` on either knob is still the install-wide master off.
+        with_env(
+            &[
+                ("RUNNER_SLEEP_AFTER_MIN", "0"),
+                ("RUNNER_SLEEP_AFTER_H", "48"),
+            ],
+            || {
+                let cfg = Config::from_env().expect("zero minutes must boot");
+                assert!(cfg.env_problems.is_empty());
+                assert_eq!(cfg.sleep_after_s, 0);
+            },
+        );
+        // Blank counts as unset (compose renders an unset var empty), so the
+        // other knob still applies.
+        with_env(
+            &[
+                ("RUNNER_SLEEP_AFTER_MIN", ""),
+                ("RUNNER_SLEEP_AFTER_H", "6"),
+            ],
+            || {
+                let cfg = Config::from_env().expect("blank minutes must boot");
+                assert!(cfg.env_problems.is_empty());
+                assert_eq!(cfg.sleep_after_s, 6 * 3600);
+            },
+        );
+        // Nothing set derives, and the sweep cadence follows it.
+        with_env(&[], || {
+            let cfg = Config::from_env().expect("unset must boot");
+            assert_eq!(cfg.sleep_after_s, derived);
+            assert_eq!(cfg.sleep_sweep_s, sleep_sweep_default_s(derived));
+        });
+        // An explicit sweep cadence still wins.
+        with_env(&[("RUNNER_SLEEP_SWEEP_S", "60")], || {
+            let cfg = Config::from_env().expect("explicit sweep must boot");
+            assert_eq!(cfg.sleep_sweep_s, 60);
+        });
+        // A malformed value is a boot problem naming the var, never silent.
+        with_env(&[("RUNNER_SLEEP_AFTER_MIN", "soon")], || {
+            let err = Config::from_env().expect_err("malformed minutes must fail boot");
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains("RUNNER_SLEEP_AFTER_MIN"),
+                "names the knob: {msg}"
+            );
         });
     }
 

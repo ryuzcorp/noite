@@ -221,7 +221,7 @@ pub async fn delete_app(
 
 /// Park an app now (SPEC, Scale to zero), skipping the idle check — the
 /// operator's lever, and how tests exercise wake-on-request without waiting
-/// out `RUNNER_SLEEP_AFTER_H`. 409 when the app cannot sleep (stopped,
+/// out the idle threshold. 409 when the app cannot sleep (stopped,
 /// undeployed, already asleep, or not running yet).
 pub async fn sleep_app(State(state): State<AppState>, Path(id): Path<String>) -> impl IntoResponse {
     match service::apps::sleep(&state, &id).await {
