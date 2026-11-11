@@ -89,9 +89,15 @@ interface BrowserBox {
    * a `ref` with detached scratch copies on every re-render, so `attach` only
    * wires the element that is actually in the page, and only once. */
   wired: boolean;
+  /** The instance's one cancellation source: every listener and pending answer
+   * rides it, and it is aborted when the page lets the browser go. It lives in
+   * the box because a render must not replace it — listeners attached with an
+   * already-aborted signal are silently dead. */
+  dialogs: AbortController;
 }
 
 const newBrowserBox = (): BrowserBox => ({
+  dialogs: new AbortController(),
   live: true,
   request: null,
   wired: false,
@@ -119,7 +125,6 @@ export const SourceBrowser = ({
   let pushOp: PushOperation = PushOps.Idle();
   let editor: ReturnType<typeof createEditorPane> | null = null;
   let tree: TreeWiring | null = null;
-  const dialogs = new AbortController();
 
   const current = (): ReadyCheckout | null => {
     const state = view();
@@ -366,7 +371,15 @@ export const SourceBrowser = ({
       editor?.drop();
       invalidateForge(appId);
       apply(discardAll(session));
-      requestRef(target, true);
+
+      // The URL is the browsed ref: committing to another branch (a new one,
+      // or a target picked in the form) moves it there, and the watch below
+      // installs it. The same branch only needs its new tip read.
+      if (target === checkout.ref) {
+        requestRef(target, true);
+      } else {
+        gitRef.set(target);
+      }
     } catch (error) {
       pushOp = settlePush(pushOp, {
         failure: operationFailure(error),
@@ -400,7 +413,7 @@ export const SourceBrowser = ({
     const ok = await confirmDialog({
       confirmLabel: "Discard and switch",
       message: `${count} unsaved ${count === 1 ? "change goes" : "changes go"} away. Commit them first to keep them.`,
-      signal: dialogs.signal,
+      signal: box.dialogs.signal,
       title: `Switch to ${next}?`,
     });
 
@@ -419,10 +432,10 @@ export const SourceBrowser = ({
       // is in the document, then wire it once.
       const codeHost = await whenFrame(
         () => (host.isConnected ? host : null),
-        dialogs.signal
+        box.dialogs.signal
       );
 
-      const treeEl = await whenLive(treeHost, dialogs.signal);
+      const treeEl = await whenLive(treeHost, box.dialogs.signal);
 
       if (codeHost === null || treeEl === null || !box.live) {
         return;
@@ -484,7 +497,7 @@ export const SourceBrowser = ({
           apply(remove(session, path));
         },
         rows,
-        signal: dialogs.signal,
+        signal: box.dialogs.signal,
         treeEl,
         trees: treesTyped,
       });
@@ -539,7 +552,7 @@ export const SourceBrowser = ({
 
     onCleanup(() => {
       box.live = false;
-      dialogs.abort();
+      box.dialogs.abort();
       tree?.cleanUp();
       editor?.cleanUp();
 

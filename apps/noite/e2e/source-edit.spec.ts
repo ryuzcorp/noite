@@ -26,18 +26,14 @@ test.afterAll(async ({ request }) => {
   }
 });
 
-/** Append a line to the open file. Clicking below the last line focuses the
- * content element (a click on a line is pierre's and takes no focus). */
+/** Append a line to the open file. The editor's text is a contenteditable
+ * textbox, so it is focused directly: a pointer click can land on pierre's
+ * gutter overlay (which intercepts it) when the file is shorter than the
+ * pane. */
 const appendLine = async (page: Page, line: string): Promise<void> => {
   const editor = page.locator('[contenteditable="true"]').first();
   await expect(editor).toBeVisible({ timeout: 60_000 });
-  const box = await editor.boundingBox();
-
-  if (box === null) {
-    throw new TypeError("the editor has no box");
-  }
-
-  await editor.click({ position: { x: 8, y: box.height - 8 } });
+  await editor.focus();
   await page.keyboard.press("ControlOrMeta+End");
   await page.keyboard.press("Enter");
   await page.keyboard.type(line);

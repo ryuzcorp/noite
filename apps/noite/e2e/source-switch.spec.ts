@@ -38,20 +38,23 @@ const pickBranch = async (page: Page, name: string): Promise<void> => {
     .click();
 };
 
-/** Append a line to the open file. */
+/** Append a line to the open file (focused directly: a click can land on
+ * pierre's gutter overlay for a short file). */
 const appendLine = async (page: Page, line: string): Promise<void> => {
   const editor = page.locator('[contenteditable="true"]').first();
   await expect(editor).toBeVisible({ timeout: 60_000 });
-  const box = await editor.boundingBox();
-
-  if (box === null) {
-    throw new TypeError("the editor has no box");
-  }
-
-  await editor.click({ position: { x: 8, y: box.height - 8 } });
+  await editor.focus();
   await page.keyboard.press("ControlOrMeta+End");
   await page.keyboard.press("Enter");
   await page.keyboard.type(line);
+};
+
+/** Create a branch from the picker: the dropdown's own form, then Create. */
+const createBranch = async (page: Page, name: string): Promise<void> => {
+  await page.getByLabel(/^Branch or ref:/u).click();
+  const picker = page.locator(".dropdown-content");
+  await picker.getByLabel("New branch name").fill(name);
+  await picker.getByRole("button", { name: "Create" }).click();
 };
 
 const changesBadge = (page: Page) =>
@@ -123,7 +126,7 @@ test("a ref switch with an unsaved buffer asks before throwing it away", async (
 
   // Cancel keeps the buffer and the ref: the picker goes back to what the
   // panes show.
-  await pickBranch(page, "topic");
+  await createBranch(page, "topic");
   const ask = page.getByRole("alertdialog", { name: "Switch to topic?" });
   await expect(ask).toBeVisible({ timeout: 60_000 });
   await ask.getByRole("button", { name: "Cancel" }).click();

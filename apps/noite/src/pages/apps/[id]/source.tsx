@@ -328,8 +328,15 @@ const SourceBody = ({ appId }: { appId: string }) => {
   });
 
   // main is protected when `require_pr` is on and the caller is below admin;
-  // the Changes panel then only commits to a new branch.
-  const rules = resourceValue(branchRules(appId).state());
+  // the Changes panel then only commits to a new branch. The rule is read
+  // again on mount: the cached snapshot may predate a save on the settings
+  // page, and the gate must never offer a commit the runner will refuse.
+  const rulesRes = branchRules(appId);
+  const rules = resourceValue(rulesRes.state());
+
+  watch.once(() => {
+    void rulesRes.refetch();
+  });
   const detailRes = appDetail(appId);
   const myRole = resourceValue(detailRes.state())?.myRole;
   const browsing = gitRef();
