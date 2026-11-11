@@ -1,3 +1,0 @@
-### Fixed
-
-- **Import retry and delete no longer corrupt a running app.** Retry is refused with a 409 for a deployed or busy app instead of setting its status back to `importing`; a failed import is stored as `error` rather than an unknown badge value; the "an import is running" claim is released on every exit path, so a panic can no longer block retries until the runner restarts. Deleting an app stops its import first, waits for it to end, and re-checks that the app still owns the slug before a ref move, so an app created later with that slug cannot inherit the imported tree; retry, patch and rename on an app being deleted answer 409.
