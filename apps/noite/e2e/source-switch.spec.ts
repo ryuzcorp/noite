@@ -120,25 +120,32 @@ test("a ref switch with an unsaved buffer asks before throwing it away", async (
 
   pushAppDir(apiKey, new URL("fixtures/intel", import.meta.url), slug);
 
+  // A branch to come back to exists before there is anything to lose: the
+  // switch under test is the one *away* from the dirty ref, not a branch
+  // create that a prompt would have to interrupt.
   await page.goto(`/apps/${appId}/source?file=index.ts&ref=main&panel=changes`);
+  await createBranch(page, "topic");
+  await expect(page).toHaveURL(/ref=topic/u);
+  await expect(overlay(page)).toHaveCount(0, { timeout: 60_000 });
+
   await appendLine(page, "// unsaved");
   await expect(changesBadge(page)).toHaveText("1");
 
   // Cancel keeps the buffer and the ref: the picker goes back to what the
   // panes show.
-  await createBranch(page, "topic");
-  const ask = page.getByRole("alertdialog", { name: "Switch to topic?" });
+  await pickBranch(page, "main");
+  const ask = page.getByRole("alertdialog", { name: "Switch to main?" });
   await expect(ask).toBeVisible({ timeout: 60_000 });
   await ask.getByRole("button", { name: "Cancel" }).click();
   await expect(ask).toBeHidden();
-  await expect(page.getByLabel(/^Branch or ref: main/u)).toBeVisible();
+  await expect(page).toHaveURL(/ref=topic/u);
   await expect(changesBadge(page)).toHaveText("1");
 
   // Confirming discards the buffer and switches.
-  await pickBranch(page, "topic");
+  await pickBranch(page, "main");
   await expect(ask).toBeVisible();
   await ask.getByRole("button", { name: "Discard and switch" }).click();
-  await expect(page).toHaveURL(/ref=topic/u);
+  await expect(page).not.toHaveURL(/[?&]ref=/u);
   await expect(overlay(page)).toHaveCount(0, { timeout: 60_000 });
   await expect(changesBadge(page)).toBeHidden();
   await expect(page.getByRole("treeitem", { name: "index.ts" })).toBeVisible();

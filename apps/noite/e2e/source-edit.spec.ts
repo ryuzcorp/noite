@@ -1,7 +1,12 @@
 import { expect, test } from "@playwright/test";
-import type { Page } from "@playwright/test";
+import type { BrowserContext, Page } from "@playwright/test";
 
-import { createAppWithKey, deleteApp, pushAppDir } from "./helpers";
+import {
+  createAppWithKey,
+  deleteApp,
+  pushAppDir,
+  registerInviteeWithFreshCode,
+} from "./helpers";
 
 // Browser edits across files: the in-page buffers survive opening another
 // file, and one Push commits every edited file together. The page repaints on
@@ -19,11 +24,18 @@ const PROTECTED_SLUG = "source-protected";
  * quota (10) is shared by the whole lane. */
 const createdApps: string[] = [];
 
+/** The second browser the protection test signs into (closed after it). */
+const contexts: BrowserContext[] = [];
+
 test.afterAll(async ({ request }) => {
   for (const slug of createdApps.splice(0)) {
     // oxlint-disable-next-line eslint/no-await-in-loop -- one delete at a time; each purges a fleet on the runner
     await deleteApp(request, slug);
   }
+});
+
+test.afterEach(async () => {
+  await Promise.all(contexts.splice(0).map((context) => context.close()));
 });
 
 /** Append a line to the open file. The editor's text is a contenteditable
@@ -133,10 +145,13 @@ test("a commit to a new branch lands and offers the pull request", async ({
   await expect(page.getByLabel(/^Branch or ref: topic/u)).toBeVisible();
 });
 
-// With `require_pr` on, `main` refuses a direct commit: the target select
-// disables it, says why, and the commit goes to a new branch instead — which is
-// the only path the runner accepts for a non-admin on the default branch.
-test("branch protection re-targets the commit to a new branch", async ({
+// With `require_pr` on, `main` refuses a direct commit for anyone below
+// admin: the target select disables it, says why, and the commit goes to a new
+// branch instead — the only path the runner accepts. The rule never binds an
+// admin, so this runs as a `push` collaborator (prs.spec covers the server-side
+// refusal itself).
+test("branch protection re-targets a push collaborator's commit", async ({
+  browser,
   page,
   request,
 }) => {
@@ -158,10 +173,37 @@ test("branch protection re-targets the commit to a new branch", async ({
   await page.getByRole("button", { name: "Save branch rules" }).click();
   await expect(page.getByText("Saved.")).toBeVisible();
 
-  await page.goto(`/apps/${appId}/source?file=index.ts&ref=main&panel=changes`);
-  await appendLine(page, "// protected");
+  const email = `code-push-${Date.now()}@example.com`;
 
-  const panel = page.getByRole("complementary", { name: "Changes" });
+  const invitee = await registerInviteeWithFreshCode(browser, page, {
+    email,
+    name: "Code Push",
+  });
+
+  contexts.push(invitee.context);
+
+  await page.goto(`/apps/${appId}/settings?section=collaborators`);
+  await page.getByRole("button", { exact: true, name: "Invite" }).click();
+  await page.locator("#invite-email").fill(email);
+  await page.locator("#invite-role").selectOption("push");
+  await page
+    .getByRole("dialog")
+    .getByRole("button", { exact: true, name: "Invite" })
+    .click();
+  await expect(page.getByRole("dialog")).toBeHidden();
+
+  await invitee.page.goto("/apps");
+  await invitee.page
+    .getByRole("button", { exact: true, name: "Accept" })
+    .click();
+  await expect(invitee.page).toHaveURL(new RegExp(`/apps/${appId}`, "u"));
+
+  await invitee.page.goto(
+    `/apps/${appId}/source?file=index.ts&ref=main&panel=changes`
+  );
+  await appendLine(invitee.page, "// protected");
+
+  const panel = invitee.page.getByRole("complementary", { name: "Changes" });
   await expect(
     panel.getByText(
       "Protected branch: commit to a new branch and open a pull request."
@@ -169,7 +211,7 @@ test("branch protection re-targets the commit to a new branch", async ({
   ).toBeVisible({ timeout: 60_000 });
 
   // The disabled option is the refusal: the runner refuses `main` for a
-  // non-admin while the rule is on, so the form never offers it.
+  // push-role collaborator while the rule is on, so the form never offers it.
   const target = panel.getByLabel("Commit to");
   await expect(
     target.locator("option", { hasText: "main (protected)" })
@@ -182,5 +224,5 @@ test("branch protection re-targets the commit to a new branch", async ({
   await expect(panel.getByRole("link", { name: "Open a pull" })).toBeVisible({
     timeout: 60_000,
   });
-  await expect(page).toHaveURL(/ref=protected-change/u);
+  await expect(invitee.page).toHaveURL(/ref=protected-change/u);
 });

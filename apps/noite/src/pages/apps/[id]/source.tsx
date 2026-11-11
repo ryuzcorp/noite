@@ -500,6 +500,9 @@ const SourceBody = ({ appId }: { appId: string }) => {
                 onState={(state) => {
                   browser.set(state);
                 }}
+                setRef={(next) => {
+                  gitRef.set(next);
+                }}
                 treeHost={treeHost}
               />
               <ResizeHandle label="Resize side panel" />

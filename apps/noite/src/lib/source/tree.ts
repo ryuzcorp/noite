@@ -597,8 +597,19 @@ export const createTreeWiring = (host: TreeHost): TreeWiring => {
   };
 
   /** Right-click below the rows: pierre opens its menu on rows only, so the
-   * pane offers the same one for the tree's root there. */
+   * pane offers the same one for the tree's root there. The listener sits on
+   * the document in the capture phase: pierre's own handler runs inside its
+   * shadow root and can consume the event before it bubbles, and a right-click
+   * that opens no menu at all is worse than a duplicate one — the row case is
+   * detected from the composed path and left to pierre. */
   const onTreeContextMenu = (event: MouseEvent): void => {
+    if (
+      !host.treeEl.isConnected ||
+      !event.composedPath().includes(host.treeEl)
+    ) {
+      return;
+    }
+
     if (!host.editable()) {
       notify("This checkout is read-only.");
 
@@ -716,7 +727,8 @@ export const createTreeWiring = (host: TreeHost): TreeWiring => {
 
   host.treeEl.parentElement?.append(input);
   input.addEventListener("change", onPicked, { signal: host.signal });
-  host.treeEl.addEventListener("contextmenu", onTreeContextMenu, {
+  document.addEventListener("contextmenu", onTreeContextMenu, {
+    capture: true,
     signal: host.signal,
   });
   host.treeEl.addEventListener("focusout", onNameBlur, {

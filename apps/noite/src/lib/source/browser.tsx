@@ -70,6 +70,9 @@ export interface SourceBrowserProps {
   file: SearchParam<string>;
   /** The browsed ref, in step with `?ref=`. */
   gitRef: AtomHandle<string>;
+  /** Write a ref to the URL: a commit to another branch moves the browse there,
+   * and the page's `?ref=` is what the panes follow. */
+  setRef: (ref: string) => void;
   /** The draft verbs, handed over once the browser has them. */
   onDraftsReady: (actions: DraftActions) => void;
   /** Every change of the session, for the page's badge and panel. */
@@ -110,6 +113,7 @@ export const SourceBrowser = ({
   gitRef,
   onDraftsReady,
   onState,
+  setRef,
   treeHost,
 }: SourceBrowserProps) => {
   // The box carries the installed request closure (functions do not serialize):
@@ -378,7 +382,7 @@ export const SourceBrowser = ({
       if (target === checkout.ref) {
         requestRef(target, true);
       } else {
-        gitRef.set(target);
+        setRef(target);
       }
     } catch (error) {
       pushOp = settlePush(pushOp, {
