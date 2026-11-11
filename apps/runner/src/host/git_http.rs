@@ -277,6 +277,11 @@ pub(crate) async fn init_repos(state: &AppState, slug: &str) -> anyhow::Result<(
     Ok(())
 }
 
+/// The retired hidden preview namespace. Nothing writes it, the boot sweep
+/// deletes what an upgrade left, and the Git advertisement and fetch paths
+/// hide it.
+pub const RETIRED_PREVIEW_PREFIX: &str = "refs/previews/";
+
 /// Every ref the runner tracks in a mirror: branches and tags.
 pub(crate) async fn list_refs(bare: &Path) -> anyhow::Result<HashMap<String, String>> {
     let out = exec::run_cmd(
@@ -474,7 +479,14 @@ pub async fn info_refs(
     };
     let out = match exec::run_cmd(
         "git",
-        &[prog, "--stateless-rpc", "--advertise-refs", bare_arg],
+        &[
+            "-c",
+            &format!("uploadpack.hideRefs={RETIRED_PREVIEW_PREFIX}"),
+            prog,
+            "--stateless-rpc",
+            "--advertise-refs",
+            bare_arg,
+        ],
         None,
         &[],
         Duration::from_secs(30),
@@ -524,7 +536,13 @@ pub async fn upload_pack(
     };
     match exec::run_cmd_stdin(
         "git",
-        &["upload-pack", "--stateless-rpc", bare_arg],
+        &[
+            "-c",
+            &format!("uploadpack.hideRefs={RETIRED_PREVIEW_PREFIX}"),
+            "upload-pack",
+            "--stateless-rpc",
+            bare_arg,
+        ],
         &body,
         None,
         &[],

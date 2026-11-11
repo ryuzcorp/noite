@@ -16,12 +16,22 @@ use axum::{
 use crate::config::is_localhost_domain;
 use crate::AppState;
 
-/// The retired pod host's label prefix (`pod-<app id>.<base>`). The host is
-/// gone, but browsers may still hold a certificate, a bookmark, history or
-/// origin storage for it, so the name stays unclaimable: an app with that slug
-/// would serve attacker-controlled code on the origin a victim's stale tab or
-/// bookmark can still load, same-origin with that stored workspace.
+/// The retired pod host's label prefix (`pod-<app id>.<base>`).
 pub const RETIRED_POD_PREFIX: &str = "pod-";
+
+/// Whether `label` is the **retired pod host** shape, `pod-<uuid>`. Only that
+/// exact shape ever served a pod origin, so only it stays unclaimable: an app
+/// called `pod-staging` was never a pod host and keeps its name.
+pub fn retired_pod_label(label: &str) -> bool {
+    let Some(id) = label.strip_prefix(RETIRED_POD_PREFIX) else {
+        return false;
+    };
+    id.len() == 36
+        && id.chars().enumerate().all(|(i, c)| match i {
+            8 | 13 | 18 | 23 => c == '-',
+            _ => c.is_ascii_hexdigit(),
+        })
+}
 
 /// Tenant slug from a Host header, if it addresses `{slug}.{base}` under any
 /// tenant base (configured domain plus LAN/extra DNS names) and is not one
@@ -49,7 +59,7 @@ pub fn parse_edge_slug(host: &str, bases: &[String], control_sub: &str) -> Optio
         if slug == control_sub || slug == "api" || slug == "git" {
             return None;
         }
-        if slug.starts_with(RETIRED_POD_PREFIX) {
+        if slug.starts_with(RETIRED_POD_PREFIX) && retired_pod_label(slug) {
             return None;
         }
         return Some(slug.to_string());
@@ -741,7 +751,10 @@ mod tests {
             ),
             None
         );
-        assert_eq!(parse_edge_slug("pod-staging.noite.now", &prod, "app"), None);
+        assert_eq!(
+            parse_edge_slug("pod-staging.noite.now", &prod, "app"),
+            Some("pod-staging".to_string())
+        );
         assert_eq!(parse_edge_slug("a.b.localhost", &dev, ""), None);
         assert_eq!(parse_edge_slug("", &dev, ""), None);
     }

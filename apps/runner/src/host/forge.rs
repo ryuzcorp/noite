@@ -512,6 +512,50 @@ pub fn publishable_ref(refname: &str) -> bool {
     }
 }
 
+/// Remove every ref under the retired `refs/previews/` namespace from one
+/// app's push mirror and its manifest, so old hidden snapshots are gone from
+/// the durable state too (a rehydrate cannot bring them back) and a later
+/// push's snapshot does not disagree with a manifest that still lists them.
+/// Idempotent; returns how many refs it removed.
+pub async fn delete_retired_refs(state: &AppState, slug: &str) -> anyhow::Result<usize> {
+    let retired = crate::host::git_http::RETIRED_PREVIEW_PREFIX;
+    let _push_guard = state.wal.lock(slug).await;
+    let bare = state.wal.ensure_synced_locked(slug).await?;
+    let out = git_out(
+        &bare,
+        &["for-each-ref", "--format=%(objectname) %(refname)", retired],
+    )
+    .await?;
+    let updates: Vec<ryuz_git::RefUpdate> = out
+        .lines()
+        .filter_map(|line| {
+            let (sha, refname) = line.trim().split_once(' ')?;
+            refname
+                .starts_with(retired)
+                .then(|| ryuz_git::RefUpdate::delete(refname.trim(), Some(sha.trim())))
+        })
+        .collect();
+    if updates.is_empty() {
+        return Ok(0);
+    }
+    let count = updates.len();
+    let outcome = state
+        .wal
+        .publish_locked(slug, &updates)
+        .await
+        .map_err(|e| anyhow!("{e:#}"))?;
+    for moved in &outcome.moved {
+        if let Some(bundle) = &moved.bundle {
+            crate::host::git_http::prune_old_bundles(&state.config, slug, &moved.refname, bundle)
+                .await;
+        }
+    }
+    for deleted in &outcome.deleted {
+        crate::host::git_http::delete_ref_prefix(&state.config, slug, deleted).await;
+    }
+    Ok(count)
+}
+
 /// `git merge-tree --write-tree` of `ours` and `theirs` in the push mirror.
 /// A clean merge yields the tree; a conflict yields the conflicted paths and
 /// no tree.
@@ -3658,6 +3702,81 @@ mod tests {
         assert!(!valid_ref("refs/previews/user/feature"));
         assert!(!valid_ref("refs/pull/1/head"));
         assert!(!valid_ref("refs/"));
+    }
+
+    /// The retirement sweep removes every `refs/previews/*` ref from the
+    /// mirror and the durable manifest, so the next push's snapshot agrees
+    /// with the manifest and a rehydrate cannot bring the hidden snapshots
+    /// back.
+    #[tokio::test]
+    async fn retired_preview_refs_are_deleted_from_mirror_and_manifest() {
+        let h = Harness::new("retiredrefs").await;
+        let app = h.app.clone();
+        let bare = h.mirror().await;
+        let work = Work::new(&h.dir.join("scratch")).await;
+        work.write("a.txt", "a\n");
+        let sha = work.commit("one").await;
+        let tips = seed_objects(&bare, &work).await;
+        for (branch, sha) in &tips {
+            publish_ref(&h.state, &app, branch, None, Some(sha.as_str()))
+                .await
+                .expect("publish");
+        }
+        // The old preview writer put the snapshot on a hidden ref; publish it
+        // through the same WAL so the manifest carries it.
+        h.state
+            .wal
+            .publish_locked(
+                &app.slug,
+                &[ryuz_git::RefUpdate::set(
+                    "refs/previews/user/wip",
+                    None::<String>,
+                    sha.as_str(),
+                )],
+            )
+            .await
+            .expect("preview ref");
+        assert!(
+            !git(&bare, &["show-ref", "--verify", "refs/previews/user/wip"])
+                .await
+                .is_empty()
+        );
+
+        assert_eq!(
+            delete_retired_refs(&h.state, &app.slug)
+                .await
+                .expect("sweep"),
+            1
+        );
+        assert!(
+            exec::run_cmd(
+                "git",
+                &[
+                    &format!("--git-dir={}", bare.display()),
+                    "show-ref",
+                    "--verify",
+                    "refs/previews/user/wip",
+                ],
+                None,
+                &[],
+                Duration::from_secs(15),
+            )
+            .await
+            .is_err(),
+            "the hidden ref is gone"
+        );
+        // A later branch push still records: the snapshot and the manifest
+        // no longer disagree.
+        publish_ref(&h.state, &app, "refs/heads/next", None, Some(sha.as_str()))
+            .await
+            .expect("branch push after cleanup");
+        assert_eq!(
+            delete_retired_refs(&h.state, &app.slug)
+                .await
+                .expect("idempotent sweep"),
+            0
+        );
+        h.finish().await;
     }
 
     #[test]

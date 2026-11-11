@@ -53,6 +53,7 @@ pub async fn teardown(
     procs: &ProcMap,
     log_state: &LogState,
     env: EnvTarget<'_>,
+    strict_credentials: bool,
 ) -> anyhow::Result<()> {
     supervisor::stop_environment_fleet(procs, env.app_slug, env.label).await;
     // Brief settle, same as purge: don't clear a dying node's prefix.
@@ -87,8 +88,18 @@ pub async fn teardown(
     // skip its first compactions.
     crate::host::metrics::forget_fleet(&fleet_key);
     // The environment's key must not outlive its prefix (SPEC, Scoped
-    // credentials); the app's own key is untouched.
+    // credentials); the app's own key is untouched. The boot retirement has no
+    // later sweep for a row it deletes, so there a failed revoke keeps the row
+    // (and `kind`) for the next boot instead of dropping the only retry.
     if let Err(e) = crate::host::credentials::revoke_environment(pool, cfg, env.id).await {
+        if strict_credentials {
+            return Err(e).with_context(|| {
+                format!(
+                    "revoke the scoped credential of retired environment {}",
+                    env.id
+                )
+            });
+        }
         tracing::warn!(env_id = %env.id, error = %format!("{e:#}"), "environment deleted but credential revoke failed");
     }
     // Its operator token goes too (row and process cache), so a reused
@@ -137,6 +148,7 @@ pub async fn on_refs_deleted(state: &crate::AppState, app: &App, deleted: &[Stri
             &state.procs,
             &state.logs,
             (&env).into(),
+            false,
         )
         .await
         {
@@ -175,7 +187,29 @@ pub async fn retire_workspace_environments(state: &crate::AppState) -> anyhow::R
     .context("list retired workspace environments")?;
     let total = rows.len();
     let mut failed: Vec<String> = Vec::new();
+    // The refs are retired for the whole app, not just the rows: any
+    // `refs/previews/*` still in its mirror (even one a row no longer points
+    // at) must leave the mirror and the durable manifest before the rows that
+    // are their only pointer go.
+    let mut slugs: Vec<&str> = rows.iter().map(|row| row.app_slug.as_str()).collect();
+    slugs.sort_unstable();
+    slugs.dedup();
+    let mut broken: Vec<String> = Vec::new();
+    for slug in slugs {
+        if let Err(e) = crate::host::forge::delete_retired_refs(state, slug).await {
+            tracing::warn!(
+                slug = %slug,
+                error = %format!("{e:#}"),
+                "retired workspace ref cleanup failed"
+            );
+            broken.push(slug.to_string());
+        }
+    }
     for row in rows {
+        if broken.contains(&row.app_slug) {
+            failed.push(format!("{}.{}", row.app_slug, row.label));
+            continue;
+        }
         tracing::info!(
             slug = %row.app_slug,
             label = %row.label,
@@ -193,6 +227,7 @@ pub async fn retire_workspace_environments(state: &crate::AppState) -> anyhow::R
             &state.procs,
             &state.logs,
             target,
+            true,
         )
         .await
         {

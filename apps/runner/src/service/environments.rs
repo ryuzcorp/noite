@@ -243,6 +243,7 @@ async fn delete_inner(
         &state.procs,
         &state.logs,
         (&env).into(),
+        false,
     )
     .await
     .map_err(|e| ApiError::internal(format!("{e:#}")))?;
