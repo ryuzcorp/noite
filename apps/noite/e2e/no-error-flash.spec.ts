@@ -190,6 +190,20 @@ test("pages and tabs never paint an error before a load settles", async ({
     }
     /* oxlint-enable eslint/no-await-in-loop */
 
+    // --- the whole Settings page at once ---------------------------------
+    // Every section's resource starts in the same paint; none may paint an
+    // error while it is still loading. No feed opens here, so the panels'
+    // own loaded paints are the signal.
+    await mark(page, "settings page");
+    await page.goto(`/apps/${appId}/settings`);
+    await expect(
+      page.getByRole("heading", { level: 2, name: "Danger zone" })
+    ).toBeVisible();
+    await expect(
+      page.locator('[role="status"][aria-label="Loading"]')
+    ).toHaveCount(0);
+    await expectNoFlash(page, "settings page");
+
     // --- back to the list and in again -----------------------------------
     await mark(page, "back to apps");
     const backStream = nextStreams(page);

@@ -88,10 +88,9 @@ export const CollaboratorsPanel = ({
   };
 
   return (
-    <SettingsSection>
-      <div class="flex items-center justify-between gap-2">
-        <h3 class="m-0 text-lg font-semibold">Collaborators</h3>
-        {isAdmin ? (
+    <SettingsSection
+      actions={
+        isAdmin ? (
           <button
             type="button"
             class="btn btn-sm btn-neutral"
@@ -103,8 +102,10 @@ export const CollaboratorsPanel = ({
           >
             Invite
           </button>
-        ) : null}
-      </div>
+        ) : null
+      }
+      section="collaborators"
+    >
       <p class="m-0 text-sm opacity-80">
         Roles: <code>view</code> read-only · <code>push</code> deploy, push
         code, write data · <code>admin</code> members, variables, delete.

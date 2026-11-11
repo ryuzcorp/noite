@@ -2,13 +2,13 @@ import { describe, expect, test } from "bun:test";
 
 import type { RunnerEnvironment } from "../runner";
 import {
-  DEFAULT_SETTINGS_SECTION,
   legacySettingsHref,
   parseAppRoute,
   parseErrorFilter,
   parseScope,
   parseSettingsSection,
   scopeId,
+  settingsSectionLabel,
   settingsSectionsFor,
 } from "./route.machine";
 
@@ -70,32 +70,51 @@ describe("parseErrorFilter", () => {
 });
 
 describe("parseSettingsSection", () => {
-  test("a known section is the section", () => {
+  test("a known section is the anchor to scroll to", () => {
     expect(parseSettingsSection("domains", true)).toBe("domains");
   });
 
-  test("an unknown section is the default, never an empty view", () => {
-    expect(parseSettingsSection("", true)).toBe(DEFAULT_SETTINGS_SECTION);
-    expect(parseSettingsSection("nope", true)).toBe(DEFAULT_SETTINGS_SECTION);
+  test("an unknown or missing section has no anchor", () => {
+    expect(parseSettingsSection("", true)).toBeNull();
+    expect(parseSettingsSection("nope", true)).toBeNull();
   });
 
-  test("an admin-only section is refused for a non-admin", () => {
+  test("an admin-only section has no anchor for a non-admin", () => {
     for (const section of ["branch-protection", "danger"] as const) {
       expect(parseSettingsSection(section, true)).toBe(section);
-      expect(parseSettingsSection(section, false)).toBe(
-        DEFAULT_SETTINGS_SECTION
-      );
+      expect(parseSettingsSection(section, false)).toBeNull();
     }
   });
 });
 
 describe("settingsSectionsFor", () => {
-  test("the admin-only sections leave a non-admin's tab row", () => {
+  test("every section stacks on one page, admin-only ones last", () => {
+    expect(settingsSectionsFor(true)).toEqual([
+      "identity",
+      "domains",
+      "limits",
+      "error-reporting",
+      "collaborators",
+      "env",
+      "branch-protection",
+      "danger",
+    ]);
+  });
+
+  test("the admin-only sections are not on a non-admin's page", () => {
     expect(settingsSectionsFor(true)).toContain("branch-protection");
     expect(settingsSectionsFor(true)).toContain("danger");
     expect(settingsSectionsFor(false)).not.toContain("branch-protection");
     expect(settingsSectionsFor(false)).not.toContain("danger");
-    expect(settingsSectionsFor(false)[0]).toBe(DEFAULT_SETTINGS_SECTION);
+    expect(settingsSectionsFor(false)[0]).toBe("identity");
+  });
+});
+
+describe("settingsSectionLabel", () => {
+  test("headings read the way the page's contents nav lists them", () => {
+    expect(settingsSectionLabel("domains")).toBe("Domains");
+    expect(settingsSectionLabel("env")).toBe("Environment");
+    expect(settingsSectionLabel("danger")).toBe("Danger zone");
   });
 });
 

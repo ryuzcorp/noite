@@ -14,7 +14,7 @@ import type { AppRole } from "../../roles";
 import { confirmDialog } from "../../ui/confirm";
 import { CopyButton } from "../../ui/copy-button";
 import { LoadError } from "../../ui/load-error";
-import { SectionSkeleton } from "../../ui/skeletons";
+import { ListSkeleton } from "../../ui/skeletons";
 import { capabilities } from "../capabilities";
 import { domainClaim } from "../lifecycle";
 import {
@@ -54,12 +54,15 @@ const DomainsApp = defineApp({
     const busy = model.op._tag !== "Idle";
 
     if (res.state()._tag === "Loading") {
-      return <SectionSkeleton lines={2} />;
+      return (
+        <SettingsSection section="domains">
+          <ListSkeleton rows={2} />
+        </SettingsSection>
+      );
     }
 
     return (
-      <SettingsSection>
-        <h3 class="m-0 text-lg font-semibold">Custom Domain</h3>
+      <SettingsSection section="domains">
         <p class="m-0 text-sm opacity-70">
           Serve this app from your own hostname. Only a verified hostname
           routes: add it, publish the TXT proof, then verify. Keep DNS pointed

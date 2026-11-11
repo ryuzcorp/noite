@@ -62,8 +62,7 @@ export const AppIdentityForm = ({
   const failure = form().status;
 
   return (
-    <SettingsSection>
-      <h3 class="m-0 text-lg font-semibold">Identity</h3>
+    <SettingsSection section="identity">
       {failure._tag === "Failed" ? (
         <p class="text-error m-0 text-sm">{failure.error}</p>
       ) : null}

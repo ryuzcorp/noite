@@ -11,7 +11,7 @@ import type { AppRole } from "../../roles";
 import type { BranchRules } from "../../runner";
 import { branchRules } from "../../source/branch-rules";
 import { LoadError } from "../../ui/load-error";
-import { SectionSkeleton } from "../../ui/skeletons";
+import { ListSkeleton } from "../../ui/skeletons";
 import { capabilities } from "../capabilities";
 import { watchResource } from "../watch-resource";
 import {
@@ -71,13 +71,16 @@ export const BranchProtectionPanel = ({
   });
 
   if (res.state()._tag === "Loading") {
-    return <SectionSkeleton lines={2} />;
+    return (
+      <SettingsSection section="branch-protection">
+        <ListSkeleton rows={2} />
+      </SettingsSection>
+    );
   }
 
   if (!current) {
     return (
-      <SettingsSection>
-        <h3 class="m-0 text-lg font-semibold">Branch protection</h3>
+      <SettingsSection section="branch-protection">
         <LoadError error={resourceError(res.state())} />
       </SettingsSection>
     );
@@ -108,8 +111,7 @@ export const BranchProtectionPanel = ({
   };
 
   return (
-    <SettingsSection>
-      <h3 class="m-0 text-lg font-semibold">Branch protection</h3>
+    <SettingsSection section="branch-protection">
       <p class="m-0 text-sm opacity-70">
         With <code>require_pr</code> on, only admins can push to{" "}
         <code>main</code> directly: everyone else commits to a branch and opens

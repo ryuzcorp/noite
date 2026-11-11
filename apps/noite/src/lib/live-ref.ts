@@ -42,27 +42,36 @@ export const liveEl = <T extends Element>(box: LiveRef<T>): T | null => {
   return null;
 };
 
-/** Resolve the live element once it is inserted (a first mount calls `ref`
- * before insertion). Polls animation frames, bounded. */
-export const whenLive = async <T extends Element>(
-  box: LiveRef<T>,
+/** Resolve `check()` once it returns a value (a first mount calls `ref`
+ * before insertion, and a child component's holes mount a frame after its
+ * parent's element). Polls animation frames, bounded. */
+export const whenFrame = async <T>(
+  check: () => T | null,
   signal: AbortSignal,
   maxFrames = 120
 ): Promise<T | null> => {
   for (let i = 0; i < maxFrames && !signal.aborted; i += 1) {
-    const el = liveEl(box);
+    const value = check();
 
-    if (el) {
-      return el;
+    if (value) {
+      return value;
     }
 
-    // oxlint-disable-next-line eslint/no-await-in-loop, promise/avoid-new -- frame-paced wait for insertion; each check must see the previous frame
-    await new Promise<void>((resolve) => {
-      requestAnimationFrame(() => {
-        resolve();
-      });
+    const { promise, resolve } = Promise.withResolvers<undefined>();
+    requestAnimationFrame(() => {
+      resolve();
     });
+    // oxlint-disable-next-line eslint/no-await-in-loop -- frame-paced wait for insertion; each check must see the previous frame
+    await promise;
   }
 
-  return liveEl(box);
+  return check();
 };
+
+/** Resolve the live element once it is inserted (a first mount calls `ref`
+ * before insertion). Polls animation frames, bounded. */
+export const whenLive = <T extends Element>(
+  box: LiveRef<T>,
+  signal: AbortSignal,
+  maxFrames = 120
+): Promise<T | null> => whenFrame(() => liveEl(box), signal, maxFrames);

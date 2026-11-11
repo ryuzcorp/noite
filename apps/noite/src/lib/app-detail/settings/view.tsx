@@ -1,19 +1,35 @@
-//! Settings view body: fetches the app's own role gate, then renders the
-//! section `?section=` names full width. The sections (identity, domains,
-//! rate limits, error reporting, collaborators, env, branch protection,
-//! danger) are sub-navigation of this one view — `/apps/<id>/settings` — not a
-//! side panel: the app page's tab row no longer carries a Settings item, the
-//! sidebar does.
+//! Settings page body: fetches the app's own role gate, then stacks every
+//! section the role may see on one page — Identity, Domains, Limits, Error
+//! reporting, Collaborators, Environment, then Branch protection and Danger
+//! zone for admins. There is no tab row: each section is its own heading with
+//! a stable anchor (`?section=` scrolls to it, and the compact contents nav
+//! links to it), and each panel keeps its own state machine and save flow.
+//! The panels are components, so one section's save never touches another's
+//! draft, and every section's resource starts loading in the same paint.
 
+import { atom, watch } from "ilha";
 import type { View } from "ilha";
 
 import { errorMessage } from "../../errors";
+import {
+  collectRef,
+  liveEl,
+  newLiveRef,
+  whenFrame,
+  whenLive,
+} from "../../live-ref";
 import { resourceValue, resourceError } from "../../resource";
 import { appDetail, invalidate, keys } from "../../resources";
 import type { AppRole } from "../../roles";
+import { searchParam } from "../../search-param";
 import { SectionSkeleton } from "../../ui/skeletons";
 import { capabilities } from "../capabilities";
-import type { SettingsSection } from "../route.machine";
+import {
+  parseSettingsSection,
+  settingsSectionLabel,
+  settingsSectionsFor,
+} from "../route.machine";
+import type { SettingsSection as SettingsSectionId } from "../route.machine";
 import { BranchProtectionPanel } from "./branch-protection";
 import { CollaboratorsPanel } from "./collaborators";
 import { AppDangerZone } from "./danger";
@@ -22,6 +38,7 @@ import { EnvVarsPanel } from "./env";
 import { ErrorReportingPanel } from "./error-reporting";
 import { AppIdentityForm } from "./identity";
 import { RateLimitsPanel } from "./limits";
+import { settingsSectionAnchor } from "./section";
 
 /** What a section renders: the app's own row, gated by the role the server
  * answered with. */
@@ -36,7 +53,7 @@ interface SettingsGate {
 /** Every section's body, one entry per `SettingsSection` (the `satisfies`
  * makes a new section id a build error until its body is here). The
  * admin-only sections re-check the gate before painting a write form — the
- * tab row and the URL parser already kept them out of a non-admin's view. */
+ * page and the URL parser already keep them out of a non-admin's view. */
 const SECTION_VIEWS = {
   "branch-protection": (gate) =>
     capabilities(gate.myRole).admin ? (
@@ -77,18 +94,118 @@ const SECTION_VIEWS = {
     />
   ),
   limits: (gate) => <RateLimitsPanel appId={gate.appId} myRole={gate.myRole} />,
-} as const satisfies Record<SettingsSection, (gate: SettingsGate) => View>;
+} as const satisfies Record<SettingsSectionId, (gate: SettingsGate) => View>;
 
-/** One section of the Settings view, chosen by the page's `?section=`. Fetches
- * its own role gate so it stays independent of any other page's fetch (the
- * same `appDetail` resource, so this is never a second request). */
-export const AppSettingsView = ({
-  appId,
-  section,
+/** The stacked sections, their contents nav, and the deep-link scroll. A
+ * child component so its `atom`/`watch` slots only exist once the role is
+ * known (the panels below need the gate). */
+const SettingsSections = ({
+  gate,
+  sections,
 }: {
-  appId: string;
-  section: SettingsSection;
+  gate: SettingsGate;
+  sections: readonly SettingsSectionId[];
 }) => {
+  const rawSection = searchParam("section", { default: "" });
+  const isAdmin = capabilities(gate.myRole).admin;
+  const anchor = parseSettingsSection(rawSection(), isAdmin);
+  const box = atom.lazy(newLiveRef<HTMLDivElement>)();
+  // A contents-nav pick owns the scroll from that point on: the deep-link
+  // scroll below must never pull the viewport back to the section the page
+  // opened on.
+  const jumped = atom(false);
+
+  // A shared link (`?section=domains`, or the old `?panel=settings` redirect)
+  // opens on that section. Sections above the target grow as their own
+  // resources answer, so the heading keeps moving; re-align it on every DOM
+  // change until no section is a skeleton anymore (no `role=status`), which
+  // is the settled layout.
+  watch.once(async ({ signal }) => {
+    if (typeof window === "undefined" || anchor === null) {
+      return;
+    }
+
+    const host = await whenLive(box, signal);
+    const headingId = `#${settingsSectionAnchor(anchor)}`;
+
+    const first = host
+      ? await whenFrame(() => host.querySelector(headingId), signal)
+      : null;
+
+    if (!host || !first || signal.aborted) {
+      return;
+    }
+
+    first.scrollIntoView({ block: "start" });
+
+    const settled = (): boolean =>
+      host.querySelector('[role="status"]') === null;
+
+    if (settled()) {
+      return;
+    }
+
+    let observer: MutationObserver | null = null;
+
+    const follow = (): void => {
+      if (jumped()) {
+        observer?.disconnect();
+
+        return;
+      }
+
+      host.querySelector(headingId)?.scrollIntoView({ block: "start" });
+
+      if (settled()) {
+        observer?.disconnect();
+      }
+    };
+
+    observer = new MutationObserver(follow);
+    observer.observe(host, { childList: true, subtree: true });
+    signal.addEventListener("abort", () => observer?.disconnect(), {
+      once: true,
+    });
+  });
+
+  const jump = (section: SettingsSectionId): void => {
+    jumped.set(true);
+    rawSection.set(section);
+    liveEl(box)
+      ?.querySelector(`#${settingsSectionAnchor(section)}`)
+      ?.scrollIntoView({ block: "start" });
+  };
+
+  return (
+    <div class="flex w-full max-w-3xl flex-col gap-6">
+      <nav aria-label="Settings sections" class="m-0">
+        <ul class="m-0 flex list-none flex-wrap gap-x-3 gap-y-1 p-0 text-sm">
+          {sections.map((section) => (
+            <li key={section}>
+              <button
+                type="button"
+                class="link link-hover"
+                onclick={() => {
+                  jump(section);
+                }}
+              >
+                {settingsSectionLabel(section)}
+              </button>
+            </li>
+          ))}
+        </ul>
+      </nav>
+      <div ref={(el) => collectRef(box, el)} class="flex flex-col gap-10">
+        {sections.map((section) => SECTION_VIEWS[section](gate))}
+      </div>
+    </div>
+  );
+};
+
+/** The app's whole Settings page. Fetches its own role gate so it stays
+ * independent of any other page's fetch (the same `appDetail` resource, so
+ * this is never a second request). */
+export const AppSettingsView = ({ appId }: { appId: string }) => {
   const res = appDetail(appId);
   const info = resourceValue(res.state());
 
@@ -106,11 +223,16 @@ export const AppSettingsView = ({
     return null;
   }
 
-  return SECTION_VIEWS[section]({
-    appId: info.app.id,
-    myRole: info.myRole,
-    name: info.app.name,
-    slug: info.app.slug,
-    subdomain: info.app.subdomain,
-  });
+  return (
+    <SettingsSections
+      gate={{
+        appId: info.app.id,
+        myRole: info.myRole,
+        name: info.app.name,
+        slug: info.app.slug,
+        subdomain: info.app.subdomain,
+      }}
+      sections={settingsSectionsFor(capabilities(info.myRole).admin)}
+    />
+  );
 };
