@@ -59,7 +59,9 @@ test(
 
     pushAppDir(apiKey, new URL("fixtures/intel", import.meta.url), SLUG);
 
-    await page.goto(`/apps/${appId}/source?file=index.ts&ref=main`);
+    await page.goto(
+      `/apps/${appId}/source?file=index.ts&ref=main&panel=changes`
+    );
     await expect(page.getByRole("treeitem", { name: "index.ts" })).toBeVisible({
       timeout: 60_000,
     });
@@ -114,7 +116,7 @@ test("a commit to a new branch lands and offers the pull request", async ({
 
   pushAppDir(apiKey, new URL("fixtures/intel", import.meta.url), BRANCH_SLUG);
 
-  await page.goto(`/apps/${appId}/source?file=index.ts&ref=main`);
+  await page.goto(`/apps/${appId}/source?file=index.ts&ref=main&panel=changes`);
   await appendLine(page, "// on a branch");
   await expect(changesBadge(page)).toHaveText("1");
 
@@ -160,7 +162,7 @@ test("branch protection re-targets the commit to a new branch", async ({
   await page.getByRole("button", { name: "Save branch rules" }).click();
   await expect(page.getByText("Saved.")).toBeVisible();
 
-  await page.goto(`/apps/${appId}/source?file=index.ts&ref=main`);
+  await page.goto(`/apps/${appId}/source?file=index.ts&ref=main&panel=changes`);
   await appendLine(page, "// protected");
 
   const panel = page.getByRole("complementary", { name: "Changes" });

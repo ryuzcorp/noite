@@ -117,7 +117,7 @@ test("a ref switch with an unsaved buffer asks before throwing it away", async (
 
   pushAppDir(apiKey, new URL("fixtures/intel", import.meta.url), slug);
 
-  await page.goto(`/apps/${appId}/source?file=index.ts&ref=main`);
+  await page.goto(`/apps/${appId}/source?file=index.ts&ref=main&panel=changes`);
   await appendLine(page, "// unsaved");
   await expect(changesBadge(page)).toHaveText("1");
 

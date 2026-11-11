@@ -19,7 +19,7 @@ import { api } from "../api";
 import { commitSource } from "../commit-source";
 import { errorMessage } from "../errors";
 import { invalidateForge } from "../forge/data";
-import { whenLive } from "../live-ref";
+import { whenFrame, whenLive } from "../live-ref";
 import type { LiveRef } from "../live-ref";
 import type { RunnerBlob, RunnerTree } from "../runner";
 import type { SearchParam } from "../search-param";
@@ -85,9 +85,17 @@ interface BrowserBox {
   live: boolean;
   /** Starts one ref's read. Installed by `attach`. */
   request: ((ref: string, force: boolean) => void) | null;
+  /** Whether the panes are already wired to the document's element. ilha calls
+   * a `ref` with detached scratch copies on every re-render, so `attach` only
+   * wires the element that is actually in the page, and only once. */
+  wired: boolean;
 }
 
-const newBrowserBox = (): BrowserBox => ({ live: true, request: null });
+const newBrowserBox = (): BrowserBox => ({
+  live: true,
+  request: null,
+  wired: false,
+});
 
 export const SourceBrowser = ({
   appId,
@@ -400,19 +408,28 @@ export const SourceBrowser = ({
   };
 
   /** Paint the shell and wire the panes: one mount per page visit. */
-  const attach = (codeHost: HTMLElement | null) => {
-    if (codeHost === null) {
+  const attach = (host: HTMLElement | null) => {
+    if (host === null || box.wired) {
       return;
     }
 
-    const body = paneIn(codeHost);
-
     void (async () => {
+      // A first mount calls `ref` before insertion, and every later render
+      // calls it with a detached scratch copy: wait for the one element that
+      // is in the document, then wire it once.
+      const codeHost = await whenFrame(
+        () => (host.isConnected ? host : null),
+        dialogs.signal
+      );
+
       const treeEl = await whenLive(treeHost, dialogs.signal);
 
-      if (treeEl === null || !box.live) {
+      if (codeHost === null || treeEl === null || !box.live) {
         return;
       }
+
+      box.wired = true;
+      const body = paneIn(codeHost);
 
       paintSkeleton(treeEl, "tree", "Loading files…");
       paintSkeleton(body, "code", "Loading files…");

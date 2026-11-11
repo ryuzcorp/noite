@@ -50,7 +50,7 @@ test("the tree menu adds and deletes a file, and one Push commits both", async (
 
   pushAppDir(apiKey, new URL("fixtures/intel", import.meta.url), slug);
 
-  await page.goto(`/apps/${appId}/source?ref=main`);
+  await page.goto(`/apps/${appId}/source?ref=main&panel=changes`);
   await expect(page.getByRole("treeitem", { name: "util.ts" })).toBeVisible();
 
   await openRootMenu(page);
@@ -100,7 +100,7 @@ test("renaming a row is a move the commit carries", async ({
 
   pushAppDir(apiKey, new URL("fixtures/intel", import.meta.url), slug);
 
-  await page.goto(`/apps/${appId}/source?ref=main`);
+  await page.goto(`/apps/${appId}/source?ref=main&panel=changes`);
   const util = page.getByRole("treeitem", { name: "util.ts" });
   await expect(util).toBeVisible();
 
@@ -145,7 +145,7 @@ test("an uploaded file is a binary row the commit carries", async ({
 
   pushAppDir(apiKey, new URL("fixtures/intel", import.meta.url), slug);
 
-  await page.goto(`/apps/${appId}/source?ref=main`);
+  await page.goto(`/apps/${appId}/source?ref=main&panel=changes`);
   await expect(page.getByRole("treeitem", { name: "util.ts" })).toBeVisible();
 
   await openRootMenu(page);
