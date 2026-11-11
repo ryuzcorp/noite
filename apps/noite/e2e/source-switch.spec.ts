@@ -54,7 +54,7 @@ const createBranch = async (page: Page, name: string): Promise<void> => {
   await page.getByLabel(/^Branch or ref:/u).click();
   const picker = page.locator(".dropdown-content");
   await picker.getByLabel("New branch name").fill(name);
-  await picker.getByRole("button", { name: "Create" }).click();
+  await picker.getByRole("button", { exact: true, name: "Create" }).click();
 };
 
 const changesBadge = (page: Page) =>
@@ -93,7 +93,7 @@ test("a browse settles, after a reload and after a branch switch", async ({
   await page.getByLabel(/^Branch or ref:/u).click();
   const picker = page.locator(".dropdown-content");
   await picker.getByLabel("New branch name").fill("topic");
-  await picker.getByRole("button", { name: "Create" }).click();
+  await picker.getByRole("button", { exact: true, name: "Create" }).click();
   await expect(page).toHaveURL(/ref=topic/u);
   await expect(overlay(page)).toHaveCount(0, { timeout: 60_000 });
   await expect(page.getByRole("treeitem", { name: "index.ts" })).toBeVisible();
@@ -181,7 +181,7 @@ test("a failed open ends in the failure card, and Retry recovers", async ({
   await page.getByLabel(/^Branch or ref:/u).click();
   const picker = page.locator(".dropdown-content");
   await picker.getByLabel("New branch name").fill("stuck");
-  await picker.getByRole("button", { name: "Create" }).click();
+  await picker.getByRole("button", { exact: true, name: "Create" }).click();
   await expect(page).toHaveURL(/ref=stuck/u);
 
   const card = page.getByRole("alert").filter({ hasText: "Could not open" });

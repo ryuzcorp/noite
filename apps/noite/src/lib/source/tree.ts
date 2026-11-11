@@ -690,15 +690,17 @@ export const createTreeWiring = (host: TreeHost): TreeWiring => {
   };
 
   const onPicked = (): void => {
-    const { files } = input;
+    // Snapshot the list before clearing the input: resetting `value` empties
+    // the live `FileList` this `input` handed out.
+    const picked = [...(input.files ?? [])];
     input.value = "";
 
-    if (files === null || files.length === 0) {
+    if (picked.length === 0) {
       return;
     }
 
     void (async () => {
-      landReads(await readPickedFiles(files));
+      landReads(await readPickedFiles(picked));
     })();
   };
 

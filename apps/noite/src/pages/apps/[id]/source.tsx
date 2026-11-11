@@ -30,14 +30,6 @@ import type { AtomHandle, View } from "ilha";
 
 import { resourceValue } from "../../../lib/resource";
 
-/** Keep a component atom in step with a value derived from props/resources
- * (an `atom(init)` only seeds on the first render). */
-const syncAtom = <T,>(handle: AtomHandle<T>, value: T): void => {
-  if (!Equal.equals(handle(), value)) {
-    handle.set(value);
-  }
-};
-
 /** Mounts the browser once per app. ilha closes a keyed child whenever its
  * parent repaints, unless the parent's whole view is a keyed list. SourceBody
  * repaints on every `?file=`/`?skip=` write, and a remount there throws away
@@ -46,6 +38,14 @@ const syncAtom = <T,>(handle: AtomHandle<T>, value: T): void => {
  * `?ref=` among them: a branch switch is the browser's own (it installs the
  * new ref's files under the panes it already has, see `./source/browser`), so
  * the key must not name the ref. */
+/** Keep a component atom in step with a value derived from props/resources
+ * (an `atom(init)` only seeds on the first render). */
+const syncAtom = <T,>(handle: AtomHandle<T>, value: T): void => {
+  if (!Equal.equals(handle(), value)) {
+    handle.set(value);
+  }
+};
+
 const BrowserSlot = (props: SourceBrowserProps) => [
   <SourceBrowser key={props.appId} {...props} />,
 ];
