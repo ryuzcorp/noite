@@ -53,6 +53,7 @@ import {
   EnvironmentGroup,
 } from "./environments";
 import {
+  autoDeployNotice,
   deployBadgeTone,
   deployIntentLabel,
   deployStatusFacts,
@@ -565,6 +566,12 @@ const DeployFeedList = ({
           (one) => one.id === environmentId
         );
 
+  // A paused budget is the runner's own state (two failures at one sha, or an
+  // operator stop): say so above the history instead of letting the next
+  // sweep look like it is still trying.
+  const auto = environmentId === "" ? app?.autoDeploy : env?.autoDeploy;
+  const paused = auto === undefined ? null : autoDeployNotice(auto);
+
   // Production's live release is the app's own sha; an environment's is its
   // newest successful row. A scope the runner has stopped serves nothing.
   const currentSha = environmentId === "" ? (app?.lastDeploySha ?? null) : null;
@@ -599,6 +606,9 @@ const DeployFeedList = ({
         </p>
       ) : null}
       {problem() ? <p class="text-error m-0 text-sm">{problem()}</p> : null}
+      {paused === null ? null : (
+        <p class="text-warning m-0 text-sm">{paused}</p>
+      )}
       <ul class="list bg-base-100 dark:bg-base-200 border-base-300 rounded-box w-full border shadow-md">
         {feedLoading(feed.state()) ? (
           <li class="px-4 pt-4 pb-4">

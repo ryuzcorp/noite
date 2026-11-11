@@ -388,6 +388,11 @@ pub struct App {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub fleet_hold: Option<FleetHoldInfo>,
+    /// Whether the runner may still deploy the git tip on its own
+    /// ([`AutoDeploy`]). Derived from the deploy rows on every read, so it is
+    /// never a column and survives a restart.
+    #[sqlx(skip)]
+    pub auto_deploy: AutoDeploy,
 }
 
 impl App {
@@ -463,6 +468,80 @@ impl DeployIntent {
             Self::Deploy => "deploy",
             Self::Rollback => "rollback",
             Self::Redeploy => "redeploy",
+        }
+    }
+
+    /// Whether the row was started by an operator action (rollback, redeploy)
+    /// rather than by a push or the automatic tip sweep. An explicit row is
+    /// what resets the automatic-deploy budget.
+    pub fn is_explicit(self) -> bool {
+        !matches!(self, Self::Deploy)
+    }
+}
+
+/// Whether the runner may still deploy a target's git tip on its own.
+///
+/// Owner rule (2026-11-10): after **two consecutive failed deploys of the same
+/// target at the same sha**, automatic deploys of that sha stop until a new
+/// sha arrives or an explicit deploy (Deploy/Redeploy/Rollback from the UI,
+/// the CLI or MCP) runs — the same action that applies a build-affecting
+/// settings or env-var change. A `cancelled` run is an operator stop: it never
+/// counts as a failure, but it also never lets the sweep retry that sha on its
+/// own.
+///
+/// The state is derived from the persisted `deploy` rows on every read
+/// (`host::auto_deploy`), so it survives a restart; nothing here is a column.
+///
+/// ```mermaid
+/// stateDiagram-v2
+///   [*] --> Eligible
+///   Eligible --> Failing: automatic failure (failures = 1)
+///   Failing --> Failing: automatic failure, other sha (failures = 1)
+///   Failing --> Exhausted: automatic failure, same sha (failures = 2)
+///   Exhausted --> Exhausted: automatic failure, same sha (failures + 1)
+///   Failing --> Eligible: success
+///   Exhausted --> Eligible: success
+///   Failing --> Eligible: explicit row (rollback / redeploy)
+///   Exhausted --> Eligible: explicit row
+///   Eligible --> Stopped: cancel
+///   Failing --> Stopped: cancel
+///   Exhausted --> Stopped: cancel
+///   Stopped --> Eligible: success or explicit row
+///   Eligible --> Eligible: in-flight row (new attempt)
+///   Failing --> Eligible: in-flight row (new attempt)
+///   Exhausted --> Eligible: in-flight row (new attempt)
+///   Stopped --> Eligible: in-flight row (explicit redeploy)
+/// ```
+///
+/// `Eligible` and `Failing` allow an automatic deploy; `Exhausted` and
+/// `Stopped` block one **for the sha they name** — a new sha is a new start.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS, Default)]
+#[serde(rename_all = "camelCase", tag = "state")]
+#[ts(export)]
+pub enum AutoDeploy {
+    /// No blocking history: the tip may deploy.
+    #[default]
+    Eligible,
+    /// One automatic failure at `sha`; the next automatic attempt is allowed.
+    Failing { sha: String, failures: u32 },
+    /// The automatic budget is spent: `failures` (>= 2) consecutive automatic
+    /// deploys of `sha` failed.
+    Exhausted { sha: String, failures: u32 },
+    /// An operator stopped a deploy of `sha`; automatic retries of it are off.
+    Stopped { sha: String },
+}
+
+impl AutoDeploy {
+    /// The failure cap: the second consecutive failure closes the budget.
+    pub const FAILURE_CAP: u32 = 2;
+
+    /// Whether an automatic deploy of `sha` must be refused.
+    pub fn blocks(&self, sha: &str) -> bool {
+        match self {
+            Self::Eligible | Self::Failing { .. } => false,
+            Self::Exhausted { sha: blocked, .. } | Self::Stopped { sha: blocked } => {
+                crate::lifecycle::sha_same(blocked, sha)
+            }
         }
     }
 }
@@ -593,6 +672,10 @@ pub struct Environment {
     /// Members-only by default; a public environment serves without the gate.
     pub public: bool,
     pub last_error: Option<String>,
+    /// Whether the runner may still deploy this environment's ref head on its
+    /// own ([`AutoDeploy`], derived from its own deploy rows).
+    #[sqlx(skip)]
+    pub auto_deploy: AutoDeploy,
     pub created_at: String,
     pub updated_at: String,
     /// The owning app's slug: joined in, never a column (the edge and the

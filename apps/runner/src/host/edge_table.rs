@@ -624,6 +624,7 @@ mod tests {
             import_source: None,
             imported: false,
             fleet_hold: None,
+            auto_deploy: crate::models::AutoDeploy::Eligible,
         }
     }
 

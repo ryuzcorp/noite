@@ -99,6 +99,40 @@ pub async fn latest_deploy_status_for_env(
 /// and its single parameter.
 const TARGET_CLAUSE: &str = "environment_id IS ?";
 
+/// How many of a target's newest rows the automatic-deploy budget reads. The
+/// rule only needs the trailing failure streak (and the row that ended it),
+/// so a bounded window is enough; a push/rollback older than this cannot
+/// still be the reason a tip is blocked.
+const AUTO_DEPLOY_ROWS: i64 = 50;
+
+/// The budget's read, its parameters bound in order: `app_id`,
+/// `environment_id`, limit. The window is served by
+/// `idx_deploy_target_created` (app, target, newest first) with no sort — the
+/// test below pins that plan.
+fn auto_deploy_sql() -> String {
+    format!(
+        "SELECT sha, status, intent FROM deploy \
+         WHERE app_id = ? AND {TARGET_CLAUSE} \
+         ORDER BY created_at DESC, rowid DESC LIMIT ?"
+    )
+}
+
+/// The newest deploy rows of one target, newest first (the caller reverses
+/// them for [`crate::host::auto_deploy::evaluate`]). Only the three columns
+/// the rule reads are selected — never the build logs.
+pub async fn auto_deploy_rows(
+    pool: &SqlitePool,
+    app_id: &str,
+    environment_id: Option<&str>,
+) -> sqlx::Result<Vec<(Option<String>, DeployStatus, DeployIntent)>> {
+    sqlx::query_as(sqlx::AssertSqlSafe(auto_deploy_sql()))
+        .bind(app_id)
+        .bind(environment_id)
+        .bind(AUTO_DEPLOY_ROWS)
+        .fetch_all(pool)
+        .await
+}
+
 /// Deploy history for the live stream (T1.7): same rows as `list_deploys`
 /// but without build-log text, except the newest row when it is still in
 /// flight (its live log is what the panel shows). Finished rows' logs come
@@ -519,24 +553,34 @@ async fn write_target_status(
     }
 }
 
+/// One target whose row the stall sweep just closed: what the automatic-deploy
+/// budget must re-read (the host layer emits the pause event — the db layer
+/// never calls `host`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StalledDeploy {
+    pub app_id: String,
+    pub environment_id: Option<String>,
+}
+
 /// Sweep deploys whose row has not moved since `older_than_ms`, closing them
 /// as `stalled` (not `failed`: nothing in the run reported an error — the host
 /// interrupted it or the step timed out). A preview row marks its
 /// environment, never the app. The row write
 /// is guarded by the transition table, so a row that another writer closed
 /// between the read and the update is left alone (and does not touch the
-/// target's status).
+/// target's status). Returns the closed rows' targets: a stall spends the
+/// automatic-deploy budget exactly like a failure.
 pub async fn fail_stuck_deploys(
     pool: &SqlitePool,
     older_than_ms: i64,
     skip_app_ids: &HashSet<String>,
-) -> sqlx::Result<u64> {
+) -> sqlx::Result<Vec<StalledDeploy>> {
     let rows = sqlx::query_as::<_, Deploy>(sqlx::AssertSqlSafe(format!(
         "SELECT {DEPLOY_COLS} FROM deploy ORDER BY updated_at DESC LIMIT 200"
     )))
     .fetch_all(pool)
     .await?;
-    let mut n = 0u64;
+    let mut closed = Vec::new();
     for row in rows {
         if skip_app_ids.contains(&row.app_id) {
             continue;
@@ -563,14 +607,14 @@ pub async fn fail_stuck_deploys(
              WHERE id = ? AND status IN ({})",
             status_list(IN_FLIGHT),
         );
-        let closed = sqlx::query(sqlx::AssertSqlSafe(sql))
+        let written = sqlx::query(sqlx::AssertSqlSafe(sql))
             .bind(DeployStatus::Stalled.as_str())
             .bind(&log)
             .bind(now_iso())
             .bind(&row.id)
             .execute(pool)
             .await?;
-        if closed.rows_affected() == 0 {
+        if written.rows_affected() == 0 {
             // Another writer (the stop endpoint, the run itself) got there
             // first: its story stands, and the target keeps its status.
             continue;
@@ -583,9 +627,12 @@ pub async fn fail_stuck_deploys(
             Some(STALLED_SUMMARY),
         )
         .await?;
-        n += 1;
+        closed.push(StalledDeploy {
+            app_id: row.app_id.clone(),
+            environment_id: row.environment_id.clone(),
+        });
     }
-    Ok(n)
+    Ok(closed)
 }
 
 fn utc_cutoff(older_than_ms: i64) -> chrono::DateTime<chrono::Utc> {
@@ -765,7 +812,7 @@ mod tests {
         let swept = fail_stuck_deploys(&pool, 60_000, &HashSet::new())
             .await
             .expect("sweep");
-        assert_eq!(swept, 0, "the row was already closed");
+        assert!(swept.is_empty(), "the row was already closed");
         let fresh = get_deploy(&pool, &app.id, &row.id)
             .await
             .expect("read")
@@ -864,7 +911,8 @@ mod tests {
         assert_eq!(
             fail_stuck_deploys(&pool, 60_000, &HashSet::new())
                 .await
-                .expect("sweep"),
+                .expect("sweep")
+                .len(),
             1
         );
 
@@ -911,8 +959,55 @@ mod tests {
         assert_eq!(
             fail_stuck_deploys(&pool, 60_000, &HashSet::new())
                 .await
-                .expect("second sweep"),
+                .expect("second sweep")
+                .len(),
             0
         );
+    }
+
+    /// The budget's read must not scan and sort an app's whole deploy history:
+    /// `idx_deploy_target_created` serves the target filter and the newest-first
+    /// window. Without it, every annotated page load and every automatic deploy
+    /// paid for the history.
+    #[tokio::test]
+    async fn the_auto_deploy_read_uses_the_target_index() {
+        let pool = crate::db::connect("sqlite::memory:")
+            .await
+            .expect("memory db");
+        let app = seed_app(&pool, "budget-plan").await;
+        for sha in ["sha1", "sha2", "sha3"] {
+            upsert_deploy(
+                &pool,
+                None,
+                &app.id,
+                None,
+                DeployStatus::Failed,
+                Some(sha),
+                "boom",
+            )
+            .await
+            .expect("seed deploy");
+        }
+        let plan: Vec<(i64, i64, i64, String)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+            "EXPLAIN QUERY PLAN {}",
+            auto_deploy_sql().replace('?', "NULL")
+        )))
+        .fetch_all(&pool)
+        .await
+        .expect("explain");
+        let detail = plan
+            .iter()
+            .map(|(_, _, _, detail)| detail.as_str())
+            .collect::<Vec<_>>()
+            .join(" | ");
+        assert!(
+            detail.contains("idx_deploy_target_created"),
+            "the budget read must use the target index, plan was: {detail}"
+        );
+        assert!(
+            !detail.contains("USE TEMP B-TREE"),
+            "no sort: the index carries newest-first order, plan was: {detail}"
+        );
+        pool.close().await;
     }
 }

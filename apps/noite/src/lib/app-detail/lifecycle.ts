@@ -43,6 +43,7 @@
 import { Data } from "effect";
 
 import type { AppStatus } from "../runner-types/AppStatus";
+import type { AutoDeploy } from "../runner-types/AutoDeploy";
 import type { DeployIntent } from "../runner-types/DeployIntent";
 import type { DeployStatus } from "../runner-types/DeployStatus";
 import type { DesiredState } from "../runner-types/DesiredState";
@@ -281,6 +282,34 @@ export const deployStatusFacts = (raw: string): DeployStatusFacts =>
  * frames and fixtures may say `""`. Either is production. */
 export const isProductionRow = (environmentId: string | null): boolean =>
   environmentId === null || environmentId === "";
+
+/** The Deployments tab's pause line, or null while automatic deploys are
+ * still allowed. `failing` is one failed attempt: the runner retries it, so
+ * there is nothing to tell the operator yet. */
+export const autoDeployNotice = (auto: AutoDeploy): string | null => {
+  switch (auto.state) {
+    case "eligible":
+    case "failing": {
+      return null;
+    }
+
+    case "exhausted": {
+      return `Automatic deploys paused after ${auto.failures} failed attempts of ${auto.sha.slice(0, 12)}; push a fix or deploy manually.`;
+    }
+
+    case "stopped": {
+      return `Automatic deploys paused after you stopped ${auto.sha.slice(0, 12)}; push a fix or deploy manually.`;
+    }
+
+    default: {
+      // A new runner variant must fail to compile here instead of painting
+      // nothing (every variant is handled above).
+      const unhandled: never = auto;
+
+      return unhandled;
+    }
+  }
+};
 
 /** Whether an app or environment is serving traffic at all. A deliberate
  * stop (desired or observed) means its history has no live release; a build

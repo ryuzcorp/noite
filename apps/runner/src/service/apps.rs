@@ -26,13 +26,21 @@ use crate::AppState;
 static CREATE_LOCK: LazyLock<tokio::sync::Mutex<()>> =
     LazyLock::new(|| tokio::sync::Mutex::new(()));
 
-/// Fill a row's [`App::fleet_hold`] on its way out: the supervisor's crash or
-/// OOM backoff is process state, so the row never carries it and every read
-/// that answers a client annotates here. One helper so REST, RPC and the state
-/// stream cannot disagree about whether an app is held.
+/// Fill the derived fields of a row on its way out: [`App::fleet_hold`] (the
+/// supervisor's crash or OOM backoff, process state) and [`App::auto_deploy`]
+/// (the automatic-deploy budget, derived from the deploy rows). Neither is a
+/// column, so every read that answers a client annotates here — one helper so
+/// REST, RPC and the state stream cannot disagree about whether an app is
+/// held or paused.
 async fn with_hold(state: &AppState, mut app: App) -> App {
     crate::host::supervisor::annotate_holds(&state.procs, std::slice::from_mut(&mut app)).await;
+    annotate_auto_deploy(state, std::slice::from_mut(&mut app)).await;
     app
+}
+
+/// Fill each app's automatic-deploy state from its production deploy rows.
+async fn annotate_auto_deploy(state: &AppState, apps: &mut [App]) {
+    crate::host::auto_deploy::annotate_apps(&state.pool, apps).await;
 }
 
 /// The single "load the app or answer 404" helper every domain uses, so the
@@ -53,6 +61,7 @@ pub async fn list(state: &AppState) -> Result<Vec<App>, ApiError> {
         .filter(|app| !deleting(&app.id))
         .collect();
     crate::host::supervisor::annotate_holds(&state.procs, &mut apps).await;
+    annotate_auto_deploy(state, &mut apps).await;
     Ok(apps)
 }
 
@@ -214,7 +223,7 @@ async fn create_inner(
     .map_err(|e| ApiError::internal(e.to_string()))?;
     drop(ports);
     let Some(git) = git_source else {
-        return Ok(app);
+        return Ok(with_hold(state, app).await);
     };
     // An import is a background job (A2): store the source so it can be retried,
     // flip the status, and answer at once.
@@ -377,7 +386,7 @@ async fn rename_inner(
     )
     .await
     {
-        Ok(app) => Ok(app),
+        Ok(app) => Ok(with_hold(state, app).await),
         // `rename_app` reports intent as anyhow strings; keep the mapping here
         // so REST and RPC cannot drift on it.
         Err(e) => {

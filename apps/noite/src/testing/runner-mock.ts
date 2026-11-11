@@ -7,6 +7,7 @@ import type { RunnerApp } from "../lib/runner";
 
 export const makeApp = (over: Partial<RunnerApp> = {}): RunnerApp => ({
   asleepSince: null,
+  autoDeploy: { state: "eligible" },
   createdAt: "2026-01-01T00:00:00Z",
   desiredState: "running",
   fleetBucket: "",

@@ -539,6 +539,15 @@ impl Progress<'_> {
             &format!("ERROR: {} failed\n{detail}\n", self.step),
         )
         .await?;
+        // The transition into "automatic deploys paused" is the second
+        // consecutive failure: the event the Deployments tab shows next to the
+        // paused line (an explicit or later failure is not the transition).
+        crate::host::auto_deploy::note_exhausted(
+            self.pool,
+            self.app_id,
+            self.environment_id.as_deref(),
+        )
+        .await;
         let summary = failure_summary(self.step, detail);
         match self.environment_id.as_deref() {
             // `upsert_deploy` already moved the environment to failed with the
@@ -2698,6 +2707,21 @@ pub async fn deploy_tip(
         .is_some_and(|s| sha_same(s, &tip.sha))
     {
         return;
+    }
+    // The one chokepoint every automatic deploy passes: the push fast path,
+    // the fallback sweep and any future caller. An explicit deploy calls
+    // `deploy_app` directly, so the operator can always override a pause.
+    match crate::host::auto_deploy::for_target(pool, &app.id, target.environment_id()).await {
+        Ok(auto) if auto.blocks(&tip.sha) => {
+            tracing::info!(
+                slug = %app.slug,
+                sha = %&tip.sha[..12.min(tip.sha.len())],
+                "automatic deploy paused"
+            );
+            return;
+        }
+        Ok(_) => {}
+        Err(e) => tracing::warn!(slug = %app.slug, error = %e, "auto deploy state"),
     }
     deploy_app(
         pool,

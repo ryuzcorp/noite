@@ -7,6 +7,7 @@ import { staleKeys } from "./state-sync";
 
 const app = (patch: Partial<RunnerApp> = {}): RunnerApp => ({
   asleepSince: null,
+  autoDeploy: { state: "eligible" },
   createdAt: "2026-10-20T00:00:00Z",
   desiredState: "running",
   fleetBucket: "noite",
@@ -31,6 +32,7 @@ const env = (patch: Partial<RunnerEnvironment> = {}): RunnerEnvironment => ({
   appId: "app_1",
   appSlug: "demo",
   asleepSince: null,
+  autoDeploy: { state: "eligible" },
   createdAt: "2026-10-20T00:00:00Z",
   createdBy: "u_1",
   desiredState: "running",
@@ -95,6 +97,30 @@ describe("staleKeys", () => {
     expect(staleKeys("app_1", frame({}, []), detail(), [env()])).toEqual([
       keys.environments("app_1"),
     ]);
+  });
+
+  test("a paused automatic budget makes the detail stale so the line appears live", () => {
+    expect(
+      staleKeys(
+        "app_1",
+        frame({
+          autoDeploy: { failures: 2, sha: "aaa111", state: "exhausted" },
+        }),
+        detail(),
+        [env()]
+      )
+    ).toEqual([keys.appDetail("app_1")]);
+  });
+
+  test("an environment's paused budget repaints its group", () => {
+    expect(
+      staleKeys(
+        "app_1",
+        frame({}, [env({ autoDeploy: { sha: "bbb222", state: "stopped" } })]),
+        detail(),
+        [env()]
+      )
+    ).toEqual([keys.environments("app_1")]);
   });
 
   test("a stop or a sleep shows too, not only a deploy", () => {

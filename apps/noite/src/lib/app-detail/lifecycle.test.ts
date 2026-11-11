@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 
 import {
   appLifecycle,
+  autoDeployNotice,
   deployIntentLabel,
   deployStatusFacts,
   domainClaim,
@@ -293,5 +294,32 @@ describe("isProductionRow", () => {
     expect(isProductionRow(null)).toBe(true);
     expect(isProductionRow("")).toBe(true);
     expect(isProductionRow("env_1")).toBe(false);
+  });
+});
+
+describe("autoDeployNotice", () => {
+  test("nothing to say while the runner may still retry", () => {
+    expect(autoDeployNotice({ state: "eligible" })).toBeNull();
+    expect(
+      autoDeployNotice({ failures: 1, sha: "abc123def456", state: "failing" })
+    ).toBeNull();
+  });
+
+  test("the exhausted line names the sha and the count", () => {
+    expect(
+      autoDeployNotice({
+        failures: 2,
+        sha: "abc123def4567890",
+        state: "exhausted",
+      })
+    ).toBe(
+      "Automatic deploys paused after 2 failed attempts of abc123def456; push a fix or deploy manually."
+    );
+  });
+
+  test("a stop is reported as the operator's own", () => {
+    expect(
+      autoDeployNotice({ sha: "abc123def4567890", state: "stopped" })
+    ).toContain("after you stopped abc123def456");
   });
 });

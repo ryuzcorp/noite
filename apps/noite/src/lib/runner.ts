@@ -105,6 +105,8 @@ export type { EnvGrant } from "./runner-types/EnvGrant";
 
 export type { AppStateFrame as RunnerAppState } from "./runner-types/AppStateFrame";
 
+export type { AutoDeploy as RunnerAutoDeploy } from "./runner-types/AutoDeploy";
+
 export type { Environment as RunnerEnvironment } from "./runner-types/Environment";
 
 export type { EnvironmentKind } from "./runner-types/EnvironmentKind";

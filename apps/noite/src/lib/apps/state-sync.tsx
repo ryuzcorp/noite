@@ -44,6 +44,9 @@ const envShown = (env: RunnerEnvironment): string =>
     env.lastError,
     env.public,
     env.asleepSince,
+    // The Deployments pause line reads this: a group must repaint when its
+    // automatic budget runs out or a new sha resets it.
+    env.autoDeploy,
   ]);
 
 /** The app fields a badge or a gated button reads. `myRole` is included so a
@@ -74,6 +77,8 @@ const appShown = (
   app.lastDeploySha !== frame.lastDeploySha ||
   app.lastError !== frame.lastError ||
   app.asleepSince !== frame.asleepSince ||
+  // Same for the app's own pause line on the Deployments tab.
+  JSON.stringify(app.autoDeploy) !== JSON.stringify(frame.autoDeploy) ||
   holdShown(app.fleetHold) !== holdShown(frame.fleetHold) ||
   app.name !== frame.name ||
   app.slug !== frame.slug ||
