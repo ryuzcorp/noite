@@ -8,3 +8,9 @@
 
 - **`commit_files`' compare-and-set is enforced by the runner, not by a read-then-write guess.** The web-commit body takes an optional `expectedTip`; a branch that moved since the caller read it is refused with `tip moved` (409) before any object is written, and the publish carries the same value so the window before the ref write cannot let a racing push through either.
 - **`/mcp` has its own request bound (65 s) instead of the 15 s action bound.** A tool call that waits on purpose (`wait_for_deploy`) would otherwise be cut into a 504 the caller cannot read. Every other route keeps 15 s.
+- **`/mcp` is inside the platform rate limiter.** Tool calls count against the same per-client, per-route-class budget as the other API classes (`NOITE_RATE_LIMIT_RPM`), so a key-driven agent that bursts is bounded like any public client.
+- **`wait_for_deploy` holds at most four concurrent waits per key.** A fifth concurrent call for the same key answers the typed `too_many_waits` refusal instead of parking another 45-second poll in the worker; every other call is unaffected.
+
+### Security
+
+- **A caller-chosen ref can no longer reach the runner's own namespaces.** `repo_tree`/`repo_blob`/`repo_log`/`repo_commit`/`repo_compare`, the browser commit's `fromSha`/`expectedTip`, environment create, branch create and a pull request's head/base all resolved any ref the caller named — including the hidden `refs/previews/<user>/<branch>` snapshot a collaborator's workspace preview writes, which made it readable and publishable as an advertised branch. One boundary predicate now refuses `refs/previews/`, `refs/notes/`, `refs/stash/` and `refs/seed/` for caller input (as an invalid ref, so the answer never confirms the hidden ref exists), while branches, tags and shas resolve as before; the preview deploy keeps an explicit internal resolve for the row it owns. `commit_files` also refuses a raw ref in `base`/`expectedTip` up front with the `invalid` refusal.

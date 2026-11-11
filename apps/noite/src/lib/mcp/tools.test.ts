@@ -21,6 +21,7 @@ import type { RunnerMock } from "../../testing/runner-mock";
 import { grantCollaborator } from "../collaborators";
 import { ensureDb, setD1Binding } from "../db";
 import type { KeyPrincipal } from "../key-principal";
+import { deployWaitGate, MAX_CONCURRENT_WAITS } from "./deploy-wait";
 import { McpToolError } from "./protocol";
 import { MCP_TOOLS, deployStatusLive } from "./tools";
 
@@ -378,6 +379,46 @@ describe("commit_files", () => {
     expect(runner.calls).not.toContain("source.commit");
   });
 
+  test("a hidden preview base is refused before it can become a parent", async () => {
+    // `refs/previews/…` is another user's uncommitted workspace snapshot. The
+    // tool refuses a raw ref as invalid, and never forwards it as `fromSha`.
+    answers.set("git.refs", () => refs);
+
+    const thrown = await invocationError(
+      "commit_files",
+      principalFor("u-push"),
+      {
+        app: "app-one",
+        base: "refs/previews/u-1/main",
+        branch: "leak",
+        files: file,
+        message: "m",
+      }
+    );
+
+    expect(refusalCode(thrown)).toBe("invalid");
+    expect(runner.calls).not.toContain("source.commit");
+  });
+
+  test("a raw expectedTip is refused like a raw base", async () => {
+    answers.set("git.refs", () => refs);
+
+    const thrown = await invocationError(
+      "commit_files",
+      principalFor("u-push"),
+      {
+        app: "app-one",
+        branch: "main",
+        expectedTip: "refs/previews/u-1/main",
+        files: file,
+        message: "m",
+      }
+    );
+
+    expect(refusalCode(thrown)).toBe("invalid");
+    expect(runner.calls).not.toContain("source.commit");
+  });
+
   test("needs at least one change", async () => {
     const thrown = await invocationError(
       "commit_files",
@@ -580,6 +621,61 @@ describe("deploy tools", () => {
       maxWaitSeconds: 1,
       sha: null,
     });
+  });
+
+  test("a key already holding every wait slot is refused, not queued", async () => {
+    const principal = principalFor("u-view");
+
+    const held = Array.from({ length: MAX_CONCURRENT_WAITS }, () => {
+      deployWaitGate.enter(principal.keyId);
+
+      return principal.keyId;
+    });
+
+    try {
+      answers.set("deploys.list", () => {
+        throw new Error("a refused wait must not read the runner");
+      });
+
+      const before = runner.calls.length;
+
+      const thrown = await invocationError("wait_for_deploy", principal, {
+        app: "app-one",
+      });
+
+      expect(refusalCode(thrown)).toBe("too_many_waits");
+      expect(runner.calls.slice(before)).not.toContain("deploys.list");
+      expect(deployWaitGate.active(principal.keyId)).toBe(held.length);
+    } finally {
+      for (const _ of held) {
+        deployWaitGate.leave(principal.keyId);
+      }
+    }
+
+    expect(deployWaitGate.active(principal.keyId)).toBe(0);
+  });
+
+  test("a completed wait releases its slot", async () => {
+    const principal = principalFor("u-view");
+
+    answers.set("deploys.list", () => [
+      {
+        actor: null,
+        appId: "app-1",
+        createdAt: "2026-01-01T00:00:00Z",
+        environmentId: null,
+        id: "dep-1",
+        intent: "deploy",
+        log: "",
+        sha: "a".repeat(40),
+        status: "success",
+        updatedAt: "2026-01-01T00:00:10Z",
+      },
+    ]);
+
+    await invocationResult("wait_for_deploy", principal, { app: "app-one" });
+
+    expect(deployWaitGate.active(principal.keyId)).toBe(0);
   });
 });
 

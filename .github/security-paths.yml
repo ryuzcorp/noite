@@ -26,6 +26,18 @@ sensitive:
   # The adapter that makes the git allow/deny decision: Basic-credential
   # verification, the role check and the force-push/delete policy.
   - "apps/runner/src/host/git_http.rs"
+  # The ref-resolution boundary every caller-facing read and write goes
+  # through: it decides which namespaces (hidden preview snapshots, notes,
+  # stash) a caller-supplied ref may resolve. Widening it exposes another
+  # collaborator's uncommitted work.
+  - "apps/runner/src/host/forge.rs"
+  # The browser/agent commit path: the parent a commit grows from
+  # (`fromSha`) and its compare-and-set tip are caller input, and publishing
+  # from a hidden ref would advertise another user's snapshot as a branch.
+  - "apps/runner/src/host/web_commit.rs"
+  # The source read + commit service entry: it resolves the caller's `ref`
+  # for tree/blob/bundle reads and forwards a commit body's refs.
+  - "apps/runner/src/service/source.rs"
   - "apps/runner/src/host/env_gate.rs"
   # The admin-role gate on per-app limits (#79).
   - "apps/runner/src/service/limits.rs"

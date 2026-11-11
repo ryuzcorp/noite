@@ -82,7 +82,14 @@ import { createAppForUser, slugError } from "../server/apps.server";
 import { redactEnv } from "../server/env.server";
 import { keyAppVerdict } from "../server/key-access.server";
 import { keyActor, userDisplayName } from "../server/key-attribution.server";
-import { MAX_WAIT_SECONDS, realSleep, waitForDeploy } from "./deploy-wait";
+import {
+  deployWaitGate,
+  MAX_CONCURRENT_WAITS,
+  MAX_WAIT_SECONDS,
+  realSleep,
+  waitForDeploy,
+} from "./deploy-wait";
+import type { DeployWait } from "./deploy-wait";
 import { prChecks } from "./pr-checks";
 import type { PreviewFacts } from "./pr-checks";
 import { defineTool, McpToolError } from "./protocol";
@@ -314,7 +321,14 @@ const toCreateSource = (
   return { id: source.template, kind: "template" };
 };
 
-/** The branch a commit targets, with the two preconditions the runner would
+/** Raw refs are not part of `commit_files`'s contract: `base` and
+ * `expectedTip` are a branch, a tag or a sha. The runner refuses its own ref
+ * namespaces (notably the hidden `refs/previews/…` workspace snapshots) before
+ * resolving them; refusing a raw ref here gives the agent a code without a
+ * round trip, and the runner stays the boundary. */
+const isRawRef = (value: string): boolean => value.trim().startsWith("refs/");
+
+/** The branch a commit targets, with the preconditions the runner would
  * otherwise only discover mid-write: `base` is meaningless for a branch that
  * already exists, and `expectedTip` must match the tip the caller read. Both
  * refusals name the numbers an agent needs to retry. */
@@ -327,6 +341,18 @@ const checkedCommitTarget = (
   const branch = (wanted ?? "").trim() || refs.defaultBranch;
   const existing = refs.branches.find((row) => row.name === branch);
   const expectedTip = (wantedTip ?? "").trim();
+
+  for (const [field, value] of [
+    ["base", base],
+    ["expectedTip", wantedTip],
+  ] as const) {
+    if (value !== undefined && isRawRef(value)) {
+      throw refused(
+        "invalid",
+        `"${field}" is a raw ref; pass a branch, tag or commit sha instead.`
+      );
+    }
+  }
 
   if (base !== undefined && existing) {
     throw refused(
@@ -370,6 +396,49 @@ const requireGatedApp = async (
   need: AppRole
 ): Promise<{ app: RunnerApp; role: AppRole }> =>
   await denyAs(() => requireApp(principal, ref, need), "forbidden");
+
+/** One bounded `wait_for_deploy` poll. The key holds one gate slot for the
+ * whole call (a burst of long polls would otherwise park the isolate for 45 s
+ * each), and a key at its limit is refused before the first read. */
+const boundedWait = async (
+  appId: string,
+  environmentId: string,
+  wanted: { readonly deployId?: string; readonly sha?: string },
+  key: string,
+  budgetMs: number
+): Promise<DeployWait> => {
+  if (!deployWaitGate.enter(key)) {
+    throw refused(
+      "too_many_waits",
+      `${MAX_CONCURRENT_WAITS} wait_for_deploy calls are already in flight for this key; wait for one to answer before re-arming.`
+    );
+  }
+
+  try {
+    return await waitForDeploy(
+      {
+        now: Date.now,
+        read: async (): Promise<RunnerDeploy | null> => {
+          const rows = await runnerListDeploys(appId, environmentId);
+
+          if (wanted.deployId !== undefined) {
+            return rows.find((row) => row.id === wanted.deployId) ?? null;
+          }
+
+          if (wanted.sha !== undefined) {
+            return rows.find((row) => row.sha === wanted.sha) ?? null;
+          }
+
+          return rows.at(0) ?? null;
+        },
+        sleep: realSleep,
+      },
+      budgetMs
+    );
+  } finally {
+    deployWaitGate.leave(key);
+  }
+};
 
 /** The deploy a commit triggered, if the runner has queued one: production's
  * row for the sha, else the row of the preview environment that tracks the
@@ -2020,24 +2089,11 @@ export const MCP_TOOLS: readonly McpToolDefinition[] = [
         wanted = `the deploy of ${sha}`;
       }
 
-      const outcome = await waitForDeploy(
-        {
-          now: Date.now,
-          read: async (): Promise<RunnerDeploy | null> => {
-            const rows = await runnerListDeploys(app.id, environmentId);
-
-            if (deployId !== undefined) {
-              return rows.find((row) => row.id === deployId) ?? null;
-            }
-
-            if (sha !== undefined) {
-              return rows.find((row) => row.sha === sha) ?? null;
-            }
-
-            return rows.at(0) ?? null;
-          },
-          sleep: realSleep,
-        },
+      const outcome = await boundedWait(
+        app.id,
+        environmentId,
+        { deployId, sha },
+        principal.keyId,
         budgetSeconds * 1000
       );
 

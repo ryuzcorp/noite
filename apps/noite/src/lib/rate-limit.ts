@@ -203,5 +203,13 @@ export const limitedClass = (pathname: string): string | null => {
     return "stream";
   }
 
+  if (pathname === "/mcp") {
+    // The hosted MCP endpoint: every tool call is one POST, and an agent's
+    // loop makes bursts of them (reads, then a write, then a bounded wait), so
+    // it gets the same per-IP budget as the other API classes rather than a
+    // tighter one. The limit runs before the bearer check, like the rest.
+    return "mcp";
+  }
+
   return pathname.startsWith("/api/auth") ? "auth" : null;
 };

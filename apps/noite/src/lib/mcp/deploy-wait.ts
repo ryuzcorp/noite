@@ -69,6 +69,59 @@ export const realSleep = (ms: number): Promise<void> =>
     setTimeout(resolve, ms);
   });
 
+/** Concurrent `wait_for_deploy` calls one key may hold. Each call sits in the
+ * worker for up to `MAX_WAIT_SECONDS`, so a key that fires a burst of waits
+ * would park a slot per call; four is a burst an agent's loop needs (a
+ * commit's deploy plus its environment) without letting one key starve the
+ * isolate. */
+export const MAX_CONCURRENT_WAITS = 4;
+
+/** The in-flight waits per key: `enter` refuses once the key's
+ * {@link MAX_CONCURRENT_WAITS} slots are held, and every entered slot must be
+ * left (the tool releases in a `finally`). Keys with no wait left are
+ * forgotten, so the map only ever holds keys that are waiting right now. */
+export interface WaitGate {
+  readonly active: (key: string) => number;
+  readonly enter: (key: string) => boolean;
+  readonly leave: (key: string) => void;
+}
+
+export const createWaitGate = (
+  limit: number = MAX_CONCURRENT_WAITS
+): WaitGate => {
+  const held = new Map<string, number>();
+
+  return {
+    active: (key) => held.get(key) ?? 0,
+    enter: (key) => {
+      const count = held.get(key) ?? 0;
+
+      if (count >= limit) {
+        return false;
+      }
+
+      held.set(key, count + 1);
+
+      return true;
+    },
+    leave: (key) => {
+      const count = held.get(key) ?? 0;
+
+      if (count <= 1) {
+        held.delete(key);
+
+        return;
+      }
+
+      held.set(key, count - 1);
+    },
+  };
+};
+
+/** The one gate `wait_for_deploy` uses (isolate-local, like the rate limiter:
+ * a practical abuse bound, not a fleet-wide quota). */
+export const deployWaitGate = createWaitGate();
+
 /** What one poll needs, injected so the budget is testable without a clock. */
 export interface WaitDeps {
   /** The row the caller waits for, or null when it does not exist yet. */

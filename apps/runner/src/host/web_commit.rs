@@ -251,7 +251,7 @@ async fn commit_into(
             let parent = match &existing {
                 Some(sha) => Some(sha.clone()),
                 None => match from_sha {
-                    Some(from) => Some(forge::resolve_ref(&bare, from).await?),
+                    Some(from) => Some(forge::resolve_user_ref(&bare, from).await?),
                     None => refs.get(&format!("refs/heads/{DEFAULT_BRANCH}")).cloned(),
                 },
             };
@@ -278,7 +278,7 @@ async fn commit_into(
     // this check and the ref write cannot let a racing push through either.
     let expected_old = match expected_tip {
         Some(tip) => {
-            let tip_sha = forge::resolve_ref(&bare, tip).await?;
+            let tip_sha = forge::resolve_user_ref(&bare, tip).await?;
             let current = refs.get(&refname).cloned();
             if current.as_deref() != Some(tip_sha.as_str()) {
                 bail!("tip moved under this update: {refname} is {current:?}, expected {tip_sha}");

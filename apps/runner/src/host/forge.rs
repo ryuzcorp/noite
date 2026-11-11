@@ -187,6 +187,52 @@ fn valid_ref(reference: &str) -> bool {
     is_hex_sha(reference) || valid_branch_name(reference)
 }
 
+/// A branch name a caller may name: a plain branch, never a full ref (which
+/// could name a hidden namespace such as `refs/previews/…`).
+pub fn valid_user_branch_name(name: &str) -> bool {
+    valid_branch_name(name) && !name.starts_with("refs/")
+}
+
+/// The ref namespaces the runner owns: they are never resolved for a
+/// caller-supplied ref, because they hold state a caller does not own or
+/// should not see — the hidden workspace-preview snapshots
+/// (`refs/previews/<user>/<branch>`, another collaborator's uncommitted work),
+/// git's own notes and stash namespaces, and the temporary seed refs a
+/// repository import writes before it publishes. One list, so every
+/// caller-facing surface (`resolve_user_ref`, and the readers and comparers
+/// built on it) refuses the same set; an internal caller that must resolve a
+/// stored ref uses `resolve_ref` instead.
+const RESERVED_REF_PREFIXES: &[&str] = &[
+    crate::host::git_http::PREVIEW_REF_PREFIX,
+    "refs/notes/",
+    "refs/stash/",
+    "refs/seed/",
+];
+
+/// Reserved namespaces whose name is itself a ref (`refs/stash` is a ref, its
+/// children are not; the others are directories git never resolves on their
+/// own).
+const RESERVED_REF_NAMES: &[&str] = &["refs/stash"];
+
+/// `true` when `reference` names (or starts) a namespace the runner owns.
+/// Both spellings git accepts are checked: a full `refs/…` name, and the bare
+/// name git rewrites to `refs/<name>` (so `previews/<user>/<branch>` reaches
+/// the same hidden ref as `refs/previews/<user>/<branch>`). A bare name that is
+/// only a namespace directory (`previews`, `notes`, `seed`) is an ordinary
+/// branch name and stays resolvable.
+pub fn is_reserved_ref(reference: &str) -> bool {
+    let in_namespace = |candidate: &str| {
+        RESERVED_REF_PREFIXES
+            .iter()
+            .any(|prefix| candidate.starts_with(prefix))
+            || RESERVED_REF_NAMES.contains(&candidate)
+    };
+    if reference.starts_with("refs/") {
+        return in_namespace(reference);
+    }
+    in_namespace(&format!("refs/{reference}"))
+}
+
 /// Outcome of trying to materialize a fleet's push mirror from its manifest.
 /// The `Cold`/`Hot` decision and the degraded fallback live here, so the forge
 /// reads and the Git HTTP routes cannot drift.
@@ -299,7 +345,7 @@ pub async fn read_rev(
     reference: Option<&str>,
 ) -> anyhow::Result<Option<String>> {
     if let Some(reference) = reference {
-        return match resolve_ref(bare, reference).await {
+        return match resolve_user_ref(bare, reference).await {
             Ok(sha) => Ok(Some(sha)),
             Err(_) if unborn_default(bare, reference).await? => Ok(None),
             Err(e) => Err(e),
@@ -625,9 +671,10 @@ async fn ahead_behind(bare: &Path, base: &str, head: &str) -> anyhow::Result<(i6
     Ok((behind, ahead))
 }
 
-/// Resolve a branch, tag or 7..=40 hex sha to a commit sha. The string is
-/// validated before git sees it; an unknown ref is an error containing
-/// "not found".
+/// Resolve an **internal** ref: a stored row's ref or a name this module
+/// built. Caller-supplied refs go through [`resolve_user_ref`], which refuses
+/// the reserved namespaces first; this raw form exists so the preview deploy
+/// can resolve the `refs/previews/…` row it owns.
 pub async fn resolve_ref(bare: &Path, reference: &str) -> anyhow::Result<String> {
     if !valid_ref(reference) {
         bail!("invalid ref {reference:?}");
@@ -637,6 +684,18 @@ pub async fn resolve_ref(bare: &Path, reference: &str) -> anyhow::Result<String>
         .await
         .with_context(|| format!("ref {reference:?} not found"))?;
     Ok(out.trim().to_string())
+}
+
+/// Resolve a ref a caller supplied: a branch, tag or sha resolves exactly as
+/// [`resolve_ref`] does, while a ref in a namespace the runner owns (a hidden
+/// `refs/previews/…` workspace snapshot, notes, stash, a seed ref) is refused
+/// as an invalid ref. The refusal is the same whether or not that hidden ref
+/// exists, so a caller cannot use resolution (or its error) to confirm one.
+pub async fn resolve_user_ref(bare: &Path, reference: &str) -> anyhow::Result<String> {
+    if is_reserved_ref(reference) {
+        bail!("invalid ref {reference:?}");
+    }
+    resolve_ref(bare, reference).await
 }
 
 /// One page of history. `reference = None` means `main`; an empty repository
@@ -656,7 +715,7 @@ pub async fn log(
         next_skip: None,
     };
     let start = match reference {
-        Some(reference) => match resolve_ref(bare, reference).await {
+        Some(reference) => match resolve_user_ref(bare, reference).await {
             Ok(sha) => sha,
             Err(_) if unborn_default(bare, reference).await? => return Ok(empty),
             Err(e) => return Err(e),
@@ -699,7 +758,7 @@ pub async fn log(
 /// One commit with its files and patch, against its first parent (or the
 /// empty tree for a root commit).
 pub async fn commit_detail(bare: &Path, reference: &str) -> anyhow::Result<GitCommitDetail> {
-    let sha = resolve_ref(bare, reference).await?;
+    let sha = resolve_user_ref(bare, reference).await?;
     let summary = git_out(
         bare,
         &["show", "-s", &format!("--format={}", log_format()), &sha],
@@ -733,8 +792,8 @@ pub async fn compare(
     base: &str,
     head: &str,
 ) -> anyhow::Result<GitCompare> {
-    let base_sha = resolve_ref(bare, base).await?;
-    let head_sha = resolve_ref(bare, head).await?;
+    let base_sha = resolve_user_ref(bare, base).await?;
+    let head_sha = resolve_user_ref(bare, head).await?;
     let merge_base = merge_base(bare, &base_sha, &head_sha).await?;
     let (behind, ahead) = ahead_behind(bare, &base_sha, &head_sha).await?;
     let range = match &merge_base {
@@ -1437,6 +1496,119 @@ mod tests {
         }
         let err = resolve_ref(&bare, "nope").await.expect_err("unknown");
         assert!(format!("{err:#}").contains("not found"));
+        h.finish().await;
+    }
+
+    #[tokio::test]
+    async fn caller_refs_refuse_reserved_namespaces() {
+        let h = Harness::new("refguard").await;
+        let bare = h.mirror().await;
+        let work = Work::new(&h.dir.join("scratch")).await;
+        work.write("a.txt", "one\n");
+        work.commit("one").await;
+        let tips = seed_objects(&bare, &work).await;
+        let main = tips.get("main").expect("main tip").clone();
+        publish_ref(&h.state, &h.app, "main", None, Some(&main))
+            .await
+            .expect("publish main");
+        // The hidden snapshot another collaborator's workspace preview writes.
+        let preview = format!(
+            "{}user_1/feature",
+            crate::host::git_http::PREVIEW_REF_PREFIX
+        );
+        publish_refname(&h.state, &h.app, &preview, None, Some(&main))
+            .await
+            .expect("publish preview ref");
+        let short = &main[..7];
+
+        // The bare spellings matter too: git's DWIM rewrites `previews/…` to
+        // `refs/previews/…`, so the guard has to know both.
+        let bare_preview = preview["refs/".len()..].to_string();
+        for reserved in [
+            preview.as_str(),
+            bare_preview.as_str(),
+            "refs/previews/",
+            "previews/user_1/feature",
+            "refs/notes/commits",
+            "notes/commits",
+            "refs/stash",
+            "stash",
+            "refs/seed/main",
+            "seed/main",
+        ] {
+            assert!(is_reserved_ref(reserved), "{reserved:?} is reserved");
+            let err = resolve_user_ref(&bare, reserved)
+                .await
+                .expect_err("reserved ref");
+            assert!(
+                format!("{err:#}").contains("invalid ref"),
+                "{reserved:?} -> {err:#}"
+            );
+        }
+        assert!(!is_reserved_ref("main"));
+        assert!(!is_reserved_ref("refs/heads/main"));
+        assert!(!is_reserved_ref("refs/tags/v1"));
+        // A branch merely named like a namespace directory is not internal.
+        for branch in ["previews", "notes", "seed"] {
+            assert!(!is_reserved_ref(branch), "{branch:?} is a branch name");
+        }
+        // A reserved name reads as an invalid ref whether it exists or not: the
+        // refusal never confirms the hidden ref is there.
+        for reserved in [preview.as_str(), "refs/previews/user_9/gone"] {
+            let err = format!("{:#}", resolve_user_ref(&bare, reserved).await.unwrap_err());
+            assert!(err.contains("invalid ref"), "{reserved}: {err}");
+            assert!(!err.contains("not found"), "{reserved}: {err}");
+        }
+
+        // Caller-facing reads still resolve branches, tags and shas.
+        assert_eq!(resolve_user_ref(&bare, "main").await.expect("branch"), main);
+        // A branch named like a namespace directory is just a branch.
+        publish_ref(&h.state, &h.app, "previews", None, Some(&main))
+            .await
+            .expect("publish previews branch");
+        assert_eq!(
+            resolve_user_ref(&bare, "previews")
+                .await
+                .expect("branch named previews"),
+            main
+        );
+        assert_eq!(resolve_user_ref(&bare, short).await.expect("sha"), main);
+        assert_eq!(
+            read_rev(&bare, &h.app, Some("main")).await.expect("rev"),
+            Some(main.clone())
+        );
+        assert_eq!(
+            read_rev(&bare, &h.app, Some(short)).await.expect("sha rev"),
+            Some(main.clone())
+        );
+        assert_eq!(
+            log(&bare, Some("main"), None, 0, None)
+                .await
+                .expect("log")
+                .commits
+                .len(),
+            1
+        );
+        assert!(commit_detail(&bare, short).await.is_ok());
+        // The view-only source reads (repo_tree/repo_blob) go through
+        // `read_rev`, so the preview ref is invisible there too.
+        let err = read_rev(&bare, &h.app, Some(&preview))
+            .await
+            .expect_err("preview read");
+        assert!(format!("{err:#}").contains("invalid ref"), "{err:#}");
+        let err = log(&bare, Some(&preview), None, 0, None)
+            .await
+            .expect_err("preview log");
+        assert!(format!("{err:#}").contains("invalid ref"), "{err:#}");
+        let err = commit_detail(&bare, &preview)
+            .await
+            .expect_err("preview commit");
+        assert!(format!("{err:#}").contains("invalid ref"), "{err:#}");
+        let err = compare(&h.state.config, &h.app.slug, &bare, "main", &preview)
+            .await
+            .expect_err("preview compare");
+        assert!(format!("{err:#}").contains("invalid ref"), "{err:#}");
+
         h.finish().await;
     }
 
@@ -2253,6 +2425,133 @@ mod tests {
         .await
         .expect_err("bad branch");
         assert!(format!("{err:#}").contains("invalid branch"), "{err:#}");
+        h.finish().await;
+    }
+
+    /// A caller-chosen `fromSha`/`expectedTip` may not name a hidden
+    /// namespace: the preview ref holds another collaborator's uncommitted
+    /// snapshot, and a branch published from it would advertise it. A branch
+    /// or sha still starts the branch and still works as the tip precondition.
+    #[tokio::test]
+    async fn web_commit_refuses_a_preview_base() {
+        use crate::host::web_commit::WebChanges;
+        let h = Harness::new("webref").await;
+        let actor = crate::host::git_identity::noreply(&h.state.config, "user_1", "Ada");
+        let root_files = vec![text_file("README.md", "# hello\n")];
+        let main = crate::host::web_commit::web_commit(
+            &h.state,
+            &h.app,
+            &actor,
+            "root",
+            WebChanges {
+                files: &root_files,
+                moves: &[],
+                deletes: &[],
+            },
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("root commit");
+        // A preview snapshot on top of main, as another user's workspace wrote.
+        let preview = format!(
+            "{}user_2/feature",
+            crate::host::git_http::PREVIEW_REF_PREFIX
+        );
+        publish_refname(&h.state, &h.app, &preview, None, Some(&main))
+            .await
+            .expect("publish preview ref");
+        let files = vec![text_file("feature.txt", "wip\n")];
+
+        // `fromSha` naming the preview ref is refused before any object write.
+        let err = crate::host::web_commit::web_commit(
+            &h.state,
+            &h.app,
+            &actor,
+            "leak",
+            WebChanges {
+                files: &files,
+                moves: &[],
+                deletes: &[],
+            },
+            Some("feature/leak"),
+            Some(&preview),
+            None,
+        )
+        .await
+        .expect_err("preview base");
+        assert!(format!("{err:#}").contains("invalid ref"), "{err:#}");
+        let bare = http_bare(&h.state.config, &h.app.slug);
+        let refs_now = list_refs(&bare).await.expect("list");
+        assert!(
+            !refs_now.contains_key("refs/heads/feature/leak"),
+            "nothing was published"
+        );
+
+        // A branch or sha still starts a new branch.
+        let mut from_main = String::new();
+        for from in ["main", main.as_str()] {
+            let name = format!("feature/from-{}", &from[..4.min(from.len())]);
+            let sha = crate::host::web_commit::web_commit(
+                &h.state,
+                &h.app,
+                &actor,
+                "ok",
+                WebChanges {
+                    files: &files,
+                    moves: &[],
+                    deletes: &[],
+                },
+                Some(&name),
+                Some(from),
+                None,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("from {from:?}: {e:#}"));
+            let detail = commit_detail(&bare, &sha).await.expect("detail");
+            assert_eq!(detail.commit.parents, vec![main.clone()]);
+            if from == "main" {
+                from_main = sha;
+            }
+        }
+
+        // `expectedTip` naming the preview ref is refused too.
+        let err = crate::host::web_commit::web_commit(
+            &h.state,
+            &h.app,
+            &actor,
+            "tip",
+            WebChanges {
+                files: &files,
+                moves: &[],
+                deletes: &[],
+            },
+            Some("feature/tip"),
+            None,
+            Some(&preview),
+        )
+        .await
+        .expect_err("preview tip");
+        assert!(format!("{err:#}").contains("invalid ref"), "{err:#}");
+        // The real tip still works on the branch it names.
+        let sha = crate::host::web_commit::web_commit(
+            &h.state,
+            &h.app,
+            &actor,
+            "tip",
+            WebChanges {
+                files: &files,
+                moves: &[],
+                deletes: &[],
+            },
+            Some("feature/from-main"),
+            None,
+            Some(&from_main),
+        )
+        .await
+        .expect("real tip");
+        assert_ne!(sha, main);
         h.finish().await;
     }
 

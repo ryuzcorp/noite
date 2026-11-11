@@ -28,7 +28,8 @@ export type RefusalCode =
   | "not_mergeable"
   | "not_open"
   | "protected_branch"
-  | "stale_tip";
+  | "stale_tip"
+  | "too_many_waits";
 
 /** What to do next, per code. One sentence each: the code says what happened,
  * the hint says the next call. */
@@ -55,6 +56,8 @@ const HINTS: Record<RefusalCode, string> = {
     "Commit to a new branch and open a pull request; main only takes merges while branch protection is on.",
   stale_tip:
     "Read the branch tip again (repo_branches), then retry with the new tip as expectedTip.",
+  too_many_waits:
+    "Wait for one of the calls already in flight to answer, then re-arm this one.",
 };
 
 /** One refusal, as it travels: `code` is the closed reason, `message` and
@@ -132,6 +135,12 @@ export const refusalOf = (error: unknown): McpToolError | null => {
 
     if (failure.status === 404) {
       return refused("not_found", `the runner has no such row (404)`);
+    }
+
+    if (failure.status === 400) {
+      // A rejected argument: the caller can fix what it sent (a bad ref, path
+      // or body). The body itself is not forwarded, so the code carries it.
+      return refused("invalid", `the runner rejected this call (400)`);
     }
 
     return null;

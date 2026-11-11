@@ -54,13 +54,16 @@ describe("refusalOf", () => {
     ).toBe("invalid");
   });
 
-  test("an HTTP 403/404 is a refusal; anything else is not", () => {
+  test("an HTTP 400/403/404 is a refusal; a 500 is not", () => {
     expect(codeOf(new RunnerHttpError("GET /v1/apps/x", 403, ""))).toBe(
       "forbidden"
     );
     expect(codeOf(new RunnerHttpError("GET /v1/apps/x", 404, ""))).toBe(
       "not_found"
     );
+    expect(
+      codeOf(new RunnerHttpError("POST /v1/apps/x/source/commit", 400, ""))
+    ).toBe("invalid");
     expect(codeOf(new RunnerHttpError("GET /v1/apps/x", 500, ""))).toBeNull();
   });
 

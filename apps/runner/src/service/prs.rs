@@ -464,21 +464,20 @@ pub async fn create(
     // hidden `refs/previews/<user>/<branch>` workspace snapshot must never
     // become a PR head (its owner never committed it), and a tag or sha is
     // not a branch here.
-    if !forge::valid_branch_name(base)
-        || !forge::valid_branch_name(head)
-        || base.starts_with("refs/")
-        || head.starts_with("refs/")
-    {
+    if !forge::valid_user_branch_name(base) || !forge::valid_user_branch_name(head) {
         return Err(ApiError::bad("invalid branch name"));
     }
     if base == head {
         return Err(ApiError::bad("head and base must be different branches"));
     }
     let (app, bare) = app_repo(state, id).await?;
-    let head_sha = forge::resolve_ref(&bare, head)
+    // `resolve_user_ref` refuses the runner's own namespaces, including the
+    // bare `previews/…` spelling git rewrites to `refs/previews/…`: a hidden
+    // workspace snapshot can never become a PR head.
+    let head_sha = forge::resolve_user_ref(&bare, head)
         .await
         .map_err(|_| ApiError::not_found(format!("branch {head:?} not found")))?;
-    let base_sha = forge::resolve_ref(&bare, base)
+    let base_sha = forge::resolve_user_ref(&bare, base)
         .await
         .map_err(|_| ApiError::not_found(format!("branch {base:?} not found")))?;
     // A pull request with nothing on its head is meaningless: refuse it with a

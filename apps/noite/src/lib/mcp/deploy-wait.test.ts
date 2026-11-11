@@ -1,7 +1,12 @@
 import { describe, expect, test } from "bun:test";
 
 import type { RunnerDeploy } from "../runner";
-import { isTerminalDeploy, waitForDeploy } from "./deploy-wait";
+import {
+  createWaitGate,
+  isTerminalDeploy,
+  MAX_CONCURRENT_WAITS,
+  waitForDeploy,
+} from "./deploy-wait";
 
 const deploy = (over: Partial<RunnerDeploy> = {}): RunnerDeploy => ({
   actor: null,
@@ -112,5 +117,55 @@ describe("waitForDeploy", () => {
     const outcome = await waitForDeploy(fake.deps, 5000);
 
     expect(outcome._tag === "Settled" && outcome.deploy.id).toBe("dep-2");
+  });
+});
+
+describe("the wait gate", () => {
+  test("caps one key's in-flight waits and frees a slot on leave", () => {
+    const gate = createWaitGate(2);
+
+    expect(gate.enter("key-a")).toBe(true);
+    expect(gate.enter("key-a")).toBe(true);
+    expect(gate.enter("key-a")).toBe(false);
+    expect(gate.active("key-a")).toBe(2);
+    // Another key has its own slots.
+    expect(gate.enter("key-b")).toBe(true);
+    expect(gate.enter("key-b")).toBe(true);
+    expect(gate.enter("key-b")).toBe(false);
+
+    gate.leave("key-a");
+    expect(gate.active("key-a")).toBe(1);
+    expect(gate.enter("key-a")).toBe(true);
+    expect(gate.enter("key-a")).toBe(false);
+
+    gate.leave("key-a");
+    gate.leave("key-a");
+    // A released key is forgotten, so the map holds only live waits.
+    expect(gate.active("key-a")).toBe(0);
+    expect(gate.enter("key-a")).toBe(true);
+  });
+
+  test("the agent loop's default limit leaves room for a burst", () => {
+    const gate = createWaitGate();
+
+    expect(MAX_CONCURRENT_WAITS).toBeGreaterThanOrEqual(4);
+
+    for (let i = 0; i < MAX_CONCURRENT_WAITS; i += 1) {
+      expect(gate.enter("key-a")).toBe(true);
+    }
+
+    expect(gate.enter("key-a")).toBe(false);
+  });
+
+  test("a stray leave never underflows another key's count", () => {
+    const gate = createWaitGate(1);
+
+    gate.leave("key-nobody");
+    expect(gate.active("key-nobody")).toBe(0);
+    expect(gate.enter("key-nobody")).toBe(true);
+    expect(gate.enter("key-nobody")).toBe(false);
+    gate.leave("key-nobody");
+    gate.leave("key-nobody");
+    expect(gate.active("key-nobody")).toBe(0);
   });
 });

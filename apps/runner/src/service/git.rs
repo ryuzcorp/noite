@@ -125,16 +125,13 @@ pub async fn branch_create(
     if !forge::valid_branch_name(name) {
         return Err(ApiError::bad(format!("invalid branch name {name:?}")));
     }
-    // `from` may be a branch, a tag or a sha, but never a hidden workspace
-    // preview ref: creating an advertised branch from one would publish
-    // another collaborator's uncommitted snapshot (`refs/previews/…`).
-    if from.starts_with(crate::host::git_http::PREVIEW_REF_PREFIX) {
-        return Err(ApiError::bad(format!(
-            "invalid base ref {from:?}: preview refs cannot start a branch"
-        )));
-    }
+    // `from` may be a branch, a tag or a sha; `resolve_user_ref` refuses the
+    // runner's own namespaces, so a hidden workspace preview ref cannot start
+    // an advertised branch (and publish another collaborator's snapshot).
     let (app, bare) = app_repo(state, id).await?;
-    let sha = forge::resolve_ref(&bare, from).await.map_err(forge_error)?;
+    let sha = forge::resolve_user_ref(&bare, from)
+        .await
+        .map_err(forge_error)?;
     forge::publish_ref(state, &app, name, None, Some(&sha))
         .await
         .map_err(forge_error)?;
