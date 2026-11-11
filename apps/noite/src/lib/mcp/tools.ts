@@ -13,14 +13,12 @@
  * never sees a contract the server does not enforce.
  */
 import * as Schema from "effect/Schema";
-import { sql } from "void/db";
 
 import { appLifecycle } from "../app-detail/lifecycle";
 import type { AppStatusPage } from "../app-detail/lifecycle";
 import type { CreateSourceInput } from "../apps/create-source";
 import { TEMPLATES } from "../apps/templates";
 import { listAppsForCollaborator } from "../collaborators";
-import { getDb, withDb } from "../db";
 import { keyCoversApp } from "../key-principal";
 import type { KeyPrincipal } from "../key-principal";
 import type { AppRole } from "../roles";
@@ -61,6 +59,7 @@ import type {
 import { createAppForUser, slugError } from "../server/apps.server";
 import { redactEnv } from "../server/env.server";
 import { keyAppVerdict } from "../server/key-access.server";
+import { keyActor } from "../server/key-attribution.server";
 import { defineTool, McpToolError } from "./protocol";
 import type { McpToolDefinition } from "./protocol";
 
@@ -98,17 +97,6 @@ const requireApp = async (
   throw new McpToolError(
     `No app "${ref}" this key can ${NEEDS[need]} (it may not exist, you may not be a collaborator, or the key may be limited to other apps).`
   );
-};
-
-/** The account's display name, for the one commit a create may author (a
- * squashed import). Absent accounts fall back to the platform default. */
-const displayName = async (userId: string): Promise<string> => {
-  const row = await withDb(() =>
-    getDb().get<{ name: string }>(sql`
-      SELECT name FROM "user" WHERE id = ${userId} LIMIT 1`)
-  );
-
-  return row?.name?.trim() ?? "";
 };
 
 const sha10 = (sha: string): string => sha.slice(0, 10);
@@ -407,11 +395,10 @@ export const MCP_TOOLS: readonly McpToolDefinition[] = [
         throw new McpToolError(problem, { invalid: true });
       }
 
+      const actor = await keyActor(principal);
+
       const app = await createAppForUser({
-        account: {
-          id: principal.userId,
-          name: await displayName(principal.userId),
-        },
+        account: { id: actor.userId, name: actor.name },
         name: name?.trim() || normalized,
         slug: normalized,
         source: toCreateSource(source),
@@ -799,7 +786,15 @@ export const MCP_TOOLS: readonly McpToolDefinition[] = [
     run: async ({ principal }, { app: ref, environment }) => {
       const { app, role } = await requireApp(principal, ref, "push");
       const env = await requireEnvironment(app, role, environment);
-      const result = await runnerEnvironmentDeploy(app.id, env.id, role);
+
+      const actor = await keyActor(principal);
+
+      const result = await runnerEnvironmentDeploy(
+        app.id,
+        env.id,
+        role,
+        actor.name
+      );
 
       return {
         structured: {

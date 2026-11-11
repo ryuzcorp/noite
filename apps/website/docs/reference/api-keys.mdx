@@ -42,6 +42,15 @@ A key is at most as powerful as its owner: a ceiling never grants a role the own
 - **Bans win.** A banned account's keys stop working immediately and are deleted; unbanning does not restore them.
 - **Not a session.** A key cannot sign in, change the account, mint another key or read `/account`; it only reaches the surfaces in the table above.
 
+## Attribution
+
+Actions a key performs are labelled with it, so a bot's work stays visible as a bot's:
+
+- A commit the control plane writes for a key (an MCP `create_app` import today) is authored and committed as `<your name> via key <key name>`.
+- A preview-environment redeploy triggered with a key records that label on its deploy row, shown under the deploy as "by …".
+
+Automatic deploys from a plain git push carry the pusher's own git identity in the commit, so there is no key label on the deploy row.
+
 ## Rotating a key
 
 Revoke the old key on the Account page and mint a new one — revocation is immediate on every surface (git, MCP, ingest). Short expiries are the low-effort version of the same discipline: a CI key with a 30-day expiry cannot become a permanent credential nobody remembers.

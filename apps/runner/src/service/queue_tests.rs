@@ -220,7 +220,7 @@ async fn an_environment_deploy_records_a_redeploy() {
     .await;
 
     let (deploy_id, sha) =
-        crate::service::environments::deploy(&h.state, &app.id, &env.id, Some("push"))
+        crate::service::environments::deploy(&h.state, &app.id, &env.id, Some("push"), None)
             .await
             .expect("redeploy the environment");
     let row = crate::db::get_deploy(&h.state.pool, &app.id, &deploy_id)

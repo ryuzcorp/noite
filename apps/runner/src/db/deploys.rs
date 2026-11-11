@@ -45,8 +45,8 @@ use super::apps::{record_app_deploy_sha, status_list, write_app_status};
 use super::environments::{mark_environment_deployed, write_environment_status};
 
 /// Columns every `deploy` query selects, in [`Deploy`] order.
-const DEPLOY_COLS: &str =
-    "id, app_id, environment_id, sha, status, intent, log, created_at, updated_at";
+const DEPLOY_COLS: &str = "id, app_id, environment_id, sha, status, intent, actor, log, \
+     created_at, updated_at";
 
 /// The target's `last_error` when the sweep, not the run, closed a deploy.
 const STALLED_SUMMARY: &str = "deploy stalled (host interrupted or timed out)";
@@ -339,6 +339,7 @@ pub async fn upsert_deploy(
             environment_id,
             id: &id,
             intent: DeployIntent::Deploy,
+            actor: None,
             log: append_log,
             sha,
             status,
@@ -360,6 +361,7 @@ struct NewDeploy<'a> {
     environment_id: Option<&'a str>,
     status: DeployStatus,
     intent: DeployIntent,
+    actor: Option<&'a str>,
     sha: Option<&'a str>,
     log: &'a str,
 }
@@ -368,8 +370,8 @@ struct NewDeploy<'a> {
 async fn insert_deploy(pool: &SqlitePool, row: NewDeploy<'_>) -> sqlx::Result<()> {
     let ts = now_iso();
     sqlx::query(
-        "INSERT INTO deploy (id, app_id, environment_id, sha, status, intent, log, created_at, \
-         updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO deploy (id, app_id, environment_id, sha, status, intent, actor, log, \
+         created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(row.id)
     .bind(row.app_id)
@@ -377,6 +379,7 @@ async fn insert_deploy(pool: &SqlitePool, row: NewDeploy<'_>) -> sqlx::Result<()
     .bind(row.sha)
     .bind(row.status.as_str())
     .bind(row.intent.as_str())
+    .bind(row.actor)
     .bind(row.log)
     .bind(&ts)
     .bind(&ts)
@@ -397,6 +400,7 @@ pub async fn queue_deploy(
     environment_id: Option<&str>,
     intent: DeployIntent,
     sha: &str,
+    actor: Option<&str>,
 ) -> sqlx::Result<String> {
     let id = new_id();
     let log = "▸ queued behind the app's running deploy\n";
@@ -407,6 +411,7 @@ pub async fn queue_deploy(
             environment_id,
             id: &id,
             intent,
+            actor,
             log,
             sha: Some(sha),
             status: DeployStatus::Queued,
@@ -825,6 +830,56 @@ mod tests {
         assert!(!fresh.log.contains("stalled"), "{}", fresh.log);
     }
 
+    /// A caller that can say who asked (a key's attributable label) keeps it
+    /// on the row; the automatic pipeline leaves it NULL.
+    #[tokio::test]
+    async fn a_caller_attributed_deploy_keeps_its_actor() {
+        let pool = crate::db::connect("sqlite::memory:").await.expect("db");
+        let app = seed_app(&pool, "actor").await;
+        let id = queue_deploy(
+            &pool,
+            &app.id,
+            None,
+            DeployIntent::Redeploy,
+            "abc1234",
+            Some("Ada via key ci"),
+        )
+        .await
+        .expect("queue the redeploy");
+        let queued = get_deploy(&pool, &app.id, &id)
+            .await
+            .expect("read")
+            .expect("row");
+        assert_eq!(queued.actor.as_deref(), Some("Ada via key ci"));
+
+        // The pipeline continuing the row never rewrites who asked.
+        upsert_deploy(
+            &pool,
+            Some(&id),
+            &app.id,
+            None,
+            DeployStatus::Building,
+            Some("abc1234"),
+            "\u{25b8} build\n",
+        )
+        .await
+        .expect("advance");
+        let running = get_deploy(&pool, &app.id, &id)
+            .await
+            .expect("read")
+            .expect("row");
+        assert_eq!(running.actor.as_deref(), Some("Ada via key ci"));
+
+        let automatic = queue_deploy(&pool, &app.id, None, DeployIntent::Deploy, "def5678", None)
+            .await
+            .expect("queue the automatic deploy");
+        let auto_row = get_deploy(&pool, &app.id, &automatic)
+            .await
+            .expect("read")
+            .expect("row");
+        assert_eq!(auto_row.actor, None);
+    }
+
     /// A row's intent is settled when the row is created: `queue_deploy`
     /// records the trigger, and the pipeline continuing the same row never
     /// rewrites it. A row the pipeline creates itself is a plain deploy.
@@ -832,9 +887,16 @@ mod tests {
     async fn a_deploy_intent_is_set_once_and_never_rewritten() {
         let pool = crate::db::connect("sqlite::memory:").await.expect("db");
         let app = seed_app(&pool, "intent").await;
-        let id = queue_deploy(&pool, &app.id, None, DeployIntent::Rollback, "abc1234")
-            .await
-            .expect("queue the rollback");
+        let id = queue_deploy(
+            &pool,
+            &app.id,
+            None,
+            DeployIntent::Rollback,
+            "abc1234",
+            None,
+        )
+        .await
+        .expect("queue the rollback");
         let queued = get_deploy(&pool, &app.id, &id)
             .await
             .expect("read")

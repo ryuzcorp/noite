@@ -160,6 +160,18 @@ struct EnvIdParams {
     role: Option<String>,
 }
 
+/// `environments.deploy` also carries who asked, when the caller can say: a
+/// profile API key's attributable label, which the deploy row keeps.
+#[derive(Deserialize)]
+struct EnvDeployParams {
+    id: String,
+    env_id: String,
+    #[serde(default)]
+    role: Option<String>,
+    #[serde(default)]
+    actor: Option<String>,
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct CreateEnvironmentParams {
@@ -723,15 +735,21 @@ async fn dispatch_call(
             )
         }
         "environments.deploy" => {
-            let p: EnvIdParams = match parse(params, &id) {
+            let p: EnvDeployParams = match parse(params, &id) {
                 Ok(p) => p,
                 Err(e) => return e,
             };
             complete(
                 id,
-                service::environments::deploy(state, &p.id, &p.env_id, p.role.as_deref())
-                    .await
-                    .map(|(deploy_id, sha)| json!({ "deployId": deploy_id, "sha": sha })),
+                service::environments::deploy(
+                    state,
+                    &p.id,
+                    &p.env_id,
+                    p.role.as_deref(),
+                    p.actor.as_deref(),
+                )
+                .await
+                .map(|(deploy_id, sha)| json!({ "deployId": deploy_id, "sha": sha })),
             )
         }
         "environments.vars.get" => {

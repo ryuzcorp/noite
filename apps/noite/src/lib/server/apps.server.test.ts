@@ -4,6 +4,7 @@ import type { RunnerDeploy } from "../runner";
 import { leanDeployRows } from "./apps.server";
 
 const row = (overrides: Partial<RunnerDeploy>): RunnerDeploy => ({
+  actor: null,
   appId: "a",
   createdAt: "2026-10-22T00:00:00Z",
   environmentId: null,

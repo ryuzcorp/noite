@@ -1,6 +1,8 @@
 /* oxlint-disable anti-slop/no-chained-type-assertions, anti-slop/require-safety-comment-for-type-assertion -- test doubles: a minimal KitEnv stands in for the Worker env */
 import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 
+import type { Json } from "effect/Schema";
+
 import { authFromEnv } from "../lib/auth";
 import { ensureDb, setD1Binding } from "../lib/db";
 import { resetPlatformLimits } from "../lib/rate-limit";
@@ -273,11 +275,7 @@ describe("POST /mcp", () => {
   });
 });
 
-const callTool = async (
-  key: string,
-  name: string,
-  args: Record<string, string | null>
-) => {
+const callTool = async (key: string, name: string, args: Json) => {
   const response = await call(
     JSON.stringify({
       id: 7,
@@ -357,6 +355,26 @@ describe("a scoped key over MCP", () => {
 
     expect(foreign.result?.isError).toBe(true);
     expect(foreign.result?.content[0]?.text).toContain("No app");
+  });
+
+  test("create_app attributes its import commit to the key", async () => {
+    const key = await mintKey("u-scoped", { apps: ["manage"] });
+
+    await callTool(key, "create_app", {
+      slug: "imported",
+      source: { kind: "template", template: "ilha-void" },
+    });
+
+    // SAFETY: the runner mock records each call's params object as sent.
+    const create = runner.requests.find(
+      (request) => (request as { slug?: string }).slug === "imported"
+    );
+
+    expect(create).toMatchObject({
+      source: {
+        actor: { name: "u-scoped via key mcp-test", userId: "u-scoped" },
+      },
+    });
   });
 
   test("an app-scoped key cannot create an app", async () => {

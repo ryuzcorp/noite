@@ -393,6 +393,7 @@ const RowApp = defineApp({
             </div>
             <div class="text-base-content/70 text-xs">
               {intent === null ? null : <span class="mr-2">{intent}</span>}
+              {d.actor === null ? null : <span class="mr-2">by {d.actor}</span>}
               {formatDateTime(d.createdAt)}
             </div>
           </div>
