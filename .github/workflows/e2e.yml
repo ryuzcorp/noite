@@ -68,6 +68,8 @@ jobs:
   # so the lane matrix below stays clean instead of scattering skipped cells.
   plan:
     runs-on: ubuntu-latest
+    # ~3x the 0.1 min p95 (25 runs, 2026-11-11), floor 10.
+    timeout-minutes: 10
     outputs:
       rounds: ${{ steps.rounds.outputs.json }}
     steps:
@@ -85,6 +87,9 @@ jobs:
     name: e2e (${{ matrix.lane }} round ${{ matrix.round }} shard ${{ matrix.shard }})
     needs: plan
     runs-on: ubuntu-latest
+    # ~3x the 13.0 min p95 of a lane without the shared image (25 runs,
+    # 2026-11-11; max 17.2), rounded up to 40. A lane that boots nothing
+    # fails here instead of in the merge queue.
     timeout-minutes: 40
     permissions:
       contents: read
@@ -110,9 +115,12 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        timeout-minutes: 3
       - run: bun install
+        timeout-minutes: 5
       - name: install UI deps
         working-directory: apps/noite
+        timeout-minutes: 5
         run: bun install --frozen-lockfile
       # Browser binaries (~170 MB) survive across runs; the install below
       # skips binaries already on disk. No `--with-deps`: the ubuntu runner
@@ -125,6 +133,8 @@ jobs:
           path: ~/.cache/ms-playwright
       - name: playwright chromium
         working-directory: apps/noite
+        # ~170 MB download on a cache miss; bounded so it cannot eat the job.
+        timeout-minutes: 10
         run: bunx playwright install chromium
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
       # The runner and UI stages compile into cache mounts, which a hosted
@@ -203,6 +213,8 @@ jobs:
     needs: [plan, e2e]
     if: ${{ !cancelled() && needs.e2e.result != 'skipped' && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') }}
     runs-on: ubuntu-latest
+    # ~3x the 0.2 min p95 (25 runs, 2026-11-11), floor 10.
+    timeout-minutes: 10
     permissions:
       contents: read
       actions: read
@@ -210,6 +222,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        timeout-minutes: 3
       - name: download result reports
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:

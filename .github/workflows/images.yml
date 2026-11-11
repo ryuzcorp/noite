@@ -90,6 +90,9 @@ jobs:
           - platform: linux/arm64
             runs-on: ubuntu-24.04-arm
     runs-on: ${{ matrix.runs-on }}
+    # ~3x the 11.6 min arm64 / 6.2 min amd64 p95 (49 runs each, 2026-11-11),
+    # rounded up: a stuck registry or build fails instead of hanging for 6 h.
+    timeout-minutes: 35
     permissions:
       actions: write
       contents: read
@@ -139,6 +142,8 @@ jobs:
     needs: image
     if: ${{ !cancelled() && needs.image.result == 'success' }}
     runs-on: ubuntu-latest
+    # ~3x the 0.5 min p95 (50 runs, 2026-11-11), floor 10.
+    timeout-minutes: 10
     permissions:
       actions: read
       contents: read
@@ -182,6 +187,8 @@ jobs:
     needs: merge
     if: ${{ !cancelled() && needs.merge.result == 'success' && startsWith(github.ref, 'refs/tags/v') }}
     runs-on: ubuntu-latest
+    # ~3x the 0.1 min p95 (50 runs, 2026-11-11), floor 10.
+    timeout-minutes: 10
     permissions:
       contents: write
     steps:
@@ -213,18 +220,23 @@ jobs:
     needs: prerelease
     if: ${{ startsWith(github.ref, 'refs/tags/v') && needs.prerelease.result == 'success' }}
     runs-on: ubuntu-latest
+    # ~3x the 0.4 min p95 (50 runs, 2026-11-11), floor 10.
+    timeout-minutes: 10
     permissions:
       contents: read
       id-token: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        timeout-minutes: 3
       # npm >= 11.5.1 speaks OIDC; node 24 ships it.
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        timeout-minutes: 5
         with:
           node-version: 24
           registry-url: "https://registry.npmjs.org"
       - run: bun install
+        timeout-minutes: 5
       - name: build
         working-directory: packages/cli
         run: bun run build

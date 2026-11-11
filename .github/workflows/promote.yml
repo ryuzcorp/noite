@@ -30,6 +30,8 @@ concurrency:
 jobs:
   promote:
     runs-on: ubuntu-latest
+    # ~3x the 0.5 min p95 (8 runs, 2026-11-11), floor 10.
+    timeout-minutes: 10
     permissions:
       contents: read
       packages: write

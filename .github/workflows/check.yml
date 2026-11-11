@@ -22,13 +22,18 @@ permissions:
 jobs:
   check:
     runs-on: ubuntu-latest
+    # ~3x the 0.7 min p95 (50 runs, 2026-11-11), floor 10: the 2026-11-11
+    # merge queue hung here in `bun install` for 40+ min on GitHub's default.
+    timeout-minutes: 10
     permissions:
       attestations: read
       contents: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        timeout-minutes: 3
       - run: bun install
+        timeout-minutes: 5
       - name: changelog entry for this release
         if: ${{ inputs.changelog }}
         run: bun docker/check-changelog.ts "${GITHUB_REF_NAME#v}"
@@ -141,6 +146,8 @@ jobs:
   # rather than ci.yml's `rust` job.
   types:
     runs-on: ubuntu-latest
+    # ~3x the 1.4 min p95 (50 runs, 2026-11-11), floor 10.
+    timeout-minutes: 10
     defaults:
       run:
         working-directory: apps/runner
@@ -168,12 +175,17 @@ jobs:
   # checkout's file order decided which later file saw it.
   ui:
     runs-on: ubuntu-latest
+    # ~3x the 0.9 min p95 (50 runs, 2026-11-11), floor 10.
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        timeout-minutes: 3
       - run: bun install
+        timeout-minutes: 5
       - name: install UI deps
         working-directory: apps/noite
+        timeout-minutes: 5
         run: bun install --frozen-lockfile
       - name: unit tests
         working-directory: apps/noite
@@ -183,10 +195,14 @@ jobs:
   # the typecheck, and the version it advertises (inlined from package.json).
   cli:
     runs-on: ubuntu-latest
+    # ~3x the 0.4 min p95 (50 runs, 2026-11-11), floor 10.
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        timeout-minutes: 3
       - run: bun install
+        timeout-minutes: 5
       - name: build
         working-directory: packages/cli
         run: bun run build
