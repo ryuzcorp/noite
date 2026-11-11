@@ -130,7 +130,7 @@ describe("matchTopic", () => {
 
   test("refuses anything that is not a stream route", () => {
     expect(matchTopic("/api/apps/get")).toBeNull();
-    expect(matchTopic("/api/apps/a/source/archive")).toBeNull();
+    expect(matchTopic("/api/apps/a/source/commit")).toBeNull();
     expect(matchTopic("https://evil.test/api/apps/stream")).toBeNull();
     expect(matchTopic("//evil.test/api/apps/stream")).toBeNull();
     expect(matchTopic("/storage/a/stream")).toBeNull();

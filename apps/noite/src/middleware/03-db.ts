@@ -1,8 +1,8 @@
 /**
  * Stamp the Worker D1 binding, then run the admin bootstrap before routes /
  * pages. Runs on every request that reaches the Worker (`src/middleware/` =
- * Void global middleware, in numeric order after the timeout and pod-host
- * gates) — static bundles do not: celld serves `/assets/*` itself, see
+ * Void global middleware, in numeric order after the timeout and the rate
+ * limit) — static bundles do not: celld serves `/assets/*` itself, see
  * `RUN_WORKER_FIRST` in `void.config.ts`. Also stamps the runner credentials
  * for the plain-route fetch path (what `handleHttp` did before the Void
  * routes slice).

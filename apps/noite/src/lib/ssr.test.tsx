@@ -14,31 +14,32 @@ import { CreateAppForm } from "./apps/create-form";
 import { AppsList } from "./apps/list";
 import { Onboarding } from "./auth/onboarding";
 import { keys } from "./resources";
+import { ChangesPanel } from "./source/changes";
 import type { SourceBrowserState } from "./source/drafts";
-import { PreviewPanel } from "./source/preview-panel";
 import { writeSwr } from "./swr-store";
 
 const APP_ID = "ssr-probe";
 
 // Named (not inline): renderHtml resolves anonymous closures without their
 // imports, so only a module-level component renders the real tree.
-const PreviewProbe = () => (
-  <PreviewPanel
+const ChangesProbe = () => (
+  <ChangesPanel
     appId={APP_ID}
     branch="main"
-    onClose={() => {}}
-    onDeployPreview={() => Promise.resolve(null)}
+    branches={[]}
+    commit={() => Promise.resolve(false)}
+    defaultBranch="main"
+    discard={() => {}}
+    discardAll={() => {}}
+    isProtected={() => false}
+    restore={() => {}}
     state={atom<SourceBrowserState>({
-      conflicts: [],
       files: [],
-      previewError: null,
-      previewed: null,
       pushError: null,
       pushed: null,
       pushing: false,
       readOnly: "",
       revision: 0,
-      stale: null,
     })}
   />
 );
@@ -103,9 +104,9 @@ describe("ssr", () => {
     expect(html).not.toContain("Live updates are unavailable");
   });
 
-  test("the preview panel renders without browser globals", async () => {
-    const html = await renderHtml(PreviewProbe);
+  test("the changes panel renders without browser globals", async () => {
+    const html = await renderHtml(ChangesProbe);
     expect(html).not.toContain("data-ilha-error");
-    expect(html).toContain("probe");
+    expect(html).toContain("Commit message");
   });
 });

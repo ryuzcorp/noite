@@ -20,7 +20,6 @@ export interface MenuTarget {
 export interface MenuActions {
   deleteCount?: number;
   newFile: () => void;
-  newFolder: () => void;
   onDelete?: () => void;
   onRename?: () => void;
   onUpload?: () => void;
@@ -180,7 +179,6 @@ export const newTreeMenu = (actions: MenuActions): HTMLElement => {
   };
 
   add("New File", actions.newFile);
-  add("New Folder", actions.newFolder);
 
   if (actions.onUpload !== undefined) {
     add("Upload files…", actions.onUpload);

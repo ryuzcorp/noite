@@ -1,421 +1,178 @@
-//! The source pane's editor wiring: the `@pierre/diffs` File view and its
-//! editor, the live text of every open path, and the file-open flow around
-//! them. The pod is the file system: opening a file reads it from there, an
-//! edit hands its text back to the browser (which writes it), and the bytes a
-//! staged deletion no longer has on disk come from the workspace's own blob
-//! cache. The TypeScript intelligence — diagnostics, hover, go-to-definition
-//! and inline prediction — lives behind `editor-intel.ts`, which the pane
-//! feeds the open file's state and the editor pierre attaches. Everything
-//! crosses through `host`.
+//! The code pane: the `@pierre/diffs` file view, the edit session attached to
+//! it, and the one blob read that fills it. There is no file system behind it —
+//! opening a path reads that file from the runner, a keystroke hands the text
+//! to the page's session (`./session`), and nothing is written anywhere until
+//! the Changes form commits.
+//!
+//! ## What the pane shows
+//!
+//! | the blob | the pane |
+//! | --- | --- |
+//! | text, editable checkout | a text file, the editor attached |
+//! | text, read-only checkout | a text file, no edit session |
+//! | binary | a placeholder note, no edit session |
+//! | past `TEXT_MAX_BYTES` | a placeholder note, no edit session |
+//! | a path the commit dropped | whatever is staged at it, or "not found" |
 
 import { errorMessage } from "../errors";
+import type { RunnerBlob } from "../runner";
 import type { SearchParam } from "../search-param";
 import { curatedLang } from "../shiki-langs";
-import { createEditorIntel } from "./editor-intel";
-import { isScriptFile } from "./intel-protocol";
-import type { IntelPosition } from "./intel-protocol";
 import { THEME } from "./pane";
 import {
   newPaneMachine,
-  ownedPainted,
   paintedOf,
   PaneEvents,
   panePath,
   PaneViews,
   stepPane,
 } from "./pane-view";
-import type { PaneMachine, PaintedView, ResolvedShow } from "./pane-view";
-import type { DiffsModule, EditModule } from "./pierre";
-import { TEXT_MAX_BYTES, isTextBytes } from "./uploads";
-import { projectPath } from "./workspace/types";
-import type { ChangeKind, Workspace, WorkspaceChange } from "./workspace/types";
+import type {
+  PaneEvent,
+  PaneMachine,
+  PanePainted,
+  ReadTicket,
+} from "./pane-view";
+import type { DiffsModule, EditModule, PierreFileView } from "./pierre";
+import type { ChangeKind } from "./session";
+import { TEXT_MAX_BYTES } from "./uploads";
 
-/** Pierre's built-in marker popover would open on the same token as the hover
- * tip and overlap it; the tip renders the diagnostics itself (one stack), so
- * the built-in popover is hidden. `unsafeCSS` is pierre's own escape hatch into
- * the file container's shadow root, where that popover lives. */
-const HIDE_MARKER_POPOVER_CSS = "[data-marker-popover] { display: none; }";
-
-/** Inline prediction only applies where the worker can complete: TS/JS, with
- * declarations excepted (their text is generated, nobody types them). */
-const PREDICTION_INCLUDE = [
-  "**/*.ts",
-  "**/*.tsx",
-  "**/*.mts",
-  "**/*.cts",
-  "**/*.js",
-  "**/*.jsx",
-  "**/*.mjs",
-  "**/*.cjs",
-] as const;
-
-const PREDICTION_EXCLUDE = ["**/*.d.ts", "**/*.d.mts", "**/*.d.cts"] as const;
-
-/** What the pane shows for a file it will not render as text — bytes that are
- * not text, or text past the size the editor works under. Both are read-only:
- * no edit session can form on a placeholder. */
+/** What the pane shows for a file it will not render as text. */
 const BINARY_PLACEHOLDER = "(binary file — preview not available)";
 const OVERSIZE_PLACEHOLDER = "(file exceeds 256 KB — preview not available)";
 
-/** The letter the header paints the open file's change as. The tree's own lane
- * spells the kinds the same way (pierre draws the letters from its status), so
- * the two panes never disagree; the kind itself comes from the workspace's
- * changes, the same list the tree marks from. */
-const CHANGE_LETTER = {
+/** The letter the header paints the open file's change as, matching the tree's
+ * own lane so the two panes never disagree. */
+const CHANGE_LETTER: Record<ChangeKind, string> = {
   added: "A",
   deleted: "D",
   modified: "M",
   moved: "R",
-} satisfies Record<ChangeKind, string>;
+};
 
-const DECODER = new TextDecoder();
-
-/** What the pod holds at a path, as the pane reads it. */
-interface DiskRead {
-  /** The placeholder bytes with no text show, or null when the text is real. */
-  placeholder: string | null;
-  text: string;
-}
-
-/** What the pane should show for a path, and whether it may be edited. */
-interface Show {
-  contents: string;
-  editable: boolean;
-  placeholder: string | null;
-}
-
-/** What `show` describes as a resolved read. */
-const resolved = (path: string, show: Show): ResolvedShow => ({
-  committedOnly: !show.editable && show.placeholder === null,
-  editable: show.editable,
-  path,
-  placeholder: show.placeholder,
-  text: show.contents,
-});
-
-/** What the editor pane needs from the browser, the tree and the workspace. */
+/** What the editor pane needs from the browser. */
 export interface EditorHost {
   aborted: () => boolean;
-  appId: string;
-  /** The workspace's changes, as of the last derive: the worker's own copy of
-   * the program is built out of their texts. */
-  changes: () => readonly WorkspaceChange[];
-  /** The pane's body (`paneIn`): what pierre mounts into, and the one
-   * container a paint wipes. The hover tip hangs in the pane above it (see
-   * `pane.ts`), so it outlives every placeholder and note. */
+  /** The change at the open path, for the header chip (null when none). */
+  changeAt: (path: string) => ChangeKind | null;
+  /** The pane's body: what pierre mounts into, and the one container a paint
+   * wipes. */
   codeEl: HTMLElement;
   diffs: DiffsModule;
   edit: EditModule;
-  /** The browser's write of an edit's text into the pod, and its report to the
-   * page. The tree's markers and the panel's rows follow from the derive the
-   * write triggers. Resolves when the pod holds the text, which is what tells
-   * the pane a read of its own write will see it. */
-  editChanged: (path: string, text: string) => Promise<void>;
+  /** Whether the browsed checkout may be edited at all (see `ReadOnlyRef`). */
+  editable: () => boolean;
+  /** The text this page already holds for `path` (a buffer), or null. */
+  held: (path: string) => string | null;
+  /** A keystroke: the text of the open file, to keep in the session. */
+  onEdit: (path: string, text: string) => void;
+  /** `?file=`: the open file is deep-linkable. */
   file: SearchParam<string>;
-  /** The ref the checkout under the pane is browsing: read, never captured —
-   * a branch switch installs another checkout under this same pane, and every
-   * read here (the committed text, the worker's sources) has to follow it. */
-  gitRef: () => string;
-  /** The checkout the pane drives, as of now: the browser installs another one
-   * when the browsed ref changes, and the pane follows it without being
-   * rebuilt (its edit session and its intel worker are the pane's own). */
-  workspace: () => Workspace;
+  /** Read one blob at the browsed ref. Throws the runner's refusal. */
+  read: (path: string) => Promise<RunnerBlob>;
 }
 
 /** The editor pane's surface for the browser and the tree wiring. */
 export interface EditorPane {
-  /** The pierre teardown: the File view and its editor. Called last, after the
-   * tree's own cleanup. */
+  /** The pierre teardown, called last, after the tree's own cleanup. */
   cleanUp: () => void;
-  /** Drop the edit session, the pending diagnostics and the intel worker. */
-  dispose: () => void;
-  /** Close the open file without reopening it (a change that took it away). */
-  dropOpen: () => void;
-  /** The checkout under the pane changed (a branch switch): the open file's
-   * text and path, its edit session and the worker's session all belong to the
-   * checkout that went, so they go — while what the pane *shows* stays
-   * standing, until the next `openFile` paints the new ref's file over it. */
-  rebase: () => void;
-  /** Re-key the open file's path and text when a move carried it off (a folder
-   * move carries everything under it). */
-  followMove: (from: string, to: string) => void;
-  getCurrentPath: () => string | null;
-  /** Open `path`; answers whether the pane shows it at all (`false` for a
-   * folder row, or a path neither the pod nor the commit has a file at). */
-  openFile: (path: string, caret?: IntelPosition) => Promise<boolean>;
-  /** Hand the caret back to `path` after something else took focus (the tree
-   * row a New File names grabs it as the rename lands), unless the user has
-   * typed since the file opened. */
-  reclaimCaret: (path: string, caret: IntelPosition) => void;
-  /** Re-sync the worker from scratch (a push changed the repo). */
-  resetIntel: () => void;
-  startedIntel: () => boolean;
-  /** The pod moved under the pane (an FS event named the open path): repaint
-   * what changed, refill the worker, and close a file that is gone. */
-  syncOpen: () => Promise<void>;
+  /** The path the pane holds, or null. */
+  current: () => string | null;
+  /** A ref switch dropped the checkout under the pane: forget the file. */
+  drop: () => void;
+  /** Paint `path`; answers whether the pane shows a file at all. */
+  open: (path: string) => Promise<boolean>;
+  /** Re-read the open file (a commit moved its base, or the page reset). */
+  reload: () => Promise<boolean>;
+  /** Paint a standing note in the pane ("Select a file to view"). */
+  note: (message: string) => void;
+  /** Repaint the header chip from the session's changes. */
+  syncStatus: () => void;
 }
 
 export const createEditorPane = (host: EditorHost): EditorPane => {
-  const { diffs } = host;
-  // Live text per open path: the editor's own copy is the truth while a file
-  // is open, and every editor position (token, cursor) becomes an offset
-  // against it before the worker sees it.
-  const liveText = new Map<string, string>();
-  /** What the code surface holds: one value for the open path, its text, its
-   * edit session and the token of the read that painted it (see
-   * `./pane-view`). `syncOpen` compares the pod against it. */
+  const { codeEl, diffs } = host;
   let machine: PaneMachine = newPaneMachine();
-  /** The path the pane is responsible for (`?file=`, the tree's selection):
-   * null while nothing is open, and after a rebase (the surface's text is the
-   * old checkout's). */
-  const currentPath = (): string | null => panePath(machine.view);
-  /** Whether the open file may be edited: the painted surface's own answer. */
-  const editableNow = (): boolean => paintedOf(machine.view)?.editable ?? false;
-  /** The text this pane handed to the pod whose write has not resolved yet,
-   * per open path. A read of the pod that runs while one of the pane's own
-   * writes is still landing comes back with bytes older than the editor, and
-   * repainting from them would drop the keystroke that is in them. */
-  const pendingWrites = new Map<string, string>();
-  /** Edits the user has made in this pane. A caret the pane was asked for
-   * lands only if no edit happened since it was asked for: Playwright and
-   * people alike type between frames, and a caret placed after the first
-   * keystroke sends the rest of the typing in front of it (`xport const
-   * extra = 1;e` in a new file). */
-  let edits = 0;
-  /** `edits` as of the open file's last paint, or a re-open nobody typed
-   * through. */
-  let editsAtOpen = 0;
-  // The open file's change, in the code header beside its name: pierre renders
-  // the header from a shadow root with a slot for it, and the chip rides along
-  // as light DOM. It reads the same workspace changes the tree marks from, so
-  // an edit, a discard, an undo or another tab's write shows in both without
-  // the pane keeping a second copy of the state.
+  let disposeEdit: (() => void) | undefined;
+
+  // The chip rides in pierre's header as light DOM (the header is a shadow
+  // root with a slot for it), so it survives every repaint.
   const statusChip = document.createElement("span");
   statusChip.className = "noite-src-change";
   statusChip.slot = "header-filename-suffix";
   statusChip.hidden = true;
 
-  /** Paint the change at `path` into the header chip, or hide it when the
-   * workspace has none there. */
   const paintStatus = (path: string | null): void => {
-    const change =
-      path === null
-        ? undefined
-        : host.changes().find((one) => one.path === path);
+    const kind = path === null ? null : host.changeAt(path);
 
-    if (change === undefined) {
+    if (kind === null) {
       statusChip.hidden = true;
 
       return;
     }
 
-    statusChip.dataset.changeKind = change.kind;
-    statusChip.textContent = CHANGE_LETTER[change.kind];
+    statusChip.dataset.changeKind = kind;
+    statusChip.textContent = CHANGE_LETTER[kind];
     statusChip.hidden = false;
   };
 
-  /** Put the chip in the header slot: pierre renders the header from a shadow
-   * root, and the chip carries the header's slot as its light DOM. */
   const attachStatus = (container: Element | null): void => {
     if (container !== null && statusChip.parentNode !== container) {
       container.append(statusChip);
     }
   };
 
-  // The intelligence layer is built before the editor it paints through, so
-  // the open file reaches it as live accessors rather than as values.
-  const intel = createEditorIntel({
-    aborted: host.aborted,
-    appId: host.appId,
-    changes: host.changes,
-    codeEl: host.codeEl,
-    currentEditable: editableNow,
-    currentPath,
-    diffs,
-    gitRef: host.gitRef,
-    liveText,
-  });
+  const editor = new host.edit.Editor("file");
 
-  let disposeEdit: (() => void) | undefined;
+  const fileView: PierreFileView = new diffs.File({
+    onEditChange: () => {
+      const shown = paintedOf(machine.view);
 
-  const editor = new host.edit.Editor("file", {
-    editPrediction: {
-      exclude: PREDICTION_EXCLUDE,
-      include: PREDICTION_INCLUDE,
-      provider: { predict: intel.predict },
+      if (shown === null || !shown.editable) {
+        return;
+      }
+
+      host.onEdit(shown.path, editor.getText());
+      paintStatus(shown.path);
     },
-    onAttach: intel.onAttach,
-  });
-
-  // Draft bookkeeping for the pierre editor: an edit that lands back on the
-  // commit's text leaves no change behind, which the derive settles on its
-  // own — the text goes to the pod either way.
-  const handleEditChange = () => {
-    const path = currentPath();
-
-    if (path === null || !editableNow()) {
-      return;
-    }
-
-    edits += 1;
-
-    const text = editor.getText();
-    liveText.set(path, text);
-
-    // The surface holds the typed text now: the machine spends the token of
-    // any read the pod is still answering, so its older bytes cannot paint
-    // over the keystrokes (and the rest of the typing, which pierre sends to
-    // the document a repaint rebuilt). The write's own derive reads again.
-    const typed = stepPane(machine, PaneEvents.TextChanged({ path, text }));
-
-    if (!typed.refused) {
-      ({ machine } = typed);
-    }
-
-    pendingWrites.set(path, text);
-
-    const settle = async () => {
-      try {
-        await host.editChanged(path, text);
-      } catch {
-        // The pod refused the write: the pane keeps the text it has, and the
-        // next derive re-reads whatever the pod really holds (see `syncOpen`).
-      }
-
-      if (pendingWrites.get(path) === text) {
-        pendingWrites.delete(path);
-      }
-    };
-
-    void settle();
-    intel.scheduleDiagnostics();
-  };
-
-  const fileView = new diffs.File({
-    onEditChange: handleEditChange,
     overflow: "scroll",
     theme: THEME,
   });
 
-  /** What the pod holds at `path`, or null when it holds no file there (a
-   * folder row, or a path that never was one). */
-  const readDisk = async (path: string): Promise<DiskRead | null> => {
-    const abs = projectPath(path);
+  /** The text a paint shows for one blob. */
+  const painted = (path: string, blob: RunnerBlob): PanePainted => {
+    const live = host.held(path);
 
-    if (!(await host.workspace().fs.exists(abs))) {
-      return null;
+    if (blob.binary) {
+      return {
+        editable: false,
+        path,
+        placeholder: BINARY_PLACEHOLDER,
+        text: "",
+      };
     }
 
-    const { isFile } = await host.workspace().fs.stat(abs);
-
-    if (!isFile) {
-      return null;
+    if (blob.truncated || blob.size > TEXT_MAX_BYTES) {
+      return {
+        editable: false,
+        path,
+        placeholder: OVERSIZE_PLACEHOLDER,
+        text: "",
+      };
     }
 
-    const bytes = await host.workspace().fs.readFile(abs);
-
-    if (!isTextBytes(bytes)) {
-      return { placeholder: BINARY_PLACEHOLDER, text: "" };
-    }
-
-    if (bytes.byteLength > TEXT_MAX_BYTES) {
-      return { placeholder: OVERSIZE_PLACEHOLDER, text: "" };
-    }
-
-    return { placeholder: null, text: DECODER.decode(bytes) };
+    return {
+      editable: host.editable(),
+      path,
+      placeholder: null,
+      text: live ?? blob.text,
+    };
   };
 
-  /** What an open may show of `path`: the pod's own file, the committed text
-   * read-only when the pod no longer has one (a staged deletion — the checkout
-   * is where those bytes are), or nothing at all when neither holds a text
-   * file. */
-  const resolveShow = async (path: string): Promise<Show | null> => {
-    const disk = await readDisk(path);
-
-    if (disk !== null) {
-      return disk.placeholder === null
-        ? {
-            contents: disk.text,
-            editable: host.workspace().editable,
-            placeholder: null,
-          }
-        : { contents: "", editable: false, placeholder: disk.placeholder };
-    }
-
-    const committed = await host.workspace().baseText(path);
-
-    return committed === null
-      ? null
-      : { contents: committed, editable: false, placeholder: null };
-  };
-
-  /** Whether the code surface already holds exactly what `show` describes for
-   * `path`: painting it again would rebuild the same document, and that (not
-   * the text) is what drops the caret's place and the edit session's focus. */
-  const shows = (path: string, show: Show): boolean => {
-    // Only the current checkout's own paint counts: a `Stale` surface (the
-    // checkout that went) must be repainted even for the same path and text,
-    // because the rebase took the edit session with it.
-    const painted: PaintedView | null = ownedPainted(machine.view);
-
-    return (
-      painted !== null &&
-      painted.path === path &&
-      painted.editable === show.editable &&
-      painted.placeholder === show.placeholder &&
-      painted.text === show.contents
-    );
-  };
-
-  /** What opening a file starts from: the previous file's session, markers,
-   * hover tip and any check still running are stale from here on; the
-   * intelligence layer drops its own half while the old session is still
-   * attached. */
-  const beginPreview = (path: string) => {
-    // Mirror the open file into the URL (deep-linkable).
-    host.file.set(path);
-    intel.beginPreview(path);
-    // A new file always starts detached; text re-attaches in `paint`.
-    disposeEdit?.();
-    disposeEdit = undefined;
-  };
-
-  /** Paint a file: the code surface, the edit session a text file of the pod's
-   * own gets, and the intelligence layer's first look at it. */
-  const paint = (path: string, show: Show, caret?: IntelPosition) => {
-    beginPreview(path);
-    const started = stepPane(machine, PaneEvents.Requested({ path }));
-    ({ machine } = started);
-
-    if (started.read === null) {
-      return;
-    }
-
-    const landed = stepPane(
-      machine,
-      PaneEvents.Resolved({
-        show: resolved(path, show),
-        token: started.read.token,
-      })
-    );
-
-    ({ machine } = landed);
-    editsAtOpen = edits;
-
-    if (show.placeholder !== null) {
-      liveText.delete(path);
-      host.codeEl.textContent = show.placeholder;
-      paintStatus(path);
-
-      return;
-    }
-
-    // The note a wait or a click painted, or the last placeholder, goes:
-    // leaving it would stack the file under stale text. Pierre's own container
-    // stays — a repaint of the same view renders into it and never appends it
-    // again. The pane's own furniture (the hover tip) is outside this
-    // container (see `pane.ts`).
-    let node = host.codeEl.firstChild;
+  /** Strip everything the last paint left except pierre's own container (a
+   * repaint of the same view renders into it, and never appends it again). */
+  const clearBody = (): void => {
+    let node = codeEl.firstChild;
 
     while (node !== null) {
       const next = node.nextSibling;
@@ -426,304 +183,143 @@ export const createEditorPane = (host: EditorHost): EditorPane => {
 
       node = next;
     }
+  };
 
-    liveText.set(path, show.contents);
+  const paint = (show: PanePainted): void => {
+    disposeEdit?.();
+    disposeEdit = undefined;
+
+    if (show.placeholder !== null) {
+      clearBody();
+      codeEl.textContent = show.placeholder;
+      paintStatus(show.path);
+
+      return;
+    }
+
+    clearBody();
     fileView.render({
-      containerWrapper: host.codeEl,
+      containerWrapper: codeEl,
       file: {
-        contents: show.contents,
-        lang: curatedLang(path, diffs.getFiletypeFromFileName),
-        name: path,
+        contents: show.text,
+        lang: curatedLang(show.path, diffs.getFiletypeFromFileName),
+        name: show.path,
       },
     });
-    attachStatus(host.codeEl.querySelector("diffs-container"));
-    paintStatus(path);
+    attachStatus(codeEl.querySelector("diffs-container"));
+    paintStatus(show.path);
 
     if (show.editable) {
       disposeEdit = editor.edit(fileView);
-
-      if (caret) {
-        intel.placeCaret(caret);
-      }
-    }
-
-    if (isScriptFile(path)) {
-      void intel.ensure();
-      void intel.runDiagnostics(path);
     }
   };
 
-  /** Open `path` in the pane; `caret` lands the cursor there (used by
-   * go-to-definition). A file the pod holds is a real file to the pane and
-   * needs no fetch; a path the checkout the pod came from still has opens as
-   * its committed text, read-only; a path neither holds is a folder row. */
-  const openFile = async (
-    path: string,
-    caret?: IntelPosition
-  ): Promise<boolean> => {
+  /** Apply one event to the machine and keep its new state. */
+  const advance = (event: PaneEvent) => {
+    const decision = stepPane(machine, event);
+    ({ machine } = decision);
+
+    return decision;
+  };
+
+  const note = (message: string): void => {
+    clearBody();
+    codeEl.textContent = message;
+    statusChip.hidden = true;
+  };
+
+  const read = async (ticket: ReadTicket): Promise<boolean> => {
+    let blob: RunnerBlob;
+
+    try {
+      blob = await host.read(ticket.path);
+    } catch (error) {
+      if (!host.aborted()) {
+        advance(
+          PaneEvents.Failed({
+            message: errorMessage(error),
+            ticket,
+          })
+        );
+        note(errorMessage(error));
+      }
+
+      return false;
+    }
+
     if (host.aborted()) {
       return false;
     }
 
-    const started = stepPane(machine, PaneEvents.Requested({ path }));
-    ({ machine } = started);
+    const show = painted(ticket.path, blob);
+    const resolved = advance(PaneEvents.Resolved({ painted: show, ticket }));
 
-    if (started.read === null) {
+    if (resolved.refused) {
+      // A newer read was started while this one was in flight.
       return false;
     }
 
-    const { token } = started.read;
-    const editsAtCall = edits;
+    if (host.file() !== ticket.path) {
+      host.file.set(ticket.path);
+    }
 
-    try {
-      const show = await resolveShow(path);
+    paint(show);
 
-      if (machine.seq !== token || host.aborted()) {
-        return false;
-      }
+    return true;
+  };
 
-      if (show === null) {
-        // Nothing to show: the surface goes back to what it held.
-        ({ machine } = stepPane(machine, PaneEvents.Abandoned()));
-
-        return false;
-      }
-
-      // The pane may be asked for what it already holds — the tree's own
-      // selection follows the open, and a move re-keys the open file without
-      // repainting it. Painting that again would rebuild the same document for
-      // nothing (and take the caret's place with it), so only the deep link
-      // and the caret asked for here are applied. The same holds while one of
-      // the pane's own writes to it is landing: the read is older than the
-      // editor (see `syncOpen`), and painting it would drop the keystrokes in
-      // that write. A caret asked for before the user typed in this document
-      // is stale.
-      if (shows(path, show) || pendingWrites.has(path)) {
-        ({ machine } = stepPane(
-          machine,
-          PaneEvents.Resolved({ show: resolved(path, show), token })
-        ));
-
-        if (host.file() !== path) {
-          host.file.set(path);
-        }
-
-        if (edits === editsAtCall) {
-          editsAtOpen = edits;
-
-          if (caret) {
-            intel.placeCaret(caret);
-          }
-        }
-
-        return true;
-      }
-
-      paint(path, show, caret);
-
-      return true;
-    } catch (error) {
-      if (machine.seq === token && !host.aborted()) {
-        ({ machine } = stepPane(
-          machine,
-          PaneEvents.OpenFailed({
-            message: errorMessage(error),
-            path,
-            token,
-          })
-        ));
-        host.codeEl.textContent = errorMessage(error);
-      }
-
+  const open = async (path: string): Promise<boolean> => {
+    if (host.aborted() || path === "") {
       return false;
     }
-  };
 
-  /** Close the open file: nothing shows it any more. */
-  const dropOpen = () => {
-    const path = currentPath();
+    const decision = advance(PaneEvents.Requested({ path }));
 
-    if (path === null) {
-      return;
+    if (decision.read === null) {
+      return false;
     }
 
-    ({ machine } = stepPane(machine, PaneEvents.Dropped()));
-    disposeEdit?.();
-    disposeEdit = undefined;
-    intel.detachSession();
-    liveText.delete(path);
-    host.codeEl.textContent = "";
-    paintStatus(null);
-  };
+    const shown = paintedOf(machine.view);
 
-  /** The checkout under the pane changed: the open file, its edit session and
-   * the worker's session are the old ref's, so they go — what the pane shows
-   * stays standing until the next `openFile` paints over it. In-flight opens
-   * of the old checkout answer into nothing (their token is spent). */
-  const rebase = () => {
-    ({ machine } = stepPane(machine, PaneEvents.Rebased()));
-    disposeEdit?.();
-    disposeEdit = undefined;
-    intel.detachSession();
-    liveText.clear();
-    pendingWrites.clear();
-    paintStatus(null);
-  };
-
-  /** The pod moved under the pane: repaint whatever the code surface is not
-   * already showing — a discard, a restore, an upload replacing the bytes, a
-   * push that landed on another branch, a staged deletion — and close the pane
-   * for a file that is gone from both the pod and the checkout. The pane's own
-   * writes are the one thing it must not paint over: a read taken while one is
-   * in flight is older than the editor, so it is skipped (the write's own
-   * derive comes back here with bytes it can trust). */
-  const syncOpen = async (): Promise<void> => {
-    const path = currentPath();
-
-    if (path === null || host.aborted()) {
-      return;
+    if (shown !== null && shown.placeholder === null && shown.path !== path) {
+      // The last paint stays on screen until the read lands: one note first,
+      // so the old file is not edited under a path that is about to change.
+      disposeEdit?.();
+      disposeEdit = undefined;
     }
 
-    // The change may be all that moved (an edit settling on the commit's text
-    // leaves no change, a new one arrives): the header follows it here, before
-    // any of the reads below can short-circuit.
-    attachStatus(host.codeEl.querySelector("diffs-container"));
-    paintStatus(path);
-    // A write of the pane's own is in flight: the pod may answer with bytes
-    // older than the editor, so this read is not one to compare against. The
-    // machine refuses the sync outright in that case (and while an open of this
-    // path is in flight), which is what keeps `?file=` and the surface in
-    // step: the in-flight open is never cancelled by a sync it would then
-    // abandon.
-    const writing = pendingWrites.has(path);
-
-    const started = stepPane(
-      machine,
-      PaneEvents.SyncStarted({ path, writing })
-    );
-
-    if (started.refused) {
-      if (writing) {
-        intel.scheduleDiagnostics();
-      }
-
-      return;
-    }
-
-    ({ machine } = started);
-
-    if (started.recheck || started.read === null) {
-      intel.scheduleDiagnostics();
-
-      return;
-    }
-
-    const { token } = started.read;
-    const show = await resolveShow(path);
-
-    // The token is spent when the surface moved on under the read — another
-    // request, a rebase, or a keystroke (`TextChanged`). A keystroke is the
-    // common one: the read was sent before it, so the pod answers with bytes
-    // older than the editor, and painting them would undo the typing.
-    if (machine.seq !== token || path !== currentPath() || host.aborted()) {
-      return;
-    }
-
-    if (show === null) {
-      dropOpen();
-
-      return;
-    }
-
-    if (shows(path, show)) {
-      // Put the surface back on its painted value: the sync opened a read that
-      // found nothing to change.
-      const painted = paintedOf(machine.view);
-
-      machine =
-        painted === null
-          ? stepPane(machine, PaneEvents.Abandoned()).machine
-          : {
-              seq: machine.seq,
-              view: PaneViews.Painted(painted),
-            };
-      intel.scheduleDiagnostics();
-
-      return;
-    }
-
-    paint(path, show);
-  };
-
-  const followMove = (from: string, to: string) => {
-    const moved = (path: string): string =>
-      path === from || path.startsWith(`${from}/`)
-        ? `${to}${path.slice(from.length)}`
-        : path;
-
-    // Re-keying the entry being visited is safe: the map holds the open files
-    // only, and a move never lands inside the path it came from.
-    for (const [path, text] of liveText) {
-      const next = moved(path);
-
-      if (next !== path) {
-        liveText.delete(path);
-        liveText.set(next, text);
-      }
-    }
-
-    ({ machine } = stepPane(machine, PaneEvents.Moved({ from, to })));
-  };
-
-  // `File.setOptions` replaces the whole option set, so the hooks are added
-  // to a copy of what the component was built with. The click hook needs the
-  // pane's own open path (go-to-definition jumps through it), which only
-  // exists from here on.
-  fileView.setOptions({
-    onEditChange: handleEditChange,
-    // The header is re-rendered (a worker highlight lands, another file opens):
-    // the chip rides along as the header slot's light DOM, so it is put back.
-    onPostRender: attachStatus,
-    onTokenClick: (props, event) => {
-      intel.tokenClick(props, event, openFile);
-    },
-    onTokenEnter: (props) => {
-      void intel.tokenEnter(props);
-    },
-    onTokenLeave: intel.tokenLeave,
-    overflow: "scroll",
-    theme: THEME,
-    unsafeCSS: HIDE_MARKER_POPOVER_CSS,
-  });
-
-  const dispose = () => {
-    disposeEdit?.();
-    disposeEdit = undefined;
-    intel.dispose();
-  };
-
-  const cleanUp = () => {
-    fileView.cleanUp();
-    editor.cleanUp();
-  };
-
-  const reclaimCaret = (path: string, caret: IntelPosition) => {
-    if (path === currentPath() && edits === editsAtOpen) {
-      intel.placeCaret(caret);
-    }
+    return await read(decision.read);
   };
 
   return {
-    cleanUp,
-    dispose,
-    dropOpen,
-    followMove,
-    getCurrentPath: currentPath,
-    openFile,
-    rebase,
-    reclaimCaret,
-    resetIntel: intel.reset,
-    startedIntel: intel.started,
-    syncOpen,
+    cleanUp: () => {
+      disposeEdit?.();
+      disposeEdit = undefined;
+      fileView.cleanUp();
+      editor.cleanUp();
+    },
+    current: () => panePath(machine.view),
+    drop: () => {
+      disposeEdit?.();
+      disposeEdit = undefined;
+      // A new sequence: any read still in flight resolves against a machine
+      // that is no longer waiting for it, and is refused.
+      machine = { seq: machine.seq + 1, view: PaneViews.Closed() };
+      statusChip.hidden = true;
+    },
+    note,
+    open,
+    reload: async () => {
+      const path = panePath(machine.view);
+
+      if (path === null) {
+        return false;
+      }
+
+      return await open(path);
+    },
+    syncStatus: () => {
+      paintStatus(panePath(machine.view));
+    },
   };
 };

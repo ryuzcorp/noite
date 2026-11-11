@@ -40,7 +40,6 @@ import type { PrDetail } from "./runner-types/PrDetail";
 import type { PrList } from "./runner-types/PrList";
 import type { R2File } from "./runner-types/R2File";
 import type { R2Preview } from "./runner-types/R2Preview";
-import type { SourceBundle as RunnerSourceBundle } from "./runner-types/SourceBundle";
 import type { SourceCommitBody } from "./runner-types/SourceCommitBody";
 import type { StorageItem } from "./runner-types/StorageItem";
 import type { TelemetryStatus as RunnerTelemetryStatus } from "./runner-types/TelemetryStatus";
@@ -169,8 +168,6 @@ export type { R2Folder } from "./runner-types/R2Folder";
 export type { R2Object } from "./runner-types/R2Object";
 
 export type { R2Preview } from "./runner-types/R2Preview";
-
-export type { SourceBundle as RunnerSourceBundle } from "./runner-types/SourceBundle";
 
 export type { SourceCommitBody } from "./runner-types/SourceCommitBody";
 
@@ -952,13 +949,6 @@ export const runnerSourceTree = (id: string, ref?: string) =>
 
 export const runnerSourceBlob = (id: string, path: string, ref?: string) =>
   runnerRpc<RunnerBlob>("source.blob", { id, path, ref });
-
-// RunnerSourceBundle/SourceFile are generated from
-// host::source::{SourceBundle, SourceFile}. The bundle is the repo's own text
-// sources at `ref` (capped, `truncated` marks a capped read).
-
-export const runnerSourceBundle = (id: string, ref?: string) =>
-  runnerRpc<RunnerSourceBundle>("source.bundle", { id, ref });
 
 // Preview environments (ROADMAP: Preview environments). The runner enforces
 // the app role on every call, so the UI resolves the caller's role and passes

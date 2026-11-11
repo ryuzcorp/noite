@@ -9,7 +9,7 @@
 // `not_found_handling "none"` (a missing hashed chunk 404s instead of
 // serving the document), the D1 `DB` keyed by name (no `database_id`), the
 // `ASSETS` binding declared (celld does not inject it), and `vars` defaults
-// the runner overwrites at deploy time. Isolation + cache headers mirror
+// the runner overwrites at deploy time. The asset cache header mirrors
 // `public/_headers` (celld reads that file too); Void applies
 // `routing.headers` to assets, SSR pages and API responses.
 import { defineConfig } from "void/config";
@@ -58,11 +58,6 @@ export default defineConfig({
   },
   routing: {
     headers: {
-      "/*": [
-        "Cross-Origin-Embedder-Policy: require-corp",
-        "Cross-Origin-Opener-Policy: same-origin",
-        "Cross-Origin-Resource-Policy: same-origin",
-      ],
       "/assets/*": ["Cache-Control: public, max-age=31536000, immutable"],
     },
   },

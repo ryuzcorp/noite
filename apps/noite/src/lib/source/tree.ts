@@ -1,43 +1,56 @@
 //! The source tree wiring: the `@pierre/trees` instance the pane mounts, its
 //! options and composition (context menu, inline renaming, drag and drop), and
-//! the flows it composes. The pod is the tree's data: its rows are the checkout
-//! (every file, plus the folders that hold none), every gesture is a filesystem
-//! write, and the markers come from the workspace's own derive. The row flows
-//! live in `./tree-rows` and the upload UI in `./tree-uploads`; this module
-//! wires both through `host` and keeps pierre's store in step with the pod.
+//! the flows it composes. The rows are the browsed commit's files plus what
+//! the page's session holds — nothing is read from or written to a filesystem,
+//! because there is none: a New File is a buffer, a move is the commit's
+//! `moves` list, and a delete is a staged deletion. The markers come from the
+//! same session, so the tree and the Changes panel cannot disagree.
 
+/* oxlint-disable eslint/no-use-before-define -- the tree's flows are mutually
+   recursive by nature: `build` wires the pierre callbacks that call the flows,
+   and every flow rebuilds the rows after a structural change. Hoisting one side
+   would only move the cycle. */
 import { errorMessage } from "../errors";
 import type { SearchParam } from "../search-param";
-import type { IntelPosition } from "./intel-protocol";
+import { confirmDialog } from "../ui/confirm";
+import {
+  clearNaming,
+  finishNaming,
+  newNamingMachine,
+  refuseNaming,
+  settleNaming,
+  startNaming,
+} from "./naming-state";
+import type { NamingMachine, PendingAdd } from "./naming-state";
 import type {
   Tree,
+  TreeDropContext,
   TreeGitStatus,
+  TreeRenameEvent,
   TreeStatusEntry,
   TreesModule,
 } from "./pierre";
+import type { ChangeKind, SourceChange, Upload } from "./session";
+import { byPath } from "./session";
 import {
   isTreeRow,
   menuDir,
   newToaster,
   newTreeMenu,
   openTreeMenu,
+  parentDir,
   renameInput,
   sortTreePaths,
   withoutSlash,
 } from "./tree-menu";
-import type { MenuTarget, Toaster, TreeMenu } from "./tree-menu";
-import { createTreeNaming } from "./tree-naming";
-import { createTreeRows } from "./tree-rows";
-import type { TreeRowStore } from "./tree-rows";
-import { askResync, finishResync, ResyncStates } from "./tree-sync";
-import type { ResyncState } from "./tree-sync";
-import { createTreeUploads } from "./tree-uploads";
-import type {
-  ChangeKind,
-  CheckoutListing,
-  Workspace,
-  WorkspaceChange,
-} from "./workspace/types";
+import type { Toaster, TreeMenu } from "./tree-menu";
+import {
+  checkLimits,
+  readDroppedItems,
+  readPickedFiles,
+  UPLOAD_LIMITS,
+} from "./uploads";
+import type { UploadRead } from "./uploads";
 
 /** How a change paints in the tree: pierre's own names, one per change kind. */
 const STATUS: Record<ChangeKind, TreeGitStatus> = {
@@ -58,109 +71,108 @@ const CONFIG_FILES = [
 /** What the tree wiring needs from the browser and the editor pane. */
 export interface TreeHost {
   aborted: () => boolean;
-  /** The workspace's changes, as of the last derive: what the markers paint
-   * and what a name may not claim (a staged deletion). */
-  changes: () => readonly WorkspaceChange[];
+  /** The change the session holds at `path`, when it has one. */
+  changeAt: (path: string) => SourceChange | undefined;
+  /** Every file the tree shows (the session's rows), in path order. */
+  rows: () => readonly string[];
+  /** Whether the browsed checkout may be edited. */
   editable: () => boolean;
+  /** `?file=`: the open file is deep-linkable. */
   file: SearchParam<string>;
-  /** The pane's `followMove(from, to)`: re-keys the open file's text and path. */
-  followMove: (from: string, to: string) => void;
-  getCurrentPath: () => string | null;
-  openFile: (path: string, caret?: IntelPosition) => Promise<boolean>;
-  reclaimCaret: (path: string, caret: IntelPosition) => void;
-  /** The page's report: a change happened, so an earlier push outcome is
-   * superseded. */
-  report: () => void;
+  /** The pane's open, so a selection shows the file. */
+  openFile: (path: string) => Promise<boolean>;
+  notify: (message: string) => void;
+  /** Add a text file to the session; the reason when it is refused. */
+  addText: (path: string, text: string) => string;
+  /** Add an uploaded file to the session; the reason when it is refused. */
+  addUpload: (path: string, upload: Upload) => string;
+  /** Stage `path`'s deletion (an added file is simply forgotten). */
+  removePath: (path: string) => void;
+  /** Rename in the session; the reason when it is refused. */
+  movePath: (from: string, to: string) => string;
   signal: AbortSignal;
-  /** The pane's `syncOpen()`: put the open file back in step with the pod. */
-  syncOpen: () => Promise<void>;
   treeEl: HTMLElement;
   trees: TreesModule;
-  /** The checkout the rows read and write, as of now: a branch switch installs
-   * another one under this same tree (the rows are rebuilt from its listing). */
-  workspace: () => Workspace;
 }
 
 /** The tree wiring's surface for the browser. */
 export interface TreeWiring {
-  /** Paint the checkout: every file and every empty folder as a row, and the
-   * commit's own markers. Answers the file to open first, if any. */
-  buildTree: (listing: CheckoutListing) => string | undefined;
+  /** Build the rows: answers the file to open first, if any. */
+  build: () => string | undefined;
   cleanUp: () => void;
-  /** Discard one row's change (see `discardChange`). */
-  discard: (path: string) => void;
-  /** Discard every change and put the rows back on the checkout. */
-  discardAll: () => void;
-  /** Whether pierre still holds a path (its store, not the visible rows). */
-  hasRow: (path: string) => boolean;
-  /** The pane's toast corner, for the composition's own notices. */
-  notify: (message: string) => void;
-  restorePath: (path: string) => void;
-  /** Derive again and put the rows in step with the pod (a push can change
-   * what the checkout holds without the pane having touched it). */
-  resync: () => Promise<void>;
-  /** Push the changes into the tree's status markers, if they changed. */
+  /** Repaint the markers from the session (a keystroke changes none of the
+   * rows, only their status). */
   syncStatus: () => void;
 }
 
 /** The markers as a memo key: an unchanged set never repaints the tree. */
-const statusKey = (entries: readonly TreeStatusEntry[]) =>
+const statusKey = (entries: readonly TreeStatusEntry[]): string =>
   entries.map((entry) => `${entry.path}\u0000${entry.status}`).join("\n");
 
-/** The changes as pierre paints them: one marker per changed path, under the
- * status its kind names. */
-const markers = (changes: readonly WorkspaceChange[]): TreeStatusEntry[] =>
-  changes.map((change) => ({
-    path: change.path,
-    status: STATUS[change.kind],
-  }));
+/** A folder rename carries every row under it. */
+const under = (rows: readonly string[], dir: string): string[] =>
+  rows.filter((path) => path.startsWith(`${dir}/`));
 
-/** The paths the checkout's rules exclude, as pierre paints them: its own
- * `ignored` status, which dims the row — and a folder under it with it. */
-const ignoredMarkers = (listing: CheckoutListing): TreeStatusEntry[] => [
-  ...listing.ignoredDirs.map((dir) => ({
-    path: `${dir}/`,
-    status: "ignored" as const,
-  })),
-  ...listing.ignoredFiles.map((path) => ({
-    path,
-    status: "ignored" as const,
-  })),
-];
+/** The path a row stands for: pierre hands folder rows with a trailing slash,
+ * and the session speaks bare paths. */
+const rowPath = (path: string): string => withoutSlash(path);
 
-/** The checkout as the tree's rows: `dir/` for a folder, the path itself for a
- * file. A folder the checkout holds no file under is a row of its own — the
- * only place such a folder shows — and so is a path the rules exclude, which
- * the markers below paint dimmed. */
-const rowPaths = (listing: CheckoutListing): string[] => [
-  ...listing.files,
-  ...listing.ignoredFiles,
-  ...listing.dirs.map((dir) => `${dir}/`),
-  ...listing.ignoredDirs.map((dir) => `${dir}/`),
-];
+/** The folder rows of a path, so a deep link opens with its parents shown. */
+const ancestors = (path: string): string[] => {
+  const parts = path.split("/");
+  const out: string[] = [];
+
+  for (let i = 1; i < parts.length; i += 1) {
+    out.push(parts.slice(0, i).join("/"));
+  }
+
+  return out;
+};
+
+/** Whether a drag carries files from outside the page (an OS drop). */
+const onDragOver = (event: DragEvent): void => {
+  if (event.dataTransfer === null) {
+    return;
+  }
+
+  if ([...event.dataTransfer.types].includes("Files")) {
+    event.preventDefault();
+  }
+};
 
 export const createTreeWiring = (host: TreeHost): TreeWiring => {
   let tree: Tree | undefined;
   /** The row paths pierre holds, as one set: pierre's store cannot be
-   * enumerated, so the wiring keeps the same set beside it. */
+   * enumerated, so the wiring remembers what it put there. */
   let held = new Set<string>();
-  /** The paths the checkout's rules exclude, as the tree paints them (dimmed —
-   * see `ignoredMarkers`) and as one set the row flows read. A listing replaces
-   * both, so they always describe the rows in the tree. */
-  let ignored: TreeStatusEntry[] = [];
-  let excluded = new Set<string>();
-  /** The open context menu, torn down with the pane (it lives on
-   * `document.body`, outside the panes ilha rebuilds). */
+  let treeStatusKey = "";
   let menu: TreeMenu | null = null;
+  let naming: NamingMachine = newNamingMachine();
   const toaster: Toaster = newToaster();
 
-  /** Push the changes into the tree: the markers of the derive, plus the paths
-   * the checkout's rules exclude, which pierre paints dimmed beside them. A
-   * no-op while neither set moved, so typing never repaints the tree. */
-  let treeStatusKey = "";
+  // One hidden picker for the menu's upload action; its change handler is
+  // registered with the rest of the listeners at the bottom.
+  const input = document.createElement("input");
+  input.type = "file";
+  input.multiple = true;
+  input.hidden = true;
+  input.dataset.sourceUpload = "true";
 
-  const syncStatus = () => {
-    const entries = [...markers(host.changes()), ...ignored];
+  const notify = (message: string): void => {
+    toaster.notify(message);
+  };
+
+  const markers = (): TreeStatusEntry[] =>
+    host.rows().flatMap((path) => {
+      const change = host.changeAt(path);
+
+      return change === undefined
+        ? []
+        : [{ path, status: STATUS[change.kind] }];
+    });
+
+  const syncStatus = (): void => {
+    const entries = markers();
     const key = statusKey(entries);
 
     if (key === treeStatusKey) {
@@ -171,290 +183,405 @@ export const createTreeWiring = (host: TreeHost): TreeWiring => {
     tree?.setGitStatus(entries);
   };
 
-  /** Whether pierre still holds a path (its store, not the visible rows). */
-  const hasRow = (path: string): boolean =>
-    tree !== undefined && tree.getItem(path) !== null;
+  /** The file to open when a browse names none: the deep link, else the
+   * Worker config, else nothing. */
+  const firstFile = (): string | undefined => {
+    const wanted = host.file();
 
-  /** Drop a row pierre still holds — removing an absent path throws. The
-   * markers go with it: a row that left the tree must not leave its status
-   * behind in the store. */
-  const dropRow = (path: string) => {
-    if (hasRow(path)) {
-      tree?.remove(path);
+    if (wanted !== "" && held.has(wanted)) {
+      return wanted;
     }
 
-    held.delete(path);
-    syncStatus();
+    return CONFIG_FILES.find((name) => held.has(name));
   };
 
-  /** Add a row to pierre's store, and mirror it only when pierre took it: a
-   * `held` entry without a row made `hasRow` and `filesUnder` disagree (a
-   * delete counted files the tree could not remove). */
-  const addRow = (path: string) => {
-    if (tree === undefined) {
-      return;
-    }
-
-    tree.add(path);
-    held.add(path);
-    syncStatus();
-  };
-
-  /** The live rows, as the row flows reach them (see `TreeRowStore`). */
-  const store: TreeRowStore = { add: addRow, drop: dropRow, has: hasRow };
-
-  /** The change the workspace derived for `path`, when it has one. */
-  const changeAt = (path: string): WorkspaceChange | undefined =>
-    host.changes().find((change) => change.path === path);
-
-  /** The file rows under a folder ("" at the root): what a folder delete
-   * counts, and what a delete of it takes with it. */
-  const filesUnder = (dir: string): string[] => {
-    const prefix = dir === "" ? "" : `${dir}/`;
-
-    return [...held].filter(
-      (path) => !path.endsWith("/") && path.startsWith(prefix)
-    );
-  };
-
-  /** Take one listing's excluded paths as the tree's own: the dimmed markers,
-   * and the set the row flows ask about (`ignoredPath`). */
-  const holdIgnored = (listing: CheckoutListing) => {
-    ignored = ignoredMarkers(listing);
-    excluded = new Set([...listing.ignoredDirs, ...listing.ignoredFiles]);
-  };
-
-  /** Whether the checkout's rules exclude a row — a path git is not tracking,
-   * whatever the pod holds there. A delete does not count one as part of the
-   * repository, and nothing about it is ever pushed. */
-  const ignoredPath = (path: string): boolean =>
-    excluded.has(withoutSlash(path));
-
-  /** The placeholder path the inline input is naming, if any. The naming flow
-   * below owns it, but the flows it feeds need `resync` first — so this cell
-   * is assigned with the naming flow and `resync` reads through it. */
-  let pendingPath: (() => string | undefined) | undefined = undefined;
-
-  /** Derive the pod again and put the rows in step with it: the listing is the
-   * truth, so a row the checkout no longer has goes (deepest first — pierre
-   * refuses to remove a folder that still holds children) and one it gained
-   * comes in (shallowest first). A row pierre moved itself is already where the
-   * listing says it is, so it costs nothing. The add being named stays: its
-   * placeholder is in no listing yet, and dropping it would kill the inline
-   * input mid-name. A derive or a row pierre refuses is reported and leaves
-   * the rows as they are. */
-  const syncRows = async (): Promise<void> => {
-    try {
-      await host.workspace().refresh();
-      const listing = await host.workspace().listing();
-      holdIgnored(listing);
-      const next = rowPaths(listing);
-      const wanted = new Set(next);
-      // Every folder the listing's rows sit under. A folder row the pod no
-      // longer names in its own right is not a row to drop while these hold it
-      // up: pierre refuses to remove a folder that still has children, and
-      // those children are exactly what implies the folder now — an empty or
-      // ignored folder that just gained a file is the usual way to get here.
-      const implied = new Set<string>();
-
-      for (const row of next) {
-        const parts = row.split("/");
-
-        for (let i = 1; i < parts.length; i += 1) {
-          implied.add(`${parts.slice(0, i).join("/")}/`);
-        }
-      }
-
-      const pending = pendingPath === undefined ? undefined : pendingPath();
-
-      for (const path of [...held].toSorted((a, b) => b.length - a.length)) {
-        if (
-          !wanted.has(path) &&
-          path !== pending &&
-          !(path.endsWith("/") && implied.has(path))
-        ) {
-          dropRow(path);
-        }
-      }
-
-      for (const path of next.toSorted((a, b) => a.length - b.length)) {
-        // A row pierre moved itself (its inline rename, a drag) is already in
-        // its store under the new path: the mirror takes it from there.
-        if (hasRow(path)) {
-          held.add(path);
-          continue;
-        }
-
-        store.add(path);
-      }
-
-      syncStatus();
-    } catch (error) {
-      toaster.notify(errorMessage(error));
-    }
-  };
-
-  /** The runs are one at a time, and the last ask wins: a gesture, the pod's
-   * own watcher and a `.gitignore` write all ask for one, and two listings
-   * landing out of order would put back a row the pod no longer holds (the
-   * empty-folder and ignored-folder rows are the ones nothing else implies).
-   * A caller that arrives mid-run is answered by the run after it (see
-   * `./tree-sync`). */
-  let queue: ResyncState = ResyncStates.Idle();
-  let running: Promise<void> | null = null;
-
-  const resync = async (): Promise<void> => {
-    const asked = askResync(queue);
-    queue = asked.state;
-
-    if (!asked.run) {
-      await running;
-
-      return;
-    }
-
-    let run = true;
-
-    while (run) {
-      const pass = syncRows();
-      running = pass;
-
-      try {
-        // oxlint-disable-next-line eslint/no-await-in-loop -- one run at a time is the point: a later listing must not overtake an earlier one.
-        await pass;
-      } finally {
-        running = null;
-      }
-
-      const next = finishResync(queue);
-      queue = next.state;
-      ({ run } = next);
-    }
-  };
-
-  const flow = createTreeRows({
-    aborted: host.aborted,
-    changeAt,
-    editable: host.editable,
-    filesUnder,
-    followMove: host.followMove,
-    getCurrentPath: host.getCurrentPath,
-    ignoredPath,
-    notify: (message) => {
-      toaster.notify(message);
-    },
-    openFile: host.openFile,
-    reclaimCaret: host.reclaimCaret,
-    report: host.report,
-    resync,
-    rows: store,
-    signal: host.signal,
-    syncOpen: host.syncOpen,
-    workspace: host.workspace,
-  });
-
-  // The upload flow mounts its own input and drop highlight, and registers its
-  // drag listeners as it is built (see `./tree-uploads`).
-  const uploads = createTreeUploads({
-    aborted: host.aborted,
-    changeAt,
-    editable: host.editable,
-    hasRow,
-    notify: (message) => {
-      toaster.notify(message);
-    },
-    overlay: host.treeEl.parentNode ?? host.treeEl,
-    report: host.report,
-    resync,
-    signal: host.signal,
-    treeEl: host.treeEl,
-    workspace: host.workspace,
-  });
-
-  // Naming an add is pierre's own inline rename (the row itself becomes the
-  // input); the naming flow only holds its name rules in front of the commit.
-  const naming = createTreeNaming({
-    changeAt,
-    dropRow,
-    editable: host.editable,
-    hasRow,
-    landAdd: flow.landAdd,
-    onRenamed: flow.renamedRow,
-    rowAdd: (row) => {
-      store.add(row);
-    },
-    startRenaming: (path) =>
-      tree?.startRenaming(path, { removeIfCanceled: true }) ?? false,
-    toaster,
-    treeReady: () => tree !== undefined,
-  });
-
-  // oxlint-disable-next-line eslint/prefer-destructuring -- assigning one cell, not unpacking a shape.
-  pendingPath = naming.pendingPath;
-
-  /** Tear the pane's menu down (idempotent: pierre's own close lands here
-   * too, when its menu state settles). */
-  const closeMenu = () => {
+  const closeMenu = (): void => {
     menu?.close();
     menu = null;
+  };
+
+  /** One rename in the session; the refusal is the user's to read. */
+  const landMove = (from: string, to: string): void => {
+    const refusal = host.movePath(from, to);
+
+    if (refusal !== "") {
+      notify(refusal);
+    }
+  };
+
+  /** Rebuild the rows from the session: after a ref switch, a move, a delete
+   * or an add, the listing is the truth. Rebuilding rather than patching keeps
+   * pierre's store and the session from drifting apart — the two used to be
+   * separate copies of the tree. */
+  const build = (): string | undefined => {
+    const rows = [...host.rows()].toSorted(byPath);
+    held = new Set(rows);
+    const initial = firstFile();
+    tree?.cleanUp();
+    closeMenu();
+    const { FileTree, preparePresortedFileTreeInput } = host.trees;
+    const entries = markers();
+    treeStatusKey = statusKey(entries);
+    tree = new FileTree({
+      composition: host.editable()
+        ? {
+            contextMenu: {
+              enabled: true,
+              onClose: closeMenu,
+              onOpen: (item, context) => {
+                openMenu(rowPath(item.path), context.anchorRect, context.close);
+              },
+              triggerMode: "right-click",
+            },
+          }
+        : undefined,
+      dragAndDrop: host.editable()
+        ? {
+            canDrop: (drop: TreeDropContext) =>
+              host.editable() && drop.draggedPaths.length > 0,
+            onDropComplete: (drop) => {
+              for (const dragged of drop.draggedPaths) {
+                const from = rowPath(dragged);
+                const name = from.slice(from.lastIndexOf("/") + 1);
+
+                const to =
+                  drop.target.kind === "root" ||
+                  drop.target.directoryPath === null
+                    ? name
+                    : `${drop.target.directoryPath}${name}`;
+
+                landMove(from, to);
+              }
+
+              build();
+            },
+            onDropError: notify,
+          }
+        : undefined,
+      gitStatus: entries,
+      initialExpandedPaths: initial === undefined ? [] : ancestors(initial),
+      initialSelectedPaths: initial === undefined ? undefined : [initial],
+      onSelectionChange: (selected) => {
+        const [first] = selected;
+
+        if (first !== undefined && !first.endsWith("/")) {
+          void host.openFile(rowPath(first));
+        }
+      },
+      preparedInput: preparePresortedFileTreeInput(sortTreePaths(rows)),
+      // Top-level, not under `composition`: see `FileTreeOptions`.
+      renaming: host.editable()
+        ? {
+            canRename: () => host.editable(),
+            onError: nameRefused,
+            onRename: finishAdd,
+          }
+        : undefined,
+      search: true,
+    });
+    // The pane may hold a note from before the rows arrived: the tree replaces
+    // it rather than stacking under it.
+    host.treeEl.textContent = "";
+    tree.render({ fileTreeContainer: host.treeEl });
+
+    return initial;
+  };
+
+  /** Rename a row pierre already moved: a folder carries everything under it,
+   * and the row itself is one file or nothing. */
+  const landRename = (from: string, to: string, isFolder: boolean): void => {
+    if (!isFolder) {
+      landMove(from, to);
+      build();
+
+      return;
+    }
+
+    for (const path of under([...held], from)) {
+      landMove(path, `${to}${path.slice(from.length)}`);
+    }
+
+    build();
+  };
+
+  /** A name no path may carry, or one a staged change still claims. */
+  const nameError = (leaf: string, path: string): string | null => {
+    if (leaf === "" || leaf === "." || leaf === "..") {
+      return `"${leaf}" is not a usable name.`;
+    }
+
+    const change = host.changeAt(path);
+
+    return change === undefined ? null : `"${leaf}" already exists.`;
+  };
+
+  /** A free leaf in `dir` for the row the inline input names. */
+  const uniqueLeaf = (dir: string, stem: string): string => {
+    for (let n = 1; ; n += 1) {
+      const leaf = n === 1 ? stem : `${stem}-${n}`;
+
+      if (host.changeAt(`${dir}${leaf}`) === undefined) {
+        return leaf;
+      }
+    }
+  };
+
+  /** The placeholder a New File parked, landed as the file it named. */
+  const landAdd = (add: PendingAdd): void => {
+    const refusal = host.addText(add.path, "");
+
+    if (refusal !== "") {
+      notify(refusal);
+      build();
+
+      return;
+    }
+
+    build();
+    void host.openFile(add.path);
+  };
+
+  /** pierre's inline input landed on a name: the add becomes the file it
+   * names, or the placeholder is taken back out. */
+  const finishAdd = (event: TreeRenameEvent): void => {
+    const dest = rowPath(event.destinationPath);
+    const pending = naming.state._tag === "Naming" ? naming.state.add : null;
+
+    if (pending !== null && event.sourcePath === pending.path) {
+      const error = nameError(dest.slice(dest.lastIndexOf("/") + 1), dest);
+
+      if (error !== null) {
+        naming = clearNaming(naming);
+        queueMicrotask(() => {
+          build();
+        });
+        notify(error);
+
+        return;
+      }
+    }
+
+    const decision = finishNaming(naming, {
+      destinationPath: dest,
+      isFolder: event.isFolder,
+      sourcePath: rowPath(event.sourcePath),
+    });
+
+    naming = decision.machine;
+
+    if (decision.land !== null) {
+      landAdd(decision.land);
+
+      return;
+    }
+
+    if (decision.rename !== null) {
+      landRename(
+        rowPath(decision.rename.sourcePath),
+        rowPath(decision.rename.destinationPath),
+        event.isFolder
+      );
+    }
+  };
+
+  /** pierre refused a name (empty, a "/" in it, a path its store holds): the
+   * input closes but the placeholder stays, so it is taken back out here. */
+  const nameRefused = (error: string): void => {
+    const decision = refuseNaming(naming, error);
+    naming = decision.machine;
+
+    if (decision.refused) {
+      return;
+    }
+
+    queueMicrotask(() => {
+      build();
+    });
+
+    if (decision.notify !== null) {
+      notify(decision.notify);
+    }
+  };
+
+  /** An untouched name is no rename at all: the placeholder is settled by the
+   * blur that closes the input. One microtask out, because pierre finishes its
+   * own state after its callbacks return. */
+  const settleAdd = (add: PendingAdd): void => {
+    queueMicrotask(() => {
+      const decision = settleNaming(naming, add, held.has(add.path));
+      naming = decision.machine;
+
+      if (decision.land !== null) {
+        landAdd(decision.land);
+      }
+    });
+  };
+
+  /** New File: a placeholder row goes in, pierre turns it into its inline
+   * input, and the name it lands on becomes the file. A second pick while one
+   * is being named is refused — it would orphan the first placeholder. */
+  const startAdd = (dir: string): void => {
+    if (!host.editable() || tree === undefined) {
+      return;
+    }
+
+    const prefix = dir === "" ? "" : `${dir}/`;
+    const path = `${prefix}${uniqueLeaf(prefix, "untitled")}`;
+    const started = startNaming(naming, { isFolder: false, path });
+
+    if (!started.accepted) {
+      return;
+    }
+
+    naming = started.machine;
+
+    try {
+      tree.add(path);
+      held.add(path);
+    } catch (error) {
+      notify(errorMessage(error));
+
+      return;
+    }
+
+    if (!tree.startRenaming(path, { removeIfCanceled: true })) {
+      naming = clearNaming(naming);
+      build();
+      notify("This tree cannot be changed.");
+    }
+  };
+
+  /** New name rules in front of pierre's commit: Enter would take the name and
+   * move the row, so a refused one is stopped while the input still has it. */
+  const guardNameKey = (event: KeyboardEvent): void => {
+    const add = naming.state._tag === "Naming" ? naming.state.add : null;
+
+    if (event.key !== "Enter" || add === null || renameInput(event) === null) {
+      return;
+    }
+
+    const field = renameInput(event);
+
+    if (field === null) {
+      return;
+    }
+
+    const name = field.value.trim();
+    const dir = parentDir(add.path);
+    const path = dir === "" ? name : `${dir}/${name}`;
+    const error = nameError(name, path);
+
+    if (error !== null) {
+      event.preventDefault();
+      event.stopPropagation();
+      notify(error);
+
+      return;
+    }
+
+    if (path === add.path) {
+      settleAdd(add);
+    }
+  };
+
+  const onNameBlur = (event: FocusEvent): void => {
+    const add = naming.state._tag === "Naming" ? naming.state.add : null;
+
+    if (add === null || renameInput(event) === null) {
+      return;
+    }
+
+    settleAdd(add);
+  };
+
+  /** Stage the deletion of every selected row, one confirmation for all of
+   * them. A folder row takes its files with it. */
+  const deleteRows = async (paths: readonly string[]): Promise<void> => {
+    if (!host.editable() || paths.length === 0) {
+      return;
+    }
+
+    const targets = paths.flatMap((path) => {
+      const bare = rowPath(path);
+
+      return path.endsWith("/") ? under([...held], bare) : [bare];
+    });
+
+    const unique = [...new Set(targets)];
+
+    const committed = unique.filter(
+      (path) => host.changeAt(path)?.kind !== "added"
+    ).length;
+
+    const [only] = paths;
+
+    const ok = await confirmDialog({
+      confirmLabel: "Delete",
+      message:
+        committed === 0
+          ? "These files leave the tree."
+          : `Pushing removes ${committed} ${committed === 1 ? "file" : "files"} from the repository.`,
+      signal: host.signal,
+      title:
+        paths.length === 1 && only !== undefined
+          ? `Delete ${rowPath(only)}?`
+          : `Delete ${paths.length} items?`,
+    });
+
+    if (ok !== "confirm" || host.aborted()) {
+      return;
+    }
+
+    for (const path of unique) {
+      host.removePath(path);
+    }
+
+    build();
   };
 
   /** One menu for both targets: the rows pierre reports and the pane's empty
    * space, parked at the click because the tree's own pane clips and scrolls. */
   const openMenu = (
-    target: MenuTarget,
+    path: string | null,
     point: { x: number; y: number },
     close: (options?: { restoreFocus?: boolean }) => void
-  ) => {
+  ): void => {
     closeMenu();
-    const { path } = target;
     const dir = menuDir(path);
 
-    // The adds take focus themselves (pierre's inline input), so the menu
-    // closes without handing it back to the tree.
-    const newFile = () => {
+    const newFile = (): void => {
       close({ restoreFocus: false });
-      naming.startAdd(dir, false);
+      startAdd(dir);
     };
 
-    const newFolder = () => {
+    const pickUpload = (): void => {
       close({ restoreFocus: false });
-      naming.startAdd(dir, true);
-    };
-
-    const onUpload = () => {
-      close({ restoreFocus: false });
-      uploads.pick(dir);
+      input.click();
     };
 
     if (path === null) {
       menu = openTreeMenu(
-        newTreeMenu({ newFile, newFolder, onUpload }),
+        newTreeMenu({ newFile, onUpload: pickUpload }),
         point,
-        close
+        closeMenu
       );
 
       return;
     }
 
-    // A right-click inside a multi-selection acts on all of it; anywhere
-    // else, on that row alone.
     const selected = tree?.getSelectedPaths() ?? [];
 
     const rows =
-      selected.length > 1 && selected.includes(path) ? selected : [path];
+      selected.length > 1 && selected.includes(path) ? [...selected] : [path];
 
     menu = openTreeMenu(
       newTreeMenu({
         deleteCount: rows.length,
         newFile,
-        newFolder,
         onDelete: () => {
           close();
-          void flow.deleteRows(rows);
+          void deleteRows(rows);
         },
-        // A rename names one row: with a multi-selection in play the menu
-        // leaves it out (pierre's inline input edits a single row).
         onRename:
           rows.length === 1
             ? () => {
@@ -462,19 +589,29 @@ export const createTreeWiring = (host: TreeHost): TreeWiring => {
                 tree?.startRenaming(path);
               }
             : undefined,
-        onUpload,
+        onUpload: pickUpload,
       }),
       point,
-      close
+      closeMenu
     );
   };
 
   /** Right-click below the rows: pierre opens its menu on rows only, so the
-   * pane offers the same one for the tree's root there. A read-only checkout
-   * has no row actions at all, so the pane says why instead of doing nothing. */
-  const onTreeContextMenu = (event: MouseEvent) => {
+   * pane offers the same one for the tree's root there. The listener sits on
+   * the document in the capture phase: pierre's own handler runs inside its
+   * shadow root and can consume the event before it bubbles, and a right-click
+   * that opens no menu at all is worse than a duplicate one — the row case is
+   * detected from the composed path and left to pierre. */
+  const onTreeContextMenu = (event: MouseEvent): void => {
+    if (
+      !host.treeEl.isConnected ||
+      !event.composedPath().includes(host.treeEl)
+    ) {
+      return;
+    }
+
     if (!host.editable()) {
-      toaster.notify("This checkout is read-only.");
+      notify("This checkout is read-only.");
 
       return;
     }
@@ -486,18 +623,14 @@ export const createTreeWiring = (host: TreeHost): TreeWiring => {
     event.preventDefault();
 
     if (menu === null) {
-      openMenu(
-        { path: null },
-        { x: event.clientX, y: event.clientY },
-        closeMenu
-      );
+      openMenu(null, { x: event.clientX, y: event.clientY }, closeMenu);
     }
   };
 
   /** Delete (and Cmd/Ctrl+Backspace, the mac shortcut) stages the selected
    * rows through the menu's own flow, confirmation and all. A rename input in
-   * focus owns its keys, and a read-only ref has no rows to stage. */
-  const onTreeKeyDown = (event: KeyboardEvent) => {
+   * focus owns its keys. */
+  const onTreeKeyDown = (event: KeyboardEvent): void => {
     const deleting =
       event.key === "Delete" ||
       (event.key === "Backspace" && (event.metaKey || event.ctrlKey));
@@ -513,199 +646,115 @@ export const createTreeWiring = (host: TreeHost): TreeWiring => {
     }
 
     event.preventDefault();
-    void flow.deleteRows(rows);
+    void deleteRows(rows);
   };
 
-  // Naming an add is pierre's own inline rename (the row itself becomes the
-  // input); the pane only has to hold its name rules in front of the commit,
-  // open a menu where pierre has no row of its own, and take the OS file drops
-  // pierre itself knows nothing about. Every listener rides the wiring's
-  // signal: the pane element outlives a ref change (ilha adopts it), so a
-  // wiring that does not abort would leave its handlers acting on a closed
-  // workspace.
-  host.treeEl.addEventListener("contextmenu", onTreeContextMenu, {
-    signal: host.signal,
-  });
-  host.treeEl.addEventListener("focusout", naming.onNameBlur, {
+  // The upload flow: one hidden picker for the menu (created above), and OS
+  // file drops on the pane (pierre knows nothing of files dragged in from the
+  // desktop).
+  /** Land one upload read: text files are buffers, everything else bytes. */
+  const landReads = (reads: readonly UploadRead[]): void => {
+    if (reads.length === 0) {
+      return;
+    }
+
+    const refusal = checkLimits(reads, UPLOAD_LIMITS);
+
+    if (refusal !== null) {
+      notify(refusal);
+
+      return;
+    }
+
+    for (const read of reads) {
+      if (read.kind === "error") {
+        notify(`${read.path}: ${read.reason}`);
+
+        continue;
+      }
+
+      const landed =
+        read.kind === "text"
+          ? host.addText(read.path, read.text)
+          : host.addUpload(read.path, {
+              bytes: read.bytes,
+              content: read.base64,
+            });
+
+      if (landed !== "") {
+        notify(landed);
+      }
+    }
+
+    build();
+  };
+
+  const onPicked = (): void => {
+    // Snapshot the list before clearing the input: resetting `value` empties
+    // the live `FileList` this `input` handed out.
+    const picked = [...(input.files ?? [])];
+    input.value = "";
+
+    if (picked.length === 0) {
+      return;
+    }
+
+    void (async () => {
+      landReads(await readPickedFiles(picked));
+    })();
+  };
+
+  const onDrop = (event: DragEvent): void => {
+    if (!host.editable() || event.dataTransfer === null) {
+      return;
+    }
+
+    const hasFiles = [...event.dataTransfer.types].includes("Files");
+
+    if (!hasFiles) {
+      return;
+    }
+
+    event.preventDefault();
+    const { items } = event.dataTransfer;
+
+    if (items.length === 0) {
+      return;
+    }
+
+    void (async () => {
+      landReads(await readDroppedItems(items));
+    })();
+  };
+
+  document.body.append(input);
+  input.addEventListener("change", onPicked, { signal: host.signal });
+  document.addEventListener("contextmenu", onTreeContextMenu, {
     capture: true,
     signal: host.signal,
   });
-  host.treeEl.addEventListener("keydown", naming.guardNameKey, {
+  host.treeEl.addEventListener("focusout", onNameBlur, {
+    capture: true,
+    signal: host.signal,
+  });
+  host.treeEl.addEventListener("keydown", guardNameKey, {
     capture: true,
     signal: host.signal,
   });
   host.treeEl.addEventListener("keydown", onTreeKeyDown, {
     signal: host.signal,
   });
-
-  /** Build the file tree from the checkout: one row per file and per empty
-   * folder, one per path the rules exclude (which the markers paint dimmed),
-   * with the commit's own markers. Returns the file to open first, if any. */
-  const buildTree = (listing: CheckoutListing): string | undefined => {
-    holdIgnored(listing);
-    const paths = rowPaths(listing);
-    held = new Set(paths);
-    // Deep link wins when it names a real row; otherwise the Worker config is
-    // the sensible default to open — and the tree highlights whichever file
-    // lands open.
-    const urlFile = host.file();
-
-    const configFile = CONFIG_FILES.find((name) =>
-      listing.files.includes(name)
-    );
-
-    const initial: string | undefined =
-      urlFile !== "" && held.has(urlFile) ? urlFile : configFile;
-
-    // Ancestor dirs of the initial file, so deep links land with
-    // parents expanded (collapsed parents hide the selection and
-    // block the focus scroll).
-    const ancestors: string[] = [];
-
-    if (initial) {
-      const parts = initial.split("/");
-
-      for (let i = 1; i < parts.length; i += 1) {
-        ancestors.push(parts.slice(0, i).join("/"));
-      }
-    }
-
-    tree?.cleanUp();
-    // A rebuild drops the old tree with whatever menu or placeholder row it
-    // was showing: the rows come straight back from the fresh input.
-    closeMenu();
-    naming.clearPending();
-    const { FileTree, preparePresortedFileTreeInput } = host.trees;
-    const entries = [...markers(host.changes()), ...ignored];
-    treeStatusKey = statusKey(entries);
-    tree = new FileTree({
-      composition: host.editable()
-        ? {
-            contextMenu: {
-              enabled: true,
-              onClose: closeMenu,
-              onOpen: (item, context) => {
-                openMenu(
-                  { path: item.path },
-                  context.anchorRect,
-                  context.close
-                );
-              },
-              triggerMode: "right-click",
-            },
-          }
-        : undefined,
-      // Top-level, like `renaming`: on a read-only ref there is no config at
-      // all, so nothing is draggable.
-      dragAndDrop: host.editable()
-        ? {
-            canDrop: flow.canDrop,
-            onDropComplete: flow.landDrops,
-            onDropError: (error) => {
-              toaster.notify(error);
-            },
-          }
-        : undefined,
-      gitStatus: entries,
-      initialExpandedPaths: ancestors,
-      initialSelectedPaths: initial ? [initial] : undefined,
-      onSelectionChange: (selected) => {
-        if (selected[0]) {
-          void host.openFile(selected[0]);
-        }
-      },
-      preparedInput: preparePresortedFileTreeInput(
-        sortTreePaths([...listing.files, ...listing.ignoredFiles])
-      ),
-      // Top-level, not under `composition`: see `FileTreeOptions`.
-      renaming: host.editable()
-        ? {
-            // A row of the commit renames in place (a move in the pod); the
-            // add placeholder renames too, and lands as the file it named.
-            canRename: () => host.editable(),
-            onError: naming.nameRefused,
-            onRename: naming.finishAdd,
-          }
-        : undefined,
-      search: true,
-    });
-    // The pane may hold the note painted while the checkout opened (see
-    // `browser.tsx`): the rows replace it rather than stack under it.
-    host.treeEl.textContent = "";
-    tree.render({ fileTreeContainer: host.treeEl });
-
-    // An empty folder is a row nothing implies — git keeps none, so the
-    // checkout only has one because someone made it here: pierre is told about
-    // it by name. An excluded folder is named for the same reason: nothing
-    // under it was listed, so no row of its own implies it either.
-    for (const dir of [...listing.dirs, ...listing.ignoredDirs]) {
-      const row = `${dir}/`;
-
-      if (!hasRow(row)) {
-        addRow(row);
-      }
-    }
-
-    return initial;
-  };
-
-  /** Discard every change: the pod goes back to the browsed commit, the rows
-   * follow it, and the pane lands on the file it was showing — or on the one
-   * the browse opened with, when that file is gone. */
-  const discardAllChanges = () => {
-    if (!host.editable()) {
-      return;
-    }
-
-    void (async () => {
-      const wasOpen = host.getCurrentPath();
-
-      try {
-        await host.workspace().discardAll();
-      } catch (error) {
-        toaster.notify(errorMessage(error));
-      }
-
-      await resync();
-      host.report();
-
-      if (wasOpen !== null && hasRow(wasOpen)) {
-        void host.openFile(wasOpen);
-
-        return;
-      }
-
-      const wanted = host.file();
-
-      if (wanted !== "" && hasRow(wanted)) {
-        void host.openFile(wanted);
-
-        return;
-      }
-
-      await host.syncOpen();
-    })();
-  };
-
-  const cleanUp = () => {
-    menu?.close();
-    menu = null;
-    toaster.host.remove();
-    uploads.cleanUp();
-    tree?.cleanUp();
-  };
+  host.treeEl.addEventListener("dragover", onDragOver, { signal: host.signal });
+  host.treeEl.addEventListener("drop", onDrop, { signal: host.signal });
 
   return {
-    buildTree,
-    cleanUp,
-    discard: flow.discardChange,
-    discardAll: discardAllChanges,
-    hasRow,
-    notify: (message) => {
-      toaster.notify(message);
+    build,
+    cleanUp: () => {
+      closeMenu();
+      toaster.host.remove();
+      input.remove();
+      tree?.cleanUp();
     },
-    restorePath: flow.restorePath,
-    resync,
     syncStatus,
   };
 };

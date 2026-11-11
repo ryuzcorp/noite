@@ -1,14 +1,12 @@
-import { api } from "$lib/api";
 import { BranchPicker } from "$lib/forge/branches";
 import { CODE_PANELS, PanelToggles, toCodePanel } from "$lib/forge/code-bar";
 import type { CodePanel } from "$lib/forge/code-bar";
 import { forgeRefs } from "$lib/forge/data";
 import { HistoryView } from "$lib/forge/history";
 import { collectRef, newLiveRef } from "$lib/live-ref";
-import { PREVIEW_MIXED_CONTENT_MESSAGE } from "$lib/preview-host";
 import { appDetail } from "$lib/resources";
 import type { AppRole } from "$lib/roles";
-import type { GitRefs, RunnerEnvironment } from "$lib/runner";
+import type { GitRefs } from "$lib/runner";
 import { parseSkip, searchParam } from "$lib/search-param";
 import type { SearchParam } from "$lib/search-param";
 import { branchRules } from "$lib/source/branch-rules";
@@ -21,37 +19,24 @@ import type {
   ReadOnlyRef,
   SourceBrowserState,
 } from "$lib/source/drafts";
-import { PreviewPanel } from "$lib/source/preview-panel";
 import { refAccess } from "$lib/source/push-target";
-import { TerminalPanel } from "$lib/source/terminal-panel";
-import { createTerminalSession } from "$lib/source/terminal-session";
-import { SquareTerminal } from "$lib/ui/icons";
 import { createPaneGroup, MORPH_PRESERVE } from "$lib/ui/resizable";
 import { ResizeHandle } from "$lib/ui/resize-handle";
 import { SidePanel } from "$lib/ui/side-panel";
 import { useParams } from "@ilha/void";
-import * as Equal from "effect/Equal";
 import { atom, watch } from "ilha";
-import type { AtomHandle, View } from "ilha";
+import type { View } from "ilha";
 
 import { resourceValue } from "../../../lib/resource";
-
-/** Keep a component atom in step with a value derived from props/resources
- * (an `atom(init)` only seeds on the first render). */
-const syncAtom = <T,>(handle: AtomHandle<T>, value: T): void => {
-  if (!Equal.equals(handle(), value)) {
-    handle.set(value);
-  }
-};
 
 /** Mounts the browser once per app. ilha closes a keyed child whenever its
  * parent repaints, unless the parent's whole view is a keyed list. SourceBody
  * repaints on every `?file=`/`?skip=` write, and a remount there throws away
- * the drafts of every other file. So this slot's view is that list. Props
+ * the buffers of every other file. So this slot's view is that list. Props
  * other than the key are only read at mount; the ones that change are atoms —
  * `?ref=` among them: a branch switch is the browser's own (it installs the
- * new ref's checkout under the panes it already has, see `./source/browser`),
- * so the key must not name the ref. */
+ * new ref's files under the panes it already has, see `./source/browser`), so
+ * the key must not name the ref. */
 const BrowserSlot = (props: SourceBrowserProps) => [
   <SourceBrowser key={props.appId} {...props} />,
 ];
@@ -66,7 +51,6 @@ const newCommitter = (): Committer => ({ actions: null });
 const PANEL_TITLE = {
   changes: "Changes",
   history: "History",
-  preview: "Preview",
 } as const;
 
 /** The panel's tabs, in the bar's own order. The bodies are drawn in it
@@ -81,7 +65,6 @@ const TAB_ORDER = CODE_PANELS.map((entry) => entry.id);
 const TAB_CLASS: Record<Exclude<CodePanel, "">, string> = {
   changes: "contents",
   history: "min-h-0 flex-1 overflow-auto px-3 py-3",
-  preview: "contents",
 };
 
 /** Why the browsed ref opens read-only (see `refAccess`): a branch the viewer
@@ -99,12 +82,11 @@ const readOnlyReason = (
   refAccess(refs, undefined, role, ref, "").readOnly;
 
 /** Code mode's pane groups (`$lib/ui/resizable`): the file tree against
- * everything else, that column in two (the editor beside the side panel, the
- * terminal under them both). They exist at `lg` and up, and each keeps its own
- * split in localStorage; below `lg` nothing is bound and the classes on the
- * same elements lay the page out exactly as before — the tree column at its
- * own width, the editor beside it, the terminal under them and the panel over
- * the lot. */
+ * everything else, that column in two (the editor beside the side panel). They
+ * exist at `lg` and up, and each keeps its own split in localStorage; below
+ * `lg` nothing is bound and the classes on the same elements lay the page out
+ * as before — the tree column at its own width, the editor beside it, the
+ * panel over the lot. */
 const TREE_PANES = {
   direction: "horizontal",
   key: "code-tree",
@@ -118,46 +100,17 @@ const PANEL_PANES = {
   minPx: [320, 280],
 } as const;
 
-const TERMINAL_PANES = {
-  direction: "vertical",
-  key: "code-terminal",
-  minPx: [200, 120],
-} as const;
-
-/** The tree column's footer: toggles `?terminal=1`, styled like the Code mode
- * bar's panel toggles. */
-const TerminalToggle = ({ param }: { param: SearchParam<string> }) => {
-  const open = param() === "1";
-
-  return (
-    <button
-      type="button"
-      class={`btn btn-sm w-full justify-start ${open ? "btn-neutral" : "btn-ghost"}`}
-      aria-pressed={open ? "true" : "false"}
-      onclick={() => {
-        param.set(open ? "" : "1");
-      }}
-    >
-      <SquareTerminal />
-      Terminal
-    </button>
-  );
-};
-
-/** The right panel: History (optionally only the open file) or the unpushed
- * Changes. Its own component so `?file=` changes and
- * draft reports re-render it, never SourceBody.
+/** The right panel: History (optionally only the open file) or the unsaved
+ * Changes. Its own component so `?file=` changes and draft reports re-render
+ * it, never SourceBody.
  *
  * Every tab it has shown stays mounted — hidden, never closed — so switching
  * tabs keeps what each one holds: the commit form's draft, History's page and
  * its scroll. ilha closes a keyed child its parent's paint does not reach and
  * reuses an unkeyed one by position, so both the wrapper and the body carry
- * the tab's key: the keyed wrapper keeps a tab opened later from shifting the
- * body drawn where it goes, and the keyed body keeps its own fiber, which a
- * body added ahead of it would otherwise take over. The component itself
- * outlives the panel being closed (the pane it fills has to stay for the slide
- * that closes it), so `open` is what mounts the tabs at all: closed, every tab
- * in it is let go. */
+ * the tab's key. The component itself outlives the panel being closed (the
+ * pane it fills has to stay for the slide that closes it), so `open` is what
+ * mounts the tabs at all: closed, every tab in it is let go. */
 const CodeSidePanel = ({
   appId,
   changes,
@@ -165,11 +118,9 @@ const CodeSidePanel = ({
   file,
   gitRef,
   onClose,
-  onDeployPreview,
   open,
   panel,
   skip,
-  state,
 }: {
   appId: string;
   changes: ChangesPanelProps;
@@ -179,16 +130,12 @@ const CodeSidePanel = ({
   file: SearchParam<string>;
   gitRef: string;
   onClose: () => void;
-  /** Snapshot the workspace's changes and deploy their environment (the
-   * Preview panel's Deploy preview; null when there is nothing to deploy). */
-  onDeployPreview: () => Promise<RunnerEnvironment | null>;
   /** Whether `?panel=` names a tab: closed, the tabs are unmounted and the
    * pane is inert. */
   open: boolean;
   /** `?panel=`: the tab that is showing, "" when the panel is closed. */
   panel: CodePanel;
   skip: SearchParam<number>;
-  state: AtomHandle<SourceBrowserState>;
 }) => {
   const fileOnly = atom(false);
   // The tab whose pane this is: closed, the header still has to name something
@@ -199,8 +146,8 @@ const CodeSidePanel = ({
   // The tabs this panel has opened, one set per panel mount: a tab is drawn
   // from its first visit on, so a deep link (`?panel=history`) mounts only the
   // tab it names, and no tab fetches before it is opened.
-  // A Set does not survive the SSR snapshot (serializes as `{}`), so it
-  // stays out of it; the client builds its own on hydration.
+  // A Set does not survive the SSR snapshot (serializes as `{}`), so it stays
+  // out of it; the client builds its own on hydration.
   const opened = atom.lazy(() => new Set<Exclude<CodePanel, "">>(), {
     snapshot: false,
   })();
@@ -243,19 +190,6 @@ const CodeSidePanel = ({
   const tabBody = (body: Exclude<CodePanel, "">): View => {
     if (body === "changes") {
       return <ChangesPanel key={body} {...changes} />;
-    }
-
-    if (body === "preview") {
-      return (
-        <PreviewPanel
-          key={body}
-          appId={appId}
-          branch={gitRef}
-          onClose={onClose}
-          onDeployPreview={onDeployPreview}
-          state={state}
-        />
-      );
     }
 
     return (
@@ -302,7 +236,6 @@ const CodeSidePanel = ({
     >
       <SidePanel
         title={PANEL_TITLE[tab]}
-        bare={tab === "preview"}
         onClose={onClose}
         extras={extras}
         slide
@@ -326,61 +259,21 @@ const SourceBody = ({ appId }: { appId: string }) => {
   const refs = resourceValue(refsRes.state());
   const defaultBranch = refs?.defaultBranch ?? "main";
   // The ref every read is keyed by; no `?ref=` browses the default branch. The
-  // handle goes to the browser, which switches its checkout in place on every
-  // change (the panels below read the value, so they follow it too).
+  // handle goes to the browser, which installs that ref's files under the panes
+  // it already has (and asks before throwing unsaved work away).
   const gitRef = searchParam("ref", { default: defaultBranch });
   // Open file lives in ?file= (deep-linkable); the browser reads + writes it.
   const file = searchParam("file", { default: "" });
   // Paging cursor of whichever panel is open.
   const skip = searchParam<number>("skip", { default: 0, parse: parseSkip });
 
-  // The terminal panel (`?terminal=1` keeps refresh and deep links working,
-  // like `?panel=`).
-  const terminalParam = searchParam("terminal", {
-    default: "",
-    parse: (raw: string): string => (raw === "1" ? "1" : ""),
-  });
-
   // The browser hands its commit function over on mount; the Changes panel
   // calls it.
   const committer = atom.lazy(newCommitter)();
 
-  // The pod host origin, resolved when a checkout opens: every ref the user
-  // browses frames the pod host there. The action answers with the control's
-  // origin for this app (the edge serves the pod's four assets there), so guest
-  // code never runs on this page's origin.
-  const podHostOrigin = async (): Promise<string> => {
-    const { previewOrigin } = await api<{ previewOrigin: string }>(
-      "/api/preview/sourcePreviewOrigin",
-      { appId }
-    );
-
-    // The action cannot see the page's scheme through a TLS-terminating
-    // proxy: repeat its mixed-content refusal here with the real one, so the
-    // browser fails closed instead of framing an origin that cannot connect.
-    if (
-      previewOrigin.startsWith("http://") &&
-      window.location.protocol === "https:"
-    ) {
-      throw new Error(PREVIEW_MIXED_CONTENT_MESSAGE);
-    }
-
-    return previewOrigin;
-  };
-
-  // The terminal panel's session: the canvas shows the shell the pod frame
-  // runs, and a panel left open keeps it across a ref change (the new browser
-  // attaches on mount).
-  // The session is closures over the shell (functions do not serialize), so
-  // it stays out of the SSR snapshot; the client builds its own on hydration.
-  const terminalSession = atom.lazy(() => createTerminalSession(), {
-    snapshot: false,
-  })();
-
   // The state every group below is seeded with: which tab `?panel=` names
-  // ("" = closed) and whether the terminal is open.
+  // ("" = closed).
   const openPanel = panel();
-  const terminalOpen = terminalParam() === "1";
 
   /** Close the side panel: the URL is the panel's state, so the pane, the
    * toggle and the tabs all follow it from there. A drag that takes the pane
@@ -411,43 +304,42 @@ const SourceBody = ({ appId }: { appId: string }) => {
     { snapshot: false }
   )();
 
-  const terminalPanes = atom.lazy(() => createPaneGroup(TERMINAL_PANES), {
-    snapshot: false,
-  })();
-
   // The tree column's shadow-pane host: the column is a pane of this page's
   // own group, so the page renders it and hands the browser the mount point
   // (see `./source/browser`).
   const treeHost = atom.lazy(() => newLiveRef<HTMLElement>())();
 
   const browser = atom<SourceBrowserState>({
-    conflicts: [],
     files: [],
-    previewError: null,
-    previewed: null,
     pushError: null,
     pushed: null,
     pushing: false,
     readOnly: "",
     revision: 0,
-    stale: null,
   });
 
   // main is protected when `require_pr` is on and the caller is below admin;
-  // the Changes panel then only commits to a new branch.
-  const rules = resourceValue(branchRules(appId).state());
+  // the Changes panel then only commits to a new branch. The rule is read
+  // again on mount: the cached snapshot may predate a save on the settings
+  // page, and the gate must never offer a commit the runner will refuse.
+  const rulesRes = branchRules(appId);
+  const rules = resourceValue(rulesRes.state());
+
+  watch.once(() => {
+    void rulesRes.refetch();
+  });
   const detailRes = appDetail(appId);
   const myRole = resourceValue(detailRes.state())?.myRole;
   const browsing = gitRef();
 
   /** Why the browsed ref opens read-only ("" = editable — see
-   * `readOnlyReason`). Asked when the browser opens the checkout rather than
-   * handed over, because both answers arrive after the browser mounts — and
-   * answered off the current state, never the render's. A list that does not
-   * hold the ref is read again either way: the picker creates a branch and
-   * switches to it in the same breath, and a *loaded* list without that branch
-   * is the one answer that is certainly stale (a tag or a raw commit is simply
-   * absent again, and stays read-only). */
+   * `readOnlyReason`). Asked when the browser opens the ref rather than handed
+   * over, because both answers arrive after the browser mounts — and answered
+   * off the current state, never the render's. A list that does not hold the
+   * ref is read again either way: the picker creates a branch and switches to
+   * it in the same breath, and a *loaded* list without that branch is the one
+   * answer that is certainly stale (a tag or a raw commit is simply absent
+   * again, and stays read-only). */
   const canEditRef = async (ref: string): Promise<ReadOnlyRef> => {
     const loaded = resourceValue(refsRes.state());
 
@@ -473,12 +365,21 @@ const SourceBody = ({ appId }: { appId: string }) => {
   };
 
   // The ref the browser browses, kept in step with `?ref=` here: the browser
-  // watches it and installs that ref's checkout under the panes it already has
-  // (see `./source/browser`), so `?ref=` no longer remounts it — the keyed
-  // list below hands it the app alone. An atom rather than the param handle:
-  // the browser's request has to be started from a watch, not a render.
+  // watches it and installs that ref's files under the panes it already has
+  // (see `./source/browser`), so `?ref=` no longer remounts it — the keyed list
+  // below hands it the app alone. An atom rather than the param handle: the
+  // browser's request has to be started from a watch, not a render.
   const ref = atom(gitRef());
-  syncAtom(ref, gitRef());
+
+  /** Write the browsed ref, in the URL and in the atom the browser watches.
+   * The atom is written here rather than in the render below: a render-time
+   * write is dropped after the first paint, so the picker would move the URL
+   * and never reach the browser. */
+  const writeRef = (next: string): void => {
+    gitRef.set(next);
+    ref.set(next);
+  };
+
   // The side panel opens and closes through the library, not through the
   // render: `?panel=` is the state, and the pane slides to it (the split either
   // side of it and the divider between them are the group's). Applied here,
@@ -509,14 +410,12 @@ const SourceBody = ({ appId }: { appId: string }) => {
     onCleanup(() => {
       treePanes.destroy();
       panelPanes.destroy();
-      terminalPanes.destroy();
     });
   });
   // The splits the panes open at: what the user last dragged them to, or
   // nothing (the page's own classes, which are the layout below `lg` anyway).
   const treeSplit = treePanes.stored(2);
   const panelSplit = panelPanes.stored(2);
-  const terminalSplit = terminalPanes.stored(terminalOpen ? 2 : 1);
 
   return (
     // The app shell already sits under a 3rem top bar below `lg`: this page
@@ -524,13 +423,7 @@ const SourceBody = ({ appId }: { appId: string }) => {
     // bottom line is not 3rem past the viewport.
     <div class="flex h-[calc(100dvh-3rem)] w-full flex-col overflow-hidden lg:h-dvh">
       <div class="border-base-300 flex flex-wrap items-center gap-2 border-b px-4 py-2">
-        <BranchPicker
-          appId={appId}
-          value={browsing}
-          onChange={(next) => {
-            gitRef.set(next);
-          }}
-        />
+        <BranchPicker appId={appId} value={browsing} onChange={writeRef} />
         <div class="ml-auto flex flex-wrap items-center justify-end gap-2">
           <PanelToggles
             active={openPanel}
@@ -541,12 +434,11 @@ const SourceBody = ({ appId }: { appId: string }) => {
         </div>
       </div>
       {/* The page's panes, nested: the file tree against everything else, that
-          column in three (the editor beside the side panel, the terminal under
-          them). The groups bind at `lg` and up (see `$lib/ui/resizable`);
-          below `lg` these same classes lay the page out as it always was — the
-          tree column, the editor beside it, the terminal under both and the
-          side panel over the lot (`relative` is what that overlay and the
-          browser's own overlays measure themselves against). */}
+          column in two (the editor beside the side panel). The groups bind at
+          `lg` and up (see `$lib/ui/resizable`); below `lg` these same classes
+          lay the page out as it always was — the tree column, the editor beside
+          it and the side panel over the lot (`relative` is what that overlay
+          and the browser's own overlays measure themselves against). */}
       <div
         ref={treePanes.ref}
         data-slot="resizable"
@@ -560,7 +452,7 @@ const SourceBody = ({ appId }: { appId: string }) => {
           data-slot="resizable-panel"
           data-default-size={treeSplit?.[0]}
           data-morph-preserve={MORPH_PRESERVE}
-          class="bg-base-200/50 border-base-300 flex w-72 shrink-0 grow-0 flex-col justify-between border-r"
+          class="bg-base-200/50 border-base-300 flex w-72 shrink-0 grow-0 flex-col border-r"
         >
           <div
             ref={(host) => {
@@ -568,119 +460,83 @@ const SourceBody = ({ appId }: { appId: string }) => {
             }}
             class="noite-src-tree min-h-0 min-w-0 flex-1 overflow-auto pt-2"
           ></div>
-          <div class="border-base-300 border-t p-2">
-            <TerminalToggle param={terminalParam} />
-          </div>
         </div>
         <ResizeHandle label="Resize file tree" />
-        {/* What the tree leaves: the editor and the terminal, split
-            vertically. */}
         <div
           data-slot="resizable-panel"
           data-default-size={treeSplit?.[1]}
           data-morph-preserve={MORPH_PRESERVE}
           class="flex min-h-0 min-w-0 flex-1 flex-col"
         >
+          {/* The editor beside the side panel — below `lg` the panel covers
+              the page instead, so this row is the editor alone. */}
           <div
-            ref={terminalPanes.ref}
-            data-slot="resizable"
-            data-direction="vertical"
+            data-slot="resizable-panel"
+            data-default-size={panelSplit?.[0]}
             data-morph-preserve={MORPH_PRESERVE}
-            class="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden"
+            class="flex min-h-0 min-w-0 shrink-0 grow-0 basis-full"
           >
-            {/* The editor beside the side panel — below `lg` the panel covers
-                the page instead, so this row is the editor alone — and the
-                terminal below them. */}
             <div
-              data-slot="resizable-panel"
-              data-default-size={panelSplit?.[0]}
+              ref={panelPanes.ref}
+              data-slot="resizable"
+              data-direction="horizontal"
               data-morph-preserve={MORPH_PRESERVE}
-              class={`flex min-h-0 min-w-0 shrink-0 grow-0 ${terminalOpen ? "basis-2/3" : "basis-full"}`}
+              class="flex min-h-0 min-w-0 flex-1 overflow-hidden"
             >
-              <div
-                ref={panelPanes.ref}
-                data-slot="resizable"
-                data-direction="horizontal"
-                data-morph-preserve={MORPH_PRESERVE}
-                class="flex min-h-0 min-w-0 flex-1 overflow-hidden"
-              >
-                <BrowserSlot
-                  appId={appId}
-                  canEditRef={canEditRef}
-                  file={file}
-                  gitRef={ref}
-                  onDraftsReady={(actions) => {
-                    committer.actions = actions;
-                  }}
-                  onState={(state) => {
-                    browser.set(state);
-                  }}
-                  podHostOrigin={podHostOrigin}
-                  terminal={terminalSession}
-                  treeHost={treeHost}
-                />
-                <ResizeHandle label="Resize side panel" />
-                <CodeSidePanel
-                  appId={appId}
-                  changes={{
-                    appId,
-                    branch: browsing,
-                    branches: refs?.branches ?? [],
-                    commit: async (request) =>
-                      (await committer.actions?.commit(request)) ?? false,
-                    defaultBranch,
-                    discard: (path) => {
-                      committer.actions?.discard(path);
-                    },
-                    discardAll: () => {
-                      committer.actions?.discardAll();
-                    },
-                    dismissConflicts: (path) => {
-                      committer.actions?.dismissConflicts(path);
-                    },
-                    // Branch protection covers the default branch alone (the
-                    // only ref the runner refuses a direct commit to): the
-                    // commit target select disables it and offers a new branch
-                    // instead. Browsing another branch takes its commits
-                    // however the app-wide rule is set (see `./push-target`).
-                    isProtected: (name) =>
-                      refAccess(refs, rules, myRole, name, defaultBranch)
-                        .commit === "pr-only",
-                    restore: (path) => {
-                      committer.actions?.restore(path);
-                    },
-                    state: browser,
-                  }}
-                  defaultSize={panelSplit?.[1] ?? null}
-                  file={file}
-                  gitRef={browsing}
-                  onClose={() => {
-                    togglePanel("");
-                  }}
-                  onDeployPreview={async () => {
-                    const previewed = await committer.actions?.preview();
-
-                    return previewed?.environment ?? null;
-                  }}
-                  open={openPanel !== ""}
-                  panel={openPanel}
-                  skip={skip}
-                  state={browser}
-                />
-              </div>
-            </div>
-            {terminalOpen ? (
-              <ResizeHandle label="Resize terminal" vertical />
-            ) : null}
-            {terminalOpen ? (
-              <TerminalPanel
-                defaultSize={terminalSplit?.[1]}
-                terminal={terminalSession}
-                onClose={() => {
-                  terminalParam.set("");
+              <BrowserSlot
+                appId={appId}
+                canEditRef={canEditRef}
+                file={file}
+                gitRef={ref}
+                onDraftsReady={(actions) => {
+                  committer.actions = actions;
                 }}
+                onState={(state) => {
+                  browser.set(state);
+                }}
+                setRef={writeRef}
+                treeHost={treeHost}
               />
-            ) : null}
+              <ResizeHandle label="Resize side panel" />
+              <CodeSidePanel
+                appId={appId}
+                changes={{
+                  appId,
+                  branch: browsing,
+                  branches: refs?.branches ?? [],
+                  commit: async (request) =>
+                    (await committer.actions?.commit(request)) ?? false,
+                  defaultBranch,
+                  discard: (path) => {
+                    committer.actions?.discard(path);
+                  },
+                  discardAll: () => {
+                    committer.actions?.discardAll();
+                  },
+                  // Branch protection covers the default branch alone (the
+                  // only ref the runner refuses a direct commit to): the
+                  // commit target select disables it and offers a new branch
+                  // instead. Browsing another branch takes its commits
+                  // however the app-wide rule is set (see `./push-target`).
+                  isProtected: (name) =>
+                    refAccess(refs, rules, myRole, name, defaultBranch)
+                      .commit === "pr-only",
+                  restore: (path) => {
+                    committer.actions?.restore(path);
+                  },
+                  state: browser,
+                }}
+                defaultSize={panelSplit?.[1] ?? null}
+                file={file}
+                gitRef={browsing}
+                onClose={() => {
+                  togglePanel("");
+                }}
+                open={openPanel !== ""}
+                panel={openPanel}
+                skip={skip}
+              />
+            </div>
           </div>
         </div>
       </div>
@@ -688,12 +544,12 @@ const SourceBody = ({ appId }: { appId: string }) => {
   );
 };
 
-/** Source browser for one app — files of the latest pushed commit. The
- * body is keyed by app id so an id change remounts it (see the app page:
- * reused fibers keep resource()/feed slots bound to their first key), and
- * handed over as a one-item keyed list so a `?file=` write does not remount
- * it and drop its drafts: with the id as the only prop ilha reuses the row,
- * and the body repaints through its own param reads. */
+/** Source browser for one app — files of the latest pushed commit. The body is
+ * keyed by app id so an id change remounts it (see the app page: reused fibers
+ * keep resource()/feed slots bound to their first key), and handed over as a
+ * one-item keyed list so a `?file=` write does not remount it and drop its
+ * buffers: with the id as the only prop ilha reuses the row, and the body
+ * repaints through its own param reads. */
 export default function Source() {
   const { id: appId } = useParams();
 

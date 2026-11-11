@@ -66,16 +66,14 @@ describe("control asset routing", () => {
   });
 
   test("every other path still starts the Worker", () => {
-    // Pages, actions and the pod document must keep the app pipeline: the
-    // pod-host gate and the auth middleware only run there.
+    // Pages and actions must keep the app pipeline: the auth middleware and
+    // the page fallback only run there.
     for (const path of [
       "/",
       "/apps/new",
       "/apps/a/source",
       "/api/apps/create",
       "/api/streams",
-      "/__nodepod_bridge__.html",
-      "/__sw__.js",
       "/favicon.svg",
     ]) {
       expect(startsWorker(path)).toBe(true);

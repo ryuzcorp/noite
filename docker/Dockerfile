@@ -122,7 +122,6 @@ FROM docker.io/oven/bun:1.4-debian AS ui-build
 COPY --from=node /usr/local/bin/node /usr/local/bin/node
 WORKDIR /app
 COPY apps/noite/package.json apps/noite/bun.lock ./
-COPY apps/noite/patches/ ./patches/
 # The package cache only saves downloads; `--frozen-lockfile` still checks
 # every package against the lockfile's integrity hashes.
 RUN --mount=type=cache,id=noite-bun-cache,target=/root/.bun/install/cache,sharing=locked \
@@ -251,7 +250,7 @@ COPY --from=celld /usr/local/bin/celld /usr/local/bin/celld
 COPY --from=caddy-build /out/caddy /usr/local/bin/caddy
 RUN caddy version && caddy list-modules | grep -qx 'http.handlers.edge_routes'
 # Apache-2.0 §4(a): a distributed image carries a copy of the License, and
-# §4(d) its NOTICE (third-party attributions, e.g. the bundled Nodepod).
+# §4(d) its NOTICE (third-party attributions, e.g. the bundled editor).
 COPY LICENSE NOTICE /licenses/
 WORKDIR /data
 # Everything the edge proxies to lives in this container (tenant fleets,

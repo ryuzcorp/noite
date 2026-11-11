@@ -1,7 +1,7 @@
-/** The source page's Changes panel: every unpushed change as a diff or a row,
+/** The source page's Changes panel: every unsaved change as a diff or a row,
  * the discard behind each of them, and the commit form under it (message,
- * target branch, Push). The drafts live in the browser; this reads the state
- * it reports and asks it to commit or throw away. */
+ * target branch, Push). The buffers live in the page's editor session; this
+ * reads the state the browser reports and asks it to commit or throw away. */
 import { Link } from "@ilha/void";
 import { atom, watch } from "ilha";
 import type { AtomHandle } from "ilha";
@@ -10,7 +10,6 @@ import { formatBytes } from "../bytes";
 import { DraftDiffView } from "../forge/diff";
 import type { GitBranch } from "../runner";
 import { confirmDialog } from "../ui/confirm";
-import { X } from "../ui/icons";
 import {
   choiceOf,
   CommitChoices,
@@ -31,7 +30,7 @@ import {
   rowUndoable,
   rowView,
 } from "./row-view";
-import type { ChangeKind, WorkspaceChange } from "./workspace/types";
+import type { ChangeKind, SourceChange } from "./session";
 
 /** The commit targets, in the select's order: the browsed ref first (the
  * default target), then the default branch, then every other branch
@@ -70,8 +69,8 @@ const KIND_VERBS: Record<ChangeKind, string> = {
 };
 
 /** The verb of one change: a new binary file is an upload, not an add. */
-const changeVerb = (file: WorkspaceChange): string =>
-  file.binary !== undefined && file.kind === "added"
+const changeVerb = (file: SourceChange): string =>
+  file.bytes !== undefined && file.kind === "added"
     ? "Upload"
     : KIND_VERBS[file.kind];
 
@@ -93,7 +92,7 @@ const defaultMessage = (state: SourceBrowserState): string => {
   }
 
   const [first] = files;
-  const verb = changeVerb(first);
+  const verb = first === undefined ? "" : changeVerb(first);
 
   return files.every((file) => changeVerb(file) === verb)
     ? `${verb} ${files.length} files`
@@ -104,19 +103,17 @@ const defaultMessage = (state: SourceBrowserState): string => {
  * (with the pull-request shortcut after a push to a new branch). */
 const PushOutcome = ({
   appId,
-  base,
   state,
   title,
 }: {
   appId: string;
-  base: string;
   state: SourceBrowserState;
   title: string;
 }) => {
   if (state.pushError !== null) {
     return (
       <p class="text-error m-0 text-xs" role="alert">
-        {pushErrorCopy(state.pushError, state.readOnly)}
+        {pushErrorCopy(state.pushError)}
       </p>
     );
   }
@@ -140,7 +137,7 @@ const PushOutcome = ({
       Pushed to <span class="font-mono">{pushed.branch}</span>.{" "}
       <Link
         class="link"
-        href={`/apps/${appId}/pulls/new?base=${encodeURIComponent(base)}&head=${encodeURIComponent(pushed.branch)}&title=${encodeURIComponent(title)}`}
+        href={`/apps/${appId}/pulls/new?base=${encodeURIComponent(pushed.base)}&head=${encodeURIComponent(pushed.branch)}&title=${encodeURIComponent(title)}`}
       >
         Open a pull
       </Link>
@@ -234,9 +231,11 @@ const CommitForm = ({
         // grows from its own tip.
         if (plan.branch !== undefined) {
           request.branch = plan.branch;
+          request.create = plan.choice._tag === "New";
         }
 
         lastMessage.set(text);
+
         void (async () => {
           // A landed push empties the form for the next commit; a failed one
           // keeps it for the retry. Only this ref's choice is cleared — a
@@ -336,12 +335,7 @@ const CommitForm = ({
           )}
         </>
       ) : null}
-      <PushOutcome
-        appId={appId}
-        base={branch}
-        state={current}
-        title={lastMessage()}
-      />
+      <PushOutcome appId={appId} state={current} title={lastMessage()} />
     </form>
   );
 };
@@ -360,14 +354,11 @@ export interface ChangesPanelProps {
   discard: (path: string) => void;
   /** Throw every change away, back to the last commit (asked first). */
   discardAll: () => void;
-  /** Drop one "changed in another tab" notice (the peer overwrite it names
-   * has already landed in the file). */
-  dismissConflicts: (path: string) => void;
   /** Whether a branch refuses a direct commit — `require_pr` on, the caller
    * below admin, the default branch (see `./push-target`): the select disables
    * it and the commit goes to a new branch instead. */
   isProtected: (branch: string) => boolean;
-  /** Undo of a deletion draft — the file returns to the tree. */
+  /** Undo of a deletion draft or a move — the file returns to the tree. */
   restore: (path: string) => void;
   state: AtomHandle<SourceBrowserState>;
 }
@@ -382,9 +373,9 @@ const ChangeRow = ({
   onDiscard,
   restore,
 }: {
-  file: WorkspaceChange;
+  file: SourceChange;
   last: boolean;
-  onDiscard: (file: WorkspaceChange) => void;
+  onDiscard: (file: SourceChange) => void;
   restore: (path: string) => void;
 }) => {
   const row = rowView(file);
@@ -400,12 +391,6 @@ const ChangeRow = ({
         {rowLabel(row)}
         {bytes === null ? null : ` · ${formatBytes(bytes)}`}
       </span>
-      {row._tag === "Loading" ? (
-        <span
-          class="loading loading-xs"
-          title="Reading the committed copy"
-        ></span>
-      ) : null}
       {rowDiscardable(row) ? (
         <button
           type="button"
@@ -444,12 +429,11 @@ export const ChangesPanel = ({
   defaultBranch,
   discard,
   discardAll,
-  dismissConflicts,
   isProtected,
   restore,
   state,
 }: ChangesPanelProps) => {
-  const { conflicts, files, readOnly, revision, stale } = state();
+  const { files, readOnly, revision } = state();
 
   // One controller per mounted panel: a dialog left open by a close is torn
   // down with it instead of blocking the page.
@@ -465,10 +449,15 @@ export const ChangesPanel = ({
     });
   });
 
-  // Text changes carry a diff; an upload has no text to compare, a pure move
-  // or a staged deletion has none either, and a row whose committed text is
-  // still being read has nothing to compare against yet.
-  const diffed = files.filter((file) => rowDiffed(rowView(file)));
+  // Text changes carry a diff; an upload has no text to compare, and a pure
+  // move or a staged deletion has none either.
+  const diffed = files
+    .filter((file) => rowDiffed(rowView(file)))
+    .map((file) => ({
+      after: file.after,
+      before: file.before ?? "",
+      path: file.path,
+    }));
 
   const ask = (title: string, message: string, confirmLabel: string) =>
     confirmDialog({
@@ -478,7 +467,7 @@ export const ChangesPanel = ({
       title,
     });
 
-  const askDiscard = (file: WorkspaceChange) => {
+  const askDiscard = (file: SourceChange) => {
     void (async () => {
       const ok = await ask(
         `Discard changes to ${file.path}?`,
@@ -508,48 +497,7 @@ export const ChangesPanel = ({
 
   return (
     <div class="flex min-h-0 flex-1 flex-col">
-      {stale === null ? null : (
-        <p
-          class="bg-warning/20 text-base-content border-base-300 m-0 border-b px-3 py-2 text-xs"
-          role="status"
-        >
-          Based on an older commit:{" "}
-          <span class="font-mono">{stale.baseSha.slice(0, 7)}</span>; pushing
-          may conflict with{" "}
-          <span class="font-mono" title={stale.tipSha}>
-            {stale.tipSha.slice(0, 7)}
-          </span>
-          .
-        </p>
-      )}
       <div class="min-h-0 flex-1 overflow-auto">
-        {conflicts.length === 0 ? null : (
-          <ul class="m-0 list-none p-0" aria-label="Changes from other tabs">
-            {conflicts.map((path) => (
-              <li
-                key={path}
-                class="bg-warning/20 text-base-content border-base-300 flex items-center gap-2 border-b px-3 py-2 text-xs"
-                role="status"
-              >
-                <span class="min-w-0 flex-1 truncate">
-                  <span class="font-mono">{path}</span> was changed in another
-                  tab
-                </span>
-                <button
-                  type="button"
-                  class="btn btn-ghost btn-xs btn-square"
-                  aria-label={`Dismiss notice for ${path}`}
-                  title="Dismiss"
-                  onclick={() => {
-                    dismissConflicts(path);
-                  }}
-                >
-                  <X class="h-3.5 w-3.5" />
-                </button>
-              </li>
-            ))}
-          </ul>
-        )}
         {files.length === 0 ? (
           <p class="m-0 px-3 py-3 text-sm opacity-70">
             {readOnly === "" ? (
@@ -575,15 +523,6 @@ export const ChangesPanel = ({
                 Discard all
               </button>
             </div>
-            {readOnly === "" ? null : (
-              <p
-                class="bg-warning/20 text-base-content border-base-300 m-0 border-b px-3 py-2 text-xs"
-                role="status"
-              >
-                These changes were made outside the editor and can't be pushed
-                here. {READ_ONLY_PUSH[readOnly]}
-              </p>
-            )}
             {diffed.length === 0 ? null : (
               <DraftDiffView
                 key={`drafts:${revision}`}

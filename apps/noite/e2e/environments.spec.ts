@@ -74,7 +74,7 @@ const pushBranch = (apiKey: string, source: URL, slug: string): void => {
 };
 
 test(
-  "a branch becomes an environment and Code mode frames it",
+  "a branch becomes an environment and serves its own host",
   { tag: "@fast" },
   async ({ page, request }) => {
     createdApps.push(SLUG);
@@ -103,30 +103,11 @@ test(
       page.getByText("feature", { exact: true }).first()
     ).toBeVisible();
 
-    // --- Code mode: the Preview panel frames what each branch deploys --------
-    // Production's deploy ran while the environment was created; the default
-    // branch frames it once it has a commit live.
+    // The environment serves the branch's deploy on its own host. (Code mode no
+    // longer frames it: the Preview panel went with the light editor, and an
+    // environment is reached by its own URL.)
     const deploy = await waitForDeploy(request, appId);
     expect(deploy.status).toBe("success");
-    await page.goto(`/apps/${appId}/source?ref=main&panel=preview`);
-    const panel = page.getByRole("complementary", { name: "Preview" });
-    const frame = panel.locator("iframe");
-    // The default branch frames production (`<slug>.<base>`)…
-    await expect(frame).toHaveAttribute("src", /^https?:\/\/envs\./u);
-    // …and the address field navigates the frame, a path against its address.
-    const address = panel.getByRole("textbox", { name: "Address" });
-    await address.fill("/missing");
-    await address.press("Enter");
-    await expect(frame).toHaveAttribute(
-      "src",
-      /^https?:\/\/envs\.[^/]+\/missing$/u
-    );
-    // A branch with an environment frames that environment.
-    await page.goto(`/apps/${appId}/source?ref=feature&panel=preview`);
-    await expect(frame).toHaveAttribute("src", /^https?:\/\/feature\.envs\./u);
-    await expect(
-      panel.getByRole("link", { name: "Deploys for feature" })
-    ).toHaveAttribute("href", /\/apps\/[0-9a-f-]+\?t=deployments&env=/u);
 
     // --- the environment rolls back to its own earlier release ---------------
     // The environment's history is its own; a sha that succeeded there is a

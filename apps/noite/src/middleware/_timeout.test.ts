@@ -30,13 +30,12 @@ const contextFor = (path: string) =>
 const exempt = (path: string): boolean => routeTimeout(path).kind === "exempt";
 
 describe("routeTimeout", () => {
-  test("spares streams, R2 objects, and the source archive", () => {
+  test("spares streams and R2 objects", () => {
     expect(exempt("/api/apps/a/logs/stream")).toBe(true);
     expect(exempt("/api/apps/stream")).toBe(true);
     expect(exempt("/api/streams")).toBe(true);
     expect(exempt("/storage/a/r2/b/raw?key=k")).toBe(true);
     expect(exempt("/storage/a/r2/b/upload?key=k")).toBe(true);
-    expect(exempt("/api/apps/a/source/archive")).toBe(true);
     expect(exempt("/api/apps/a/source/commit")).toBe(false);
     expect(exempt("/api/auth/session")).toBe(false);
     expect(exempt("/health")).toBe(false);
@@ -52,7 +51,7 @@ describe("routeTimeout", () => {
       kind: "exempt",
       why: "stream",
     });
-    expect(routeTimeout("/api/apps/a/source/archive")).toEqual({
+    expect(routeTimeout("/storage/a/r2/b/raw?key=k")).toEqual({
       kind: "exempt",
       why: "download",
     });
@@ -82,10 +81,6 @@ describe("routeTimeout", () => {
       ms: TIMEOUT_MS,
     });
     expect(routeTimeout("/api/apps/create")).toEqual({
-      kind: "bounded",
-      ms: TIMEOUT_MS,
-    });
-    expect(routeTimeout("/__nodepod_bridge__.html")).toEqual({
       kind: "bounded",
       ms: TIMEOUT_MS,
     });
