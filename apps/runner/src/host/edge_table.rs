@@ -519,6 +519,35 @@ async fn served_generation(cfg: &Config) -> Option<u64> {
     resp.json::<Live>().await.ok().map(|live| live.generation)
 }
 
+/// The edge reports the generation it serves, not the content it installed,
+/// and `install` deliberately applies an equal generation with different
+/// routes as a correction (a lifecycle write, an operator's `curl`). So a
+/// matching generation does not prove the content matches, and an unchanged
+/// table is still POSTed once per interval: 12 pushes an hour instead of the
+/// 720 the every-tick push did. Keyed by routes file so tests (and any future
+/// second table) do not share the clock.
+static LAST_FULL_PUSH: std::sync::LazyLock<std::sync::Mutex<HashMap<String, std::time::Instant>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
+/// The safety re-push interval: the longest a same-generation correction can
+/// stay live unnoticed by the reconcile tick.
+const FULL_PUSH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+
+fn full_push_due(cfg: &Config) -> bool {
+    let seen = LAST_FULL_PUSH
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    seen.get(&cfg.routes_path)
+        .is_none_or(|at| at.elapsed() >= FULL_PUSH_INTERVAL)
+}
+
+fn record_full_push(cfg: &Config) {
+    LAST_FULL_PUSH
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(cfg.routes_path.clone(), std::time::Instant::now());
+}
+
 /// Push the table to Caddy's admin API (loopback-only). Lifecycle callers
 /// and the reconcile tick only warn on a refusal (the next tick re-pushes);
 /// a deploy must not report success on one (see `deploy::route_live`).
@@ -562,6 +591,12 @@ async fn push_live(cfg: &Config, table: &EdgeTable) -> Pushed {
 /// an unreachable admin API), so the next tick pushes again. A refused or
 /// unanswered push leaves the edge on the old generation, so the next tick's
 /// probe differs and retries it.
+///
+/// The probe reports the generation, not the routes, and the edge applies an
+/// equal generation with different routes as a correction, so the skip is
+/// bounded: one full POST per `FULL_PUSH_INTERVAL` (5 min) still goes out
+/// even when the generation matches. That keeps an equal-generation
+/// correction landing within minutes at 12 pushes an hour, instead of 720.
 /// Serializes concurrent pushes: two lifecycle events at once must not
 /// interleave build → write → push, or an older table lands last until the
 /// next tick (the module also rejects older generations with a 409, and the
@@ -615,14 +650,17 @@ pub async fn push_routes(pool: &sqlx::SqlitePool, cfg: &Config) -> anyhow::Resul
         tokio::fs::write(&tmp, &next).await?;
         tokio::fs::rename(&tmp, path).await?;
         tracing::info!(path = %cfg.routes_path, n = table.exact.len(), "edge routes updated");
-    } else if served_generation(cfg).await == Some(table.generation) {
+    } else if !full_push_due(cfg) && served_generation(cfg).await == Some(table.generation) {
         // Nothing changed and the edge already serves this generation.
         // Skipping the POST is the point: an idle runner must not re-send
         // (and Caddy must not re-parse, re-validate and re-install) the
-        // whole table every reconcile tick.
+        // whole table every reconcile tick. Once per `FULL_PUSH_INTERVAL`
+        // the skip is refused instead, so an equal-generation correction
+        // the probe cannot see still lands.
         push_note(true, String::new());
         return Ok(Pushed::Accepted);
     }
+    record_full_push(cfg);
     Ok(push_live(cfg, &table).await)
 }
 
@@ -1264,6 +1302,36 @@ mod tests {
         assert_eq!(push_routes(&pool, &cfg).await.unwrap(), Pushed::Accepted);
         assert_eq!(admin.posts(), 2, "a lost table is pushed again");
         assert_eq!(admin.live(), 1);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// The probe reports the generation, not the routes, so a same-generation
+    /// correction the GET cannot see must still land: one full push per
+    /// `FULL_PUSH_INTERVAL`, even while every other tick skips.
+    #[tokio::test]
+    async fn a_same_generation_correction_lands_within_the_safety_interval() {
+        let (pool, mut cfg, dir) = push_env().await;
+        let (url, admin) = admin_server().await;
+        cfg.caddy_admin_url = url;
+
+        push_routes(&pool, &cfg).await.unwrap();
+        assert_eq!(admin.posts(), 1);
+        push_routes(&pool, &cfg).await.unwrap();
+        assert_eq!(admin.posts(), 1, "the fresh full push allows a skip");
+
+        // Age the last full push past the interval, as if five minutes of
+        // ticks had skipped: the next tick must push the same table again.
+        {
+            let mut seen = LAST_FULL_PUSH
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let at = seen.get_mut(&cfg.routes_path).expect("recorded push");
+            *at = std::time::Instant::now() - FULL_PUSH_INTERVAL;
+        }
+        assert_eq!(push_routes(&pool, &cfg).await.unwrap(), Pushed::Accepted);
+        assert_eq!(admin.posts(), 2, "the safety push must go out");
+        push_routes(&pool, &cfg).await.unwrap();
+        assert_eq!(admin.posts(), 2, "the safety push restarts the interval");
         std::fs::remove_dir_all(dir).ok();
     }
 }
