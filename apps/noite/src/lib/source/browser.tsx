@@ -84,10 +84,21 @@ export interface SourceBrowserProps {
 /** The browser's mutable box: what must outlive re-renders and never enter the
  * SSR snapshot (functions, DOM handles). */
 interface BrowserBox {
+  changeIndex: Map<string, SourceChange>;
+  changeList: readonly SourceChange[];
+  /** The installed panes, once `attach` has built them. */
+  editor: ReturnType<typeof createEditorPane> | null;
   /** False once the page let the browser go: every pending answer is dropped. */
   live: boolean;
+  /** The push in flight or its outcome. */
+  pushOp: PushOperation;
   /** Starts one ref's read. Installed by `attach`. */
   request: ((ref: string, force: boolean) => void) | null;
+  /** The page's edit session: the browsed tree and every buffer. */
+  session: EditSession;
+  /** Bumped on every change: a key for views rebuilt from the session. */
+  revision: number;
+  tree: TreeWiring | null;
   /** Whether the panes are already wired to the document's element. ilha calls
    * a `ref` with detached scratch copies on every re-render, so `attach` only
    * wires the element that is actually in the page, and only once. */
@@ -100,9 +111,16 @@ interface BrowserBox {
 }
 
 const newBrowserBox = (): BrowserBox => ({
+  changeIndex: new Map(),
+  changeList: [],
   dialogs: new AbortController(),
+  editor: null,
   live: true,
+  pushOp: PushOps.Idle(),
   request: null,
+  revision: 0,
+  session: emptySession(),
+  tree: null,
   wired: false,
 });
 
@@ -122,14 +140,6 @@ export const SourceBrowser = ({
   const view = atom<RefView>(RefViews.Booting());
   const notice = atom("");
 
-  let session: EditSession = emptySession();
-  let changeList: readonly SourceChange[] = [];
-  let changeIndex = new Map<string, SourceChange>();
-  let revision = 0;
-  let pushOp: PushOperation = PushOps.Idle();
-  let editor: ReturnType<typeof createEditorPane> | null = null;
-  let tree: TreeWiring | null = null;
-
   const current = (): ReadyCheckout | null => {
     const state = view();
 
@@ -143,29 +153,29 @@ export const SourceBrowser = ({
   };
 
   const recompute = (): void => {
-    changeList = changes(session);
-    changeIndex = new Map(changeList.map((row) => [row.path, row]));
+    box.changeList = changes(box.session);
+    box.changeIndex = new Map(box.changeList.map((row) => [row.path, row]));
   };
 
   /** Report the session and the commit to the page. */
   const syncState = (): void => {
     onState({
-      files: changeList,
-      pushError: pushOp._tag === "Failed" ? pushOp.failure : null,
-      pushed: pushOp._tag === "Done" ? pushOp.to : null,
-      pushing: pushOp._tag === "Pushing",
+      files: box.changeList,
+      pushError: box.pushOp._tag === "Failed" ? box.pushOp.failure : null,
+      pushed: box.pushOp._tag === "Done" ? box.pushOp.to : null,
+      pushing: box.pushOp._tag === "Pushing",
       readOnly: readOnlyOf(view()),
-      revision,
+      revision: box.revision,
     });
   };
 
   /** Install a session's successor and repaint what reads it. */
   const apply = (next: EditSession): void => {
-    session = next;
-    revision += 1;
+    box.session = next;
+    box.revision += 1;
     recompute();
-    editor?.syncStatus();
-    tree?.syncStatus();
+    box.editor?.syncStatus();
+    box.tree?.syncStatus();
     syncState();
   };
 
@@ -174,19 +184,19 @@ export const SourceBrowser = ({
   const rows = (): string[] => {
     const out: string[] = [];
 
-    for (const path of session.base.keys()) {
-      if (!session.moves.has(path)) {
+    for (const path of box.session.base.keys()) {
+      if (!box.session.moves.has(path)) {
         out.push(path);
       }
     }
 
-    for (const [path, buffer] of session.buffers) {
+    for (const [path, buffer] of box.session.buffers) {
       if (buffer.base === null) {
         out.push(path);
       }
     }
 
-    for (const to of session.moves.keys()) {
+    for (const to of box.session.moves.keys()) {
       out.push(to);
     }
 
@@ -199,7 +209,7 @@ export const SourceBrowser = ({
     // A file this session added is not in any commit yet: its buffer is the
     // only copy, and the pane shows it without asking the runner (a request
     // for it would be a 404).
-    const held = session.buffers.get(path);
+    const held = box.session.buffers.get(path);
 
     if (held !== undefined && held.base === null) {
       return {
@@ -221,7 +231,7 @@ export const SourceBrowser = ({
     });
 
     if (!(blob.binary || blob.truncated)) {
-      session = prime(session, path, blob.text);
+      box.session = prime(box.session, path, blob.text);
       recompute();
     }
 
@@ -231,7 +241,7 @@ export const SourceBrowser = ({
   /** The buffer verbs the tree and the panel call: each mutates the session and
    * repaints, and each answers its refusal as text for the toast. */
   const addText = (path: string, text: string): string => {
-    const result = add(session, path, text);
+    const result = add(box.session, path, text);
 
     if (!result.ok) {
       return result.reason;
@@ -243,7 +253,7 @@ export const SourceBrowser = ({
   };
 
   const addUploadFile = (path: string, upload: Upload): string => {
-    const result = addUpload(session, path, upload);
+    const result = addUpload(box.session, path, upload);
 
     if (!result.ok) {
       return result.reason;
@@ -255,7 +265,7 @@ export const SourceBrowser = ({
   };
 
   const movePath = (from: string, to: string): string => {
-    const result = move(session, from, to);
+    const result = move(box.session, from, to);
 
     if (!result.ok) {
       return result.reason;
@@ -276,20 +286,20 @@ export const SourceBrowser = ({
     }
 
     view.set(decision.state);
-    session = openSession(checkout.tree);
-    revision += 1;
+    box.session = openSession(checkout.tree);
+    box.revision += 1;
     recompute();
-    editor?.drop();
-    const initial = tree?.build();
+    box.editor?.drop();
+    const initial = box.tree?.build();
     syncState();
 
     if (initial !== undefined) {
-      await editor?.open(initial);
+      await box.editor?.open(initial);
 
       return;
     }
 
-    editor?.note("This repository has no files yet");
+    box.editor?.note("This repository has no files yet");
   };
 
   /** Start one ref's read. A stale answer is dropped by the ref machine (it
@@ -335,13 +345,17 @@ export const SourceBrowser = ({
     message: string;
   }): Promise<boolean> => {
     const checkout = current();
-    const started = startPush(pushOp, request.branch ?? checkout?.ref ?? "");
+
+    const started = startPush(
+      box.pushOp,
+      request.branch ?? checkout?.ref ?? ""
+    );
 
     if (checkout === null || started === null) {
       return false;
     }
 
-    const input = commitInput(session);
+    const input = commitInput(box.session);
 
     if (
       input.files.length === 0 &&
@@ -351,7 +365,7 @@ export const SourceBrowser = ({
       return false;
     }
 
-    pushOp = started;
+    box.pushOp = started;
     syncState();
 
     // The commit names the branch it lands on; the runner creates a new one at
@@ -366,7 +380,7 @@ export const SourceBrowser = ({
         ...where,
         message: request.message,
       });
-      pushOp = settlePush(pushOp, {
+      box.pushOp = settlePush(box.pushOp, {
         ok: true,
         to: {
           base: checkout.ref,
@@ -376,9 +390,9 @@ export const SourceBrowser = ({
       });
       // The commit owns the bytes now: the buffers are gone, and the rows come
       // back from the branch's new tip (which is how a move and a delete land).
-      editor?.drop();
+      box.editor?.drop();
       invalidateForge(appId);
-      apply(discardAll(session));
+      apply(discardAll(box.session));
 
       // The URL is the browsed ref: committing to another branch (a new one,
       // or a target picked in the form) moves it there, and the watch below
@@ -389,7 +403,7 @@ export const SourceBrowser = ({
         setRef(target);
       }
     } catch (error) {
-      pushOp = settlePush(pushOp, {
+      box.pushOp = settlePush(box.pushOp, {
         failure: operationFailure(error),
         ok: false,
       });
@@ -397,26 +411,26 @@ export const SourceBrowser = ({
 
     syncState();
 
-    return pushOp._tag === "Done";
+    return box.pushOp._tag === "Done";
   };
 
   const drafts: DraftActions = {
     commit,
     discard: (path) => {
-      apply(discard(session, path));
+      apply(discard(box.session, path));
     },
     discardAll: () => {
-      apply(discardAll(session));
+      apply(discardAll(box.session));
     },
     restore: (path) => {
-      apply(restore(session, path));
+      apply(restore(box.session, path));
     },
   };
 
   /** A ref switch with unsaved work asks first: the buffers belong to the ref
    * they were edited on, and there is nowhere to keep them. */
   const askSwitch = async (next: string): Promise<boolean> => {
-    const count = changeCount(session);
+    const count = changeCount(box.session);
 
     const ok = await confirmDialog({
       confirmLabel: "Discard and switch",
@@ -474,35 +488,35 @@ export const SourceBrowser = ({
       const treesTyped = treesModule as unknown as TreesModule;
       /* oxlint-enable anti-slop/no-chained-type-assertions, anti-slop/require-safety-comment-for-type-assertion */
 
-      editor = createEditorPane({
+      box.editor = createEditorPane({
         aborted: () => !box.live,
-        changeAt: (path) => changeIndex.get(path)?.kind ?? null,
+        changeAt: (path) => box.changeIndex.get(path)?.kind ?? null,
         codeEl: body,
         diffs: diffsModule,
         edit: editModuleTyped,
         editable: () => readOnlyOf(view()) === "",
         file,
-        held: (path) => session.buffers.get(path)?.text ?? null,
+        held: (path) => box.session.buffers.get(path)?.text ?? null,
         onEdit: (path, text) => {
-          apply(edit(session, path, text, null));
+          apply(edit(box.session, path, text, null));
         },
         read: readBlob,
       });
 
-      tree = createTreeWiring({
+      box.tree = createTreeWiring({
         aborted: () => !box.live,
         addText,
         addUpload: addUploadFile,
-        changeAt: (path) => changeIndex.get(path),
+        changeAt: (path) => box.changeIndex.get(path),
         editable: () => readOnlyOf(view()) === "",
         file,
         movePath,
         notify: (message) => {
           notice.set(message);
         },
-        openFile: async (path) => (await editor?.open(path)) ?? false,
+        openFile: async (path) => (await box.editor?.open(path)) ?? false,
         removePath: (path) => {
-          apply(remove(session, path));
+          apply(remove(box.session, path));
         },
         rows,
         signal: box.dialogs.signal,
@@ -521,7 +535,7 @@ export const SourceBrowser = ({
       return;
     }
 
-    if (changeCount(session) === 0) {
+    if (changeCount(box.session) === 0) {
       box.request(next, false);
 
       return;
@@ -546,7 +560,7 @@ export const SourceBrowser = ({
   /** A page going away with unsaved work warns: there is no persistence to
    * come back to. */
   const onBeforeUnload = (event: BeforeUnloadEvent): void => {
-    if (changeCount(session) === 0) {
+    if (changeCount(box.session) === 0) {
       return;
     }
 
@@ -561,8 +575,8 @@ export const SourceBrowser = ({
     onCleanup(() => {
       box.live = false;
       box.dialogs.abort();
-      tree?.cleanUp();
-      editor?.cleanUp();
+      box.tree?.cleanUp();
+      box.editor?.cleanUp();
 
       if (typeof window !== "undefined") {
         window.removeEventListener("beforeunload", onBeforeUnload);

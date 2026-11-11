@@ -727,7 +727,7 @@ export const createTreeWiring = (host: TreeHost): TreeWiring => {
     })();
   };
 
-  host.treeEl.parentElement?.append(input);
+  document.body.append(input);
   input.addEventListener("change", onPicked, { signal: host.signal });
   document.addEventListener("contextmenu", onTreeContextMenu, {
     capture: true,
