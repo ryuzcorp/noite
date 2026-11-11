@@ -26,6 +26,21 @@ sensitive:
   - "apps/runner/src/host/env_gate.rs"
   # The admin-role gate on per-app limits (#79).
   - "apps/runner/src/service/limits.rs"
+  # Slug and hostname grammar, including the platform labels the edge already
+  # serves: a bug here lets an app claim a control/api/git/pod host.
+  - "apps/runner/src/lifecycle.rs"
+  # Custom-domain claims: hostname grammar, the admin gate, the TXT ownership
+  # proof and the loser cleanup. A wrong row puts someone else's hostname on
+  # this install's edge.
+  - "apps/runner/src/service/domains.rs"
+  - "apps/runner/src/dns.rs"
+  # Preview-environment labels: the label becomes the environment's DNS label
+  # and its bucket prefix, and the reserved platform labels/prefix must never
+  # be taken.
+  - "apps/runner/src/host/env_label.rs"
+  # The role predicate every service-side view/push/admin gate calls: widening
+  # it widens all of them at once.
+  - "apps/runner/src/service/environments.rs"
   # Invite-only signup and the platform limiter that throttles auth and
   # envelope ingest (brute force, key enumeration).
   - "apps/noite/src/lib/server/invites.server.ts"
@@ -41,6 +56,21 @@ sensitive:
   - "apps/noite/src/http/routes/auth.ts"
   - "apps/noite/src/lib/server/session.server.ts"
   - "apps/noite/src/middleware/**"
+  # Collaborator gates and role ranking: who may view, push or administer an
+  # app, and the membership decisions behind invite/grant/remove.
+  - "apps/noite/src/lib/collaborators.ts"
+  - "apps/noite/src/lib/server/collaborators.server.ts"
+  - "apps/noite/src/lib/roles.ts"
+  - "apps/noite/src/lib/membership.ts"
+  # Profile API keys are git, ingest and MCP credentials: the owner check that
+  # refuses a banned or missing owner, and the ban-triggered revocation.
+  - "apps/noite/src/lib/server/api-keys.server.ts"
+  - "apps/noite/src/lib/server/mcp-auth.server.ts"
+  # The runner-token-only internal surface (git credential verification,
+  # account-recovery codes, app creation for an arbitrary user): a change here
+  # can bypass the session and role checks the public routes rely on.
+  - "apps/noite/src/http/routes/internal.ts"
+  - "apps/noite/src/lib/server/recovery.server.ts"
 
   # Sandboxed execution and tenant isolation: what a build or fleet process
   # can reach, and the uid/cgroup/memory containment around it.
