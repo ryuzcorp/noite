@@ -166,10 +166,15 @@ services:
       RUNNER_DUCKDB_TEMP_MB: ${RUNNER_DUCKDB_TEMP_MB:-}
       RUNNER_TELEMETRY_RETENTION_DAYS: ${RUNNER_TELEMETRY_RETENTION_DAYS:-30}
       RUNNER_TIP_SWEEP_S: ${RUNNER_TIP_SWEEP_S:-60}
-      # Scale to zero (SPEC): park apps idle this many hours (0 = never);
-      # the next request wakes them transparently.
-      RUNNER_SLEEP_AFTER_H: ${RUNNER_SLEEP_AFTER_H:-24}
-      RUNNER_SLEEP_SWEEP_S: ${RUNNER_SLEEP_SWEEP_S:-3600}
+      # Scale to zero (SPEC): park apps idle past this threshold (0 = never);
+      # the next request wakes them transparently. Empty derives from the
+      # host's memory (15 min at <= 2 GiB, 6 h at <= 4 GiB, else 24 h);
+      # minutes win over hours when both are set.
+      RUNNER_SLEEP_AFTER_MIN: ${RUNNER_SLEEP_AFTER_MIN:-}
+      RUNNER_SLEEP_AFTER_H: ${RUNNER_SLEEP_AFTER_H:-}
+      # Sleep sweep cadence; empty follows the threshold (a quarter of it,
+      # clamped 300..3600 s).
+      RUNNER_SLEEP_SWEEP_S: ${RUNNER_SLEEP_SWEEP_S:-}
       RUNNER_WAKE_TIMEOUT_S: ${RUNNER_WAKE_TIMEOUT_S:-120}
       RUNNER_WAKE_CONCURRENCY: ${RUNNER_WAKE_CONCURRENCY:-4}
       # Pre-activation canary (SPEC, Deploy pipeline): after staging, the

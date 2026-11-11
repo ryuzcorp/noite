@@ -26,6 +26,7 @@ import {
 } from "./draft";
 import type { DraftForm } from "./draft";
 import { SettingsSection } from "./section";
+import { sleepPlaceholder } from "./sleep-placeholder";
 
 /** How a limit reads when it is left at the platform default. */
 const defaultLabel = (rpm: number) =>
@@ -45,19 +46,6 @@ const parseRpm = (raw: string): number | null | undefined => {
   }
 
   return Number(value);
-};
-
-/** The sleep default's placeholder, in the largest exact unit. */
-const sleepPlaceholder = (seconds: number): string => {
-  if (seconds === 0) {
-    return "Default: never";
-  }
-
-  if (seconds % 3600 === 0) {
-    return `Default: ${seconds / 3600} h`;
-  }
-
-  return `Default: ${seconds} s`;
 };
 
 /** The four inputs parsed, or the one validation sentence an invalid input

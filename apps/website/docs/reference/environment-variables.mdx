@@ -122,8 +122,9 @@ These are install-level variables (Compose, the image environment). Per-app valu
 
 | Var | Default | Effect | Owner |
 | --- | --- | --- | --- |
-| `RUNNER_SLEEP_AFTER_H` | detected memory: `1` (≤ 2 GiB), `6` (≤ 4 GiB), else `24` | Park apps idle this long; `0` = never (no per-app override re-enables it) | runner-owned |
-| `RUNNER_SLEEP_SWEEP_S` | `3600` | Sleep sweep cadence | runner-owned |
+| `RUNNER_SLEEP_AFTER_MIN` | detected memory: `15` (≤ 2 GiB), `360` (≤ 4 GiB), else `1440` | Park apps idle this many minutes; wins over `RUNNER_SLEEP_AFTER_H`; `0` = never (no per-app override re-enables it), clamped at `2592000` s (30 days) | runner-owned |
+| `RUNNER_SLEEP_AFTER_H` | — | The same threshold in whole hours, for windows minutes cannot express; ignored when `RUNNER_SLEEP_AFTER_MIN` is set; `0` = never (overrides a set `RUNNER_SLEEP_AFTER_MIN`); clamped at `720` h (30 days) | runner-owned |
+| `RUNNER_SLEEP_SWEEP_S` | a quarter of the threshold, clamped `300`–`3600` | Sleep sweep cadence | runner-owned |
 | `RUNNER_WAKE_TIMEOUT_S` | `120` | Longest a held request waits for a woken fleet; failed wake answers `503` | runner-owned |
 | `RUNNER_WAKE_CONCURRENCY` | `4` | Apps allowed to cold-start at once for requests; later wakes queue inside `RUNNER_WAKE_TIMEOUT_S` | runner-owned |
 See [Limits](/reference/limits) for the sleep mechanism.

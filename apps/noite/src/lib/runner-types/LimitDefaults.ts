@@ -11,7 +11,7 @@ export type LimitDefaults = { clientRpm: number, appRpm: number, memoryMb: numbe
  */
 memoryMaxMb: number | null, 
 /**
- * Platform idle-sleep threshold in seconds (`RUNNER_SLEEP_AFTER_H`,
- * derived from detected memory when unset).
+ * Platform idle-sleep threshold in seconds (`RUNNER_SLEEP_AFTER_MIN`
+ * or `RUNNER_SLEEP_AFTER_H`, derived from detected memory when unset).
  */
 defaultSleepAfterS: number, };

@@ -5,7 +5,7 @@ use serde::Serialize;
 use ts_rs::TS;
 
 use crate::api_error::ApiError;
-use crate::config::Config;
+use crate::config::{Config, MAX_SLEEP_AFTER_S};
 use crate::db;
 use crate::models::AppLimit;
 use crate::AppState;
@@ -39,9 +39,9 @@ const MAX_FLEET_MEMORY_MB: i64 = 1_048_576;
 
 /// Bounds on a per-app idle-sleep override in seconds: below a minute the
 /// sweep would park an app between two normal requests, so a typo'd `5`
-/// refuses loudly instead of flapping the fleet. `0` means never sleep.
+/// refuses loudly instead of flapping the fleet. `0` means never sleep; the
+/// platform-wide ceiling is `config::MAX_SLEEP_AFTER_S`.
 const MIN_SLEEP_AFTER_S: i64 = 60;
-const MAX_SLEEP_AFTER_S: i64 = 2_592_000;
 
 /// Whether a per-app sleep override is storable: `None` clears back to the
 /// platform default, `Some(0)` means never, otherwise a real threshold.
@@ -67,8 +67,8 @@ pub struct LimitDefaults {
     /// `Some` ceiling in `multi` (a tenant can only lower its cap);
     /// `None` in `single`, where the operator is the only admin.
     pub memory_max_mb: Option<u32>,
-    /// Platform idle-sleep threshold in seconds (`RUNNER_SLEEP_AFTER_H`,
-    /// derived from detected memory when unset).
+    /// Platform idle-sleep threshold in seconds (`RUNNER_SLEEP_AFTER_MIN`
+    /// or `RUNNER_SLEEP_AFTER_H`, derived from detected memory when unset).
     pub default_sleep_after_s: u64,
 }
 
@@ -103,7 +103,7 @@ fn limits_view(cfg: &Config, limit: &AppLimit) -> LimitsView {
             memory_mb: cfg.fleet_memory_mb,
             memory_max_mb: matches!(cfg.tenancy, crate::config::Tenancy::Multi)
                 .then_some(cfg.fleet_memory_max_mb),
-            default_sleep_after_s: cfg.sleep_after_h.saturating_mul(3600),
+            default_sleep_after_s: cfg.sleep_after_s,
         },
     }
 }
@@ -274,7 +274,7 @@ mod tests {
         assert_eq!(view.sleep_after_s, None);
         assert_eq!(
             view.defaults.default_sleep_after_s,
-            state.config.sleep_after_h.saturating_mul(3600)
+            state.config.sleep_after_s
         );
         let reread = get(&state, &app.id).await.expect("get stays role-free");
         assert_eq!(reread.client_rpm, Some(100));

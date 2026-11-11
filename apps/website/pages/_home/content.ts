@@ -111,7 +111,7 @@ export const FEATURES = [
     title: "Bring your Workers app",
   },
   {
-    body: "Apps idle for a day go to sleep and free their memory. The next request wakes them and is served normally: no splash page, no dropped request.",
+    body: "Apps idle past their window go to sleep and free their memory — 15 minutes on a small host. The next request wakes them and is served normally: no splash page, no dropped request.",
     title: "Scale to zero, for real",
   },
   {
