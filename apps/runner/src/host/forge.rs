@@ -183,7 +183,14 @@ fn is_hex_sha(reference: &str) -> bool {
 }
 
 /// A ref the forge will hand to git: a branch or tag name, or a full-ish sha.
+/// A `refs/`-prefixed name must be under `refs/heads/` or `refs/tags/`: the
+/// retired `refs/previews/*` refs (and anything else hidden) must not be
+/// readable through `source.tree`/`source.blob`.
 fn valid_ref(reference: &str) -> bool {
+    if let Some(rest) = reference.strip_prefix("refs/") {
+        let readable = rest.starts_with("heads/") || rest.starts_with("tags/");
+        return readable && valid_branch_name(reference);
+    }
     is_hex_sha(reference) || valid_branch_name(reference)
 }
 
@@ -3607,9 +3614,8 @@ mod tests {
         h.finish().await;
     }
 
-    /// The TLS ask still admits a tenant host only once its fleet is up. The
-    /// retired pod host (`pod-<app id>.<base>`) now names a tenant slug like
-    /// any other, and gets no certificate without a live app.
+    /// The TLS ask mints nothing for the retired pod origin: its slug
+    /// namespace is reserved and no app can own it.
     #[tokio::test]
     async fn tls_ask_admits_no_retired_pod_host() {
         let h = Harness::new("previewtls").await;
@@ -3628,7 +3634,7 @@ mod tests {
         .await
         .expect("seed app");
         let router = crate::api::router::router(h.state.clone());
-        // A pod-shaped host is an ordinary (undeployed) tenant host now.
+        // A pod-shaped host names no live app and cannot become one.
         assert_eq!(
             ask_tls(&router, &format!("pod-{}.localhost", app.id)).await,
             axum::http::StatusCode::NOT_FOUND
@@ -3638,6 +3644,20 @@ mod tests {
             axum::http::StatusCode::NOT_FOUND
         );
         h.finish().await;
+    }
+
+    #[test]
+    fn preview_refs_are_not_readable() {
+        // Source reads accept branches, tags and shas; the retired hidden
+        // namespace stays unreachable by an explicit ref.
+        assert!(valid_ref("main"));
+        assert!(valid_ref("feature/x"));
+        assert!(valid_ref("refs/heads/main"));
+        assert!(valid_ref("refs/tags/v1"));
+        assert!(valid_ref("0123456789abcdef0123456789abcdef01234567"));
+        assert!(!valid_ref("refs/previews/user/feature"));
+        assert!(!valid_ref("refs/pull/1/head"));
+        assert!(!valid_ref("refs/"));
     }
 
     #[test]

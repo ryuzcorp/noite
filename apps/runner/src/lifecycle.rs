@@ -55,6 +55,12 @@ pub fn slug_ok(cfg: &Config, slug: &str) -> bool {
     if slug == crate::host::control::SLUG {
         return false;
     }
+    // The retired pod-origin namespace (`pod-<app id>`): browsers may still
+    // hold a certificate and origin storage for a name whose app had that id,
+    // so no tenant may claim it while that is true.
+    if slug.starts_with(crate::host::edge::RETIRED_POD_PREFIX) {
+        return false;
+    }
     let platform: std::collections::HashSet<String> = crate::host::edge_table::platform_routes(cfg)
         .into_iter()
         .map(|(host, _)| host)
@@ -114,14 +120,16 @@ mod tests {
     }
 
     #[test]
-    fn retired_pod_labels_are_ordinary_slugs() {
-        // The pod host is gone, so its old namespace is a tenant host now.
-        assert!(slug_ok(
+    fn the_retired_pod_namespace_stays_unclaimable() {
+        // The pod origin is gone, but its old addresses must not be reused:
+        // a stale tab or bookmark there still loads whatever owns the name.
+        assert!(!slug_ok(
             &config_for_tests(),
             "pod-0f4b0f6e-5a8e-4a0e-9c3f-2b1d0c9e8f7a"
         ));
-        // Ordinary slugs and near misses stay available.
-        for ok in ["pod", "podcast", "pod-123", "mypod-x"] {
+        assert!(!slug_ok(&config_for_tests(), "pod-staging"));
+        // Names that merely start with the letters stay available.
+        for ok in ["pod", "podcast", "mypod-x"] {
             assert!(slug_ok(&config_for_tests(), ok), "should accept {ok}");
         }
     }

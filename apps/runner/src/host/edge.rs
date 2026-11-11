@@ -16,6 +16,13 @@ use axum::{
 use crate::config::is_localhost_domain;
 use crate::AppState;
 
+/// The retired pod host's label prefix (`pod-<app id>.<base>`). The host is
+/// gone, but browsers may still hold a certificate, a bookmark, history or
+/// origin storage for it, so the name stays unclaimable: an app with that slug
+/// would serve attacker-controlled code on the origin a victim's stale tab or
+/// bookmark can still load, same-origin with that stored workspace.
+pub const RETIRED_POD_PREFIX: &str = "pod-";
+
 /// Tenant slug from a Host header, if it addresses `{slug}.{base}` under any
 /// tenant base (configured domain plus LAN/extra DNS names) and is not one
 /// of the platform hosts (bare bases, control, api, git).
@@ -40,6 +47,9 @@ pub fn parse_edge_slug(host: &str, bases: &[String], control_sub: &str) -> Optio
             return None;
         }
         if slug == control_sub || slug == "api" || slug == "git" {
+            return None;
+        }
+        if slug.starts_with(RETIRED_POD_PREFIX) {
             return None;
         }
         return Some(slug.to_string());
@@ -722,6 +732,16 @@ mod tests {
         assert_eq!(parse_edge_slug("api.noite.now", &prod, "app"), None);
         assert_eq!(parse_edge_slug("git.noite.now", &prod, "app"), None);
         assert_eq!(parse_edge_slug("app.noite.now", &prod, "app"), None);
+        // The retired pod origin namespace stays unroutable.
+        assert_eq!(
+            parse_edge_slug(
+                "pod-0f4b0f6e-5a8e-4a0e-9c3f-2b1d0c9e8f7a.noite.now",
+                &prod,
+                "app"
+            ),
+            None
+        );
+        assert_eq!(parse_edge_slug("pod-staging.noite.now", &prod, "app"), None);
         assert_eq!(parse_edge_slug("a.b.localhost", &dev, ""), None);
         assert_eq!(parse_edge_slug("", &dev, ""), None);
     }

@@ -47,9 +47,10 @@ pub type GitWal = ryuz_git::Wal<ryuz_git::RefsCodec>;
 
 /// Build the process's git WAL over [`GitStore`].
 ///
-/// Mirror root, layout, storage mode and ref filters match what the
-/// smart-HTTP adapter has always used, so existing mirrors, manifests and tip
-/// bundles keep working unchanged.
+/// Mirror root, layout and storage mode match what the smart-HTTP adapter has
+/// always used, so existing mirrors, manifests and tip bundles keep working
+/// unchanged. The retired `refs/previews/*` refs are no longer hidden here:
+/// nothing lists or writes them, and source reads refuse them (`valid_ref`).
 pub fn build_wal(cfg: &Config) -> GitWal {
     let store: DynStore = Arc::new(GitStore::new(cfg));
     let config = ryuz_git::WalConfig::new(

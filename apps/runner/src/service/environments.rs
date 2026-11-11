@@ -60,13 +60,13 @@ pub async fn list(
 }
 
 /// Fill each environment's automatic-deploy state from its own deploy rows.
-/// A preview's budget is its own: production's failures never pause it.
+/// An environment's budget is its own: production's failures never pause it.
 async fn annotate_auto_deploy(state: &AppState, envs: &mut [Environment]) {
     crate::host::auto_deploy::annotate_environments(&state.pool, envs).await;
 }
 
 /// Load one environment of one app, or 404.
-/// The push gate a preview-target operation shares with `deploy`.
+/// The push gate an environment-target operation shares with `deploy`.
 pub(crate) fn require_push(role: Option<&str>) -> Result<(), ApiError> {
     require(role, "push")
 }

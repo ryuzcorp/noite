@@ -144,8 +144,7 @@ pub struct SourceCommitBody {
 
 /// Browser edits are input validation first (400), a lost CAS race is a real
 /// 409 conflict, and an unknown branch to start from is a 404. A genuine
-/// git/exec failure stays 500. `service::environments` reuses it for
-/// `source.preview`, so both commit surfaces report identically.
+/// git/exec failure stays 500.
 pub(super) fn commit_error(e: anyhow::Error) -> ApiError {
     let msg = format!("{e:#}");
     if msg.contains("tip moved") {
