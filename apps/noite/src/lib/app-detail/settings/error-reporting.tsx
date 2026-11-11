@@ -9,7 +9,7 @@ import { ingestKey } from "../../resources";
 import type { AppRole } from "../../roles";
 import type { RunnerIngestKey } from "../../runner";
 import { LoadError } from "../../ui/load-error";
-import { SectionSkeleton } from "../../ui/skeletons";
+import { ListSkeleton } from "../../ui/skeletons";
 import { capabilities } from "../capabilities";
 import { SettingsSection } from "./section";
 
@@ -32,13 +32,16 @@ export const ErrorReportingPanel = ({
   const current = resourceValue(res.state());
 
   if (res.state()._tag === "Loading") {
-    return <SectionSkeleton lines={2} />;
+    return (
+      <SettingsSection section="error-reporting">
+        <ListSkeleton rows={2} />
+      </SettingsSection>
+    );
   }
 
   if (!current) {
     return (
-      <SettingsSection>
-        <h3 class="m-0 text-lg font-semibold">Error reporting</h3>
+      <SettingsSection section="error-reporting">
         <LoadError error={resourceError(res.state())} />
       </SettingsSection>
     );
@@ -72,8 +75,7 @@ Sentry.init({
   };
 
   return (
-    <SettingsSection>
-      <h3 class="m-0 text-lg font-semibold">Error reporting</h3>
+    <SettingsSection section="error-reporting">
       <p class="m-0 text-sm opacity-70">
         Report browser errors with any Sentry-compatible SDK. The DSN carries
         this app&apos;s project id and ingest key — the key is public by design,

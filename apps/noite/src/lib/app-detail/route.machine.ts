@@ -11,10 +11,10 @@
 //! ```
 //!
 //! The wire stays exactly as before: `?t=`, `?panel=settings`, `?env=<id>`
-//! (`""` = production), `?es=`, `?r=`, `?e=`, plus the Settings view's
-//! `?section=`. Only the *composition* is one value, and only a stale
-//! environment produces a notice — an unknown tab, panel or section still
-//! falls back quietly, since old links keep working.
+//! (`""` = production), `?es=`, `?r=`, `?e=`, plus the Settings page's
+//! `?section=` heading anchor. Only the *composition* is one value, and only
+//! a stale environment produces a notice — an unknown tab, panel or section
+//! still falls back quietly, since old links keep working.
 
 import { Data } from "effect";
 
@@ -32,9 +32,10 @@ export type AppTab = (typeof APP_TABS)[number];
 
 export type AppPanel = "" | "settings";
 
-/** The Settings view's sections (`/apps/<id>/settings?section=…`), in display
- * order. `branch-protection` and `danger` are admin-only: a non-admin never
- * sees their tab, and a shared link to one lands on the default section. */
+/** The Settings page's sections (`/apps/<id>/settings`), in display order:
+ * every section is stacked on the one page. `branch-protection` and `danger`
+ * are admin-only: a non-admin never sees them, and a shared `?section=` link
+ * to one has no anchor to scroll to. */
 export const SETTINGS_SECTIONS = [
   "identity",
   "domains",
@@ -48,14 +49,12 @@ export const SETTINGS_SECTIONS = [
 
 export type SettingsSection = (typeof SETTINGS_SECTIONS)[number];
 
-export const DEFAULT_SETTINGS_SECTION: SettingsSection = "identity";
-
 const SETTINGS_SECTION_META = {
   "branch-protection": { adminOnly: true, label: "Branch protection" },
   collaborators: { adminOnly: false, label: "Collaborators" },
   danger: { adminOnly: true, label: "Danger zone" },
   domains: { adminOnly: false, label: "Domains" },
-  env: { adminOnly: false, label: "Environment variables" },
+  env: { adminOnly: false, label: "Environment" },
   "error-reporting": { adminOnly: false, label: "Error reporting" },
   identity: { adminOnly: false, label: "Identity" },
   limits: { adminOnly: false, label: "Limits" },
@@ -64,10 +63,11 @@ const SETTINGS_SECTION_META = {
   { readonly adminOnly: boolean; readonly label: string }
 >;
 
+/** A section's heading, and the text of its table-of-contents link. */
 export const settingsSectionLabel = (section: SettingsSection): string =>
   SETTINGS_SECTION_META[section].label;
 
-/** The sections this role may open, in display order: the tab row. */
+/** The sections this role sees on the page, in display order. */
 export const settingsSectionsFor = (
   isAdmin: boolean
 ): readonly SettingsSection[] =>
@@ -75,21 +75,20 @@ export const settingsSectionsFor = (
     (section) => isAdmin || !SETTINGS_SECTION_META[section].adminOnly
   );
 
-/** `?section=`: an unknown id — or one this role may not open — is the
- * default section, so an old or shared link never renders an empty view. */
+/** `?section=`: the section a shared link scrolls to. An unknown id — or one
+ * this role may not see — has no anchor, so the page opens at the top rather
+ * than inventing a section the role cannot read. */
 export const parseSettingsSection = (
   raw: string,
   isAdmin: boolean
-): SettingsSection => {
+): SettingsSection | null => {
   const known = SETTINGS_SECTIONS.find((section) => section === raw);
 
   if (known === undefined) {
-    return DEFAULT_SETTINGS_SECTION;
+    return null;
   }
 
-  return settingsSectionsFor(isAdmin).includes(known)
-    ? known
-    : DEFAULT_SETTINGS_SECTION;
+  return settingsSectionsFor(isAdmin).includes(known) ? known : null;
 };
 
 /** Settings used to be a side panel on the app page (`?panel=settings`). It

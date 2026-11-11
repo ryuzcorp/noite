@@ -3,7 +3,7 @@ title: Configure
 description: Env vars, custom domains, rate limits, collaborators, source edits, and storage for one app.
 ---
 
-All of this lives in the app's **Settings** view (`/apps/<id>/settings`), the item directly under **Pull requests** in the sidebar. It is a page of its own, not a panel: one section at a time (Identity / Domains / Limits / Error reporting / Collaborators / Environment variables, then Branch protection and Danger zone for admins) chosen by the tab row, with `?section=` as the deep link — so Settings → Domains is `/apps/<id>/settings?section=domains`. The app's own tabs (Overview / Deployments / Metrics / Errors / Events) carry no Settings item. Old `?panel=settings` links redirect to the view and keep their `?section=`.
+All of this lives in the app's **Settings** page (`/apps/<id>/settings`), the item directly under **Pull requests** in the sidebar. Every section is stacked on that one page, each with its own heading and save flow: Identity, Domains, Limits, Error reporting, Collaborators and Environment, then Branch protection and Danger zone for app admins. A compact contents list at the top jumps to a section, and `?section=` is the deep link — so Settings → Domains is `/apps/<id>/settings?section=domains`, which opens scrolled to the Domains heading. There is no tab row; the app's own tabs (Overview / Deployments / Metrics / Errors / Events) carry no Settings item. Old `?panel=settings` links redirect to the page and keep their `?section=`.
 
 ## Environment variables
 
@@ -21,7 +21,7 @@ Void apps send email and call AI through that proxy (`revalidate()`, `sendEmail(
 
 ## Custom domains
 
-Settings → Custom Domain. Adding a hostname claims it for the app; proving
+Settings → Domains. Adding a hostname claims it for the app; proving
 ownership takes one DNS step: publish the TXT record the panel shows
 (`_noite-challenge.<hostname>` containing the claim's token — the same shape
 as ACME's `_acme-challenge` DNS proof, under our own label), then press
@@ -43,7 +43,7 @@ route and the hostname's certificate.
 
 ## Rate limits
 
-Settings → Rate Limits (admins). Requests per minute the edge lets through to this app, across all its hostnames: per visitor (client IP) and for the whole app. Leave a field empty for the platform default or enter `0` for no limit; the edge applies a change within seconds. Past a limit, visitors get `429 Too Many Requests` with `Retry-After`. Behind a proxy the edge does not trust, per-visitor limits are off and the field says so. See [Edge protection](/self-hosting/protection).
+Settings → Limits (app admins). Requests per minute the edge lets through to this app, across all its hostnames: per visitor (client IP) and for the whole app. Leave a field empty for the platform default or enter `0` for no limit; the edge applies a change within seconds. Past a limit, visitors get `429 Too Many Requests` with `Retry-After`. Behind a proxy the edge does not trust, per-visitor limits are off and the field says so. See [Edge protection](/self-hosting/protection).
 
 ## Collaborators
 

@@ -11,7 +11,7 @@ import { resourceValue, resourceError } from "../../resource";
 import { limits } from "../../resources";
 import type { AppRole } from "../../roles";
 import { LoadError } from "../../ui/load-error";
-import { SectionSkeleton } from "../../ui/skeletons";
+import { ListSkeleton } from "../../ui/skeletons";
 import { capabilities } from "../capabilities";
 import { watchResource } from "../watch-resource";
 import {
@@ -163,13 +163,16 @@ export const RateLimitsPanel = ({
   });
 
   if (res.state()._tag === "Loading") {
-    return <SectionSkeleton lines={2} />;
+    return (
+      <SettingsSection section="limits">
+        <ListSkeleton rows={2} />
+      </SettingsSection>
+    );
   }
 
   if (!current) {
     return (
-      <SettingsSection>
-        <h3 class="m-0 text-lg font-semibold">Limits</h3>
+      <SettingsSection section="limits">
         <LoadError error={resourceError(res.state())} />
       </SettingsSection>
     );
@@ -226,8 +229,7 @@ export const RateLimitsPanel = ({
   const failure = form().status;
 
   return (
-    <SettingsSection>
-      <h3 class="m-0 text-lg font-semibold">Limits</h3>
+    <SettingsSection section="limits">
       <p class="m-0 text-sm opacity-70">
         Requests per minute the edge lets through to this app, across all its
         hostnames. Past a limit, visitors get <code>429 Too Many Requests</code>{" "}

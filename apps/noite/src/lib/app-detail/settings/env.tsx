@@ -126,10 +126,9 @@ export const EnvVarsPanel = ({
   };
 
   return (
-    <SettingsSection>
-      <div class="flex items-center justify-between gap-2">
-        <h3 class="m-0 text-lg font-semibold">Environment</h3>
-        {isAdmin ? (
+    <SettingsSection
+      actions={
+        isAdmin ? (
           <span class="flex items-center gap-2">
             <button
               type="button"
@@ -169,8 +168,10 @@ export const EnvVarsPanel = ({
               Add Variable
             </button>
           </span>
-        ) : null}
-      </div>
+        ) : null
+      }
+      section="env"
+    >
       <p class="m-0 text-sm opacity-70">
         Variables reach the build, the release command, the fleet, and Worker
         code (<code>env.NAME</code>). A change takes effect on the next deploy.

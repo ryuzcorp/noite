@@ -21,7 +21,7 @@ A refused request gets `Retry-After` with the real remaining time of the limit t
 
 Each zone remembers up to 65,536 visitors. Under a flood of that many distinct addresses, a visitor still inside their window keeps the budget they have spent, and new addresses are let through uncounted until the flood's windows pass, instead of being let in at the expense of someone else's limit.
 
-The whole-app ceiling stops traffic from many addresses at once from taking the server's CPU away from every other app. It is off by default because a real traffic spike looks the same. Set a platform-wide ceiling with `NOITE_EDGE_APP_RPM`, or set one app's limits in its **Settings → Rate Limits** (app admins only). There, an empty field uses the platform default and `0` means no limit.
+The whole-app ceiling stops traffic from many addresses at once from taking the server's CPU away from every other app. It is off by default because a real traffic spike looks the same. Set a platform-wide ceiling with `NOITE_EDGE_APP_RPM`, or set one app's limits in its **Settings → Limits** (app admins only). There, an empty field uses the platform default and `0` means no limit.
 
 The edge also drops connections that take more than 10 seconds to send their request headers, and closes idle keep-alive connections after 2 minutes.
 

@@ -139,8 +139,7 @@ export const AppDangerZone = ({
   };
 
   return (
-    <SettingsSection>
-      <h3 class="text-error m-0 text-lg font-semibold">Danger Zone</h3>
+    <SettingsSection section="danger">
       {notice() ? (
         <div class="alert alert-error m-0 py-2" role="alert">
           <span>{notice()}</span>
