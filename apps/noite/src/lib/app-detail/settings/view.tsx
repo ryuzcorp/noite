@@ -110,36 +110,66 @@ const SettingsSections = ({
   const isAdmin = capabilities(gate.myRole).admin;
   const anchor = parseSettingsSection(rawSection(), isAdmin);
   const box = atom.lazy(newLiveRef<HTMLDivElement>)();
+  // A contents-nav pick owns the scroll from that point on: the deep-link
+  // scroll below must never pull the viewport back to the section the page
+  // opened on.
+  const jumped = atom(false);
 
   // A shared link (`?section=domains`, or the old `?panel=settings` redirect)
-  // opens on that section. One scroll per mount: the redirect lands as a new
-  // page, and the contents nav scrolls directly.
+  // opens on that section. Sections above the target grow as their own
+  // resources answer, so the heading keeps moving; re-align it on every DOM
+  // change until no section is a skeleton anymore (no `role=status`), which
+  // is the settled layout.
   watch.once(async ({ signal }) => {
     if (typeof window === "undefined" || anchor === null) {
       return;
     }
 
     const host = await whenLive(box, signal);
+    const headingId = `#${settingsSectionAnchor(anchor)}`;
 
-    if (!host) {
+    const first = host
+      ? await whenFrame(() => host.querySelector(headingId), signal)
+      : null;
+
+    if (!host || !first || signal.aborted) {
       return;
     }
 
-    // Sections above the target grow as their own resources answer: wait
-    // until none is still a skeleton (no `role=status`), so the heading is
-    // where the final layout puts it, not where it sat for a frame.
-    const heading = await whenFrame(() => {
-      const el = host.querySelector(`#${settingsSectionAnchor(anchor)}`);
+    first.scrollIntoView({ block: "start" });
 
-      return el && host.querySelector('[role="status"]') === null ? el : null;
-    }, signal);
+    const settled = (): boolean =>
+      host.querySelector('[role="status"]') === null;
 
-    (
-      heading ?? host.querySelector(`#${settingsSectionAnchor(anchor)}`)
-    )?.scrollIntoView({ block: "start" });
+    if (settled()) {
+      return;
+    }
+
+    let observer: MutationObserver | null = null;
+
+    const follow = (): void => {
+      if (jumped()) {
+        observer?.disconnect();
+
+        return;
+      }
+
+      host.querySelector(headingId)?.scrollIntoView({ block: "start" });
+
+      if (settled()) {
+        observer?.disconnect();
+      }
+    };
+
+    observer = new MutationObserver(follow);
+    observer.observe(host, { childList: true, subtree: true });
+    signal.addEventListener("abort", () => observer?.disconnect(), {
+      once: true,
+    });
   });
 
   const jump = (section: SettingsSectionId): void => {
+    jumped.set(true);
     rawSection.set(section);
     liveEl(box)
       ?.querySelector(`#${settingsSectionAnchor(section)}`)
