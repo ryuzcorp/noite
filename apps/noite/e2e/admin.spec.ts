@@ -444,9 +444,22 @@ test("the apps tab deletes another account's app", async ({
   await page.goto(`/apps/_control?t=apps&aq=${encodeURIComponent(PROBE_SLUG)}`);
   const row = appRow(page, PROBE_SLUG);
   await expect(row).toBeVisible();
+
+  // Wait for the action's answer, not the runner listing: the runner hides
+  // an app the moment its delete starts, and the action drops the grants
+  // (including PROBE's collaborator row) only after the runner answered.
+  // The next test counts those grants, so leaving before the answer here
+  // leaves a stale row behind.
+  const deleted = page.waitForResponse((response) =>
+    response.url().endsWith("/api/admin/adminDeleteApp")
+  );
+
   await row.getByRole("button", { name: "Delete" }).click();
   await confirmInDialog(page, "Delete");
   await expect(page.getByText("No apps match that search.")).toBeVisible();
+
+  const answer = await deleted;
+  expect(answer.ok()).toBe(true);
   await expect(async () => {
     expect(await findAppId(request, PROBE_SLUG)).toBeNull();
   }).toPass({ timeout: 60_000 });
