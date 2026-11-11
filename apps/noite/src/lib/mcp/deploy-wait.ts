@@ -56,9 +56,10 @@ export const DeployWaits = Data.taggedEnum<DeployWait>();
  * response. */
 export const MAX_WAIT_SECONDS = 45;
 
-/** How often the poll re-reads the row. One runner call per second is a
- * single indexed row read on loopback. */
-export const WAIT_INTERVAL_MS = 1000;
+/** How often the poll re-reads the row. Two seconds: one `deploys.list` per
+ * poll is the app's 20 newest rows (the fat query), so the interval is the one
+ * lever this tool has on the cost of a long wait. */
+export const WAIT_INTERVAL_MS = 2000;
 
 /** Wait one interval on the real clock. `wait_for_deploy` passes this; a test
  * passes a fake one that advances its own clock instead of sleeping. */

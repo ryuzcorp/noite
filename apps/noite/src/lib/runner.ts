@@ -957,8 +957,6 @@ export const runnerSourceTree = (id: string, ref?: string) =>
 export const runnerSourceBlob = (id: string, path: string, ref?: string) =>
   runnerRpc<RunnerBlob>("source.blob", { id, path, ref });
 
-<<<<<<< HEAD
-=======
 /** Commit source edits server-side (the MCP `commit_files` path): the same
  * runner endpoint the control route forwards a browser's body to, so both
  * surfaces make the identical commit and answer `{ sha }`. The runner is the
@@ -973,7 +971,6 @@ export const runnerSourceCommit = (id: string, body: SourceCommitBody) =>
     }
   );
 
->>>>>>> a20f234b (feat(mcp): close the agent loop with write, PR and deploy tools)
 // Preview environments (ROADMAP: Preview environments). The runner enforces
 // the app role on every call, so the UI resolves the caller's role and passes
 // it: `view` to read, `push` to create/deploy and set variables, `admin` to

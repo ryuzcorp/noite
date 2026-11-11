@@ -221,7 +221,10 @@ describe("POST /api/apps/:appId/source/commit with an API key", () => {
 
   test("a key without apps:manage is refused", async () => {
     restoreFetch = captureForward(() => Response.json({ sha: "unused" }));
-    const key = await mintKey("u_push", { permissions: { events: ["ingest"] } });
+
+    const key = await mintKey("u_push", {
+      permissions: { events: ["ingest"] },
+    });
 
     const response = await call({
       headers: { authorization: `Bearer ${key}`, origin: "" },

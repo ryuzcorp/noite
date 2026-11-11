@@ -15,17 +15,12 @@ pub fn sha_valid(sha: &str) -> bool {
 /// Deploy history, filtered by target: `environment_id = None` is the app's
 /// production history, `Some` one preview environment's (ROADMAP, the
 /// Deployments tab filters by environment).
-/// Deploy history, without finished rows' build logs: the one in-flight row
-/// keeps its live log (the panel renders it), everything else answers `""` and
-/// the UI fetches a finished log on demand with `deploys.log`. This is the same
-/// shape the deploy stream sends (`list_deploys_lean`), and it keeps a poll of
-/// this list cheap — `wait_for_deploy` reads it once a second.
 pub async fn list(
     state: &AppState,
     id: &str,
     environment_id: Option<&str>,
 ) -> Result<Vec<Deploy>, ApiError> {
-    db::list_deploys_lean(&state.pool, id, environment_id)
+    db::list_deploys(&state.pool, id, environment_id)
         .await
         .map_err(|e| ApiError::internal(e.to_string()))
 }

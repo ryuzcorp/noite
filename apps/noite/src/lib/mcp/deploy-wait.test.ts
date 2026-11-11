@@ -85,7 +85,7 @@ describe("waitForDeploy", () => {
 
     expect(outcome._tag).toBe("Settled");
     expect(outcome._tag === "Settled" && outcome.deploy.status).toBe("success");
-    expect(fake.sleeps).toEqual([1000, 1000]);
+    expect(fake.sleeps).toEqual([2000, 2000]);
   });
 
   test("a row still moving when the budget runs out answers Waiting", async () => {
@@ -97,7 +97,7 @@ describe("waitForDeploy", () => {
       "building"
     );
     // 1000 + 1000 + the 500 left, never past the budget.
-    expect(fake.sleeps).toEqual([1000, 1000, 500]);
+    expect(fake.sleeps).toEqual([2000, 500]);
   });
 
   test("no row yet answers Missing instead of Waiting", async () => {
