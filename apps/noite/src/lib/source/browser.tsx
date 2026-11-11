@@ -24,7 +24,12 @@ import type { LiveRef } from "../live-ref";
 import type { RunnerBlob, RunnerTree } from "../runner";
 import type { SearchParam } from "../search-param";
 import { confirmDialog } from "../ui/confirm";
-import type { DraftActions, ReadOnlyRef, SourceBrowserState } from "./drafts";
+import type {
+  DraftActions,
+  PushRequest,
+  ReadOnlyRef,
+  SourceBrowserState,
+} from "./drafts";
 import { createEditorPane } from "./editor";
 import { READ_ONLY_PUSH } from "./failure-copy";
 import { operationFailure, PushOps, settlePush, startPush } from "./operations";
@@ -340,10 +345,7 @@ export const SourceBrowser = ({
   };
 
   /** The commit: one body, one request, one outcome. */
-  const commit = async (request: {
-    branch?: string;
-    message: string;
-  }): Promise<boolean> => {
+  const commit = async (request: PushRequest): Promise<boolean> => {
     const checkout = current();
 
     const started = startPush(
@@ -368,10 +370,18 @@ export const SourceBrowser = ({
     box.pushOp = started;
     syncState();
 
-    // The commit names the branch it lands on; the runner creates a new one at
-    // the browsed tip and grows an existing one from its own tip.
+    // The commit names the branch it lands on. The runner's own default is the
+    // default branch, which is not necessarily the one being browsed, so the
+    // target is always sent; a branch this commit creates starts at the
+    // browsed commit (`fromSha`), and an existing one grows from its own tip
+    // (the runner ignores `fromSha` then).
     const target = request.branch ?? checkout.ref;
-    const where = request.branch === undefined ? {} : { branch: target };
+
+    const createsBranch = request.branch !== undefined;
+
+    const where = createsBranch
+      ? { branch: target, fromSha: checkout.tree.sha }
+      : { branch: target };
 
     try {
       await commitSource({
@@ -385,7 +395,7 @@ export const SourceBrowser = ({
         to: {
           base: checkout.ref,
           branch: target,
-          newBranch: request.branch !== undefined,
+          newBranch: request.create === true,
         },
       });
       // The commit owns the bytes now: the buffers are gone, and the rows come
@@ -552,7 +562,7 @@ export const SourceBrowser = ({
       const shown = current();
 
       if (shown !== null) {
-        gitRef.set(shown.ref);
+        setRef(shown.ref);
       }
     })();
   });

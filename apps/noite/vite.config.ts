@@ -248,7 +248,7 @@ export default defineConfig({
     // `void.config.ts` (`sourceDir: "src"`) — no wrangler file, no
     // `src/worker.ts`. `voidIlha()` renders Void pages with ilha. Void has
     // no action timeout, so the 15 s per-route bound lives in
-    // `src/middleware/01-timeout.ts` (JSON 504, stream/R2/archive exempt).
+    // `src/middleware/01-timeout.ts` (JSON 504, stream/R2/static exempt).
     // Keep dev D1 where the Oxide/Cloudflare plugin kept it
     // (`.wrangler/state/v3/d1/...`), so existing local accounts survive the
     // migration — Void's default (`.void/`) starts a fresh database.

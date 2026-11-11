@@ -231,6 +231,7 @@ const CommitForm = ({
         // grows from its own tip.
         if (plan.branch !== undefined) {
           request.branch = plan.branch;
+          request.create = plan.choice._tag === "New";
         }
 
         lastMessage.set(text);

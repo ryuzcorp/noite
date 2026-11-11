@@ -43,6 +43,9 @@ export interface SourceBrowserState {
  * to the browsed branch itself. */
 export interface PushRequest {
   branch?: string;
+  /** Whether `branch` is a branch this commit creates (the form's New
+   * branch…): only then does the outcome offer a pull request. */
+  create?: boolean;
   message: string;
 }
 
