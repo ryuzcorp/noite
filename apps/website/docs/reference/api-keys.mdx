@@ -24,7 +24,6 @@ Beyond its scopes, a key can be narrowed three ways. All three are enforced by o
 | Field | Default | What it does |
 | --- | --- | --- |
 | **Apps** | All apps | Limits the key to the app ids you pick. A request naming any other app — by slug or by id — is refused. `create_app` (and claiming a new slug with a git push) is refused too, because the new app would not be in the key. |
-| **Create** | — | Only a key whose ceiling is **Admin** can create an app: creating makes you its admin, above a narrower ceiling. |
 | **Role ceiling** | Admin (no cap) | The key's effective role is the lower of **your role on that app** and this ceiling. A `push` key owned by an admin can push and open pull requests but cannot change variables or settings, force-push, delete a branch, or commit to a protected branch. |
 | **Expiry** | Never | `1 hour`, `1 day`, `7 days` or `30 days`. Once the instant passes the key is refused everywhere, and the next attempt deletes it. |
 

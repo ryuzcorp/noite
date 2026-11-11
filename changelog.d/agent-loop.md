@@ -1,0 +1,10 @@
+### Added
+
+- **The agent loop closes: an API key can now go from code to production without the UI.** Fifteen new MCP tools — `commit_files` (writes, deletes, moves, a new branch from a base, and an `expectedTip` compare-and-set), `create_branch`/`delete_branch`, `list_prs`/`get_pr`/`create_pr`/`comment_pr`/`review_pr`/`merge_pr`/`close_pr`, `rollback`/`redeploy`/`cancel_deploy` and `wait_for_deploy` — each gated through the one app-resolution helper with the role the UI uses, and each answering a typed refusal (`protected_branch`, `stale_tip`, `not_mergeable`, `not_open`, `forbidden`, …) as `structuredContent.refusal` so an agent can branch on the code instead of parsing English. `get_pr` reports the checks that gate merging (mergeability, approvals, the preview deploy of the head commit) and the preview environment tracking the branch; `wait_for_deploy` is one bounded long poll (≤ 60 s, `resume` hint) because the transport is stateless HTTP.
+- **The web-commit route accepts `Authorization: Bearer noite_…`.** A key authenticates through the same function `/mcp` uses and is gated on the app by the one key-enforcement helper, so a key limited to other apps, capped below `push`, expired or owner-banned cannot commit; the commit actor reads `<user> via key <name>`. Cookie auth and the route's body limits are unchanged.
+- **`noite pr list|view|create|merge`, `noite rollback`, `noite logs`, `noite deploy status|wait`.** They reuse the MCP tools, so the CLI and an agent share one implementation of every rule.
+
+### Changed
+
+- **`commit_files`' compare-and-set is enforced by the runner, not by a read-then-write guess.** The web-commit body takes an optional `expectedTip`; a branch that moved since the caller read it is refused with `tip moved` (409) before any object is written, and the publish carries the same value so the window before the ref write cannot let a racing push through either.
+- **`/mcp` has its own request bound (65 s) instead of the 15 s action bound.** A tool call that waits on purpose (`wait_for_deploy`) would otherwise be cut into a 504 the caller cannot read. Every other route keeps 15 s.

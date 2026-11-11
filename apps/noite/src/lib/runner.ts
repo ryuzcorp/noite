@@ -1,4 +1,5 @@
 /* oxlint-disable eslint/max-classes-per-file -- the two runner error classes are the transport contract: a caught runner error is one of them. */
+import { SOURCE_FORWARD_TIMEOUT_MS } from "./commit-source";
 import { controlEnv, hydrateControlEnv } from "./control-env";
 // Wire types, generated from the Rust structs in apps/runner into
 // ./runner-types (never edit those files by hand). Regenerate with `cargo
@@ -950,6 +951,23 @@ export const runnerSourceTree = (id: string, ref?: string) =>
 export const runnerSourceBlob = (id: string, path: string, ref?: string) =>
   runnerRpc<RunnerBlob>("source.blob", { id, path, ref });
 
+<<<<<<< HEAD
+=======
+/** Commit source edits server-side (the MCP `commit_files` path): the same
+ * runner endpoint the control route forwards a browser's body to, so both
+ * surfaces make the identical commit and answer `{ sha }`. The runner is the
+ * authority on paths, sizes and encodings. */
+export const runnerSourceCommit = (id: string, body: SourceCommitBody) =>
+  runnerFetch<{ sha: string }>(
+    `/v1/apps/${encodeURIComponent(id)}/source/commit`,
+    {
+      body: JSON.stringify(body),
+      method: "POST",
+      signal: AbortSignal.timeout(SOURCE_FORWARD_TIMEOUT_MS),
+    }
+  );
+
+>>>>>>> a20f234b (feat(mcp): close the agent loop with write, PR and deploy tools)
 // Preview environments (ROADMAP: Preview environments). The runner enforces
 // the app role on every call, so the UI resolves the caller's role and passes
 // it: `view` to read, `push` to create/deploy and set variables, `admin` to

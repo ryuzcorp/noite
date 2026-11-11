@@ -115,18 +115,36 @@ export interface McpToolResult {
   text: string;
 }
 
+/** A refusal a caller can act on: the closed `code` names the reason, the
+ * `message` is the runner's own wording, and `hint` says what to do next. It
+ * travels as the error result's `structuredContent`, so an agent branches on
+ * the code instead of reading English; `tools.ts`'s classifier is the only
+ * place one is built. */
+export interface ToolRefusal {
+  readonly code: string;
+  readonly hint: string;
+  readonly message: string;
+}
+
 /** A tool call that failed. `invalid` marks arguments that do not match the
  * tool's published `inputSchema` — a client error, answered with a JSON-RPC
  * error, per the MCP tools spec; every other failure is a tool result with
- * `isError: true` carrying this message. */
+ * `isError: true` carrying this message. A `refusal` is the machine-readable
+ * half of that result. */
 export class McpToolError extends Error {
   override name = "McpToolError";
 
   readonly invalid: boolean;
 
-  constructor(message: string, options?: { invalid?: boolean }) {
+  readonly refusal: ToolRefusal | null;
+
+  constructor(
+    message: string,
+    options?: { invalid?: boolean; refusal?: ToolRefusal }
+  ) {
     super(message);
     this.invalid = options?.invalid ?? false;
+    this.refusal = options?.refusal ?? null;
   }
 }
 
@@ -255,10 +273,20 @@ const callTool = async (
       error instanceof Error ? error.message : String(error)
     ).replace(/^runner (?:rpc \S+: \d+|GET \S+: \d+) /u, "");
 
+    // A refusal keeps `isError: true` (the spec's tool-execution error) and
+    // carries its code in `structuredContent`, which the spec leaves to the
+    // server to shape: a client can branch on `refusal.code` and still show
+    // the text it would have shown anyway.
+    const content = [{ text: message, type: "text" }];
+    const refusal = error instanceof McpToolError ? error.refusal : null;
+
     return {
       id,
       jsonrpc: "2.0",
-      result: { content: [{ text: message, type: "text" }], isError: true },
+      result:
+        refusal === null
+          ? { content, isError: true }
+          : { content, isError: true, structuredContent: { refusal } },
     };
   }
 };

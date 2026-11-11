@@ -116,19 +116,6 @@ export const authenticateKey = async (
           });
     }
 
-    // A present-but-unreadable expiry must refuse, not read as "never": the
-    // plugin's own comparison (`Date.now() > new Date(NaN)`) is false, so a
-    // corrupt row would otherwise be a perpetual key.
-    const expiresAt = asDate(verifiedKey.expiresAt);
-
-    if (
-      expiresAt === null &&
-      verifiedKey.expiresAt !== null &&
-      verifiedKey.expiresAt !== undefined
-    ) {
-      return KeyAuthState.Rejected({ code: "KEY_EXPIRY_INVALID" });
-    }
-
     // A key whose metadata cannot be read is refused instead of being treated
     // as account-wide: a scope we cannot parse must not widen the credential.
     const read = parseKeyScope(verifiedKey.metadata);
@@ -147,7 +134,7 @@ export const authenticateKey = async (
 
     return KeyAuthState.Authed({
       principal: {
-        expiresAt,
+        expiresAt: asDate(verifiedKey.expiresAt),
         keyId: verifiedKey.id,
         keyName: verifiedKey.name?.trim() ?? "",
         scope: keyScopeOf(read),

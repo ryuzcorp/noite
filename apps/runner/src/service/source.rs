@@ -165,6 +165,12 @@ pub struct SourceCommitBody {
     #[serde(default)]
     #[ts(optional)]
     pub from_sha: Option<String>,
+    /// The caller's compare-and-set precondition: the branch must still be at
+    /// this commit (a ref or sha resolving to it) or the commit is refused with
+    /// "tip moved". Absent keeps the browser's read-then-write behaviour.
+    #[serde(default)]
+    #[ts(optional)]
+    pub expected_tip: Option<String>,
     /// The caller's app role; `require_pr` blocks a non-admin commit to
     /// `main` (`None` counts as a non-admin).
     #[serde(default)]
@@ -248,6 +254,7 @@ pub async fn commit(
         },
         body.branch.as_deref(),
         body.from_sha.as_deref(),
+        body.expected_tip.as_deref(),
     )
     .await
     .map_err(commit_error)?;

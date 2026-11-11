@@ -13,6 +13,7 @@ import {
 } from "../lib/feeds";
 import { testRouteContext } from "../testing/context";
 import defaultTimeoutMiddleware, {
+  MCP_TIMEOUT_MS,
   routeTimeout,
   TIMEOUT_MS,
   timeoutMiddleware as withTimeout,
@@ -58,6 +59,21 @@ describe("routeTimeout", () => {
     expect(routeTimeout("/assets/pages-client-CA3vIREc.js")).toEqual({
       kind: "exempt",
       why: "static",
+    });
+  });
+
+  test("the MCP endpoint answers on its own, longer bound", () => {
+    // One `tools/call` may wait on purpose (`wait_for_deploy`, capped at 60 s):
+    // the action bound would cut a healthy answer into an unreadable 504.
+    expect(routeTimeout("/mcp")).toEqual({
+      kind: "bounded",
+      ms: MCP_TIMEOUT_MS,
+    });
+    expect(MCP_TIMEOUT_MS).toBeGreaterThan(60_000);
+    // Every other action keeps the 15 s bound.
+    expect(routeTimeout("/api/apps/create")).toEqual({
+      kind: "bounded",
+      ms: TIMEOUT_MS,
     });
   });
 

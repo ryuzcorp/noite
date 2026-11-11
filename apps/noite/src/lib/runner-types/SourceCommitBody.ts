@@ -19,6 +19,12 @@ moves?: Array<SourceCommitMove>,
  */
 deletes?: Array<string>, message: string, branch?: string, fromSha?: string, 
 /**
+ * The caller's compare-and-set precondition: the branch must still be at
+ * this commit (a ref or sha resolving to it) or the commit is refused with
+ * "tip moved". Absent keeps the browser's read-then-write behaviour.
+ */
+expectedTip?: string, 
+/**
  * The caller's app role; `require_pr` blocks a non-admin commit to
  * `main` (`None` counts as a non-admin).
  */

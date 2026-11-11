@@ -5,6 +5,8 @@ import { Data, Effect } from "effect";
 import { Command, Flag } from "effect/cli";
 
 import { connection } from "./config.js";
+import { print } from "./connect.js";
+import type { ConnFlags } from "./connect.js";
 import {
   commentPr,
   parseCommentMode,
@@ -13,6 +15,7 @@ import {
 } from "./gh.js";
 import type { CommentOutcome } from "./gh.js";
 import { copyTreeEntries, pushTree } from "./git.js";
+import { callTool } from "./mcp.js";
 import { withTempDir } from "./temp.js";
 
 /** Default deploy message from the action sha or a timestamp. */
@@ -148,9 +151,15 @@ export const advanceDeploy = (
   throw new Error(`illegal deploy transition: ${phase._tag} + ${event._tag}`);
 };
 
-export const deploy = Command.make(
+const deployCommand = Command.make(
   "deploy",
   {
+    appUrl: Flag.String("app-url").pipe(
+      Flag.withDescription(
+        "Control UI origin for `deploy status`/`deploy wait` (default: derived from --url, or NOITE_APP_URL)"
+      ),
+      Flag.withDefault("")
+    ),
     comment: Flag.String("comment").pipe(
       Flag.withDescription("PR comment mode: update, create, or off"),
       Flag.withDefault("update")
@@ -282,4 +291,190 @@ export const deploy = Command.make(
   Command.withDescription(
     "Deploy a prebuilt dist directory over Git smart-HTTP"
   )
+);
+
+/** `deploy wait`'s machine: it re-arms the bounded long poll until the deploy
+ * stops moving or the command's own deadline passes.
+ *
+ * ```text
+ * Waiting ──Observed(done)──▶ Settled
+ * Waiting ──Observed(!done)─▶ Waiting (next call)
+ * Waiting ──Deadline───────▶ GaveUp
+ * ```
+ */
+export type WaitPhase = Data.TaggedEnum<{
+  /** Gave up before the row settled; `status` is the last one seen. */
+  GaveUp: { readonly status: string | null };
+  Settled: { readonly status: string };
+  /** `status` is the last one seen (`null`: no deploy row yet). */
+  Waiting: { readonly status: string | null };
+}>;
+
+export type WaitEvent = Data.TaggedEnum<{
+  Deadline: Record<never, never>;
+  Observed: { readonly done: boolean; readonly status: string | null };
+}>;
+
+export const WaitPhases = Data.taggedEnum<WaitPhase>();
+
+export const WaitEvents = Data.taggedEnum<WaitEvent>();
+
+/** The one legal-transition function. Anything else is a programming error,
+ * not a runtime condition, so it throws instead of silently skipping a step. */
+export const advanceWait = (phase: WaitPhase, event: WaitEvent): WaitPhase => {
+  if (phase._tag !== "Waiting") {
+    throw new Error(`illegal wait transition: ${phase._tag} + ${event._tag}`);
+  }
+
+  if (event._tag === "Deadline") {
+    return WaitPhases.GaveUp({ status: phase.status });
+  }
+
+  return event.done
+    ? WaitPhases.Settled({ status: event.status ?? "unknown" })
+    : WaitPhases.Waiting({ status: event.status });
+};
+
+/** What one `wait_for_deploy` call answered, as the loop reads it. */
+interface WaitAnswer {
+  readonly done: boolean;
+  readonly status: string | null;
+}
+
+/** `deploy status` / `deploy wait` take the connection flags from their parent
+ * (`noite deploy --slug … status`), so the two commands and the deploy itself
+ * can never disagree about which app they mean. */
+const waitArgs = (flags: {
+  readonly deployId: string;
+  readonly environment: string;
+  readonly maxWait: string;
+  readonly sha: string;
+}) => ({
+  deployId: flags.deployId === "" ? undefined : flags.deployId,
+  environment: flags.environment === "" ? undefined : flags.environment,
+  maxWaitSeconds: flags.maxWait === "" ? undefined : Number(flags.maxWait),
+  sha: flags.sha === "" ? undefined : flags.sha,
+});
+
+const statusCommand = Command.make(
+  "status",
+  {
+    environment: Flag.String("environment").pipe(
+      Flag.withDescription(
+        "Preview environment label or id (default: production)"
+      ),
+      Flag.withDefault("")
+    ),
+  },
+  (flags) =>
+    Effect.gen(function* status() {
+      // SAFETY: `Command.withSubcommands` provides the parent's parsed config
+      // through its handler service; `deploy`'s own config is `ConnFlags` plus
+      // its push flags, and the yielded type loses the config here.
+      // oxlint-disable-next-line anti-slop/no-chained-type-assertions -- the CLI's `Command` erases its yielded config type; this restores it.
+      const parent = (yield* deployCommand) as unknown as ConnFlags;
+      const ctx = yield* readActionContext();
+
+      const conn = yield* connection(
+        parent,
+        ctx._tag === "Actions" ? ctx.repo : null
+      );
+
+      const result = yield* callTool<unknown>(conn, "deploy_status", {
+        app: conn.slug,
+        environment: flags.environment === "" ? undefined : flags.environment,
+      });
+
+      yield* print(result.text);
+    })
+).pipe(Command.withDescription("This app's deploy state and recent deploys"));
+
+const waitCommand = Command.make(
+  "wait",
+  {
+    deployId: Flag.String("deploy-id").pipe(
+      Flag.withDescription("Wait for this deploy id (default: the newest)"),
+      Flag.withDefault("")
+    ),
+    environment: Flag.String("environment").pipe(
+      Flag.withDescription(
+        "Preview environment label or id (default: production)"
+      ),
+      Flag.withDefault("")
+    ),
+    maxWait: Flag.String("max-wait").pipe(
+      Flag.withDescription("Seconds per MCP call, at most 60 (default 25)"),
+      Flag.withDefault("")
+    ),
+    sha: Flag.String("sha").pipe(
+      Flag.withDescription("Wait for the deploy of this commit sha"),
+      Flag.withDefault("")
+    ),
+    timeout: Flag.String("timeout").pipe(
+      Flag.withDescription("Give up after this many seconds (default 900)"),
+      Flag.withDefault("")
+    ),
+  },
+  (flags) =>
+    Effect.gen(function* wait() {
+      // SAFETY: `Command.withSubcommands` provides the parent's parsed config
+      // through its handler service; `deploy`'s own config is `ConnFlags` plus
+      // its push flags, and the yielded type loses the config here.
+      // oxlint-disable-next-line anti-slop/no-chained-type-assertions -- the CLI's `Command` erases its yielded config type; this restores it.
+      const parent = (yield* deployCommand) as unknown as ConnFlags;
+      const ctx = yield* readActionContext();
+
+      const conn = yield* connection(
+        parent,
+        ctx._tag === "Actions" ? ctx.repo : null
+      );
+
+      const args = waitArgs(flags);
+      const callSeconds = Number(flags.maxWait === "" ? 25 : flags.maxWait);
+
+      const deadline =
+        Date.now() + Number(flags.timeout === "" ? 900 : flags.timeout) * 1000;
+
+      let phase: WaitPhase = WaitPhases.Waiting({ status: null });
+      let text = "";
+
+      while (phase._tag === "Waiting") {
+        // The call itself waits up to `callSeconds`; the client bound leaves
+        // room for the answer so the tool's own budget is never cut short.
+        const answer = yield* callTool<WaitAnswer>(
+          conn,
+          "wait_for_deploy",
+          { app: conn.slug, ...args },
+          { timeoutMs: (callSeconds + 15) * 1000 }
+        );
+
+        const { text: answerText } = answer;
+        text = answerText;
+        phase = advanceWait(
+          phase,
+          WaitEvents.Observed({
+            done: answer.structured.done,
+            status: answer.structured.status,
+          })
+        );
+
+        if (phase._tag === "Waiting" && Date.now() >= deadline) {
+          phase = advanceWait(phase, WaitEvents.Deadline());
+        }
+      }
+
+      yield* print(
+        phase._tag === "Settled"
+          ? `deploy ${phase.status} — ${conn.slug}`
+          : `${text}\nGave up after the timeout with status ${phase.status ?? "unknown"}.`
+      );
+    })
+).pipe(
+  Command.withDescription(
+    "Wait for a deploy to finish (bounded long poll; re-arms until it settles)"
+  )
+);
+
+export const deploy = deployCommand.pipe(
+  Command.withSubcommands([statusCommand, waitCommand])
 );

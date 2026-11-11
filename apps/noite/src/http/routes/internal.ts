@@ -1,8 +1,8 @@
 import * as Schema from "effect/Schema";
 
 import { authFromEnv, MissingAuthSecretError } from "../../lib/auth";
+import { requireAppRoleBySlug } from "../../lib/collaborators";
 import { ensureDb } from "../../lib/db";
-import type { KeyPrincipal } from "../../lib/key-principal";
 import { parseAppRole } from "../../lib/roles";
 import {
   isAppLimitReached,
@@ -146,11 +146,9 @@ const GitAuthBody = Schema.Struct({
  * pushes at once) re-reads the app: the pusher may push if it turned out to be
  * theirs, and sees the 404 otherwise. */
 const gitAuthCreate = async (
-  principal: KeyPrincipal,
+  userId: string,
   slug: string
 ): Promise<Response> => {
-  const { userId } = principal;
-
   const notFound = Response.json(
     { error: "repository not found", ok: false },
     { status: 404 }
@@ -187,18 +185,18 @@ const gitAuthCreate = async (
     const failure = runnerFailureOf(error);
 
     if (isSlugTaken(failure)) {
-      // The slug is someone's app: the same key gate decides, so a capped or
-      // app-restricted key never learns more than the ordinary path gives it.
-      const verdict = await keyAppVerdict(principal, { slug }, "admin");
+      const access = await requireAppRoleBySlug(slug, userId, "admin").catch(
+        () => null
+      );
 
-      if (verdict._tag !== "Granted") {
+      if (!access) {
         return notFound;
       }
 
       return Response.json({
-        appId: verdict.app.id,
+        appId: access.app.id,
         ok: true,
-        role: verdict.role,
+        role: access.role,
         userId,
       });
     }
@@ -299,20 +297,8 @@ export const handleGitAuth: RouteHandler = async (request, env) => {
       );
     }
 
-    // Creating an app makes the caller its admin, so only a key that may
-    // administer may create one: a capped key must not answer `admin` here.
-    if (principal.scope.roleCeiling !== "admin") {
-      return Response.json(
-        {
-          error: "This API key's role ceiling cannot create apps",
-          ok: false,
-        },
-        { status: 403 }
-      );
-    }
-
     try {
-      return await gitAuthCreate(principal, slug);
+      return await gitAuthCreate(principal.userId, slug);
     } catch (error) {
       console.error("[git-auth]", error);
 

@@ -2129,6 +2129,7 @@ mod tests {
             },
             None,
             None,
+            None,
         )
         .await
         .expect("root commit");
@@ -2158,6 +2159,7 @@ mod tests {
             },
             Some("feature/x"),
             Some(&first),
+            None,
         )
         .await
         .expect("branch commit");
@@ -2200,6 +2202,7 @@ mod tests {
             },
             Some("feature/x"),
             None,
+            None,
         )
         .await
         .expect("append");
@@ -2226,6 +2229,7 @@ mod tests {
             },
             None,
             None,
+            None,
         )
         .await
         .expect_err("traversal");
@@ -2243,6 +2247,7 @@ mod tests {
                 deletes: &[],
             },
             Some("a..b"),
+            None,
             None,
         )
         .await
@@ -2271,6 +2276,7 @@ mod tests {
             },
             None,
             None,
+            None,
         )
         .await
         .expect("root commit");
@@ -2288,6 +2294,7 @@ mod tests {
                 moves: &[],
                 deletes: &deletes,
             },
+            None,
             None,
             None,
         )
@@ -2343,6 +2350,7 @@ mod tests {
             },
             None,
             None,
+            None,
         )
         .await
         .expect_err("missing delete");
@@ -2350,6 +2358,76 @@ mod tests {
             format!("{err:#}").contains("missing.txt not found"),
             "{err:#}"
         );
+
+        h.finish().await;
+    }
+
+    #[tokio::test]
+    async fn web_commit_expected_tip_refuses_a_moved_branch() {
+        // `commit_files`' compare-and-set: the commit lands only while the
+        // branch is still at the tip the caller read; a tip another writer
+        // moved is refused before any object is written, so the branch keeps
+        // the commit that won.
+        let h = Harness::new("webcas").await;
+        let actor = crate::host::git_identity::noreply(&h.state.config, "user_1", "Ada");
+        let files = vec![text_file("README.md", "# hello\n")];
+        let first = crate::host::web_commit::web_commit(
+            &h.state,
+            &h.app,
+            &actor,
+            "root",
+            crate::host::web_commit::WebChanges {
+                files: &files,
+                moves: &[],
+                deletes: &[],
+            },
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("root commit");
+
+        let files = vec![text_file("b.txt", "b\n")];
+        let second = crate::host::web_commit::web_commit(
+            &h.state,
+            &h.app,
+            &actor,
+            "on the tip",
+            crate::host::web_commit::WebChanges {
+                files: &files,
+                moves: &[],
+                deletes: &[],
+            },
+            None,
+            None,
+            Some(&first),
+        )
+        .await
+        .expect("matched tip");
+
+        let files = vec![text_file("c.txt", "c\n")];
+        let err = crate::host::web_commit::web_commit(
+            &h.state,
+            &h.app,
+            &actor,
+            "stale tip",
+            crate::host::web_commit::WebChanges {
+                files: &files,
+                moves: &[],
+                deletes: &[],
+            },
+            None,
+            None,
+            Some(&first),
+        )
+        .await
+        .expect_err("stale tip");
+
+        assert!(format!("{err:#}").contains("tip moved"), "{err:#}");
+        let bare = http_bare(&h.state.config, &h.app.slug);
+        let refs_now = list_refs(&bare).await.expect("list");
+        assert_eq!(refs_now.get("refs/heads/main"), Some(&second));
 
         h.finish().await;
     }
@@ -2409,6 +2487,7 @@ mod tests {
             },
             None,
             None,
+            None,
         )
         .await
         .expect("root commit");
@@ -2444,6 +2523,7 @@ mod tests {
             },
             None,
             None,
+            None,
         )
         .await
         .expect("move commit");
@@ -2476,6 +2556,7 @@ mod tests {
                 moves: &moves,
                 deletes: &[],
             },
+            None,
             None,
             None,
         )
@@ -2533,6 +2614,7 @@ mod tests {
             },
             None,
             None,
+            None,
         )
         .await
         .expect("swap commit");
@@ -2568,6 +2650,7 @@ mod tests {
                 moves: &moves,
                 deletes: &[],
             },
+            None,
             None,
             None,
         )
@@ -2608,6 +2691,7 @@ mod tests {
                 moves: &[],
                 deletes: &[],
             },
+            None,
             None,
             None,
         )
@@ -2657,6 +2741,7 @@ mod tests {
             },
             None,
             None,
+            None,
         )
         .await
         .expect_err("nul in text");
@@ -2677,6 +2762,7 @@ mod tests {
                 moves: &[],
                 deletes: &[],
             },
+            None,
             None,
             None,
         )
@@ -2714,6 +2800,7 @@ mod tests {
                 moves: &[],
                 deletes: &[],
             },
+            None,
             None,
             None,
         )
