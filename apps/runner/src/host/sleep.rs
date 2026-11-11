@@ -290,8 +290,9 @@ pub async fn sleep_app(
         None
     } else {
         let own = db::get_app_limit(pool, &app.id).await?.sleep_after_s;
-        // The platform `0` is a master off (see `sweep`).
-        if cfg.sleep_after_s == 0 && own.is_none() {
+        // The platform `0` is a master off (see `sweep`): no override
+        // re-enables it.
+        if cfg.sleep_after_s == 0 {
             return Ok(false);
         }
         match auto_sleep_after_s(own, app.deployed_config.as_deref(), cfg.sleep_after_s) {
@@ -747,7 +748,9 @@ pub async fn sleep_environment(
     if !force {
         let owner = db::get_app(pool, &env.app_id).await?;
         let own = db::get_app_limit(pool, &env.app_id).await?.sleep_after_s;
-        if cfg.sleep_after_s == 0 && own.is_none() {
+        // The platform `0` is a master off (see `sweep`): no override
+        // re-enables it.
+        if cfg.sleep_after_s == 0 {
             return Ok(false);
         }
         let owner_config = owner.as_ref().and_then(|a| a.deployed_config.as_deref());

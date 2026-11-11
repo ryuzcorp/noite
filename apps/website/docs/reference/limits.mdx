@@ -59,13 +59,13 @@ The edge also bounds each request before a worker sees it: request headers past 
 
 ## Sleep (scale to zero)
 
-An app idle past its threshold stops costing anything; the next request brings it back transparently (a cold wake measures ~1.3 s). The platform threshold is `RUNNER_SLEEP_AFTER_MIN` minutes, or `RUNNER_SLEEP_AFTER_H` hours — minutes win when both are set. Unset, it derives from detected memory: `15` minutes at ≤ 2 GiB, `6` hours at ≤ 4 GiB, else `24` hours. `0` on either disables sleeping install-wide and no per-app override re-enables it. The sweep runs a quarter of the threshold apart (5 minutes on a ≤ 2 GiB host, an hour on the longer tiers), so an app parks close to its threshold.
+An app idle past its threshold stops costing anything; the next request brings it back transparently (a cold wake measures ~1.3 s). The platform threshold is `RUNNER_SLEEP_AFTER_MIN` minutes, or `RUNNER_SLEEP_AFTER_H` hours — minutes win when both are set. Unset, it derives from detected memory: `15` minutes at ≤ 2 GiB, `6` hours at ≤ 4 GiB, else `24` hours. `0` on either disables sleeping install-wide and no per-app override re-enables it; the longest window is `2592000` seconds (30 days). The sweep runs a quarter of the threshold apart (5 minutes on a ≤ 2 GiB host, an hour on the longer tiers), so an app parks close to its threshold.
 
 **Per-app override.** Settings → Limits → Sleep after sets this app's threshold in seconds (`0` = never, valid range `60`–`2592000` = 30 days); empty falls back to the install default. Preview environments use their owning app's override.
 
 **Scheduled work never auto-sleeps.** An app whose last deploy uploaded a Wrangler config with `triggers.crons` or `queues.consumers` skips the sweep unless its owner set an explicit override — a sleeping scheduler would silently miss its triggers. Memory-pressure parking below still parks it; the next request wakes it.
 
-**Sweep.** Every `RUNNER_SLEEP_SWEEP_S` seconds (default 3600) the runner parks apps that are deployed, desired `running`, awake, and request-free for their window.
+**Sweep.** Every `RUNNER_SLEEP_SWEEP_S` seconds — unset, a quarter of the threshold, clamped `300`–`3600` — the runner parks apps that are deployed, desired `running`, awake, and request-free for their window.
 
 **Activity** is the newest of: the last minute bucket with requests in `app_metric` (real `celld.fetch` spans), the app's last wake (`woke_at`), its last deploy. A fresh deploy or manual start gets a full window.
 

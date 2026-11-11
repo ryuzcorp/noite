@@ -191,6 +191,12 @@ fn sleep_sweep_default_s(sleep_after_s: u64) -> u64 {
     (sleep_after_s / 4).clamp(5 * 60, 3600)
 }
 
+/// The longest configurable idle threshold: 30 days, matching the per-app
+/// override's ceiling. The sweep turns a threshold into a `chrono::Duration`
+/// from an `i64` cast, so an unbounded env value would wrap negative (park
+/// immediately) or panic (and leave the sweep latched off); `0` means never.
+pub(crate) const MAX_SLEEP_AFTER_S: i64 = 2_592_000;
+
 /// The operator's idle threshold in seconds: `RUNNER_SLEEP_AFTER_MIN` (minutes)
 /// if set, else `RUNNER_SLEEP_AFTER_H` (hours), else the derived default.
 /// Minutes are the finer knob the 15-minute default needs, so they win when
@@ -199,25 +205,34 @@ fn sleep_sweep_default_s(sleep_after_s: u64) -> u64 {
 /// counts as unset.
 fn sleep_after_setting_s(default_s: u64, problems: &mut Vec<String>) -> u64 {
     let set = |key: &str| env::var(key).map(|v| !v.trim().is_empty()).unwrap_or(false);
-    if set("RUNNER_SLEEP_AFTER_MIN") {
-        return env_num(
+    // Both knobs are parsed when set (a malformed one is a boot problem even
+    // if the other wins), and `0` on either is the install-wide master off —
+    // the operator who disables sleeping must not be overruled by the other
+    // knob.
+    let minutes = set("RUNNER_SLEEP_AFTER_MIN").then(|| {
+        env_num(
             "RUNNER_SLEEP_AFTER_MIN",
             default_s / 60,
             "a non-negative integer",
             problems,
         )
-        .saturating_mul(60);
-    }
-    if set("RUNNER_SLEEP_AFTER_H") {
-        return env_num(
+    });
+    let hours = set("RUNNER_SLEEP_AFTER_H").then(|| {
+        env_num(
             "RUNNER_SLEEP_AFTER_H",
             default_s / 3600,
             "a non-negative integer",
             problems,
         )
-        .saturating_mul(3600);
+    });
+    if minutes == Some(0) || hours == Some(0) {
+        return 0;
     }
-    default_s
+    match (minutes, hours) {
+        (Some(minutes), _) => minutes.saturating_mul(60),
+        (None, Some(hours)) => hours.saturating_mul(3600),
+        (None, None) => default_s,
+    }
 }
 
 /// Telemetry DuckDB's derived worker count: the cores this container may
@@ -1756,6 +1771,12 @@ impl Config {
         // records each one (var, value, expected form) and the boot fails
         // here naming them all, before any range complaint below.
         let mut problems: Vec<String> = self.env_problems.clone();
+        if self.sleep_after_s > MAX_SLEEP_AFTER_S as u64 {
+            problems.push(format!(
+                "RUNNER_SLEEP_AFTER_MIN/RUNNER_SLEEP_AFTER_H must be 0 (never) or at most {MAX_SLEEP_AFTER_S} seconds (30 days), got {}",
+                self.sleep_after_s
+            ));
+        }
         let dev_token = self.runner_token == "dev-runner-token";
         let dev_auth = std::env::var("BETTER_AUTH_SECRET")
             .map(|v| v.trim().is_empty() || v.starts_with("dev-"))
@@ -2818,7 +2839,8 @@ mod tests {
                 assert_eq!(cfg.sleep_after_s, 20 * 60);
             },
         );
-        // `0` on either knob is still the install-wide master off.
+        // `0` on either knob is still the install-wide master off — the
+        // finer knob must not overrule a disable.
         with_env(
             &[
                 ("RUNNER_SLEEP_AFTER_MIN", "0"),
@@ -2830,6 +2852,29 @@ mod tests {
                 assert_eq!(cfg.sleep_after_s, 0);
             },
         );
+        with_env(
+            &[
+                ("RUNNER_SLEEP_AFTER_MIN", "15"),
+                ("RUNNER_SLEEP_AFTER_H", "0"),
+            ],
+            || {
+                let cfg = Config::from_env().expect("zero hours must boot");
+                assert!(cfg.env_problems.is_empty());
+                assert_eq!(cfg.sleep_after_s, 0);
+            },
+        );
+        // The longest window is 30 days; beyond it the sweep would cast past
+        // `i64` seconds or panic building the chrono duration, so boot fails.
+        with_env(&[("RUNNER_SLEEP_AFTER_MIN", "43201")], || {
+            let err = Config::from_env().expect_err("a threshold past 30 days must fail boot");
+            let msg = format!("{err:#}");
+            assert!(msg.contains("2592000"), "names the ceiling: {msg}");
+        });
+        with_env(&[("RUNNER_SLEEP_AFTER_H", "720")], || {
+            let cfg = Config::from_env().expect("30 days is the ceiling");
+            assert!(cfg.env_problems.is_empty());
+            assert_eq!(cfg.sleep_after_s, MAX_SLEEP_AFTER_S as u64);
+        });
         // Blank counts as unset (compose renders an unset var empty), so the
         // other knob still applies.
         with_env(

@@ -5,7 +5,7 @@ use serde::Serialize;
 use ts_rs::TS;
 
 use crate::api_error::ApiError;
-use crate::config::Config;
+use crate::config::{Config, MAX_SLEEP_AFTER_S};
 use crate::db;
 use crate::models::AppLimit;
 use crate::AppState;
@@ -39,9 +39,9 @@ const MAX_FLEET_MEMORY_MB: i64 = 1_048_576;
 
 /// Bounds on a per-app idle-sleep override in seconds: below a minute the
 /// sweep would park an app between two normal requests, so a typo'd `5`
-/// refuses loudly instead of flapping the fleet. `0` means never sleep.
+/// refuses loudly instead of flapping the fleet. `0` means never sleep; the
+/// platform-wide ceiling is `config::MAX_SLEEP_AFTER_S`.
 const MIN_SLEEP_AFTER_S: i64 = 60;
-const MAX_SLEEP_AFTER_S: i64 = 2_592_000;
 
 /// Whether a per-app sleep override is storable: `None` clears back to the
 /// platform default, `Some(0)` means never, otherwise a real threshold.
