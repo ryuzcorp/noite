@@ -1,11 +1,13 @@
 /* oxlint-disable anti-slop/no-chained-type-assertions, anti-slop/require-safety-comment-for-type-assertion -- test doubles: a minimal KitEnv stands in for the Worker env */
-import { beforeEach, describe, expect, spyOn, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 
 import { authFromEnv } from "../lib/auth";
 import { ensureDb, setD1Binding } from "../lib/db";
 import { resetPlatformLimits } from "../lib/rate-limit";
 import { createTestD1 } from "../testing/d1";
 import type { TestD1 } from "../testing/d1";
+import { installRunnerMock, makeApp } from "../testing/runner-mock";
+import type { RunnerMock } from "../testing/runner-mock";
 import { forwardIngest } from "./routes/ingest";
 import { handleGitAuth } from "./routes/internal";
 
@@ -29,18 +31,26 @@ beforeEach(async () => {
 
 /** An account plus a scoped key, minted through better-auth exactly as the
  * account page's create action does. */
-const mintKey = async (userId: string): Promise<string> => {
-  db.raw.run(`INSERT INTO "user" (id, name, email) VALUES (?, ?, ?)`, [
-    userId,
-    userId,
-    `${userId}@example.com`,
-  ]);
+interface TestKeyMetadata {
+  appIds?: string[] | null;
+  roleCeiling?: "view" | "push" | "admin";
+}
+
+const mintKey = async (
+  userId: string,
+  metadata?: TestKeyMetadata
+): Promise<string> => {
+  db.raw.run(
+    `INSERT OR IGNORE INTO "user" (id, name, email) VALUES (?, ?, ?)`,
+    [userId, userId, `${userId}@example.com`]
+  );
 
   const created = await authFromEnv(
     ENV as unknown as KitEnv,
     ENV.BETTER_AUTH_URL
   ).api.createApiKey({
     body: {
+      metadata,
       name: "key-owner-test",
       permissions: { apps: ["manage"], events: ["push"] },
       userId,
@@ -56,20 +66,24 @@ const mintKey = async (userId: string): Promise<string> => {
   return key;
 };
 
-const gitAuth = async (key: string): Promise<Response | undefined> =>
+const gitAuth = async (
+  key: string,
+  slug = "demo",
+  need = "push"
+): Promise<Response | undefined> =>
   await handleGitAuth(
     new Request("http://localhost:9080/internal/git-auth", {
-      body: JSON.stringify({ key, need: "push", slug: "demo" }),
+      body: JSON.stringify({ key, need, slug }),
       headers: { ...RUNNER_HEADERS, "content-type": "application/json" },
       method: "POST",
     }),
     ENV as unknown as KitEnv
   );
 
-const ingest = (key: string): Promise<Response> =>
+const ingest = (key: string, appId = "demo"): Promise<Response> =>
   forwardIngest(
-    new Request("http://localhost:9080/api/apps/demo/ingest/events", {
-      body: JSON.stringify({ event: "test", project: "demo" }),
+    new Request(`http://localhost:9080/api/apps/${appId}/ingest/events`, {
+      body: JSON.stringify({ event: "test", project: appId }),
       headers: {
         authorization: `Bearer ${key}`,
         "content-type": "application/json",
@@ -77,7 +91,7 @@ const ingest = (key: string): Promise<Response> =>
       method: "POST",
     }),
     ENV as unknown as KitEnv,
-    { appId: "demo", kind: "events" }
+    { appId, kind: "events" }
   ) as Promise<Response>;
 
 /** A real better-auth session cookie for an existing account, through the
@@ -193,6 +207,54 @@ describe("a banned owner's API key", () => {
     const response = await gitAuth(key);
 
     expect(response?.status).toBe(401);
+  });
+});
+
+/** POST the client-reachable update route with the mint-time fields. The
+ * guard runs before the session read (no sign-in here: the auth limiter is
+ * shared by the file), so asserting its own code proves the hook refused
+ * the field rather than the endpoint answering "unauthenticated". */
+const updateBody = async (body: {
+  expiresIn?: null;
+  keyId: string;
+  metadata?: { appIds: string[] | null; roleCeiling?: string };
+}): Promise<Response> =>
+  await authFromEnv(ENV as unknown as KitEnv, ENV.BETTER_AUTH_URL).handler(
+    new Request(`${ENV.BETTER_AUTH_URL}/api/auth/api-key/update`, {
+      body: JSON.stringify(body),
+      headers: { "content-type": "application/json" },
+      method: "POST",
+    })
+  );
+
+describe("a key's mint-time scope", () => {
+  test("cannot be widened or un-expired through the client update route", async () => {
+    await mintKey("u-scoped", { appIds: ["app-1"] });
+
+    const row = db.raw
+      .query(`SELECT id, metadata FROM apikey WHERE referenceId = 'u-scoped'`)
+      .get() as { id: string; metadata: string | null };
+
+    expect(row.metadata).toContain("app-1");
+
+    const widened = await updateBody({
+      keyId: row.id,
+      metadata: { appIds: null },
+    });
+
+    expect(widened.status).toBe(400);
+    expect(await widened.text()).toContain("KEY_SCOPE_IS_MINT_TIME");
+
+    const cleared = await updateBody({ expiresIn: null, keyId: row.id });
+
+    expect(cleared.status).toBe(400);
+    expect(await cleared.text()).toContain("KEY_SCOPE_IS_MINT_TIME");
+
+    const after = db.raw
+      .query(`SELECT metadata FROM apikey WHERE referenceId = 'u-scoped'`)
+      .get() as { metadata: string | null };
+
+    expect(after.metadata).toContain("app-1");
   });
 });
 
@@ -312,5 +374,204 @@ describe("the ban endpoint", () => {
     expect(forbidden.status).toBe(403);
     expect(keyCount("dos-target")).toBe(1);
     expect(key.length).toBeGreaterThan(0);
+  });
+});
+
+describe("a scoped key on git and ingest", () => {
+  const OWN = makeApp({ id: "app-1", slug: "app-one", userId: "u-owner" });
+
+  const OTHER = makeApp({
+    id: "app-2",
+    name: "Two",
+    slug: "two",
+    userId: "u-other",
+  });
+
+  let runner: RunnerMock;
+
+  beforeEach(() => {
+    runner = installRunnerMock([OWN, OTHER]);
+    db.raw.run(
+      `INSERT OR IGNORE INTO "user" (id, name, email) VALUES ('u-scoped', 'u-scoped', 'u-scoped@example.com')`
+    );
+    db.raw.run(
+      `INSERT INTO app_collaborator (id, appId, userId, role) VALUES ('c1', 'app-1', 'u-scoped', 'push'), ('c2', 'app-2', 'u-scoped', 'push')`
+    );
+  });
+
+  afterEach(() => {
+    runner.restore();
+  });
+
+  test("git-auth allows its own app and refuses another", async () => {
+    const key = await mintKey("u-scoped", { appIds: ["app-1"] });
+
+    const own = await gitAuth(key, "app-one");
+    expect(own?.status).toBe(200);
+
+    const ownBody: unknown = await own?.json();
+    expect(ownBody).toMatchObject({ appId: "app-1", ok: true, role: "push" });
+
+    // By the other app's slug and by its id: the set check runs on the
+    // resolved app id, so neither spelling reaches it.
+    const bySlug = await gitAuth(key, "two");
+    expect(bySlug?.status).toBe(403);
+
+    const byId = await gitAuth(key, "app-2", "view");
+    expect(byId?.status).toBe(403);
+  });
+
+  test("ingest allows its own app and refuses another", async () => {
+    const key = await mintKey("u-scoped", { appIds: ["app-1"] });
+
+    const response = await ingest(key, "app-2");
+    expect(response.status).toBe(403);
+  });
+
+  test("git's answer carries the key's role ceiling, not the owner's role", async () => {
+    // The owner is a full admin; a push-only agent key must still be answered
+    // as `push`, because the runner's force-push and delete policy reads it.
+    db.raw.run(`UPDATE "user" SET role = 'admin' WHERE id = 'u-scoped'`);
+    db.raw.run(
+      `UPDATE app_collaborator SET role = 'admin' WHERE userId = 'u-scoped'`
+    );
+
+    const key = await mintKey("u-scoped", {
+      appIds: null,
+      roleCeiling: "push",
+    });
+
+    const response = await gitAuth(key, "app-one", "push");
+    expect(response?.status).toBe(200);
+
+    const body: unknown = await response?.json();
+    expect(body).toMatchObject({ ok: true, role: "push" });
+
+    // An admin-only need on the same app is refused, not silently widened.
+    const adminNeed = await gitAuth(key, "app-one", "admin");
+    expect(adminNeed?.status).toBe(403);
+  });
+
+  test("an expired key is refused on git and ingest with its own reason", async () => {
+    // One key per surface: the plugin deletes an expired key when it refuses
+    // it, so a second attempt with the same key is simply unknown.
+    const gitKey = await mintKey("u-scoped");
+    const ingestKey = await mintKey("u-scoped");
+    db.raw.run(
+      `UPDATE apikey SET expiresAt = ? WHERE referenceId = 'u-scoped'`,
+      [new Date("2020-01-01T00:00:00Z").toISOString()]
+    );
+
+    const logged = spyOn(console, "error").mockImplementation(() => {});
+
+    try {
+      const git = await gitAuth(gitKey, "app-one");
+      expect(git?.status).toBe(401);
+
+      const body: unknown = await git?.json();
+      expect(body).toEqual({ error: "API key expired", ok: false });
+
+      const events = await ingest(ingestKey, "app-1");
+      expect(events.status).toBe(401);
+      expect(await events.text()).toBe("API key expired");
+    } finally {
+      logged.mockRestore();
+    }
+  });
+
+  test("a capped key cannot claim a new app through a push", async () => {
+    const key = await mintKey("u-scoped", {
+      appIds: null,
+      roleCeiling: "push",
+    });
+
+    const response = await gitAuth(key, "brand-new", "create");
+
+    expect(response?.status).toBe(403);
+
+    const body: unknown = await response?.json();
+    expect(body).toEqual({
+      error: "This API key's role ceiling cannot create apps",
+      ok: false,
+    });
+  });
+
+  test("a push-only creator keeps its push role and is not re-granted admin", async () => {
+    // The caller's own row is taken (a retry after a lost first attempt), but
+    // its grant says push: the create path must not raise it back to admin.
+    db.raw.run(
+      `INSERT INTO app_collaborator (id, appId, userId, role) VALUES ('c9', 'taken', 'u-scoped', 'push')`
+    );
+    runner.apps.push(
+      makeApp({
+        createdAt: new Date().toISOString(),
+        id: "taken",
+        slug: "taken",
+        userId: "u-scoped",
+      })
+    );
+
+    const key = await mintKey("u-scoped");
+    const response = await gitAuth(key, "taken", "create");
+
+    expect(response?.status).toBe(404);
+    expect(runner.apps.find((app) => app.id === "taken")?.slug).toBe("taken");
+  });
+
+  test("a removed creator is refused the taken slug", async () => {
+    db.raw.run(
+      `INSERT OR IGNORE INTO "user" (id, name, email) VALUES ('u-other', 'u-other', 'other@example.com')`
+    );
+    db.raw.run(
+      `INSERT INTO app_collaborator (id, appId, userId, role) VALUES ('c10', 'gone', 'u-other', 'admin')`
+    );
+    runner.apps.push(
+      makeApp({
+        createdAt: new Date().toISOString(),
+        id: "gone",
+        slug: "gone",
+        userId: "u-scoped",
+      })
+    );
+
+    const key = await mintKey("u-scoped");
+    const response = await gitAuth(key, "gone", "create");
+
+    expect(response?.status).toBe(404);
+  });
+
+  test("a timed-out create that landed grant-less is still recovered", async () => {
+    // No grant at all and a fresh row: the retry recovery the create path
+    // exists for. It adopts, grants admin, and answers the admin role.
+    runner.apps.push(
+      makeApp({
+        createdAt: new Date().toISOString(),
+        id: "fresh",
+        slug: "fresh",
+        userId: "u-scoped",
+      })
+    );
+
+    const key = await mintKey("u-scoped");
+    const response = await gitAuth(key, "fresh", "create");
+
+    expect(response?.status).toBe(200);
+
+    const body: unknown = await response?.json();
+    expect(body).toMatchObject({ appId: "fresh", ok: true, role: "admin" });
+  });
+
+  test("an app-scoped key cannot claim a new app through a push", async () => {
+    const key = await mintKey("u-scoped", { appIds: ["app-1"] });
+
+    const response = await gitAuth(key, "brand-new", "create");
+
+    expect(response?.status).toBe(403);
+
+    const body: unknown = await response?.json();
+    expect(body).toEqual({
+      error: "This API key is limited to specific apps",
+      ok: false,
+    });
   });
 });

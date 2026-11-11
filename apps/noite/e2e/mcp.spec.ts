@@ -387,3 +387,72 @@ test("a wrong key is refused and another account's app is denied", async ({
   expect(denied.body.result?.isError).toBe(true);
   expect(denied.body.result?.content?.[0]?.text).toContain(FOREIGN_SLUG);
 });
+
+const SCOPED_SLUG = "mcp-scoped";
+const OUTSIDE_SLUG = "mcp-outside";
+
+test("a scoped key reaches only its app, over MCP and git", async ({
+  page,
+  request,
+}) => {
+  createdApps.push(SCOPED_SLUG, OUTSIDE_SLUG);
+
+  // Account-wide keys create both apps; the scoped key only ever sees the
+  // first, with a push ceiling and a one-hour expiry.
+  const adminKey = await mintApiKey(page, "mcp-scope-admin");
+
+  const own = await callTool<CreatedApp>(request, adminKey, 20, "create_app", {
+    slug: SCOPED_SLUG,
+    source: { kind: "blank" },
+  });
+
+  const outside = await callTool<CreatedApp>(
+    request,
+    adminKey,
+    21,
+    "create_app",
+    { slug: OUTSIDE_SLUG, source: { kind: "blank" } }
+  );
+
+  expect(outside.app.slug).toBe(OUTSIDE_SLUG);
+
+  const key = await mintApiKey(page, "mcp-scoped-key", {
+    ceiling: "push",
+    expiry: "1h",
+    onlyApps: [own.app.id],
+  });
+
+  const apps = await callTool<{ apps: { id: string }[] }>(
+    request,
+    key,
+    22,
+    "list_apps"
+  );
+
+  expect(apps.apps.map((app) => app.id)).toEqual([own.app.id]);
+
+  // Another app's tool call is refused (one uniform message, so the key is
+  // not an existence oracle).
+  const foreign = await callMcp(request, key, {
+    id: 23,
+    method: "tools/call",
+    params: { arguments: { app: OUTSIDE_SLUG }, name: "get_app" },
+  });
+
+  expect(foreign.body.result?.isError).toBe(true);
+  expect(foreign.body.result?.content?.[0]?.text).toContain("No app");
+
+  // The same restriction holds on git: a push to the other app is refused
+  // before any object is stored.
+  expect(() =>
+    pushAppDir(key, new URL("../test", import.meta.url), OUTSIDE_SLUG)
+  ).toThrow();
+
+  // The account page names the key's scope and ceiling on its row.
+  await page.goto("/account");
+  const row = page.locator("li", { hasText: "mcp-scoped-key" });
+  // Exact: the key's own label contains the slug as a substring.
+  await expect(row.getByText(SCOPED_SLUG, { exact: true })).toBeVisible();
+  await expect(row.getByText("≤ Push")).toBeVisible();
+  await expect(row.getByText(/expires /u)).toBeVisible();
+});

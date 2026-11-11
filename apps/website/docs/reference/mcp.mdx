@@ -20,8 +20,10 @@ The server implements protocol revision `2025-06-18` and reports itself as `noit
 
 The key is a normal account API key created on `/account` with the **App Management** scope (`apps: manage`) — the same scope `git push` uses. A key without it is refused. The key is shown once at creation; keep it secret, since anyone holding it can act as you.
 
+For an agent, narrow the key when you mint it ([API keys](/reference/api-keys)): limit it to the apps it works on, cap it at the role it needs (a `push` ceiling keeps an agent out of variables, settings and protected branches), and give it an expiry. The restrictions apply to every tool below and to git with the same key.
+
 :::tip
-Every tool takes `app` — an app slug or id — and resolves your role on that app exactly as the UI does. An agent can do what a collaborator of your role can do on that app, and nothing more.
+Every tool takes `app` — an app slug or id — and resolves your role on that app exactly as the UI does, then applies the key's app set and role ceiling. An agent can do what a collaborator of its effective role can do on that app, and nothing more. `list_apps` returns only the apps the key may act on, and `create_app` is refused for an app-restricted key.
 :::
 
 ## Setup

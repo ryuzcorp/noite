@@ -272,17 +272,85 @@ export const waitForDeploy = async (
   return latest;
 };
 
+/** What a minted key is narrowed to: leave a field out for the account-wide,
+ * uncapped, never-expiring key every earlier spec mints. */
+export interface KeyScopeOptions {
+  /** Only these app ids; omit for account-wide. */
+  onlyApps?: readonly string[];
+  /** Highest app role the key may reach. */
+  ceiling?: "view" | "push" | "admin";
+  /** The preset label the form offers (`1h`, `1d`, `7d`, `30d`, `never`). */
+  expiry?: "1h" | "1d" | "7d" | "30d" | "never";
+}
+
 /** Mint an API key on the signed-in account's Account page. The raw key is
  * shown exactly once, so it is read from that one screen. */
 export const mintApiKey = async (
   page: Page,
-  label: string
+  label: string,
+  options: KeyScopeOptions = {}
 ): Promise<string> => {
   await page.goto("/account");
   await page
     .locator('button[type="button"]', { hasText: "Create key" })
     .click();
   await page.locator("#key-name").fill(label);
+
+  if (options.onlyApps) {
+    const only = options.onlyApps;
+    // The app picker is fed by the shared app-list live feed: wait for its
+    // rows before unchecking, or the unchecks land on an empty list. A row
+    // that arrives mid-pass is checked again, so uncheck in passes until none
+    // is left (bounded: the feed does not keep producing rows).
+    await expect(page.locator('input[id^="key-app-"]').first()).toBeVisible({
+      timeout: 30_000,
+    });
+
+    for (let pass = 0; pass < 3; pass += 1) {
+      // oxlint-disable-next-line eslint/no-await-in-loop -- one DOM snapshot per pass; the passes converge on the feed's own state
+      const rows = await page
+        .locator('input[id^="key-app-"]')
+        .evaluateAll((nodes) =>
+          nodes.map((node) => {
+            // SAFETY: the selector only matches the picker's checkboxes.
+            const box = node as HTMLInputElement;
+
+            return { checked: box.checked, id: box.id.replace("key-app-", "") };
+          })
+        );
+
+      const unwanted = rows.filter(
+        (row) => row.checked && !only.includes(row.id)
+      );
+
+      if (unwanted.length === 0) {
+        break;
+      }
+
+      // Real clicks, one at a time: each writes the dialog's draft state and
+      // re-renders, so parallel clicks would race the patch.
+      // oxlint-disable-next-line eslint/no-await-in-loop -- see above; the pass loop retries stragglers
+      for (const row of unwanted) {
+        // oxlint-disable-next-line eslint/no-await-in-loop -- see above
+        await page.locator(`#key-app-${row.id}`).uncheck();
+      }
+    }
+
+    // The key must cover exactly the named apps: a row left checked would
+    // make the key wider than this spec claims.
+    await expect(page.locator('input[id^="key-app-"]:checked')).toHaveCount(
+      only.length
+    );
+  }
+
+  if (options.ceiling) {
+    await page.locator("#key-ceiling").selectOption(options.ceiling);
+  }
+
+  if (options.expiry) {
+    await page.locator("#key-expiry").selectOption(options.expiry);
+  }
+
   await page
     .locator('button[type="submit"]', { hasText: "Create key" })
     .click();

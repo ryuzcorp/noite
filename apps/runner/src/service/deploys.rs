@@ -205,6 +205,7 @@ pub async fn prepare_rollback(
         target.environment_id(),
         crate::models::DeployIntent::Rollback,
         &sha,
+        None,
     )
     .await
     .map_err(|e| ApiError::internal(e.to_string()))?;

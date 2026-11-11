@@ -15,7 +15,7 @@ use sqlx::SqliteConnection;
 pub const FIRST_COMPACTED_VERSION: i64 = 100;
 
 /// Version a database has after every migration ran.
-pub const SCHEMA_VERSION: i64 = FIRST_COMPACTED_VERSION + 2;
+pub const SCHEMA_VERSION: i64 = FIRST_COMPACTED_VERSION + 3;
 
 /// One upgrade step: the statements that take a database from `version - 1`
 /// to `version`. Empty at the compacted baseline; append above it to change
@@ -41,6 +41,13 @@ pub const MIGRATIONS: &[Migration] = &[
         version: FIRST_COMPACTED_VERSION + 2,
         sql: "CREATE INDEX IF NOT EXISTS main.idx_deploy_target_created \
               ON deploy(app_id, environment_id, created_at);",
+    },
+    Migration {
+        // 103: who asked for a deploy, when the caller could say. NULL on
+        // every existing row and on the automatic push/tip pipeline, so the
+        // column reads as "nobody (automatic)".
+        version: FIRST_COMPACTED_VERSION + 3,
+        sql: "ALTER TABLE main.deploy ADD COLUMN actor TEXT;",
     },
 ];
 

@@ -93,6 +93,10 @@ CREATE TABLE IF NOT EXISTS deploy (
   -- row is created; schema version 101 added it, and older rows read
   -- `'deploy'`.
   intent TEXT NOT NULL DEFAULT 'deploy',
+  -- Who asked for this run, when a caller could say: the key's attributable
+  -- label ("Ada via key ci") for a key-triggered redeploy, NULL for the
+  -- automatic push/tip pipeline. Schema version 103 added it.
+  actor TEXT,
   log TEXT NOT NULL DEFAULT '',
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL

@@ -11,4 +11,10 @@ environmentId: string | null, sha: string | null, status: DeployStatus,
  * Why the run exists ([`DeployIntent`]); settled when the row is created
  * and never rewritten.
  */
-intent: DeployIntent, log: string, createdAt: string, updatedAt: string, };
+intent: DeployIntent, 
+/**
+ * Who asked for the run, when the caller could say: a profile API key's
+ * attributable label ("Ada via key ci") for a redeploy it triggered.
+ * `None` is the automatic push/tip pipeline, which has no request.
+ */
+actor: string | null, log: string, createdAt: string, updatedAt: string, };

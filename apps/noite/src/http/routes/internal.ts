@@ -1,8 +1,8 @@
 import * as Schema from "effect/Schema";
 
 import { authFromEnv, MissingAuthSecretError } from "../../lib/auth";
-import { requireAppRoleBySlug } from "../../lib/collaborators";
 import { ensureDb } from "../../lib/db";
+import type { KeyPrincipal } from "../../lib/key-principal";
 import { parseAppRole } from "../../lib/roles";
 import {
   isAppLimitReached,
@@ -10,8 +10,9 @@ import {
   runnerFailureMessage,
   runnerFailureOf,
 } from "../../lib/runner";
-import { keyOwnerActive } from "../../lib/server/api-keys.server";
 import { createAppForUser, slugError } from "../../lib/server/apps.server";
+import { keyAppVerdict } from "../../lib/server/key-access.server";
+import { authenticateKey } from "../../lib/server/key-auth.server";
 import {
   findRecoveryEmail,
   RECOVERY_CODE_TTL_SECONDS,
@@ -145,9 +146,11 @@ const GitAuthBody = Schema.Struct({
  * pushes at once) re-reads the app: the pusher may push if it turned out to be
  * theirs, and sees the 404 otherwise. */
 const gitAuthCreate = async (
-  userId: string,
+  principal: KeyPrincipal,
   slug: string
 ): Promise<Response> => {
+  const { userId } = principal;
+
   const notFound = Response.json(
     { error: "repository not found", ok: false },
     { status: 404 }
@@ -164,23 +167,38 @@ const gitAuthCreate = async (
       slug,
     });
 
-    return Response.json({ appId: app.id, ok: true, role: "admin", userId });
+    // The app now exists (created, or adopted by the retry recovery): answer
+    // with the role the key gate resolves on the resolved id, never a
+    // hard-coded admin. An adopted row the account does not administer is
+    // refused like any other app it cannot push to.
+    const verdict = await keyAppVerdict(principal, { id: app.id }, "admin");
+
+    if (verdict._tag !== "Granted") {
+      return notFound;
+    }
+
+    return Response.json({
+      appId: verdict.app.id,
+      ok: true,
+      role: verdict.role,
+      userId,
+    });
   } catch (error) {
     const failure = runnerFailureOf(error);
 
     if (isSlugTaken(failure)) {
-      const access = await requireAppRoleBySlug(slug, userId, "admin").catch(
-        () => null
-      );
+      // The slug is someone's app: the same key gate decides, so a capped or
+      // app-restricted key never learns more than the ordinary path gives it.
+      const verdict = await keyAppVerdict(principal, { slug }, "admin");
 
-      if (!access) {
+      if (verdict._tag !== "Granted") {
         return notFound;
       }
 
       return Response.json({
-        appId: access.app.id,
+        appId: verdict.app.id,
         ok: true,
-        role: access.role,
+        role: verdict.role,
         userId,
       });
     }
@@ -245,62 +263,86 @@ export const handleGitAuth: RouteHandler = async (request, env) => {
 
   await ensureDb();
 
-  try {
-    const auth = authFromEnv(
-      env,
-      env.BETTER_AUTH_URL ?? new URL(request.url).origin
+  // One authentication for every key surface (lib/server/key-auth.server):
+  // the scope, the owner's ban and the key's expiry are decided once, here,
+  // for git exactly as for `/mcp` and ingest. Git smart-HTTP is the main
+  // machine credential, so a ban must stop it now, not on the next session
+  // refresh.
+  const auth = await authenticateKey(request, env, key, {
+    apps: ["manage"],
+  });
+
+  if (auth._tag === "Misconfigured") {
+    return new Response(auth.message, { status: 500 });
+  }
+
+  if (auth._tag !== "Authed") {
+    return Response.json(
+      {
+        error: auth._tag === "Expired" ? "API key expired" : "invalid key",
+        ok: false,
+      },
+      { status: 401 }
     );
+  }
 
-    const verified = await auth.api.verifyApiKey({
-      body: { key, permissions: { apps: ["manage"] } },
-    });
+  const { principal } = auth;
 
-    if (!(verified.valid && verified.key?.referenceId)) {
+  if (wanted === "create") {
+    // A key limited to apps cannot grow its own set: the app the push would
+    // create is not one of the key's apps, so claiming it here would fail on
+    // the very next request.
+    if (principal.scope.appIds !== null) {
       return Response.json(
-        { error: "invalid key", ok: false },
-        { status: 401 }
+        { error: "This API key is limited to specific apps", ok: false },
+        { status: 403 }
       );
     }
 
-    const userId = verified.key.referenceId;
-
-    // Git smart-HTTP is the main machine credential: a ban must stop it now,
-    // not on the next session refresh (the shared owner predicate,
-    // lib/server/api-keys.server). Same uniform answer as a bad key.
-    if (!(await keyOwnerActive(userId))) {
+    // Creating an app makes the caller its admin, so only a key that may
+    // administer may create one: a capped key must not answer `admin` here.
+    if (principal.scope.roleCeiling !== "admin") {
       return Response.json(
-        { error: "invalid key", ok: false },
-        { status: 401 }
+        {
+          error: "This API key's role ceiling cannot create apps",
+          ok: false,
+        },
+        { status: 403 }
       );
     }
 
-    if (wanted === "create") {
-      return await gitAuthCreate(userId, slug);
+    try {
+      return await gitAuthCreate(principal, slug);
+    } catch (error) {
+      console.error("[git-auth]", error);
+
+      return Response.json({ error: "forbidden", ok: false }, { status: 403 });
     }
+  }
 
-    // The create branch returned above, so `need` is the parsed role here.
-    if (!need) {
-      return Response.json(
-        { error: "need must be view, push, admin or create", ok: false },
-        { status: 400 }
-      );
-    }
+  // The create branch returned above, so `need` is the parsed role here.
+  if (!need) {
+    return Response.json(
+      { error: "need must be view, push, admin or create", ok: false },
+      { status: 400 }
+    );
+  }
 
-    const access = await requireAppRoleBySlug(slug, userId, need);
+  const verdict = await keyAppVerdict(principal, { slug }, need);
 
-    return Response.json({
-      appId: access.app.id,
-      ok: true,
-      role: access.role,
-      userId,
-    });
-  } catch (error) {
-    if (error instanceof MissingAuthSecretError) {
-      return new Response(error.message, { status: 500 });
-    }
-
+  if (verdict._tag !== "Granted") {
+    // Every refusal answers the same 403: the app set, the role ceiling and
+    // "not a collaborator" must not be told apart (or a key could probe which
+    // apps exist).
     return Response.json({ error: "forbidden", ok: false }, { status: 403 });
   }
+
+  return Response.json({
+    appId: verdict.app.id,
+    ok: true,
+    role: verdict.role,
+    userId: principal.userId,
+  });
 };
 
 /** Runner → UI: how many accounts exist on this instance. The runner buckets

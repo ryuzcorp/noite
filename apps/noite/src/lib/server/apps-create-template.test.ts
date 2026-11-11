@@ -87,7 +87,13 @@ test("an unknown template id fails before any runner call", async () => {
 
 test("a retry recovers an app whose create outlived the call bound", async () => {
   runner.apps.push(
-    makeApp({ id: "app-9", name: "Taken", slug: "taken", userId: "u-1" })
+    makeApp({
+      createdAt: new Date().toISOString(),
+      id: "app-9",
+      name: "Taken",
+      slug: "taken",
+      userId: "u-1",
+    })
   );
 
   const app = await createAppForUser({

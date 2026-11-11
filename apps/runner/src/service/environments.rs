@@ -201,7 +201,9 @@ pub async fn create(
     if let Err(e) = crate::host::edge_table::push_routes(&state.pool, &state.config).await {
         tracing::warn!(error = %format!("{e:#}"), "caddy rewrite after environment create");
     }
-    spawn_deploy(state, &app, env.clone(), &sha).await?;
+    // The create's deploy is part of the create, whose own row records
+    // `created_by`; only an explicit redeploy carries a caller's label.
+    spawn_deploy(state, &app, env.clone(), &sha, None).await?;
     let mut envs = [env];
     annotate_auto_deploy(state, &mut envs).await;
     let [env] = envs;
@@ -277,6 +279,7 @@ pub async fn deploy(
     id: &str,
     env_id: &str,
     role: Option<&str>,
+    actor: Option<&str>,
 ) -> Result<(String, String), ApiError> {
     require(role, "push")?;
     let app = app_or_404(state, id).await?;
@@ -292,7 +295,7 @@ pub async fn deploy(
             ApiError::bad(msg)
         }
     })?;
-    let deploy_id = spawn_deploy(state, &app, env, &sha).await?;
+    let deploy_id = spawn_deploy(state, &app, env, &sha, actor).await?;
     Ok((deploy_id, sha))
 }
 
@@ -304,6 +307,7 @@ async fn spawn_deploy(
     app: &App,
     env: Environment,
     sha: &str,
+    actor: Option<&str>,
 ) -> Result<String, ApiError> {
     // Mirror the hidden-ref shape: `git/<slug>/<ref>/<sha>.bundle`, written by
     // `after_receive` for every ref a write moved.
@@ -316,6 +320,7 @@ async fn spawn_deploy(
         Some(&env.id),
         crate::models::DeployIntent::Redeploy,
         sha,
+        actor,
     )
     .await
     .map_err(|e| ApiError::internal(e.to_string()))?;
@@ -529,7 +534,9 @@ pub async fn preview(
     )
     .await
     .map_err(commit_error)?;
-    let deploy_id = spawn_deploy(state, &app, env.clone(), &sha).await?;
+    // A preview commit's deploy follows the commit, which already carries
+    // the author; only an explicit redeploy carries a caller's label.
+    let deploy_id = spawn_deploy(state, &app, env.clone(), &sha, None).await?;
     Ok(PreviewResult {
         environment: env,
         sha,

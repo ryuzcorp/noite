@@ -1,0 +1,66 @@
+---
+title: API keys
+description: The machine credential for git, event ingest and agents — its scopes, app set, role ceiling, expiry and what each one refuses.
+---
+
+An API key is a machine identity for a bot: a CI job, a deploy script, an agent. It acts **as its owner** — the account whose Account page minted it — and every request re-resolves that account's role, so removing a collaborator, transferring an app or lowering a role takes effect on the key's very next request.
+
+Keys are created, listed and revoked on **Account → API keys**. The raw key is shown once; keep it secret.
+
+## What a key can reach
+
+| Surface | How the key is presented | Scope it needs |
+| --- | --- | --- |
+| Git over HTTPS | HTTP Basic: username `git`, password the key (`http://git:<domain>/<slug>`) | **App Management**; `view` fetches, `push`/`admin` pushes |
+| MCP (agents) | `Authorization: Bearer noite_…` on `/mcp` ([Agents](/reference/mcp)) | **App Management** |
+| Event ingest | `Authorization: Bearer noite_…` on `/api/apps/<id>/ingest/events` | **Events** |
+
+The two scopes are independent checkboxes: an events-only key cannot push code or reach MCP, and an app-management-only key cannot ingest events.
+
+## Narrowing a key
+
+Beyond its scopes, a key can be narrowed three ways. All three are enforced by one function on every key-authenticated surface, including the ones added later.
+
+| Field | Default | What it does |
+| --- | --- | --- |
+| **Apps** | All apps | Limits the key to the app ids you pick. A request naming any other app — by slug or by id — is refused. `create_app` (and claiming a new slug with a git push) is refused too, because the new app would not be in the key. |
+| **Create** | — | Only a key whose ceiling is **Admin** can create an app: creating makes you its admin, above a narrower ceiling. |
+| **Role ceiling** | Admin (no cap) | The key's effective role is the lower of **your role on that app** and this ceiling. A `push` key owned by an admin can push and open pull requests but cannot change variables or settings, force-push, delete a branch, or commit to a protected branch. |
+| **Expiry** | Never | `1 hour`, `1 day`, `7 days` or `30 days`. Once the instant passes the key is refused everywhere, and the next attempt deletes it. |
+
+The account page lists each key with its apps, ceiling, expiry and last use, so an old credential is visible before it is a problem.
+
+:::tip
+A key is at most as powerful as its owner: a ceiling never grants a role the owner does not hold, and an app-restricted key never reaches an app the owner cannot.
+:::
+
+## Enforcement, precisely
+
+- **App restriction is by id.** The app is resolved first (slug first, then id), then the resolved row's `id` is checked against the key's set. A renamed app keeps its restriction; a deleted app is simply gone; naming one app's slug can never resolve to a different app's id.
+- **Roles are re-resolved per request** from the collaborator grants and the instance-admin rule the UI uses, so a key minted while you were an admin loses that power the moment you are demoted or removed.
+- **Every refusal is uniform.** A key scoped elsewhere, an app you cannot see and an app that does not exist answer the same way, so a key is never an existence oracle for apps it cannot reach. An expired key is the one exception: the caller holds it, so the answer says `API key expired`.
+- **A key whose stored scope cannot be read is refused**, never treated as account-wide.
+- **Bans win.** A banned account's keys stop working immediately and are deleted; unbanning does not restore them.
+- **Not a session.** A key cannot sign in, change the account, mint another key or read `/account`; it only reaches the surfaces in the table above.
+
+## Attribution
+
+Actions a key performs are labelled with it, so a bot's work stays visible as a bot's:
+
+- A commit the control plane writes for a key (an MCP `create_app` import today) is authored and committed as `<your name> via key <key name>`.
+- A preview-environment redeploy triggered with a key records that label on its deploy row, shown under the deploy as "by …".
+
+Automatic deploys from a plain git push carry the pusher's own git identity in the commit, so there is no key label on the deploy row.
+
+:::note
+A key's scope, ceiling and expiry are **self-imposed limits on a credential**, not a tamper-proof sandbox: they constrain what a holder of the key can do, and the instance refuses a key whose stored scope cannot be read, but the account that mints a key is trusted to choose its limits. A compromised account session can mint a new key without limits — treat account security, not key scope, as the boundary.
+:::
+
+## Rotating a key
+
+Revoke the old key on the Account page and mint a new one — revocation is immediate on every surface (git, MCP, ingest). Short expiries are the low-effort version of the same discipline: a CI key with a 30-day expiry cannot become a permanent credential nobody remembers.
+
+## Related
+
+- [Agents (MCP)](/reference/mcp) — the tool list and client setup an app-management key unlocks.
+- [Collaborators](/apps/configure#collaborators) — what `view`, `push` and `admin` mean on an app.

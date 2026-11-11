@@ -1004,16 +1004,22 @@ export const runnerEnvironmentUpdate = (
     role,
   });
 
+/** Re-deploy one environment. `actor` is who asked, when the caller can say
+ * (a profile API key's attributable label); the deploy row keeps it. */
 export const runnerEnvironmentDeploy = (
   id: string,
   envId: string,
-  role: string
-) =>
-  runnerRpc<{ deployId: string; sha: string }>("environments.deploy", {
-    envId,
-    id,
-    role,
-  });
+  role: string,
+  actor?: string
+) => {
+  const params =
+    actor === undefined ? { envId, id, role } : { actor, envId, id, role };
+
+  return runnerRpc<{ deployId: string; sha: string }>(
+    "environments.deploy",
+    params
+  );
+};
 
 /** One environment's variable overrides (raw rows: the caller redacts). */
 export const runnerEnvironmentVars = (

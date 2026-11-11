@@ -205,6 +205,27 @@ export const requireAppRole = async (
 ): Promise<{ app: App; role: AppRole }> =>
   await gate(await findApp({ id: appId }), userId, need);
 
+/** One app and the account's raw role on it (`null` when it holds no grant
+ * and is not an instance admin), or null when the app does not exist.
+ *
+ * The non-throwing half of the gate, for callers that fold the answer into
+ * their own closed outcome instead of an exception: a key's scope and role
+ * ceiling (lib/server/key-access.server) must re-resolve the owner's role on
+ * every request, so a collaborator removed or an app transferred after the
+ * key was minted loses access immediately. */
+export const resolveAppRole = async (
+  ref: { id: string } | { slug: string },
+  userId: string
+): Promise<{ app: RunnerApp; role: AppRole | null } | null> => {
+  const app = await findApp(ref);
+
+  if (!app) {
+    return null;
+  }
+
+  return { app, role: await roleFor(app, userId) };
+};
+
 /** Instance-admin check for a signed-in account: the `admin` role, or an
  * address matching the `NOITE_ADMIN_EMAIL` anchor. One query, the same
  * role/anchor test `roleFor` applies — used where there is no app row to gate

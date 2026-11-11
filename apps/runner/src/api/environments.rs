@@ -46,6 +46,9 @@ pub struct UpdateEnvironmentBody {
 pub struct DeployEnvironmentBody {
     #[serde(default)]
     pub role: Option<String>,
+    /// Who asked, when the caller can say (a key's attributable label).
+    #[serde(default)]
+    pub actor: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -107,9 +110,15 @@ pub async fn deploy_environment(
     Path((id, env_id)): Path<(String, String)>,
     Json(body): Json<DeployEnvironmentBody>,
 ) -> impl IntoResponse {
-    service::environments::deploy(&state, &id, &env_id, body.role.as_deref())
-        .await
-        .map(|(deploy_id, sha)| Json(json!({ "deployId": deploy_id, "sha": sha })))
+    service::environments::deploy(
+        &state,
+        &id,
+        &env_id,
+        body.role.as_deref(),
+        body.actor.as_deref(),
+    )
+    .await
+    .map(|(deploy_id, sha)| Json(json!({ "deployId": deploy_id, "sha": sha })))
 }
 
 pub async fn list_environment_env(

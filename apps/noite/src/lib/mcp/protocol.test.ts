@@ -10,7 +10,7 @@ import {
   negotiateProtocolVersion,
   RPC_CODES,
 } from "./protocol";
-import type { JsonRpcError, JsonRpcResponse } from "./protocol";
+import type { JsonRpcError, JsonRpcResponse, McpContext } from "./protocol";
 
 /** The three shapes a tool can have: it runs, it rejects its arguments, or it
  * fails while running. */
@@ -42,7 +42,15 @@ const BROKEN = defineTool({
 
 const TOOLS = [ECHO, STRICT, BROKEN];
 
-const CALLER = { userId: "u1" };
+const CALLER = {
+  principal: {
+    expiresAt: null,
+    keyId: "key-1",
+    keyName: "test",
+    scope: { appIds: null, roleCeiling: "admin" },
+    userId: "u1",
+  },
+} satisfies McpContext;
 
 const send = (message: Schema.Json) => handleMcpMessage(CALLER, message, TOOLS);
 

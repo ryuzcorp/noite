@@ -13,19 +13,14 @@
  * never sees a contract the server does not enforce.
  */
 import * as Schema from "effect/Schema";
-import { sql } from "void/db";
 
 import { appLifecycle } from "../app-detail/lifecycle";
 import type { AppStatusPage } from "../app-detail/lifecycle";
 import type { CreateSourceInput } from "../apps/create-source";
 import { TEMPLATES } from "../apps/templates";
-import { UnauthorizedError } from "../auth";
-import {
-  listAppsForCollaborator,
-  requireAppRole,
-  requireAppRoleBySlug,
-} from "../collaborators";
-import { getDb, withDb } from "../db";
+import { listAppsForCollaborator } from "../collaborators";
+import { keyCoversApp } from "../key-principal";
+import type { KeyPrincipal } from "../key-principal";
 import type { AppRole } from "../roles";
 import {
   runnerDeleteEnv,
@@ -63,6 +58,8 @@ import type {
 } from "../runner";
 import { createAppForUser, slugError } from "../server/apps.server";
 import { redactEnv } from "../server/env.server";
+import { keyAppVerdict } from "../server/key-access.server";
+import { keyActor } from "../server/key-attribution.server";
 import { defineTool, McpToolError } from "./protocol";
 import type { McpToolDefinition } from "./protocol";
 
@@ -75,44 +72,31 @@ const NEEDS: Record<AppRole, string> = {
 };
 
 /** The app one tool call names, by slug (how agents see apps) or by id (what
- * `create_app` and `list_apps` return). Both lookups apply the same gate, and
- * a denial is the one message for "not found" and "no access" — the same
- * answer the UI gives, so an id is never an existence oracle. */
+ * `create_app` and `list_apps` return). Both lookups go through the one
+ * key-enforcement function, which resolves the owner's role per request and
+ * applies the key's app set and role ceiling; a denial is one message for
+ * "not found", "no access", "another key's app" and "above the ceiling" — the
+ * same answer the UI gives, so an id is never an existence oracle. */
 const requireApp = async (
-  userId: string,
+  principal: KeyPrincipal,
   ref: string,
   need: AppRole
 ): Promise<{ app: RunnerApp; role: AppRole }> => {
-  try {
-    return await requireAppRoleBySlug(ref, userId, need);
-  } catch (error) {
-    if (!(error instanceof UnauthorizedError)) {
-      throw error;
-    }
+  const bySlug = await keyAppVerdict(principal, { slug: ref }, need);
+
+  if (bySlug._tag === "Granted") {
+    return { app: bySlug.app, role: bySlug.role };
   }
 
-  try {
-    return await requireAppRole(ref, userId, need);
-  } catch (error) {
-    if (!(error instanceof UnauthorizedError)) {
-      throw error;
-    }
+  const byId = await keyAppVerdict(principal, { id: ref }, need);
 
-    throw new McpToolError(
-      `No app "${ref}" this account can ${NEEDS[need]} (it may not exist, or you may not be a collaborator).`
-    );
+  if (byId._tag === "Granted") {
+    return { app: byId.app, role: byId.role };
   }
-};
 
-/** The account's display name, for the one commit a create may author (a
- * squashed import). Absent accounts fall back to the platform default. */
-const displayName = async (userId: string): Promise<string> => {
-  const row = await withDb(() =>
-    getDb().get<{ name: string }>(sql`
-      SELECT name FROM "user" WHERE id = ${userId} LIMIT 1`)
+  throw new McpToolError(
+    `No app "${ref}" this key can ${NEEDS[need]} (it may not exist, you may not be a collaborator, or the key may be limited to other apps).`
   );
-
-  return row?.name?.trim() ?? "";
 };
 
 const sha10 = (sha: string): string => sha.slice(0, 10);
@@ -310,8 +294,15 @@ export const MCP_TOOLS: readonly McpToolDefinition[] = [
       "List the apps this account can see, with their slug, status and URL.",
     name: "list_apps",
     params: NoArgs,
-    run: async ({ userId }) => {
-      const apps = await listAppsForCollaborator(userId);
+    run: async ({ principal }) => {
+      // A scoped key lists exactly its own apps: the set is filtered here,
+      // where the list is built, so a tool later added to this table cannot
+      // forget it.
+      const visible = await listAppsForCollaborator(principal.userId);
+
+      const apps = visible.filter((app) =>
+        keyCoversApp(principal.scope, app.id)
+      );
 
       if (apps.length === 0) {
         return {
@@ -352,8 +343,8 @@ export const MCP_TOOLS: readonly McpToolDefinition[] = [
       "One app's details: status, access role, public URL and git remote.",
     name: "get_app",
     params: AppParams,
-    run: async ({ userId }, { app: ref }) => {
-      const { app, role } = await requireApp(userId, ref, "view");
+    run: async ({ principal }, { app: ref }) => {
+      const { app, role } = await requireApp(principal, ref, "view");
       const remote = await runnerGitRemote(app.id);
       const url = appUrl(remote.url, app.subdomain);
 
@@ -388,7 +379,23 @@ export const MCP_TOOLS: readonly McpToolDefinition[] = [
       "Create an app: blank, imported from a public GitHub repo, or from a shipped template. Returns its id, URL, git remote and push instructions.",
     name: "create_app",
     params: CreateAppParams,
-    run: async ({ userId }, { name, slug, source }) => {
+    run: async ({ principal }, { name, slug, source }) => {
+      // A key limited to apps cannot create one: the new app would not be in
+      // its set, so the push it advertises would be refused. A capped key
+      // cannot either: creating makes the caller the app's admin, above the
+      // ceiling it was minted with.
+      if (principal.scope.appIds !== null) {
+        throw new McpToolError(
+          "This key is limited to specific apps, so it cannot create new ones. Create the app in the dashboard, or use an account-wide key."
+        );
+      }
+
+      if (principal.scope.roleCeiling !== "admin") {
+        throw new McpToolError(
+          "This key's role ceiling cannot create apps. Create the app in the dashboard, or use a key with an admin ceiling."
+        );
+      }
+
       const normalized = slug.trim().toLowerCase();
       const problem = slugError(normalized);
 
@@ -396,12 +403,24 @@ export const MCP_TOOLS: readonly McpToolDefinition[] = [
         throw new McpToolError(problem, { invalid: true });
       }
 
+      const actor = await keyActor(principal);
+
       const app = await createAppForUser({
-        account: { id: userId, name: await displayName(userId) },
+        account: { id: actor.userId, name: actor.name },
         name: name?.trim() || normalized,
         slug: normalized,
         source: toCreateSource(source),
       });
+
+      // A create may have adopted the caller's own earlier row (a retry
+      // recovery); the app is only advertised if the key can administer it.
+      const access = await keyAppVerdict(principal, { id: app.id }, "admin");
+
+      if (access._tag !== "Granted") {
+        throw new McpToolError(
+          `Created ${app.slug}, but this key cannot administer it. Check the app's collaborators in the dashboard.`
+        );
+      }
 
       const remote = await runnerGitRemote(app.id);
       const url = appUrl(remote.url, app.subdomain);
@@ -443,8 +462,8 @@ export const MCP_TOOLS: readonly McpToolDefinition[] = [
       "An app's deploy state: status, whether it is live, and its recent deploys. `live` means the app is serving now, or is asleep and starts on the next request; a crash- or OOM-held fleet is not live. Pass `environment` for one preview environment instead of production. Poll this after a push.",
     name: "deploy_status",
     params: appParams({ environment: Schema.optional(EnvironmentRef) }),
-    run: async ({ userId }, { app: ref, environment }) => {
-      const { app, role } = await requireApp(userId, ref, "view");
+    run: async ({ principal }, { app: ref, environment }) => {
+      const { app, role } = await requireApp(principal, ref, "view");
 
       const env = environment
         ? await requireEnvironment(app, role, environment)
@@ -510,8 +529,8 @@ export const MCP_TOOLS: readonly McpToolDefinition[] = [
         })
       ),
     }),
-    run: async ({ userId }, { app: ref, deployId }) => {
-      const { app } = await requireApp(userId, ref, "view");
+    run: async ({ principal }, { app: ref, deployId }) => {
+      const { app } = await requireApp(principal, ref, "view");
       let wanted = deployId;
 
       if (!wanted) {
@@ -552,8 +571,8 @@ export const MCP_TOOLS: readonly McpToolDefinition[] = [
         })
       ),
     }),
-    run: async ({ userId }, { app: ref, environment, limit }) => {
-      const { app, role } = await requireApp(userId, ref, "view");
+    run: async ({ principal }, { app: ref, environment, limit }) => {
+      const { app, role } = await requireApp(principal, ref, "view");
 
       const env = environment
         ? await requireEnvironment(app, role, environment)
@@ -591,8 +610,8 @@ export const MCP_TOOLS: readonly McpToolDefinition[] = [
         })
       ),
     }),
-    run: async ({ userId }, { app: ref, environment, status }) => {
-      const { app, role } = await requireApp(userId, ref, "view");
+    run: async ({ principal }, { app: ref, environment, status }) => {
+      const { app, role } = await requireApp(principal, ref, "view");
 
       const env = environment
         ? await requireEnvironment(app, role, environment)
@@ -643,8 +662,8 @@ export const MCP_TOOLS: readonly McpToolDefinition[] = [
       "An app's environment variables. Values are hidden unless they are 0/1 flags, exactly as the UI shows them.",
     name: "env_list",
     params: AppParams,
-    run: async ({ userId }, { app: ref }) => {
-      const { app } = await requireApp(userId, ref, "view");
+    run: async ({ principal }, { app: ref }) => {
+      const { app } = await requireApp(principal, ref, "view");
       const rows = await runnerListEnv(app.id);
 
       const env = rows.map((row) => {
@@ -676,8 +695,8 @@ export const MCP_TOOLS: readonly McpToolDefinition[] = [
       }),
       value: Schema.String.annotate({ description: "Variable value." }),
     }),
-    run: async ({ userId }, { app: ref, key, value }) => {
-      const { app } = await requireApp(userId, ref, "admin");
+    run: async ({ principal }, { app: ref, key, value }) => {
+      const { app } = await requireApp(principal, ref, "admin");
       await runnerSetEnv(app.id, key, value);
 
       return {
@@ -694,8 +713,8 @@ export const MCP_TOOLS: readonly McpToolDefinition[] = [
         description: "Variable name.",
       }),
     }),
-    run: async ({ userId }, { app: ref, key }) => {
-      const { app } = await requireApp(userId, ref, "admin");
+    run: async ({ principal }, { app: ref, key }) => {
+      const { app } = await requireApp(principal, ref, "admin");
       await runnerDeleteEnv(app.id, key);
 
       return {
@@ -709,8 +728,8 @@ export const MCP_TOOLS: readonly McpToolDefinition[] = [
       "List an app's preview environments: label, what each tracks, status, URL and whether it is public. An environment is members-only unless made public. `main` is the app itself, never an environment.",
     name: "list_environments",
     params: AppParams,
-    run: async ({ userId }, { app: ref }) => {
-      const { app, role } = await requireApp(userId, ref, "view");
+    run: async ({ principal }, { app: ref }) => {
+      const { app, role } = await requireApp(principal, ref, "view");
       const environments = await appEnvironments(app.id, role);
       const remote = await runnerGitRemote(app.id);
 
@@ -739,8 +758,8 @@ export const MCP_TOOLS: readonly McpToolDefinition[] = [
         description: "A branch of the app's repository (not main).",
       }),
     }),
-    run: async ({ userId }, { app: ref, branch }) => {
-      const { app, role } = await requireApp(userId, ref, "push");
+    run: async ({ principal }, { app: ref, branch }) => {
+      const { app, role } = await requireApp(principal, ref, "push");
       const env = await runnerEnvironmentCreate(app.id, branch, role);
       const remote = await runnerGitRemote(app.id);
       const row = environmentRow(env, app.subdomain, remote.url);
@@ -760,8 +779,8 @@ export const MCP_TOOLS: readonly McpToolDefinition[] = [
       "Delete one preview environment: its fleet is stopped and its storage, host and deploys are gone.",
     name: "delete_environment",
     params: appParams({ environment: EnvironmentRef }),
-    run: async ({ userId }, { app: ref, environment }) => {
-      const { app, role } = await requireApp(userId, ref, "admin");
+    run: async ({ principal }, { app: ref, environment }) => {
+      const { app, role } = await requireApp(principal, ref, "admin");
       const env = await requireEnvironment(app, role, environment);
       await runnerEnvironmentDelete(app.id, env.id, role);
 
@@ -782,10 +801,18 @@ export const MCP_TOOLS: readonly McpToolDefinition[] = [
       "Re-deploy one preview environment at its ref's current head (the same commit rebuilds).",
     name: "deploy_environment",
     params: appParams({ environment: EnvironmentRef }),
-    run: async ({ userId }, { app: ref, environment }) => {
-      const { app, role } = await requireApp(userId, ref, "push");
+    run: async ({ principal }, { app: ref, environment }) => {
+      const { app, role } = await requireApp(principal, ref, "push");
       const env = await requireEnvironment(app, role, environment);
-      const result = await runnerEnvironmentDeploy(app.id, env.id, role);
+
+      const actor = await keyActor(principal);
+
+      const result = await runnerEnvironmentDeploy(
+        app.id,
+        env.id,
+        role,
+        actor.name
+      );
 
       return {
         structured: {
@@ -810,8 +837,8 @@ export const MCP_TOOLS: readonly McpToolDefinition[] = [
           "true = anyone with the URL can open it; false = collaborators only.",
       }),
     }),
-    run: async ({ userId }, { app: ref, environment, public: isPublic }) => {
-      const { app, role } = await requireApp(userId, ref, "admin");
+    run: async ({ principal }, { app: ref, environment, public: isPublic }) => {
+      const { app, role } = await requireApp(principal, ref, "admin");
       const before = await requireEnvironment(app, role, environment);
 
       const env = await runnerEnvironmentUpdate(
@@ -835,8 +862,8 @@ export const MCP_TOOLS: readonly McpToolDefinition[] = [
       "One preview environment's variable overrides. App variables are inherited; these win for this environment only. Values are hidden unless they are 0/1 flags, exactly as the UI shows them.",
     name: "environment_env_list",
     params: appParams({ environment: EnvironmentRef }),
-    run: async ({ userId }, { app: ref, environment }) => {
-      const { app, role } = await requireApp(userId, ref, "view");
+    run: async ({ principal }, { app: ref, environment }) => {
+      const { app, role } = await requireApp(principal, ref, "view");
       const env = await requireEnvironment(app, role, environment);
       const rows = await runnerEnvironmentVars(app.id, env.id, role);
 
@@ -877,8 +904,8 @@ export const MCP_TOOLS: readonly McpToolDefinition[] = [
       }),
       value: Schema.String.annotate({ description: "Variable value." }),
     }),
-    run: async ({ userId }, { app: ref, environment, key, value }) => {
-      const { app, role } = await requireApp(userId, ref, "push");
+    run: async ({ principal }, { app: ref, environment, key, value }) => {
+      const { app, role } = await requireApp(principal, ref, "push");
       const env = await requireEnvironment(app, role, environment);
       await runnerEnvironmentVarSet(app.id, env.id, key, value, role);
 
@@ -905,8 +932,8 @@ export const MCP_TOOLS: readonly McpToolDefinition[] = [
         description: "Variable name.",
       }),
     }),
-    run: async ({ userId }, { app: ref, environment, key }) => {
-      const { app, role } = await requireApp(userId, ref, "push");
+    run: async ({ principal }, { app: ref, environment, key }) => {
+      const { app, role } = await requireApp(principal, ref, "push");
       const env = await requireEnvironment(app, role, environment);
       await runnerEnvironmentVarDelete(app.id, env.id, key, role);
 
@@ -928,8 +955,8 @@ export const MCP_TOOLS: readonly McpToolDefinition[] = [
       "The app's branches: tip, last commit and distance from the default branch.",
     name: "repo_branches",
     params: AppParams,
-    run: async ({ userId }, { app: ref }) => {
-      const { app } = await requireApp(userId, ref, "view");
+    run: async ({ principal }, { app: ref }) => {
+      const { app } = await requireApp(principal, ref, "view");
       const refs: GitRefs = await runnerGitRefs(app.id);
 
       return {
@@ -949,8 +976,8 @@ export const MCP_TOOLS: readonly McpToolDefinition[] = [
       "The app's file tree at a ref (default: what is deployed, else the default branch).",
     name: "repo_tree",
     params: appParams({ ref: Schema.optional(SourceRef) }),
-    run: async ({ userId }, { app: ref, ref: revision }) => {
-      const { app } = await requireApp(userId, ref, "view");
+    run: async ({ principal }, { app: ref, ref: revision }) => {
+      const { app } = await requireApp(principal, ref, "view");
       const tree: RunnerTree = await runnerSourceTree(app.id, revision);
 
       return {
@@ -972,8 +999,8 @@ export const MCP_TOOLS: readonly McpToolDefinition[] = [
       "One file's contents at a ref (default: what is deployed, else the default branch).",
     name: "repo_file",
     params: appParams({ path: PathRef, ref: Schema.optional(SourceRef) }),
-    run: async ({ userId }, { app: ref, path, ref: revision }) => {
-      const { app } = await requireApp(userId, ref, "view");
+    run: async ({ principal }, { app: ref, path, ref: revision }) => {
+      const { app } = await requireApp(principal, ref, "view");
       const blob: RunnerBlob = await runnerSourceBlob(app.id, path, revision);
       let note = "";
 
@@ -1012,8 +1039,8 @@ export const MCP_TOOLS: readonly McpToolDefinition[] = [
         })
       ),
     }),
-    run: async ({ userId }, { app: ref, path, ref: revision, skip }) => {
-      const { app } = await requireApp(userId, ref, "view");
+    run: async ({ principal }, { app: ref, path, ref: revision, skip }) => {
+      const { app } = await requireApp(principal, ref, "view");
 
       const log: GitLog = await runnerGitLog(app.id, {
         path,
@@ -1059,8 +1086,8 @@ export const MCP_TOOLS: readonly McpToolDefinition[] = [
         description: "Commit SHA (7-40 hex chars).",
       }),
     }),
-    run: async ({ userId }, { app: ref, sha }) => {
-      const { app } = await requireApp(userId, ref, "view");
+    run: async ({ principal }, { app: ref, sha }) => {
+      const { app } = await requireApp(principal, ref, "view");
       const detail: GitCommitDetail = await runnerGitCommit(app.id, sha);
 
       return {

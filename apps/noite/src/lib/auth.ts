@@ -333,6 +333,28 @@ export const createAuth = (env: KitEnv, baseURL: string) =>
         }
       }),
       before: createAuthMiddleware(async (ctx) => {
+        // A key's scope and expiry are decided when it is minted. `update` is
+        // reachable from the owner's own session, and with `enableMetadata`
+        // it would let that session widen a key (or clear its expiry) after
+        // the fact — so the mint-time fields are refused there. Revoking and
+        // minting a new key is the supported path.
+        if (ctx.path === "/api-key/update") {
+          const body = Schema.decodeUnknownResult(
+            Schema.Record(Schema.String, Schema.Json)
+          )(ctx.body ?? {});
+
+          if (
+            body._tag === "Success" &&
+            ("metadata" in body.success || "expiresIn" in body.success)
+          ) {
+            throw APIError.from("BAD_REQUEST", {
+              code: "KEY_SCOPE_IS_MINT_TIME",
+              message:
+                "A key's scope and expiry are set when it is minted. Revoke the key and create a new one.",
+            });
+          }
+        }
+
         if (ctx.path !== "/api-key/create") {
           return;
         }
@@ -373,7 +395,13 @@ export const createAuth = (env: KitEnv, baseURL: string) =>
       }),
       apiKey({
         defaultPrefix: "noite_",
-        enableMetadata: false,
+        // Scope, role ceiling and key label ride in `metadata` (the shape is
+        // lib/key-principal's `KeyMetadata`). Without this the create action
+        // cannot store them and every key would be account-wide.
+        enableMetadata: true,
+        // The shortest preset the account page offers is one hour; the
+        // plugin's default floor is one day, which would refuse it.
+        keyExpiration: { minExpiresIn: 0 },
         // Machine scopes: `apps.manage` (git push and other app-management
         // API calls) and `events.push` (event ingest). Keys created without
         // explicit permissions inherit both.

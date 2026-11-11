@@ -502,3 +502,54 @@ test("require_pr rejects a push-role push to main while an admin push lands", as
     expect(deploy.sha).toBe(adminSha);
   }).toPass({ timeout: 8 * 60_000 });
 });
+
+test("a push-ceiling key cannot commit to a protected main even when its owner is an admin", async ({
+  page,
+  request,
+}) => {
+  const slug = "prs-ceiling";
+  createdApps.push(slug);
+
+  const { apiKey, appId } = await createAppWithKey(page, request, {
+    name: "PRs Ceiling",
+    slug,
+  });
+
+  pushAppDir(apiKey, new URL("../test", import.meta.url), slug);
+
+  await page.goto(`/apps/${appId}/settings?section=branch-protection`);
+  await page.locator("#branch-require-pr").check();
+  await page.getByRole("button", { name: "Save branch rules" }).click();
+  await expect(page.getByText("Saved.")).toBeVisible();
+
+  // The e2e account is this app's admin. A key it mints with a `push`
+  // ceiling is answered as `push` by git-auth, so the runner's branch
+  // protection refuses the direct commit to main — the same admin-only right
+  // a merge needs.
+  const capped = await mintApiKey(page, `${slug}-capped`, { ceiling: "push" });
+  const cappedRepo = cloneRepo(capped, slug);
+  commitFiles(
+    cappedRepo,
+    { "CAPPED.md": "from a capped key\n" },
+    "capped key tries main"
+  );
+
+  expect(() => cappedRepo.run(["push", "origin", "main"])).toThrow();
+
+  // The account's own (uncapped) key still lands, so the refusal is the
+  // ceiling and not the app's state.
+  const adminRepo = cloneRepo(apiKey, slug);
+
+  const adminSha = commitFiles(
+    adminRepo,
+    { "ADMIN-KEY.md": "from the admin key\n" },
+    "admin key pushes main"
+  );
+
+  adminRepo.run(["push", "origin", "main"]);
+
+  await expect(async () => {
+    const deploy = await waitForDeploy(request, appId);
+    expect(deploy.sha).toBe(adminSha);
+  }).toPass({ timeout: 8 * 60_000 });
+});

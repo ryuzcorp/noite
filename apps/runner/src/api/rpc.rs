@@ -160,6 +160,19 @@ struct EnvIdParams {
     role: Option<String>,
 }
 
+/// `environments.deploy` also carries who asked, when the caller can say: a
+/// profile API key's attributable label, which the deploy row keeps.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct EnvDeployParams {
+    id: String,
+    env_id: String,
+    #[serde(default)]
+    role: Option<String>,
+    #[serde(default)]
+    actor: Option<String>,
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct CreateEnvironmentParams {
@@ -723,15 +736,21 @@ async fn dispatch_call(
             )
         }
         "environments.deploy" => {
-            let p: EnvIdParams = match parse(params, &id) {
+            let p: EnvDeployParams = match parse(params, &id) {
                 Ok(p) => p,
                 Err(e) => return e,
             };
             complete(
                 id,
-                service::environments::deploy(state, &p.id, &p.env_id, p.role.as_deref())
-                    .await
-                    .map(|(deploy_id, sha)| json!({ "deployId": deploy_id, "sha": sha })),
+                service::environments::deploy(
+                    state,
+                    &p.id,
+                    &p.env_id,
+                    p.role.as_deref(),
+                    p.actor.as_deref(),
+                )
+                .await
+                .map(|(deploy_id, sha)| json!({ "deployId": deploy_id, "sha": sha })),
             )
         }
         "environments.vars.get" => {
@@ -1572,5 +1591,37 @@ mod wire_tests {
         .expect("camelCase alias parses");
         assert_eq!(camel.user_id, "u2");
         assert_eq!(camel.environment_id.as_deref(), Some("e1"));
+    }
+}
+
+#[cfg(test)]
+mod param_tests {
+    use super::*;
+
+    /// The control UI and MCP send camelCase params. `environments.deploy`
+    /// silently answered `InvalidParams` when it was the one struct without
+    /// `rename_all`, so the shape is pinned here.
+    #[test]
+    fn environment_deploy_params_are_camel_case() {
+        let p: EnvDeployParams = serde_json::from_value(serde_json::json!({
+            "id": "app-1",
+            "envId": "env-1",
+            "role": "push",
+            "actor": "Ada via key ci",
+        }))
+        .expect("camelCase params parse");
+
+        assert_eq!(p.id, "app-1");
+        assert_eq!(p.env_id, "env-1");
+        assert_eq!(p.role.as_deref(), Some("push"));
+        assert_eq!(p.actor.as_deref(), Some("Ada via key ci"));
+
+        // An actor is optional: a UI redeploy sends none.
+        let bare: EnvDeployParams = serde_json::from_value(serde_json::json!({
+            "id": "app-1",
+            "envId": "env-1",
+        }))
+        .expect("role and actor are optional");
+        assert_eq!(bare.actor, None);
     }
 }

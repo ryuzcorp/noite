@@ -427,6 +427,10 @@ pub struct Deploy {
     /// Why the run exists ([`DeployIntent`]); settled when the row is created
     /// and never rewritten.
     pub intent: DeployIntent,
+    /// Who asked for the run, when the caller could say: a profile API key's
+    /// attributable label ("Ada via key ci") for a redeploy it triggered.
+    /// `None` is the automatic push/tip pipeline, which has no request.
+    pub actor: Option<String>,
     pub log: String,
     pub created_at: String,
     pub updated_at: String,

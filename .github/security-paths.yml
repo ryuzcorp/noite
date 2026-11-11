@@ -70,10 +70,24 @@ sensitive:
   - "apps/noite/src/lib/authority.ts"
   # `requireAdmin`, ban/unban, role changes and the impersonation check.
   - "apps/noite/src/lib/server/admin.server.tsx"
-  # Profile API keys are git, ingest and MCP credentials: the owner check that
-  # refuses a banned or missing owner, and the ban-triggered revocation.
+  # Profile API keys are git, ingest and MCP credentials: the one
+  # authentication/scope read every key surface calls, the app+role
+  # enforcement that applies the key's app set, role ceiling and expiry, the
+  # owner check that refuses a banned or missing owner, and the ban-triggered
+  # revocation.
   - "apps/noite/src/lib/server/api-keys.server.ts"
-  - "apps/noite/src/lib/server/mcp-auth.server.ts"
+  - "apps/noite/src/lib/server/key-auth.server.ts"
+  - "apps/noite/src/lib/server/key-access.server.ts"
+  - "apps/noite/src/lib/key-principal.ts"
+  # The account action that mints keys (scope, ceiling, expiry) — a bug here
+  # widens a credential beyond what its owner chose.
+  - "apps/noite/src/lib/server/account.server.ts"
+  # App creation and adoption: what a create grants, and whose row may be
+  # adopted after a lost first attempt. A bug here hands admin on an app whose
+  # collaborator was removed.
+  - "apps/noite/src/lib/server/apps.server.ts"
+  # The MCP tool table: every tool's app gate and its create refusal.
+  - "apps/noite/src/lib/mcp/tools.ts"
   # The runner-token-only internal surface (git credential verification,
   # account-recovery codes, app creation for an arbitrary user): a change here
   # can bypass the session and role checks the public routes rely on.

@@ -25,14 +25,14 @@ import {
 } from "../../lib/mcp/protocol";
 import type { JsonRpcFailure } from "../../lib/mcp/protocol";
 import { MCP_TOOLS } from "../../lib/mcp/tools";
-import { authenticateMcp } from "../../lib/server/mcp-auth.server";
+import { authenticateKey, bearerKey } from "../../lib/server/key-auth.server";
 import { MAX_BODY_BYTES, readBoundedText, tooLarge } from "../body";
 import type { RouteHandler } from "../config";
 import { originAllowed } from "../origin";
 
-const unauthorized = (): Response =>
+const unauthorized = (message = "missing or invalid API key"): Response =>
   Response.json(
-    { error: "missing or invalid API key" },
+    { error: message },
     {
       headers: {
         "cache-control": "no-store",
@@ -81,20 +81,28 @@ export const handleMcp: RouteHandler = async (request, env) => {
     );
   }
 
-  // One state per credential outcome (lib/server/mcp-auth.server); every
+  // One state per credential outcome (lib/server/key-auth.server); every
   // refusal keeps the single "missing or invalid API key" 401 body, so a key
-  // without the scope stays indistinguishable from an unknown one.
-  const auth = await authenticateMcp(request, env);
+  // without the scope stays indistinguishable from an unknown one. An expired
+  // key is the one exception: its holder already knows it, and the reason is
+  // what tells them to mint a new one.
+  const auth = await authenticateKey(request, env, bearerKey(request), {
+    apps: ["manage"],
+  });
 
   if (auth._tag === "Misconfigured") {
     return new Response(auth.message, { status: 500 });
+  }
+
+  if (auth._tag === "Expired") {
+    return unauthorized("API key expired");
   }
 
   if (auth._tag !== "Authed") {
     return unauthorized();
   }
 
-  const { userId } = auth;
+  const { principal } = auth;
 
   const body = await readBoundedText(request, MAX_BODY_BYTES);
 
@@ -110,7 +118,7 @@ export const handleMcp: RouteHandler = async (request, env) => {
     return parseFailure();
   }
 
-  const response = await handleMcpMessage({ userId }, message, MCP_TOOLS);
+  const response = await handleMcpMessage({ principal }, message, MCP_TOOLS);
 
   if (response === null) {
     return new Response(null, { status: 202 });

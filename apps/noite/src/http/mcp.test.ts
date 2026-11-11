@@ -1,11 +1,15 @@
 /* oxlint-disable anti-slop/no-chained-type-assertions, anti-slop/require-safety-comment-for-type-assertion -- test doubles: a minimal KitEnv stands in for the Worker env */
-import { beforeEach, describe, expect, spyOn, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
+
+import type { Json } from "effect/Schema";
 
 import { authFromEnv } from "../lib/auth";
 import { ensureDb, setD1Binding } from "../lib/db";
 import { resetPlatformLimits } from "../lib/rate-limit";
 import { createTestD1 } from "../testing/d1";
 import type { TestD1 } from "../testing/d1";
+import { installRunnerMock, makeApp } from "../testing/runner-mock";
+import type { RunnerMock } from "../testing/runner-mock";
 import { MAX_BODY_BYTES } from "./body";
 import { handleMcp } from "./routes/mcp";
 
@@ -29,18 +33,25 @@ beforeEach(async () => {
 
 /** An account plus a scoped key, minted through better-auth exactly as the
  * account page's create action does. */
+interface TestKeyMetadata {
+  appIds?: string[] | null;
+  roleCeiling?: "view" | "push" | "admin";
+}
+
 const mintKey = async (
   userId: string,
-  permissions?: Record<string, string[]>
+  permissions?: Record<string, string[]>,
+  metadata?: TestKeyMetadata
 ): Promise<string> => {
-  db.raw.run(`INSERT INTO "user" (id, name, email) VALUES (?, ?, ?)`, [
-    userId,
-    userId,
-    `${userId}@example.com`,
-  ]);
+  // OR IGNORE: a suite may seed the account (and its grants) before minting.
+  db.raw.run(
+    `INSERT OR IGNORE INTO "user" (id, name, email) VALUES (?, ?, ?)`,
+    [userId, userId, `${userId}@example.com`]
+  );
 
   const created = await authFromEnv(ENV, ENV.BETTER_AUTH_URL).api.createApiKey({
     body: {
+      metadata,
       name: "mcp-test",
       permissions: permissions ?? { apps: ["manage"] },
       userId,
@@ -261,5 +272,232 @@ describe("POST /mcp", () => {
     });
 
     expect(supported?.status).toBe(200);
+  });
+});
+
+const callTool = async (key: string, name: string, args: Json) => {
+  const response = await call(
+    JSON.stringify({
+      id: 7,
+      jsonrpc: "2.0",
+      method: "tools/call",
+      params: { arguments: args, name },
+    }),
+    { headers: bearer(key) }
+  );
+
+  // SAFETY: a tools/call answers one JSON-RPC envelope (the route asserted
+  // 200 for every call that reaches here).
+  return (await response?.json()) as {
+    result?: {
+      content: { text: string }[];
+      isError?: boolean;
+      structuredContent?: {
+        apps?: { id: string }[];
+        app?: { id: string; slug: string };
+      };
+    };
+  };
+};
+
+describe("a scoped key over MCP", () => {
+  const SCOPED = makeApp({ id: "app-1", slug: "app-one", userId: "u-scoped" });
+
+  const OTHER = makeApp({
+    id: "app-2",
+    name: "Two",
+    slug: "two",
+    userId: "u-other",
+  });
+
+  let runner: RunnerMock;
+
+  beforeEach(() => {
+    runner = installRunnerMock([SCOPED, OTHER]);
+    db.raw.run(
+      `INSERT OR IGNORE INTO "user" (id, name, email) VALUES ('u-scoped', 'u-scoped', 'u-scoped@example.com')`
+    );
+    db.raw.run(
+      `INSERT INTO app_collaborator (id, appId, userId, role) VALUES ('c1', 'app-1', 'u-scoped', 'push'), ('c2', 'app-2', 'u-scoped', 'push')`
+    );
+  });
+
+  afterEach(() => {
+    runner.restore();
+  });
+
+  test("list_apps returns only the apps the key may act on", async () => {
+    const key = await mintKey(
+      "u-scoped",
+      { apps: ["manage"] },
+      {
+        appIds: ["app-1"],
+      }
+    );
+
+    const payload = await callTool(key, "list_apps", {});
+
+    expect(
+      payload.result?.structuredContent?.apps?.map((app) => app.id)
+    ).toEqual(["app-1"]);
+  });
+
+  test("an app outside the key's set is refused by every app tool", async () => {
+    const key = await mintKey(
+      "u-scoped",
+      { apps: ["manage"] },
+      {
+        appIds: ["app-1"],
+      }
+    );
+
+    const foreign = await callTool(key, "get_app", { app: "two" });
+
+    expect(foreign.result?.isError).toBe(true);
+    expect(foreign.result?.content[0]?.text).toContain("No app");
+  });
+
+  test("create_app attributes its import commit to the key", async () => {
+    const key = await mintKey("u-scoped", { apps: ["manage"] });
+
+    await callTool(key, "create_app", {
+      slug: "imported",
+      source: { kind: "template", template: "ilha-void" },
+    });
+
+    // SAFETY: the runner mock records each call's params object as sent.
+    const create = runner.requests.find(
+      (request) => (request as { slug?: string }).slug === "imported"
+    );
+
+    expect(create).toMatchObject({
+      source: {
+        actor: { name: "u-scoped via key mcp-test", userId: "u-scoped" },
+      },
+    });
+  });
+
+  test("a capped key cannot create an app", async () => {
+    const key = await mintKey(
+      "u-scoped",
+      { apps: ["manage"] },
+      {
+        appIds: null,
+        roleCeiling: "push",
+      }
+    );
+
+    const created = await callTool(key, "create_app", { slug: "capped" });
+
+    expect(created.result?.isError).toBe(true);
+    expect(created.result?.content[0]?.text).toContain(
+      "role ceiling cannot create apps"
+    );
+  });
+
+  test("a push-only owner is not re-granted admin by create_app", async () => {
+    db.raw.run(
+      `INSERT INTO app_collaborator (id, appId, userId, role) VALUES ('c3', 'taken', 'u-scoped', 'push')`
+    );
+    runner.apps.push(
+      makeApp({
+        createdAt: new Date().toISOString(),
+        id: "taken",
+        slug: "taken",
+        userId: "u-scoped",
+      })
+    );
+
+    const key = await mintKey("u-scoped");
+    const created = await callTool(key, "create_app", { slug: "taken" });
+
+    expect(created.result?.isError).toBe(true);
+  });
+
+  test("a grant-less fresh row is still recovered by create_app", async () => {
+    runner.apps.push(
+      makeApp({
+        createdAt: new Date().toISOString(),
+        id: "fresh",
+        slug: "fresh",
+        userId: "u-scoped",
+      })
+    );
+
+    const key = await mintKey("u-scoped");
+    const created = await callTool(key, "create_app", { slug: "fresh" });
+
+    expect(created.result?.isError).toBeFalsy();
+    expect(created.result?.structuredContent?.app?.id).toBe("fresh");
+  });
+
+  test("an app-scoped key cannot create an app", async () => {
+    const key = await mintKey(
+      "u-scoped",
+      { apps: ["manage"] },
+      {
+        appIds: ["app-1"],
+      }
+    );
+
+    const created = await callTool(key, "create_app", { slug: "fresh" });
+
+    expect(created.result?.isError).toBe(true);
+    expect(created.result?.content[0]?.text).toContain(
+      "limited to specific apps"
+    );
+  });
+
+  test("an expired key is refused with its own message", async () => {
+    const key = await mintKey("u-scoped");
+
+    db.raw.run(
+      `UPDATE apikey SET expiresAt = ? WHERE referenceId = 'u-scoped'`,
+      [new Date("2020-01-01T00:00:00Z").toISOString()]
+    );
+
+    // better-auth logs every refused key at ERROR level; this case is about
+    // the answer.
+    const logged = spyOn(console, "error").mockImplementation(() => {});
+
+    try {
+      const response = await call(`{"id":1,"method":"ping"}`, {
+        headers: bearer(key),
+      });
+
+      expect(response?.status).toBe(401);
+      expect(await response?.json()).toEqual({ error: "API key expired" });
+    } finally {
+      logged.mockRestore();
+    }
+  });
+
+  test("a push ceiling keeps an admin's key out of admin tools", async () => {
+    // The owner is a full admin on the app; the key may only push.
+    db.raw.run(`UPDATE "user" SET role = 'admin' WHERE id = 'u-scoped'`);
+    db.raw.run(
+      `UPDATE app_collaborator SET role = 'admin' WHERE userId = 'u-scoped'`
+    );
+
+    const key = await mintKey(
+      "u-scoped",
+      { apps: ["manage"] },
+      {
+        appIds: null,
+        roleCeiling: "push",
+      }
+    );
+
+    const settings = await callTool(key, "env_set", {
+      app: "app-one",
+      key: "A",
+      value: "1",
+    });
+
+    expect(settings.result?.isError).toBe(true);
+    expect(settings.result?.content[0]?.text).toContain("administer");
+
+    const read = await callTool(key, "get_app", { app: "app-one" });
+    expect(read.result?.isError).toBeFalsy();
   });
 });
