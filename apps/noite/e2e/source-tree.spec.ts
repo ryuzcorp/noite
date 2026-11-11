@@ -64,10 +64,12 @@ test("the tree menu adds and deletes a file, and one Push commits both", async (
   await page.keyboard.press("Enter");
   await expect(page.getByRole("treeitem", { name: "extra.ts" })).toBeVisible();
 
-  // The new file opens ready to type in, and its text is a change.
+  // The new file opens ready to type in, and its text is a change. Focused
+  // directly: a pointer click can land on pierre's gutter overlay (which
+  // intercepts it) for a file shorter than the pane.
   const editor = page.locator('[contenteditable="true"]').first();
   await expect(editor).toBeVisible({ timeout: 60_000 });
-  await editor.click();
+  await editor.focus();
   await page.keyboard.type("export const extra = 1;");
 
   // Delete util.ts through its own row menu, one confirmation for the row.
