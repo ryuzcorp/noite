@@ -24,9 +24,8 @@ import { createPaneGroup, MORPH_PRESERVE } from "$lib/ui/resizable";
 import { ResizeHandle } from "$lib/ui/resize-handle";
 import { SidePanel } from "$lib/ui/side-panel";
 import { useParams } from "@ilha/void";
-import * as Equal from "effect/Equal";
 import { atom, watch } from "ilha";
-import type { AtomHandle, View } from "ilha";
+import type { View } from "ilha";
 
 import { resourceValue } from "../../../lib/resource";
 
@@ -38,14 +37,6 @@ import { resourceValue } from "../../../lib/resource";
  * `?ref=` among them: a branch switch is the browser's own (it installs the
  * new ref's files under the panes it already has, see `./source/browser`), so
  * the key must not name the ref. */
-/** Keep a component atom in step with a value derived from props/resources
- * (an `atom(init)` only seeds on the first render). */
-const syncAtom = <T,>(handle: AtomHandle<T>, value: T): void => {
-  if (!Equal.equals(handle(), value)) {
-    handle.set(value);
-  }
-};
-
 const BrowserSlot = (props: SourceBrowserProps) => [
   <SourceBrowser key={props.appId} {...props} />,
 ];
@@ -379,7 +370,16 @@ const SourceBody = ({ appId }: { appId: string }) => {
   // below hands it the app alone. An atom rather than the param handle: the
   // browser's request has to be started from a watch, not a render.
   const ref = atom(gitRef());
-  syncAtom(ref, gitRef());
+
+  /** Write the browsed ref, in the URL and in the atom the browser watches.
+   * The atom is written here rather than in the render below: a render-time
+   * write is dropped after the first paint, so the picker would move the URL
+   * and never reach the browser. */
+  const writeRef = (next: string): void => {
+    gitRef.set(next);
+    ref.set(next);
+  };
+
   // The side panel opens and closes through the library, not through the
   // render: `?panel=` is the state, and the pane slides to it (the split either
   // side of it and the divider between them are the group's). Applied here,
@@ -423,13 +423,7 @@ const SourceBody = ({ appId }: { appId: string }) => {
     // bottom line is not 3rem past the viewport.
     <div class="flex h-[calc(100dvh-3rem)] w-full flex-col overflow-hidden lg:h-dvh">
       <div class="border-base-300 flex flex-wrap items-center gap-2 border-b px-4 py-2">
-        <BranchPicker
-          appId={appId}
-          value={browsing}
-          onChange={(next) => {
-            gitRef.set(next);
-          }}
-        />
+        <BranchPicker appId={appId} value={browsing} onChange={writeRef} />
         <div class="ml-auto flex flex-wrap items-center justify-end gap-2">
           <PanelToggles
             active={openPanel}
@@ -500,9 +494,7 @@ const SourceBody = ({ appId }: { appId: string }) => {
                 onState={(state) => {
                   browser.set(state);
                 }}
-                setRef={(next) => {
-                  gitRef.set(next);
-                }}
+                setRef={writeRef}
                 treeHost={treeHost}
               />
               <ResizeHandle label="Resize side panel" />
