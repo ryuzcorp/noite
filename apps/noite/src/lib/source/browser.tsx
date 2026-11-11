@@ -368,7 +368,11 @@ export const SourceBrowser = ({
       });
       pushOp = settlePush(pushOp, {
         ok: true,
-        to: { branch: target, newBranch: request.branch !== undefined },
+        to: {
+          base: checkout.ref,
+          branch: target,
+          newBranch: request.branch !== undefined,
+        },
       });
       // The commit owns the bytes now: the buffers are gone, and the rows come
       // back from the branch's new tip (which is how a move and a delete land).

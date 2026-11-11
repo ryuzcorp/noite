@@ -81,7 +81,7 @@ test(
     await page.getByRole("treeitem", { name: "util.ts" }).click();
     await expect(
       page.locator('[contenteditable="true"]').first()
-    ).toContainText("util", { timeout: 60_000 });
+    ).toHaveAttribute("aria-label", "util.ts", { timeout: 60_000 });
     await appendLine(page, "export const second = 2;");
 
     await expect(changesBadge(page)).toHaveText("2");

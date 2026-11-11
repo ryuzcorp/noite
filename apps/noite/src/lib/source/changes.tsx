@@ -103,12 +103,10 @@ const defaultMessage = (state: SourceBrowserState): string => {
  * (with the pull-request shortcut after a push to a new branch). */
 const PushOutcome = ({
   appId,
-  base,
   state,
   title,
 }: {
   appId: string;
-  base: string;
   state: SourceBrowserState;
   title: string;
 }) => {
@@ -139,7 +137,7 @@ const PushOutcome = ({
       Pushed to <span class="font-mono">{pushed.branch}</span>.{" "}
       <Link
         class="link"
-        href={`/apps/${appId}/pulls/new?base=${encodeURIComponent(base)}&head=${encodeURIComponent(pushed.branch)}&title=${encodeURIComponent(title)}`}
+        href={`/apps/${appId}/pulls/new?base=${encodeURIComponent(pushed.base)}&head=${encodeURIComponent(pushed.branch)}&title=${encodeURIComponent(title)}`}
       >
         Open a pull
       </Link>
@@ -336,12 +334,7 @@ const CommitForm = ({
           )}
         </>
       ) : null}
-      <PushOutcome
-        appId={appId}
-        base={branch}
-        state={current}
-        title={lastMessage()}
-      />
+      <PushOutcome appId={appId} state={current} title={lastMessage()} />
     </form>
   );
 };

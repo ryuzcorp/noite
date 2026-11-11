@@ -30,7 +30,12 @@ const openRootMenu = async (page: Page): Promise<void> => {
     throw new TypeError("the tree column has no box");
   }
 
-  await page.mouse.click(box.x + box.width / 2, box.y + box.height - 12);
+  // The tree's own element, right button: `page.mouse.click` would be a left
+  // click, which opens no menu at all.
+  await tree.click({
+    button: "right",
+    position: { x: box.width / 2, y: box.height - 12 },
+  });
 };
 
 // New File parks a placeholder row that pierre names in place; Delete stages a

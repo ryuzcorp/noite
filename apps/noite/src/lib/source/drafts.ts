@@ -10,8 +10,10 @@ import type { SourceChange } from "./session";
  * branch) or `role` (the viewer's app role is below `push`). */
 export type ReadOnlyRef = "" | "tag" | "commit" | "role";
 
-/** Where the last push landed (`newBranch`: the push created `branch`). */
+/** Where the last push landed (`newBranch`: the push created `branch`), and
+ * the branch it started from — the base a pull request from `branch` targets. */
 export interface PushedTo {
+  base: string;
   branch: string;
   newBranch: boolean;
 }

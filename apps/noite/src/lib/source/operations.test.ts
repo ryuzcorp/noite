@@ -26,11 +26,11 @@ describe("the commit operation's transition table", () => {
 
     const settled = settlePush(pushing, {
       ok: true,
-      to: { branch: "feature", newBranch: true },
+      to: { base: "main", branch: "feature", newBranch: true },
     });
 
     expect(settled).toEqual(
-      PushOps.Done({ to: { branch: "feature", newBranch: true } })
+      PushOps.Done({ to: { base: "main", branch: "feature", newBranch: true } })
     );
   });
 
@@ -46,10 +46,15 @@ describe("the commit operation's transition table", () => {
   });
 
   test("an outcome only lands on a push in flight", () => {
-    const done = PushOps.Done({ to: { branch: "main", newBranch: false } });
+    const done = PushOps.Done({
+      to: { base: "main", branch: "main", newBranch: false },
+    });
 
     expect(
-      settlePush(done, { ok: true, to: { branch: "other", newBranch: false } })
+      settlePush(done, {
+        ok: true,
+        to: { base: "main", branch: "other", newBranch: false },
+      })
     ).toBe(done);
   });
 
