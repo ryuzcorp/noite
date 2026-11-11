@@ -76,7 +76,10 @@ const CONFLICTS: readonly (readonly [RegExp, RefusalCode])[] = [
     /is protected|protected ref|cannot delete the default branch/u,
     "protected_branch",
   ],
-  [/not open|is (?:closed|merged) and cannot be merged/u, "not_open"],
+  [
+    /not open|is (?:closed|merged) and cannot be merged|not in flight|point of no return/u,
+    "not_open",
+  ],
   [
     /merge conflicts|approving review|head branch|head .* is gone|base branch .* is gone/u,
     "not_mergeable",

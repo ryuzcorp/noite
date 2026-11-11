@@ -49,9 +49,12 @@ export type DeployWait = Data.TaggedEnum<{
 
 export const DeployWaits = Data.taggedEnum<DeployWait>();
 
-/** The longest a single call waits. The MCP route's own bound is
- * `MCP_TIMEOUT_MS` (65 s), so a 60 s wait still answers inside it. */
-export const MAX_WAIT_SECONDS = 60;
+/** The longest a single call waits. Two bounds apply and the shorter wins:
+ * the MCP route's own `MCP_TIMEOUT_MS` (65 s), and the edge's progress-based
+ * `write_idle` (1 m, `host/caddy.rs`) — a 60 s wait would sit exactly on that
+ * edge and could be cut while healthy. 45 s leaves room for the read and the
+ * response. */
+export const MAX_WAIT_SECONDS = 45;
 
 /** How often the poll re-reads the row. One runner call per second is a
  * single indexed row read on loopback. */

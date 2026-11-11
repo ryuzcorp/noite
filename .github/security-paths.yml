@@ -95,6 +95,10 @@ sensitive:
   # The hosted MCP endpoint: bearer-key auth plus the browser Origin check, so
   # a cross-site page cannot replay a captured key.
   - "apps/noite/src/http/routes/mcp.ts"
+  # The web-commit/preview route: the same key authentication gates a commit,
+  # and its cookie path trusts the browser Origin. A wrong branch here is a
+  # commit as somebody else.
+  - "apps/noite/src/http/routes/source.ts"
   - "apps/noite/src/http/origin.ts"
   - "apps/noite/src/lib/server/recovery.server.ts"
   # `runnerTokenOk`, the bearer check behind the whole internal surface.

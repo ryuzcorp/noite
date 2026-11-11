@@ -460,7 +460,15 @@ pub async fn create(
     if title.is_empty() {
         return Err(ApiError::bad("title is required"));
     }
-    if !forge::valid_branch_name(base) || !forge::valid_branch_name(head) {
+    // A pull request names two branches. A raw ref is refused outright: a
+    // hidden `refs/previews/<user>/<branch>` workspace snapshot must never
+    // become a PR head (its owner never committed it), and a tag or sha is
+    // not a branch here.
+    if !forge::valid_branch_name(base)
+        || !forge::valid_branch_name(head)
+        || base.starts_with("refs/")
+        || head.starts_with("refs/")
+    {
         return Err(ApiError::bad("invalid branch name"));
     }
     if base == head {
@@ -2012,6 +2020,41 @@ mod tests {
             }
             other => panic!("expected bad request, got {other:?}"),
         }
+        h.finish().await;
+    }
+
+    /// A pull request names two branches. A hidden workspace preview ref
+    /// (`refs/previews/<user>/<branch>`) holds another collaborator's
+    /// uncommitted snapshot and must never become a PR head, so any raw ref
+    /// (a preview, a tag) is refused here; a bare name or sha resolves as it
+    /// always has.
+    #[tokio::test]
+    async fn create_refuses_a_ref_instead_of_a_branch() {
+        let h = Harness::new("prrefhead").await;
+        let bare = h.mirror().await;
+        let (_base, head) = clean_pair(&h, &bare).await;
+        // The workspace snapshot a browser preview commits to.
+        let preview = format!(
+            "{}user_1/feature",
+            crate::host::git_http::PREVIEW_REF_PREFIX
+        );
+        forge::publish_refname(&h.state, &h.app, &preview, None, Some(&head))
+            .await
+            .expect("publish preview ref");
+        let author = actor("user_author", "Author");
+
+        for refname in [preview.as_str(), "refs/heads/feature", "refs/tags/v1"] {
+            let err = create(&h.state, &h.app.id, &author, "t", "", "main", refname, None)
+                .await
+                .expect_err("a ref is not a branch name");
+            match err {
+                ApiError::BadRequest(message) => {
+                    assert!(message.contains("invalid branch name"), "{message}");
+                }
+                other => panic!("expected bad request, got {other:?}"),
+            }
+        }
+
         h.finish().await;
     }
 

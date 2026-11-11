@@ -39,14 +39,24 @@ describe("parseKeyScope", () => {
     expect(keyScopeOf(parseKeyScope({}))).toEqual(ACCOUNT_WIDE);
   });
 
-  test("unknown fields are ignored, known ones are read", () => {
-    expect(
-      keyScopeOf(parseKeyScope({ appIds: ["a", "b", "a"], future: true }))
-    ).toEqual({ appIds: ["a", "b"], roleCeiling: "admin" });
+  test("known fields are read and de-duplicated", () => {
+    expect(keyScopeOf(parseKeyScope({ appIds: ["a", "b", "a"] }))).toEqual({
+      appIds: ["a", "b"],
+      roleCeiling: "admin",
+    });
 
     expect(
       keyScopeOf(parseKeyScope({ appIds: null, roleCeiling: "push" }))
     ).toEqual({ appIds: null, roleCeiling: "push" });
+  });
+
+  test("an unknown field is refused, not stripped into the widest scope", () => {
+    // `app_ids`/`ceiling` are a mis-shaped scope: stripping them would make
+    // the key account-wide and uncapped.
+    expect(parseKeyScope({ app_ids: ["a"] })._tag).toBe("Malformed");
+    expect(parseKeyScope({ appIds: ["a"], ceiling: "view" })._tag).toBe(
+      "Malformed"
+    );
   });
 
   test("a metadata that does not describe a scope is malformed", () => {
@@ -258,5 +268,11 @@ describe("attributor", () => {
   test("an unnamed key or account still reads as a person", () => {
     expect(attributor("Ada", " ")).toBe("Ada");
     expect(attributor("  ", "ci")).toBe("Noite user via key ci");
+  });
+
+  test("control characters never reach the commit header", () => {
+    expect(attributor("Ada\u0000\u001B[31m", "ci\u0000")).toBe(
+      "Ada[31m via key ci"
+    );
   });
 });

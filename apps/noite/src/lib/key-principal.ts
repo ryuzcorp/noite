@@ -114,7 +114,8 @@ const KeyMetadata = Schema.Struct({
 
 /** Read the scope out of a key's `metadata` column. `null`/`undefined` (every
  * key minted before scopes existed) is account-wide; anything that does not
- * match {@link KeyMetadata} is `Malformed` — refused, never treated as
+ * match {@link KeyMetadata} exactly — wrong field types, unknown fields, an
+ * empty app list — is `Malformed`, refused rather than treated as
  * account-wide. */
 // oxlint-disable-next-line anti-slop/no-unknown-parameters -- this IS the boundary parser for the api-key plugin's JSON metadata column; the schema below is what turns it into a domain value
 export const parseKeyScope = (metadata: unknown): KeyScopeRead => {
@@ -122,7 +123,11 @@ export const parseKeyScope = (metadata: unknown): KeyScopeRead => {
     return KeyScopeReads.Account();
   }
 
-  const decoded = Schema.decodeUnknownResult(KeyMetadata)(metadata);
+  // Unknown fields are refused, not stripped: a mis-shaped scope (`app_ids`,
+  // `ceiling`) must never decode to the widest scope.
+  const decoded = Schema.decodeUnknownResult(KeyMetadata, {
+    onExcessProperty: "error",
+  })(metadata);
 
   if (decoded._tag === "Failure") {
     return KeyScopeReads.Malformed();
@@ -232,11 +237,22 @@ export const decideKeyAccess = (input: KeyAccessInput): KeyAccess => {
   return KeyAccesses.Granted({ role });
 };
 
+/** C0 controls plus DEL: never allowed into a name git writes into a header. */
+// oxlint-disable-next-line eslint/no-control-regex -- the point is to strip these from a label that reaches a git header
+const CONTROL_CHARS = /[\u0000-\u001F\u007F]/gu;
+
+/** The label as it may reach a git header or deploy text. */
+const cleanLabel = (value: string): string =>
+  value.replaceAll(CONTROL_CHARS, "").trim();
+
 /** "%s via key %s": how a key's actions are attributed in commit authors,
  * pull-request authors and deploy rows, so a bot's work is visible as one. */
 export const attributor = (displayName: string, keyName: string): string => {
-  const owner = displayName.trim() === "" ? "Noite user" : displayName.trim();
-  const key = keyName.trim();
+  // Control characters are stripped (cleanLabel): the label reaches a git
+  // author header and deploy text, where NUL breaks the header and the rest
+  // render as garbage. The runner sanitizes the name again before committing.
+  const owner = cleanLabel(displayName) || "Noite user";
+  const key = cleanLabel(keyName);
 
   return key === "" ? owner : `${owner} via key ${key}`;
 };

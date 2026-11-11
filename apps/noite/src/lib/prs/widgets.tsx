@@ -412,10 +412,15 @@ export const ReviewCard = ({
 
   return (
     <article class="border-base-300 flex items-center gap-3 rounded-lg border p-3">
-      <Avatar label={nameFor(names, review.reviewerId)} size="sm" />
+      <Avatar
+        label={nameFor(names, review.reviewerId, review.authorLabel)}
+        size="sm"
+      />
       <div class="min-w-0 flex-1">
         <div class="flex flex-wrap items-center gap-x-2 gap-y-1 text-sm">
-          <span class="font-medium">{nameFor(names, review.reviewerId)}</span>
+          <span class="font-medium">
+            {nameFor(names, review.reviewerId, review.authorLabel)}
+          </span>
           <span class={`badge badge-sm ${facts.badge}`}>{facts.label}</span>
           {review.dismissedAt ? (
             <span class="badge badge-sm badge-ghost">Dismissed</span>
