@@ -182,12 +182,17 @@ jobs:
             code:
               - 'apps/noite/**'
               - 'apps/runner/**'
+              - 'apps/void-proxy/**'
+              - 'apps/void-sandbox/**'
               - 'packages/**'
+              - 'edge/**'
               - 'docker/**'
               - 'Makefile'
               - 'bun.lock'
               - '.env.example'
               - '.github/workflows/e2e.yml'
+              - 'LICENSE'
+              - 'NOTICE'
 
   # Fast on code pull requests, release on the `e2e` label or by hand from the
   # Actions tab, always release on merge_group. The lanes live in e2e.yml,

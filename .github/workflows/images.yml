@@ -26,12 +26,17 @@ on:
     paths:
       - "apps/runner/**"
       - "apps/noite/**"
+      - "apps/void-proxy/**"
+      - "apps/void-sandbox/**"
+      - "edge/**"
       - "docker/Dockerfile"
       - "docker/Dockerfile.dockerignore"
       - "docker/install-sidecars.sh"
       - "docker/compose.yaml"
       - ".github/workflows/images.yml"
       - ".github/workflows/check.yml"
+      - "LICENSE"
+      - "NOTICE"
     tags:
       - "v*"
   workflow_dispatch:
