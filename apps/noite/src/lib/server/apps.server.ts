@@ -9,6 +9,7 @@ import { failUnknown, UnauthorizedError } from "../auth";
 import {
   dropAppCollaborators,
   grantCollaborator,
+  listCollaboratorRows,
   requireAppRole,
 } from "../collaborators";
 import {
@@ -260,6 +261,53 @@ const adoptSlowCreate = async (
   }
 };
 
+/** How old a grant-less row may be and still be adopted: a create that
+ * outlived the control plane's bound lands detached, and its grant never ran.
+ * Beyond the create's own recovery window such a row is not a retry of ours. */
+const LOST_GRANT_MS = 15 * 60 * 1000;
+
+/** The row a failed create may adopt, and whether it still needs its grant.
+ * `user_id` is the creator field, not access: a creator can be removed, so
+ * adopting on that field alone would hand a removed or demoted collaborator
+ * admin again. Two cases only:
+ *
+ * - the account is **currently** an admin on the app — adopt, never write a
+ *   grant (an existing grant is never raised or recreated);
+ * - the app has **no** grants at all and the row is inside the recovery window
+ *   — the timed-out create whose grant never ran (#177/#191). This is the one
+ *   adoption that writes the creator's admin grant. */
+const adoptableFor = async (
+  app: RunnerApp | null,
+  accountId: string
+): Promise<{ app: RunnerApp; grant: boolean } | null> => {
+  if (!app || app.userId !== accountId) {
+    return null;
+  }
+
+  const grants = await listCollaboratorRows(app.id);
+
+  if (grants.length === 0) {
+    const created = new Date(app.createdAt).getTime();
+
+    if (!Number.isFinite(created) || Date.now() - created > LOST_GRANT_MS) {
+      return null;
+    }
+
+    return { app, grant: true };
+  }
+
+  const mine = grants.find((row) => row.userId === accountId);
+
+  return mine?.role === "admin" ? { app, grant: false } : null;
+};
+
+/** {@link adoptableFor} for a slug whose row is not in hand yet. */
+const adoptable = async (
+  slug: string,
+  accountId: string
+): Promise<{ app: RunnerApp; grant: boolean } | null> =>
+  adoptableFor(await runnerGetAppBySlug(slug).catch(() => null), accountId);
+
 /** Create an app for one account and grant that account admin — the single
  * implementation behind the create action and /internal/git-auth's
  * push-to-create (A5). The runner owns the app row; the grant is ours, and a
@@ -271,6 +319,9 @@ export const createAppForUser = async (input: {
   source?: CreateSourceInput;
 }): Promise<RunnerApp> => {
   let app: RunnerApp;
+  // A fresh create (and a grant-less recovered row) needs its admin grant; an
+  // adopted row that already has collaborators must never be re-granted.
+  let needsGrant = true;
   const deadline = Date.now() + CREATE_RECOVERY_MS;
 
   try {
@@ -290,13 +341,15 @@ export const createAppForUser = async (input: {
     // caller's own first attempt. Treat that as the same create instead of
     // failing the retry, and grant the account below as usual.
     if (isSlugTaken(failure)) {
-      const existing = await runnerGetAppBySlug(input.slug).catch(() => null);
+      const adoption = await adoptable(input.slug, input.account.id);
 
-      if (existing?.userId !== input.account.id) {
+      if (!adoption) {
+        // Someone else's app, or the caller's own row where access was
+        // removed or demoted: the slug is taken, and nothing is granted.
         throw error;
       }
 
-      app = existing;
+      ({ app, grant: needsGrant } = adoption);
     } else if (failure.kind === "timeout") {
       // The same detached create, but the caller saw the abort: adopt the
       // row when it lands (inside the create's recovery budget) instead of
@@ -318,10 +371,22 @@ export const createAppForUser = async (input: {
         throw error;
       }
 
-      app = existing;
+      const adoption = await adoptableFor(existing, input.account.id);
+
+      if (!adoption) {
+        // Landed, but someone already granted it (or it is not ours): never
+        // adopt a row whose collaborators say the caller lost access.
+        throw error;
+      }
+
+      ({ app, grant: needsGrant } = adoption);
     } else {
       throw error;
     }
+  }
+
+  if (!needsGrant) {
+    return app;
   }
 
   try {

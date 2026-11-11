@@ -333,6 +333,28 @@ export const createAuth = (env: KitEnv, baseURL: string) =>
         }
       }),
       before: createAuthMiddleware(async (ctx) => {
+        // A key's scope and expiry are decided when it is minted. `update` is
+        // reachable from the owner's own session, and with `enableMetadata`
+        // it would let that session widen a key (or clear its expiry) after
+        // the fact — so the mint-time fields are refused there. Revoking and
+        // minting a new key is the supported path.
+        if (ctx.path === "/api-key/update") {
+          const body = Schema.decodeUnknownResult(
+            Schema.Record(Schema.String, Schema.Json)
+          )(ctx.body ?? {});
+
+          if (
+            body._tag === "Success" &&
+            ("metadata" in body.success || "expiresIn" in body.success)
+          ) {
+            throw APIError.from("BAD_REQUEST", {
+              code: "KEY_SCOPE_IS_MINT_TIME",
+              message:
+                "A key's scope and expiry are set when it is minted. Revoke the key and create a new one.",
+            });
+          }
+        }
+
         if (ctx.path !== "/api-key/create") {
           return;
         }

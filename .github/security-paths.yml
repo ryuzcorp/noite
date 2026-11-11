@@ -82,6 +82,12 @@ sensitive:
   # The account action that mints keys (scope, ceiling, expiry) — a bug here
   # widens a credential beyond what its owner chose.
   - "apps/noite/src/lib/server/account.server.ts"
+  # App creation and adoption: what a create grants, and whose row may be
+  # adopted after a lost first attempt. A bug here hands admin on an app whose
+  # collaborator was removed.
+  - "apps/noite/src/lib/server/apps.server.ts"
+  # The MCP tool table: every tool's app gate and its create refusal.
+  - "apps/noite/src/lib/mcp/tools.ts"
   # The runner-token-only internal surface (git credential verification,
   # account-recovery codes, app creation for an arbitrary user): a change here
   # can bypass the session and role checks the public routes rely on.

@@ -52,6 +52,10 @@ Actions a key performs are labelled with it, so a bot's work stays visible as a 
 
 Automatic deploys from a plain git push carry the pusher's own git identity in the commit, so there is no key label on the deploy row.
 
+:::note
+A key's scope, ceiling and expiry are **self-imposed limits on a credential**, not a tamper-proof sandbox: they constrain what a holder of the key can do, and the instance refuses a key whose stored scope cannot be read, but the account that mints a key is trusted to choose its limits. A compromised account session can mint a new key without limits — treat account security, not key scope, as the boundary.
+:::
+
 ## Rotating a key
 
 Revoke the old key on the Account page and mint a new one — revocation is immediate on every surface (git, MCP, ingest). Short expiries are the low-effort version of the same discipline: a CI key with a 30-day expiry cannot become a permanent credential nobody remembers.

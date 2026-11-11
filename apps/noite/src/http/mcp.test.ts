@@ -294,7 +294,7 @@ const callTool = async (key: string, name: string, args: Json) => {
       isError?: boolean;
       structuredContent?: {
         apps?: { id: string }[];
-        app?: { slug: string };
+        app?: { id: string; slug: string };
       };
     };
   };
@@ -393,6 +393,42 @@ describe("a scoped key over MCP", () => {
     expect(created.result?.content[0]?.text).toContain(
       "role ceiling cannot create apps"
     );
+  });
+
+  test("a push-only owner is not re-granted admin by create_app", async () => {
+    db.raw.run(
+      `INSERT INTO app_collaborator (id, appId, userId, role) VALUES ('c3', 'taken', 'u-scoped', 'push')`
+    );
+    runner.apps.push(
+      makeApp({
+        createdAt: new Date().toISOString(),
+        id: "taken",
+        slug: "taken",
+        userId: "u-scoped",
+      })
+    );
+
+    const key = await mintKey("u-scoped");
+    const created = await callTool(key, "create_app", { slug: "taken" });
+
+    expect(created.result?.isError).toBe(true);
+  });
+
+  test("a grant-less fresh row is still recovered by create_app", async () => {
+    runner.apps.push(
+      makeApp({
+        createdAt: new Date().toISOString(),
+        id: "fresh",
+        slug: "fresh",
+        userId: "u-scoped",
+      })
+    );
+
+    const key = await mintKey("u-scoped");
+    const created = await callTool(key, "create_app", { slug: "fresh" });
+
+    expect(created.result?.isError).toBeFalsy();
+    expect(created.result?.structuredContent?.app?.id).toBe("fresh");
   });
 
   test("an app-scoped key cannot create an app", async () => {

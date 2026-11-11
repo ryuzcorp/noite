@@ -167,7 +167,22 @@ const gitAuthCreate = async (
       slug,
     });
 
-    return Response.json({ appId: app.id, ok: true, role: "admin", userId });
+    // The app now exists (created, or adopted by the retry recovery): answer
+    // with the role the key gate resolves on the resolved id, never a
+    // hard-coded admin. An adopted row the account does not administer is
+    // refused like any other app it cannot push to.
+    const verdict = await keyAppVerdict(principal, { id: app.id }, "admin");
+
+    if (verdict._tag !== "Granted") {
+      return notFound;
+    }
+
+    return Response.json({
+      appId: verdict.app.id,
+      ok: true,
+      role: verdict.role,
+      userId,
+    });
   } catch (error) {
     const failure = runnerFailureOf(error);
 

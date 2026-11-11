@@ -210,6 +210,54 @@ describe("a banned owner's API key", () => {
   });
 });
 
+/** POST the client-reachable update route with the mint-time fields. The
+ * guard runs before the session read (no sign-in here: the auth limiter is
+ * shared by the file), so asserting its own code proves the hook refused
+ * the field rather than the endpoint answering "unauthenticated". */
+const updateBody = async (body: {
+  expiresIn?: null;
+  keyId: string;
+  metadata?: { appIds: string[] | null; roleCeiling?: string };
+}): Promise<Response> =>
+  await authFromEnv(ENV as unknown as KitEnv, ENV.BETTER_AUTH_URL).handler(
+    new Request(`${ENV.BETTER_AUTH_URL}/api/auth/api-key/update`, {
+      body: JSON.stringify(body),
+      headers: { "content-type": "application/json" },
+      method: "POST",
+    })
+  );
+
+describe("a key's mint-time scope", () => {
+  test("cannot be widened or un-expired through the client update route", async () => {
+    await mintKey("u-scoped", { appIds: ["app-1"] });
+
+    const row = db.raw
+      .query(`SELECT id, metadata FROM apikey WHERE referenceId = 'u-scoped'`)
+      .get() as { id: string; metadata: string | null };
+
+    expect(row.metadata).toContain("app-1");
+
+    const widened = await updateBody({
+      keyId: row.id,
+      metadata: { appIds: null },
+    });
+
+    expect(widened.status).toBe(400);
+    expect(await widened.text()).toContain("KEY_SCOPE_IS_MINT_TIME");
+
+    const cleared = await updateBody({ expiresIn: null, keyId: row.id });
+
+    expect(cleared.status).toBe(400);
+    expect(await cleared.text()).toContain("KEY_SCOPE_IS_MINT_TIME");
+
+    const after = db.raw
+      .query(`SELECT metadata FROM apikey WHERE referenceId = 'u-scoped'`)
+      .get() as { metadata: string | null };
+
+    expect(after.metadata).toContain("app-1");
+  });
+});
+
 describe("the ban endpoint", () => {
   test("deletes the account's keys, and an unban does not restore them", async () => {
     const key = await mintKey("ban-target");
@@ -446,6 +494,71 @@ describe("a scoped key on git and ingest", () => {
       error: "This API key's role ceiling cannot create apps",
       ok: false,
     });
+  });
+
+  test("a push-only creator keeps its push role and is not re-granted admin", async () => {
+    // The caller's own row is taken (a retry after a lost first attempt), but
+    // its grant says push: the create path must not raise it back to admin.
+    db.raw.run(
+      `INSERT INTO app_collaborator (id, appId, userId, role) VALUES ('c9', 'taken', 'u-scoped', 'push')`
+    );
+    runner.apps.push(
+      makeApp({
+        createdAt: new Date().toISOString(),
+        id: "taken",
+        slug: "taken",
+        userId: "u-scoped",
+      })
+    );
+
+    const key = await mintKey("u-scoped");
+    const response = await gitAuth(key, "taken", "create");
+
+    expect(response?.status).toBe(404);
+    expect(runner.apps.find((app) => app.id === "taken")?.slug).toBe("taken");
+  });
+
+  test("a removed creator is refused the taken slug", async () => {
+    db.raw.run(
+      `INSERT OR IGNORE INTO "user" (id, name, email) VALUES ('u-other', 'u-other', 'other@example.com')`
+    );
+    db.raw.run(
+      `INSERT INTO app_collaborator (id, appId, userId, role) VALUES ('c10', 'gone', 'u-other', 'admin')`
+    );
+    runner.apps.push(
+      makeApp({
+        createdAt: new Date().toISOString(),
+        id: "gone",
+        slug: "gone",
+        userId: "u-scoped",
+      })
+    );
+
+    const key = await mintKey("u-scoped");
+    const response = await gitAuth(key, "gone", "create");
+
+    expect(response?.status).toBe(404);
+  });
+
+  test("a timed-out create that landed grant-less is still recovered", async () => {
+    // No grant at all and a fresh row: the retry recovery the create path
+    // exists for. It adopts, grants admin, and answers the admin role.
+    runner.apps.push(
+      makeApp({
+        createdAt: new Date().toISOString(),
+        id: "fresh",
+        slug: "fresh",
+        userId: "u-scoped",
+      })
+    );
+
+    const key = await mintKey("u-scoped");
+    const response = await gitAuth(key, "fresh", "create");
+
+    expect(response?.status).toBe(200);
+
+    const body: unknown = await response?.json();
+    expect(body).toMatchObject({ appId: "fresh", ok: true, role: "admin" });
   });
 
   test("an app-scoped key cannot claim a new app through a push", async () => {

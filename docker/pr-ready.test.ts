@@ -481,6 +481,8 @@ describe("matchSensitive", () => {
       "apps/noite/src/lib/server/key-access.server.ts",
       "apps/noite/src/lib/key-principal.ts",
       "apps/noite/src/lib/server/account.server.ts",
+      "apps/noite/src/lib/server/apps.server.ts",
+      "apps/noite/src/lib/mcp/tools.ts",
       "apps/noite/src/http/routes/internal.ts",
       "apps/noite/src/lib/server/recovery.server.ts",
       "apps/noite/src/http/config.ts",

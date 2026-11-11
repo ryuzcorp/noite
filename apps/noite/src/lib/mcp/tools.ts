@@ -412,6 +412,16 @@ export const MCP_TOOLS: readonly McpToolDefinition[] = [
         source: toCreateSource(source),
       });
 
+      // A create may have adopted the caller's own earlier row (a retry
+      // recovery); the app is only advertised if the key can administer it.
+      const access = await keyAppVerdict(principal, { id: app.id }, "admin");
+
+      if (access._tag !== "Granted") {
+        throw new McpToolError(
+          `Created ${app.slug}, but this key cannot administer it. Check the app's collaborators in the dashboard.`
+        );
+      }
+
       const remote = await runnerGitRemote(app.id);
       const url = appUrl(remote.url, app.subdomain);
 
