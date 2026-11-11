@@ -354,7 +354,8 @@ pub async fn ensure_bootstrap_caddyfile(path: &str) -> anyhow::Result<()> {
 /// table (`host::edge_table::push_routes`). App events never reload: there
 /// is no `--watch` and no `/load` path after boot. On boot Caddy reads the
 /// file the runner wrote before supervising it; the table file it loads in
-/// Provision, and the tick re-pushes the live table.
+/// Provision, and the tick pushes it again when it changed or when the edge
+/// reports a different generation (a restart lost the live table).
 pub fn supervise_caddy(config: &Config) -> Supervised {
     let caddyfile = config.caddyfile_path.clone();
     Supervised::start("caddy", move || {

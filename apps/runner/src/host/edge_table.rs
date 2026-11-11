@@ -486,14 +486,45 @@ pub enum Pushed {
     Rejected(String),
 }
 
+/// Shared admin-API client. The reconcile tick probes the edge before every
+/// push, so keep-alive matters: a fresh client per tick allocated a pool and
+/// a connector for a request that is usually a few bytes over loopback.
+static ADMIN_CLIENT: std::sync::LazyLock<reqwest::Client> =
+    std::sync::LazyLock::new(reqwest::Client::new);
+
+fn admin_url(cfg: &Config) -> String {
+    format!("{}/edge/routes", cfg.caddy_admin_url.trim_end_matches('/'))
+}
+
+/// The generation the edge currently serves. `None` means the admin API did
+/// not answer with a table (Caddy booting or restarting, or the module not
+/// registered yet), so the caller must treat the live state as unknown and
+/// push. This is the edge's own report, never a flag the runner remembers:
+/// a Caddy that lost its table (a fresh process, a wiped state) reports the
+/// generation it really serves instead of one the runner once pushed.
+async fn served_generation(cfg: &Config) -> Option<u64> {
+    #[derive(Deserialize)]
+    struct Live {
+        generation: u64,
+    }
+    let resp = ADMIN_CLIENT
+        .get(admin_url(cfg))
+        .timeout(std::time::Duration::from_secs(2))
+        .send()
+        .await
+        .ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    resp.json::<Live>().await.ok().map(|live| live.generation)
+}
+
 /// Push the table to Caddy's admin API (loopback-only). Lifecycle callers
 /// and the reconcile tick only warn on a refusal (the next tick re-pushes);
 /// a deploy must not report success on one (see `deploy::route_live`).
 async fn push_live(cfg: &Config, table: &EdgeTable) -> Pushed {
-    let url = format!("{}/edge/routes", cfg.caddy_admin_url.trim_end_matches('/'));
-    let client = reqwest::Client::new();
-    match client
-        .post(&url)
+    match ADMIN_CLIENT
+        .post(admin_url(cfg))
         .json(table)
         .timeout(std::time::Duration::from_secs(10))
         .send()
@@ -522,6 +553,15 @@ async fn push_live(cfg: &Config, table: &EdgeTable) -> Pushed {
 /// Build the table from the DB, write the file atomically when it changed,
 /// and push it live. Every app lifecycle event calls this immediately; the
 /// reconcile tick calls it too as the self-healing backstop.
+///
+/// Only a changed table is POSTed. When the build equals the file the edge
+/// already loaded, the runner asks the edge which generation it serves (a
+/// tiny loopback GET) and skips the full-table POST when they match. That
+/// probe is also what makes a Caddy restart self-healing without a blind
+/// periodic re-push: a process that lost the table reports generation 0 (or
+/// an unreachable admin API), so the next tick pushes again. A refused or
+/// unanswered push leaves the edge on the old generation, so the next tick's
+/// probe differs and retries it.
 /// Serializes concurrent pushes: two lifecycle events at once must not
 /// interleave build → write → push, or an older table lands last until the
 /// next tick (the module also rejects older generations with a 409, and the
@@ -575,6 +615,13 @@ pub async fn push_routes(pool: &sqlx::SqlitePool, cfg: &Config) -> anyhow::Resul
         tokio::fs::write(&tmp, &next).await?;
         tokio::fs::rename(&tmp, path).await?;
         tracing::info!(path = %cfg.routes_path, n = table.exact.len(), "edge routes updated");
+    } else if served_generation(cfg).await == Some(table.generation) {
+        // Nothing changed and the edge already serves this generation.
+        // Skipping the POST is the point: an idle runner must not re-send
+        // (and Caddy must not re-parse, re-validate and re-install) the
+        // whole table every reconcile tick.
+        push_note(true, String::new());
+        return Ok(Pushed::Accepted);
     }
     Ok(push_live(cfg, &table).await)
 }
@@ -1013,5 +1060,210 @@ mod tests {
         app.asleep_since = Some("t".into());
         let t = build_table(&cfg, &[app], &[], &[], &[]);
         assert!(t.exact["myapp.localhost"].asleep);
+    }
+
+    /// A pool and config whose route file lives in its own temp dir, so the
+    /// push tests never share the default path (or each other's).
+    async fn push_env() -> (sqlx::SqlitePool, Config, std::path::PathBuf) {
+        let pool = crate::db::connect("sqlite::memory:")
+            .await
+            .expect("memory db");
+        let mut cfg = config_for_tests();
+        let dir = std::env::temp_dir().join(format!("noite-edge-push-{}", crate::models::new_id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        cfg.routes_path = dir.join("routes.json").to_string_lossy().into_owned();
+        (pool, cfg, dir)
+    }
+
+    /// A stand-in for the edge's loopback admin API: `GET` reports the live
+    /// generation, `POST` installs (or refuses) the posted table and counts
+    /// itself. Its state survives calls, like Caddy's process-wide table.
+    #[derive(Default)]
+    struct Admin {
+        live: std::sync::Mutex<u64>,
+        posts: std::sync::atomic::AtomicUsize,
+        refuse: std::sync::atomic::AtomicBool,
+    }
+
+    impl Admin {
+        fn live(&self) -> u64 {
+            *self
+                .live
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+        }
+        fn set_live(&self, generation: u64) {
+            *self
+                .live
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = generation;
+        }
+        fn posts(&self) -> usize {
+            self.posts.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    async fn admin_handler(
+        axum::extract::State(admin): axum::extract::State<std::sync::Arc<Admin>>,
+        method: axum::http::Method,
+        body: axum::body::Bytes,
+    ) -> axum::response::Response {
+        use axum::response::IntoResponse;
+        if method == axum::http::Method::GET {
+            return axum::Json(serde_json::json!({
+                "generation": admin.live(),
+                "routes": 0,
+            }))
+            .into_response();
+        }
+        admin
+            .posts
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if admin.refuse.load(std::sync::atomic::Ordering::SeqCst) {
+            return (axum::http::StatusCode::CONFLICT, "stale generation").into_response();
+        }
+        let table: EdgeTable = serde_json::from_slice(&body).expect("posted route table");
+        admin.set_live(table.generation);
+        axum::Json(serde_json::json!({ "generation": table.generation })).into_response()
+    }
+
+    async fn admin_server() -> (String, std::sync::Arc<Admin>) {
+        let admin = std::sync::Arc::new(Admin::default());
+        let app = axum::Router::new()
+            .route(
+                "/edge/routes",
+                axum::routing::get(admin_handler).post(admin_handler),
+            )
+            .with_state(std::sync::Arc::clone(&admin));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind admin");
+        let addr = listener.local_addr().expect("admin addr");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (format!("http://{addr}"), admin)
+    }
+
+    /// The reconcile tick calls `push_routes` every 5 s. Once the edge
+    /// serves the current generation, an unchanged table must not be
+    /// re-POSTed (the measured cost was ~720 full-table installs an hour).
+    #[tokio::test]
+    async fn an_unchanged_table_is_not_pushed_again() {
+        let (pool, mut cfg, dir) = push_env().await;
+        let (url, admin) = admin_server().await;
+        cfg.caddy_admin_url = url;
+
+        assert_eq!(push_routes(&pool, &cfg).await.unwrap(), Pushed::Accepted);
+        assert_eq!(admin.posts(), 1, "the first build is pushed");
+        assert_eq!(push_routes(&pool, &cfg).await.unwrap(), Pushed::Accepted);
+        assert_eq!(
+            admin.posts(),
+            1,
+            "an unchanged table must not be pushed again"
+        );
+        assert_eq!(served_generation(&cfg).await, Some(1));
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// A table that changed is pushed at once, without waiting for the
+    /// generation probe to notice anything.
+    #[tokio::test]
+    async fn a_changed_table_is_pushed_immediately() {
+        let (pool, mut cfg, dir) = push_env().await;
+        let (url, admin) = admin_server().await;
+        cfg.caddy_admin_url = url;
+
+        push_routes(&pool, &cfg).await.unwrap();
+        assert_eq!(admin.posts(), 1);
+        crate::db::create_app(
+            &pool,
+            &cfg,
+            crate::db::NewApp {
+                name: "blog",
+                slug: "blog",
+                user_id: "local",
+                subdomain: "blog.localhost",
+                listen: 30100,
+                internal: 30101,
+            },
+        )
+        .await
+        .expect("seed app");
+
+        assert_eq!(push_routes(&pool, &cfg).await.unwrap(), Pushed::Accepted);
+        assert_eq!(admin.posts(), 2, "a changed table is pushed at once");
+        assert_eq!(served_generation(&cfg).await, Some(2));
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// A refused push leaves the edge on the previous generation, so the
+    /// next tick must try the same table again instead of believing it live.
+    #[tokio::test]
+    async fn a_refused_push_is_retried_on_the_next_tick() {
+        let (pool, mut cfg, dir) = push_env().await;
+        let (url, admin) = admin_server().await;
+        cfg.caddy_admin_url = url;
+
+        admin
+            .refuse
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(matches!(
+            push_routes(&pool, &cfg).await.unwrap(),
+            Pushed::Rejected(_)
+        ));
+        assert_eq!(admin.posts(), 1);
+        assert_eq!(admin.live(), 0, "the edge kept no table");
+
+        admin
+            .refuse
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(push_routes(&pool, &cfg).await.unwrap(), Pushed::Accepted);
+        assert_eq!(admin.posts(), 2, "the same table is retried");
+        assert_eq!(admin.live(), 1);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// An admin API that does not answer (Caddy booting or restarting) is
+    /// `Unreachable`; the next tick must push again rather than skip.
+    #[tokio::test]
+    async fn an_unanswered_push_is_retried_on_the_next_tick() {
+        let (pool, mut cfg, dir) = push_env().await;
+        // Bind and drop a port: nothing listens there, so the push fails fast.
+        let dead = {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            listener.local_addr().unwrap()
+        };
+        cfg.caddy_admin_url = format!("http://{dead}");
+
+        assert_eq!(push_routes(&pool, &cfg).await.unwrap(), Pushed::Unreachable);
+
+        let (url, admin) = admin_server().await;
+        cfg.caddy_admin_url = url;
+        assert_eq!(push_routes(&pool, &cfg).await.unwrap(), Pushed::Accepted);
+        assert_eq!(admin.posts(), 1, "the table is pushed to the live edge");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// A Caddy that restarted lost its in-memory table while the runner's
+    /// file did not change: the reported generation differs, so the runner
+    /// must push again instead of assuming the table is still live.
+    #[tokio::test]
+    async fn a_restarted_edge_gets_the_table_again() {
+        let (pool, mut cfg, dir) = push_env().await;
+        let (url, admin) = admin_server().await;
+        cfg.caddy_admin_url = url;
+
+        push_routes(&pool, &cfg).await.unwrap();
+        assert_eq!(admin.posts(), 1);
+        assert_eq!(admin.live(), 1);
+
+        // A fresh Caddy process: empty shared state until a push or its own
+        // Provision load. The runner's file has not changed.
+        admin.set_live(0);
+        assert_eq!(push_routes(&pool, &cfg).await.unwrap(), Pushed::Accepted);
+        assert_eq!(admin.posts(), 2, "a lost table is pushed again");
+        assert_eq!(admin.live(), 1);
+        std::fs::remove_dir_all(dir).ok();
     }
 }
