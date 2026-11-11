@@ -118,6 +118,7 @@ enum WebTarget<'a> {
 /// resolves to it — or the commit is refused with "tip moved" instead of
 /// silently growing on top of a tip another writer moved. `None` keeps the
 /// read-then-write behaviour a browser edit has always had.
+#[allow(clippy::too_many_arguments)] // the commit surface: one call per field the body carries
 pub async fn web_commit(
     state: &AppState,
     app: &App,

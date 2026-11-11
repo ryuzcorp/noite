@@ -15,7 +15,7 @@ use sqlx::SqliteConnection;
 pub const FIRST_COMPACTED_VERSION: i64 = 100;
 
 /// Version a database has after every migration ran.
-pub const SCHEMA_VERSION: i64 = FIRST_COMPACTED_VERSION + 3;
+pub const SCHEMA_VERSION: i64 = FIRST_COMPACTED_VERSION + 4;
 
 /// One upgrade step: the statements that take a database from `version - 1`
 /// to `version`. Empty at the compacted baseline; append above it to change
@@ -48,6 +48,15 @@ pub const MIGRATIONS: &[Migration] = &[
         // column reads as "nobody (automatic)".
         version: FIRST_COMPACTED_VERSION + 3,
         sql: "ALTER TABLE main.deploy ADD COLUMN actor TEXT;",
+    },
+    Migration {
+        // 104: how a machine signed a pull request, a comment and a review.
+        // `keyActor` writes '<user> via key <name>' so the PR pages show a
+        // bot's work as one; NULL keeps the account name D1 resolves.
+        version: FIRST_COMPACTED_VERSION + 4,
+        sql: "ALTER TABLE main.pull_request ADD COLUMN author_label TEXT; \
+              ALTER TABLE main.pr_comment ADD COLUMN author_label TEXT; \
+              ALTER TABLE main.pr_review ADD COLUMN author_label TEXT;",
     },
 ];
 
@@ -262,6 +271,9 @@ mod tests {
             "CREATE TABLE main.app (id TEXT PRIMARY KEY, slug TEXT); \
              CREATE TABLE main.deploy (id TEXT PRIMARY KEY, app_id TEXT, environment_id TEXT, \
                                        sha TEXT, status TEXT, intent TEXT, created_at TEXT); \
+             CREATE TABLE main.pull_request (id TEXT PRIMARY KEY NOT NULL); \
+             CREATE TABLE main.pr_comment (id TEXT PRIMARY KEY NOT NULL); \
+             CREATE TABLE main.pr_review (id TEXT PRIMARY KEY NOT NULL); \
              PRAGMA main.user_version = 101;",
         )
         .execute(&mut conn)
@@ -297,6 +309,9 @@ mod tests {
                                       sha TEXT, status TEXT NOT NULL, created_at TEXT); \
              INSERT INTO main.deploy (id, app_id, status) VALUES ('d1', 'a1', 'failed'); \
              CREATE TABLE main.app (id TEXT PRIMARY KEY, slug TEXT); \
+             CREATE TABLE main.pull_request (id TEXT PRIMARY KEY NOT NULL); \
+             CREATE TABLE main.pr_comment (id TEXT PRIMARY KEY NOT NULL); \
+             CREATE TABLE main.pr_review (id TEXT PRIMARY KEY NOT NULL); \
              PRAGMA main.user_version = 100;",
         )
         .execute(&mut conn)
@@ -316,6 +331,44 @@ mod tests {
             .await
             .expect("intent column");
         assert_eq!(intent, "deploy");
+    }
+
+    /// The 104 step adds `author_label` to the three pull-request tables: a
+    /// database from the previous baseline gains the column on each, NULL for
+    /// every row it already holds (the UI then keeps the D1 account name).
+    #[tokio::test]
+    async fn the_author_label_step_upgrades_a_stamped_database() {
+        let mut conn = memory().await;
+        sqlx::raw_sql(
+            "CREATE TABLE main.app (id TEXT PRIMARY KEY, slug TEXT); \
+             CREATE TABLE main.pull_request (id TEXT PRIMARY KEY NOT NULL); \
+             CREATE TABLE main.pr_comment (id TEXT PRIMARY KEY NOT NULL); \
+             CREATE TABLE main.pr_review (id TEXT PRIMARY KEY NOT NULL); \
+             PRAGMA main.user_version = 103;",
+        )
+        .execute(&mut conn)
+        .await
+        .expect("seed a 103 database");
+        apply(
+            &mut conn,
+            "CREATE TABLE IF NOT EXISTS main.app (id TEXT PRIMARY KEY, slug TEXT);",
+            SCHEMA_VERSION,
+            MIGRATIONS,
+        )
+        .await
+        .expect("migrate forward");
+        assert_eq!(version(&mut conn).await, SCHEMA_VERSION);
+
+        for table in ["pull_request", "pr_comment", "pr_review"] {
+            let columns: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM pragma_table_info(?) WHERE name = 'author_label'",
+            )
+            .bind(table)
+            .fetch_one(&mut conn)
+            .await
+            .expect("column lookup");
+            assert_eq!(columns, 1, "{table} gained author_label");
+        }
     }
 
     #[tokio::test]

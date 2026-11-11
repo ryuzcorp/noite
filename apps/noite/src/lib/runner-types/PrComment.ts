@@ -5,4 +5,4 @@
  * the `commit_sha` it was written against); `outdated` says that anchor no
  * longer matches the current diff.
  */
-export type PrComment = { id: string, authorId: string, body: string, path: string | null, line: number | null, side: string | null, commitSha: string | null, createdAt: string, editedAt: string | null, outdated: boolean, };
+export type PrComment = { id: string, authorId: string, authorLabel: string | null, body: string, path: string | null, line: number | null, side: string | null, commitSha: string | null, createdAt: string, editedAt: string | null, outdated: boolean, };

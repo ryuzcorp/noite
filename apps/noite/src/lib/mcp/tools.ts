@@ -1641,6 +1641,7 @@ export const MCP_TOOLS: readonly McpToolDefinition[] = [
       const detail = await attempt(() =>
         runnerPrCreate(app.id, {
           actor,
+          authorLabel: actor.name,
           base: (base ?? "").trim() || refs.defaultBranch,
           body,
           head,
@@ -1709,6 +1710,7 @@ export const MCP_TOOLS: readonly McpToolDefinition[] = [
       const comment = await attempt(() =>
         runnerPrComment(app.id, number, {
           actor,
+          authorLabel: actor.name,
           body,
           commitSha: sha,
           line,
@@ -1742,7 +1744,12 @@ export const MCP_TOOLS: readonly McpToolDefinition[] = [
       const actor = await keyActor(principal);
 
       const detail = await attempt(() =>
-        runnerPrReview(app.id, number, { actor, role, state })
+        runnerPrReview(app.id, number, {
+          actor,
+          authorLabel: actor.name,
+          role,
+          state,
+        })
       );
 
       const preview = await prPreview(

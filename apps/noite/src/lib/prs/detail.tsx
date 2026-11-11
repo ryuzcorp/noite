@@ -300,7 +300,8 @@ export const PrDetailView = ({
             <PrMergeState detail={detail} />
           ) : null}
           <span class="text-base-content/70">
-            {nameFor(names, pullRequest.authorId)} wants to merge
+            {nameFor(names, pullRequest.authorId, pullRequest.authorLabel)}{" "}
+            wants to merge
           </span>
           <span class="font-mono text-xs">
             <Link
@@ -324,7 +325,9 @@ export const PrDetailView = ({
         {requesting.length > 0 ? (
           <p class="text-warning m-0 text-sm" role="status">
             {requesting
-              .map((review) => nameFor(names, review.reviewerId))
+              .map((review) =>
+                nameFor(names, review.reviewerId, review.authorLabel)
+              )
               .join(", ")}{" "}
             requested changes.
           </p>

@@ -113,7 +113,8 @@ const PrDescription = ({
     <div class="border-base-300 flex flex-col gap-2 rounded-lg border p-3">
       <div class="flex items-center justify-between gap-2">
         <span class="text-sm font-medium">
-          {nameFor(names, pullRequest.authorId)} opened this pull request
+          {nameFor(names, pullRequest.authorId, pullRequest.authorLabel)} opened
+          this pull request
         </span>
         {canEdit ? (
           <button

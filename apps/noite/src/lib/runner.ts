@@ -854,6 +854,8 @@ export const runnerPrCreate = (
   id: string,
   body: {
     actor: { name: string; userId: string };
+    /** How a machine signs the pull request; absent for a person. */
+    authorLabel?: string;
     base: string;
     body?: string;
     head: string;
@@ -878,6 +880,8 @@ export const runnerPrComment = (
   number: number,
   body: {
     actor: { name: string; userId: string };
+    /** How a machine signs the comment; absent for a person. */
+    authorLabel?: string;
     body: string;
     commitSha?: string;
     line?: number;
@@ -915,6 +919,8 @@ export const runnerPrReview = (
   number: number,
   body: {
     actor: { name: string; userId: string };
+    /** How a machine signs the review; absent for a person. */
+    authorLabel?: string;
     role: string;
     state: "approved" | "changes_requested";
   }

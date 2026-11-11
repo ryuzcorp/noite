@@ -17,6 +17,7 @@ import {
 
 const comment = (over: Partial<PrComment> & { id: string }): PrComment => ({
   authorId: "u1",
+  authorLabel: null,
   body: "hello",
   commitSha: null,
   createdAt: "2026-01-01T00:00:00Z",
@@ -29,6 +30,7 @@ const comment = (over: Partial<PrComment> & { id: string }): PrComment => ({
 });
 
 const review = (over: Partial<PrReview> & { id: string }): PrReview => ({
+  authorLabel: null,
   commitSha: "sha",
   createdAt: "2026-01-01T00:00:00Z",
   dismissedAt: null,
