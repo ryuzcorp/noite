@@ -1,4 +1,0 @@
-### Fixed
-
-- **`make up`/`make dev`/`make dev-host` start on rootless Podman again.** With `DOCKER_SOCKET` unset and no host Docker socket, the Makefile mounts `/dev/null` in its place and sets `NOITE_SANDBOX=0` (unless already set), instead of Podman refusing the missing bind source. Hosts with a Docker socket, or an explicit `DOCKER_SOCKET`, are unchanged. `make dev-host` also adds `BETTER_AUTH_URL`'s host to the served control hosts, so the README's `https://noite.local` phone setup boots without a `CONTROL_EXTRA_HOSTS` prefix.
-- **`make dev`/`make dev-host` build the Void sandbox controller bundle, so sandbox apps deploy on a dev stack.** `docker/dev-sandbox.sh` compiles the bundle inside the container before the runner starts and again whenever `apps/void-sandbox` changes, publishing it at `/opt/noite/void-sandbox` through an atomically swapped symlink.

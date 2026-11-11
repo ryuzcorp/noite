@@ -1,4 +1,0 @@
-### Security
-
-- **Banning an account revokes its API keys.** `banUser` deleted the account's sessions but left its profile keys working, so a banned user could keep pushing over git smart-HTTP, posting event ingest and calling `/mcp`. Every key consumer now refuses a key whose owner is banned through one shared predicate, a ban deletes the account's keys in the same flow, key creation is refused while an account is banned, and unbanning sweeps any key a create raced in during the ban: revoked stays revoked, so mint a new one.
-- The security gate now treats the bundled Caddy edge module (`edge/**`) and the static Caddyfile writer that consumes its table (`apps/runner/src/host/caddy.rs`) as sensitive: a change to the route table, the host matcher, the rate limiter or the gate/asleep hops needs an independent review and the `security-reviewed` label.

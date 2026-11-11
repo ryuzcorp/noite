@@ -1,5 +1,0 @@
-### Changed
-
-- **Settings is one page under Pull requests** (`/apps/<id>/settings`), not a side panel on the app page and no longer an item in its tab row. Every section the role may see is stacked on that page — Identity, Domains, Limits, Error reporting, Collaborators and Environment, then Branch protection and Danger zone for app admins — each with its own heading and save flow; a compact contents list at the top jumps to a section, and `?section=` scrolls to that section's heading (`/apps/<id>/settings?section=domains`). Old `?panel=settings` links redirect to the page and carry a known `?section=` along; unknown ones open it at the top.
-- **Removing a custom domain or a collaborator asks first.** The Remove action opens the app's confirm dialog, names the hostname or the collaborator's email, and states the consequence (the domain stops serving the app; the collaborator loses access). Esc and Cancel leave the claim or grant in place.
-- **Settings forms track their draft against the last saved value**, so an unchanged Save is disabled and a failed save keeps the input.
