@@ -94,9 +94,15 @@ const workflowJobs = (yaml: string): WorkflowJob[] => {
       const stepUses = stepValue(step, "uses") ?? "";
       const run = stepValue(step, "run") ?? "";
 
+      // The whole step body minus comment lines: a `run: |` block holds the
+      // install on a continuation line, not on the `run:` line itself.
+      const stepBody = step
+        .filter((line) => !line.trimStart().startsWith("#"))
+        .join("\n");
+
       const installs =
         stepUses.startsWith("oven-sh/setup-bun@") ||
-        /\bbun install\b/u.test(run);
+        /\bbun install\b/u.test(stepBody);
 
       if (!installs) {
         return [];
