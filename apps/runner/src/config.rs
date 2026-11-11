@@ -195,6 +195,9 @@ fn sleep_sweep_default_s(sleep_after_s: u64) -> u64 {
 /// override's ceiling. The sweep turns a threshold into a `chrono::Duration`
 /// from an `i64` cast, so an unbounded env value would wrap negative (park
 /// immediately) or panic (and leave the sweep latched off); `0` means never.
+/// A larger install-wide value is clamped at boot, never refused: an operator
+/// who wrote `8760` (`1` year, meaning "never") must not lose the install on
+/// upgrade.
 pub(crate) const MAX_SLEEP_AFTER_S: i64 = 2_592_000;
 
 /// The operator's idle threshold in seconds: `RUNNER_SLEEP_AFTER_MIN` (minutes)
@@ -228,11 +231,25 @@ fn sleep_after_setting_s(default_s: u64, problems: &mut Vec<String>) -> u64 {
     if minutes == Some(0) || hours == Some(0) {
         return 0;
     }
-    match (minutes, hours) {
-        (Some(minutes), _) => minutes.saturating_mul(60),
-        (None, Some(hours)) => hours.saturating_mul(3600),
-        (None, None) => default_s,
+    let (var, value, seconds) = match (minutes, hours) {
+        (Some(minutes), _) => (
+            "RUNNER_SLEEP_AFTER_MIN",
+            minutes,
+            minutes.saturating_mul(60),
+        ),
+        (None, Some(hours)) => ("RUNNER_SLEEP_AFTER_H", hours, hours.saturating_mul(3600)),
+        (None, None) => return default_s,
+    };
+    if seconds <= MAX_SLEEP_AFTER_S as u64 {
+        return seconds;
     }
+    // One warning, then the clamp: a value past the ceiling must not refuse
+    // boot (an upgrade would strand an install that wrote `8760`), and it
+    // must not reach the sweep's `i64` cast either.
+    tracing::warn!(
+        "{var}={value} is past the 30-day sleep ceiling; clamping the idle threshold to {MAX_SLEEP_AFTER_S} s"
+    );
+    MAX_SLEEP_AFTER_S as u64
 }
 
 /// Telemetry DuckDB's derived worker count: the cores this container may
@@ -1771,12 +1788,6 @@ impl Config {
         // records each one (var, value, expected form) and the boot fails
         // here naming them all, before any range complaint below.
         let mut problems: Vec<String> = self.env_problems.clone();
-        if self.sleep_after_s > MAX_SLEEP_AFTER_S as u64 {
-            problems.push(format!(
-                "RUNNER_SLEEP_AFTER_MIN/RUNNER_SLEEP_AFTER_H must be 0 (never) or at most {MAX_SLEEP_AFTER_S} seconds (30 days), got {}",
-                self.sleep_after_s
-            ));
-        }
         let dev_token = self.runner_token == "dev-runner-token";
         let dev_auth = std::env::var("BETTER_AUTH_SECRET")
             .map(|v| v.trim().is_empty() || v.starts_with("dev-"))
@@ -2863,12 +2874,20 @@ mod tests {
                 assert_eq!(cfg.sleep_after_s, 0);
             },
         );
-        // The longest window is 30 days; beyond it the sweep would cast past
-        // `i64` seconds or panic building the chrono duration, so boot fails.
+        // The longest window is 30 days; past it the threshold clamps (with a
+        // boot warning) instead of failing: `8760` hours was a common way to
+        // say "never", and an upgrade must not refuse to boot an install that
+        // carries it. The clamp also keeps the sweep's `i64` cast in range.
+        with_env(&[("RUNNER_SLEEP_AFTER_H", "8760")], || {
+            let cfg = Config::from_env().expect("an over-ceiling threshold must still boot");
+            assert!(cfg.env_problems.is_empty());
+            assert_eq!(cfg.sleep_after_s, MAX_SLEEP_AFTER_S as u64);
+            assert_eq!(cfg.sleep_sweep_s, 3600);
+        });
         with_env(&[("RUNNER_SLEEP_AFTER_MIN", "43201")], || {
-            let err = Config::from_env().expect_err("a threshold past 30 days must fail boot");
-            let msg = format!("{err:#}");
-            assert!(msg.contains("2592000"), "names the ceiling: {msg}");
+            let cfg = Config::from_env().expect("an over-ceiling threshold must still boot");
+            assert!(cfg.env_problems.is_empty());
+            assert_eq!(cfg.sleep_after_s, MAX_SLEEP_AFTER_S as u64);
         });
         with_env(&[("RUNNER_SLEEP_AFTER_H", "720")], || {
             let cfg = Config::from_env().expect("30 days is the ceiling");
