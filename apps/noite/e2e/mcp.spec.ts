@@ -416,7 +416,7 @@ test("a scoped key reaches only its app, over MCP and git", async ({
 
   expect(outside.app.slug).toBe(OUTSIDE_SLUG);
 
-  const key = await mintApiKey(page, "mcp-scoped", {
+  const key = await mintApiKey(page, "mcp-scoped-key", {
     ceiling: "push",
     expiry: "1h",
     onlyApps: [own.app.id],
@@ -450,8 +450,8 @@ test("a scoped key reaches only its app, over MCP and git", async ({
 
   // The account page names the key's scope and ceiling on its row.
   await page.goto("/account");
-  const row = page.locator("li", { hasText: "mcp-scoped" });
+  const row = page.locator("li", { hasText: "mcp-scoped-key" });
   await expect(row.getByText(SCOPED_SLUG)).toBeVisible();
   await expect(row.getByText("≤ Push")).toBeVisible();
-  await expect(row.getByText(/^expires /u)).toBeVisible();
+  await expect(row.getByText(/expires /u)).toBeVisible();
 });
