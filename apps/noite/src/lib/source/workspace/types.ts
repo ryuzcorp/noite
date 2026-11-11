@@ -9,7 +9,6 @@ import type {
   NodepodFS,
   WorkspacePersistence,
 } from "@r1ck404/nodepod";
-import { Data } from "effect";
 
 import type { TreeEntry } from "../../runner";
 
@@ -99,43 +98,6 @@ export type GitMode = "100644" | "100755" | "120000";
  * about, whether or not the bytes changed on the way. */
 export type ChangeKind = "added" | "deleted" | "modified" | "moved";
 
-/** The two sides a row shows, as one value.
- *
- * ```mermaid
- * stateDiagram-v2
- *   [*] --> pending: the committed blob is not in the pod
- *   [*] --> text: both sides are text
- *   [*] --> binary: the working side is not text
- * ```
- *
- * A row is `pending` while its committed side is still being read (the pod
- * holds no copy of that blob): there is nothing to diff and nothing a discard
- * could put back. `binary` carries the byte count instead of any text. This is
- * the one classifier for those three: a consumer branches on it, never on
- * whether `binary` or `loading` happens to be present. */
-export type RowSideState = Data.TaggedEnum<{
-  Binary: { bytes: number };
-  Pending: Record<never, never>;
-  Text: { after: string; before: string };
-}>;
-
-export const RowSide = Data.taggedEnum<RowSideState>();
-
-/** Which side of a row the panel can show, decided in one place. `loading`
- * wins over `binary`: a row whose committed side is unreadable cannot be
- * diffed whatever its working side holds. */
-export const rowSide = (change: WorkspaceChange): RowSideState => {
-  if (change.loading === true) {
-    return RowSide.Pending();
-  }
-
-  if (change.binary !== undefined) {
-    return RowSide.Binary({ bytes: change.binary });
-  }
-
-  return RowSide.Text({ after: change.after, before: change.before });
-};
-
 /** One row of the Changes panel: what the path holds now (`after`) and what
  * the commit holds at the same path or, for a move, at its origin (`before`).
  * A binary file carries its byte count instead of any text. */
@@ -188,14 +150,6 @@ export type HashCache = Map<string, { key: string; sha: string }>;
  * saved; `diverged` keeps it and reports the browsed tip (`stale`) so the
  * banner can say the rows are against an older commit. */
 export type OpenKind = "diverged" | "fresh" | "replaced" | "restored";
-
-export interface OpenOutcome {
-  /** The commit the pod is based on once the open has landed. */
-  baseSha: string;
-  kind: OpenKind;
-  /** The browsed tip, when it is not `baseSha` — `diverged` only. */
-  tip: string | null;
-}
 
 /** The workspace's live state: the filesystem, the index of the commit it is
  * based on, the move journal, and the hash memo. A push or a discard replaces

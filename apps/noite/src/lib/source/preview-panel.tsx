@@ -136,12 +136,6 @@ const DeployLog = ({
   );
 };
 
-/** Whether a deploy is still going: the states between the queue and a
- * result, read from the shared deploy facts so a new terminal status is never
- * mistaken for a run in progress. */
-const deployRunning = (status: string): boolean =>
-  deployStatusFacts(status).inFlight;
-
 /** What the panel frames: production, a branch environment, or the viewer's
  * own workspace preview. */
 interface FrameTarget {
@@ -413,10 +407,15 @@ const TargetPreview = ({
 
   const rows = feedValue(feed.state()) ?? [];
   const [row] = rows;
+
   // What is serving: the newest deploy that succeeded (the feed is newest
   // first). Its id keys the frame, so the frame reloads when it goes live.
-  const live = rows.find((deploy) => deploy.status === "success");
-  const going = row !== undefined && deployRunning(row.status);
+  const live = rows.find(
+    (deploy) => deployStatusFacts(deploy.status).succeeded
+  );
+
+  const going = row !== undefined && deployStatusFacts(row.status).inFlight;
+
   const off = deployOff ?? (going ? "A deploy is already running." : null);
   // What a target that is not serving says in place of the frame (null when it
   // is serving).
@@ -447,15 +446,16 @@ const TargetPreview = ({
     // The deploy status is a closed union now (`runner-types`): no `""`
     // sentinel, so absence is `undefined` and the settled test is explicit.
     const status = (feedValue(state) ?? [])[0]?.status;
+
     // A finished (or absent) deploy is what closes the log.
-    const settled = status === undefined || status === "success";
+    const settled = status === undefined || deployStatusFacts(status).succeeded;
 
     if (status !== seen.status) {
       // A deploy that just finished moved the environment's own status
       // (building → running/failed) too: read it again so the dot follows.
       if (
-        deployRunning(seen.status) &&
-        (status === undefined || !deployRunning(status))
+        deployStatusFacts(seen.status).inFlight &&
+        (status === undefined || !deployStatusFacts(status).inFlight)
       ) {
         invalidateEnvironments(appId);
       }

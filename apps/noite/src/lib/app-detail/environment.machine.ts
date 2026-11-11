@@ -74,7 +74,6 @@ import { errorMessage } from "../errors";
 import { invalidate } from "../resource";
 import { keys } from "../resources";
 import type { RunnerEnvironment } from "../runner";
-import type { DesiredState } from "./lifecycle";
 import type { Step } from "./step";
 
 const attempt = <Message>(
@@ -315,11 +314,6 @@ export const updateGroup = (
 /** Whether one of the group's controls starts a mutation. Used to disable the
  * control the pending operation owns, and to refuse a request in `update`. */
 export const groupBusy = (model: GroupModel): boolean => busy(model);
-
-/** `desired_state` stopped and not yet reflected in `status`: the header
- * says "Stopping" and no deploy can be requested meanwhile. */
-export const groupStopping = (desired: DesiredState, status: string): boolean =>
-  desired === "stopped" && status !== "stopped";
 
 // --- environment variables ------------------------------------------------
 

@@ -55,7 +55,7 @@ import * as Effect from "effect/Effect";
 
 import { api, ApiError } from "../api";
 import { errorMessage } from "../errors";
-import { isProductionRow } from "./lifecycle";
+import { deployStatusFacts, isProductionRow } from "./lifecycle";
 import type { Step } from "./step";
 
 /** A 409 from the runner: the deploy row is already closed. */
@@ -310,7 +310,7 @@ const loadTargets = (appId: string): Cmd<DropdownMessage> =>
             .filter(
               (row) =>
                 isProductionRow(row.environmentId) &&
-                row.status === "success" &&
+                deployStatusFacts(row.status).succeeded &&
                 !!row.sha
             )
             .map((row) => row.sha ?? ""),

@@ -34,4 +34,15 @@ describe("leanDeployRows", () => {
 
     expect(rows.map((entry) => entry.log)).toEqual(["live log", ""]);
   });
+
+  test("a cancelled or stalled newest row is finished, so its log is blanked", () => {
+    for (const status of ["cancelled", "stalled"] as const) {
+      const rows = leanDeployRows([
+        row({ id: "new", log: "stale log", status }),
+        row({ id: "old", log: "", status: "success" }),
+      ]);
+
+      expect(rows.map((entry) => entry.log)).toEqual(["", ""]);
+    }
+  });
 });

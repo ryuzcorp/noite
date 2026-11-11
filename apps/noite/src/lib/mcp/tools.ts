@@ -15,6 +15,8 @@
 import * as Schema from "effect/Schema";
 import { sql } from "void/db";
 
+import { appLifecycle } from "../app-detail/lifecycle";
+import type { AppStatusPage } from "../app-detail/lifecycle";
 import type { CreateSourceInput } from "../apps/create-source";
 import { TEMPLATES } from "../apps/templates";
 import { UnauthorizedError } from "../auth";
@@ -141,6 +143,13 @@ const envUrl = (
 
   return `${parsed.protocol}//${label}.${subdomain}${port}`;
 };
+
+/** Whether `deploy_status` should call an app or preview environment live:
+ * it is serving, or it is asleep and the next request starts it. A crash- or
+ * OOM-held fleet is not live — its row still reads `running`, but the
+ * supervisor is in backoff until the hold's retry instant. */
+export const deployStatusLive = (row: AppStatusPage): boolean =>
+  appLifecycle(row)._tag === "Live";
 
 /** Every environment of one app. `role` is the caller's role on that app,
  * resolved above; the runner refuses a missing one. */
@@ -431,7 +440,7 @@ export const MCP_TOOLS: readonly McpToolDefinition[] = [
   }),
   defineTool({
     description:
-      "An app's deploy state: status, whether it is live, and its recent deploys. Pass `environment` for one preview environment instead of production. Poll this after a push.",
+      "An app's deploy state: status, whether it is live, and its recent deploys. `live` means the app is serving now, or is asleep and starts on the next request; a crash- or OOM-held fleet is not live. Pass `environment` for one preview environment instead of production. Poll this after a push.",
     name: "deploy_status",
     params: appParams({ environment: Schema.optional(EnvironmentRef) }),
     run: async ({ userId }, { app: ref, environment }) => {
@@ -457,7 +466,12 @@ export const MCP_TOOLS: readonly McpToolDefinition[] = [
         env === null ? app.lastDeploySha : env.lastDeploySha;
 
       const lastError = env === null ? app.lastError : env.lastError;
-      const live = status === "running";
+
+      const live = deployStatusLive({
+        desiredState,
+        fleetHold: env === null ? app.fleetHold : null,
+        status,
+      });
 
       return {
         structured: {

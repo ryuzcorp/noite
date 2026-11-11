@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 
 import * as Schema from "effect/Schema";
 
-import { MCP_TOOLS } from "./tools";
+import { MCP_TOOLS, deployStatusLive } from "./tools";
 
 /** The environment tools an agent (and the CLI, which calls them) depends on,
  * with the one argument each must require beyond `app`. */
@@ -20,6 +20,36 @@ const ENVIRONMENT_TOOLS = {
 /** The part of a published `inputSchema` these tests read. */
 const PublishedSchema = Schema.Struct({
   required: Schema.Array(Schema.String),
+});
+
+describe("deploy_status's live flag", () => {
+  test("a sleeping app is live: it serves again on the next request", () => {
+    expect(
+      deployStatusLive({ desiredState: "running", status: "sleeping" })
+    ).toBe(true);
+  });
+
+  test("a running app is live", () => {
+    expect(
+      deployStatusLive({ desiredState: "running", status: "running" })
+    ).toBe(true);
+  });
+
+  test("a crash-held fleet is not live even though its row says running", () => {
+    expect(
+      deployStatusLive({
+        desiredState: "running",
+        fleetHold: { hold: "crash", retryAt: "2026-11-10T16:40:05.000Z" },
+        status: "running",
+      })
+    ).toBe(false);
+  });
+
+  test("a stopped app is not live", () => {
+    expect(
+      deployStatusLive({ desiredState: "stopped", status: "stopped" })
+    ).toBe(false);
+  });
 });
 
 describe("MCP tool table", () => {

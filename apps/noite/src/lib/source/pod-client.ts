@@ -89,10 +89,6 @@ export class PodCallError extends Error {
   }
 }
 
-/** Why the port is closed: the page's own `close`, the frame's `fatal`, or the
- * frame's document going away. */
-export type PortCloseReason = "fatal" | "page" | "unbound";
-
 /** The port's lifecycle.
  *
  * ```mermaid

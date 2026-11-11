@@ -1,20 +1,23 @@
 //! Admin app runtime: the runner's `status` × `desiredState` collapsed into
-//! the four states the admin Apps panel acts on. The runner owns the real
-//! lifecycle (`AppStatus`/`DesiredState` in `apps/runner/src/models.rs`); this
-//! is the control plane's thin consumer view, so the button label and the
-//! "→ desired" suffix come from ONE union instead of two string comparisons.
+//! the four states the admin Apps panel acts on. The lifecycle is the app
+//! header's own (`./lifecycle`: `appLifecycle`/`APP_FACTS`), so the admin's
+//! Start/Stop can never disagree with the app page about what an app is doing;
+//! this module only folds that union into the panel's coarser view.
 //!
 //! | state           | means                                   | next action |
 //! | --------------- | --------------------------------------- | ----------- |
-//! | `Running`       | settled at desired=running (incl. asleep) | stop      |
+//! | `Running`       | settled at desired=running (incl. asleep, or held) | stop |
 //! | `Stopped`       | settled at desired=stopped              | start       |
-//! | `Transitioning` | desired != status, or a failed deploy   | none        |
-//! | `Unknown`       | the runner omitted `desiredState`       | none        |
+//! | `Transitioning` | desired != status, and a toggle settles it | the opposite |
+//! | `Unknown`       | no toggle: import, failed, never deployed, no desired | none |
 //!
 //! `next` is null exactly for the states with no meaningful action, so the
 //! panel can never send a start to an app that is already running (the old
 //! `desiredState === "" ? "Start"` default did exactly that).
 import { Data } from "effect";
+
+import { appLifecycle } from "../app-detail/lifecycle";
+import type { AppStatusPage } from "../app-detail/lifecycle";
 
 export type AppRuntime = Data.TaggedEnum<{
   Running: Record<never, never>;
@@ -36,46 +39,50 @@ export const runtimeWire = (runtime: AppRuntime): AppRuntimeWire =>
   // SAFETY: the four union tags lowercase to exactly their wire values.
   runtime._tag.toLowerCase() as AppRuntimeWire;
 
-/** The runner `status` values that mean "settled at the desired state".
- * `sleeping` is scale-to-zero: healthy and desired running, parked until the
- * next request. */
-const SETTLED_RUNNING = {
-  running: true,
-  sleeping: true,
-} satisfies Record<string, true>;
-
-/** Statuses that are settled but not at any start/stop target: a failed app or
- * one that was never deployed needs a deploy, not a toggle, so the panel
- * offers no action and stops polling it. Everything else is on its way
- * somewhere (running while a stop lands, building while a start does). */
-const NEEDS_DEPLOY = {
-  failed: true,
-  provisioned: true,
-} satisfies Record<string, true>;
-
-/** The one constructor for the admin panel's view of an app. */
-export const runtimeOf = (status: string, desiredState: string): AppRuntime => {
-  if (desiredState === "stopped") {
-    if (status === "stopped") {
-      return Runtime.Stopped();
-    }
-
-    return status in NEEDS_DEPLOY
-      ? Runtime.Unknown()
-      : Runtime.Transitioning({ to: "stopped" });
+/** The one constructor for the admin panel's view of an app. The lifecycle
+ * decides: a live (or crash-held) fleet is running, a settled stop is
+ * stopped, and only an app with a meaningful Start/Stop is transitional. An
+ * import or a never-deployed app offers neither (the header retries imports),
+ * and an app whose desired state the wire omitted is unknown. */
+export const runtimeOf = (app: AppStatusPage): AppRuntime => {
+  if (app.desiredState !== "running" && app.desiredState !== "stopped") {
+    return Runtime.Unknown();
   }
 
-  if (desiredState === "running") {
-    if (status in SETTLED_RUNNING) {
+  const lifecycle = appLifecycle(app);
+
+  switch (lifecycle._tag) {
+    case "Live":
+    case "Held": {
       return Runtime.Running();
     }
 
-    return status in NEEDS_DEPLOY
-      ? Runtime.Unknown()
-      : Runtime.Transitioning({ to: "running" });
-  }
+    case "Stopped": {
+      return Runtime.Stopped();
+    }
 
-  return Runtime.Unknown();
+    case "NeverDeployed":
+    case "Importing":
+    case "ImportFailed":
+    case "Failed": {
+      return Runtime.Unknown();
+    }
+
+    case "Deploying":
+    case "Starting":
+    case "Stopping":
+    case "Unknown": {
+      return Runtime.Transitioning({ to: app.desiredState });
+    }
+
+    default: {
+      // A new lifecycle tag must fail to compile here instead of offering a
+      // button the app header would not.
+      const unhandled: never = lifecycle;
+
+      return unhandled;
+    }
+  }
 };
 
 /** The action the panel may offer, or null when there is none. */

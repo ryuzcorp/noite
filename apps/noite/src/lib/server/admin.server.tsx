@@ -288,7 +288,7 @@ export const listUsers = apiAction(
 
 const asAppRow = (app: RunnerApp, emails: Map<string, string>): AdminAppRow => {
   const desiredState = app.desiredState ?? "";
-  const runtime = runtimeOf(app.status, desiredState);
+  const runtime = runtimeOf(app);
 
   return {
     desiredState,

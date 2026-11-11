@@ -1,7 +1,10 @@
 //! How a failed push or deploy preview reads. The workspace's read-only
-//! refusal names itself by its `code`, which crosses the pod port; the
-//! runner's protected-branch refusal is an HTTP text answer with no code, so
-//! that one message is the only string read here.
+//! refusal names itself by its typed `code`, which crosses the pod port; the
+//! runner's refusals are HTTP text only (no code field), so this module reads
+//! exactly these message shapes and nothing else: `protected` (the branch
+//! policy), `tip moved` (a lost compare-and-swap), `invalid branch`, a branch
+//! that `exists`, and the browser's own `failed to fetch`/`network` for an
+//! unreachable server. Anything else keeps the runner's words.
 
 import type { OperationFailure, ReadOnlyRef } from "./drafts";
 
@@ -20,8 +23,10 @@ export const READ_ONLY_DEPLOY: Record<Exclude<ReadOnlyRef, "">, string> = {
   tag: "Read-only — a tag checkout can't be deployed.",
 };
 
-/** A push error as the user reads it: known runner and workspace refusals get
- * copy that says what to do; anything else keeps its own words. */
+/** A push error as the user reads it: a workspace refusal is chosen by its
+ * typed code; the runner's refusals (and the browser's transport failure)
+ * carry only prose, so the shapes listed in the module header are read.
+ * Anything else keeps its own words. */
 export const pushErrorCopy = (
   failure: OperationFailure,
   readOnly: ReadOnlyRef
@@ -32,8 +37,6 @@ export const pushErrorCopy = (
       : READ_ONLY_PUSH[readOnly];
   }
 
-  // The runner answers a protected branch with text, not a code
-  // (`service/source.rs`): the one message this module still reads.
   const lower = failure.message.toLowerCase();
 
   if (lower.includes("protected")) {

@@ -243,13 +243,6 @@ export interface PodFsEvent {
   watchId: number;
 }
 
-/** One request: an id the answer reuses, its kind, and the kind's params. */
-export interface PodRequest<K extends PodRequestKind = PodRequestKind> {
-  i: number;
-  k: K;
-  p: PodRequestMap[K]["p"];
-}
-
 /** A request that answered. */
 export interface PodOkResponse<K extends PodRequestKind = PodRequestKind> {
   i: number;
@@ -287,24 +280,6 @@ export interface PodAskMessage<K extends PodAskKind = PodAskKind> {
   p: PodAskMap[K]["p"];
 }
 
-/** A reverse ask that was answered. */
-export interface PodAnsweredAsk<K extends PodAskKind = PodAskKind> {
-  answer: number;
-  ok: true;
-  v: PodAskMap[K]["r"];
-}
-
-/** A reverse ask that was refused. */
-export interface PodUnansweredAsk {
-  answer: number;
-  e: PodError;
-  ok: false;
-}
-
-export type PodAnswer<K extends PodAskKind = PodAskKind> =
-  | PodAnsweredAsk<K>
-  | PodUnansweredAsk;
-
 /** The page's first message, before any port exists: which handshake this is
  * (the nonce the page minted) and which revision. */
 export interface PodHello {
@@ -336,11 +311,9 @@ export interface PodConnect {
  * the RPC server is bound. The page posts `connect` into a window, which can
  * always be dropped (the frame navigated in between, or its listener is not
  * attached yet) — so the page waits for this rather than assuming the port
- * arrived. */
+ * arrives). */
 export interface PodBound {
   nonce: string;
   t: "bound";
   v: number;
 }
-
-export type PodHandshake = PodBound | PodConnect | PodHello | PodReady;
