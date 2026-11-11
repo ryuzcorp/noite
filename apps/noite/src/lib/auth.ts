@@ -373,7 +373,13 @@ export const createAuth = (env: KitEnv, baseURL: string) =>
       }),
       apiKey({
         defaultPrefix: "noite_",
-        enableMetadata: false,
+        // Scope, role ceiling and key label ride in `metadata` (the shape is
+        // lib/key-principal's `KeyMetadata`). Without this the create action
+        // cannot store them and every key would be account-wide.
+        enableMetadata: true,
+        // The shortest preset the account page offers is one hour; the
+        // plugin's default floor is one day, which would refuse it.
+        keyExpiration: { minExpiresIn: 0 },
         // Machine scopes: `apps.manage` (git push and other app-management
         // API calls) and `events.push` (event ingest). Keys created without
         // explicit permissions inherit both.

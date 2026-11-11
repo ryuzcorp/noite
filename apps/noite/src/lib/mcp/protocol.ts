@@ -16,6 +16,8 @@ import { Data } from "effect";
 import type { JsonSchema } from "effect/JsonSchema";
 import * as Schema from "effect/Schema";
 
+import type { KeyPrincipal } from "../key-principal";
+
 /** Protocol revisions this server implements. Only the revision that defines
  * a plain-JSON response is listed; a client asking for another one is answered
  * with the default and decides whether it can continue. */
@@ -98,10 +100,12 @@ export interface JsonRpcSuccess {
 
 export type JsonRpcResponse = JsonRpcFailure | JsonRpcSuccess;
 
-/** Who the call runs as: the account the API key belongs to. Role checks
- * happen per app inside each tool, like the server actions do. */
+/** Who the call runs as: the principal the API key authenticated as — its
+ * owner, the key's app set, its role ceiling and its expiry. Role checks
+ * happen per app inside each tool, like the server actions do, through the
+ * one key-enforcement function (`requireApp` in ./tools). */
 export interface McpContext {
-  userId: string;
+  principal: KeyPrincipal;
 }
 
 /** What a successful tool call carries: the text the model reads and the same

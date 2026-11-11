@@ -124,10 +124,43 @@ export const installRunnerMock = (
         return { deleting: false, ok: true };
       }
 
+      case "git.remote": {
+        const app = mock.apps.find((row) => row.id === call.params.id);
+
+        return app ? { url: `http://git.test/${app.slug}` } : null;
+      }
+
       default: {
         return null;
       }
     }
+  };
+
+  /** One JSON-RPC call's envelope, from the canned answer. */
+  const envelopeFor = (
+    body: { id: number } & RpcCall
+  ):
+    | { error: { code: number; message: string }; id: number }
+    | { id: number; jsonrpc: string; result: unknown } => {
+    mock.calls.push(body.method);
+    mock.requests.push(body.params);
+    const result = answer(body);
+
+    if (result instanceof RpcFailure) {
+      return {
+        error: { code: result.code, message: result.message },
+        id: body.id,
+      };
+    }
+
+    if (result === null) {
+      return {
+        error: { code: -32_004, message: "app not found" },
+        id: body.id,
+      };
+    }
+
+    return { id: body.id, jsonrpc: "2.0", result };
   };
 
   // SAFETY: the mock only needs to satisfy the call shape runnerFetch uses.
@@ -136,31 +169,15 @@ export const installRunnerMock = (
     _url: string | URL | Request,
     init?: RequestInit
   ) => {
-    // SAFETY: runnerFetch always sends a JSON-RPC envelope as a string body.
-    const body = JSON.parse(String(init?.body)) as { id: number } & RpcCall;
-    mock.calls.push(body.method);
-    mock.requests.push(body.params);
-    const result = answer(body);
+    // SAFETY: runnerFetch always sends JSON-RPC (one call or a batch) as a
+    // string body.
+    const body = JSON.parse(String(init?.body)) as
+      | ({ id: number } & RpcCall)
+      | ({ id: number } & RpcCall)[];
 
-    let envelope:
-      | { error: { code: number; message: string }; id: number }
-      | { id: number; jsonrpc: string; result: unknown };
-
-    if (result instanceof RpcFailure) {
-      envelope = {
-        error: { code: result.code, message: result.message },
-        id: body.id,
-      };
-    } else if (result === null) {
-      envelope = {
-        error: { code: -32_004, message: "app not found" },
-        id: body.id,
-      };
-    } else {
-      envelope = { id: body.id, jsonrpc: "2.0", result };
-    }
-
-    return Response.json(envelope);
+    return Array.isArray(body)
+      ? Response.json(body.map((call) => envelopeFor(call)))
+      : Response.json(envelopeFor(body));
   }) as unknown as typeof fetch;
 
   return mock;

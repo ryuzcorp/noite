@@ -10,8 +10,9 @@ import {
   runnerFailureMessage,
   runnerFailureOf,
 } from "../../lib/runner";
-import { keyOwnerActive } from "../../lib/server/api-keys.server";
 import { createAppForUser, slugError } from "../../lib/server/apps.server";
+import { keyAppVerdict } from "../../lib/server/key-access.server";
+import { authenticateKey } from "../../lib/server/key-auth.server";
 import {
   findRecoveryEmail,
   RECOVERY_CODE_TTL_SECONDS,
@@ -245,62 +246,74 @@ export const handleGitAuth: RouteHandler = async (request, env) => {
 
   await ensureDb();
 
-  try {
-    const auth = authFromEnv(
-      env,
-      env.BETTER_AUTH_URL ?? new URL(request.url).origin
+  // One authentication for every key surface (lib/server/key-auth.server):
+  // the scope, the owner's ban and the key's expiry are decided once, here,
+  // for git exactly as for `/mcp` and ingest. Git smart-HTTP is the main
+  // machine credential, so a ban must stop it now, not on the next session
+  // refresh.
+  const auth = await authenticateKey(request, env, key, {
+    apps: ["manage"],
+  });
+
+  if (auth._tag === "Misconfigured") {
+    return new Response(auth.message, { status: 500 });
+  }
+
+  if (auth._tag !== "Authed") {
+    return Response.json(
+      {
+        error: auth._tag === "Expired" ? "API key expired" : "invalid key",
+        ok: false,
+      },
+      { status: 401 }
     );
+  }
 
-    const verified = await auth.api.verifyApiKey({
-      body: { key, permissions: { apps: ["manage"] } },
-    });
+  const { principal } = auth;
 
-    if (!(verified.valid && verified.key?.referenceId)) {
+  if (wanted === "create") {
+    // A key limited to apps cannot grow its own set: the app the push would
+    // create is not one of the key's apps, so claiming it here would fail on
+    // the very next request.
+    if (principal.scope.appIds !== null) {
       return Response.json(
-        { error: "invalid key", ok: false },
-        { status: 401 }
+        { error: "This API key is limited to specific apps", ok: false },
+        { status: 403 }
       );
     }
 
-    const userId = verified.key.referenceId;
+    try {
+      return await gitAuthCreate(principal.userId, slug);
+    } catch (error) {
+      console.error("[git-auth]", error);
 
-    // Git smart-HTTP is the main machine credential: a ban must stop it now,
-    // not on the next session refresh (the shared owner predicate,
-    // lib/server/api-keys.server). Same uniform answer as a bad key.
-    if (!(await keyOwnerActive(userId))) {
-      return Response.json(
-        { error: "invalid key", ok: false },
-        { status: 401 }
-      );
+      return Response.json({ error: "forbidden", ok: false }, { status: 403 });
     }
+  }
 
-    if (wanted === "create") {
-      return await gitAuthCreate(userId, slug);
-    }
+  // The create branch returned above, so `need` is the parsed role here.
+  if (!need) {
+    return Response.json(
+      { error: "need must be view, push, admin or create", ok: false },
+      { status: 400 }
+    );
+  }
 
-    // The create branch returned above, so `need` is the parsed role here.
-    if (!need) {
-      return Response.json(
-        { error: "need must be view, push, admin or create", ok: false },
-        { status: 400 }
-      );
-    }
+  const verdict = await keyAppVerdict(principal, { slug }, need);
 
-    const access = await requireAppRoleBySlug(slug, userId, need);
-
-    return Response.json({
-      appId: access.app.id,
-      ok: true,
-      role: access.role,
-      userId,
-    });
-  } catch (error) {
-    if (error instanceof MissingAuthSecretError) {
-      return new Response(error.message, { status: 500 });
-    }
-
+  if (verdict._tag !== "Granted") {
+    // Every refusal answers the same 403: the app set, the role ceiling and
+    // "not a collaborator" must not be told apart (or a key could probe which
+    // apps exist).
     return Response.json({ error: "forbidden", ok: false }, { status: 403 });
   }
+
+  return Response.json({
+    appId: verdict.app.id,
+    ok: true,
+    role: verdict.role,
+    userId: principal.userId,
+  });
 };
 
 /** Runner → UI: how many accounts exist on this instance. The runner buckets
