@@ -1344,7 +1344,10 @@ export const MCP_TOOLS: readonly McpToolDefinition[] = [
               description:
                 "File contents: text, or base64 bytes when `encoding` is base64.",
             }),
-            encoding: Schema.optional(Schema.Literals(["utf-8", "base64"])),
+            // The runner's wire value is `utf8` (`WebEncoding`), not a WHATWG
+            // label: `utf-8` would never be accepted.
+            // oxlint-disable-next-line unicorn/text-encoding-identifier-case -- see above.
+            encoding: Schema.optional(Schema.Literals(["utf8", "base64"])),
             path: PathRef,
           })
         ).annotate({ description: "Files to write (add or replace)." })

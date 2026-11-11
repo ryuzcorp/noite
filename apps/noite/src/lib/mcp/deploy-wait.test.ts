@@ -4,11 +4,12 @@ import type { RunnerDeploy } from "../runner";
 import { isTerminalDeploy, waitForDeploy } from "./deploy-wait";
 
 const deploy = (over: Partial<RunnerDeploy> = {}): RunnerDeploy => ({
+  actor: null,
   appId: "app-1",
   createdAt: "2026-11-11T00:00:00Z",
   environmentId: null,
   id: "dep-1",
-  intent: "push",
+  intent: "deploy",
   log: "",
   sha: "a".repeat(40),
   status: "building",
