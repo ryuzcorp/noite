@@ -159,7 +159,11 @@ export const denyAs = async <T>(
   try {
     return await work();
   } catch (error) {
-    if (error instanceof McpToolError && error.refusal === null) {
+    if (
+      error instanceof McpToolError &&
+      error.refusal === null &&
+      !error.invalid
+    ) {
       throw refused(code, error.message);
     }
 

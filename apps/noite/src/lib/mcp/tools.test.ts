@@ -52,6 +52,26 @@ describe("deploy_status's live flag", () => {
   });
 });
 
+/** The agent loop's write tools: the one argument each requires beyond `app`.
+ * A wrong entry here means an agent sees a contract the server does not
+ * enforce (or the reverse), so the published schema is the assertion. */
+const LOOP_TOOLS = {
+  cancel_deploy: ["app", "deployId"],
+  close_pr: ["app", "number"],
+  comment_pr: ["app", "body", "number"],
+  commit_files: ["app", "message"],
+  create_branch: ["app", "name"],
+  create_pr: ["app", "head", "title"],
+  delete_branch: ["app", "name"],
+  get_pr: ["app", "number"],
+  list_prs: ["app"],
+  merge_pr: ["app", "number"],
+  redeploy: ["app"],
+  review_pr: ["app", "number", "state"],
+  rollback: ["app", "sha"],
+  wait_for_deploy: ["app"],
+} satisfies Record<string, readonly string[]>;
+
 describe("MCP tool table", () => {
   test("publishes every environment tool with its required arguments", () => {
     const byName = new Map(MCP_TOOLS.map((tool) => [tool.name, tool]));
@@ -68,6 +88,26 @@ describe("MCP tool table", () => {
         published.required,
         `${name} requires ${required.join(", ")}`
       ).toEqual(required);
+    }
+  });
+
+  test("publishes every agent-loop tool with its required arguments", () => {
+    const byName = new Map(MCP_TOOLS.map((tool) => [tool.name, tool]));
+
+    for (const [name, required] of Object.entries(LOOP_TOOLS)) {
+      const tool = byName.get(name);
+      expect(tool, `${name} is missing from MCP_TOOLS`).toBeDefined();
+
+      const published = Schema.decodeUnknownSync(PublishedSchema)(
+        tool?.inputSchema
+      );
+
+      // The published `required` list is sorted by the schema library, so the
+      // expectation is too: the same set, never a different contract.
+      expect(
+        published.required.toSorted(),
+        `${name} requires ${required.join(", ")}`
+      ).toEqual([...required].toSorted());
     }
   });
 
