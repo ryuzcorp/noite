@@ -172,5 +172,8 @@ sensitive:
   # The gates themselves: workflows, this list, and the reviewer config.
   # Weakening review or CI silently weakens every path above.
   - ".github/workflows/**"
+  # The workflow drift guard: it encodes the timeout rule every workflow must
+  # keep, so deleting the describe block must need a review like the workflows.
+  - "docker/pr-ready.test.ts"
   - ".github/security-paths.yml"
   - ".coderabbit.yaml"

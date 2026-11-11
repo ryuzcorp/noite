@@ -10,6 +10,9 @@ import { detectAreas, matchSensitive, parseSensitiveGlobs } from "./pr-ready";
 
 const root = fileURLToPath(new URL("../", import.meta.url));
 
+const indentOf = (line: string): number =>
+  line.length - line.trimStart().length;
+
 interface WorkflowInstallStep {
   bounded: boolean;
   name: string;
@@ -22,16 +25,35 @@ interface WorkflowJob {
   uses: string | null;
 }
 
-const JOB_HEADER = /^ {2}(?<name>[\w-]+):\s*(?:#.*)?$/u;
-const JOB_KEY = /^ {4}(?<key>[\w-]+):\s*(?<value>[^#]*?)\s*(?:#.*)?$/u;
-const STEP_HEADER = /^ {6}-\s/u;
+const JOB_HEADER = /^ {2}(?<name>"[^"]*"|'[^']*'|[\w-]+)\s*:\s*(?:#.*)?$/u;
 
-/** The first `key: value` of a step block, dash line or nested key. */
-const stepValue = (block: string[], key: string): string | null => {
+const JOB_KEY = /^ {4}(?<key>[\w-]+):\s*(?<value>[^#]*?)\s*(?:#.*)?$/u;
+const STEPS_KEY = /^steps:\s*(?:#.*)?$/u;
+const SEQUENCE_ITEM = /^(?<pad> +)- /u;
+
+/**
+ * The first `key: value` of a step: on its `- key: value` line, or a nested
+ * key `itemIndent + 2` spaces in. `itemIndent` comes from the file, so a
+ * deeper-indented sequence is still read instead of silently skipped.
+ */
+const stepValue = (
+  block: string[],
+  key: string,
+  itemIndent: number
+): string | null => {
+  const pad = " ".repeat(itemIndent);
+
   for (const line of block) {
+    const indent = indentOf(line);
+    const onDash = indent === itemIndent && line.startsWith(`${pad}- `);
+
+    if (!(onDash || indent === itemIndent + 2)) {
+      continue;
+    }
+
     const match =
-      /^(?: {6}-\s+| {8})(?<key>[\w-]+):\s*(?<value>[^#]*?)\s*(?:#.*)?$/u.exec(
-        line
+      /^(?:- )?(?<key>[\w-]+):\s*(?<value>[^#]*?)\s*(?:#.*)?$/u.exec(
+        line.slice(indent)
       );
 
     if (match?.groups?.key === key) {
@@ -46,8 +68,11 @@ const stepValue = (block: string[], key: string): string | null => {
  * The jobs of a workflow, with only what the timeout rules read: whether the
  * job bounds itself, whether it forwards to a reusable workflow, and which of
  * its steps install from the network (respectively, whether they bound
- * themselves). Line-based on purpose: no YAML dependency at the repo root, and
- * the same shape the other workflow guards in this file read.
+ * themselves). Line-based on purpose: no YAML dependency at the repo root.
+ *
+ * Fails closed: a line at the job-key indent that is not a job header (a
+ * quoted or spaced id this parser missed) throws instead of leaving that job
+ * unchecked.
  */
 const workflowJobs = (yaml: string): WorkflowJob[] => {
   const lines = yaml.split("\n");
@@ -57,22 +82,44 @@ const workflowJobs = (yaml: string): WorkflowJob[] => {
     throw new Error("workflow has no jobs");
   }
 
-  const body = lines.slice(jobsAt + 1);
+  // `jobs:` is the last top-level key in these files; stop at the next one
+  // rather than reading a sibling's body as jobs.
+  const after = lines.slice(jobsAt + 1);
+  const end = after.findIndex((line) => line.trim() && indentOf(line) === 0);
+  const body = end === -1 ? after : after.slice(0, end);
 
-  const starts = body.flatMap((line, index) =>
-    JOB_HEADER.test(line) ? [index] : []
-  );
+  const starts = body.flatMap((line, index) => {
+    if (!line.trim() || line.trimStart().startsWith("#")) {
+      return [];
+    }
+
+    if (indentOf(line) === 2) {
+      if (!JOB_HEADER.test(line)) {
+        throw new Error(`unrecognized job header: ${line.trim()}`);
+      }
+
+      return [index];
+    }
+
+    return [];
+  });
 
   if (starts.length === 0) {
     throw new Error("workflow has no jobs");
   }
 
   return starts.map((start, at) => {
-    const end = starts[at + 1] ?? body.length;
-    const block = body.slice(start, end);
-    const name = JOB_HEADER.exec(body[start] ?? "")?.groups?.name ?? "";
-    const firstStep = block.findIndex((line) => STEP_HEADER.test(line));
-    const head = firstStep === -1 ? block : block.slice(0, firstStep);
+    const block = body.slice(start, starts[at + 1] ?? body.length);
+
+    const name = (
+      JOB_HEADER.exec(block[0] ?? "")?.groups?.name ?? ""
+    ).replaceAll(/^['"]|['"]$/gu, "");
+
+    const stepsAt = block.findIndex(
+      (line) => indentOf(line) === 4 && STEPS_KEY.test(line.trim())
+    );
+
+    const head = stepsAt === -1 ? block : block.slice(0, stepsAt);
 
     const jobKeys = new Map(
       head.flatMap((line) => {
@@ -85,14 +132,26 @@ const workflowJobs = (yaml: string): WorkflowJob[] => {
     const timeout = jobKeys.get("timeout-minutes");
     const uses = jobKeys.get("uses");
 
-    const stepStarts = block.flatMap((line, index) =>
-      STEP_HEADER.test(line) ? [index] : []
+    const stepLines = stepsAt === -1 ? [] : block.slice(stepsAt + 1);
+    const firstItem = stepLines.find((line) => SEQUENCE_ITEM.test(line));
+    const itemIndent = firstItem === undefined ? 0 : indentOf(firstItem);
+
+    const stepStarts = stepLines.flatMap((line, index) =>
+      itemIndent > 0 &&
+      indentOf(line) === itemIndent &&
+      SEQUENCE_ITEM.test(line)
+        ? [index]
+        : []
     );
 
     const installSteps = stepStarts.flatMap((from, index) => {
-      const step = block.slice(from, stepStarts[index + 1] ?? block.length);
-      const stepUses = stepValue(step, "uses") ?? "";
-      const run = stepValue(step, "run") ?? "";
+      const step = stepLines.slice(
+        from,
+        stepStarts[index + 1] ?? stepLines.length
+      );
+
+      const stepUses = stepValue(step, "uses", itemIndent) ?? "";
+      const run = stepValue(step, "run", itemIndent) ?? "";
 
       // The whole step body minus comment lines: a `run: |` block holds the
       // install on a continuation line, not on the `run:` line itself.
@@ -111,9 +170,11 @@ const workflowJobs = (yaml: string): WorkflowJob[] => {
       return [
         {
           bounded:
-            Math.trunc(Number(stepValue(step, "timeout-minutes") ?? "")) > 0,
+            Math.trunc(
+              Number(stepValue(step, "timeout-minutes", itemIndent) ?? "")
+            ) > 0,
           name:
-            stepValue(step, "name") ||
+            stepValue(step, "name", itemIndent) ||
             stepUses ||
             run.split("\n")[0] ||
             step[0]?.trim() ||
@@ -171,9 +232,6 @@ const timeoutProblems = (yaml: string): string[] =>
 
 const readRepoFile = (rel: string): string =>
   readFileSync(new URL(`../${rel}`, import.meta.url), "utf-8");
-
-const indentOf = (line: string): number =>
-  line.length - line.trimStart().length;
 
 /** List items indented under `lines[start]`, stopping at the next sibling. */
 const globsBelow = (lines: string[], start: number): string[] => {
@@ -503,11 +561,15 @@ describe("image build context coverage", () => {
 });
 
 describe("workflow job timeouts", () => {
-  const workflowFiles = readdirSync(
+  const workflowEntries = readdirSync(
     new URL("../.github/workflows/", import.meta.url)
-  )
-    .filter((name) => name.endsWith(".yml"))
-    .toSorted();
+  ).toSorted();
+
+  // GitHub runs both extensions; scanning one would leave a whole file
+  // unbounded while this guard stayed green.
+  const workflowFiles = workflowEntries.filter((name) =>
+    /\.ya?ml$/u.test(name)
+  );
 
   test("the rule rejects an unbounded job, a bounded call and an unbounded install", () => {
     expect(
@@ -550,6 +612,29 @@ describe("workflow job timeouts", () => {
     ).toEqual([]);
   });
 
+  test("the workflows directory holds only workflow files", () => {
+    expect(workflowEntries).toEqual(workflowFiles);
+  });
+
+  test("reads quoted job ids and deeper-indented step lists", () => {
+    // Both are valid GitHub workflow syntax: the parser must see the job and
+    // its install step, or the rule below silently stops applying.
+    expect(
+      timeoutProblems(
+        [
+          "jobs:",
+          '  "quoted":',
+          "    runs-on: ubuntu-latest",
+          "    steps:",
+          "        - run: bun install",
+        ].join("\n")
+      )
+    ).toEqual([
+      "quoted: job has no positive timeout-minutes",
+      'quoted: network install step "bun install" has no positive timeout-minutes',
+    ]);
+  });
+
   test("reusable-workflow calls point at a workflow this repo ships", () => {
     for (const file of workflowFiles) {
       for (const job of workflowJobs(
@@ -569,22 +654,39 @@ describe("workflow job timeouts", () => {
 
   test("every job bounds itself with a timeout, so a hang fails fast", () => {
     const problems: string[] = [];
-    let installSteps = 0;
+    const installSteps = new Map<string, number>();
 
     for (const file of workflowFiles) {
       const yaml = readRepoFile(`.github/workflows/${file}`);
-      installSteps += workflowJobs(yaml).reduce(
-        (count, job) => count + job.installSteps.length,
-        0
+      const jobs = workflowJobs(yaml);
+
+      // Per-file, not a global total: a file the parser stopped
+      // understanding must fail here, not hide behind the other files.
+      expect(jobs.length, `${file} has no readable jobs`).toBeGreaterThan(0);
+      installSteps.set(
+        file,
+        jobs.reduce((count, job) => count + job.installSteps.length, 0)
       );
       problems.push(
         ...timeoutProblems(yaml).map((problem) => `${file}: ${problem}`)
       );
     }
 
-    // Guard the parser itself: if job or step detection broke, every list
-    // above would be empty and the drift check would pass vacuously.
-    expect(installSteps).toBeGreaterThan(10);
+    // These files install dependencies with bun: each must contribute at
+    // least one install step, so a parser or indentation change cannot make
+    // the rule vacuously pass for them.
+    for (const file of [
+      "check.yml",
+      "ci.yml",
+      "e2e.yml",
+      "images.yml",
+      "website.yml",
+    ]) {
+      expect(
+        installSteps.get(file) ?? 0,
+        `${file} has no install step`
+      ).toBeGreaterThan(0);
+    }
 
     // An unbounded job waits GitHub's 360-minute default: the 2026-11-11
     // merge-group `check` hung in `bun install` for 40+ minutes, outlived
