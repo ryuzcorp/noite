@@ -60,10 +60,24 @@ const imagePushPaths = (yaml: string): string[] => {
   return globsBelow(lines, paths);
 };
 
-/** The `code:` globs inside the `filters: |` block of `ci.yml`. */
+/**
+ * The `code:` globs of the `changes` job's dorny/paths-filter step, not any
+ * other `filters:` block in `ci.yml`.
+ */
 const codeFilterGlobs = (yaml: string): string[] => {
   const lines = yaml.split("\n");
-  const filters = lines.findIndex((line) => /^\s*filters: \|\s*$/u.test(line));
+
+  const step = lines.findIndex((line) =>
+    /^\s*(?:-\s*)?uses:\s*dorny\/paths-filter@/u.test(line)
+  );
+
+  if (step === -1) {
+    throw new Error("ci.yml has no paths-filter step");
+  }
+
+  const filters = lines.findIndex(
+    (line, index) => index > step && /^\s*filters: \|\s*$/u.test(line)
+  );
 
   if (filters === -1) {
     throw new Error("ci.yml has no filters block");
@@ -238,6 +252,7 @@ describe("matchSensitive", () => {
       "apps/runner/src/host/env_label.rs",
       "apps/runner/src/service/environments.rs",
       "apps/runner/src/host/git_http.rs",
+      "apps/runner/src/host/container_image.rs",
       "apps/noite/src/lib/collaborators.ts",
       "apps/noite/src/lib/server/collaborators.server.ts",
       "apps/noite/src/lib/roles.ts",
@@ -249,6 +264,9 @@ describe("matchSensitive", () => {
       "apps/noite/src/http/routes/internal.ts",
       "apps/noite/src/lib/server/recovery.server.ts",
       "apps/noite/src/http/config.ts",
+      "apps/noite/src/http/routes/mcp.ts",
+      "apps/noite/src/http/origin.ts",
+      "docker/Dockerfile.dockerignore",
     ];
 
     // A renamed file must fail here instead of silently leaving the gate.
@@ -300,6 +318,9 @@ describe("image build context coverage", () => {
     // The push block parsed is the real one, not another `paths:` list.
     expect(imagePaths).toContain("docker/Dockerfile");
     expect(imagePaths).toContain("edge/**");
+    // So is the code filter: the changes job's step, not another block.
+    expect(codePaths).toContain("apps/noite/**");
+    expect(codePaths).toContain("docker/**");
   });
 
   test("every copied source is covered by both gate filters", () => {

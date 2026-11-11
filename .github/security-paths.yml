@@ -78,6 +78,10 @@ sensitive:
   # account-recovery codes, app creation for an arbitrary user): a change here
   # can bypass the session and role checks the public routes rely on.
   - "apps/noite/src/http/routes/internal.ts"
+  # The hosted MCP endpoint: bearer-key auth plus the browser Origin check, so
+  # a cross-site page cannot replay a captured key.
+  - "apps/noite/src/http/routes/mcp.ts"
+  - "apps/noite/src/http/origin.ts"
   - "apps/noite/src/lib/server/recovery.server.ts"
   # `runnerTokenOk`, the bearer check behind the whole internal surface.
   - "apps/noite/src/http/config.ts"
@@ -89,6 +93,10 @@ sensitive:
   - "apps/runner/src/host/netisolation.rs"
   - "apps/runner/src/host/cgroups.rs"
   - "apps/runner/src/db/alloc.rs"
+  # The tenant Dockerfile admission predicate: the instruction allowlist, the
+  # ONBUILD scan and digest pinning decide what a tenant build runs on the
+  # host engine.
+  - "apps/runner/src/host/container_image.rs"
   # The Sandbox container plane: the engine proxy that filters every Docker
   # call a tenant fleet makes, the gateway and the per-container network
   # plane. A wrong allowlist entry hands a tenant the host's engine.
@@ -146,6 +154,10 @@ sensitive:
   # The release image and its entrypoints: everything inside the trust
   # boundary ships from here, including the third-party binaries baked in.
   - "docker/Dockerfile"
+  # The context guard: it keeps dotenv files and .dev.vars out of the build
+  # context, so a loosened pattern could bake a build-time secret into the
+  # image.
+  - "docker/Dockerfile.dockerignore"
   - "docker/dev.sh"
   # The dev container's sandbox controller build: it installs the package's
   # dependencies and compiles the bundle the runner deploys, so a change here
