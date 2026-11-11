@@ -25,12 +25,12 @@ export const SettingsSection = ({
 }) => (
   <section
     aria-labelledby={settingsSectionAnchor(section)}
-    class="flex w-full scroll-mt-4 flex-col gap-3"
+    class="flex w-full flex-col gap-3"
   >
     <div class="flex flex-wrap items-center justify-between gap-2">
       <h2
         id={settingsSectionAnchor(section)}
-        class={`m-0 text-lg font-semibold${
+        class={`m-0 scroll-mt-4 text-lg font-semibold${
           section === "danger" ? " text-error" : ""
         }`}
       >
