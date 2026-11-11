@@ -272,6 +272,22 @@ describe("image build context coverage", () => {
 
   const codePaths = codeFilterGlobs(readRepoFile(".github/workflows/ci.yml"));
 
+  test("keeps context sources on a flagged COPY, dropping only --from", () => {
+    expect(
+      dockerfileCopySources(
+        [
+          "COPY --chown=0:0 new-source /app",
+          "ADD --chmod=0755 helper /usr/local/bin/helper",
+          "COPY --from=runner-build /out/noite-runner /usr/local/bin/",
+          "copy edge /edge",
+        ].join("\n")
+      )
+    ).toEqual(["new-source", "helper", "edge"]);
+
+    expect(() => dockerfileCopySources('COPY ["a", "b"]')).toThrow();
+    expect(() => dockerfileCopySources("COPY a \\\n b /x")).toThrow();
+  });
+
   test("parses the context sources of every build stage", () => {
     expect(sources).toContain("edge");
     expect(sources).toContain("apps/void-proxy/src");
