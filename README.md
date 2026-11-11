@@ -158,7 +158,7 @@ make help     # everything else: backup, restore, down, nuke
 | http://api.noite.localhost:9080      | runner API    |
 | `http://<slug>.noite.localhost:9080` | deployed apps |
 
-The dev base is `noite.localhost`, never bare `localhost`: the control UI and every app and preview host then share one registrable domain, so the workspace frame's IndexedDB and service workers are same-site. Browsers resolve every `*.localhost` host to loopback and treat it as a secure context.
+The dev base is `noite.localhost`, never bare `localhost`: the control UI, every app and every preview environment then share one registrable domain, so cookies and sign-in are same-site across them. Browsers resolve every `*.localhost` host to loopback and treat it as a secure context.
 
 | Path |  |
 | --- | --- |
@@ -195,11 +195,10 @@ portless proxy start --lan --https  # https://noite.local (accept sudo)
 
 On the phone, install `~/.portless/ca.pem` as a trusted CA (iOS: open the file, install the profile, enable full trust; Android: Security → install CA certificate), open `https://noite.local`, and register a **fresh** passkey: `localhost` credentials never transfer. Android often can't resolve mDNS `.local` names; iOS works. `portless list` shows routes and `portless proxy stop` stops the proxy.
 
-Tenant apps work the same way: with `noite.local` among the control hosts the runner also serves `<slug>.noite.local`, but each app needs its own alias before its name resolves (without one the browser says "Server Not Found"; Caddy is never reached). Code mode's Preview runs on the app's pod host, one label under the same base (`pod-<app id>.noite.local`), so add that alias too:
+Tenant apps work the same way: with `noite.local` among the control hosts the runner also serves `<slug>.noite.local`, but each app needs its own alias before its name resolves (without one the browser says "Server Not Found"; Caddy is never reached):
 
 ```bash
-portless alias test.noite 9080             # → https://test.noite.local
-portless alias pod-<app id>.noite 9080     # → Code mode Preview for that app
+portless alias test.noite 9080   # → https://test.noite.local
 ```
 
 </details>

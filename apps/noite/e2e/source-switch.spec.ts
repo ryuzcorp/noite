@@ -4,16 +4,13 @@ import type { Page } from "@playwright/test";
 import { createAppWithKey, deleteApp, pushAppDir } from "./helpers";
 
 // Code mode's ref machine must always settle. A browse ends in the ref's own
-// checkout or in the failure card with its Retry — never in the switch overlay
-// ("Switching to <ref>…") standing over the panes: the machine's `Opening`
-// had no transition out for a request it refused, and the frame's `open`
-// answer is unbounded, so a lost one held the overlay forever.
+// files or in the failure card with its Retry — never in the switch overlay
+// ("Switching to <ref>…") standing over the panes.
+//
+// The page holds the buffers: a ref switch with unsaved work asks first
+// (`beforeunload` guards a page leave the same way), and a reload starts clean.
 
 const SLUG = "source-switch";
-const DEAD_SLUG = "source-switch-dead";
-
-/** The ref's archive, as the control page fetches it for the frame. */
-const ARCHIVE = /\/source\/archive\?/u;
 
 /** Every app this spec creates, dropped after the file: the account's app
  * quota (10) is shared by the whole lane. */
@@ -41,6 +38,25 @@ const pickBranch = async (page: Page, name: string): Promise<void> => {
     .click();
 };
 
+/** Append a line to the open file. */
+const appendLine = async (page: Page, line: string): Promise<void> => {
+  const editor = page.locator('[contenteditable="true"]').first();
+  await expect(editor).toBeVisible({ timeout: 60_000 });
+  const box = await editor.boundingBox();
+
+  if (box === null) {
+    throw new TypeError("the editor has no box");
+  }
+
+  await editor.click({ position: { x: 8, y: box.height - 8 } });
+  await page.keyboard.press("ControlOrMeta+End");
+  await page.keyboard.press("Enter");
+  await page.keyboard.type(line);
+};
+
+const changesBadge = (page: Page) =>
+  page.getByRole("button", { name: /^Changes/u }).locator(".badge");
+
 test("a browse settles, after a reload and after a branch switch", async ({
   page,
   request,
@@ -62,15 +78,15 @@ test("a browse settles, after a reload and after a branch switch", async ({
   await expect(page.getByRole("treeitem", { name: "index.ts" })).toBeVisible();
   await expect(overlay(page)).toHaveCount(0);
 
-  // A reload opens the ref the URL names again, and settles the same way: the
-  // worker's saved copy comes back from IndexedDB, so the frame's `open` is
-  // answering for a pod that did not start cold.
+  // A reload opens the ref the URL names again and settles the same way. The
+  // buffers are the page's, so nothing came back with it.
   await page.reload();
   await expect(editor).toBeVisible({ timeout: 60_000 });
   await expect(overlay(page)).toHaveCount(0);
+  await expect(changesBadge(page)).toBeHidden();
 
   // A branch created in the picker switches the browser in place: the overlay
-  // marks the switch and goes when the new checkout is under the panes.
+  // marks the switch and goes when the new ref's files are under the panes.
   await page.getByLabel(/^Branch or ref:/u).click();
   const picker = page.locator(".dropdown-content");
   await picker.getByLabel("New branch name").fill("topic");
@@ -79,10 +95,7 @@ test("a browse settles, after a reload and after a branch switch", async ({
   await expect(overlay(page)).toHaveCount(0, { timeout: 60_000 });
   await expect(page.getByRole("treeitem", { name: "index.ts" })).toBeVisible();
 
-  // And back to the ref it came from: the checkout the browser kept warm is
-  // installed under the same panes, and the overlay clears again. `main` is
-  // this app's default ref, so the param drops out of the URL rather than
-  // naming it (see `searchParam`).
+  // And back: the checkout is read again, and the overlay clears.
   await pickBranch(page, "main");
   await expect(page).not.toHaveURL(/[?&]ref=/u);
   await expect(page.getByLabel(/^Branch or ref: main/u)).toBeVisible();
@@ -90,32 +103,67 @@ test("a browse settles, after a reload and after a branch switch", async ({
   await expect(editor).toBeVisible();
 });
 
-test("a lost open answer ends in the failure card, and Retry recovers", async ({
+test("a ref switch with an unsaved buffer asks before throwing it away", async ({
   page,
   request,
 }) => {
-  createdApps.push(DEAD_SLUG);
+  const slug = "source-switch-dirty";
+  createdApps.push(slug);
+
+  const { apiKey, appId } = await createAppWithKey(page, request, {
+    name: "Source Switch Dirty",
+    slug,
+  });
+
+  pushAppDir(apiKey, new URL("fixtures/intel", import.meta.url), slug);
+
+  await page.goto(`/apps/${appId}/source?file=index.ts&ref=main`);
+  await appendLine(page, "// unsaved");
+  await expect(changesBadge(page)).toHaveText("1");
+
+  // Cancel keeps the buffer and the ref: the picker goes back to what the
+  // panes show.
+  await pickBranch(page, "topic");
+  const ask = page.getByRole("alertdialog", { name: "Switch to topic?" });
+  await expect(ask).toBeVisible({ timeout: 60_000 });
+  await ask.getByRole("button", { name: "Cancel" }).click();
+  await expect(ask).toBeHidden();
+  await expect(page.getByLabel(/^Branch or ref: main/u)).toBeVisible();
+  await expect(changesBadge(page)).toHaveText("1");
+
+  // Confirming discards the buffer and switches.
+  await pickBranch(page, "topic");
+  await expect(ask).toBeVisible();
+  await ask.getByRole("button", { name: "Discard and switch" }).click();
+  await expect(page).toHaveURL(/ref=topic/u);
+  await expect(overlay(page)).toHaveCount(0, { timeout: 60_000 });
+  await expect(changesBadge(page)).toBeHidden();
+  await expect(page.getByRole("treeitem", { name: "index.ts" })).toBeVisible();
+});
+
+test("a failed open ends in the failure card, and Retry recovers", async ({
+  page,
+  request,
+}) => {
+  const slug = "source-switch-dead";
+  createdApps.push(slug);
 
   const { apiKey, appId } = await createAppWithKey(page, request, {
     name: "Source Switch Dead",
-    slug: DEAD_SLUG,
+    slug,
   });
 
-  pushAppDir(apiKey, new URL("fixtures/intel", import.meta.url), DEAD_SLUG);
+  pushAppDir(apiKey, new URL("fixtures/intel", import.meta.url), slug);
 
   await page.goto(`/apps/${appId}/source?file=index.ts&ref=main`);
   await expect(page.locator('[contenteditable="true"]').first()).toBeVisible({
     timeout: 60_000,
   });
-  await expect(overlay(page)).toHaveCount(0);
 
-  // The pod's `open` waits for the ref's archive, which this page fetches: a
-  // fetch that never answers is exactly the answer that could be lost. The
-  // frame takes the `open` and never gets a reply to it. Every archive is
-  // held, and the checkout on screen already has its files.
-  await page.route(ARCHIVE, () => {
-    // Deliberately unanswered: the request stays pending for the page's life.
-  });
+  // The ref's listing is the one request an open cannot do without: failing it
+  // is the failure card's own path, and the answer is an HTTP status, not a
+  // dead frame.
+  await page.route("**/api/source/sourceTree", (route) => route.abort());
 
   await page.getByLabel(/^Branch or ref:/u).click();
   const picker = page.locator(".dropdown-content");
@@ -123,19 +171,15 @@ test("a lost open answer ends in the failure card, and Retry recovers", async ({
   await picker.getByRole("button", { name: "Create" }).click();
   await expect(page).toHaveURL(/ref=stuck/u);
 
-  // Bounded: the switch ends in the card the retry offers, never in an overlay
-  // that never clears (see OPEN_DEADLINE_MS in `$lib/source/ref-view`).
   const card = page.getByRole("alert").filter({ hasText: "Could not open" });
-  await expect(card).toBeVisible({ timeout: 90_000 });
+  await expect(card).toBeVisible({ timeout: 60_000 });
   await expect(card).toContainText("stuck");
   await expect(overlay(page)).toHaveCount(0);
 
-  // The retry opens a frame of its own — the abandoned open is not queued
-  // behind — and this time the archive answers.
-  await page.unroute(ARCHIVE);
+  await page.unroute("**/api/source/sourceTree");
   await card.getByRole("button", { name: "Retry" }).click();
-  await expect(overlay(page)).toHaveCount(0, { timeout: 60_000 });
-  await expect(card).toHaveCount(0);
+  await expect(card).toHaveCount(0, { timeout: 60_000 });
+  await expect(overlay(page)).toHaveCount(0);
   await expect(page.getByRole("treeitem", { name: "index.ts" })).toBeVisible({
     timeout: 60_000,
   });

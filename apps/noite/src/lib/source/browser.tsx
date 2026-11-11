@@ -179,6 +179,22 @@ export const SourceBrowser = ({
   /** Read one blob at the browsed ref, priming the buffer with the committed
    * text so the first keystroke has a diff base without a second read. */
   const readBlob = async (path: string): Promise<RunnerBlob> => {
+    // A file this session added is not in any commit yet: its buffer is the
+    // only copy, and the pane shows it without asking the runner (a request
+    // for it would be a 404).
+    const held = session.buffers.get(path);
+
+    if (held !== undefined && held.base === null) {
+      return {
+        binary: held.upload !== undefined,
+        path,
+        sha: "",
+        size: held.upload?.bytes ?? held.text.length,
+        text: held.text,
+        truncated: false,
+      };
+    }
+
     const checkout = current();
 
     const blob = await api<RunnerBlob>("/api/source/sourceBlob", {
