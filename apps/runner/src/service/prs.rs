@@ -464,7 +464,11 @@ pub async fn create(
     // hidden `refs/previews/<user>/<branch>` workspace snapshot must never
     // become a PR head (its owner never committed it), and a tag or sha is
     // not a branch here.
-    if !forge::valid_user_branch_name(base) || !forge::valid_user_branch_name(head) {
+    if !forge::valid_user_branch_name(base)
+        || !forge::valid_user_branch_name(head)
+        || forge::is_reserved_ref(base)
+        || forge::is_reserved_ref(head)
+    {
         return Err(ApiError::bad("invalid branch name"));
     }
     if base == head {
@@ -581,7 +585,7 @@ pub async fn update(
         Some("open") => {
             let reopenable = row.state == PrState::Closed;
             if reopenable {
-                if forge::resolve_ref(&bare, &row.head).await.is_err() {
+                if forge::resolve_user_ref(&bare, &row.head).await.is_err() {
                     return Err(ApiError::conflict(
                         "the head branch no longer exists; push it again before reopening",
                     ));
@@ -799,7 +803,7 @@ pub async fn review(
     if row.author_id == actor.user_id {
         return Err(ApiError::bad("you cannot review your own pull request"));
     }
-    let head_sha = forge::resolve_ref(&bare, &row.head)
+    let head_sha = forge::resolve_user_ref(&bare, &row.head)
         .await
         .map_err(|_| ApiError::conflict("the head branch no longer exists"))?;
     // The insert itself re-checks `open`: a close between the read above and
@@ -847,10 +851,10 @@ pub async fn merge(
         .await
         .map_err(internal_error)?;
 
-    let base_sha = forge::resolve_ref(&bare, &row.base)
+    let base_sha = forge::resolve_user_ref(&bare, &row.base)
         .await
         .map_err(|_| ApiError::conflict(format!("base branch {:?} is gone", row.base)))?;
-    let head_sha = forge::resolve_ref(&bare, &row.head)
+    let head_sha = forge::resolve_user_ref(&bare, &row.head)
         .await
         .map_err(|_| ApiError::conflict(format!("head branch {:?} is gone", row.head)))?;
 
@@ -2042,7 +2046,12 @@ mod tests {
             .expect("publish preview ref");
         let author = actor("user_author", "Author");
 
-        for refname in [preview.as_str(), "refs/heads/feature", "refs/tags/v1"] {
+        for refname in [
+            preview.as_str(),
+            "previews/user_1/feature",
+            "refs/heads/feature",
+            "refs/tags/v1",
+        ] {
             let err = create(&h.state, &h.app.id, &author, "t", "", "main", refname, None)
                 .await
                 .expect_err("a ref is not a branch name");

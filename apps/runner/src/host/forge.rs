@@ -686,16 +686,69 @@ pub async fn resolve_ref(bare: &Path, reference: &str) -> anyhow::Result<String>
     Ok(out.trim().to_string())
 }
 
-/// Resolve a ref a caller supplied: a branch, tag or sha resolves exactly as
-/// [`resolve_ref`] does, while a ref in a namespace the runner owns (a hidden
-/// `refs/previews/…` workspace snapshot, notes, stash, a seed ref) is refused
-/// as an invalid ref. The refusal is the same whether or not that hidden ref
-/// exists, so a caller cannot use resolution (or its error) to confirm one.
+/// Resolve a ref a caller supplied: a branch, tag or sha resolves, while a
+/// ref in a namespace the runner owns (a hidden `refs/previews/…` workspace
+/// snapshot, notes, stash, a seed ref) is refused. The refusal is the same
+/// whether or not that hidden ref exists, so a caller cannot use resolution
+/// (or its error) to confirm one.
+///
+/// Resolution is explicit rather than git's DWIM order: only
+/// `refs/heads/<name>` and `refs/tags/<name>` are tried (or the full
+/// `refs/heads/…`/`refs/tags/…` the caller gave). DWIM also reads
+/// `$GIT_DIR/<name>`, and `FETCH_HEAD` — written by every bundle fetch the WAL
+/// rehydrate runs — can carry a hidden preview tip. A sha is accepted only
+/// when it is reachable from a branch or tag, so a preview-only commit whose
+/// sha leaked through a deploy or environment row is not a readable object.
 pub async fn resolve_user_ref(bare: &Path, reference: &str) -> anyhow::Result<String> {
     if is_reserved_ref(reference) {
         bail!("invalid ref {reference:?}");
     }
-    resolve_ref(bare, reference).await
+    if is_hex_sha(reference) {
+        let sha = resolve_ref(bare, reference).await?;
+        if !visible_from_refs(bare, &sha).await? {
+            bail!("ref {reference:?} not found");
+        }
+        return Ok(sha);
+    }
+    if !valid_branch_name(reference) {
+        bail!("invalid ref {reference:?}");
+    }
+    let candidates = if reference.starts_with("refs/heads/") || reference.starts_with("refs/tags/")
+    {
+        vec![reference.to_string()]
+    } else {
+        vec![
+            format!("refs/heads/{reference}"),
+            format!("refs/tags/{reference}"),
+        ]
+    };
+    for name in candidates {
+        let spec = format!("{name}^{{commit}}");
+        if let Ok(out) = git_out(bare, &["rev-parse", "--verify", "--end-of-options", &spec]).await
+        {
+            return Ok(out.trim().to_string());
+        }
+    }
+    bail!("ref {reference:?} not found")
+}
+
+/// Whether `sha` is reachable from a branch or tag. The forge's own hidden
+/// namespaces (`refs/previews/…`) and git's internal ones are excluded, so a
+/// commit only they carry is not caller-visible even by sha.
+async fn visible_from_refs(bare: &Path, sha: &str) -> anyhow::Result<bool> {
+    let out = git_out(
+        bare,
+        &[
+            "for-each-ref",
+            "--contains",
+            sha,
+            "--format=%(refname)",
+            "refs/heads/",
+            "refs/tags/",
+        ],
+    )
+    .await?;
+    Ok(!out.trim().is_empty())
 }
 
 /// One page of history. `reference = None` means `main`; an empty repository
@@ -1511,12 +1564,20 @@ mod tests {
         publish_ref(&h.state, &h.app, "main", None, Some(&main))
             .await
             .expect("publish main");
+        // A second commit that only the hidden preview ref will carry. Seeding
+        // its objects runs a bundle-style fetch, which leaves `FETCH_HEAD`
+        // pointing at it — the pseudo-ref a caller must not be able to resolve.
+        work.write("a.txt", "two\n");
+        work.commit("two").await;
+        let seeded = seed_objects(&bare, &work).await;
+        let preview_only = seeded.get("main").expect("second tip").clone();
+        assert_ne!(preview_only, main);
         // The hidden snapshot another collaborator's workspace preview writes.
         let preview = format!(
             "{}user_1/feature",
             crate::host::git_http::PREVIEW_REF_PREFIX
         );
-        publish_refname(&h.state, &h.app, &preview, None, Some(&main))
+        publish_refname(&h.state, &h.app, &preview, None, Some(&preview_only))
             .await
             .expect("publish preview ref");
         let short = &main[..7];
@@ -1560,7 +1621,41 @@ mod tests {
             assert!(!err.contains("not found"), "{reserved}: {err}");
         }
 
+        // git's `$GIT_DIR/<name>` pseudo-refs are not caller refs either: the
+        // raw resolver reaches the hidden tip through `FETCH_HEAD`, the
+        // caller-facing one does not.
+        assert_eq!(
+            resolve_ref(&bare, "FETCH_HEAD")
+                .await
+                .expect("raw fetch head"),
+            preview_only
+        );
+        let err = resolve_user_ref(&bare, "FETCH_HEAD")
+            .await
+            .expect_err("pseudo-ref");
+        assert!(format!("{err:#}").contains("not found"), "{err:#}");
+        // A commit reachable only from the hidden ref is not readable by sha,
+        // even when its sha leaked through a deploy or environment row.
+        for leaked in [preview_only.as_str(), &preview_only[..7]] {
+            let err = resolve_user_ref(&bare, leaked)
+                .await
+                .expect_err("leaked sha");
+            assert!(
+                format!("{err:#}").contains("not found"),
+                "{leaked}: {err:#}"
+            );
+            assert!(read_rev(&bare, &h.app, Some(leaked)).await.is_err());
+            assert!(log(&bare, Some(leaked), None, 0, None).await.is_err());
+            assert!(commit_detail(&bare, leaked).await.is_err());
+        }
+
         // Caller-facing reads still resolve branches, tags and shas.
+        git(&bare, &["update-ref", "refs/tags/v1", &main]).await;
+        assert_eq!(
+            resolve_user_ref(&bare, "v1").await.expect("tag"),
+            main,
+            "a tag resolves by its bare name"
+        );
         assert_eq!(resolve_user_ref(&bare, "main").await.expect("branch"), main);
         // A branch named like a namespace directory is just a branch.
         publish_ref(&h.state, &h.app, "previews", None, Some(&main))

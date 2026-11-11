@@ -1296,10 +1296,29 @@ async fn caller_refs_refuse_hidden_preview_refs() {
             bare.to_str().expect("mirror path"),
             "HEAD:refs/heads/main",
             "HEAD:refs/heads/feature",
+        ],
+    )
+    .await;
+    // A commit only the hidden workspace-preview ref carries: the sha a
+    // deploy or environment row would disclose to a view-only caller.
+    git(&work, &["commit", "-q", "--allow-empty", "-m", "wip"]).await;
+    let preview_only = git(&work, &["rev-parse", "HEAD"]).await.trim().to_string();
+    git(
+        &work,
+        &[
+            "push",
+            "-q",
+            bare.to_str().expect("mirror path"),
             "HEAD:refs/previews/user_1/feature",
         ],
     )
     .await;
+    // A bundle fetch leaves this behind in a rehydrated mirror.
+    std::fs::write(
+        bare.join("FETCH_HEAD"),
+        format!("{preview_only}\t\tbranch 'feature' of /tmp/x\n"),
+    )
+    .expect("fetch head");
 
     let preview = "refs/previews/user_1/feature";
     // git's DWIM expands the bare spelling to the same hidden ref.
@@ -1307,29 +1326,67 @@ async fn caller_refs_refuse_hidden_preview_refs() {
     let short = &sha[..7];
 
     // Reads: repo_tree / repo_blob / git_log / git_commit / git_compare.
-    for (name, path) in [
-        ("tree", format!("/v1/apps/{}/tree?ref={preview}", app.id)),
+    for (name, path, fragment) in [
+        (
+            "tree",
+            format!("/v1/apps/{}/tree?ref={preview}", app.id),
+            "invalid ref",
+        ),
         (
             "blob",
             format!("/v1/apps/{}/blob/src/index.ts?ref={preview}", app.id),
+            "invalid ref",
         ),
-        ("log", format!("/v1/apps/{}/git/log?ref={preview}", app.id)),
+        (
+            "log",
+            format!("/v1/apps/{}/git/log?ref={preview}", app.id),
+            "invalid ref",
+        ),
         (
             "tree-bare",
             format!("/v1/apps/{}/tree?ref={bare_preview}", app.id),
+            "invalid ref",
+        ),
+        (
+            "tree-sha",
+            format!("/v1/apps/{}/tree?ref={preview_only}", app.id),
+            "not found",
+        ),
+        (
+            "fetch-head",
+            format!("/v1/apps/{}/tree?ref=FETCH_HEAD", app.id),
+            "not found",
         ),
         (
             "compare",
             format!("/v1/apps/{}/git/compare?base=main&head={preview}", app.id),
+            "invalid ref",
         ),
     ] {
         let (status, body) = h.rest("GET", &path, None).await;
         assert!(
             status.is_client_error(),
-            "{name} resolved a preview ref: {status} {body}"
+            "{name} resolved a hidden ref: {status} {body}"
         );
-        assert!(body.to_string().contains("invalid ref"), "{name} -> {body}");
+        assert!(body.to_string().contains(fragment), "{name} -> {body}");
     }
+    // `git rev-parse` would reach the hidden tip through the pseudo-ref, so
+    // the pinned sha proves the fixture is real.
+    let raw = crate::host::exec::run_cmd(
+        "git",
+        &[
+            &format!("--git-dir={}", bare.display()),
+            "rev-parse",
+            "--verify",
+            "FETCH_HEAD",
+        ],
+        None,
+        &[],
+        std::time::Duration::from_secs(10),
+    )
+    .await
+    .expect("raw fetch head");
+    assert_eq!(raw.trim(), preview_only);
     let (status, body) = h
         .rest(
             "GET",
@@ -1396,17 +1453,20 @@ async fn caller_refs_refuse_hidden_preview_refs() {
     // the accepted forms are covered by the forge tests, whose S3 stub can
     // store the manifest the publish writes).
 
-    // PR head/base: only a branch name, never a raw ref.
+    // PR head/base: only a branch name, never a raw ref (or the bare spelling
+    // git DWIMs into the hidden namespace).
     let actor = json!({ "userId": "user_1", "name": "Ada" });
-    let (status, body) = h
-        .rest(
-            "POST",
-            &format!("/v1/apps/{}/pull_requests", app.id),
-            Some(json!({ "actor": actor, "title": "t", "base": "main", "head": preview })),
-        )
-        .await;
-    assert!(status.is_client_error(), "pr create: {status} {body}");
-    assert!(body.to_string().contains("invalid branch name"), "{body}");
+    for head in [preview, bare_preview] {
+        let (status, body) = h
+            .rest(
+                "POST",
+                &format!("/v1/apps/{}/pull_requests", app.id),
+                Some(json!({ "actor": actor, "title": "t", "base": "main", "head": head })),
+            )
+            .await;
+        assert!(status.is_client_error(), "pr create: {status} {body}");
+        assert!(body.to_string().contains("invalid branch name"), "{body}");
+    }
     // A plain branch still gets past the name check (it has nothing to review).
     let (status, body) = h
         .rest(

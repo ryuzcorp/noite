@@ -38,6 +38,11 @@ sensitive:
   # The source read + commit service entry: it resolves the caller's `ref`
   # for tree/blob/bundle reads and forwards a commit body's refs.
   - "apps/runner/src/service/source.rs"
+  # Branch create resolves the caller's `from` ref and publishes the branch.
+  - "apps/runner/src/service/git.rs"
+  # PR create/merge/review resolve the head/base refs: a wrong resolution
+  # publishes or reviews a hidden snapshot as a branch.
+  - "apps/runner/src/service/prs.rs"
   - "apps/runner/src/host/env_gate.rs"
   # The admin-role gate on per-app limits (#79).
   - "apps/runner/src/service/limits.rs"

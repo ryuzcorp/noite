@@ -472,6 +472,8 @@ describe("matchSensitive", () => {
       "apps/runner/src/host/forge.rs",
       "apps/runner/src/host/web_commit.rs",
       "apps/runner/src/service/source.rs",
+      "apps/runner/src/service/git.rs",
+      "apps/runner/src/service/prs.rs",
       "apps/runner/src/host/container_image.rs",
       "apps/noite/src/lib/collaborators.ts",
       "apps/noite/src/lib/server/collaborators.server.ts",
