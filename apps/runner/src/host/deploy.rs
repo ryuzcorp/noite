@@ -2821,8 +2821,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// One-shot Caddy admin stand-in: reads one full request, answers with
-    /// `status` and `body`, and closes.
+    /// Caddy admin stand-in: answers `GET /edge/routes` with generation 0
+    /// (so a push is due) and every `POST` with `status` and `body`. It keeps
+    /// accepting connections because `push_routes` probes the live generation
+    /// on an unchanged table before deciding to push.
     async fn admin_stub(status: &'static str, body: &'static str) -> String {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -2830,37 +2832,52 @@ mod tests {
             .expect("bind stub");
         let addr = listener.local_addr().expect("stub addr");
         tokio::spawn(async move {
-            let (mut sock, _) = listener.accept().await.expect("accept");
-            let mut buf = Vec::new();
-            let mut chunk = [0u8; 4096];
-            // Headers, then exactly Content-Length body bytes: answering
-            // early would reset the connection and read as "unreachable".
             loop {
-                let n = sock.read(&mut chunk).await.expect("read");
-                buf.extend_from_slice(&chunk[..n]);
-                let text = String::from_utf8_lossy(&buf);
-                if let Some(end) = text.find("\r\n\r\n") {
-                    let len = text[..end]
-                        .lines()
-                        .find_map(|l| {
-                            l.to_ascii_lowercase()
-                                .strip_prefix("content-length:")
-                                .map(|v| v.trim().parse::<usize>().unwrap_or(0))
-                        })
-                        .unwrap_or(0);
-                    if buf.len() >= end + 4 + len {
-                        break;
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                tokio::spawn(async move {
+                    let mut buf = Vec::new();
+                    let mut chunk = [0u8; 4096];
+                    // Headers, then exactly Content-Length body bytes:
+                    // answering early would reset the connection and read as
+                    // "unreachable".
+                    loop {
+                        let Ok(n) = sock.read(&mut chunk).await else {
+                            return;
+                        };
+                        buf.extend_from_slice(&chunk[..n]);
+                        let text = String::from_utf8_lossy(&buf);
+                        if let Some(end) = text.find("\r\n\r\n") {
+                            let len = text[..end]
+                                .lines()
+                                .find_map(|l| {
+                                    l.to_ascii_lowercase()
+                                        .strip_prefix("content-length:")
+                                        .map(|v| v.trim().parse::<usize>().unwrap_or(0))
+                                })
+                                .unwrap_or(0);
+                            if buf.len() >= end + 4 + len {
+                                break;
+                            }
+                        }
+                        if n == 0 {
+                            return;
+                        }
                     }
-                }
-                if n == 0 {
-                    break;
-                }
+                    let is_get = buf.starts_with(b"GET ");
+                    let (status, body) = if is_get {
+                        ("200 OK", "{\"generation\":0,\"routes\":0}")
+                    } else {
+                        (status, body)
+                    };
+                    let reply = format!(
+                        "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = sock.write_all(reply.as_bytes()).await;
+                });
             }
-            let reply = format!(
-                "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                body.len()
-            );
-            sock.write_all(reply.as_bytes()).await.expect("reply");
         });
         format!("http://{addr}")
     }

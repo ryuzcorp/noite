@@ -1,8 +1,9 @@
 // The noite edge module: a host route table for Caddy.
 //
 // Caddy's config is static after boot. The runner pushes this table on
-// every app lifecycle event (and every reconcile tick as a backstop), so
-// app events never reload Caddy. All state (table, limiters, readiness
+// every app lifecycle event, and the reconcile tick as a backstop pushes
+// only when the table changed or this process no longer reports the
+// runner's generation (a restart lost it). All state (table, limiters, readiness
 // probers) is process-wide and shared by every handler instance: the
 // static config has one EdgeRoutes per site, and a push swaps the table
 // once for all of them.
@@ -636,10 +637,10 @@ func handleAdmin(w http.ResponseWriter, r *http.Request) error {
 		case InstallStale:
 			return caddy.APIError{HTTPStatus: http.StatusConflict, Err: err}
 		case InstallIdentical:
-			// No-op re-pushes (the runner re-pushes every tick as a
-			// backstop) stay quiet; only a new generation logs at info, so
-			// the lane can assert pushes happened and operators can see
-			// real changes.
+			// Identical re-pushes (a lifecycle event racing the tick, or a
+			// runner that does not yet know this generation landed) stay quiet;
+			// only a new generation logs at info, so the lane can assert
+			// pushes happened and operators can see real changes.
 			if log != nil {
 				log.Debug("edge_routes: table re-push (unchanged)",
 					zap.Uint64("generation", t.Generation))

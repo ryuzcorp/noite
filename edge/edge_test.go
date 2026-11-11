@@ -931,6 +931,42 @@ func itoa(n uint64) string {
 	return string(b[i:])
 }
 
+// TestAdminReportsLiveGeneration covers the probe the runner reads before
+// skipping an unchanged re-push: GET answers the generation this process
+// actually serves, 0 while it has no table, so a restarted Caddy can never
+// look current to the runner.
+func TestAdminReportsLiveGeneration(t *testing.T) {
+	testHandler(t, nil)
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest(http.MethodGet, "/edge/routes", nil)
+	if err := handleAdmin(w, r); err != nil {
+		t.Fatalf("probe with no table: %v", err)
+	}
+	if body := w.Body.String(); !strings.Contains(body, `"generation":0`) {
+		t.Fatalf("empty edge must report generation 0, got %s", body)
+	}
+
+	testHandler(t, &Table{
+		Generation: 13,
+		Exact: map[string]Route{
+			"a.test": {Kind: KindTenant, Upstream: "127.0.0.1:1"},
+		},
+		Wildcards: []Wildcard{{
+			Suffix: ".test",
+			Route:  Route{Kind: KindFallback, Upstream: "127.0.0.1:2"},
+		}},
+	})
+	w = httptest.NewRecorder()
+	r = httptest.NewRequest(http.MethodGet, "/edge/routes", nil)
+	if err := handleAdmin(w, r); err != nil {
+		t.Fatalf("probe with a table: %v", err)
+	}
+	body := w.Body.String()
+	if !strings.Contains(body, `"generation":13`) || !strings.Contains(body, `"routes":2`) {
+		t.Fatalf("live edge must report generation 13 and 2 routes, got %s", body)
+	}
+}
+
 // TestAdminValidation maps a bad table to 400, keeps the old one and 405s other verbs.
 func TestAdminValidation(t *testing.T) {
 	testHandler(t, &Table{Generation: 7, Exact: map[string]Route{
