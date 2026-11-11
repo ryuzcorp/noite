@@ -1,3 +1,0 @@
-### Changed
-
-- **Settings is a page of its own, under Pull requests in the sidebar** (`/apps/<id>/settings`), not a side panel on the app page and no longer an item in its tab row. Every section the role may see is stacked on that one page — Identity, Domains, Limits, Error reporting, Collaborators and Environment, then Branch protection and Danger zone for app admins — each with its own heading and save flow; there is no section tab row. A compact contents list at the top jumps to a section, and `?section=` scrolls to that section's heading (`/apps/<id>/settings?section=domains`). Old `?panel=settings` links redirect to the page and carry a known `?section=` along; unknown ones open it at the top.
