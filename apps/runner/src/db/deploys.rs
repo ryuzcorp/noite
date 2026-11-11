@@ -147,7 +147,7 @@ pub async fn list_deploys_lean(
     // flight: reading 20 full build logs to blank 19 of them costs the same
     // SQLite work as the fat query this replaced.
     let sql = format!(
-        r#"SELECT id, app_id, environment_id, sha, status, intent,
+        r#"SELECT id, app_id, environment_id, sha, status, intent, actor,
                   CASE WHEN rn = 1 AND status IN ('building', 'deploying') THEN log ELSE '' END AS log,
                   created_at, updated_at
            FROM (SELECT d.*, ROW_NUMBER() OVER (ORDER BY created_at DESC) AS rn
@@ -851,6 +851,11 @@ mod tests {
             .expect("read")
             .expect("row");
         assert_eq!(queued.actor.as_deref(), Some("Ada via key ci"));
+
+        // The lean list query has its own column list; a column it forgets
+        // fails the decode at runtime, so it is exercised here too.
+        let listed = list_deploys_lean(&pool, &app.id, None).await.expect("list");
+        assert_eq!(listed[0].actor.as_deref(), Some("Ada via key ci"));
 
         // The pipeline continuing the row never rewrites who asked.
         upsert_deploy(

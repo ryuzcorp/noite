@@ -451,7 +451,8 @@ test("a scoped key reaches only its app, over MCP and git", async ({
   // The account page names the key's scope and ceiling on its row.
   await page.goto("/account");
   const row = page.locator("li", { hasText: "mcp-scoped-key" });
-  await expect(row.getByText(SCOPED_SLUG)).toBeVisible();
+  // Exact: the key's own label contains the slug as a substring.
+  await expect(row.getByText(SCOPED_SLUG, { exact: true })).toBeVisible();
   await expect(row.getByText("≤ Push")).toBeVisible();
   await expect(row.getByText(/expires /u)).toBeVisible();
 });
