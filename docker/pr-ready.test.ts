@@ -10,6 +10,159 @@ import { detectAreas, matchSensitive, parseSensitiveGlobs } from "./pr-ready";
 
 const root = fileURLToPath(new URL("../", import.meta.url));
 
+interface WorkflowInstallStep {
+  bounded: boolean;
+  name: string;
+}
+
+interface WorkflowJob {
+  installSteps: WorkflowInstallStep[];
+  name: string;
+  timeoutMinutes: number | null;
+  uses: string | null;
+}
+
+const JOB_HEADER = /^ {2}(?<name>[\w-]+):\s*(?:#.*)?$/u;
+const JOB_KEY = /^ {4}(?<key>[\w-]+):\s*(?<value>[^#]*?)\s*(?:#.*)?$/u;
+const STEP_HEADER = /^ {6}-\s/u;
+
+/** The first `key: value` of a step block, dash line or nested key. */
+const stepValue = (block: string[], key: string): string | null => {
+  for (const line of block) {
+    const match =
+      /^(?: {6}-\s+| {8})(?<key>[\w-]+):\s*(?<value>[^#]*?)\s*(?:#.*)?$/u.exec(
+        line
+      );
+
+    if (match?.groups?.key === key) {
+      return (match.groups.value ?? "").trim();
+    }
+  }
+
+  return null;
+};
+
+/**
+ * The jobs of a workflow, with only what the timeout rules read: whether the
+ * job bounds itself, whether it forwards to a reusable workflow, and which of
+ * its steps install from the network (respectively, whether they bound
+ * themselves). Line-based on purpose: no YAML dependency at the repo root, and
+ * the same shape the other workflow guards in this file read.
+ */
+const workflowJobs = (yaml: string): WorkflowJob[] => {
+  const lines = yaml.split("\n");
+  const jobsAt = lines.findIndex((line) => /^jobs:\s*$/u.test(line));
+
+  if (jobsAt === -1) {
+    throw new Error("workflow has no jobs");
+  }
+
+  const body = lines.slice(jobsAt + 1);
+
+  const starts = body.flatMap((line, index) =>
+    JOB_HEADER.test(line) ? [index] : []
+  );
+
+  if (starts.length === 0) {
+    throw new Error("workflow has no jobs");
+  }
+
+  return starts.map((start, at) => {
+    const end = starts[at + 1] ?? body.length;
+    const block = body.slice(start, end);
+    const name = JOB_HEADER.exec(body[start] ?? "")?.groups?.name ?? "";
+    const firstStep = block.findIndex((line) => STEP_HEADER.test(line));
+    const head = firstStep === -1 ? block : block.slice(0, firstStep);
+
+    const jobKeys = new Map(
+      head.flatMap((line) => {
+        const groups = JOB_KEY.exec(line)?.groups;
+
+        return groups ? [[groups.key, (groups.value ?? "").trim()]] : [];
+      })
+    );
+
+    const timeout = jobKeys.get("timeout-minutes");
+    const uses = jobKeys.get("uses");
+
+    const stepStarts = block.flatMap((line, index) =>
+      STEP_HEADER.test(line) ? [index] : []
+    );
+
+    const installSteps = stepStarts.flatMap((from, index) => {
+      const step = block.slice(from, stepStarts[index + 1] ?? block.length);
+      const stepUses = stepValue(step, "uses") ?? "";
+      const run = stepValue(step, "run") ?? "";
+
+      const installs =
+        stepUses.startsWith("oven-sh/setup-bun@") ||
+        /\bbun install\b/u.test(run);
+
+      if (!installs) {
+        return [];
+      }
+
+      return [
+        {
+          bounded:
+            Math.trunc(Number(stepValue(step, "timeout-minutes") ?? "")) > 0,
+          name:
+            stepValue(step, "name") ||
+            stepUses ||
+            run.split("\n")[0] ||
+            step[0]?.trim() ||
+            "install step",
+        },
+      ];
+    });
+
+    return {
+      installSteps,
+      name,
+      timeoutMinutes:
+        timeout === undefined ? null : Math.trunc(Number(timeout)),
+      uses: uses && uses.length > 0 ? uses : null,
+    };
+  });
+};
+
+/**
+ * Every job bounds its own wall clock, and every step that installs from the
+ * network bounds itself too. A `uses:` job forwards to another workflow and
+ * GitHub rejects `timeout-minutes` there, so the exemption is the `uses:` key
+ * itself; the called workflow's jobs are checked on their own file.
+ *
+ * Returns `<job>: <problem>` lines, empty when the workflow is sound.
+ */
+const timeoutProblems = (yaml: string): string[] =>
+  workflowJobs(yaml).flatMap((job) => {
+    const problems: string[] = [];
+
+    if (job.uses) {
+      if (job.timeoutMinutes !== null) {
+        problems.push(
+          `${job.name}: a reusable-workflow call cannot set timeout-minutes`
+        );
+      }
+
+      return problems;
+    }
+
+    if (!job.timeoutMinutes || job.timeoutMinutes <= 0) {
+      problems.push(`${job.name}: job has no positive timeout-minutes`);
+    }
+
+    for (const step of job.installSteps) {
+      if (!step.bounded) {
+        problems.push(
+          `${job.name}: network install step "${step.name}" has no positive timeout-minutes`
+        );
+      }
+    }
+
+    return problems;
+  });
+
 const readRepoFile = (rel: string): string =>
   readFileSync(new URL(`../${rel}`, import.meta.url), "utf-8");
 
@@ -340,5 +493,97 @@ describe("image build context coverage", () => {
         expect(uncovered, `${filter} misses ${source}`).toEqual([]);
       }
     }
+  });
+});
+
+describe("workflow job timeouts", () => {
+  const workflowFiles = readdirSync(
+    new URL("../.github/workflows/", import.meta.url)
+  )
+    .filter((name) => name.endsWith(".yml"))
+    .toSorted();
+
+  test("the rule rejects an unbounded job, a bounded call and an unbounded install", () => {
+    expect(
+      timeoutProblems(
+        [
+          "jobs:",
+          "  plain:",
+          "    runs-on: ubuntu-latest",
+          "    steps:",
+          "      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6",
+          "      - run: bun install",
+          "  call:",
+          "    uses: ./.github/workflows/check.yml",
+          "    timeout-minutes: 10",
+        ].join("\n")
+      )
+    ).toEqual([
+      "plain: job has no positive timeout-minutes",
+      'plain: network install step "oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6" has no positive timeout-minutes',
+      'plain: network install step "bun install" has no positive timeout-minutes',
+      "call: a reusable-workflow call cannot set timeout-minutes",
+    ]);
+
+    expect(
+      timeoutProblems(
+        [
+          "jobs:",
+          "  plain:",
+          "    runs-on: ubuntu-latest",
+          "    timeout-minutes: 10",
+          "    steps:",
+          "      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6",
+          "        timeout-minutes: 3",
+          "      - run: bun install",
+          "        timeout-minutes: 5",
+          "  call:",
+          "    uses: ./.github/workflows/check.yml",
+        ].join("\n")
+      )
+    ).toEqual([]);
+  });
+
+  test("reusable-workflow calls point at a workflow this repo ships", () => {
+    for (const file of workflowFiles) {
+      for (const job of workflowJobs(
+        readRepoFile(`.github/workflows/${file}`)
+      )) {
+        if (!job.uses?.startsWith("./")) {
+          continue;
+        }
+
+        expect(
+          existsSync(path.join(root, job.uses.replace(/^\.\//u, ""))),
+          `${file}: ${job.name} calls ${job.uses}`
+        ).toBe(true);
+      }
+    }
+  });
+
+  test("every job bounds itself with a timeout, so a hang fails fast", () => {
+    const problems: string[] = [];
+    let installSteps = 0;
+
+    for (const file of workflowFiles) {
+      const yaml = readRepoFile(`.github/workflows/${file}`);
+      installSteps += workflowJobs(yaml).reduce(
+        (count, job) => count + job.installSteps.length,
+        0
+      );
+      problems.push(
+        ...timeoutProblems(yaml).map((problem) => `${file}: ${problem}`)
+      );
+    }
+
+    // Guard the parser itself: if job or step detection broke, every list
+    // above would be empty and the drift check would pass vacuously.
+    expect(installSteps).toBeGreaterThan(10);
+
+    // An unbounded job waits GitHub's 360-minute default: the 2026-11-11
+    // merge-group `check` hung in `bun install` for 40+ minutes, outlived
+    // `gh run cancel --force`, and held the merge queue until the PR was
+    // dequeued. Each timeout is ~3x that job's p95 (50 runs, 2026-11-11).
+    expect(problems).toEqual([]);
   });
 });
