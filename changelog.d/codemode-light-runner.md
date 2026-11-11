@@ -5,5 +5,5 @@
 
 ### Operator action required
 
-- On upgrade the runner tears down every environment row left from workspace previews before it serves: the fleet is stopped, the local state and `envs/<slug>/<label>` prefix are deleted, every `refs/previews/*` ref is deleted from the app's mirror and durable manifest, the route is rebuilt without its host, and the row is removed. A failure stops the boot so the next start retries; nothing is left half-deleted.
+- On upgrade the runner tears down every environment row left from workspace previews before it serves: the fleet is stopped, the local state and `envs/<slug>/<label>` prefix are deleted, every `refs/previews/*` ref is deleted from every app's mirror and durable manifest (a one-shot sweep, because the old teardown removed the row but left the hidden ref), the route is rebuilt without its host, and the row is removed. A failure stops the boot so the next start retries; nothing is left half-deleted.
 - Remove `RUNNER_ENVIRONMENT_TTL_H` from your environment if you set it; it is no longer read.

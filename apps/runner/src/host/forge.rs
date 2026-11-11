@@ -3767,7 +3767,7 @@ mod tests {
         );
         // A later branch push still records: the snapshot and the manifest
         // no longer disagree.
-        publish_ref(&h.state, &app, "refs/heads/next", None, Some(sha.as_str()))
+        publish_ref(&h.state, &app, "next", None, Some(sha.as_str()))
             .await
             .expect("branch push after cleanup");
         assert_eq!(
@@ -3775,6 +3775,62 @@ mod tests {
                 .await
                 .expect("idempotent sweep"),
             0
+        );
+        h.finish().await;
+    }
+
+    /// A push's snapshot holds branches and tags only, while the WAL tracks
+    /// the retired namespace too. `after_receive` folds in whatever preview
+    /// refs the mirror still holds, so a leftover ref is carried through
+    /// unchanged instead of being read as a create the manifest already has
+    /// (which would fail the push the runner already accepted).
+    #[tokio::test]
+    async fn a_push_records_beside_a_leftover_preview_ref() {
+        let h = Harness::new("leftoverpreview").await;
+        let app = h.app.clone();
+        let bare = h.mirror().await;
+        let work = Work::new(&h.dir.join("scratch")).await;
+        work.write("a.txt", "a\n");
+        let sha = work.commit("one").await;
+        let tips = seed_objects(&bare, &work).await;
+        for (branch, sha) in &tips {
+            publish_ref(&h.state, &app, branch, None, Some(sha.as_str()))
+                .await
+                .expect("publish");
+        }
+        // The pre-upgrade preview writer's hidden ref, still in the manifest
+        // (the boot sweep has not run in this test).
+        h.state
+            .wal
+            .publish_locked(
+                &app.slug,
+                &[ryuz_git::RefUpdate::set(
+                    "refs/previews/user/wip",
+                    None::<String>,
+                    sha.as_str(),
+                )],
+            )
+            .await
+            .expect("preview ref");
+
+        // What a real push leaves behind: the snapshot is taken before
+        // receive-pack moves the branch in the mirror, and it lists branches
+        // and tags only.
+        let before = crate::host::git_http::list_refs(&bare)
+            .await
+            .expect("push snapshot");
+        assert!(!before.contains_key("refs/previews/user/wip"));
+        git(&bare, &["update-ref", "refs/heads/next", &sha]).await;
+
+        let moved = crate::host::git_http::after_receive(&h.state, &app, &bare, &before)
+            .await
+            .expect("push records beside the retired ref");
+        assert!(
+            moved
+                .tips
+                .iter()
+                .any(|tip| tip.git_ref == "refs/heads/next"),
+            "the pushed branch's tip is recorded"
         );
         h.finish().await;
     }

@@ -378,14 +378,42 @@ pub(crate) struct MovedRefs {
 pub(crate) async fn after_receive(
     state: &AppState,
     app: &App,
-    _bare: &Path,
+    bare: &Path,
     before: &HashMap<String, String>,
 ) -> anyhow::Result<MovedRefs> {
+    let mut refs: std::collections::BTreeMap<String, String> = before
+        .iter()
+        .map(|(name, sha)| (name.clone(), sha.clone()))
+        .collect();
+    // The WAL tracks the retired preview namespace (so the boot sweep can
+    // delete what an upgrade left), and its snapshot must cover the same refs
+    // or a surviving preview ref reads as a create while the manifest already
+    // has it — that conflict would fail the whole push. Carry whatever the
+    // mirror still holds through unchanged.
+    let git_dir = format!("--git-dir={}", bare.display());
+    let retired = exec::run_cmd(
+        "git",
+        &[
+            &git_dir,
+            "for-each-ref",
+            "--format=%(objectname) %(refname)",
+            RETIRED_PREVIEW_PREFIX,
+        ],
+        None,
+        &[],
+        Duration::from_secs(30),
+    )
+    .await?;
+    for line in retired.lines() {
+        let Some((sha, refname)) = line.trim().split_once(' ') else {
+            continue;
+        };
+        if refname.starts_with(RETIRED_PREVIEW_PREFIX) {
+            refs.insert(refname.to_string(), sha.to_string());
+        }
+    }
     let snapshot = ryuz_git::git::RefSnapshot {
-        refs: before
-            .iter()
-            .map(|(name, sha)| (name.clone(), sha.clone()))
-            .collect(),
+        refs,
         head: None,
         peeled: Default::default(),
     };

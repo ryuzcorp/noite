@@ -168,13 +168,21 @@ struct RetiredWorkspace {
     label: String,
 }
 
+/// `instance_setting` key: the one-shot retired `refs/previews/` sweep ran.
+/// Only a pre-upgrade runner ever wrote that namespace, so after the sweep
+/// there is nothing left to look for; a failure leaves the key unset so the
+/// next boot retries.
+const RETIRED_PREVIEWS_SWEPT: &str = "retired_previews_swept";
+
 /// Boot step: tear down every `kind='workspace'` environment an upgraded
 /// install still holds (`source.preview` and its in-browser predecessor,
-/// removed). `EnvironmentKind` no longer decodes `workspace`, so the rows
-/// must go before anything lists environments; a failure is returned rather
-/// than served, because the next environment read in this process would fail
-/// with them still there. Idempotent: teardown is (an empty prefix is a
-/// no-op), so a later boot retries whatever this one could not finish.
+/// removed), and delete the retired `refs/previews/*` refs an upgrade left in
+/// any app's mirror and durable manifest. `EnvironmentKind` no longer decodes
+/// `workspace`, so the rows must go before anything lists environments; a
+/// failure is returned rather than served, because the next environment read
+/// in this process would fail with them still there. Idempotent: teardown is
+/// (an empty prefix is a no-op), so a later boot retries whatever this one
+/// could not finish.
 pub async fn retire_workspace_environments(state: &crate::AppState) -> anyhow::Result<usize> {
     let rows: Vec<RetiredWorkspace> = sqlx::query_as(
         r#"SELECT e.id, e.app_id, a.slug AS app_slug, e.label
@@ -186,30 +194,32 @@ pub async fn retire_workspace_environments(state: &crate::AppState) -> anyhow::R
     .await
     .context("list retired workspace environments")?;
     let total = rows.len();
-    let mut failed: Vec<String> = Vec::new();
-    // The refs are retired for the whole app, not just the rows: any
-    // `refs/previews/*` still in its mirror (even one a row no longer points
-    // at) must leave the mirror and the durable manifest before the rows that
-    // are their only pointer go.
-    let mut slugs: Vec<&str> = rows.iter().map(|row| row.app_slug.as_str()).collect();
-    slugs.sort_unstable();
-    slugs.dedup();
-    let mut broken: Vec<String> = Vec::new();
-    for slug in slugs {
-        if let Err(e) = crate::host::forge::delete_retired_refs(state, slug).await {
-            tracing::warn!(
-                slug = %slug,
-                error = %format!("{e:#}"),
-                "retired workspace ref cleanup failed"
-            );
-            broken.push(slug.to_string());
+    // The refs are retired for **every** app, not just the ones that still
+    // hold a workspace row: the old teardown (the delete route and the TTL
+    // sweep) removed the row but never the hidden ref, so an app whose
+    // preview was already deleted still carries one. A push's snapshot holds
+    // branches and tags only, so a surviving preview ref in the manifest
+    // would make every later push fail as a create of a ref the manifest
+    // already has. The sweep is one-shot: nothing writes the namespace any
+    // more, and a failure aborts the boot before the marker is written, so
+    // the next start retries.
+    if db::get_setting(&state.pool, RETIRED_PREVIEWS_SWEPT)
+        .await?
+        .is_none()
+    {
+        let apps = db::list_apps(&state.pool)
+            .await
+            .context("list apps for the retired preview ref sweep")?;
+        for app in &apps {
+            crate::host::forge::delete_retired_refs(state, &app.slug)
+                .await
+                .with_context(|| format!("delete the retired preview refs of {}", app.slug))?;
         }
+        db::set_setting(&state.pool, RETIRED_PREVIEWS_SWEPT, "1").await?;
+        tracing::info!(apps = apps.len(), "removed retired preview refs");
     }
+    let mut failed: Vec<String> = Vec::new();
     for row in rows {
-        if broken.contains(&row.app_slug) {
-            failed.push(format!("{}.{}", row.app_slug, row.label));
-            continue;
-        }
         tracing::info!(
             slug = %row.app_slug,
             label = %row.label,
@@ -428,8 +438,22 @@ mod tests {
         )
         .await
         .expect("app");
-        // The row an older runner wrote: raw SQL, because the model no longer
-        // decodes `workspace`.
+        // A second app with **no** workspace row: the old teardown removed
+        // the row but left the hidden ref, so the sweep must visit it too.
+        db::create_app(
+            &pool,
+            &state.config,
+            db::NewApp {
+                name: "orphan",
+                slug: "orphan",
+                user_id: "local",
+                subdomain: "orphan.localhost",
+                listen: 30200,
+                internal: 30201,
+            },
+        )
+        .await
+        .expect("orphan app");
         let env_id = new_id();
         let ts = crate::models::now_iso();
         sqlx::query(
@@ -477,7 +501,19 @@ mod tests {
             "the fleet entry is gone"
         );
         assert!(!state_dir.exists());
+        // The ref sweep ran once for the whole install, including an app with
+        // no workspace row, and marked itself done.
+        assert_eq!(
+            db::get_setting(&pool, RETIRED_PREVIEWS_SWEPT)
+                .await
+                .expect("setting"),
+            Some("1".to_string())
+        );
         let lines = seen.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        assert!(
+            lines.iter().any(|line| line.contains("orphan")),
+            "the sweep visits an app with no workspace row: {lines:?}"
+        );
         assert!(
             lines
                 .iter()
