@@ -1,8 +1,0 @@
-### Changed
-
-- **A stopped deploy is `cancelled`, and a swept one is `stalled`.** Both used to be recorded as `failed`, with the cause visible only in the log text. The stop endpoint (`POST /v1/apps/{id}/deploys/{id}/cancel`, `deploys.cancel`) and a run that finds its own token tripped now close the row as `cancelled`; the stuck-deploy sweep closes a row nothing reported on as `stalled`. Both go through the same guarded `DeployStatus::predecessors()` writers, so they stay terminal: a late log line, a second stop or a second sweep is refused. The app/environment chip still reads `failed` with the stop or the timeout as its one-line summary. The Deployments tab shows **Stopped** and **Timed out** badges, the Stop dialog says the row closes as stopped, and rollback eligibility still requires `success`.
-- The deploy e2e helpers (`waitForDeploy` and the env-deploy waits) treat all four terminal statuses as finished, so a stopped or stalled deploy no longer leaves a poll running to its deadline.
-
-### Operator action required
-
-- **API and SDK consumers must treat `cancelled` and `stalled` as terminal failures.** `DeployStatus` (runner REST/RPC, and the generated `DeployStatus` binding in `apps/noite/src/lib/runner-types`) gains the two values; anything that branched on `status === 'failed'` to stop polling should branch on "terminal" instead. A terminal non-success still means the deploy did not land, so a client that exits non-zero on `failed` must exit non-zero on both new values too. There is no schema change (the column is TEXT with no CHECK) and rows written before the upgrade stay `failed`.

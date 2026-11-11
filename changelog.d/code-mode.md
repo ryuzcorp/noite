@@ -1,0 +1,13 @@
+### Fixed
+
+- **Switching refs can no longer hang on "Switching to …".** A request for the ref the panes still show is a new switch instead of a no-op, and a pod that takes the open but never answers ends on "Could not open" with Retry after a bounded wait.
+- **Typing is never overwritten by the pod's change feed.** A keystroke spends the token of any read still in flight, so an older read can no longer repaint the document and drop the keys that followed.
+- **A checkout whose pod stopped after its listing loaded is refused** instead of leaving a dead tree and editor behind the "Could not open" card, and the card names the ref that actually failed. A failed Deploy preview and a failed push also stay with the button that caused them, and the read-only banner no longer describes a different branch from the failure card.
+- **A pod-side change arriving while a file opens no longer cancels that open**, so `?file=` and the editor agree.
+- **Smaller code-mode edges no longer leave stale actions or dialogs.** A changed row whose committed text is still being read keeps its Discard button and diff; renaming a new file after its placeholder was taken back can no longer rename a path the pod never had; two drops cannot interleave their confirmations and a refused drop clears the outline; the branch picker clears its stale action error and opens one delete confirmation at a time.
+- **The workspace waits for the pod frame's own acknowledgement**, and says the host answered but never took the port instead of failing each request on its own deadline.
+- **A push the page reported as settled without its commit no longer leaves the pod mid-push.** The refusal keeps the push open for another answer, and a push the page never settles expires so the next one can start.
+- **A tab that loses the saved workspace's lock stops claiming to save**: it returns to following, says its edits are not being kept, and reloads cleanly.
+- **The tree and Changes panel are no longer one pass behind a rename or a terminal write**, and an out-of-order change event cannot roll the panel back.
+- **Language intelligence restarts its worker after a crash** instead of losing diagnostics, hover and go-to-definition for the rest of the mount, and a terminal whose frame died says so instead of showing a prompt that swallows keystrokes.
+- **A second tab no longer waits out its full timeout** when the other tab is not the one saving the workspace, a bracketed window of unsaved edits the browser refused to mirror is reported, and a branch opened after a large one no longer inherits its declaration budget cap.
