@@ -7,7 +7,8 @@
 
 ### Changed
 
-- A key whose stored scope cannot be read is refused instead of being treated as account-wide.
+- A key whose stored scope cannot be read — wrong field types, unknown fields, an empty app list — is refused instead of being treated as account-wide.
+- A capped key (`view`/`push` ceiling) cannot create an app, over MCP or by pushing to a new slug: creating makes the caller its admin, which is above the key's ceiling.
 
 ### Operator action required
 

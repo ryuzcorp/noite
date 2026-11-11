@@ -381,10 +381,18 @@ export const MCP_TOOLS: readonly McpToolDefinition[] = [
     params: CreateAppParams,
     run: async ({ principal }, { name, slug, source }) => {
       // A key limited to apps cannot create one: the new app would not be in
-      // its set, so the push it advertises would be refused.
+      // its set, so the push it advertises would be refused. A capped key
+      // cannot either: creating makes the caller the app's admin, above the
+      // ceiling it was minted with.
       if (principal.scope.appIds !== null) {
         throw new McpToolError(
           "This key is limited to specific apps, so it cannot create new ones. Create the app in the dashboard, or use an account-wide key."
+        );
+      }
+
+      if (principal.scope.roleCeiling !== "admin") {
+        throw new McpToolError(
+          "This key's role ceiling cannot create apps. Create the app in the dashboard, or use a key with an admin ceiling."
         );
       }
 

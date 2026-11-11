@@ -377,6 +377,24 @@ describe("a scoped key over MCP", () => {
     });
   });
 
+  test("a capped key cannot create an app", async () => {
+    const key = await mintKey(
+      "u-scoped",
+      { apps: ["manage"] },
+      {
+        appIds: null,
+        roleCeiling: "push",
+      }
+    );
+
+    const created = await callTool(key, "create_app", { slug: "capped" });
+
+    expect(created.result?.isError).toBe(true);
+    expect(created.result?.content[0]?.text).toContain(
+      "role ceiling cannot create apps"
+    );
+  });
+
   test("an app-scoped key cannot create an app", async () => {
     const key = await mintKey(
       "u-scoped",

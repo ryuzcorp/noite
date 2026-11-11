@@ -431,6 +431,23 @@ describe("a scoped key on git and ingest", () => {
     }
   });
 
+  test("a capped key cannot claim a new app through a push", async () => {
+    const key = await mintKey("u-scoped", {
+      appIds: null,
+      roleCeiling: "push",
+    });
+
+    const response = await gitAuth(key, "brand-new", "create");
+
+    expect(response?.status).toBe(403);
+
+    const body: unknown = await response?.json();
+    expect(body).toEqual({
+      error: "This API key's role ceiling cannot create apps",
+      ok: false,
+    });
+  });
+
   test("an app-scoped key cannot claim a new app through a push", async () => {
     const key = await mintKey("u-scoped", { appIds: ["app-1"] });
 
