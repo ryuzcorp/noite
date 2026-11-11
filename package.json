@@ -20,8 +20,5 @@
     "picomatch": "4.0.7",
     "typescript": "^7",
     "ultracite": "8.0.1"
-  },
-  "patchedDependencies": {
-    "@r1ck404/nodepod@1.11.2": "apps/noite/patches/@r1ck404%2Fnodepod@1.11.2.patch"
   }
 }

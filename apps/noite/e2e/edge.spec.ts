@@ -1,4 +1,3 @@
-import { CONTROL_HOST_DENIED_ASSETS } from "$lib/preview-host";
 import { expect, test } from "@playwright/test";
 
 // Raw-port lane: the control UI through Caddy on the lane's `*.localhost` base,
@@ -17,39 +16,9 @@ test("control serves the UI", async ({ page }) => {
   ).toBeVisible();
 });
 
-test(
-  "control UI is cross-origin isolated",
-  { tag: "@fast" },
-  async ({ page, request }) => {
-    // The TypeScript language service passes `SharedArrayBuffer` to workers, so
-    // every document (and the worker scripts it loads) must carry COOP/COEP or
-    // the browser refuses to expose it.
-    await page.goto("/login");
-    expect(await page.evaluate(() => crossOriginIsolated)).toBe(true);
-
-    // The workspace — its code, its workers, its preview service worker — belongs
-    // to the app's preview origin, never this one. Every pod path is absent here:
-    // nothing on the control origin may create a process worker or register a
-    // service worker, or app-controlled code would run in this page's agent
-    // cluster, with the viewer's session.
-    const answers = await Promise.all(
-      CONTROL_HOST_DENIED_ASSETS.map(async (path) => {
-        const res = await request.get(path);
-
-        return `${path} -> ${res.status()}`;
-      })
-    );
-
-    expect(answers).toEqual(
-      CONTROL_HOST_DENIED_ASSETS.map((path) => `${path} -> 404`)
-    );
-  }
-);
-
 test("control UI still serves its own bundle", async ({ request }) => {
-  // `/assets/*` is both the control UI's bundle and, on the preview host, the
-  // frame bundle's chunks: the pod route must decline it here so the platform
-  // serves these scripts exactly as it always has.
+  // `/assets/*` must reach celld's own resolver, never the Worker: the pages
+  // fallback would fetch them inside the app and its 15 s action bound.
   const response = await request.get("/login", {
     headers: { accept: "text/html" },
   });

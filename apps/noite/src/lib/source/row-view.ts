@@ -1,23 +1,16 @@
 //! One change as the Changes panel reads it: a closed union that says what the
 //! row is, whether it has a diff, and whether there is an edit to throw away —
-//! so an upload, a staged deletion, a pure move and a row whose committed text
-//! is still being read cannot be confused with one another.
-//!
-//! ``Loading`` is a real state, not "text with empty fields": a row whose
-//! committed copy is still being read is a change the user made, so it keeps
-//! its Discard action (it used to hide both buttons and its diff, because its
-//! `before` and `after` were both the empty string).
+//! so an upload, a staged deletion, a pure move and a text change cannot be
+//! confused with one another.
 
 import { Data } from "effect";
 
-import type { ChangeKind, WorkspaceChange } from "./workspace/types";
+import type { ChangeKind, SourceChange } from "./session";
 
 /** What a change row is. */
 export type RowView = Data.TaggedEnum<{
-  /** The committed copy is being read: nothing to diff yet. */
-  Loading: { path: string };
   /** An upload: bytes, not text. */
-  Binary: { bytes: number; kind: ChangeKind; path: string };
+  Upload: { bytes: number; path: string };
   /** A staged deletion: the row undoes it, there is nothing to discard. */
   Deleted: { path: string };
   /** A move: `edited` when the bytes changed on the way too. */
@@ -28,18 +21,10 @@ export type RowView = Data.TaggedEnum<{
 
 export const RowViews = Data.taggedEnum<RowView>();
 
-/** Derive the row from the workspace's change. */
-export const rowView = (change: WorkspaceChange): RowView => {
-  if (change.loading) {
-    return RowViews.Loading({ path: change.path });
-  }
-
-  if (change.binary !== undefined) {
-    return RowViews.Binary({
-      bytes: change.binary,
-      kind: change.kind,
-      path: change.path,
-    });
+/** Derive the row from the session's change. */
+export const rowView = (change: SourceChange): RowView => {
+  if (change.bytes !== undefined) {
+    return RowViews.Upload({ bytes: change.bytes, path: change.path });
   }
 
   if (change.kind === "deleted") {
@@ -48,7 +33,9 @@ export const rowView = (change: WorkspaceChange): RowView => {
 
   if (change.kind === "moved") {
     return RowViews.Move({
-      edited: change.after !== change.before,
+      // A move whose committed text this page never read (no buffer) has
+      // nothing to compare: only a known, different base counts as edited.
+      edited: change.before !== null && change.before !== change.after,
       from: change.movedFrom,
       path: change.path,
     });
@@ -57,12 +44,13 @@ export const rowView = (change: WorkspaceChange): RowView => {
   return RowViews.Text({ kind: change.kind, path: change.path });
 };
 
-/** Whether the row carries a text diff. */
+/** Whether the row carries a text diff: a change whose committed side this
+ * page never read (a deletion staged from the tree) has nothing to compare. */
 export const rowDiffed = (row: RowView): boolean =>
   row._tag === "Text" || (row._tag === "Move" && row.edited);
 
-/** Whether there is an edit to throw away. A loading row still stands for one:
- * the change exists, only its committed copy has not arrived. */
+/** Whether there is an edit to throw away. A pure move has none: the bytes are
+ * the commit's, only the path changed, so it can only be undone. */
 export const rowDiscardable = (row: RowView): boolean =>
   row._tag !== "Deleted" && !(row._tag === "Move" && !row.edited);
 
@@ -72,7 +60,7 @@ export const rowUndoable = (row: RowView): boolean =>
 
 /** The row's badge: what it is, and the daisyUI tone it wears. */
 export const rowBadge = (row: RowView) => {
-  if (row._tag === "Binary") {
+  if (row._tag === "Upload") {
     return { class: "badge-neutral", label: "binary" };
   }
 
@@ -84,11 +72,7 @@ export const rowBadge = (row: RowView) => {
     return { class: "badge-warning", label: "moved" };
   }
 
-  if (row._tag === "Text") {
-    return { class: "badge-neutral", label: row.kind };
-  }
-
-  return { class: "badge-neutral", label: "change" };
+  return { class: "badge-neutral", label: row.kind };
 };
 
 /** What a row reads as: a move shows both paths. */
@@ -99,4 +83,4 @@ export const rowLabel = (row: RowView): string =>
 
 /** The bytes an upload row shows beside its path, when it is one. */
 export const rowBytes = (row: RowView): number | null =>
-  row._tag === "Binary" ? row.bytes : null;
+  row._tag === "Upload" ? row.bytes : null;

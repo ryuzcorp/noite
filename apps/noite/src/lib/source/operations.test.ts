@@ -1,108 +1,63 @@
-import { expect, test } from "bun:test";
+import { describe, expect, test } from "bun:test";
 
 import {
   operationFailure,
-  previewView,
-  PreviewOps,
-  pushView,
   PushOps,
   resetOperations,
-  settlePreview,
   settlePush,
-  startPreview,
   startPush,
 } from "./operations";
-import { WorkspaceError } from "./workspace/types";
 
-/** A start the test expects to be accepted (the refusal cases assert on the
- * null directly). */
-const started = <T>(value: T | null): T => {
-  if (value === null) {
-    throw new Error("expected the operation to start");
-  }
-
-  return value;
-};
-
-test("a preview failure never reports as a push failure", () => {
-  const preview = settlePreview(started(startPreview(PreviewOps.Idle())), {
-    failure: { code: null, message: "preview refused" },
-    ok: false,
+describe("the commit operation's transition table", () => {
+  test("Idle starts a push", () => {
+    expect(startPush(PushOps.Idle(), "main")).toEqual(
+      PushOps.Pushing({ branch: "main" })
+    );
   });
 
-  expect(previewView(preview).previewError).toEqual({
-    code: null,
-    message: "preview refused",
-  });
-  // The push slot was never touched.
-  const push = pushView(PushOps.Idle());
+  test("a push in flight refuses a second one", () => {
+    const pushing = PushOps.Pushing({ branch: "main" });
 
-  expect(push.pushError).toBeNull();
-  expect(push.pushing).toBe(false);
-});
-
-test("a push failure never reports as a preview failure", () => {
-  const push = settlePush(started(startPush(PushOps.Idle())), {
-    failure: { code: null, message: "push refused" },
-    ok: false,
+    expect(startPush(pushing, "main")).toBeNull();
   });
 
-  expect(pushView(push).pushError).toEqual({
-    code: null,
-    message: "push refused",
-  });
-  expect(previewView(PreviewOps.Idle()).previewError).toBeNull();
-});
+  test("a landed push records where it went", () => {
+    const pushing = PushOps.Pushing({ branch: "feature" });
 
-test("one push and one preview at a time, and they do not block each other", () => {
-  const pushing = started(startPush(PushOps.Idle()));
+    const settled = settlePush(pushing, {
+      ok: true,
+      to: { branch: "feature", newBranch: true },
+    });
 
-  expect(startPush(pushing)).toBeNull();
-
-  const running = started(startPreview(PreviewOps.Idle()));
-
-  expect(startPreview(running)).toBeNull();
-
-  // Both are in flight at once.
-  expect(pushView(pushing).pushing).toBe(true);
-  expect(previewView(running).previewed).toBeNull();
-});
-
-test("a landed push reports where it went, and a change resets it", () => {
-  const push = settlePush(started(startPush(PushOps.Idle())), {
-    ok: true,
-    to: { branch: "feature", newBranch: true },
+    expect(settled).toEqual(
+      PushOps.Done({ to: { branch: "feature", newBranch: true } })
+    );
   });
 
-  expect(pushView(push).pushed).toEqual({ branch: "feature", newBranch: true });
+  test("a failed push records its reason", () => {
+    const settled = settlePush(PushOps.Pushing({ branch: "main" }), {
+      failure: { message: "409 tip moved" },
+      ok: false,
+    });
 
-  const reset = resetOperations();
-
-  expect(pushView(reset.push).pushed).toBeNull();
-  expect(pushView(reset.push).pushing).toBe(false);
-});
-
-test("a caught workspace refusal keeps its code in the failure", () => {
-  expect(
-    operationFailure(
-      new WorkspaceError("read-only", "workspace: this checkout is read-only")
-    )
-  ).toEqual({
-    code: "read-only",
-    message: "workspace: this checkout is read-only",
+    expect(settled).toEqual(
+      PushOps.Failed({ failure: { message: "409 tip moved" } })
+    );
   });
-});
 
-test("a remote refusal without a code reports only its message", () => {
-  expect(
-    operationFailure(
-      new Error(
-        "commit failed: 409 refs/heads/main is protected; commit to a new branch"
-      )
-    )
-  ).toEqual({
-    code: null,
-    message:
-      "commit failed: 409 refs/heads/main is protected; commit to a new branch",
+  test("an outcome only lands on a push in flight", () => {
+    const done = PushOps.Done({ to: { branch: "main", newBranch: false } });
+
+    expect(
+      settlePush(done, { ok: true, to: { branch: "other", newBranch: false } })
+    ).toBe(done);
+  });
+
+  test("a change landed resets the form", () => {
+    expect(resetOperations()._tag).toBe("Idle");
+  });
+
+  test("a caught error becomes its message", () => {
+    expect(operationFailure(new Error("boom"))).toEqual({ message: "boom" });
   });
 });

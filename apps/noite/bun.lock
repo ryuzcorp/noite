@@ -13,15 +13,11 @@
         "@ilha/model": "^0.1.1",
         "@ilha/void": "^0.1.5",
         "@pierre/diffs": "1.5.2",
-        "@pierre/highlights": "0.1.3",
         "@pierre/trees": "1.0.0-beta.6",
-        "@r1ck404/nodepod": "1.11.2",
         "better-auth": "^1.7.14",
         "effect": "^4.1.0",
-        "ghostty-web": "0.4.0",
         "ilha": "^0.16.3",
         "scule": "^1.3.0",
-        "typescript-ls": "npm:typescript@^5.9",
       },
       "devDependencies": {
         "@cloudflare/workers-types": "^5.20261029.1",
@@ -40,10 +36,7 @@
     "esbuild",
     "workerd",
   ],
-  "patchedDependencies": {
-    "@r1ck404/nodepod@1.11.2": "patches/@r1ck404%2Fnodepod@1.11.2.patch",
-  },
-  "packages": {
+    "packages": {
     "@ark/schema": ["@ark/schema@0.56.8", "", { "dependencies": { "@ark/util": "0.56.8" } }, "sha512-R05TOe85oQBGFFw2zKMuZpqkXibLKuC/aJt6VwFn5Cjc4x3NkWfhvGRpRDycNkj3ddcHnOPtIsmjVowJO9Yxdw=="],
 
     "@ark/util": ["@ark/util@0.56.8", "", {}, "sha512-XLiQyGfpJcws1zCtp2Cva8s1oheCdFn1Rt6JSyC4NnkDrpwCJnlaiawuuOc1Z97vMH+jEzW5vyyf0xOju5wUQA=="],
@@ -320,7 +313,6 @@
 
     "@poppinss/exception": ["@poppinss/exception@1.2.3", "", {}, "sha512-dCED+QRChTVatE9ibtoaxc+WkdzOSjYTKi/+uacHWIsfodVfpsueo3+DKpgU5Px8qXjgmXkSvhXvSCz3fnP9lw=="],
 
-    "@r1ck404/nodepod": ["@r1ck404/nodepod@1.11.2", "", { "dependencies": { "@noble/hashes": "^1.8.0", "acorn": "npm:@r1ck404/fast-acorn@8.18.1", "acorn-jsx": "npm:@r1ck404/fast-acorn-jsx@5.3.3", "brotli": "^1.3.3", "brotli-wasm": "npm:@r1ck404/fast-brotli-wasm@3.0.2", "comlink": "^4.4.2", "es-module-lexer": "1.7.0", "pako": "^2.1.0", "resolve.exports": "^2.0.3", "set-cookie-parser": "^3.1.1" }, "peerDependencies": { "@xterm/addon-fit": "^0.11.0", "@xterm/addon-serialize": "^0.14.0", "@xterm/addon-webgl": "^0.19.0", "@xterm/xterm": "^6.0.0", "next": "^13.0.0 || ^14.0.0 || ^15.0.0 || ^16.0.0", "vite": "^5.0.0 || ^6.0.0 || ^7.0.0 || ^8.0.0" }, "optionalPeers": ["@xterm/addon-fit", "@xterm/addon-serialize", "@xterm/addon-webgl", "@xterm/xterm", "next", "vite"] }, "sha512-zpAa74OS0bQn4l8vnpqoGwjmWcHLUwm05SXcIzat83BqZ+L805opN0VKQNiliylmNrO08/Tnf5E35OudpgYlSQ=="],
 
     "@rolldown/binding-android-arm-eabi": ["@rolldown/binding-android-arm-eabi@1.2.18", "", { "os": "android", "cpu": "arm" }, "sha512-ubTG+4KlidvioxjOFdsdEa2F6JVGZb8m2ByJUqQ7fYzUeT1cEn194POcsQ10PKH4p//q0YQn4SB3YpSuzcA1Yg=="],
 

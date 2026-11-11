@@ -1,6 +1,6 @@
 import * as Schema from "effect/Schema";
 
-import { runnerSourceBundle, runnerSourceTree } from "../runner";
+import { runnerSourceBlob, runnerSourceTree } from "../runner";
 import { apiAction } from "./api";
 import { requireViewApp } from "./session.server";
 
@@ -21,14 +21,20 @@ export const sourceTree = apiAction(
   }
 );
 
-/** Every text source in the repo at `ref`, for the language-service worker's
- * virtual FS (one round trip instead of one blob per file). Same ref rules as
- * `sourceTree`. */
-export const sourceBundle = apiAction(
-  SourceRefArgs,
-  async ({ appId, ref }, { env, request }) => {
+/** One file's committed text at `ref` — what the editor opens. The runner
+ * caps it (256 KiB) and marks a binary or truncated read, which the pane shows
+ * as a placeholder instead of text. */
+const SourceBlobArgs = Schema.Struct({
+  appId: Schema.String,
+  path: Schema.String,
+  ref: Schema.optional(Schema.String),
+});
+
+export const sourceBlob = apiAction(
+  SourceBlobArgs,
+  async ({ appId, path, ref }, { env, request }) => {
     await requireViewApp(request, env, appId);
 
-    return runnerSourceBundle(appId, ref || undefined);
+    return runnerSourceBlob(appId, path, ref || undefined);
   }
 );

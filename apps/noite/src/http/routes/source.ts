@@ -15,8 +15,8 @@ import { runnerConfig } from "../config";
 import type { RouteHandler } from "../config";
 import { originAllowed } from "../origin";
 
-/** The commit-shaped payload the browser posts to either source route (the
- * runner validates its contents). */
+/** The commit-shaped payload the browser posts (the runner validates its
+ * contents). */
 interface SourcePayload {
   branch?: string;
   deletes?: string[];
@@ -26,8 +26,8 @@ interface SourcePayload {
   moves?: SourceCommitMove[];
 }
 
-/** Both source routes' payload, shape-checked only: the runner is the
- * authority on paths, sizes and encodings. */
+/** The commit payload, shape-checked only: the runner is the authority on
+ * paths, sizes and encodings. */
 const isSourcePayload = (value: unknown): value is SourcePayload => {
   if (typeof value !== "object" || value === null) {
     return false;
@@ -96,17 +96,16 @@ const runnerBody = (
   return body;
 };
 
-/** Both source routes' one gate and one forward: only the control UI's own
- * fetch calls them, so the cross-site gate, the session and the push role are
+/** The source commit's one gate and one forward: only the control UI's own
+ * fetch calls it, so the cross-site gate, the session and the push role are
  * all checked before a byte of the body is read; then a bounded read and a
- * forward to the runner's own `source/{endpoint}`. A commit can be a folder of
- * uploads and a preview is the same payload, so neither fits the Void
- * JSON-action transport's body cap: they are their own routes, like the R2 upload. */
+ * forward to the runner's own `source/commit`. A commit can be a folder of
+ * uploads, so it does not fit the Void JSON-action transport's body cap: it is
+ * its own route, like the R2 upload. */
 const forwardSourceBody = async (
   request: Request,
   env: KitEnv,
-  params: Record<string, string | undefined> | undefined,
-  endpoint: "commit" | "preview"
+  params: Record<string, string | undefined> | undefined
 ): Promise<Response> => {
   const appId = params?.appId?.trim() ?? "";
 
@@ -155,7 +154,7 @@ const forwardSourceBody = async (
   }
 
   if (!isSourcePayload(payload)) {
-    return new Response(`invalid ${endpoint} body`, { status: 400 });
+    return new Response("invalid commit body", { status: 400 });
   }
 
   const body = runnerBody(
@@ -165,7 +164,7 @@ const forwardSourceBody = async (
   );
 
   const res = await fetch(
-    `${rc.runner}/v1/apps/${encodeURIComponent(appId)}/source/${endpoint}`,
+    `${rc.runner}/v1/apps/${encodeURIComponent(appId)}/source/commit`,
     {
       body: JSON.stringify(body),
       headers: {
@@ -184,79 +183,4 @@ const forwardSourceBody = async (
 };
 
 export const handleSourceCommit: RouteHandler = (request, env, params) =>
-  forwardSourceBody(request, env, params, "commit");
-
-/** Browser deploy preview: the same body and gate as a commit, forwarded to
- * the runner's `source/preview`, which snapshots it onto the viewer's hidden
- * `refs/previews/<user>/<branch>` ref and deploys that (user, branch)
- * environment — creating it on first use — and answers the environment, the
- * commit and the deploy row. */
-export const handleSourcePreview: RouteHandler = (request, env, params) =>
-  forwardSourceBody(request, env, params, "preview");
-
-/** Browser archive download: session + view role, and for a GET the cross-site
- * gate is `Sec-Fetch-Site` — browsers send `Origin` on GETs only when
- * cross-origin, but always send `Sec-Fetch-Site`. Streams the runner's tar
- * (and its 413 message) through untouched. */
-export const handleSourceArchive: RouteHandler = async (
-  request,
-  env,
-  params
-) => {
-  const appId = params?.appId?.trim() ?? "";
-
-  if (!appId) {
-    return new Response("app required", { status: 400 });
-  }
-
-  const site = request.headers.get("sec-fetch-site");
-
-  if (
-    (site !== null && site !== "same-origin") ||
-    !originAllowed(request, env)
-  ) {
-    return new Response("origin not allowed", { status: 403 });
-  }
-
-  let ref: string;
-
-  try {
-    ref = new URL(request.url).searchParams.get("ref")?.trim() ?? "";
-  } catch {
-    return new Response("bad request", { status: 400 });
-  }
-
-  await ensureDb();
-  const session = await getSessionOrNull(request, env).catch(() => null);
-  const user = session?.user;
-
-  if (!user) {
-    return new Response("Sign in required", { status: 401 });
-  }
-
-  const grant = await requireAppRole(appId, user.id, "view").catch(() => null);
-
-  if (!grant) {
-    return new Response("forbidden", { status: 403 });
-  }
-
-  const rc = runnerConfig(env);
-
-  if (!rc) {
-    return new Response("RUNNER_TOKEN is not configured", { status: 500 });
-  }
-
-  const query = ref === "" ? "" : `?ref=${encodeURIComponent(ref)}`;
-
-  const res = await fetch(
-    `${rc.runner}/v1/apps/${encodeURIComponent(appId)}/source/archive${query}`,
-    { headers: { authorization: `Bearer ${rc.token}` } }
-  );
-
-  return new Response(res.body, {
-    headers: {
-      "content-type": res.headers.get("content-type") ?? "application/x-tar",
-    },
-    status: res.status,
-  });
-};
+  forwardSourceBody(request, env, params);

@@ -1,8 +1,8 @@
-import { expect, test } from "bun:test";
+import { describe, expect, test } from "bun:test";
 
+import type { RunnerTree } from "../runner";
 import {
   failureOf,
-  OPEN_DEADLINE_MS,
   readOnlyOf,
   RefEvents,
   RefViews,
@@ -11,201 +11,135 @@ import {
   stepRef,
   switchingTo,
 } from "./ref-view";
+import type { ReadyCheckout, RefView } from "./ref-view";
 
-const ready = () => RefViews.Ready({ readOnly: "", ref: "main" });
+const TREE: RunnerTree = { files: [], sha: "a".repeat(40), truncated: false };
 
-const opening = (ref: string) =>
-  stepRef(RefViews.Booting(), RefEvents.Requested({ force: false, ref }));
+const checkout = (
+  ref: string,
+  readOnly: ReadyCheckout["readOnly"] = ""
+): ReadyCheckout => ({ readOnly, ref, tree: TREE });
 
-test("a first open becomes Ready only through this ref's Opened", () => {
-  const { state } = opening("main");
+const boot = (): RefView => RefViews.Booting();
 
-  expect(switchingTo(state)).toBe("main");
-  expect(readOnlyOf(state)).toBe("");
+const request = (state: RefView, ref: string, force = false) =>
+  stepRef(state, RefEvents.Requested({ force, ref }));
 
-  const opened = stepRef(
-    state,
-    RefEvents.Opened({ readOnly: "", ref: "main" })
-  );
+const opened = (state: RefView, at: ReadyCheckout) =>
+  stepRef(state, RefEvents.Opened({ checkout: at }));
 
-  expect(opened.refused).toBe(false);
-  expect(opened.state._tag).toBe("Ready");
-  expect(opened.wipe).toBe(false);
-});
+const failed = (state: RefView, ref: string) =>
+  stepRef(state, RefEvents.Failed({ message: "boom", ref }));
 
-test("a pod that died during the open can never become Ready", () => {
-  // The listing resolved, then the frame reported the pod gone: the failure
-  // card is up, and the install that resolves afterwards must be refused.
-  const died = stepRef(
-    opening("main").state,
-    RefEvents.PodDied({ message: "pod stopped", ref: "main" })
-  );
+/** A machine that has opened `main`. */
+const ready = (): RefView => {
+  const decision = opened(request(boot(), "main").state, checkout("main"));
+  expect(decision.refused).toBe(false);
 
-  expect(died.state._tag).toBe("Failed");
-  expect(died.drop).toEqual(["main"]);
-  // Nothing was on screen, so the panes are wiped and the failure card says
-  // why: no banner may claim a read-only checkout that is not there.
-  expect(died.wipe).toBe(true);
-  expect(readOnlyOf(died.state)).toBe("");
+  return decision.state;
+};
 
-  const late = stepRef(
-    died.state,
-    RefEvents.Opened({ readOnly: "tag", ref: "main" })
-  );
+describe("the ref machine's transition table", () => {
+  test("Booting opens on the first request", () => {
+    const decision = request(boot(), "main");
 
-  expect(late.refused).toBe(true);
-  expect(late.state._tag).toBe("Failed");
-});
-
-test("a failed switch keeps the checkout on screen, and its readOnly", () => {
-  const readyState = ready();
-
-  const switching = stepRef(
-    readyState,
-    RefEvents.Requested({ force: false, ref: "release" })
-  ).state;
-
-  expect(shownCheckout(switching)?.ref).toBe("main");
-
-  const failed = stepRef(
-    switching,
-    RefEvents.Failed({ message: "404", ref: "release" })
-  );
-
-  expect(failed.refused).toBe(false);
-  expect(failed.wipe).toBe(false);
-  expect(shownCheckout(failed.state)?.ref).toBe("main");
-  // The banner describes the checkout the panes really show.
-  expect(readOnlyOf(failed.state)).toBe("");
-  // And the card names the ref that failed, not the browsed one.
-  expect(failureOf(failed.state)).toEqual({
-    message: "404",
-    ref: "release",
+    expect(decision.refused).toBe(false);
+    expect(decision.read).toBe("main");
+    expect(decision.state).toEqual(
+      RefViews.Opening({ previous: null, ref: "main" })
+    );
   });
-});
 
-test("a pod that dies on the installed checkout leaves nothing claimed", () => {
-  const died = stepRef(
-    RefViews.Ready({ readOnly: "role", ref: "staging" }),
-    RefEvents.PodDied({ message: "gone", ref: "staging" })
-  );
-
-  expect(died.wipe).toBe(true);
-  expect(readOnlyOf(died.state)).toBe("");
-  expect(shownCheckout(died.state)).toBeNull();
-});
-
-test("a request for the ref the panes are on is not a second open", () => {
-  const same = stepRef(
-    ready(),
-    RefEvents.Requested({ force: false, ref: "main" })
-  );
-
-  expect(same.refused).toBe(true);
-});
-
-test("the retry drops what the failed attempt left and opens it again", () => {
-  const failed = stepRef(
-    opening("main").state,
-    RefEvents.Failed({ message: "boom", ref: "main" })
-  ).state;
-
-  const retried = retryRef(failed);
-
-  expect(retried.state._tag).toBe("Opening");
-  expect(retried.drop).toEqual(["main"]);
-  // Retrying a ref that is not the failed one is not a retry.
-  expect(retryRef(ready()).refused).toBe(true);
-});
-
-test("switching back to the ref the panes still show is not refused", () => {
-  // The bug: while `release` opens, the panes still show `main`, and the user
-  // clicks back to it. Refusing that request left the machine `Opening`
-  // `release` with no request running for it — a spinner that never cleared.
-  const switching = stepRef(
-    ready(),
-    RefEvents.Requested({ force: false, ref: "release" })
-  ).state;
-
-  const back = stepRef(
-    switching,
-    RefEvents.Requested({ force: false, ref: "main" })
-  );
-
-  expect(back.refused).toBe(false);
-  expect(back.state._tag).toBe("Opening");
-  expect(switchingTo(back.state)).toBe("main");
-  // What is on screen is still what the banner describes.
-  expect(shownCheckout(back.state)?.ref).toBe("main");
-});
-
-test("a request for the ref that is opening is not a second open", () => {
-  const same = stepRef(
-    opening("main").state,
-    RefEvents.Requested({ force: false, ref: "main" })
-  );
-
-  expect(same.refused).toBe(true);
-  expect(switchingTo(same.state)).toBe("main");
-});
-
-test("the ref a failed switch left on screen opens again", () => {
-  // Going back to it after a failed switch is a new open, not a repaint of the
-  // failure: otherwise the card outlives the failure it describes.
-  const failed = stepRef(
-    stepRef(ready(), RefEvents.Requested({ force: false, ref: "release" }))
-      .state,
-    RefEvents.Failed({ message: "404", ref: "release" })
-  ).state;
-
-  const again = stepRef(
-    failed,
-    RefEvents.Requested({ force: false, ref: "main" })
-  );
-
-  expect(again.refused).toBe(false);
-  expect(again.state._tag).toBe("Opening");
-  expect(failureOf(again.state)).toBeNull();
-});
-
-test("an answer the frame never gives ends in the card the retry reopens", () => {
-  const switching = opening("main").state;
-
-  const lost = stepRef(switching, RefEvents.TimedOut({ ref: "main" }));
-
-  expect(lost.refused).toBe(false);
-  expect(switchingTo(lost.state)).toBe("");
-  expect(failureOf(lost.state)).toEqual({
-    message: `the checkout did not answer within ${OPEN_DEADLINE_MS / 1000}s`,
-    ref: "main",
+  test("an empty ref is refused", () => {
+    expect(request(boot(), "").refused).toBe(true);
   });
-  // A first open had nothing on screen: the panes go with it.
-  expect(lost.wipe).toBe(true);
-  expect(lost.drop).toEqual(["main"]);
 
-  // The retry opens it again, and a late answer to the abandoned open cannot
-  // turn that attempt into a `Ready`.
-  const retried = retryRef(lost.state);
+  test("Opening lands on Ready for the ref it is opening", () => {
+    const opening = request(boot(), "main").state;
+    const decision = opened(opening, checkout("main"));
 
-  expect(switchingTo(retried.state)).toBe("main");
+    expect(decision.refused).toBe(false);
+    expect(shownCheckout(decision.state)).toEqual(checkout("main"));
+    expect(switchingTo(decision.state)).toBe("");
+  });
 
-  const late = stepRef(
-    retried.state,
-    RefEvents.Opened({ readOnly: "", ref: "other" })
-  );
+  test("Opening fails on its own ref, keeping what the panes show", () => {
+    const loading = request(boot(), "main").state;
+    const shown = opened(loading, checkout("main")).state;
+    const next = request(shown, "feature").state;
+    const decision = failed(next, "feature");
 
-  expect(late.refused).toBe(true);
-});
+    expect(decision.state._tag).toBe("Failed");
+    expect(failureOf(decision.state)).toEqual({
+      message: "boom",
+      ref: "feature",
+    });
+    // The previous checkout stays on screen: the panes still show `main`.
+    expect(shownCheckout(decision.state)?.ref).toBe("main");
+    expect(readOnlyOf(decision.state)).toBe("");
+  });
 
-test("a timeout for a ref the machine is not opening is refused", () => {
-  const superseded = stepRef(
-    stepRef(ready(), RefEvents.Requested({ force: false, ref: "release" }))
-      .state,
-    RefEvents.Requested({ force: false, ref: "topic" })
-  ).state;
+  test("a second request for the target is refused", () => {
+    const opening = request(boot(), "main").state;
 
-  const late = stepRef(superseded, RefEvents.TimedOut({ ref: "release" }));
+    expect(request(opening, "main").refused).toBe(true);
+    expect(request(ready(), "main").refused).toBe(true);
+  });
 
-  expect(late.refused).toBe(true);
-  expect(switchingTo(late.state)).toBe("topic");
+  test("a forced request re-reads the ref the panes show", () => {
+    const decision = request(ready(), "main", true);
+
+    expect(decision.refused).toBe(false);
+    expect(decision.read).toBe("main");
+    expect(shownCheckout(decision.state)?.ref).toBe("main");
+  });
+
+  test("a request for another ref opens it over the shown one", () => {
+    const decision = request(ready(), "feature");
+
+    expect(decision.state._tag).toBe("Opening");
+    expect(shownCheckout(decision.state)?.ref).toBe("main");
+    expect(switchingTo(decision.state)).toBe("feature");
+  });
+
+  test("the shown ref can be asked for again while another opens", () => {
+    const opening = request(ready(), "feature").state;
+
+    // Going back to the ref the panes show is how the user cancels a switch:
+    // it must not be refused, or the spinner would never clear.
+    expect(request(opening, "main").refused).toBe(false);
+  });
+
+  test("an Opened for a superseded ref is refused", () => {
+    const opening = request(ready(), "feature").state;
+    const back = request(opening, "main").state;
+    const stale = opened(back, checkout("feature"));
+
+    expect(stale.refused).toBe(true);
+    expect(shownCheckout(stale.state)?.ref).toBe("main");
+  });
+
+  test("a Failed for another ref is refused", () => {
+    const opening = request(ready(), "feature").state;
+
+    expect(failed(opening, "main").refused).toBe(true);
+  });
+
+  test("Retry reopens the ref that failed", () => {
+    const failing = failed(request(ready(), "feature").state, "feature");
+    const decision = retryRef(failing.state);
+
+    expect(decision.refused).toBe(false);
+    expect(decision.read).toBe("feature");
+    expect(decision.state._tag).toBe("Opening");
+  });
+
+  test("a read-only checkout reports its reason to the banners", () => {
+    const decision = opened(
+      request(boot(), "v1.0.0").state,
+      checkout("v1.0.0", "tag")
+    );
+
+    expect(readOnlyOf(decision.state)).toBe("tag");
+  });
 });

@@ -6,9 +6,9 @@
  *
  * Whether a path is bounded is one explicit decision ({@link routeTimeout}),
  * not a substring hunt: a stream is a path that *ends* in `/stream` (plus
- * the multiplexing `/api/streams`), a download is the R2 object routes
- * under `/storage/` or the source archive (`…/archive`), and a static file
- * is the fingerprinted client bundle under `/assets/`. A JSON action whose
+ * the multiplexing `/api/streams`), a download is the R2 object routes under
+ * `/storage/`, and a static file is the fingerprinted client bundle under
+ * `/assets/`. A JSON action whose
  * name merely contains `/stream` (e.g. `…/streamSomething`) is bounded like
  * any other action.
  *
@@ -39,7 +39,7 @@ const exemptWhy = (path: string): "download" | "static" | "stream" | null => {
     return "stream";
   }
 
-  if (path.startsWith("/storage/") || path.endsWith("/archive")) {
+  if (path.startsWith("/storage/")) {
     return "download";
   }
 
