@@ -112,8 +112,8 @@ pub async fn get_environment_by_label(
         .await
 }
 
-/// The environment tracking one git ref in an app (a branch, or one user's
-/// workspace preview of it). At most one row exists per ref.
+/// The environment tracking one git ref in an app. At most one row exists
+/// per ref.
 pub async fn get_environment_by_ref(
     pool: &SqlitePool,
     app_id: &str,
@@ -142,7 +142,7 @@ pub async fn list_environments(pool: &SqlitePool, app_id: &str) -> sqlx::Result<
 }
 
 /// Every environment of every app: what the reconcile loop walks to spawn
-/// fleets, route the edge and sweep expired workspace previews.
+/// fleets and route the edge.
 pub async fn list_all_environments(pool: &SqlitePool) -> sqlx::Result<Vec<Environment>> {
     let sql = format!(
         "SELECT {ENV_COLS} FROM environment e JOIN app a ON a.id = e.app_id \
@@ -182,21 +182,19 @@ pub async fn environment_route(
         .await
 }
 
-/// Remove one environment's row and return it (its bucket and fleet key are
-/// what the caller needs to wipe). `None` when there was no such row.
-/// Its cohost skip-state goes first: a reused label gets a fresh id and
-/// must not inherit it (`environment_env` cascades; the hash table keys
-/// production on `''`, so it cannot cascade the same way).
-pub async fn delete_environment(pool: &SqlitePool, id: &str) -> sqlx::Result<Option<Environment>> {
-    let Some(row) = get_environment(pool, id).await? else {
-        return Ok(None);
-    };
+/// Remove one environment row without reading it back. The boot teardown of
+/// retired rows needs this: `EnvironmentKind` can no longer decode a
+/// `workspace` row, so the row is never loaded as a model.
+/// Its cohost skip-state goes first: a reused label gets a fresh id and must
+/// not inherit it (`environment_env` cascades; the hash table keys production
+/// on `''`, so it cannot cascade the same way).
+pub async fn delete_environment_row(pool: &SqlitePool, id: &str) -> sqlx::Result<()> {
     crate::db::delete_environment_hashes(pool, id).await?;
     sqlx::query("DELETE FROM environment WHERE id = ?")
         .bind(id)
         .execute(pool)
         .await?;
-    Ok(Some(row))
+    Ok(())
 }
 
 /// Toggle members-only/public. Returns the updated row.
@@ -361,25 +359,6 @@ pub async fn count_environments_for_app(pool: &SqlitePool, app_id: &str) -> sqlx
         .fetch_one(pool)
         .await?;
     Ok(n)
-}
-
-/// Workspace previews with no deploy since `older_than_iso` (ISO-8601, the
-/// format stored above): the reconcile sweep deletes these — ROADMAP, seven
-/// days without a deploy. Branch environments are never returned.
-pub async fn expired_workspace_environments(
-    pool: &SqlitePool,
-    older_than_iso: &str,
-) -> sqlx::Result<Vec<Environment>> {
-    let sql = format!(
-        "SELECT {ENV_COLS} FROM environment e JOIN app a ON a.id = e.app_id \
-         WHERE e.kind = 'workspace' \
-           AND coalesce(e.last_deployed_at, e.created_at) < ? \
-         ORDER BY e.created_at ASC"
-    );
-    sqlx::query_as::<_, Environment>(sqlx::AssertSqlSafe(sql))
-        .bind(older_than_iso)
-        .fetch_all(pool)
-        .await
 }
 
 /// One environment's overrides only (`environment_env` rows), provisioned
@@ -701,10 +680,7 @@ mod tests {
             .unwrap();
         assert_eq!(list_env_override(&pool, &env.id).await.unwrap().len(), 2);
         // Deleting the environment takes its overrides with it.
-        delete_environment(&pool, &env.id)
-            .await
-            .unwrap()
-            .expect("row");
+        delete_environment_row(&pool, &env.id).await.unwrap();
         assert!(list_env_override(&pool, &env.id).await.unwrap().is_empty());
     }
 
@@ -844,82 +820,6 @@ mod tests {
         );
         // Token, admission name, MODEL and the preview's own auth row.
         assert_eq!(list_env_override(&pool, &env.id).await.unwrap().len(), 4);
-    }
-
-    #[tokio::test]
-    async fn expiry_returns_only_stale_workspace_previews() {
-        let pool = connect("sqlite::memory:").await.expect("boot");
-        let cfg = crate::config::config_for_tests();
-        let app = seed(&pool).await;
-        let workspace = create_environment(
-            &pool,
-            &cfg,
-            NewEnvironment {
-                app_id: &app.id,
-                slug: "env-app",
-                label: "feat-user1",
-                kind: EnvironmentKind::Workspace,
-                git_ref: "refs/previews/user_1/feat",
-                created_by: "user_1",
-                listen: 30010,
-                internal: 30011,
-            },
-        )
-        .await
-        .expect("workspace env");
-        let branch = create_environment(&pool, &cfg, new(&app.id, "feat", "refs/heads/feat"))
-            .await
-            .expect("branch env");
-        sqlx::query(
-            "UPDATE environment SET created_at = '2020-01-01T00:00:00.000Z', \
-                     last_deployed_at = NULL WHERE id = ?",
-        )
-        .bind(&workspace.id)
-        .execute(&pool)
-        .await
-        .unwrap();
-        let stale = expired_workspace_environments(&pool, "2026-01-01T00:00:00.000Z")
-            .await
-            .unwrap();
-        assert_eq!(stale.len(), 1);
-        assert_eq!(stale[0].id, workspace.id);
-        // A branch environment twice that old is never swept.
-        assert!(
-            expired_workspace_environments(&pool, "2030-01-01T00:00:00.000Z")
-                .await
-                .unwrap()
-                .iter()
-                .all(|e| e.id != branch.id)
-        );
-        // A workspace preview that deployed recently has not expired, and a
-        // recent deploy re-arms the clock for a stale row.
-        let fresh = create_environment(
-            &pool,
-            &cfg,
-            NewEnvironment {
-                app_id: &app.id,
-                slug: "env-app",
-                label: "feat-user2",
-                kind: EnvironmentKind::Workspace,
-                git_ref: "refs/previews/user_2/feat",
-                created_by: "user_2",
-                listen: 30020,
-                internal: 30021,
-            },
-        )
-        .await
-        .expect("fresh workspace env");
-        mark_environment_deployed(&pool, &workspace.id, "abc1234")
-            .await
-            .unwrap();
-        let stale = expired_workspace_environments(&pool, "2026-01-01T00:00:00.000Z")
-            .await
-            .unwrap();
-        assert!(stale.iter().all(|e| e.id != fresh.id));
-        assert!(
-            stale.iter().all(|e| e.id != workspace.id),
-            "a deploy re-arms the clock"
-        );
     }
 
     /// A stop racing an environment status flip wins, while a deploy's sha

@@ -1190,74 +1190,6 @@ async fn update_status_agrees() {
     h.finish().await;
 }
 
-/// `source.bundle` reads a real push mirror at the requested ref, through the
-/// REST mirror and the RPC, which must agree.
-#[tokio::test]
-async fn source_bundle_agrees() {
-    let h = Harness::new().await;
-    let app = h.seed_app("code-app").await;
-
-    // A push mirror with one commit on `main`.
-    let bare = crate::host::git_http::http_bare(&h.state.config, &app.slug);
-    let work = h.dir.join("bundle-work");
-    std::fs::create_dir_all(work.join("src")).expect("worktree");
-    std::fs::write(work.join("src/index.ts"), "export const a = 1;\n").expect("source");
-    git(&work, &["init", "-q", "--initial-branch=main", "."]).await;
-    git(&work, &["add", "-A"]).await;
-    git(&work, &["commit", "-qm", "init"]).await;
-    let sha = git(&work, &["rev-parse", "HEAD"]).await.trim().to_string();
-    std::fs::create_dir_all(bare.parent().expect("mirror parent")).expect("mirror parent");
-    git(
-        &h.dir,
-        &[
-            "init",
-            "-q",
-            "--bare",
-            "--initial-branch=main",
-            bare.to_str().expect("mirror path"),
-        ],
-    )
-    .await;
-    git(
-        &work,
-        &[
-            "push",
-            "-q",
-            bare.to_str().expect("mirror path"),
-            "main:main",
-        ],
-    )
-    .await;
-
-    let (status, rest) = h
-        .rest("GET", &format!("/v1/apps/{}/bundle", app.id), None)
-        .await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(rest["sha"], json!(sha));
-    assert_eq!(
-        rest["files"],
-        json!([{ "path": "src/index.ts", "text": "export const a = 1;\n" }])
-    );
-    assert_eq!(rest["truncated"], json!(false));
-    assert_eq!(
-        h.rpc("source.bundle", json!({ "id": app.id }))
-            .await
-            .expect("source.bundle"),
-        rest
-    );
-    // An explicit ref resolves like `source.tree`, and an empty one must not
-    // 400 (the UI's "deployed" choice sends no ref at all).
-    for query in ["?ref=main", "?ref="] {
-        let (status, value) = h
-            .rest("GET", &format!("/v1/apps/{}/bundle{query}", app.id), None)
-            .await;
-        assert_eq!(status, StatusCode::OK, "{query}");
-        assert_eq!(value, rest, "{query}");
-    }
-
-    h.finish().await;
-}
-
 /// Every surface that accepts a caller-supplied ref refuses the runner's
 /// hidden namespace (`refs/previews/…`, another user's workspace snapshot)
 /// with a 4xx instead of resolving it, while branches and shas keep working.
@@ -1537,12 +1469,10 @@ async fn git(dir: &std::path::Path, args: &[&str]) -> String {
     .unwrap_or_else(|e| panic!("git {args:?}: {e:#}"))
 }
 
-/// Seed one preview environment of `app` directly (no mirror needed).
-async fn seed_env(
+/// Seed one branch environment of `app` directly (no mirror needed).async fn seed_env(
     h: &Harness,
     app: &crate::models::App,
     label: &str,
-    kind: crate::models::EnvironmentKind,
     git_ref: &str,
 ) -> crate::models::Environment {
     crate::db::create_environment(
@@ -1552,7 +1482,7 @@ async fn seed_env(
             app_id: &app.id,
             slug: &app.slug,
             label,
-            kind,
+            kind: crate::models::EnvironmentKind::Branch,
             git_ref,
             created_by: "user_1",
             listen: 31000,
@@ -1571,14 +1501,7 @@ async fn seed_env(
 async fn a_watched_environment_deploy_waits_for_the_apps_other_deploy() {
     let h = Harness::new().await;
     let app = h.seed_app("env-wait").await;
-    let env = seed_env(
-        &h,
-        &app,
-        "feature",
-        crate::models::EnvironmentKind::Branch,
-        "refs/heads/feature",
-    )
-    .await;
+    let env = seed_env(&h, &app, "feature", "refs/heads/feature").await;
     let deploy_id = crate::db::upsert_deploy(
         &h.state.pool,
         None,
@@ -1713,14 +1636,7 @@ async fn rollback_queues_behind_the_apps_in_flight_deploy() {
 async fn environments_agree_and_gate_on_role() {
     let h = Harness::new().await;
     let app = h.seed_app("env-api").await;
-    let branch = seed_env(
-        &h,
-        &app,
-        "feature",
-        crate::models::EnvironmentKind::Branch,
-        "refs/heads/feature",
-    )
-    .await;
+    let branch = seed_env(&h, &app, "feature", "refs/heads/feature").await;
 
     let (status, rest) = h
         .rest(
@@ -1844,14 +1760,7 @@ async fn environments_agree_and_gate_on_role() {
 async fn deploys_filter_by_environment() {
     let h = Harness::new().await;
     let app = h.seed_app("env-deploys").await;
-    let env = seed_env(
-        &h,
-        &app,
-        "staging",
-        crate::models::EnvironmentKind::Branch,
-        "refs/heads/staging",
-    )
-    .await;
+    let env = seed_env(&h, &app, "staging", "refs/heads/staging").await;
     let pool = &h.state.pool;
     crate::db::upsert_deploy(
         pool,
@@ -1949,14 +1858,7 @@ async fn environment_caps_and_labels() {
                 .map(|e| e.label.clone())
                 .collect::<Vec<_>>(),
         );
-        seed_env(
-            &h,
-            &app,
-            &label,
-            crate::models::EnvironmentKind::Branch,
-            &format!("refs/heads/feature/{i}"),
-        )
-        .await;
+        seed_env(&h, &app, &label, &format!("refs/heads/feature/{i}")).await;
     }
     // The cap is what `environments.create` checks; at the limit it refuses
     // with a conflict before any git work.
@@ -1968,62 +1870,6 @@ async fn environment_caps_and_labels() {
         )
         .await;
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
-    // A workspace preview of the same branch by two users is two labels.
-    assert_ne!(
-        env_label::workspace_label("feature/x", "user_1"),
-        env_label::workspace_label("feature/x", "user_2")
-    );
-    h.finish().await;
-}
-
-/// The hidden-ref plumbing `source.preview` rides on: the ref shape, the
-/// publishability rules, and ref-addressed environment lookup (the deploy
-/// routing input).
-#[tokio::test]
-async fn preview_refs_are_hidden_and_ref_routed() {
-    use crate::host::{forge, git_http};
-    use crate::service::environments;
-    let h = Harness::new().await;
-    let app = h.seed_app("env-refs").await;
-    let git_ref = environments::preview_ref("3f1a9c22-0000-4000-8000-000000000001", "feature/x");
-    assert_eq!(
-        git_ref, "refs/previews/3f1a9c22-0000-4000-8000-000000000001/feature/x",
-        "a UUID survives sanitizing unchanged"
-    );
-    assert!(git_ref.len() <= 40 + "refs/previews/".len() + "/feature/x".len());
-    // An exotic user id cannot escape the ref grammar either.
-    let odd = environments::preview_ref("../../etc", "feature/x");
-    assert!(forge::publishable_ref(&odd), "{odd}");
-    assert!(!odd.contains(".."));
-    assert!(forge::publishable_ref(&git_ref));
-    assert!(forge::publishable_ref("refs/heads/feature"));
-    assert!(!forge::publishable_ref("refs/tags/v1"));
-    assert!(!forge::publishable_ref("refs/previews//feature"));
-    assert!(git_http::PREVIEW_REF_PREFIX == "refs/previews/");
-
-    let env = seed_env(
-        &h,
-        &app,
-        &environments::preview_ref("user_1", "feature/x"),
-        crate::models::EnvironmentKind::Workspace,
-        &git_ref,
-    )
-    .await;
-    assert_eq!(env.kind, crate::models::EnvironmentKind::Workspace);
-    // Routing: only the environment that tracks the ref is found.
-    let found = crate::db::get_environment_by_ref(&h.state.pool, &app.id, &git_ref)
-        .await
-        .expect("lookup")
-        .expect("row");
-    assert_eq!(found.id, env.id);
-    assert!(crate::db::get_environment_by_ref(
-        &h.state.pool,
-        &app.id,
-        "refs/previews/other/feature/x"
-    )
-    .await
-    .expect("lookup")
-    .is_none());
     h.finish().await;
 }
 
@@ -2034,24 +1880,10 @@ async fn preview_refs_are_hidden_and_ref_routed() {
 async fn logs_scope_to_environment() {
     let h = Harness::new().await;
     let app = h.seed_app("env-logs").await;
-    let env = seed_env(
-        &h,
-        &app,
-        "staging",
-        crate::models::EnvironmentKind::Branch,
-        "refs/heads/staging",
-    )
-    .await;
+    let env = seed_env(&h, &app, "staging", "refs/heads/staging").await;
     // A sibling app with its own environment: its ring key must not cross.
     let other = h.seed_app("other-logs").await;
-    let other_env = seed_env(
-        &h,
-        &other,
-        "staging",
-        crate::models::EnvironmentKind::Branch,
-        "refs/heads/staging",
-    )
-    .await;
+    let other_env = seed_env(&h, &other, "staging", "refs/heads/staging").await;
 
     crate::host::logs::append(&h.state.logs, &app.slug, "prod line".into()).await;
     crate::host::logs::append(
@@ -2144,14 +1976,7 @@ impl SseReader {
 async fn the_state_stream_resends_the_app_and_its_environments_on_change() {
     let h = Harness::new().await;
     let app = h.seed_app("state").await;
-    let env = seed_env(
-        &h,
-        &app,
-        "feature",
-        crate::models::EnvironmentKind::Branch,
-        "refs/heads/feature",
-    )
-    .await;
+    let env = seed_env(&h, &app, "feature", "refs/heads/feature").await;
     let request = Request::builder()
         .uri(format!("/v1/apps/{}/state/stream", app.id))
         .header("authorization", format!("Bearer {TOKEN}"))

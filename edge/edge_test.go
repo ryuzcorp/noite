@@ -1191,10 +1191,13 @@ func writeTableFile(t *testing.T, path, body string) {
 func TestValidateRefusesImpossibleModes(t *testing.T) {
 	up := "127.0.0.1:1"
 	bad := []Route{
+		// The pod preview host is retired: its wire kind is no longer in the
+		// closed set, so a table carrying it is refused (the old one keeps
+		// serving).
+		{Kind: "preview", Upstream: up},
 		// Wake and gate are fleet/environment hops; on anything else the
 		// static config would ignore them.
 		{Kind: KindControl, Upstream: up, Asleep: true},
-		{Kind: KindPreview, Upstream: up, Asleep: true},
 		{Kind: KindTenant, Upstream: up, Gated: true},
 		{Kind: KindFallback, Upstream: up, Gated: true},
 		// Only git and the runner's fallback page have a rewrite.
@@ -1243,7 +1246,6 @@ func TestModeTransitionTable(t *testing.T) {
 		{Route{Kind: KindEnv, Upstream: up, Asleep: true}, false, false, true, false},
 		{Route{Kind: KindEnv, Upstream: up, Gated: true}, false, true, false, true},
 		{Route{Kind: KindEnvPark, Upstream: up}, false, false, false, false},
-		{Route{Kind: KindPreview, Upstream: up}, false, false, false, false},
 		{Route{Kind: KindFallback, Upstream: up}, false, false, false, false},
 	}
 	for _, tc := range cases {

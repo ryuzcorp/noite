@@ -99,14 +99,6 @@ fn validate_web_path(path: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Where a browser commit lands.
-enum WebTarget<'a> {
-    /// A branch (`None` = the default branch).
-    Branch(Option<&'a str>),
-    /// A workspace preview's hidden ref, committed on top of `branch`'s head.
-    Preview { git_ref: &'a str, branch: &'a str },
-}
-
 /// Commit browser edits as a branch commit without a worktree: the changes'
 /// files are written (added or modified) and its deletes removed. `branch`
 /// defaults to `main`; a branch that does not exist yet is created, from
@@ -135,35 +127,9 @@ pub async fn web_commit(
         actor,
         message,
         changes,
-        WebTarget::Branch(branch),
+        branch,
         from_sha,
         expected_tip,
-    )
-    .await
-}
-
-/// Commit uncommitted Code mode changes to a workspace preview's hidden ref
-/// (`refs/previews/<userId>/<branch>`), on top of `branch`'s head. The branch
-/// itself is never moved and no PR sees the commit: hidden refs are not
-/// advertised, not listed as branches and not used as PR heads.
-pub async fn web_commit_preview(
-    state: &AppState,
-    app: &App,
-    actor: &Identity,
-    message: &str,
-    changes: WebChanges<'_>,
-    git_ref: &str,
-    branch: &str,
-) -> anyhow::Result<String> {
-    commit_into(
-        state,
-        app,
-        actor,
-        message,
-        changes,
-        WebTarget::Preview { git_ref, branch },
-        None,
-        None,
     )
     .await
 }
@@ -175,7 +141,7 @@ async fn commit_into(
     actor: &Identity,
     message: &str,
     changes: WebChanges<'_>,
-    target: WebTarget<'_>,
+    branch: Option<&str>,
     from_sha: Option<&str>,
     expected_tip: Option<&str>,
 ) -> anyhow::Result<String> {
@@ -237,40 +203,19 @@ async fn commit_into(
     let bare = forge::read_mirror(state, &app.slug).await?;
     let refs = list_refs(&bare).await?;
     // The ref this commit moves, and the parent it grows from: a branch grows
-    // from its own tip (fromSha/main/root on creation); a workspace preview
-    // grows from its branch's head, so each snapshot is "the branch plus my
-    // uncommitted changes" rather than a chain of snapshots.
-    let (refname, parent) = match target {
-        WebTarget::Branch(branch) => {
-            let branch = branch.unwrap_or(DEFAULT_BRANCH);
-            if !forge::valid_branch_name(branch) {
-                bail!("invalid branch {branch:?}");
-            }
-            let refname = format!("refs/heads/{branch}");
-            let existing = refs.get(&refname).cloned();
-            let parent = match &existing {
-                Some(sha) => Some(sha.clone()),
-                None => match from_sha {
-                    Some(from) => Some(forge::resolve_user_ref(&bare, from).await?),
-                    None => refs.get(&format!("refs/heads/{DEFAULT_BRANCH}")).cloned(),
-                },
-            };
-            (refname, parent)
-        }
-        WebTarget::Preview { git_ref, branch } => {
-            if !forge::publishable_ref(git_ref) {
-                bail!("invalid ref {git_ref:?}");
-            }
-            if !forge::valid_branch_name(branch) {
-                bail!("invalid branch {branch:?}");
-            }
-            let branch_ref = format!("refs/heads/{branch}");
-            let parent = refs
-                .get(&branch_ref)
-                .cloned()
-                .or_else(|| refs.get(git_ref).cloned());
-            (git_ref.to_string(), parent)
-        }
+    // from its own tip (fromSha/main/root on creation).
+    let branch = branch.unwrap_or(DEFAULT_BRANCH);
+    if !forge::valid_branch_name(branch) {
+        bail!("invalid branch {branch:?}");
+    }
+    let refname = format!("refs/heads/{branch}");
+    let existing = refs.get(&refname).cloned();
+    let parent = match &existing {
+        Some(sha) => Some(sha.clone()),
+        None => match from_sha {
+            Some(from) => Some(forge::resolve_user_ref(&bare, from).await?),
+            None => refs.get(&format!("refs/heads/{DEFAULT_BRANCH}")).cloned(),
+        },
     };
     // The caller's precondition, checked before any object is written: a tip
     // that moved since it read the branch is refused, and its commit never

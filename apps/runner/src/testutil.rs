@@ -45,6 +45,12 @@ impl Drop for TempDir {
 /// never reach a real store, while missing-vs-unreachable keeps working:
 /// only a transport failure (not this stub) is an outage.
 pub async fn spawn_s3_stub() -> String {
+    spawn_s3_stub_recording().await.0
+}
+
+/// [`spawn_s3_stub`] plus the request lines it saw (`GET /noite?list-type=2…`),
+/// so a test can prove which prefix a purge walked.
+pub async fn spawn_s3_stub_recording() -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
     fn is_object_op(request: &[u8]) -> Option<bool> {
         let line = request
             .split(|byte| *byte == b'\n')
@@ -70,15 +76,26 @@ pub async fn spawn_s3_stub() -> String {
         .await
         .expect("bind s3 stub");
     let addr = listener.local_addr().expect("stub addr");
+    let seen: std::sync::Arc<std::sync::Mutex<Vec<String>>> = std::sync::Arc::default();
+    let record = seen.clone();
     tokio::spawn(async move {
         loop {
             let Ok((mut sock, _)) = listener.accept().await else {
                 break;
             };
+            let record = record.clone();
             tokio::spawn(async move {
                 use tokio::io::{AsyncReadExt, AsyncWriteExt};
                 let mut buf = vec![0u8; 8192];
-                let _ = sock.read(&mut buf).await;
+                let read = sock.read(&mut buf).await.unwrap_or(0);
+                if let Some(line) = String::from_utf8_lossy(&buf[..read]).lines().next() {
+                    if !line.is_empty() {
+                        record
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .push(line.to_string());
+                    }
+                }
                 let body = if is_object_op(&buf).unwrap_or(false) {
                     if is_read(&buf) {
                         concat!(
@@ -110,7 +127,7 @@ pub async fn spawn_s3_stub() -> String {
             });
         }
     });
-    format!("http://{addr}")
+    (format!("http://{addr}"), seen)
 }
 
 /// Whether any live process still carries `marker` in its command line.

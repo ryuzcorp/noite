@@ -2898,7 +2898,7 @@ mod tests {
             .await
             .expect("lookup")
             .expect("row");
-        db::delete_environment(&pool, &gone.id)
+        db::delete_environment_row(&pool, &gone.id)
             .await
             .expect("delete");
 

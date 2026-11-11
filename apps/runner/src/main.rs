@@ -499,6 +499,22 @@ async fn main() -> anyhow::Result<()> {
         control_boot: control_boot.clone(),
     };
 
+    // Retired workspace previews (`source.preview`, removed): an upgraded
+    // install still holds their rows, fleets and bucket prefixes, and the
+    // environment model no longer decodes one. Tear them down before the
+    // reconcile loop (or any request) lists environments; a failure aborts the
+    // boot so the next start retries instead of running on a database whose
+    // next environment read would fail.
+    let retired = host::env_teardown::retire_workspace_environments(&state).await?;
+    if retired > 0 {
+        tracing::info!(retired, "removed retired workspace preview environments");
+        // The route table is rebuilt from the rows; land the removal before
+        // the first request instead of waiting for the loop's first tick.
+        if let Err(e) = host::edge_table::push_routes(&state.pool, &state.config).await {
+            tracing::warn!(error = %format!("{e:#}"), "edge push after retiring workspace previews");
+        }
+    }
+
     let cfg_loop = (*config).clone();
     let shutdown_loop = shutdown.clone();
     tokio::spawn(host::loop_::run_forever(

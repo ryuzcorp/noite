@@ -23,7 +23,6 @@ const (
 	KindCustom   = "custom"
 	KindEnv      = "env"
 	KindEnvPark  = "env-parked"
-	KindPreview  = "preview"
 	KindFallback = "fallback"
 	KindDeny     = "deny"
 )
@@ -48,10 +47,8 @@ const (
 	// gated (forward_auth /v1/edge/env-gate) and woken.
 	ShapeEnv
 	// ShapeParked is a live environment with no fleet port yet: the
-	// runner's fallback page, no readiness hold.
+	// runner's fallback page serves its host.
 	ShapeParked
-	// ShapePreview is the pod preview host on the control plane.
-	ShapePreview
 	// ShapeFallback is the per-app and per-base wildcard fallback page.
 	ShapeFallback
 )
@@ -68,8 +65,6 @@ func shapeOf(kind string) (Shape, bool) {
 		return ShapeEnv, true
 	case KindEnvPark:
 		return ShapeParked, true
-	case KindPreview:
-		return ShapePreview, true
 	case KindFallback:
 		return ShapeFallback, true
 	case KindDeny:
@@ -88,7 +83,6 @@ func shapeOf(kind string) (Shape, bool) {
 //	    [*] --> Fleet: kind=tenant|custom
 //	    [*] --> Env: kind=env
 //	    [*] --> Parked: kind=env-parked
-//	    [*] --> Preview: kind=preview
 //	    [*] --> Fallback: kind=fallback
 //
 // Only a Fleet or an awake Env holds; Asleep wakes; Gated gates. Validate
@@ -296,7 +290,7 @@ func splitHostPort(hostport string) (string, string, error) {
 // Lookup returns the route for host: exact first, then longest suffix.
 // Suffixes match exactly one label (like Caddy's `*.base`): the remainder
 // must be a single non-empty label, so `a.b.base` never matches `.base`.
-// Environment and preview suffixes need no multi-label match: labels never
+// Environment suffixes need no multi-label match: labels never
 // contain dots (the runner's labeler folds everything else to `-`).
 func (t *Table) Lookup(host string) (Route, bool) {
 	if t == nil {

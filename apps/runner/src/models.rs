@@ -627,22 +627,21 @@ pub struct AppEnv {
     pub source: EnvSource,
 }
 
-/// What an environment was created from (ROADMAP): a pushed branch, or a
-/// workspace preview of uncommitted Code mode changes (a hidden ref).
+/// What an environment was created from: a pushed branch. It stays a closed
+/// type (and a column) because installed rows carry it; the retired
+/// `workspace` value is torn down at boot and can no longer be read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type, TS)]
 #[serde(rename_all = "lowercase")]
 #[sqlx(rename_all = "lowercase")]
 #[ts(export)]
 pub enum EnvironmentKind {
     Branch,
-    Workspace,
 }
 
 impl EnvironmentKind {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Branch => "branch",
-            Self::Workspace => "workspace",
         }
     }
 }
@@ -657,9 +656,9 @@ pub struct Environment {
     pub id: String,
     pub app_id: String,
     pub label: String,
-    /// `EnvironmentKind` as stored: `branch` or `workspace`.
+    /// `EnvironmentKind` as stored: `branch`.
     pub kind: EnvironmentKind,
-    /// `refs/heads/<branch>` or `refs/previews/<userId>/<branch>`.
+    /// `refs/heads/<branch>`.
     pub git_ref: String,
     pub created_by: String,
     pub fleet_bucket: String,

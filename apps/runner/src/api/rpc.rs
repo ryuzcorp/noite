@@ -62,7 +62,7 @@ fn internal(id: &Id, message: String) -> JsonRpcResponse {
 }
 
 /// Encode one service result: the JSON-RPC mirror of `ApiError`'s HTTP status
-/// (400/404/409/413, `InternalError` for 500).
+/// (400/403/404/409, `InternalError` for 500).
 fn complete<T: serde::Serialize>(id: Id, result: Result<T, ApiError>) -> JsonRpcResponse {
     match result {
         Ok(value) => JsonRpcResponse::success(id, value),
@@ -72,9 +72,6 @@ fn complete<T: serde::Serialize>(id: Id, result: Result<T, ApiError>) -> JsonRpc
         }
         Err(ApiError::NotFound(message)) => not_found(&id, &message),
         Err(ApiError::Conflict(message)) => conflict(&id, message),
-        Err(ApiError::TooLarge(message)) => {
-            rpc_err(id, JsonRpcErrorReason::ApplicationError(413), message)
-        }
         Err(ApiError::Internal(message)) => internal(&id, message),
     }
 }
@@ -322,8 +319,8 @@ struct RollbackParams {
     sha: String,
     #[serde(default)]
     environment_id: Option<String>,
-    /// The caller's role in the app: a preview target needs `push`, the way
-    /// `environments.deploy` does.
+    /// The caller's role in the app: an environment target needs `push`, the
+    /// way `environments.deploy` does.
     #[serde(default)]
     role: Option<String>,
 }
@@ -1121,16 +1118,6 @@ async fn dispatch_call(
                 service::source::tree(state, &p.id, p.reference.as_deref()).await,
             )
         }
-        "source.bundle" => {
-            let p: SourceRefParams = match parse(params, &id) {
-                Ok(p) => p,
-                Err(e) => return e,
-            };
-            complete(
-                id,
-                service::source::bundle(state, &p.id, p.reference.as_deref()).await,
-            )
-        }
         "source.blob" => {
             let p: SourceBlobParams = match parse(params, &id) {
                 Ok(p) => p,
@@ -1151,16 +1138,6 @@ async fn dispatch_call(
                 service::source::commit(state, &p.id, &p.body)
                     .await
                     .map(|sha| json!({ "sha": sha })),
-            )
-        }
-        "source.preview" => {
-            let p: CommitParams = match parse(params, &id) {
-                Ok(p) => p,
-                Err(e) => return e,
-            };
-            complete(
-                id,
-                service::environments::preview(state, &p.id, &p.body).await,
             )
         }
         "prs.list" => {

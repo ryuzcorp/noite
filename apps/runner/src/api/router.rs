@@ -73,7 +73,6 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/apps/{id}/git-remote", post(api::git_remote))
         .route("/v1/apps/{id}/tree", get(api::source_tree))
         .route("/v1/apps/{id}/blob/{*path}", get(api::source_blob))
-        .route("/v1/apps/{id}/bundle", get(api::source_bundle))
         // Forge mirror for the git.* RPCs. They sit under `/git/` because
         // `/v1/apps/{id}/refs` is the traffic-referrer endpoint.
         .route("/v1/apps/{id}/git/refs", get(api::git_refs))
@@ -139,13 +138,6 @@ pub fn router(state: AppState) -> Router {
                 crate::host::web_commit::MAX_COMMIT_BODY_BYTES,
             )),
         )
-        .route(
-            "/v1/apps/{id}/source/preview",
-            post(api::app_source_preview).layer(DefaultBodyLimit::max(
-                crate::host::web_commit::MAX_COMMIT_BODY_BYTES,
-            )),
-        )
-        .route("/v1/apps/{id}/source/archive", get(api::source_archive))
         .route(
             "/v1/apps/{id}/pull_requests",
             get(api::list_prs).post(api::create_pr),

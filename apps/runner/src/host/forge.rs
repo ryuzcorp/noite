@@ -412,9 +412,8 @@ async fn ensure_app_row(state: &AppState, app: &App) -> anyhow::Result<()> {
     }
 }
 
-/// [`publish_ref`] for a full ref name: `refs/heads/<branch>` (a branch) or
-/// `refs/previews/<userId>/<branch>` (a workspace preview's hidden ref, which
-/// is never advertised or browsed). Anything else is refused.
+/// [`publish_ref`] for a full ref name: `refs/heads/<branch>`. Anything else
+/// is refused.
 pub async fn publish_refname(
     state: &AppState,
     app: &App,
@@ -437,13 +436,10 @@ pub async fn publish_refname(
     // for it would create the *next* app's history (the tip sweep would
     // deploy it). Checked under the lock so create/rename cannot interleave.
     ensure_app_row(state, app).await?;
-    let bare = read_mirror_locked(state, &app.slug).await?;
-    if refname.starts_with(crate::host::git_http::PREVIEW_REF_PREFIX) {
-        // A mirror hydrated before preview environments existed has no hidden
-        // refs configured yet, and this is the first write that can create
-        // one.
-        hide_preview_refs(&bare).await;
-    }
+    // Sync the mirror inside the guard before the CAS: a cold mirror has no
+    // refs for the expected-old precondition, and the locked variants would
+    // self-deadlock if they re-took the lock.
+    read_mirror_locked(state, &app.slug).await?;
     let updates = match (expected_old, new) {
         (old, Some(sha)) => vec![ryuz_git::RefUpdate::set(refname, old, sha)],
         (Some(old), None) => vec![ryuz_git::RefUpdate::delete(refname, Some(old))],
@@ -501,47 +497,11 @@ pub async fn publish_refname(
     Ok(())
 }
 
-/// A ref a server-side move may write: a branch, or a workspace preview's
-/// hidden ref (`refs/previews/<userId>/<branch>`).
+/// A ref a server-side move may write: a branch.
 pub fn publishable_ref(refname: &str) -> bool {
     match refname.strip_prefix("refs/heads/") {
         Some(branch) => valid_branch_name(branch),
-        None => match refname.strip_prefix(crate::host::git_http::PREVIEW_REF_PREFIX) {
-            Some(rest) => {
-                let (user, branch) = rest.split_once('/').unwrap_or_default();
-                !user.is_empty()
-                    && user.len() <= 64
-                    && valid_branch_name(branch)
-                    && !user.contains('/')
-            }
-            None => false,
-        },
-    }
-}
-
-/// Make `refs/previews/*` invisible to every git client of this mirror: a
-/// clone or `ls-refs` never advertises them, and a fetch of one is refused.
-/// Idempotent (a plain config write) and cheap, so it runs on repo init and on
-/// the first preview ref written into an older mirror.
-pub async fn hide_preview_refs(bare: &Path) {
-    let git_dir = format!("--git-dir={}", bare.display());
-    for key in ["uploadpack.hideRefs", "transfer.hideRefs"] {
-        if let Err(e) = exec::run_cmd(
-            "git",
-            &[
-                &git_dir,
-                "config",
-                key,
-                crate::host::git_http::PREVIEW_REF_PREFIX,
-            ],
-            None,
-            &[],
-            Duration::from_secs(15),
-        )
-        .await
-        {
-            tracing::warn!(error = %format!("{e:#}"), "could not hide preview refs");
-        }
+        None => false,
     }
 }
 
@@ -3595,10 +3555,10 @@ mod tests {
         h.finish().await;
     }
 
-    /// The archive streams the committed tree (binary, executable, symlink)
-    /// and the listing carries each blob's sha and mode.
+    /// The tree listing carries each blob's sha and mode (binary,
+    /// executable, symlink included).
     #[tokio::test]
-    async fn source_archive_round_trips() {
+    async fn source_tree_carries_blob_sha_and_mode() {
         use std::os::unix::fs::PermissionsExt;
 
         let h = Harness::new("archive").await;
@@ -3644,113 +3604,15 @@ mod tests {
             .to_string();
         assert_eq!(binary["sha"], json!(blob), "tree carries the blob id");
 
-        let request = axum::http::Request::builder()
-            .method("GET")
-            .uri(format!("/v1/apps/{}/source/archive?ref=main", app.id))
-            .header("authorization", "Bearer test-token")
-            .body(axum::body::Body::empty())
-            .expect("build request");
-        let response = router.clone().oneshot(request).await.expect("dispatch");
-        assert_eq!(response.status(), axum::http::StatusCode::OK);
-        assert_eq!(
-            response
-                .headers()
-                .get(axum::http::header::CONTENT_TYPE)
-                .and_then(|v| v.to_str().ok()),
-            Some("application/x-tar")
-        );
-        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .expect("tar body");
-        let tar = h.dir.join("archive.tar");
-        std::fs::write(&tar, &bytes).expect("write tar");
-        let out = h.dir.join("untar");
-        std::fs::create_dir_all(&out).expect("untar dir");
-        exec::run_cmd(
-            "tar",
-            &[
-                "-xf",
-                tar.to_str().expect("tar path"),
-                "-C",
-                out.to_str().expect("out path"),
-            ],
-            None,
-            &[],
-            Duration::from_secs(60),
-        )
-        .await
-        .expect("untar");
-        assert_eq!(
-            std::fs::read(out.join("bin.dat")).expect("bin"),
-            vec![0x00_u8, 0xff, 0x01, 0x80]
-        );
-        assert_eq!(
-            std::fs::read_to_string(out.join("dir/file.txt")).expect("text"),
-            "hello\n"
-        );
-        let meta = std::fs::symlink_metadata(out.join("run.sh")).expect("run.sh");
-        assert_ne!(meta.permissions().mode() & 0o111, 0, "exec bit survives");
-        let link = std::fs::symlink_metadata(out.join("link")).expect("link");
-        assert!(link.file_type().is_symlink(), "symlink survives");
-        assert_eq!(
-            std::fs::read_link(out.join("link")).expect("link target"),
-            std::path::PathBuf::from("bin.dat")
-        );
-
         h.finish().await;
     }
 
-    /// A checkout over the Workspace caps is refused from the listing, before
-    /// the archive streams.
+    /// The TLS ask still admits a tenant host only once its fleet is up. The
+    /// retired pod host (`pod-<app id>.<base>`) now names a tenant slug like
+    /// any other, and gets no certificate without a live app.
     #[tokio::test]
-    async fn source_archive_refuses_a_repo_over_the_cap() {
-        let h = Harness::new("archivecap").await;
-        let app = h.app.clone();
-        let bare = h.mirror().await;
-        let work = Work::new(&h.dir.join("scratch")).await;
-        // Sparse: 100 MiB + 1 without writing the bytes.
-        let big = std::fs::File::create(work.dir.join("big.bin")).expect("create");
-        big.set_len(crate::host::source::MAX_WORKSPACE_BYTES + 1)
-            .expect("set len");
-        drop(big);
-        work.commit("huge").await;
-        let tips = seed_objects(&bare, &work).await;
-        for (branch, sha) in &tips {
-            publish_ref(&h.state, &app, branch, None, Some(sha.as_str()))
-                .await
-                .expect("publish");
-        }
-
-        let router = crate::api::router::router(h.state.clone());
-        let request = axum::http::Request::builder()
-            .method("GET")
-            .uri(format!("/v1/apps/{}/source/archive?ref=main", app.id))
-            .header("authorization", "Bearer test-token")
-            .body(axum::body::Body::empty())
-            .expect("build request");
-        let response = router.clone().oneshot(request).await.expect("dispatch");
-        assert_eq!(response.status(), axum::http::StatusCode::PAYLOAD_TOO_LARGE);
-        let text = String::from_utf8_lossy(
-            &axum::body::to_bytes(response.into_body(), usize::MAX)
-                .await
-                .expect("body"),
-        )
-        .to_string();
-        assert!(
-            text.contains("repository too large for Code mode"),
-            "{text}"
-        );
-
-        h.finish().await;
-    }
-
-    /// The TLS ask admits a preview host for an existing app only: the pod runs
-    /// in the browser, so the fleet need not be up, but an unknown slug gets no
-    /// certificate.
-    #[tokio::test]
-    async fn tls_ask_admits_preview_hosts_for_existing_apps() {
+    async fn tls_ask_admits_no_retired_pod_host() {
         let h = Harness::new("previewtls").await;
-        // The pod label spells the app id, so this one needs a real row id.
         let app = crate::db::create_app(
             &h.state.pool,
             &h.state.config,
@@ -3766,23 +3628,13 @@ mod tests {
         .await
         .expect("seed app");
         let router = crate::api::router::router(h.state.clone());
+        // A pod-shaped host is an ordinary (undeployed) tenant host now.
         assert_eq!(
             ask_tls(&router, &format!("pod-{}.localhost", app.id)).await,
-            axum::http::StatusCode::OK
-        );
-        // Only that one stable label is admitted: a random pod host gets no
-        // certificate (no per-session issuance, no CA-limit drain).
-        assert_eq!(
-            ask_tls(&router, "pod-1234.localhost").await,
             axum::http::StatusCode::NOT_FOUND
         );
         assert_eq!(
             ask_tls(&router, "app-0.preview.ghost.localhost").await,
-            axum::http::StatusCode::NOT_FOUND
-        );
-        // The bare tenant host still needs a deployed, running fleet.
-        assert_eq!(
-            ask_tls(&router, "previewtls.localhost").await,
             axum::http::StatusCode::NOT_FOUND
         );
         h.finish().await;

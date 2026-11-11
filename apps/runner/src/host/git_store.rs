@@ -56,8 +56,6 @@ pub fn build_wal(cfg: &Config) -> GitWal {
         exec::work_root(cfg).join("git-http"),
         ryuz_git::Layout::new("git"),
     )
-    .with_hidden_refs([crate::host::git_http::PREVIEW_REF_PREFIX.to_string()])
-    .with_extra_ref_prefixes([crate::host::git_http::PREVIEW_REF_PREFIX.to_string()])
     .with_storage(ryuz_git::StorageMode::Bundle);
     GitWal::new(store, Arc::new(config), Arc::new(ryuz_git::RefsCodec))
 }

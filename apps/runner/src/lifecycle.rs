@@ -55,12 +55,6 @@ pub fn slug_ok(cfg: &Config, slug: &str) -> bool {
     if slug == crate::host::control::SLUG {
         return false;
     }
-    // `pod-<uuid>` is a pod host label (`host::edge::POD_HOST_PREFIX`): an app
-    // with that slug would collide with the Code-mode origin of the app whose
-    // id it spells.
-    if crate::host::edge::pod_label_id(slug).is_some() {
-        return false;
-    }
     let platform: std::collections::HashSet<String> = crate::host::edge_table::platform_routes(cfg)
         .into_iter()
         .map(|(host, _)| host)
@@ -120,9 +114,9 @@ mod tests {
     }
 
     #[test]
-    fn pod_host_labels_are_not_slugs() {
-        // The Code-mode origin of the app whose id this spells.
-        assert!(!slug_ok(
+    fn retired_pod_labels_are_ordinary_slugs() {
+        // The pod host is gone, so its old namespace is a tenant host now.
+        assert!(slug_ok(
             &config_for_tests(),
             "pod-0f4b0f6e-5a8e-4a0e-9c3f-2b1d0c9e8f7a"
         ));

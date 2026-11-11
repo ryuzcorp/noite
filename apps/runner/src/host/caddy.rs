@@ -9,7 +9,7 @@
 use std::path::Path;
 
 use crate::config::{is_localhost_domain, Config};
-use crate::host::{control, env_gate};
+use crate::host::env_gate;
 
 /// W3C trace header for fleet requests, from the request UUID with the
 /// dashes dropped (32 hex = a W3C trace id; the last 16 double as the span
@@ -129,49 +129,6 @@ pub(crate) const PRODUCTION_FRAME: &[&str] = &[
 /// same-site frame is rewritten to `document` on the way upstream.
 pub(crate) const PREVIEW_DEST: &str = "request_header @preview_rewrite Sec-Fetch-Dest document";
 
-/// The dead Nodepod preview bridge: never served by the preview host nor any
-/// control site. Must match `POD_BRIDGE_PATHS` in
-/// `apps/noite/src/lib/preview-host.ts`.
-const POD_BRIDGE_ASSETS: &[&str] = &["/__nodepod_bridge__.html", "/__nodepod_bridge__.js"];
-
-/// The only pod files a preview origin serves (plus the `/assets/*` chunks
-/// the frame bundle loads at runtime). Must match `PREVIEW_HOST_ASSETS` in
-/// `apps/noite/src/lib/preview-host.ts`.
-pub(crate) const POD_FILES: &[&str] = &[
-    "/noite-pod-host.html",
-    "/noite-pod-host.js",
-    "/__sw__.js",
-    "/__worker__.js",
-];
-pub(crate) const PREVIEW_ASSETS_GLOB: &str = "/assets/*";
-
-/// Every path a control site answers 404 for: the preview host's pod assets
-/// minus the frame chunks (on this origin `/assets/*` is the control UI's
-/// own bundle, served exactly as before), plus the dead bridge pair. Must
-/// match `CONTROL_HOST_DENIED_ASSETS` in `apps/noite/src/lib/preview-host.ts`.
-pub(crate) fn control_denied_assets() -> Vec<&'static str> {
-    let mut denied = POD_FILES.to_vec();
-    denied.extend_from_slice(POD_BRIDGE_ASSETS);
-    denied
-}
-
-/// Pod response headers: the service worker registration scope and the
-/// agent-cluster headers the pod document and its workers need.
-pub(crate) const POD_HEADERS: &[&str] = &[
-    "header @sw {",
-    "\tdefer",
-    "\tService-Worker-Allowed /",
-    "\tCache-Control no-cache",
-    "}",
-    "header @hostframe {",
-    "\tdefer",
-    "\tCross-Origin-Resource-Policy cross-origin",
-    "\tCross-Origin-Embedder-Policy require-corp",
-    "\tCross-Origin-Opener-Policy same-origin",
-    "\tCache-Control no-store",
-    "}",
-];
-
 static CADDY_ADMIN_OK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 static CADDY_ADMIN_ERR: std::sync::OnceLock<std::sync::Mutex<String>> = std::sync::OnceLock::new();
 
@@ -199,19 +156,9 @@ pub(crate) fn admin_note(ok: bool, detail: String) {
 /// Matchers branching the static config on the module's vars. Each combines
 /// a request shape (path/header, from today's constants) with the route kind.
 fn matchers() -> Vec<String> {
-    let denied = control_denied_assets().join(" ");
-    let pod_allow = POD_FILES.join(" ");
     vec![
         "@deny {".into(),
         "\texpression {http.vars.edge_route} == 'deny'".into(),
-        "}".into(),
-        "@podblocked {".into(),
-        format!("\tnot path {pod_allow} {PREVIEW_ASSETS_GLOB}"),
-        "\texpression {http.vars.edge_route} == 'preview'".into(),
-        "}".into(),
-        "@controlblocked {".into(),
-        format!("\tpath {denied}"),
-        "\texpression {http.vars.edge_route} == 'control'".into(),
         "}".into(),
         "@auth {".into(),
         format!("\tpath {}*", env_gate::AUTH_PATH),
@@ -227,7 +174,7 @@ fn matchers() -> Vec<String> {
         "\texpression {http.vars.edge_route} == 'tenant' || {http.vars.edge_route} == 'custom' || {http.vars.edge_route} == 'env'".into(),
         "}".into(),
         "@controish {".into(),
-        "\texpression {http.vars.edge_route} == 'control' || {http.vars.edge_route} == 'preview'".into(),
+        "\texpression {http.vars.edge_route} == 'control'".into(),
         "}".into(),
         "@tenant_framed {".into(),
         "\theader Sec-Fetch-Dest iframe".into(),
@@ -244,14 +191,6 @@ fn matchers() -> Vec<String> {
         "\theader Sec-Fetch-Dest iframe".into(),
         "\theader Sec-Fetch-Site same-site".into(),
         "\texpression {http.vars.edge_route} == 'tenant' || {http.vars.edge_route} == 'env'".into(),
-        "}".into(),
-        "@sw {".into(),
-        "\tpath /__sw__.js".into(),
-        "\texpression {http.vars.edge_route} == 'preview'".into(),
-        "}".into(),
-        "@hostframe {".into(),
-        "\tpath /noite-pod-host.html /noite-pod-host.js".into(),
-        "\texpression {http.vars.edge_route} == 'preview'".into(),
         "}".into(),
         "@gitrewrite {".into(),
         "\texpression {http.vars.edge_route} == 'git'".into(),
@@ -294,15 +233,7 @@ fn route_block(cfg: &Config) -> Vec<String> {
         "\t\trespond 404".into(),
         "\t}".into(),
     ];
-    if control::bundle_present(cfg) {
-        out.push("\thandle @podblocked {".into());
-        out.push("\t\trespond 404".into());
-        out.push("\t}".into());
-    }
     out.extend([
-        "\thandle @controlblocked {".into(),
-        "\t\trespond 404".into(),
-        "\t}".into(),
         "\thandle @auth {".into(),
         "\t\trewrite * /v1/edge/env-auth".into(),
     ]);
@@ -331,11 +262,6 @@ fn route_block(cfg: &Config) -> Vec<String> {
         out.push(format!("\t{line}"));
     }
     out.push(format!("\t{PREVIEW_DEST}"));
-    if control::bundle_present(cfg) {
-        for line in POD_HEADERS {
-            out.push(format!("\t{line}"));
-        }
-    }
     out.push("\trewrite @gitrewrite /v1/git{uri}".into());
     out.push("\trewrite @fallbackrewrite /v1/edge/fallback".into());
     // The readiness hold runs here: after the wake/gate hops (so an
@@ -700,22 +626,22 @@ mod tests {
     }
 
     #[test]
-    fn control_denied_and_preview_allowlist_match_the_ts_lists() {
-        // Must match CONTROL_HOST_DENIED_ASSETS / PREVIEW_HOST_ASSETS in
-        // apps/noite/src/lib/preview-host.ts (pod paths live in one place).
-        let denied = control_denied_assets();
-        assert!(denied.contains(&"/noite-pod-host.html"));
-        assert!(denied.contains(&"/__sw__.js"));
-        assert!(!denied.iter().any(|p| p.contains('*')));
-        assert!(denied.contains(&"/__nodepod_bridge__.html"));
-
+    fn the_static_config_serves_no_pod_assets() {
         let cfg = prod_config();
         let out = static_caddyfile(&cfg);
-        for path in denied {
-            assert!(out.contains(path), "{path} missing\n{out}");
+        for path in [
+            "/noite-pod-host.html",
+            "/noite-pod-host.js",
+            "/__sw__.js",
+            "/__worker__.js",
+            "/__nodepod_bridge__.html",
+            "/__nodepod_bridge__.js",
+        ] {
+            assert!(!out.contains(path), "{path} still denied/listed\n{out}");
         }
-        if control::bundle_present(&cfg) {
-            assert!(out.contains("@podblocked"), "{out}");
-        }
+        assert!(!out.contains("@podblocked"), "{out}");
+        assert!(!out.contains("@controlblocked"), "{out}");
+        assert!(!out.contains("@hostframe"), "{out}");
+        assert!(!out.contains("@sw {"), "{out}");
     }
 }
