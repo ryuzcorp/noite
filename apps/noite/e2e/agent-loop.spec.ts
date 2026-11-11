@@ -331,8 +331,8 @@ test("an agent takes an app from code to production and back with one key", asyn
 
   const waited = runCli([
     "deploy",
-    ...conn,
     "wait",
+    ...conn,
     "--sha",
     first.sha,
     "--max-wait",

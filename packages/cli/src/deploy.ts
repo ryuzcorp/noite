@@ -5,8 +5,7 @@ import { Data, Effect } from "effect";
 import { Command, Flag } from "effect/cli";
 
 import { connection } from "./config.js";
-import { print } from "./connect.js";
-import type { ConnFlags } from "./connect.js";
+import { connFlags, print } from "./connect.js";
 import {
   commentPr,
   parseCommentMode,
@@ -154,12 +153,6 @@ export const advanceDeploy = (
 const deployCommand = Command.make(
   "deploy",
   {
-    appUrl: Flag.String("app-url").pipe(
-      Flag.withDescription(
-        "Control UI origin for `deploy status`/`deploy wait` (default: derived from --url, or NOITE_APP_URL)"
-      ),
-      Flag.withDefault("")
-    ),
     comment: Flag.String("comment").pipe(
       Flag.withDescription("PR comment mode: update, create, or off"),
       Flag.withDefault("update")
@@ -359,6 +352,7 @@ const waitArgs = (flags: {
 const statusCommand = Command.make(
   "status",
   {
+    ...connFlags,
     environment: Flag.String("environment").pipe(
       Flag.withDescription(
         "Preview environment label or id (default: production)"
@@ -368,15 +362,10 @@ const statusCommand = Command.make(
   },
   (flags) =>
     Effect.gen(function* status() {
-      // SAFETY: `Command.withSubcommands` provides the parent's parsed config
-      // through its handler service; `deploy`'s own config is `ConnFlags` plus
-      // its push flags, and the yielded type loses the config here.
-      // oxlint-disable-next-line anti-slop/no-chained-type-assertions -- the CLI's `Command` erases its yielded config type; this restores it.
-      const parent = (yield* deployCommand) as unknown as ConnFlags;
       const ctx = yield* readActionContext();
 
       const conn = yield* connection(
-        parent,
+        flags,
         ctx._tag === "Actions" ? ctx.repo : null
       );
 
@@ -392,6 +381,7 @@ const statusCommand = Command.make(
 const waitCommand = Command.make(
   "wait",
   {
+    ...connFlags,
     deployId: Flag.String("deploy-id").pipe(
       Flag.withDescription("Wait for this deploy id (default: the newest)"),
       Flag.withDefault("")
@@ -417,15 +407,10 @@ const waitCommand = Command.make(
   },
   (flags) =>
     Effect.gen(function* wait() {
-      // SAFETY: `Command.withSubcommands` provides the parent's parsed config
-      // through its handler service; `deploy`'s own config is `ConnFlags` plus
-      // its push flags, and the yielded type loses the config here.
-      // oxlint-disable-next-line anti-slop/no-chained-type-assertions -- the CLI's `Command` erases its yielded config type; this restores it.
-      const parent = (yield* deployCommand) as unknown as ConnFlags;
       const ctx = yield* readActionContext();
 
       const conn = yield* connection(
-        parent,
+        flags,
         ctx._tag === "Actions" ? ctx.repo : null
       );
 

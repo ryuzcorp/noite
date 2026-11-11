@@ -89,13 +89,13 @@ noite logs --slug my-app --limit 100           # --environment staging for a pre
 noite rollback --sha 1a2b3c4 --slug my-app     # --environment staging for a preview
 ```
 
-`noite deploy` keeps its push behaviour and gains two subcommands. They read the connection flags from the parent, so the flags come **before** the subcommand:
+`noite deploy` keeps its push behaviour and gains two subcommands, which carry the same connection flags as every other command:
 
 ```bash
-noite deploy --slug my-app status              # this app's deploy state and recent deploys
-noite deploy --slug my-app wait                # bounded long poll, re-armed until it settles
-noite deploy --slug my-app wait --sha 1a2b3c4 --max-wait 25 --timeout 900
-noite deploy --slug my-app wait --environment staging
+noite deploy status --slug my-app              # this app's deploy state and recent deploys
+noite deploy wait --slug my-app                # bounded long poll, re-armed until it settles
+noite deploy wait --slug my-app --sha 1a2b3c4 --max-wait 25 --timeout 900
+noite deploy wait --slug my-app --environment staging
 ```
 
 `deploy wait` re-calls `wait_for_deploy` (at most 25 s per call by default) until the deploy reaches a terminal status, then prints it; `--timeout` (default 900 s) bounds the whole wait. `--deploy-id`, `--sha` and `--environment` choose which row it follows.
