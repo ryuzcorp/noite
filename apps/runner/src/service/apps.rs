@@ -626,6 +626,25 @@ async fn delete_inner(state: &AppState, id: &str) -> Result<(), ApiError> {
             "delete failed: a deploy is still in flight; retry the delete shortly",
         ));
     };
+    // Re-read the row: the persona above may have waited out a deploy, and a
+    // rename (which wins the AppLock too) can have moved the app to another
+    // slug in that window. Everything below — the fleet stop, the wipe, the
+    // row delete — must act on the slug the row has *now*, or it would free
+    // the wrong slug and leave this app's data orphaned as another tenant's
+    // inheritance.
+    let app = match db::get_app(&state.pool, id).await {
+        Ok(Some(app)) => app,
+        Ok(None) => {
+            return Err(ApiError::not_found(
+                "delete failed: the app is already gone",
+            ))
+        }
+        Err(e) => {
+            return Err(ApiError::internal(format!(
+                "delete {id}: could not read the app: {e}"
+            )))
+        }
+    };
     // The delete claim (taken by `delete` before this task starts) is what
     // closes import admission: a retry that passed its own check cannot
     // register a new attempt now, and anything registered is swept below.

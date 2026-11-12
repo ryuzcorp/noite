@@ -925,6 +925,10 @@ async fn list_page(
     {
         Ok(resp) => resp,
         Err(e) => {
+            // `without_url`: reqwest's Display carries the full presigned URL
+            // (access-key id plus a live signature), and this text reaches the
+            // caller through the S3 error chain.
+            let e = e.without_url();
             return Err(S3Fail::Retryable(anyhow::anyhow!(
                 "s3 list {prefix} transport: {e:#}"
             )));

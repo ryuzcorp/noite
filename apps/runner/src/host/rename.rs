@@ -157,6 +157,10 @@ pub async fn rename_app(
     else {
         anyhow::bail!("deploy in flight; retry rename shortly");
     };
+    // A background wipe of a just-deleted app on the target slug is a chore
+    // with no owner: ask it to yield before we queue on its guard, exactly like
+    // create does. Whatever it leaves behind is wiped below, under the guard.
+    crate::host::purge::stop(new_slug);
     // R-02: pushes hold `push_guard(slug)` across git + S3 + manifest, so the
     // whole move (dirs, both S3 prefixes, row update, re-sweep) runs under
     // both slugs' guards — a push to either slug lands fully before or fully
@@ -171,6 +175,29 @@ pub async fn rename_app(
     if let Some(other) = db::get_app_by_slug(pool, new_slug).await? {
         if other.id != app_id {
             anyhow::bail!("slug already taken");
+        }
+    }
+    // A free slug is not necessarily an EMPTY prefix: the delete that freed it
+    // drops the row first and wipes in the background, so a wipe can still be
+    // running, stopped, or dead with its data left behind. Move our own
+    // prefixes into that and we would own another tenant's objects — and
+    // `ensure_synced_locked` would rehydrate their git history into our
+    // mirror. Wipe the target here, under its guard, exactly as create does,
+    // so "we hold a slug" always implies "its prefixes are ours alone".
+    match crate::host::purge::purge_slug(
+        cfg,
+        procs,
+        logs,
+        git_sync,
+        new_slug,
+        supervisor::StopGrace::NORMAL,
+        None,
+    )
+    .await?
+    {
+        crate::host::purge::Purged::Done => {}
+        crate::host::purge::Purged::Stopped => {
+            anyhow::bail!("the leftover wipe for the target slug was stopped")
         }
     }
     let renamed = rename_slugged(cfg, pool, procs, logs, &app, new_name, new_slug).await?;
