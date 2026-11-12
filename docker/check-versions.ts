@@ -4,11 +4,18 @@
  *
  * - celld, Caddy, Node and jup (with its tarball digest) are pinned exactly once (an ARG default); a second pin in
  *   the same file is how a stage silently builds against another version.
+ * - Every external `FROM` is `image:tag@${DIGEST}` with one `<NAME>_DIGEST`
+ *   ARG, every downloaded tarball carries the publisher's per-arch
+ *   sha256/sha512 next to its version, and the install verifies with it
+ *   (docker/check-pins.ts owns these rules; this script reads the files and
+ *   reports). Its `--online` leg, run in CI, compares each pin with the
+ *   publisher's own digest.
  * - The floating lines stay covered without freezing them: every oven/bun
  *   stage must agree on one line, and the rust line must appear exactly
  *   once — a split pin fails here instead of shipping mixed toolchains.
- * - The bundled store (rustfs) must match what platforms.mdx documents.
- * - Sidecar versions (esbuild, duckdb) live exactly once in
+ * - The bundled store (rustfs) must match what platforms.mdx documents and
+ *   CI's rustfs service, tag and digest.
+ * - Sidecar versions and checksums (esbuild, duckdb) live exactly once in
  *   docker/install-sidecars.sh; the Dockerfile only invokes the script.
  * - The access log path the image sets (CADDY_ACCESS_LOG) is the runner's own
  *   default, so the generator (which writes the Caddyfile `log` block from
@@ -546,11 +553,17 @@ if (process.argv.includes("--online")) {
     }
 
     const pending = (async () => {
-      const response = await fetch(url, { headers });
+      try {
+        const response = await fetch(url, { headers });
 
-      return response.ok
-        ? { text: await response.text() }
-        : { error: String(response.status) };
+        return response.ok
+          ? { text: await response.text() }
+          : { error: String(response.status) };
+      } catch (error) {
+        // A DNS/TLS/timeout failure is a red check with a readable line, not
+        // an unhandled rejection with a stack trace.
+        return { error: String(error) };
+      }
     })();
 
     cache.set(url, pending);
