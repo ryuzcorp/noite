@@ -222,8 +222,8 @@ async fn create_inner(
             // this guard): every pending-purge tombstone for it is satisfied.
             // A failure only leaves them for the resume pass, which re-checks
             // the row and wipes an empty prefix — never fail the create for it.
-            if let Err(e) = db::clear_app_purges(&state.pool, slug).await {
-                tracing::warn!(slug, error = %e, "could not clear the slug's purge tombstones");
+            if let Err(e) = purge::settle_slug(&state.config, &state.pool, slug).await {
+                tracing::warn!(slug, error = %format!("{e:#}"), "could not settle the slug's purge tombstones");
             }
         }
         Ok(purge::Purged::Stopped) => {
@@ -738,6 +738,23 @@ async fn delete_inner(state: &AppState, id: &str) -> Result<(), ApiError> {
             return Err(ApiError::internal(format!("delete {id}: {step}")));
         }
     };
+    // The telemetry marks are keyed by fleet key (`<slug>`, `<slug>.<label>`)
+    // and outlive the rows in this process, exactly as an environment
+    // teardown's do: a slug or label reused after this delete must start from
+    // the floor instead of inheriting the dead fleet's watermark and "already
+    // compacted" hours. The labels are read before the row goes (the cascade
+    // takes the environment rows).
+    let env_keys: Vec<String> = match db::list_environments(&state.pool, &app.id).await {
+        Ok(envs) => envs
+            .iter()
+            .map(|env| supervisor::env_fleet_key(&app.slug, &env.label))
+            .collect(),
+        Err(e) => {
+            // Only in-memory marks read this: never fail a delete for it.
+            tracing::warn!(app_id = %app.id, error = %e, "could not read the environments for the telemetry marks");
+            Vec::new()
+        }
+    };
     // The delete claim (taken by `delete` before this task starts) is what
     // closes import admission: a retry that passed its own check cannot
     // register a new attempt now, and anything registered is swept below.
@@ -770,6 +787,10 @@ async fn delete_inner(state: &AppState, id: &str) -> Result<(), ApiError> {
     supervisor::stop_environment_fleets(&state.procs, &app.slug, supervisor::StopGrace::FOR_DELETE)
         .await;
     logs::clear(&state.logs, &app.slug).await;
+    crate::host::metrics::forget_fleet(&app.slug);
+    for key in &env_keys {
+        crate::host::metrics::forget_fleet(key);
+    }
     // Row first. Every edge path resolves a host from the row (`app_for_host`,
     // `app_for_slug`), so from this moment the slug answers "no app" — the
     // reported "paused page for a deleted app" was the row lingering, stopped,
@@ -786,7 +807,7 @@ async fn delete_inner(state: &AppState, id: &str) -> Result<(), ApiError> {
     // The row delete is fenced against credential minting: a mint that is
     // already in flight either commits first (this transaction marks its row
     // `revoking`, swept below) or sees the app gone and revokes its key.
-    let delete_result = crate::host::credentials::delete_app_fenced(&state.pool, id).await;
+    let delete_result = db::delete_app(&state.pool, id).await;
     delete_result.map_err(|e| {
         let step = step_failure("could not remove the app row", &e.to_string());
         ApiError::internal(format!("delete {}: {step}", app.slug))
@@ -896,8 +917,8 @@ async fn delete_inner(state: &AppState, id: &str) -> Result<(), ApiError> {
                 }
             };
             if satisfied {
-                if let Err(e) = db::clear_app_purges(&state.pool, &slug).await {
-                    tracing::warn!(slug, error = %e, "could not clear the slug's purge tombstones");
+                if let Err(e) = purge::settle_slug(&state.config, &state.pool, &slug).await {
+                    tracing::warn!(slug, error = %format!("{e:#}"), "could not settle the slug's purge tombstones");
                 }
             }
             drop(guard);

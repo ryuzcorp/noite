@@ -568,7 +568,13 @@ pub async fn rebind_local_subdomains(pool: &SqlitePool, base_domain: &str) -> sq
 /// up front makes a concurrent writer wait (through the connection's
 /// `busy_timeout`) instead of making this transaction fail, and the row is
 /// read after the lock, so the snapshot it sees is the one it deletes.
+///
+/// It also holds the mint fence itself ([`super::credentials::mutate_fence`]),
+/// so there is no unfenced delete to call: a mint for this app either commits
+/// its row first (marked `revoking` below, swept by the caller) or starts
+/// after the row is gone and refuses.
 pub async fn delete_app(pool: &SqlitePool, id: &str) -> sqlx::Result<()> {
+    let _fence = super::credentials::mutate_fence().await;
     let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
     let row: Option<(String, Option<i64>)> =
         sqlx::query_as("SELECT slug, build_uid FROM main.app WHERE id = ?")
@@ -609,6 +615,19 @@ pub async fn pending_purges(pool: &SqlitePool) -> sqlx::Result<Vec<String>> {
     sqlx::query_scalar("SELECT slug FROM main.app_purge ORDER BY created_at, app_id")
         .fetch_all(pool)
         .await
+}
+
+/// The app ids whose tombstone is still owed for `slug`. A freed slug can
+/// carry several (deleted, re-created, deleted again), and each one reserves
+/// a build uid and a CI cache volume that the wipe must remove before the
+/// tombstones go.
+pub async fn pending_purge_apps(pool: &SqlitePool, slug: &str) -> sqlx::Result<Vec<String>> {
+    sqlx::query_scalar(
+        "SELECT app_id FROM main.app_purge WHERE slug = ? ORDER BY created_at, app_id",
+    )
+    .bind(slug)
+    .fetch_all(pool)
+    .await
 }
 
 /// Drop every tombstone for `slug`: a wipe of its prefixes finished while no

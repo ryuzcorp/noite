@@ -9,6 +9,29 @@
 
 use sqlx::SqlitePool;
 
+/// Serializes every mint and revoke with the app row delete: two callers
+/// ensuring one scope at once (a fleet spawn racing a deploy) would otherwise
+/// mint two keys for it, and a delete racing a mint would leave a `live` row
+/// for a slug that is already free.
+///
+/// [`crate::db::delete_app`] takes it itself, so no caller can delete a row
+/// unfenced: a mint either commits its row first (the delete marks it
+/// `revoking` and the sweep retracts it) or starts after the row is gone and
+/// refuses to mint. The orphan sweep relies on it too — an in-flight mint
+/// holds the fence until its row commits, so waiting for it is what keeps a
+/// half-minted key from reading as orphaned.
+///
+/// Per-process: the sweep assumes a single runner owns the DB (the
+/// `owner.json` fence in SPEC, Runner state). Two runners sharing one SQLite
+/// file would break the in-flight guarantee.
+static MUTATE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Hold the mint fence (see [`MUTATE`]): the guard is what proves the caller
+/// may change a scope's credentials or delete the app that owns them.
+pub(crate) async fn mutate_fence() -> tokio::sync::MutexGuard<'static, ()> {
+    MUTATE.lock().await
+}
+
 /// A scoped key's lifecycle. `live` is handed to the tenant fleet; `revoking`
 /// is no longer handed out and waits for the store delete (`sweep` retries it
 /// on every pass). The row is deleted when the store accepts the delete, or
@@ -236,7 +259,7 @@ pub async fn all_scoped_credential_handles(pool: &SqlitePool) -> sqlx::Result<Ve
 }
 
 /// Whether any `scoped_credential` row names `handle`: the orphan sweep's
-/// per-key re-check under `MUTATE` (see `host::credentials::orphan_sweep`).
+/// per-key re-check under the mint fence (see `host::credentials::orphan_sweep`).
 pub async fn scoped_credential_handle_exists(
     pool: &SqlitePool,
     handle: &str,
@@ -263,7 +286,7 @@ pub async fn get_operator_token(
         .await
 }
 
-/// Store a freshly minted token row. The caller holds `host` `MUTATE`, so a
+/// Store a freshly minted token row. The caller holds the mint fence, so a
 /// primary-key conflict means a second runner owns this database (the
 /// `owner.json` fence forbids that) — it surfaces as an error, never a
 /// silent overwrite.

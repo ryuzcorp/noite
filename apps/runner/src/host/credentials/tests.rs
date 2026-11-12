@@ -1849,9 +1849,7 @@ async fn a_mint_after_the_app_row_is_gone_leaves_no_live_key() {
         app_id: app.id.clone(),
         slug: "vanished".into(),
     };
-    super::delete_app_fenced(&pool, &app.id)
-        .await
-        .expect("fenced delete");
+    db::delete_app(&pool, &app.id).await.expect("fenced delete");
 
     let refused = ensure(&pool, &cfg, &provider, &scope).await;
 

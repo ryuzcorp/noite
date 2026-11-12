@@ -150,6 +150,72 @@ impl PurgeResume {
     }
 }
 
+/// Remove the CI-cache volumes a deleted app left behind for `slug`: one per
+/// tombstoned app id ([`crate::host::deploy::ci_cache_volume`]) plus the
+/// legacy slug-keyed one ([`crate::host::deploy::legacy_ci_cache_volume`]).
+///
+/// A cache volume is tenant data (package caches, a prior build's tree), so it
+/// goes with the wipe, not with the row delete: the throwaway volumes are only
+/// garbage once the wipe owes nothing. Best-effort by contract — the caller
+/// clears the tombstones only when this returns `Ok`, so a volume the
+/// container CLI could not remove is retried by the next pass, exactly like a
+/// failed prefix delete.
+async fn remove_ci_cache_volumes(
+    cfg: &Config,
+    pool: &sqlx::SqlitePool,
+    slug: &str,
+) -> anyhow::Result<()> {
+    if !cfg.ci_enabled {
+        // No workflow ever ran here, so no cache volume was ever created.
+        return Ok(());
+    }
+    let ids = crate::db::pending_purge_apps(pool, slug).await?;
+    let mut names: Vec<String> = ids
+        .iter()
+        .map(|id| crate::host::deploy::ci_cache_volume(id))
+        .collect();
+    names.push(crate::host::deploy::legacy_ci_cache_volume(slug));
+    names.sort();
+    names.dedup();
+    for name in names {
+        let removed = tokio::process::Command::new(&cfg.ci_docker_bin)
+            .args(["volume", "rm", "-f", &name])
+            .output()
+            .await;
+        match removed {
+            Ok(out) if out.status.success() => {}
+            Ok(out) => {
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                // A volume that is already gone is what the wipe wanted.
+                if !no_such_volume(&stderr) {
+                    anyhow::bail!("remove CI cache volume {name}: {}", stderr.trim());
+                }
+            }
+            // No container CLI on this host: it can hold no volume either.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e).with_context(|| format!("remove CI cache volume {name}")),
+        }
+    }
+    Ok(())
+}
+
+/// Whether the CLI said the volume is already gone (docker and podman word it
+/// differently, and podman says "object").
+fn no_such_volume(stderr: &str) -> bool {
+    let text = stderr.to_ascii_lowercase();
+    text.contains("no such volume") || text.contains("no such object")
+}
+
+/// Close out `slug`'s wipe in the database: drop the CI-cache volumes its
+/// tombstones still own, then clear the tombstones. Every caller that used to
+/// clear them directly goes through here, so a volume that cannot be removed
+/// keeps the tombstone and the resume pass retries the removal with the rest
+/// of the wipe.
+pub async fn settle_slug(cfg: &Config, pool: &sqlx::SqlitePool, slug: &str) -> anyhow::Result<u64> {
+    remove_ci_cache_volumes(cfg, pool, slug).await?;
+    Ok(crate::db::clear_app_purges(pool, slug).await?)
+}
+
 /// Resume every wipe the durable tombstones (`app_purge`) still owe.
 ///
 /// A hard delete writes its tombstone in the same transaction as the row
@@ -250,10 +316,10 @@ pub async fn resume_pending(
         };
         match satisfied {
             Ok(true) => {
-                match crate::db::clear_app_purges(pool, &slug).await {
+                match settle_slug(cfg, pool, &slug).await {
                     Ok(_) => report.cleared += 1,
                     Err(e) => {
-                        tracing::warn!(slug, error = %e, "pending purge wiped the slug but could not clear its tombstone");
+                        tracing::warn!(slug, error = %format!("{e:#}"), "pending purge wiped the slug but could not settle its tombstone");
                         report.failed += 1;
                     }
                 }
@@ -961,5 +1027,128 @@ mod tests {
             .is_empty());
         assert!(dir.exists(), "the new owner's data must survive the resume");
         pool.close().await;
+    }
+
+    /// Write a container-CLI stand-in that records its arguments and exits
+    /// with `status`/`stderr` (`docker`/`podman` are never reached in tests).
+    fn cli_stub(dir: &std::path::Path, status: i32, stderr: &str) -> (String, std::path::PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+        let log = dir.join("cli.log");
+        let bin = dir.join("container-cli");
+        std::fs::write(
+            &bin,
+            format!(
+                "#!/bin/sh\necho \"$@\" >> {}\necho {} >&2\nexit {}\n",
+                log.display(),
+                stderr,
+                status
+            ),
+        )
+        .expect("write stub");
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).expect("chmod stub");
+        (bin.to_string_lossy().into_owned(), log)
+    }
+
+    /// The CI cache volume is keyed by the app id, so a re-created slug can
+    /// never mount the departed tenant's package caches (the slug-keyed name
+    /// handed them to the new app's first build). The wipe removes one volume
+    /// per tombstoned app id plus the legacy slug-keyed one, and only then
+    /// clears the tombstone.
+    #[tokio::test]
+    async fn the_wipe_removes_the_ci_cache_volumes_its_tombstones_own() {
+        let base =
+            std::env::temp_dir().join(format!("noite-purge-cache-{}", crate::models::new_id()));
+        std::fs::create_dir_all(&base).expect("temp dir");
+        let (bin, log) = cli_stub(&base, 0, "");
+        let mut cfg = crate::config::config_for_tests();
+        cfg.work_dir = base.join("work").to_string_lossy().into_owned();
+        cfg.ci_docker_bin = bin;
+        let pool = db::connect("sqlite::memory:").await.expect("memory db");
+        let app = db::create_app(
+            &pool,
+            &cfg,
+            db::NewApp {
+                name: "cache",
+                slug: "cache-slug",
+                user_id: "local",
+                subdomain: "cache.localhost",
+                listen: 30220,
+                internal: 30221,
+            },
+        )
+        .await
+        .expect("app");
+        db::delete_app(&pool, &app.id).await.expect("delete row");
+
+        let cleared = settle_slug(&cfg, &pool, "cache-slug")
+            .await
+            .expect("settle the slug");
+        assert_eq!(cleared, 1, "the slug's only tombstone is cleared");
+        assert!(
+            db::pending_purges(&pool)
+                .await
+                .expect("tombstones")
+                .is_empty(),
+            "the tombstone goes once the volumes are gone"
+        );
+
+        let calls = std::fs::read_to_string(&log).expect("cli log");
+        let keyed = crate::host::deploy::ci_cache_volume(&app.id);
+        let legacy = crate::host::deploy::legacy_ci_cache_volume("cache-slug");
+        assert!(
+            calls.contains(&format!("volume rm -f {keyed}")),
+            "the app id's volume is removed: {calls}"
+        );
+        assert!(
+            calls.contains(&format!("volume rm -f {legacy}")),
+            "the legacy slug-keyed volume is removed: {calls}"
+        );
+        pool.close().await;
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A volume the CLI refuses to remove keeps the tombstone: the resume pass
+    /// retries the removal with the rest of the wipe instead of forgetting a
+    /// tenant's cache while it is still on disk.
+    #[tokio::test]
+    async fn a_refused_volume_removal_keeps_the_tombstone() {
+        let base =
+            std::env::temp_dir().join(format!("noite-purge-cache-{}", crate::models::new_id()));
+        std::fs::create_dir_all(&base).expect("temp dir");
+        let (bin, _log) = cli_stub(&base, 1, "permission denied");
+        let mut cfg = crate::config::config_for_tests();
+        cfg.work_dir = base.join("work").to_string_lossy().into_owned();
+        cfg.ci_docker_bin = bin;
+        let pool = db::connect("sqlite::memory:").await.expect("memory db");
+        let app = db::create_app(
+            &pool,
+            &cfg,
+            db::NewApp {
+                name: "stuck",
+                slug: "stuck-slug",
+                user_id: "local",
+                subdomain: "stuck.localhost",
+                listen: 30230,
+                internal: 30231,
+            },
+        )
+        .await
+        .expect("app");
+        db::delete_app(&pool, &app.id).await.expect("delete row");
+
+        let err = settle_slug(&cfg, &pool, "stuck-slug")
+            .await
+            .expect_err("the refusal is not swallowed");
+        assert!(
+            format!("{err:#}").contains("permission denied"),
+            "the CLI's reason is kept: {err:#}"
+        );
+        assert_eq!(
+            db::pending_purges(&pool).await.expect("tombstones"),
+            vec!["stuck-slug".to_string()],
+            "the tombstone survives so the next pass retries"
+        );
+        pool.close().await;
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

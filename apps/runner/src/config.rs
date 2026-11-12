@@ -2204,7 +2204,10 @@ pub(crate) fn config_for_tests() -> Config {
         ci_default_image: "oven/bun:1.4.4".into(),
         ci_allowed_images: vec!["oven/bun:1.4.4".into()],
         ci_network: "bridge".into(),
-        ci_docker_bin: "docker".into(),
+        // A delete's wipe removes the CI cache volumes through this binary;
+        // tests must not reach a real daemon (the removal is a no-op when the
+        // binary is absent, like an install that never enabled CI).
+        ci_docker_bin: "noite-test-no-container-cli".into(),
         telemetry_retention_days: 30,
         otel_flush_ms: 30000,
         duckdb_memory_mb: 256,

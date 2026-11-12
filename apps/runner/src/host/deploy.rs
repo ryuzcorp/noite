@@ -30,6 +30,23 @@ use sqlx::SqlitePool;
 /// The workflow file a repo root may carry (read by the deploy).
 const CI_CONFIG_NAME: &str = "noite.ci.yaml";
 
+/// The container volume a tenant's CI cache lives in. Keyed by the app id and
+/// not the slug: a freed slug is re-created by another tenant, and a
+/// slug-keyed volume was inherited by that new app's first build — one
+/// tenant's package caches readable by another, and never removed by the
+/// delete's wipe (merge-group e2e finding, 2026-11-12).
+pub fn ci_cache_volume(app_id: &str) -> String {
+    format!("noite-ci-cache-{app_id}")
+}
+
+/// The slug-keyed volume older builds created (`noite-ci-cache-<slug>`).
+/// Nothing mounts it any more — [`ci_cache_volume`] replaced it — but it is
+/// still on disk for every app deleted before that change, so the wipe
+/// removes it by name.
+pub fn legacy_ci_cache_volume(slug: &str) -> String {
+    format!("noite-ci-cache-{slug}")
+}
+
 /// Per-app exclusive lock shared by deploy and purge/delete so S3 fleets/git
 /// never see overlapping writers (ghost LTX / RestoreFailed after partial wipe).
 /// A plain mutex: every critical section below is brief and never held across
@@ -914,7 +931,7 @@ async fn deploy_inner(
                     cpus: cores.saturating_sub(1).max(1) as f64,
                     uid: sandbox_id.unwrap_or(0),
                     gid: sandbox_id.unwrap_or(0),
-                    cache_volume: Some(format!("noite-ci-cache-{}", app.slug)),
+                    cache_volume: Some(ci_cache_volume(&app.id)),
                     env: ci_env,
                     container_prefix: "noite-ci".to_string(),
                     artifact_dir: Some("dist".to_string()),
@@ -2720,13 +2737,24 @@ pub async fn deploy_tip(
 #[cfg(test)]
 mod tests {
     use super::{
-        activate_after_staged_migrate, contained_deploy_root, failure_summary, go_arch,
-        has_build_script, log_migrate_warnings, migrate_void_app, migrate_void_app_staged,
-        parse_wrangler_build, probe_staged_generation, quoted, route_live, wipe_worktree,
-        without_runner_keys, DeployTarget, MigrateInputs, Progress,
+        activate_after_staged_migrate, ci_cache_volume, contained_deploy_root, failure_summary,
+        go_arch, has_build_script, legacy_ci_cache_volume, log_migrate_warnings, migrate_void_app,
+        migrate_void_app_staged, parse_wrangler_build, probe_staged_generation, quoted, route_live,
+        wipe_worktree, without_runner_keys, DeployTarget, MigrateInputs, Progress,
     };
     use crate::models::DeployStatus;
     use serde_json::json;
+
+    /// The CI cache volume is keyed by the app id, so a slug freed by a delete
+    /// and taken by another app never mounts the departed tenant's package
+    /// caches. The legacy slug-keyed name is still derived, only to be
+    /// removed by the wipe.
+    #[test]
+    fn the_ci_cache_volume_is_keyed_by_app_id() {
+        assert_eq!(ci_cache_volume("6f1e-4a"), "noite-ci-cache-6f1e-4a");
+        assert_ne!(ci_cache_volume("6f1e-4a"), ci_cache_volume("6f1e-4b"));
+        assert_eq!(legacy_ci_cache_volume("shop"), "noite-ci-cache-shop");
+    }
 
     /// A client that waits for the deploy row (the CLI, the UI, the e2e)
     /// sends its first request the moment the row reads `success`. The edge
