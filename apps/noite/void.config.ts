@@ -1,7 +1,7 @@
 // Worker config for Void (https://void.cloud) — the control UI's single
 // source for its Worker: bindings, assets, defaults. `voidPlugin()` reads it
 // (edits need a dev server restart) and the build emits
-// `dist/ssr/wrangler.json`, from which `vite.config.ts` (`emitCelldConfig`)
+// `dist/ssr/wrangler.json`, from which `scripts/emit-celld-config.ts`
 // derives the deploy-root `dist/wrangler.json` the runner deploys with celld.
 //
 // Serving contract (runner `ensure_deployed`, celld `CELLD_KEYS`): name

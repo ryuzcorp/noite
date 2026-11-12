@@ -725,6 +725,37 @@ pub(crate) struct S3Object {
     pub(crate) etag: String,
 }
 
+/// The `Contents` entries of one ListObjectsV2 response as the rest of the
+/// crate reads them, leaving the prefixes and continuation token in place.
+/// ListObjectsV2 requires `Key`, `LastModified`, `Size` and `ETag` on every
+/// entry; a store that omits one — or sends an empty tag/date, which is not a
+/// value either — is not speaking the protocol, so this fails instead of
+/// inventing a version (`git_store` keys objects by ETag) or a size.
+fn listed_objects(
+    response: &mut rusty_s3::actions::ListObjectsV2Response,
+) -> anyhow::Result<Vec<S3Object>> {
+    std::mem::take(&mut response.contents)
+        .into_iter()
+        .map(|o| {
+            let key = o.key;
+            let missing = |field: &str| anyhow::anyhow!("s3 LIST object {key} has no {field}");
+
+            Ok(S3Object {
+                last_modified: o
+                    .last_modified
+                    .filter(|value| !value.is_empty())
+                    .ok_or_else(|| missing("LastModified"))?,
+                size: o.size.ok_or_else(|| missing("Size"))?,
+                etag: o
+                    .etag
+                    .filter(|value| !value.is_empty())
+                    .ok_or_else(|| missing("ETag"))?,
+                key,
+            })
+        })
+        .collect()
+}
+
 /// One native LIST response: one request's common prefixes and the token
 /// that continues it. Callers that page keep the token; callers that
 /// do not use `s3_list_raw`.
@@ -764,19 +795,10 @@ pub(crate) async fn s3_list_page(
         return Err(s3_err("list", prefix, resp, Duration::from_secs(20)).await);
     }
     let text = bounded_text(resp, Duration::from_secs(20), "s3 LIST body").await?;
-    let parsed = rusty_s3::actions::ListObjectsV2::parse_response(&text)
+    let mut parsed = rusty_s3::actions::ListObjectsV2::parse_response(&text)
         .with_context(|| "s3 LIST XML parse")?;
     Ok(S3Page {
-        objects: parsed
-            .contents
-            .into_iter()
-            .map(|o| S3Object {
-                key: o.key,
-                last_modified: o.last_modified,
-                size: o.size,
-                etag: o.etag,
-            })
-            .collect(),
+        objects: listed_objects(&mut parsed)?,
         prefixes: parsed
             .common_prefixes
             .into_iter()
@@ -916,18 +938,9 @@ async fn list_page(
     let text = bounded_text(resp, Duration::from_secs(20), "s3 LIST body")
         .await
         .map_err(S3Fail::Final)?;
-    let parsed = rusty_s3::actions::ListObjectsV2::parse_response(&text)
+    let mut parsed = rusty_s3::actions::ListObjectsV2::parse_response(&text)
         .map_err(|e| S3Fail::Final(anyhow::anyhow!("s3 LIST XML parse: {e:#}")))?;
-    let objects = parsed
-        .contents
-        .into_iter()
-        .map(|o| S3Object {
-            key: o.key,
-            last_modified: o.last_modified,
-            size: o.size,
-            etag: o.etag,
-        })
-        .collect();
+    let objects = listed_objects(&mut parsed).map_err(S3Fail::Final)?;
     let prefixes = parsed
         .common_prefixes
         .into_iter()
@@ -1205,6 +1218,102 @@ mod tests {
         assert_eq!(v["CommonPrefixes"][0]["Prefix"], "git/demo/refs/heads/");
         let empty: serde_json::Value = serde_json::from_str(&listings_json(&[], &[])).unwrap();
         assert_eq!(empty["Contents"].as_array().map(Vec::len), Some(0));
+    }
+
+    /// A store that omits a required `Contents` field fails the listing
+    /// instead of producing an object with an empty ETag (git_store keys
+    /// objects by it) or a zero size.
+    #[test]
+    fn listed_objects_require_protocol_fields() {
+        fn response(contents: &str) -> rusty_s3::actions::ListObjectsV2Response {
+            let xml = format!(
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+  <Name>b</Name><Prefix></Prefix><KeyCount>1</KeyCount><MaxKeys>1000</MaxKeys>
+  <IsTruncated>true</IsTruncated><NextContinuationToken>next</NextContinuationToken>
+  {contents}
+  <CommonPrefixes><Prefix>git/k/</Prefix></CommonPrefixes>
+</ListBucketResult>"#
+            );
+
+            rusty_s3::actions::ListObjectsV2::parse_response(&xml).unwrap()
+        }
+
+        fn content(etag: &str, last_modified: &str, size: &str) -> String {
+            format!(
+                "<Contents><Key>k</Key>{last_modified}{etag}{size}<StorageClass>STANDARD</StorageClass></Contents>"
+            )
+        }
+
+        let mut complete = response(&content(
+            "<ETag>\"abc\"</ETag>",
+            "<LastModified>2026-09-29T00:00:00.000Z</LastModified>",
+            "<Size>42</Size>",
+        ));
+        let objects = listed_objects(&mut complete).unwrap();
+        assert_eq!(objects[0].key, "k");
+        assert_eq!(objects[0].size, 42);
+        assert_eq!(objects[0].etag, "\"abc\"");
+        assert_eq!(objects[0].last_modified, "2026-09-29T00:00:00.000Z");
+
+        // The helper consumes `contents` only: callers still page.
+        assert!(complete.contents.is_empty());
+        assert_eq!(complete.common_prefixes[0].prefix, "git/k/");
+        assert_eq!(complete.next_continuation_token.as_deref(), Some("next"));
+
+        for (field, contents) in [
+            (
+                "ETag",
+                content(
+                    "",
+                    "<LastModified>2026-09-29T00:00:00.000Z</LastModified>",
+                    "<Size>42</Size>",
+                ),
+            ),
+            (
+                "LastModified",
+                content("<ETag>\"abc\"</ETag>", "", "<Size>42</Size>"),
+            ),
+            (
+                "Size",
+                content(
+                    "<ETag>\"abc\"</ETag>",
+                    "<LastModified>2026-09-29T00:00:00.000Z</LastModified>",
+                    "",
+                ),
+            ),
+        ] {
+            let mut incomplete = response(&contents);
+            let Err(err) = listed_objects(&mut incomplete) else {
+                panic!("missing {field} was accepted");
+            };
+            assert_eq!(err.to_string(), format!("s3 LIST object k has no {field}"));
+        }
+
+        for (field, contents) in [
+            (
+                "ETag",
+                content(
+                    "<ETag></ETag>",
+                    "<LastModified>2026-09-29T00:00:00.000Z</LastModified>",
+                    "<Size>42</Size>",
+                ),
+            ),
+            (
+                "LastModified",
+                content(
+                    "<ETag>\"abc\"</ETag>",
+                    "<LastModified></LastModified>",
+                    "<Size>42</Size>",
+                ),
+            ),
+        ] {
+            let mut empty = response(&contents);
+            let Err(err) = listed_objects(&mut empty) else {
+                panic!("empty {field} was accepted");
+            };
+            assert_eq!(err.to_string(), format!("s3 LIST object k has no {field}"));
+        }
     }
 
     #[test]

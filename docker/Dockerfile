@@ -35,31 +35,31 @@ ARG CELLD_IMAGE=ghcr.io/ryuzcorp/celld:${CELLD_VERSION}@${CELLD_DIGEST}
 # (`NOITE_BUILD_VERSION` ENV in the runtime stages): the tag without `v` on a
 # release build (images.yml passes it), `dev` otherwise.
 ARG NOITE_BUILD_VERSION=dev
-ARG CADDY_VERSION=2.11.7
+ARG CADDY_VERSION=2.11.9
 # The edge route-table module (edge/, handler `http.handlers.edge_routes`):
 # a local path, so no version pin — but its go.mod must require exactly
 # CADDY_VERSION above (docker/check-versions.ts asserts it), or Go's
 # minimum version selection would silently raise the Caddy xcaddy builds.
-ARG NODE_VERSION=24.22.0
+ARG NODE_VERSION=24.22.3
 # jup (https://github.com/unjs/jup) runs the tenant's npm, pnpm or Yarn at
 # the version the project pins. The npm tarball's sha512, as hex.
-ARG JUP_VERSION=0.6.5
-ARG JUP_SHA512=85297de2f655be9f7a98fdc3b59182eb5fe7d9b3315bc1e5858d91b5047a9e74ecbaaddc9b446714e37c3d7c40abb65ef9e63ab1eb7ae1a688dfa5f3f28fb2cf
+ARG JUP_VERSION=0.6.6
+ARG JUP_SHA512=50dd68efc2658649363b58a3e9d4ade2d9df6228ef712c5136ce0286f909772f3fcd5ccbfdf0f844612271e943561e26f06e4db200597723c3108cff3931ca3a
 # npm and pnpm bundled for unpinned tenant projects (SPEC, Package managers):
 # exact releases, with the registry tarballs' sha512 as hex. Bumping is an
 # image release: the runner's BUNDLED_*_VERSION consts must name the same
 # releases (docker/check-versions.ts asserts it).
-ARG NPM_VERSION=12.2.1
-ARG NPM_SHA512=6ca0a6151553fc107e60f1186d9c10d57508dcde6de31292a54d4cc4e8e8ef3de25b3281274657442d7115d10df930bb3794ddcb0681cdfd9d317189abf7b63d
-ARG PNPM_VERSION=12.15.0
-ARG PNPM_SHA512=b3951d6d6ff4a9f13dc7cf56cd28d2b8eb37dbcc9c68e52e1e1191873ea9f82a017287ab50baadc5ccc494f036c67c0e47eb13608c2fa36f47711b61ea128e61
+ARG NPM_VERSION=12.2.2
+ARG NPM_SHA512=2a09606d9c9a71fee31fe147b8d46a56e0b3422f15848d9aec9f3b231e3716c3d3b99a065a62175c6759b4150e03bf6fc0bf8825112a511573ba903b3ec41370
+ARG PNPM_VERSION=12.18.0
+ARG PNPM_SHA512=9d7882d5dc82147ecfc4e062aa34834e0ad0296710a1837a1115ae012127d36b7109e321ac1598a1dd0a65597681b1e99917e12ed0d749eae91187943363beb3
 # docker CLI: celld drives tenant Sandbox containers through the host's
 # engine (`celld deploy` pulls images, the fence installs its nftables
 # rules), so the image needs the CLI and the compose file mounts the host
 # socket. Pinned against the signed apt repo (docker/check-versions.ts
 # asserts it); the revision carries the base's Debian release, so a base
 # move needs a repin.
-ARG DOCKER_VERSION=5:29.9.2-1~debian.13~trixie
+ARG DOCKER_VERSION=5:29.9.3-1~debian.13~trixie
 
 FROM ${CELLD_IMAGE} AS celld
 

@@ -23,6 +23,7 @@
   },
   "include": [
     "src",
+    "scripts",
     "e2e",
     "vite.config.ts",
     "void.config.ts",

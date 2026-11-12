@@ -26,10 +26,10 @@ use serde_json::{json, Value};
 /// npm bundled in the image (`docker/Dockerfile` `NPM_VERSION`, seeded from
 /// `/opt/jup-bundled` into each app's `JUP_HOME` at deploy time).
 /// `docker/check-versions.ts` asserts it matches the Dockerfile pin.
-pub const BUNDLED_NPM_VERSION: &str = "12.2.1";
+pub const BUNDLED_NPM_VERSION: &str = "12.2.2";
 /// pnpm bundled in the image (`docker/Dockerfile` `PNPM_VERSION`).
 /// `docker/check-versions.ts` asserts it matches the Dockerfile pin.
-pub const BUNDLED_PNPM_VERSION: &str = "12.15.0";
+pub const BUNDLED_PNPM_VERSION: &str = "12.18.0";
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct PackageManager {

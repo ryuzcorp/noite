@@ -243,7 +243,7 @@ export class SandboxController extends SandboxContainer<ControllerEnv> {
       completion.failure = generation.failure;
     };
 
-    // oxlint-disable-next-line promise/prefer-await-to-then -- a completion listener, not a wait: the context must return while the process runs.
+    // oxlint-disable-next-line promise/prefer-await-to-then, promise/prefer-catch -- a completion listener, not a wait: the context must return while the process runs.
     void exitCode.then(capture, capture);
 
     return completion;
@@ -257,7 +257,7 @@ export class SandboxController extends SandboxContainer<ControllerEnv> {
   #serializeActivity<T>(operation: () => Promise<T>): Promise<T> {
     // oxlint-disable-next-line promise/prefer-await-to-then -- the queue links continuations; awaiting here would serialize the caller instead of the work.
     const result = this.#activityTail.then(operation);
-    // oxlint-disable-next-line promise/prefer-await-to-then -- see above: the tail must advance without blocking this call.
+    // oxlint-disable-next-line promise/prefer-await-to-then, promise/prefer-catch -- see above: the tail must advance without blocking this call.
     this.#activityTail = result.then(settleTail, settleTail);
 
     return result;
@@ -571,7 +571,7 @@ export class SandboxController extends SandboxContainer<ControllerEnv> {
     try {
       const process = await this.container.exec(argv, { ...options });
 
-      // oxlint-disable-next-line promise/prefer-await-to-then -- a lifetime listener, not a wait: the spawn must return while the process runs.
+      // oxlint-disable-next-line promise/prefer-await-to-then, promise/prefer-catch -- a lifetime listener, not a wait: the spawn must return while the process runs.
       void process.exitCode.then(finish, finish);
 
       return process;
@@ -812,7 +812,7 @@ export class SandboxController extends SandboxContainer<ControllerEnv> {
   #serializeLease<T>(operation: () => Promise<T>): Promise<T> {
     // oxlint-disable-next-line promise/prefer-await-to-then -- the queue links continuations; awaiting here would serialize the caller instead of the work.
     const result = this.#startTail.then(operation);
-    // oxlint-disable-next-line promise/prefer-await-to-then -- see above: the tail must advance without blocking this call.
+    // oxlint-disable-next-line promise/prefer-await-to-then, promise/prefer-catch -- see above: the tail must advance without blocking this call.
     this.#startTail = result.then(settleTail, settleTail);
 
     return result;
