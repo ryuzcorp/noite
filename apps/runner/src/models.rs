@@ -229,6 +229,13 @@ impl DeployStatus {
         matches!(self, Self::Queued | Self::Building | Self::Deploying)
     }
 
+    /// A row that has closed: its status, log and error never change again.
+    /// The complement of [`Self::is_in_flight`]; the one place the terminal
+    /// set is named.
+    pub fn is_terminal(self) -> bool {
+        !self.is_in_flight()
+    }
+
     /// The states a row may hold immediately before it is written as `self`:
     /// the one transition table for `db::deploys::upsert_deploy`. A terminal
     /// row (`success`, `failed`, `cancelled`, `stalled`) is its own
@@ -432,6 +439,14 @@ pub struct Deploy {
     /// `None` is the automatic push/tip pipeline, which has no request.
     pub actor: Option<String>,
     pub log: String,
+    /// The one-line reason a terminal run closed with: the row's own
+    /// `ERROR:` line (`build failed: …`, `cancelled by the operator`,
+    /// `deploy stalled …`). `None` on success and while in flight. Written
+    /// once, together with the terminal status, and never rewritten.
+    ///
+    /// A terminal row is never written again, so its `updated_at` is when it
+    /// finished: `created_at` to `updated_at` is the deploy's duration.
+    pub error: Option<String>,
     pub created_at: String,
     pub updated_at: String,
 }

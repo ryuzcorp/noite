@@ -4,7 +4,9 @@ import { renderHtml } from "ilha/test";
 
 import type { AppDetail } from "../api-types";
 import { keys } from "../resources";
+import type { RunnerDeploy } from "../runner";
 import { clearSwrStore, writeSwr } from "../swr-store";
+import { DeployRow } from "./deploys";
 import { AppHeader } from "./panel";
 
 const APP_ID = "app-rollback";
@@ -43,6 +45,36 @@ const detail = (lastDeploySha: string | null): AppDetail => ({
 /** The header at module scope so the server render resolves it. */
 const Header = () => <AppHeader appId={APP_ID} />;
 
+const STOPPED: RunnerDeploy = {
+  actor: null,
+  appId: APP_ID,
+  createdAt: "2026-11-10T13:27:02.395Z",
+  environmentId: null,
+  error: "cancelled by the operator",
+  id: "deploy-stopped",
+  intent: "deploy",
+  log: "",
+  sha: LIVE,
+  status: "cancelled",
+  updatedAt: "2026-11-10T13:28:44.395Z",
+};
+
+/** What the Deployments tab paints for one stopped deploy: the app page's
+ * header above the tab, then the deploy's own row. */
+const DeploymentsProbe = () => (
+  <div>
+    <AppHeader appId={APP_ID} />
+    <DeployRow
+      appId={APP_ID}
+      canPush={false}
+      currentSha={LIVE}
+      d={STOPPED}
+      environmentId=""
+      live={false}
+    />
+  </div>
+);
+
 describe("AppHeader", () => {
   beforeEach(() => {
     clearSwrStore();
@@ -63,5 +95,18 @@ describe("AppHeader", () => {
     expect(html).toContain('data-ilha-key="visit"');
     expect(html).toContain('data-ilha-key="power"');
     expect(html).toContain('data-ilha-key="deploy"');
+  });
+
+  // A stopped deploy's reason lives on its own row. It used to be copied onto
+  // the app's `last_error`, which painted the same sentence in a second alert
+  // above every tab; the runner now keeps `last_error` for failures the deploy
+  // history cannot show. The card must still say why, and say it once.
+  test("a stopped deploy shows its reason and duration in its card, once", async () => {
+    writeSwr(keys.appDetail(APP_ID), detail(LIVE));
+
+    const html = await renderHtml(DeploymentsProbe);
+
+    expect(html).toContain("took 1m 42s");
+    expect(html.split("cancelled by the operator")).toHaveLength(2);
   });
 });

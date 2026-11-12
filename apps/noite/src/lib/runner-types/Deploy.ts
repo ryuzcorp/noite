@@ -17,4 +17,14 @@ intent: DeployIntent,
  * attributable label ("Ada via key ci") for a redeploy it triggered.
  * `None` is the automatic push/tip pipeline, which has no request.
  */
-actor: string | null, log: string, createdAt: string, updatedAt: string, };
+actor: string | null, log: string, 
+/**
+ * The one-line reason a terminal run closed with: the row's own
+ * `ERROR:` line (`build failed: …`, `cancelled by the operator`,
+ * `deploy stalled …`). `None` on success and while in flight. Written
+ * once, together with the terminal status, and never rewritten.
+ *
+ * A terminal row is never written again, so its `updated_at` is when it
+ * finished: `created_at` to `updated_at` is the deploy's duration.
+ */
+error: string | null, createdAt: string, updatedAt: string, };

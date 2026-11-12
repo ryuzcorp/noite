@@ -6,7 +6,7 @@ import { atom } from "ilha";
 
 import { api } from "../api";
 import { appHost, appUrl } from "../apps/identity";
-import { formatDateTime } from "../dates";
+import { formatDateTime, formatDuration } from "../dates";
 import {
   decodeDeploys,
   deploysUrl,
@@ -344,6 +344,45 @@ const RowProps = islandProps<{
   live: boolean;
 }>("DeployRow");
 
+/** A deploy row's identity: the commit link, why/who/when it ran, how long a
+ * finished run took, and the row's own one-line reason when it did not
+ * succeed. One place, so the collapsed card always carries the reason the
+ * history used to repeat in the app's alert. */
+const DeployRowSummary = ({ appId, d }: { appId: string; d: RunnerDeploy }) => {
+  const { finished } = deployStatusFacts(d.status);
+  const intent = deployIntentLabel(d.intent, d.sha);
+  // A finished row never changes again, so its `updatedAt` is the instant it
+  // closed: `createdAt` to that is how long the deploy took.
+  const took = formatDuration(d.createdAt, finished ? d.updatedAt : null);
+
+  return (
+    <div>
+      <div class="font-mono text-sm">
+        {d.sha ? (
+          <Link
+            class="link link-hover"
+            href={`/apps/${appId}/source/commit/${d.sha}`}
+            title={d.sha}
+          >
+            {d.sha.slice(0, 12)}
+          </Link>
+        ) : (
+          "—"
+        )}
+      </div>
+      <div class="text-base-content/70 text-xs">
+        {intent === null ? null : <span class="mr-2">{intent}</span>}
+        {d.actor === null ? null : <span class="mr-2">by {d.actor}</span>}
+        {formatDateTime(d.createdAt)}
+        {took === null ? null : <span class="ml-2">took {took}</span>}
+      </div>
+      {d.error === null ? null : (
+        <p class="text-error m-0 text-xs break-words">{d.error}</p>
+      )}
+    </div>
+  );
+};
+
 /** One deploy row. Expansion, the log tab, Stop and Roll back are one
  * machine: Stop is refused while a call is in flight, and a 409 ("already
  * closed") reads as information instead of a permanent red error. */
@@ -360,7 +399,6 @@ const RowApp = defineApp({
     const props = RowProps.read();
     const { d } = props;
     const facts = deployStatusFacts(d.status);
-    const intent = deployIntentLabel(d.intent, d.sha);
     const open = rowOpen(model, props.live);
 
     const busy =
@@ -377,26 +415,7 @@ const RowApp = defineApp({
       <>
         <li class="list-row">
           <div>{deployBadge(d.status)}</div>
-          <div>
-            <div class="font-mono text-sm">
-              {d.sha ? (
-                <Link
-                  class="link link-hover"
-                  href={`/apps/${props.appId}/source/commit/${d.sha}`}
-                  title={d.sha}
-                >
-                  {d.sha.slice(0, 12)}
-                </Link>
-              ) : (
-                "—"
-              )}
-            </div>
-            <div class="text-base-content/70 text-xs">
-              {intent === null ? null : <span class="mr-2">{intent}</span>}
-              {d.actor === null ? null : <span class="mr-2">by {d.actor}</span>}
-              {formatDateTime(d.createdAt)}
-            </div>
-          </div>
+          <DeployRowSummary appId={props.appId} d={d} />
           {model.action._tag === "Failed" ? (
             <p class="text-error m-0 text-xs">{model.action.error}</p>
           ) : null}
@@ -520,7 +539,10 @@ const RowApp = defineApp({
   },
 });
 
-const DeployRowIsland = RowProps.wrap(RowApp);
+/** One deploy row: the badge, the commit and its labels, the run's duration
+ * and — for a failed, stopped or timed-out run — its own one-line reason.
+ * Exported so a render test can pin what the card shows. */
+export const DeployRow = RowProps.wrap(RowApp);
 
 /** One environment's deploy history over SSE: skeleton until the first frame,
  * then the event stream pushes updates — no polling, and rows never remount
@@ -622,7 +644,7 @@ const DeployFeedList = ({
           </li>
         ) : null}
         {items().map((d) => (
-          <DeployRowIsland
+          <DeployRow
             key={d.id}
             appId={appId}
             canPush={canPush}
