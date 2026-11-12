@@ -88,13 +88,16 @@ pub async fn spawn_s3_stub_recording() -> (String, std::sync::Arc<std::sync::Mut
                 use tokio::io::{AsyncReadExt, AsyncWriteExt};
                 let mut buf = vec![0u8; 8192];
                 let read = sock.read(&mut buf).await.unwrap_or(0);
-                if let Some(line) = String::from_utf8_lossy(&buf[..read]).lines().next() {
-                    if !line.is_empty() {
-                        record
-                            .lock()
-                            .unwrap_or_else(|p| p.into_inner())
-                            .push(line.to_string());
-                    }
+                let request_line = String::from_utf8_lossy(&buf[..read])
+                    .lines()
+                    .next()
+                    .unwrap_or_default()
+                    .to_string();
+                if !request_line.is_empty() {
+                    record
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .push(request_line.clone());
                 }
                 let body = if is_object_op(&buf).unwrap_or(false) {
                     if is_read(&buf) {

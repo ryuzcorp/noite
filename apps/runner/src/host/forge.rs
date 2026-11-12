@@ -571,6 +571,27 @@ pub async fn delete_retired_refs(state: &AppState, slug: &str) -> anyhow::Result
         return Ok(0);
     }
     let count = updates.len();
+    // The bundles go first, and the wipe is verified: if a prefix cannot be
+    // listed or still holds objects, the refs stay in the mirror and the
+    // manifest (and the boot marker stays unset) so the next boot retries —
+    // once the refs are gone the prefixes are unreachable and would leak the
+    // retired snapshots forever.
+    for update in &updates {
+        crate::host::git_http::delete_ref_prefix(&state.config, slug, &update.refname).await;
+        let prefix = format!("git/{slug}/{}/", update.refname);
+        let listing =
+            crate::host::s3::s3_list_prefix(&state.config, &state.config.s3_bucket, &prefix)
+                .await
+                .with_context(|| format!("list the retired bundle prefix {prefix}"))?;
+        let remaining = serde_json::from_str::<serde_json::Value>(&listing)
+            .ok()
+            .and_then(|v| v.get("Contents").and_then(|c| c.as_array()).cloned())
+            .map(|a| !a.is_empty())
+            .unwrap_or(true);
+        if remaining {
+            anyhow::bail!("retired bundles remain under {prefix}; retrying on the next boot");
+        }
+    }
     let outcome = match state.wal.publish_locked(slug, &updates).await {
         Ok(outcome) => outcome,
         Err(ryuz_git::WalError::RefConflict { .. }) => {
@@ -593,6 +614,8 @@ pub async fn delete_retired_refs(state: &AppState, slug: &str) -> anyhow::Result
         }
     }
     for deleted in &outcome.deleted {
+        // Best-effort here (the strict wipe already ran): a ref the WAL
+        // removed from the mirror may still have its (empty) prefix.
         crate::host::git_http::delete_ref_prefix(&state.config, slug, deleted).await;
     }
     Ok(count)
