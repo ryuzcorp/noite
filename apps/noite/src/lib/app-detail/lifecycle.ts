@@ -355,8 +355,10 @@ interface EnvironmentHeaderState {
   readonly label: string;
   readonly tone: StatusTone;
   readonly stopped: boolean;
-  /** `lastError` to show even while stopped (a stop does not erase why the
-   * last deploy failed). */
+  /** The environment's own `lastError`, for an operational failure the deploy
+   * history cannot show (a fleet that never started); a deploy's reason lives
+   * on its history row. Shown even while stopped, so a stop does not hide
+   * why the fleet is not coming up. */
   readonly error: string | null;
 }
 

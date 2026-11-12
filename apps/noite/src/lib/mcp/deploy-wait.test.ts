@@ -13,6 +13,7 @@ const deploy = (over: Partial<RunnerDeploy> = {}): RunnerDeploy => ({
   appId: "app-1",
   createdAt: "2026-11-11T00:00:00Z",
   environmentId: null,
+  error: null,
   id: "dep-1",
   intent: "deploy",
   log: "",

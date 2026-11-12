@@ -98,6 +98,12 @@ CREATE TABLE IF NOT EXISTS deploy (
   -- automatic push/tip pipeline. Schema version 103 added it.
   actor TEXT,
   log TEXT NOT NULL DEFAULT '',
+  -- The one-line reason a failed/cancelled/stalled run closed with, taken
+  -- from the row's own `ERROR:` line. The deploy history shows it in the
+  -- row; a successful or in-flight row has none. Schema version 105 added
+  -- it. A terminal row is never written again, so `created_at` to
+  -- `updated_at` is how long the deploy took.
+  error TEXT,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );

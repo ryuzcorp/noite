@@ -15,7 +15,7 @@ use sqlx::SqliteConnection;
 pub const FIRST_COMPACTED_VERSION: i64 = 100;
 
 /// Version a database has after every migration ran.
-pub const SCHEMA_VERSION: i64 = FIRST_COMPACTED_VERSION + 4;
+pub const SCHEMA_VERSION: i64 = FIRST_COMPACTED_VERSION + 5;
 
 /// One upgrade step: the statements that take a database from `version - 1`
 /// to `version`. Empty at the compacted baseline; append above it to change
@@ -57,6 +57,16 @@ pub const MIGRATIONS: &[Migration] = &[
         sql: "ALTER TABLE main.pull_request ADD COLUMN author_label TEXT; \
               ALTER TABLE main.pr_comment ADD COLUMN author_label TEXT; \
               ALTER TABLE main.pr_review ADD COLUMN author_label TEXT;",
+    },
+    Migration {
+        // 105: a finished deploy's own one-line error: the history paints the
+        // reason in the deploy's row instead of repeating it in the app's
+        // `last_error`, and the row's `updated_at` (its last write, since a
+        // terminal row never changes again) is its finish stamp. Rows
+        // finished before this step keep their history; they have no row
+        // error, and their duration reads from `updated_at` like a new one.
+        version: FIRST_COMPACTED_VERSION + 5,
+        sql: "ALTER TABLE main.deploy ADD COLUMN error TEXT;",
     },
 ];
 
@@ -341,6 +351,8 @@ mod tests {
         let mut conn = memory().await;
         sqlx::raw_sql(
             "CREATE TABLE main.app (id TEXT PRIMARY KEY, slug TEXT); \
+             CREATE TABLE main.deploy (id TEXT PRIMARY KEY, app_id TEXT, environment_id TEXT, \
+                                      sha TEXT, status TEXT NOT NULL, log TEXT, created_at TEXT); \
              CREATE TABLE main.pull_request (id TEXT PRIMARY KEY NOT NULL); \
              CREATE TABLE main.pr_comment (id TEXT PRIMARY KEY NOT NULL); \
              CREATE TABLE main.pr_review (id TEXT PRIMARY KEY NOT NULL); \
@@ -369,6 +381,53 @@ mod tests {
             .expect("column lookup");
             assert_eq!(columns, 1, "{table} gained author_label");
         }
+    }
+
+    /// The 105 step gives a finished deploy its own error line: a database
+    /// from the previous baseline gains the column on `deploy`, NULL for every
+    /// row it already holds, so the history keeps rendering and only new runs
+    /// carry a row-level reason.
+    #[tokio::test]
+    async fn the_deploy_error_step_upgrades_a_stamped_database() {
+        let mut conn = memory().await;
+        sqlx::raw_sql(
+            "CREATE TABLE main.app (id TEXT PRIMARY KEY, slug TEXT); \
+             CREATE TABLE main.deploy (id TEXT PRIMARY KEY, app_id TEXT, environment_id TEXT, \
+                                      sha TEXT, status TEXT NOT NULL, intent TEXT NOT NULL, \
+                                      actor TEXT, log TEXT, created_at TEXT, updated_at TEXT); \
+             CREATE TABLE main.pull_request (id TEXT PRIMARY KEY NOT NULL); \
+             CREATE TABLE main.pr_comment (id TEXT PRIMARY KEY NOT NULL); \
+             CREATE TABLE main.pr_review (id TEXT PRIMARY KEY NOT NULL); \
+             INSERT INTO main.deploy (id, app_id, status, intent, log) \
+                 VALUES ('d1', 'a1', 'failed', 'deploy', 'ERROR: boom'); \
+             PRAGMA main.user_version = 104;",
+        )
+        .execute(&mut conn)
+        .await
+        .expect("seed a 104 database");
+        apply(
+            &mut conn,
+            "CREATE TABLE IF NOT EXISTS main.app (id TEXT PRIMARY KEY, slug TEXT);",
+            SCHEMA_VERSION,
+            MIGRATIONS,
+        )
+        .await
+        .expect("migrate forward");
+        assert_eq!(version(&mut conn).await, SCHEMA_VERSION);
+
+        let found: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM pragma_table_info('deploy') WHERE name = 'error'",
+        )
+        .fetch_one(&mut conn)
+        .await
+        .expect("column lookup");
+        assert_eq!(found, 1, "deploy gained error");
+        let error: Option<String> =
+            sqlx::query_scalar("SELECT error FROM main.deploy WHERE id = 'd1'")
+                .fetch_one(&mut conn)
+                .await
+                .expect("old row");
+        assert_eq!(error, None, "an old row has no row-level reason");
     }
 
     #[tokio::test]

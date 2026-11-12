@@ -24,7 +24,7 @@ use crate::host::void_proxy;
 use crate::host::void_sandbox;
 use crate::host::worker_vars;
 use crate::lifecycle::{self, sha_same};
-use crate::models::{App, AppStatus, DeployStatus, Environment, WriteGuard};
+use crate::models::{App, DeployStatus, Environment};
 use sqlx::SqlitePool;
 
 /// The workflow file a repo root may carry (read by the deploy).
@@ -526,17 +526,21 @@ impl Progress<'_> {
         // A stopped run says why and nothing else: the step that was cut
         // short did not fail on its own.
         if self.cancel.as_ref().is_some_and(|c| c.is_cancelled()) {
-            // `close` writes the target too: `failed` on the chip, with the
-            // stop as its one-line summary (`db::deploys::apply_status`).
+            // `close` writes the target too: `failed` on the chip; the stop is
+            // the row's own one-line error (`Deploy::error`).
             self.close(DeployStatus::Cancelled, &format!("ERROR: {CANCELLED}\n"))
                 .await?;
             return Ok(());
         }
         let detail = lifecycle::strip_ansi(&format!("{err:#}")).into_owned();
         let detail = lifecycle::tail_utf8(detail.trim_end(), FAILURE_TAIL);
+        // The summary is the row's own one-line error (the same sentence the
+        // app used to repeat) and the first line of its log; the detail below
+        // it is the evidence behind "View logs".
+        let summary = failure_summary(self.step, detail);
         self.close(
             DeployStatus::Failed,
-            &format!("ERROR: {} failed\n{detail}\n", self.step),
+            &format!("ERROR: {summary}\n{detail}\n"),
         )
         .await?;
         // The transition into "automatic deploys paused" is the second
@@ -548,32 +552,6 @@ impl Progress<'_> {
             self.environment_id.as_deref(),
         )
         .await;
-        let summary = failure_summary(self.step, detail);
-        match self.environment_id.as_deref() {
-            // `upsert_deploy` already moved the environment to failed with the
-            // log tail; this adds the one-line summary the UI lists.
-            Some(env_id) => {
-                db::write_environment_status(
-                    self.pool,
-                    env_id,
-                    AppStatus::Failed,
-                    Some(&summary),
-                    WriteGuard::Wanted,
-                )
-                .await?;
-            }
-            None => {
-                db::write_app_status(
-                    self.pool,
-                    self.app_id,
-                    AppStatus::Failed,
-                    Some(&summary),
-                    None,
-                    WriteGuard::Wanted,
-                )
-                .await?;
-            }
-        }
         Ok(())
     }
 }
@@ -4019,9 +3997,9 @@ mod tests {
     }
 
     /// A run the operator stopped records `cancelled`, not `failed`: the row
-    /// says who ended it, while the target's chip is `failed` with the stop as
-    /// its one-line summary (nothing is building for it, the previous release
-    /// keeps serving).
+    /// says who ended it, its own error names the stop, and the target's chip
+    /// is `failed` (nothing is building for it, the previous release keeps
+    /// serving).
     #[tokio::test]
     async fn a_stopped_run_closes_its_row_as_cancelled() {
         let pool = crate::db::connect("sqlite::memory:")
@@ -4078,6 +4056,14 @@ mod tests {
             .expect("read deploy")
             .expect("deploy row");
         assert_eq!(closed.status, DeployStatus::Cancelled);
+        assert_eq!(
+            closed.error.as_deref(),
+            Some(crate::host::cancel::CANCELLED)
+        );
+        assert!(
+            closed.updated_at >= closed.created_at,
+            "the cancel is the row's last write"
+        );
         assert!(
             closed.log.contains("ERROR: cancelled by the operator"),
             "{}",
@@ -4089,8 +4075,8 @@ mod tests {
             .expect("app row");
         assert_eq!(stopped.status, crate::models::AppStatus::Failed);
         assert_eq!(
-            stopped.last_error.as_deref(),
-            Some(crate::host::cancel::CANCELLED)
+            stopped.last_error, None,
+            "the stop is the deploy row's error, not the app's last error"
         );
         crate::host::cancel::CANCELS.release(&row.id);
     }

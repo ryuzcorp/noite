@@ -8,6 +8,7 @@ const row = (overrides: Partial<RunnerDeploy>): RunnerDeploy => ({
   appId: "a",
   createdAt: "2026-10-22T00:00:00Z",
   environmentId: null,
+  error: null,
   id: "d",
   intent: "deploy",
   log: "",

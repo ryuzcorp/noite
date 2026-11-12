@@ -280,6 +280,9 @@ const HeaderApp = defineApp({
             </button>
           </div>
         ) : null}
+        {/* Operational failures only (a fleet that never spawned, an import
+            that failed): a deploy's own reason is painted on its row in the
+            Deployments tab, never copied here. */}
         {app.lastError ? (
           <div class="alert alert-error alert-soft m-0 py-2" role="alert">
             <span class="text-sm break-words">{app.lastError}</span>

@@ -36,6 +36,36 @@ export const formatHour = (utcHourKey: string): string => {
 
 const relative = new Intl.RelativeTimeFormat(undefined, { numeric: "auto" });
 
+/** How long something took, coarsely: `42s`, `1m 42s`, `2h 5m`. Whole
+ * seconds below an hour, whole minutes above it; `null` when either stamp is
+ * missing or unparseable, so callers render nothing instead of `NaN`. */
+export const formatDuration = (
+  start: string | Date | null | undefined,
+  end: string | Date | null | undefined
+): string | null => {
+  const from = toDate(start);
+  const to = toDate(end);
+
+  if (from === null || to === null) {
+    return null;
+  }
+
+  const total = Math.max(0, Math.floor((to.getTime() - from.getTime()) / 1000));
+  const seconds = total % 60;
+  const minutes = Math.floor(total / 60) % 60;
+  const hours = Math.floor(total / 3600);
+
+  if (hours > 0) {
+    return minutes > 0 ? `${hours}h ${minutes}m` : `${hours}h`;
+  }
+
+  if (minutes > 0) {
+    return seconds > 0 ? `${minutes}m ${seconds}s` : `${minutes}m`;
+  }
+
+  return `${seconds}s`;
+};
+
 const RELATIVE_STEPS: [Intl.RelativeTimeFormatUnit, number][] = [
   ["second", 60],
   ["minute", 60],
