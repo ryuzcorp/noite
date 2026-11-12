@@ -188,13 +188,22 @@ pub async fn prepare_rollback(
     // sha fetches the bundle that exists instead of assuming `refs/heads/main`.
     let reference = match &environment {
         Some(env) => env.git_ref.clone(),
-        None => match success.intent {
-            crate::models::DeployIntent::Branch => success
-                .actor
-                .clone()
-                .unwrap_or_else(|| "refs/heads/main".to_string()),
-            _ => "refs/heads/main".to_string(),
-        },
+        None => {
+            // Any branch success at this sha names the ref, not only the newest
+            // row: after a rollback/redeploy of that sha the newest success is
+            // a `rollback` row, which would otherwise fall back to main.
+            let branch = if success.intent == crate::models::DeployIntent::Branch {
+                success.actor.clone()
+            } else {
+                db::get_success_branch_deploy(&state.pool, &app.id, &sha)
+                    .await
+                    .map_err(|e| ApiError::internal(e.to_string()))?
+                    .and_then(|row| row.actor)
+            };
+            recorded_branch_ref(branch.as_deref())
+                .unwrap_or("refs/heads/main")
+                .to_string()
+        }
     };
     let key = format!("git/{}/{}/{sha}.bundle", app.slug, reference);
     let target = match environment {
@@ -366,6 +375,20 @@ pub async fn deploy_branch(
     let out = (prepared.deploy_id.clone(), prepared.sha.clone());
     tokio::spawn(async move { prepared.run().await });
     Ok(out)
+}
+
+/// A branch deploy's recorded ref, validated before it becomes an S3 key: a
+/// stored row must not be able to point the bundle read outside the app's own
+/// branch namespace. `None` falls back to the production ref.
+fn recorded_branch_ref(reference: Option<&str>) -> Option<&str> {
+    let reference = reference?;
+    let name = reference.strip_prefix("refs/heads/")?;
+    if !crate::host::forge::valid_branch_name(name)
+        || crate::host::forge::is_reserved_ref(reference)
+    {
+        return None;
+    }
+    Some(reference)
 }
 
 /// The full branch ref for a caller's reference: a branch name gains the

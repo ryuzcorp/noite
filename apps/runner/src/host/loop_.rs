@@ -753,10 +753,13 @@ async fn sweep_needs_tip(
     // operator's choice stands.
     if target.environment().is_none() {
         if let Some(live_sha) = &live {
-            if let Some(row) = db::get_success_deploy(pool, &app.id, live_sha, None).await? {
-                if row.intent == crate::models::DeployIntent::Branch {
-                    return Ok(false);
-                }
+            // Any branch success at the live sha, not only the newest row: a
+            // rollback/redeploy of that sha adds a newer `rollback` row.
+            if db::get_success_branch_deploy(pool, &app.id, live_sha)
+                .await?
+                .is_some()
+            {
+                return Ok(false);
             }
         }
     }
@@ -1106,6 +1109,41 @@ mod tests {
         )
         .await
         .expect("branch deploy success");
+        // A rollback of that release lands at the same sha: the newest success
+        // row is now `rollback`, and the sweep must still see the branch
+        // provenance from the earlier row.
+        let rollback_id = db::queue_deploy(
+            &pool,
+            &app.id,
+            None,
+            DeployIntent::Rollback,
+            "feature2222",
+            None,
+        )
+        .await
+        .expect("queue rollback");
+        db::upsert_deploy(
+            &pool,
+            Some(&rollback_id),
+            &app.id,
+            None,
+            DeployStatus::Building,
+            Some("feature2222"),
+            "",
+        )
+        .await
+        .expect("rollback building");
+        db::upsert_deploy(
+            &pool,
+            Some(&rollback_id),
+            &app.id,
+            None,
+            DeployStatus::Success,
+            Some("feature2222"),
+            "",
+        )
+        .await
+        .expect("rollback success");
         let fresh = db::get_app(&pool, &app.id).await.unwrap().expect("app row");
         assert_eq!(fresh.last_deploy_sha.as_deref(), Some("feature2222"));
 

@@ -1583,6 +1583,39 @@ async fn branch_deploy_resolves_that_branchs_tip() {
         "a rollback of a branch deploy reads the branch bundle, not main's"
     );
 
+    // The rollback lands: the newest success at the sha is now a `rollback`
+    // row, and the next rollback must still read the branch bundle.
+    crate::db::upsert_deploy(
+        &h.state.pool,
+        Some(&rollback.deploy_id),
+        &app.id,
+        None,
+        crate::models::DeployStatus::Building,
+        Some(&feature_sha),
+        "",
+    )
+    .await
+    .expect("rollback building");
+    crate::db::upsert_deploy(
+        &h.state.pool,
+        Some(&rollback.deploy_id),
+        &app.id,
+        None,
+        crate::models::DeployStatus::Success,
+        Some(&feature_sha),
+        "",
+    )
+    .await
+    .expect("rollback success");
+    let again = crate::service::deploys::prepare_rollback(&h.state, &app.id, &feature_sha, None)
+        .await
+        .expect("rollback of a rollback");
+    assert_eq!(
+        again.key,
+        format!("git/{}/refs/heads/feature/{feature_sha}.bundle", app.slug),
+        "a later rollback keeps the branch provenance"
+    );
+
     // A ref the caller cannot see is refused before anything is queued.
     let hidden = crate::service::deploys::prepare_branch_deploy(
         &h.state,
