@@ -582,8 +582,9 @@ enum FailureRecord {
     NotRecorded,
 }
 
-/// Reset a marker's failed-pass count: a manual retry (or cancel) is a fresh
-/// decision by the app's owner, so the automatic bound starts over.
+/// Reset a marker's failed-pass count: a manual forward retry is a fresh
+/// decision by the app's owner, so the automatic bound starts over and a
+/// crash-left `cancelling` flag is cleared (the retry is the newest word).
 async fn reset_resume_attempts(cfg: &Config, marker: &PendingRename) {
     if marker.attempts == 0
         && marker.last_failure.is_none()
@@ -1212,14 +1213,11 @@ async fn cancel_pending_rename(
     }
     // The app's salvage trees parked under the target's name come home with
     // it; otherwise a create of the freed target would sweep them as its own.
-    if let Err(e) = relocate_salvage(cfg, &pending.to, &app.slug).await {
-        tracing::warn!(
-            app_id = %app.id,
-            target = %pending.to,
-            error = %format!("{e:#}"),
-            "cancel moved the app back but could not relocate its salvage dirs"
-        );
-    }
+    // A failure keeps the marker (still `cancelling`), so the resume pass
+    // retries the whole idempotent cancel instead of reporting it done.
+    relocate_salvage(cfg, &pending.to, &app.slug)
+        .await
+        .with_context(|| format!("relocate the salvage for rename target {}", pending.to))?;
     // The target is ours no longer: the marker is what reserved it, and the
     // app row (still on its slug) is untouched. The unlink is part of the
     // cancel's contract: reporting success while the reservation survives
