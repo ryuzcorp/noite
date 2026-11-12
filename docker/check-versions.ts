@@ -8,8 +8,10 @@
  *   ARG, every downloaded tarball carries the publisher's per-arch
  *   sha256/sha512 next to its version, and the install verifies with it
  *   (docker/check-pins.ts owns these rules; this script reads the files and
- *   reports). Its `--online` leg, run in CI, compares each pin with the
- *   publisher's own digest.
+ *   reports). Its `--online` leg, run in CI, compares each immutable pin
+ *   with the publisher's own checksum; `--online-images` adds the image tag
+ *   digests, which upstream may re-push, so only a pin-changing PR (and the
+ *   weekly pin-drift workflow) asks for them.
  * - The floating lines stay covered without freezing them: every oven/bun
  *   stage must agree on one line, and the rust line must appear exactly
  *   once — a split pin fails here instead of shipping mixed toolchains.
@@ -29,6 +31,7 @@ import {
   checkIntegrityPins,
   hubTagUrl,
   onlineProbes,
+  parseOnlineFlags,
   verifyFetchedPin,
   verifyImageDigest,
 } from "./check-pins";
@@ -501,12 +504,20 @@ const verifyImageViaDocker = (
   return verifyImageDigest(probe, digest);
 };
 
-// `--online`: compare every pin with what the publisher serves today. CI runs
-// this leg; the offline checks above stay the local gate (no network, no
-// docker). A version bumped without its digest fails here: SHASUMS256.txt,
-// npm's `dist.integrity`, the release asset digest and the tag's index digest
-// are the sources the pins claim to come from.
-if (process.argv.includes("--online")) {
+// `--online`: compare every immutable publisher pin with what it serves
+// today. CI runs this leg on every PR; the offline checks above stay the
+// local gate (no network, no docker). A version bumped without its digest
+// fails here: SHASUMS256.txt, npm's `dist.integrity` and the release asset
+// digest are the sources the pins claim to come from.
+//
+// `--online-images` adds the image tag digests. Official images re-push the
+// same tag for a base-OS update (`rust:1-bookworm`, bun's `1.4`, even
+// `node:24.22.3-slim`), so that comparison is a drift detector, not a
+// deterministic PR gate: CI passes it only for a PR that changes a pin, and
+// `.github/workflows/pin-drift.yml` runs it weekly and files an issue.
+const online = parseOnlineFlags(process.argv.slice(2));
+
+if (online.online) {
   const cache = new Map<string, Promise<{ error?: string; text?: string }>>();
 
   const fetchText = (
@@ -574,7 +585,7 @@ if (process.argv.includes("--online")) {
     return verifyFetchedPin(probe, fetched.text ?? "");
   };
 
-  const probes = onlineProbes(pins, pinFiles);
+  const probes = onlineProbes(pins, pinFiles, { images: online.images });
   const results = await Promise.all(probes.map((probe) => verify(probe)));
 
   const mismatches = results.flatMap((failure) =>
@@ -585,7 +596,9 @@ if (process.argv.includes("--online")) {
     fail(mismatch);
   }
 
-  console.log(`online: ${probes.length} publisher pins checked`);
+  console.log(
+    `online: ${probes.length} publisher pins checked${online.images ? " (image tags included)" : " (image tags only with --online-images)"}`
+  );
 }
 
 if (failed) {
