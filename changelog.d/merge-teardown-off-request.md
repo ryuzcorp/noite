@@ -1,0 +1,3 @@
+### Fixed
+
+- **Merging a pull request with `deleteBranch` no longer waits for the deleted branch's preview environment to be wiped.** The ref move now returns as soon as the manifest flip and mirror update land, and the environment teardown (fleet stop, settle, S3 prefix sweep, credential revoke, row delete) runs in its own task. It used to run inside the merge/push request, where a fleet's graceful SIGTERM drain could hold the runner call past the control plane's 5 s bound; the abort then dropped the half-done wipe after the fleet entry had already left the process map, so nothing finished the stop or removed the row. The same ref-driven path also stopped holding the app's git push lock across the drain.

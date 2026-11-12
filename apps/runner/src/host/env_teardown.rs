@@ -4,6 +4,10 @@
 //!
 //! Order matches `host::purge`: the fleet goes down first, so nothing rewrites
 //! D1 / DO / telemetry into the prefix about to be emptied.
+//!
+//! The ref-driven wipe is queued, never awaited by the ref move: a fleet's
+//! graceful stop plus the settle plus the S3 sweep is seconds of work, and a
+//! push or merge request must not carry it (see [`on_refs_deleted`]).
 
 use std::time::Duration;
 
@@ -131,6 +135,14 @@ pub async fn clear_env_prefix(cfg: &Config, slug: &str, label: &str) -> anyhow::
 /// disappeared is torn down (ROADMAP — deleting the branch deletes its
 /// environment). Moves are not handled here: the deploy side is driven by
 /// `tips::TipNotify`.
+///
+/// The wipe runs in its own task, never in the ref move: the manifest flip and
+/// the mirror update are already durable when this returns, while a teardown
+/// stops a fleet (a SIGTERM drain), waits out the settle and sweeps an S3
+/// prefix. Awaiting that held `prs.merge`'s `deleteBranch` publish open for
+/// seconds — past the control plane's 5 s runner bound, whose abort then
+/// dropped the half-done task (the fleet entry was already gone from the map,
+/// so nothing finished the stop or removed the row).
 pub async fn on_refs_deleted(state: &crate::AppState, app: &App, deleted: &[String]) {
     for refname in deleted {
         let Ok(Some(env)) = db::get_environment_by_ref(&state.pool, &app.id, refname).await else {
@@ -142,19 +154,39 @@ pub async fn on_refs_deleted(state: &crate::AppState, app: &App, deleted: &[Stri
             ref = %refname,
             "ref deleted; removing its environment"
         );
-        if let Err(e) = teardown(
-            &state.config,
-            &state.pool,
-            &state.procs,
-            &state.logs,
-            (&env).into(),
-            false,
-        )
-        .await
-        {
-            tracing::warn!(slug = %app.slug, error = %format!("{e:#}"), "environment teardown failed");
-        }
+        let state = state.clone();
+        #[cfg(test)]
+        let task = teardown_task(&env.id);
+        tokio::spawn(async move {
+            if let Err(e) = teardown(
+                &state.config,
+                &state.pool,
+                &state.procs,
+                &state.logs,
+                (&env).into(),
+                false,
+            )
+            .await
+            {
+                tracing::warn!(env_id = %env.id, error = %format!("{e:#}"), "environment teardown failed");
+            }
+            #[cfg(test)]
+            crate::service::detached::finished(&task).notify_one();
+        });
     }
+}
+
+/// The test-only name of one queued teardown's completion signal.
+#[cfg(test)]
+fn teardown_task(env_id: &str) -> String {
+    format!("env-teardown:{env_id}")
+}
+
+/// Fired once the queued teardown of `env` has finished, every effect
+/// included (`notify_one` keeps a permit, so a test may wait after it ended).
+#[cfg(test)]
+pub(crate) fn teardown_finished(env: &Environment) -> std::sync::Arc<tokio::sync::Notify> {
+    crate::service::detached::finished(&teardown_task(&env.id))
 }
 
 /// One environment row from before the workspace previews were removed. It
@@ -377,7 +409,9 @@ mod tests {
         std::fs::write(state_dir.join("deploy.json"), "{}").unwrap();
 
         // Only `refs/heads/gone` vanished; `kept` merely moved.
+        let done = teardown_finished(&gone);
         on_refs_deleted(&state, &app, &[("refs/heads/gone").to_string()]).await;
+        done.notified().await;
 
         let survivors: Vec<String> = db::list_environments(&pool, &app.id)
             .await
@@ -397,7 +431,9 @@ mod tests {
             config: std::sync::Arc::new(cfg2),
             ..state.clone()
         };
+        let done = teardown_finished(&gone);
         on_refs_deleted(&retry, &app, &[("refs/heads/gone").to_string()]).await;
+        done.notified().await;
         assert!(db::get_environment(&pool, &gone.id)
             .await
             .unwrap()
@@ -406,6 +442,95 @@ mod tests {
             .await
             .unwrap()
             .is_some());
+        state.pool.clone().close().await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The wipe must not hold the ref move: `prs.merge`'s `deleteBranch`
+    /// publish awaited it, so a preview environment's graceful fleet stop
+    /// (up to 15 s) pushed the merge past the control plane's 5 s runner
+    /// bound and the abort dropped the half-done wipe.
+    #[tokio::test]
+    async fn ref_teardown_runs_off_the_ref_move() {
+        let dir = std::env::temp_dir().join(format!("noite-env-queue-{}", new_id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let url = format!("sqlite:{}?mode=rwc", dir.join("noite.sqlite").display());
+        let pool = db::connect(&url).await.expect("boot");
+        let mut cfg = crate::config::config_for_tests();
+        cfg.work_dir = dir.join("work").to_string_lossy().into_owned();
+        cfg.s3_endpoint = crate::testutil::spawn_s3_stub().await;
+        let state = crate::AppState {
+            pool: pool.clone(),
+            config: std::sync::Arc::new(cfg.clone()),
+            procs: supervisor::new_procs(),
+            logs: crate::host::logs::new_state(),
+            deploying: crate::host::deploy::new_deploying(),
+            log_notify: tokio::sync::watch::channel(0u64).0,
+            wal: crate::host::git_store::build_wal(&cfg),
+            tip_tx: crate::host::tips::channel().0,
+            ready: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            isolation: std::sync::Arc::new(tokio::sync::RwLock::new(
+                crate::host::isolation::IsolationStatus::default(),
+            )),
+            state_sync: crate::host::state::StateSync::new(),
+            dns: std::sync::Arc::new(crate::dns::FakeResolver::default()),
+            bucket_ok: std::sync::Arc::new(tokio::sync::RwLock::new((
+                true,
+                String::new(),
+                std::time::Instant::now(),
+            ))),
+            started_at: chrono::Utc::now(),
+            source_maps: Default::default(),
+            control_boot: Default::default(),
+        };
+        let app = db::create_app(
+            &pool,
+            &state.config,
+            db::NewApp {
+                name: "tear",
+                slug: "tear",
+                user_id: "local",
+                subdomain: "tear.localhost",
+                listen: 30100,
+                internal: 30101,
+            },
+        )
+        .await
+        .expect("app");
+        let env = db::create_environment(
+            &pool,
+            &state.config,
+            db::NewEnvironment {
+                app_id: &app.id,
+                slug: "tear",
+                label: "gone",
+                kind: EnvironmentKind::Branch,
+                git_ref: "refs/heads/gone",
+                created_by: "user_1",
+                listen: 30110,
+                internal: 30111,
+            },
+        )
+        .await
+        .expect("env");
+
+        let done = teardown_finished(&env);
+        on_refs_deleted(&state, &app, std::slice::from_ref(&env.git_ref)).await;
+
+        // Still there: the wipe is its own task, behind the settle, so the
+        // ref move returned without it. (Awaited, the row is already gone.)
+        assert!(
+            db::get_environment(&state.pool, &env.id)
+                .await
+                .unwrap()
+                .is_some(),
+            "the ref move must not wait for the environment wipe"
+        );
+        done.notified().await;
+        assert!(db::get_environment(&state.pool, &env.id)
+            .await
+            .unwrap()
+            .is_none());
         state.pool.clone().close().await;
         let _ = std::fs::remove_dir_all(&dir);
     }
