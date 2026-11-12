@@ -55,7 +55,7 @@ ARG NODE_DIGEST=sha256:dc26ae92c9fb15cf6b1d63e20f0944b2efe0f115b20e00be48fb23fce
 # major pin (`rust:1-bookworm`), `BUN_VERSION` a minor one (`1.4-debian` and
 # `1.4-slim` share it but not their digest). Keep the tags for readability.
 ARG RUST_VERSION=1
-ARG RUST_DIGEST=sha256:e6f2cff35d0f309acf8433b4f05878ed77092602c5065cc81801177da0bb3a9c
+ARG RUST_DIGEST=sha256:ade39a710ef85f3506cffcfec3e8a24ba090badef1dff2fb798f71d878833fea
 ARG BUN_VERSION=1.4
 ARG BUN_DEBIAN_DIGEST=sha256:93d5032fe06d163427822dc1598f420363759bb18155c9cc90eb1be05a64a19e
 ARG BUN_SLIM_DIGEST=sha256:1846adf22496bd711036aae8be147e57bdebbaea2e5264e3e0b5af1db187d9a4
