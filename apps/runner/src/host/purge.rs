@@ -191,6 +191,16 @@ pub async fn resume_pending(
         if is_running(&slug) {
             continue;
         }
+        // An unfinished rename reserves this slug: the prefix may already hold
+        // objects the attempt moved there, and wiping it would destroy their
+        // only copy (the rename's own resume pass owns the slug now).
+        if crate::host::rename::target_reserved(cfg, &slug).await {
+            tracing::debug!(
+                slug,
+                "pending purge skipped: an unfinished rename owns the slug"
+            );
+            continue;
+        }
         let registered = begin(&slug);
         // Holding the guard is what makes the check and the clear authoritative:
         // a create/rename inserts its row under this same guard and only after

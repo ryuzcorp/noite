@@ -544,6 +544,16 @@ async fn ensure(
     let prefix = scope.prefix();
     let store = store_id(cfg, provider);
     let _guard = MUTATE.lock().await;
+    // The app delete removes its row under this same lock: a mint for an app
+    // that is being deleted must not start at all. A mint already in flight
+    // completed before the delete's transaction, which marks its row
+    // `revoking`; see `delete_app_fenced`.
+    if db::get_app(pool, scope.app_id()).await?.is_none() {
+        anyhow::bail!(
+            "app {} no longer exists; no scoped key is minted for {prefix}",
+            scope.app_id()
+        );
+    }
     if let Some(row) = db::live_scoped_credential(pool, &scope_key).await? {
         if row.prefix == prefix && row.store == store {
             match decrypt(&cfg.runner_token, &scope_key, &row.nonce, &row.ciphertext)
@@ -685,6 +695,16 @@ async fn revoke_row(
     db::delete_scoped_credential(pool, &row.handle).await?;
     tracing::info!(scope = %row.scope, app_id = %row.app_id, prefix = %row.prefix, "revoked scoped bucket key");
     Ok(())
+}
+
+/// Remove an app row through the mint fence. A concurrent [`ensure`] either
+/// commits its credential row first (this delete's transaction marks it
+/// `revoking`, and the caller sweeps) or runs after the row is gone and
+/// revokes the key it minted. Without the fence a fleet spawn could insert a
+/// `live` row just after the delete marked everything else.
+pub async fn delete_app_fenced(pool: &sqlx::SqlitePool, app_id: &str) -> sqlx::Result<()> {
+    let _guard = MUTATE.lock().await;
+    crate::db::delete_app(pool, app_id).await
 }
 
 /// Revoke every key of one app: its own and its environments'. Delete and

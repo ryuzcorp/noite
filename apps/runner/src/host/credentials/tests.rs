@@ -166,6 +166,16 @@ async fn memory_db() -> sqlx::SqlitePool {
         .execute(&pool)
         .await
         .expect("test schema");
+    // `ensure` refuses to mint for an app with no row, so the scope helpers
+    // (`app-1` / `env-1`) need one. Its slug is unrelated on purpose: the
+    // check is "the app still exists", not "this prefix is its current one".
+    sqlx::query(
+        "INSERT INTO app (id, slug, name, subdomain, git_prefix, fleet_bucket, created_at, updated_at) \
+         VALUES ('app-1', 'seed-app', 'seed', 'seed.localhost', 'git/seed-app/', 's3://noite/fleets/seed-app', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+    )
+    .execute(&pool)
+    .await
+    .expect("seed app row");
     pool
 }
 
@@ -1753,6 +1763,114 @@ async fn a_live_key_whose_app_moved_away_is_revoked_before_the_reused_prefix() {
     pool.close().await;
 }
 
+/// A scoped key or operator token whose *environment* row is gone (a teardown
+/// that could not mark/drop it and still removed the row) is an orphan too:
+/// the app row surviving must not keep the key reachable forever.
+#[tokio::test]
+async fn boot_reconcile_marks_an_environment_key_whose_environment_row_is_gone() {
+    let pool = memory_db().await;
+    let (cfg, provider) = test_config(FakeProvider::new());
+    let app = app_row(&pool, "envowner").await;
+    let env = db::create_environment(
+        &pool,
+        &cfg,
+        db::NewEnvironment {
+            app_id: &app.id,
+            slug: "envowner",
+            label: "preview",
+            kind: crate::models::EnvironmentKind::Branch,
+            git_ref: "refs/heads/preview",
+            created_by: "u1",
+            listen: 30660,
+            internal: 30661,
+        },
+    )
+    .await
+    .expect("environment row");
+    let scope = Scope::Environment {
+        env_id: env.id.clone(),
+        app_id: app.id.clone(),
+        slug: "envowner".into(),
+        label: "preview".into(),
+    };
+    ensure(&pool, &cfg, &provider, &scope)
+        .await
+        .expect("environment key");
+    operator_token(
+        &pool,
+        &cfg.runner_token,
+        &format!("env:{}", env.id),
+        &app.id,
+    )
+    .await
+    .expect("environment token");
+    // The non-strict teardown path: the row goes, the credential rows stay.
+    sqlx::query("DELETE FROM main.environment WHERE id = ?")
+        .bind(&env.id)
+        .execute(&pool)
+        .await
+        .expect("drop environment row");
+
+    let report = super::reconcile_orphans(&pool).await.expect("reconcile");
+
+    assert_eq!(report.keys_marked, 1, "the environment key is marked");
+    assert_eq!(
+        report.tokens_dropped, 1,
+        "the environment token row is gone"
+    );
+    assert!(
+        db::live_scoped_credential(&pool, &scope.key())
+            .await
+            .expect("read")
+            .is_none(),
+        "the environment key is never handed out again"
+    );
+    assert!(db::get_operator_token(&pool, &format!("env:{}", env.id))
+        .await
+        .expect("read")
+        .is_none());
+    // The app itself is untouched.
+    assert!(db::live_scoped_credential(&pool, "app:envowner")
+        .await
+        .expect("read")
+        .is_none());
+    pool.close().await;
+}
+
+/// A mint that finishes after the app row was deleted must not leave a live
+/// key behind (the sweep reads only `revoking` rows, so nothing would ever
+/// revoke it): the fenced delete and the post-mint owner check close that.
+#[tokio::test]
+async fn a_mint_after_the_app_row_is_gone_leaves_no_live_key() {
+    let pool = memory_db().await;
+    let (cfg, provider) = test_config(FakeProvider::new());
+    let app = app_row(&pool, "vanished").await;
+    let scope = Scope::App {
+        app_id: app.id.clone(),
+        slug: "vanished".into(),
+    };
+    super::delete_app_fenced(&pool, &app.id)
+        .await
+        .expect("fenced delete");
+
+    let refused = ensure(&pool, &cfg, &provider, &scope).await;
+
+    assert!(refused.is_err(), "no key is handed out for a deleted app");
+    assert!(
+        db::live_scoped_credential(&pool, &scope.key())
+            .await
+            .expect("read")
+            .is_none(),
+        "no live credential row is inserted for the deleted app"
+    );
+    assert_eq!(
+        provider.mint_count(),
+        0,
+        "no key is minted once the app row is gone"
+    );
+    pool.close().await;
+}
+
 /// F2: the boot reconcile marks orphaned `scoped_credential` rows and drops
 /// orphaned `fleet_operator_token` rows (keeping the control fleet's, which
 /// has no app row by design), so the periodic sweep can revoke the store side.
@@ -1768,17 +1886,25 @@ async fn boot_reconcile_marks_key_and_token_rows_whose_app_is_gone() {
     ensure(&pool, &cfg, &provider, &kept_scope)
         .await
         .expect("kept key");
+    let gone = app_row(&pool, "gone").await;
     let gone_scope = Scope::App {
-        app_id: "gone".into(),
+        app_id: gone.id.clone(),
         slug: "gone".into(),
     };
     ensure(&pool, &cfg, &provider, &gone_scope)
         .await
         .expect("orphan key");
-    operator_token(&pool, &cfg.runner_token, "app:gone", "gone")
+    // The old build's interrupted delete: the app row goes, the key row stays
+    // live (the delete's atomic mark never ran).
+    sqlx::query("DELETE FROM main.app WHERE id = ?")
+        .bind(&gone.id)
+        .execute(&pool)
+        .await
+        .expect("orphan the app row");
+    operator_token(&pool, &cfg.runner_token, "app:gone", &gone.id)
         .await
         .expect("orphan token");
-    operator_token(&pool, &cfg.runner_token, "env:gone-env", "gone")
+    operator_token(&pool, &cfg.runner_token, "env:gone-env", &gone.id)
         .await
         .expect("orphan env token");
     operator_token(

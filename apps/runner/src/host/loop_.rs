@@ -62,8 +62,9 @@ pub async fn run_forever(
     // fail (or finish partially) while the database is still recovering. The
     // `sweep` below only reads rows already `revoking`, and the store-side
     // orphan pass protects any row, so a missed live row would stay reachable
-    // until the next restart: retry it here, before the sweep, a bounded
-    // number of times. Idempotent and local-only.
+    // until the next restart: retry it here, before the sweep — a minute
+    // apart at first, then every ten minutes until it completes. Idempotent
+    // and local-only.
     let mut orphan_rows_at: Option<Instant> = Some(Instant::now());
     let mut orphan_rows_attempts: u8 = 0;
     // Orphan scoped-key reconcile (SPEC, Scoped credentials): the store
@@ -77,6 +78,11 @@ pub async fn run_forever(
     // common case; this catches a store that was down at boot. One pass at a
     // time, off the tick, and paced like every background wipe.
     let mut last_purge_resume = Instant::now();
+    // Unfinished renames (their durable markers) are resumed here too: a crash
+    // mid-move must not wait for a client retry, and until it resolves the
+    // target slug stays reserved. None resumes on the first tick.
+    let mut last_rename_resume: Option<Instant> = None;
+    let rename_resuming = Arc::new(AtomicBool::new(false));
     let purge_resuming = Arc::new(AtomicBool::new(false));
     loop {
         tick.tick().await;
@@ -131,7 +137,7 @@ pub async fn run_forever(
         }
         if orphan_rows_at.is_some_and(|at| Instant::now() >= at) {
             orphan_rows_attempts += 1;
-            let (next, done) = match crate::host::credentials::reconcile_orphans(&pool).await {
+            let complete = match crate::host::credentials::reconcile_orphans(&pool).await {
                 Ok(rows) if rows.failed == 0 => {
                     if !rows.nothing() {
                         tracing::info!(
@@ -140,27 +146,36 @@ pub async fn run_forever(
                             "reconciled orphaned credential rows"
                         );
                     }
-                    (None, true)
+                    true
                 }
                 Ok(rows) => {
                     tracing::warn!(
                         failed = rows.failed,
                         "orphan credential row reconcile is incomplete"
                     );
-                    (Some(Instant::now() + Duration::from_secs(60)), false)
+                    false
                 }
                 Err(e) => {
                     tracing::warn!(
                         error = %format!("{e:#}"),
                         "orphan credential row reconcile failed; retrying"
                     );
-                    (Some(Instant::now() + Duration::from_secs(60)), false)
+                    false
                 }
             };
-            orphan_rows_at = if !done && orphan_rows_attempts < 5 {
-                next
-            } else {
+            orphan_rows_at = if complete {
                 None
+            } else if orphan_rows_attempts < 5 {
+                Some(Instant::now() + Duration::from_secs(60))
+            } else {
+                // A live orphan key outside the `revoking`-only sweep must not
+                // wait for a restart: keep trying at a slow cadence.
+                if orphan_rows_attempts == 5 {
+                    tracing::warn!(
+                        "orphan credential row reconcile still incomplete; retrying every 10 minutes"
+                    );
+                }
+                Some(Instant::now() + Duration::from_secs(10 * 60))
             };
         }
         // Scoped-key revocation retries (SPEC, Scoped credentials): a store
@@ -198,6 +213,37 @@ pub async fn run_forever(
                         failed = report.failed,
                         "resumed pending app purges"
                     );
+                }
+                flag.store(false, Ordering::SeqCst);
+            });
+        }
+        // Unfinished renames: the marker also reserves the target slug, so a
+        // resume pass that never runs would block that slug forever.
+        if last_rename_resume.is_none_or(|at| at.elapsed() >= Duration::from_secs(5 * 60))
+            && !rename_resuming.swap(true, Ordering::SeqCst)
+        {
+            last_rename_resume = Some(Instant::now());
+            let (pool2, cfg2, procs2, logs2, deploying2, sync2, flag) = (
+                pool.clone(),
+                cfg.clone(),
+                procs.clone(),
+                logs.clone(),
+                deploying.clone(),
+                git_sync.clone(),
+                rename_resuming.clone(),
+            );
+            tokio::spawn(async move {
+                let resumed = crate::host::rename::resume_pending_renames(
+                    &cfg2,
+                    &pool2,
+                    &procs2,
+                    &logs2,
+                    &deploying2,
+                    &sync2,
+                )
+                .await;
+                if resumed > 0 {
+                    tracing::info!(resumed, "resumed unfinished renames");
                 }
                 flag.store(false, Ordering::SeqCst);
             });

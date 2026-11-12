@@ -192,10 +192,15 @@ async fn create_inner(
             return Err(ApiError::internal(format!("create {slug}: {step}")));
         }
     }
-    // This create takes the slug from here on: drop any failed-rename marker
-    // for it *before* the wipe, so even a failed/aborted purge cannot leave a
-    // stale marker that lets a later retry adopt what the wipe was removing.
-    crate::host::rename::forget_target_marker(&state.config, slug).await;
+    // An unfinished rename reserves this slug: its target prefix may hold the
+    // only copy of the app's moved objects, so wiping it here would destroy
+    // them. Refuse instead; the rename resumes on its own (the loop's slow
+    // tick) or on the client's retry.
+    if crate::host::rename::target_reserved(&state.config, slug).await {
+        return Err(ApiError::conflict(format!(
+            "create {slug}: the slug is still being renamed; retry shortly"
+        )));
+    }
     // Always wipe leftover S3/local data for this slug before the new row lands
     // — safe now: no row exists for it (checked just above, under this guard).
     // Callers of `purge_slug` hold the slug's push guard (see its docs); the
@@ -772,12 +777,16 @@ async fn delete_inner(state: &AppState, id: &str) -> Result<(), ApiError> {
     // wait for the wipe. `delete_app` writes the purge tombstone and marks the
     // app's scoped keys `revoking` in the same transaction, so nothing below
     // can be lost (and no old key outlives the freed slug) if this task dies.
-    // The slug is about to lose its owner: a failed-rename marker that named
-    // it belongs to an attempt that has no claim here. Forget it *before* the
-    // row goes, so a crash right after the delete cannot leave a stale marker
-    // over the freed slug (a later retry would skip the wipe).
+    // The slug is about to lose its owner: attempts that started from it can
+    // never be resumed, and no marker may survive over the freed slug. Forget
+    // them *before* the row goes, so a crash right after the delete cannot
+    // leave a stale reservation behind.
+    crate::host::rename::forget_markers_from(&state.config, &app.slug).await;
     crate::host::rename::forget_target_marker(&state.config, &app.slug).await;
-    let delete_result = db::delete_app(&state.pool, id).await;
+    // The row delete is fenced against credential minting: a mint that is
+    // already in flight either commits first (this transaction marks its row
+    // `revoking`, swept below) or sees the app gone and revokes its key.
+    let delete_result = crate::host::credentials::delete_app_fenced(&state.pool, id).await;
     delete_result.map_err(|e| {
         let step = step_failure("could not remove the app row", &e.to_string());
         ApiError::internal(format!("delete {}: {step}", app.slug))
@@ -1678,12 +1687,11 @@ mod tests {
         drop(dir);
     }
 
-    /// The marker of a failed rename must not survive a change of owner of the
-    /// target slug. A stale marker would let a later retry skip the leftover
-    /// wipe and adopt the new owner's objects, and it would also skip clearing
-    /// the new owner's purge tombstone.
+    /// An unfinished rename reserves its target: the prefix may already hold
+    /// the only copy of the app's moved objects, so another create must be
+    /// refused instead of wiping them, and the app's own retry resolves it.
     #[tokio::test]
-    async fn a_stale_rename_marker_does_not_survive_a_new_owner_of_the_target() {
+    async fn a_pending_rename_reserves_its_target_against_another_owner() {
         let (state, dir) = test_state(10).await;
         let a = db::create_app(
             &state.pool,
@@ -1708,27 +1716,81 @@ mod tests {
         )
         .await
         .expect("failed attempt marker");
-        // B then took the target through the real create path, which wipes the
-        // target and must invalidate A's marker, and was deleted, leaving an
-        // empty prefix and its tombstone.
-        let b = create(&state, "B", "ab-target", Some("u1"), None)
-            .await
-            .expect("create B");
-        db::delete_app(&state.pool, &b.id)
-            .await
-            .expect("delete B row");
 
+        let refused = create(&state, "B", "ab-target", Some("u1"), None)
+            .await
+            .expect_err("a reserved target is not available");
+        assert!(
+            matches!(&refused, ApiError::Conflict(message) if message.contains("being renamed")),
+            "the create is a retryable conflict, got {refused:?}"
+        );
+
+        // The rename's own retry is allowed and resolves the reservation.
         let renamed = rename(&state, &a.id, None, Some("ab-target"))
             .await
             .expect("retry A's rename");
-
         assert_eq!(renamed.slug, "ab-target");
         assert!(
-            db::pending_purges(&state.pool)
+            create(&state, "B", "ab-target", Some("u1"), None)
                 .await
-                .expect("tombstones")
-                .is_empty(),
-            "the retry's authoritative wipe satisfies B's tombstone; a stale marker would skip it"
+                .is_err(),
+            "once A owns the target, B is refused as taken"
+        );
+        drop(dir);
+    }
+
+    /// The reconcile loop resumes an unfinished rename from its marker, so a
+    /// crash mid-move neither blocks the reservation forever nor loses the
+    /// partially moved data (the marker makes the retry skip the target wipe).
+    #[tokio::test]
+    async fn an_unfinished_rename_is_resumed_and_its_reservation_released() {
+        let (state, dir) = test_state(10).await;
+        let app = db::create_app(
+            &state.pool,
+            &state.config,
+            db::NewApp {
+                name: "Resumed",
+                slug: "rs-old",
+                user_id: "u1",
+                subdomain: "rs-old.localhost",
+                listen: 30670,
+                internal: 30671,
+            },
+        )
+        .await
+        .expect("app row");
+        crate::host::rename::write_rename_marker_for_test(
+            &state.config,
+            &app.id,
+            "rs-old",
+            "rs-new",
+        )
+        .await
+        .expect("failed attempt marker");
+        assert!(
+            crate::host::rename::target_reserved(&state.config, "rs-new").await,
+            "the target is reserved until the rename resolves"
+        );
+
+        let resumed = crate::host::rename::resume_pending_renames(
+            &state.config,
+            &state.pool,
+            &state.procs,
+            &state.logs,
+            &state.deploying,
+            state.wal.sync(),
+        )
+        .await;
+
+        assert_eq!(resumed, 1);
+        let now = db::get_app(&state.pool, &app.id)
+            .await
+            .expect("read")
+            .expect("row");
+        assert_eq!(now.slug, "rs-new");
+        assert!(
+            !crate::host::rename::target_reserved(&state.config, "rs-new").await,
+            "the reservation is released once the row commits"
         );
         drop(dir);
     }

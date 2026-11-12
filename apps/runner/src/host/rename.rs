@@ -46,7 +46,32 @@ async fn move_dir(from: &std::path::Path, to: &std::path::Path) -> anyhow::Resul
         if empty {
             tokio::fs::remove_dir(to).await?;
         } else {
-            anyhow::bail!("rename target {} already exists", to.display());
+            // A resume of a partially moved rename: the target already holds
+            // what the earlier attempt moved, while the reconcile loop has
+            // respawned the app under the old slug and recreated the source.
+            // Neither tree may be merged into the other and neither is ours to
+            // delete, so keep the recreated source aside and let the moved
+            // target stand (a human can reconcile the salvage dir).
+            let stamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or_default();
+            let name = to.file_name().and_then(|n| n.to_str()).unwrap_or("rename");
+            let salvaged = to.with_file_name(format!(".{name}.recreated-{stamp}"));
+            tokio::fs::rename(from, &salvaged).await.with_context(|| {
+                format!(
+                    "keep a recreated rename source {} aside at {}",
+                    from.display(),
+                    salvaged.display()
+                )
+            })?;
+            tracing::warn!(
+                from = %from.display(),
+                to = %to.display(),
+                salvaged = %salvaged.display(),
+                "kept a recreated rename source aside; the target already holds the moved data"
+            );
+            return Ok(());
         }
     }
     if let Some(parent) = to.parent() {
@@ -126,11 +151,38 @@ fn rename_marker(cfg: &Config, target: &str) -> std::path::PathBuf {
         .join(format!("{target}.json"))
 }
 
+/// One unfinished rename recorded on disk: the app, the slug it is leaving,
+/// and the target whose prefix may already hold part of its data.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PendingRename {
+    pub app_id: String,
+    pub from: String,
+    pub to: String,
+}
+
+/// Read one marker file into its pending rename (`None` when unreadable or
+/// malformed; a malformed marker is removed by [`pending_renames`]).
+async fn read_marker(path: &std::path::Path) -> Option<PendingRename> {
+    let to = path
+        .file_name()?
+        .to_str()?
+        .strip_suffix(".json")?
+        .to_string();
+    let text = tokio::fs::read_to_string(path).await.ok()?;
+    let mut lines = text.lines();
+    let app_id = lines.next()?.to_string();
+    let from = lines.next()?.to_string();
+    if app_id.is_empty() || from.is_empty() {
+        return None;
+    }
+    Some(PendingRename { app_id, from, to })
+}
+
 /// Whether the marker at `path` was written by `app_id` moving from `from`.
 async fn marker_names_rename(path: &std::path::Path, app_id: &str, from: &str) -> bool {
     matches!(
-        tokio::fs::read_to_string(path).await,
-        Ok(text) if text.trim_end() == format!("{app_id}\n{from}")
+        read_marker(path).await,
+        Some(marker) if marker.app_id == app_id && marker.from == from
     )
 }
 
@@ -138,9 +190,52 @@ async fn marker_names_rename(path: &std::path::Path, app_id: &str, from: &str) -
 /// a row that already names the target makes any marker of its own stale.
 async fn marker_belongs_to(path: &std::path::Path, app_id: &str) -> bool {
     matches!(
-        tokio::fs::read_to_string(path).await,
-        Ok(text) if text.lines().next() == Some(app_id)
+        read_marker(path).await,
+        Some(marker) if marker.app_id == app_id
     )
+}
+
+/// Every unfinished rename on disk, oldest first. Malformed markers are
+/// removed: they reserve nothing and would block a slug forever.
+pub(crate) async fn pending_renames(cfg: &Config) -> Vec<PendingRename> {
+    let dir = exec::work_root(cfg).join("rename");
+    let Ok(mut entries) = tokio::fs::read_dir(&dir).await else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        match read_marker(&path).await {
+            Some(marker) => out.push(marker),
+            None => {
+                let _ = tokio::fs::remove_file(&path).await;
+            }
+        }
+    }
+    out
+}
+
+/// Whether `slug` is reserved by an unfinished rename: another create or
+/// rename must not wipe or move into the prefix it may already hold data in.
+pub(crate) async fn target_reserved(cfg: &Config, slug: &str) -> bool {
+    tokio::fs::metadata(rename_marker(cfg, slug)).await.is_ok()
+}
+
+/// Remove every marker whose source slug is `from`: once the app left that
+/// slug (a successful rename, a delete, a different rename), an attempt that
+/// started there can never be resumed and must not block its target.
+pub(crate) async fn forget_markers_from(cfg: &Config, from: &str) -> usize {
+    let mut removed = 0;
+    for marker in pending_renames(cfg).await {
+        if marker.from == from {
+            clear_rename_marker(cfg, &marker.to).await;
+            removed += 1;
+        }
+    }
+    removed
 }
 
 /// Durably record that `app_id` started moving `from` → `to` before the first
@@ -292,6 +387,14 @@ pub async fn rename_app(
             anyhow::bail!("slug already taken");
         }
     }
+    // Another unfinished rename owns this target: its moved objects may be
+    // the only copy left, so taking the slug and wiping it would destroy them.
+    // Only this app's own retry may continue past the reservation.
+    let marker = rename_marker(cfg, new_slug);
+    let resuming = marker_names_rename(&marker, &app.id, &app.slug).await;
+    if !resuming && target_reserved(cfg, new_slug).await {
+        anyhow::bail!("the target slug is being renamed; retry shortly");
+    }
     // A free slug is not necessarily an EMPTY prefix: the delete that freed it
     // drops the row first and wipes in the background, so a wipe can still be
     // running, stopped, or dead with its data left behind. Move our own
@@ -306,8 +409,7 @@ pub async fn rename_app(
     // data. The marker below records the attempt before the first object
     // moves; when it names this app and source slug, the wipe is skipped and
     // the idempotent move resumes.
-    let marker = rename_marker(cfg, new_slug);
-    if marker_names_rename(&marker, &app.id, &app.slug).await {
+    if resuming {
         tracing::info!(
             slug = new_slug,
             "resuming a rename whose target already holds this app's moved data"
@@ -332,13 +434,14 @@ pub async fn rename_app(
                 // the tombstone for `purge::resume_pending`, which re-checks
                 // the row (we hold the guard until the row write) and wipes
                 // again.
-                if let Err(e) = crate::db::clear_app_purges(pool, new_slug).await {
-                    tracing::warn!(
-                        slug = new_slug,
-                        error = %e,
-                        "could not clear the target slug's purge tombstones"
-                    );
-                }
+                // A tombstone left behind would let the purge resume pass wipe
+                // the target *after* this rename moved objects into it: fail
+                // before moving anything instead.
+                crate::db::clear_app_purges(pool, new_slug)
+                    .await
+                    .with_context(|| {
+                        format!("clear the target slug's purge tombstone for {new_slug}")
+                    })?;
                 // Written *after* the wipe (so it never vouches for a prefix
                 // the wipe did not finish) and *before* the first move.
                 write_rename_marker(cfg, &app.id, &app.slug, new_slug).await?;
@@ -351,13 +454,82 @@ pub async fn rename_app(
     let renamed = rename_slugged(cfg, pool, procs, logs, &app, new_name, new_slug).await?;
     // The row is committed to the target: the move is no longer resumable (a
     // retry takes the name-only branch), so the marker has done its job.
+    // Attempts that started from the old slug are dead for the same reason.
     clear_rename_marker(cfg, new_slug).await;
+    forget_markers_from(cfg, &app.slug).await;
     // The old generation ends here: its S3 prefix moved to the new slug, so
     // its seq marker must go too — otherwise a future slug reuse would skip
     // its restarted seq as stale. `applied[new_slug]` starts empty, so the
     // moved manifest is applied once on the next read.
     git_sync.forget(&app.slug).await;
     Ok(renamed)
+}
+
+/// Resume every rename an earlier attempt left unfinished (the durable
+/// markers). The loop runs this on its slow tick: a crash mid-move no longer
+/// needs a client retry, and until the move resolves the target slug stays
+/// reserved (a create or another rename onto it is refused). Stale markers —
+/// the app row is gone, already at another slug, or already at the target —
+/// are removed so they can never block a slug.
+pub async fn resume_pending_renames(
+    cfg: &Config,
+    pool: &sqlx::SqlitePool,
+    procs: &ProcMap,
+    logs: &LogState,
+    deploying: &Deploying,
+    git_sync: &ryuz_git::GitSync,
+) -> usize {
+    let mut resumed = 0;
+    for marker in pending_renames(cfg).await {
+        let app = match db::get_app(pool, &marker.app_id).await {
+            Ok(app) => app,
+            Err(e) => {
+                tracing::warn!(
+                    app_id = %marker.app_id,
+                    error = %format!("{e:#}"),
+                    "pending rename left for the next pass: could not read its app"
+                );
+                continue;
+            }
+        };
+        let live = app.as_ref().is_some_and(|app| app.slug == marker.from);
+        if !live {
+            // The app left (deleted, or another rename completed): the attempt
+            // has nothing to resume and must not keep reserving the target.
+            clear_rename_marker(cfg, &marker.to).await;
+            continue;
+        }
+        match rename_app(
+            cfg,
+            pool,
+            procs,
+            logs,
+            deploying,
+            git_sync,
+            &marker.app_id,
+            None,
+            Some(&marker.to),
+        )
+        .await
+        {
+            Ok(app) => {
+                resumed += 1;
+                tracing::info!(
+                    app_id = %app.id,
+                    slug = %app.slug,
+                    "resumed an unfinished rename"
+                );
+            }
+            Err(e) => tracing::warn!(
+                app_id = %marker.app_id,
+                from = %marker.from,
+                to = %marker.to,
+                error = %format!("{e:#}"),
+                "unfinished rename still pending; retrying on a later pass"
+            ),
+        }
+    }
+    resumed
 }
 
 async fn rename_slugged(
@@ -504,7 +676,7 @@ async fn rename_slugged(
 
 #[cfg(test)]
 mod tests {
-    use super::parse_listing_keys;
+    use super::{move_dir, parse_listing_keys};
 
     /// R-06: an empty `Contents` is the only "nothing to move" shape. Garbage
     /// and a missing `Contents` are errors — the move must fail instead of
@@ -531,5 +703,42 @@ mod tests {
                 .is_err(),
             "a listing without Contents must error, never skip"
         );
+    }
+
+    /// A retry after a crash can find the source recreated by a respawn while
+    /// the target already holds the earlier attempt's moved data. The move
+    /// must not fail (which would wedge the rename forever) nor merge or
+    /// delete either tree: the recreated source is kept aside.
+    #[tokio::test]
+    async fn a_recreated_source_is_kept_aside_when_the_target_holds_moved_data() {
+        let base =
+            std::env::temp_dir().join(format!("noite-rename-salvage-{}", crate::models::new_id()));
+        let from = base.join("fleets").join("old");
+        let to = base.join("fleets").join("new");
+        std::fs::create_dir_all(&from).expect("recreated source");
+        std::fs::write(from.join("recreated.json"), "{}").expect("source file");
+        std::fs::create_dir_all(&to).expect("moved target");
+        std::fs::write(to.join("moved.json"), "{}").expect("target file");
+
+        move_dir(&from, &to)
+            .await
+            .expect("a recreated source must not fail the retry");
+
+        assert!(to.join("moved.json").exists(), "the moved data stays");
+        assert!(!from.exists(), "the recreated source is moved aside");
+        let mut salvaged = Vec::new();
+        for entry in std::fs::read_dir(base.join("fleets")).expect("read fleets") {
+            let entry = entry.expect("entry");
+            if entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".new.recreated-")
+            {
+                salvaged.push(entry.path());
+            }
+        }
+        assert_eq!(salvaged.len(), 1, "exactly one salvage dir is kept");
+        assert!(salvaged[0].join("recreated.json").exists());
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

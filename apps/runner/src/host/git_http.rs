@@ -674,6 +674,23 @@ pub async fn receive_pack(
     // rename/purge/create hold this same guard across their own moves and
     // wipes, so a push lands fully before or fully after those operations.
     let _push_guard = state.wal.lock(&app.slug).await;
+    // The authorization above ran before the guard. A delete holds this guard
+    // while it removes the row, and a create (or rename) can take it and put a
+    // *different* app on the same slug while this push waited: hydrating and
+    // writing now would land on the successor's repository. Require the row
+    // the push was authorized for to still be the row behind this slug.
+    match crate::db::get_app(&state.pool, &app.id).await {
+        Ok(Some(current)) if current.slug == app.slug => {}
+        Ok(_) => {
+            return (
+                StatusCode::CONFLICT,
+                "rule push-policy: the app was deleted or renamed; fetch and push again"
+                    .to_string(),
+            )
+                .into_response();
+        }
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")).into_response(),
+    }
     let bare = match state.wal.ensure_synced_locked(&app.slug).await {
         Ok(b) => b,
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")).into_response(),

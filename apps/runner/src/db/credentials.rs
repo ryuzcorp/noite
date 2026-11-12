@@ -194,27 +194,34 @@ pub async fn scoped_credentials_for_prefix(
     Ok(rows.into_iter().map(ScopedCredential::from_row).collect())
 }
 
-/// Every key row whose app row no longer exists (boot reconcile). The row may
-/// be `live` when a delete was interrupted before the atomic mark, or
-/// `revoking` when the store delete never landed.
+/// Every key row whose owner is gone: its app row, or — for an `env:<id>`
+/// scope — its environment row (a teardown that could not mark or drop the
+/// row). The row may be `live` when a delete was interrupted before the atomic
+/// mark, or `revoking` when the store delete never landed.
 pub async fn orphan_scoped_credentials(pool: &SqlitePool) -> sqlx::Result<Vec<ScopedCredential>> {
     let rows: Vec<ScopedRow> = sqlx::query_as(
         "SELECT scope, app_id, handle, prefix, store, state, nonce, ciphertext \
          FROM main.scoped_credential \
-         WHERE app_id NOT IN (SELECT id FROM main.app) ORDER BY updated_at",
+         WHERE app_id NOT IN (SELECT id FROM main.app) \
+            OR (scope LIKE 'env:%' \
+                AND substr(scope, 5) NOT IN (SELECT id FROM main.environment)) \
+         ORDER BY updated_at",
     )
     .fetch_all(pool)
     .await?;
     Ok(rows.into_iter().map(ScopedCredential::from_row).collect())
 }
 
-/// The scopes of operator-token rows whose app row no longer exists (boot
-/// reconcile). The reserved control fleet's row (`app_id = '_control'`) never
-/// has an app row and is kept.
+/// The scopes of operator-token rows whose owner is gone (the app row, or the
+/// `env:<id>` environment row). The reserved control fleet's row
+/// (`app_id = '_control'`) never has an app row and is kept.
 pub async fn orphan_operator_token_scopes(pool: &SqlitePool) -> sqlx::Result<Vec<String>> {
     sqlx::query_scalar(
         "SELECT scope FROM main.fleet_operator_token \
-         WHERE app_id <> '_control' AND app_id NOT IN (SELECT id FROM main.app)",
+         WHERE app_id <> '_control' \
+           AND (app_id NOT IN (SELECT id FROM main.app) \
+                OR (scope LIKE 'env:%' \
+                    AND substr(scope, 5) NOT IN (SELECT id FROM main.environment)))",
     )
     .fetch_all(pool)
     .await
