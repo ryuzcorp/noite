@@ -4,6 +4,7 @@ import { authenticateKey } from "../../lib/server/key-auth.server";
 import { MAX_BODY_BYTES, readBoundedText, tooLarge } from "../body";
 import { runnerConfig } from "../config";
 import type { RouteHandler } from "../config";
+import { routeFailure } from "../route-failure";
 
 /** Machine ingest for tenant apps (LogSnag-style event API): Bearer
  * profile API key + push role on the app, then forward the JSON body to
@@ -36,9 +37,13 @@ export const forwardIngest: RouteHandler = async (request, env, params) => {
   // The same one authentication `/mcp` and git use: scope (`events.push`),
   // then the owner's ban, then the key's expiry. A banned owner's key must
   // stop ingesting even if the ban's revocation missed it.
-  const auth = await authenticateKey(request, env, key, {
-    events: ["push"],
-  });
+  let auth: Awaited<ReturnType<typeof authenticateKey>>;
+
+  try {
+    auth = await authenticateKey(request, env, key, { events: ["push"] });
+  } catch (error) {
+    return routeFailure("[ingest]", error);
+  }
 
   if (auth._tag === "Misconfigured") {
     return new Response(auth.message, { status: 500 });
@@ -53,7 +58,13 @@ export const forwardIngest: RouteHandler = async (request, env, params) => {
 
   // Push role on the app, through the key's app set and role ceiling: a key
   // scoped to another app cannot write this app's events.
-  const verdict = await keyAppVerdict(auth.principal, { id: appId }, "push");
+  let verdict: Awaited<ReturnType<typeof keyAppVerdict>>;
+
+  try {
+    verdict = await keyAppVerdict(auth.principal, { id: appId }, "push");
+  } catch (error) {
+    return routeFailure("[ingest]", error);
+  }
 
   if (verdict._tag !== "Granted") {
     return new Response("forbidden", { status: 403 });

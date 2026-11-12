@@ -22,6 +22,7 @@ import { countControlUsers } from "../../lib/server/telemetry.server";
 import { MAX_BODY_BYTES, readBoundedText, tooLarge } from "../body";
 import { runnerConfig, runnerTokenOk } from "../config";
 import type { RouteHandler } from "../config";
+import { routeFailure } from "../route-failure";
 
 /** Optional nudge path — prefer the runner's own webhook; this proxy is for
  * deploy.sh convenience. It adds no authority: the caller must already hold
@@ -92,8 +93,14 @@ export const handleRecovery: RouteHandler = async (request, env) => {
     );
   }
 
-  await ensureDb();
-  const email = await findRecoveryEmail(decoded.success.email);
+  let email: Awaited<ReturnType<typeof findRecoveryEmail>>;
+
+  try {
+    await ensureDb();
+    email = await findRecoveryEmail(decoded.success.email);
+  } catch (error) {
+    return routeFailure("[recovery]", error);
+  }
 
   if (!email) {
     return Response.json(
@@ -352,12 +359,17 @@ export const handleGitAuth: RouteHandler = async (request, env) => {
     );
   }
 
-  await ensureDb();
-
   // One authentication for every key surface (lib/server/key-auth.server):
   // the scope, the owner's ban and the key's expiry are decided once, here,
   // for git exactly as for `/mcp` and ingest.
-  const authenticated = await gitAuthPrincipal(request, env, key);
+  let authenticated: Awaited<ReturnType<typeof gitAuthPrincipal>>;
+
+  try {
+    await ensureDb();
+    authenticated = await gitAuthPrincipal(request, env, key);
+  } catch (error) {
+    return routeFailure("[git-auth]", error);
+  }
 
   if ("response" in authenticated) {
     return authenticated.response;

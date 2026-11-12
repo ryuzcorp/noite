@@ -254,17 +254,35 @@ export const createAuth = (env: KitEnv, baseURL: string) =>
     },
     baseURL,
     database: getAuthDb(),
-    // better-auth's default onError logs the raw failure, and a database write
-    // failure is drizzle's statement plus every bound parameter — a fresh
-    // session token among them. `onError` replaces that path entirely (the
-    // default only runs when neither `onError` nor `throw` is set); the cause
-    // chain still reaches the log.
-    onAPIError: {
-      // oxlint-disable-next-line anti-slop/no-unknown-parameters -- better-auth hands the raw thrown value; the logger narrows it.
-      onError: (error: unknown) => {
-        console.error("[auth]", errorLogText(error));
+    // A non-API failure is rethrown instead of answered by the router, whose
+    // own `console.error("# SERVER_ERROR:", error)` prints it raw. `handleAuth`
+    // catches it, logs the cause chain and answers a generic 500; real API
+    // errors still become their own responses.
+    onAPIError: { throw: true },
+    // better-auth's internal catches (the session lookup, key verification,
+    // passkeys) log the failure themselves, before any of our boundaries. A
+    // database failure there is drizzle's statement plus every bound value — a
+    // session token among them — so every `Error` argument goes through the
+    // cause-chain formatter. Levels are unchanged (the default threshold keeps
+    // info/debug out).
+    logger: {
+      // oxlint-disable-next-line anti-slop/no-unknown-parameters -- better-auth hands the raw logged values; the formatter narrows them.
+      log: (level, message, ...args) => {
+        const text = [
+          `[auth] ${level}: ${message}`,
+          ...args.map((arg) =>
+            arg instanceof Error ? errorLogText(arg) : String(arg)
+          ),
+        ];
+
+        if (level === "error") {
+          console.error(...text);
+        } else if (level === "warn") {
+          console.warn(...text);
+        } else {
+          console.log(...text);
+        }
       },
-      throw: true,
     },
     // A ban revokes the account's machine credentials in the same flow as
     // the session deletion: the admin plugin's `banUser` (and a direct

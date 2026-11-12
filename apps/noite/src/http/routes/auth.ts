@@ -1,19 +1,23 @@
 import { authFromEnv, MissingAuthSecretError } from "../../lib/auth";
 import { ensureDb } from "../../lib/db";
-import { errorLogText } from "../../lib/errors";
 import { withTrustedClientAddress } from "../../lib/rate-limit";
 import {
   INVITES_PER_USER,
   signupPolicy,
 } from "../../lib/server/invites.server";
 import type { RouteHandler } from "../config";
+import { routeFailure } from "../route-failure";
 
 /** Public signup policy for the login panel: is a code required? Answered
  * without a session (the panel asks before anyone can sign in), carries no
  * account data. A broken check must not block the UI, so it answers with the
  * stricter policy on failure. */
 export const handleInviteStatus: RouteHandler = async () => {
-  await ensureDb();
+  try {
+    await ensureDb();
+  } catch (error) {
+    return routeFailure("[auth]", error);
+  }
 
   try {
     return Response.json(await signupPolicy());
@@ -27,9 +31,9 @@ export const handleInviteStatus: RouteHandler = async () => {
 };
 
 export const handleAuth: RouteHandler = async (request, env) => {
-  await ensureDb();
-
   try {
+    await ensureDb();
+
     const auth = authFromEnv(env, new URL(request.url).origin);
 
     return await auth.handler(withTrustedClientAddress(request));
@@ -42,8 +46,6 @@ export const handleAuth: RouteHandler = async (request, env) => {
     // router's own raw `console.error` never runs: log the cause chain here
     // and answer a generic 500. Normal API errors never reach this branch —
     // better-call still turns them into their response.
-    console.error("[auth]", errorLogText(error));
-
-    return new Response(null, { status: 500 });
+    return routeFailure("[auth]", error);
   }
 };

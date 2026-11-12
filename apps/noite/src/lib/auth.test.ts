@@ -235,3 +235,66 @@ describe("a failing auth database write never logs its SQL or parameters", () =>
     }
   });
 });
+
+describe("better-auth's own error logging is redacted", () => {
+  test("a failing session lookup logs the cause, never the token or the SQL", async () => {
+    db.raw.run(
+      `INSERT INTO "user" (id, name, email, emailVerified) VALUES ('u9', 'Session', 'session@example.com', 1)`
+    );
+    const code = await requestCode("session@example.com");
+
+    const signIn = await auth().handler(
+      new Request(`${ENV.BETTER_AUTH_URL}/api/auth/sign-in/email-otp`, {
+        body: JSON.stringify({ email: "session@example.com", otp: code }),
+        headers: {
+          "content-type": "application/json",
+          origin: ENV.BETTER_AUTH_URL,
+        },
+        method: "POST",
+      })
+    );
+
+    expect(signIn.status).toBe(200);
+
+    const cookie = (signIn.headers.get("set-cookie") ?? "").split(";")[0] ?? "";
+    const token = cookie.split("=")[1] ?? "";
+
+    expect(token).not.toBe("");
+
+    setD1Binding(failingD1(new Error("D1_ERROR: unavailable")));
+
+    const logged: string[] = [];
+
+    const error = spyOn(console, "error").mockImplementation((...args) => {
+      logged.push(args.map(String).join(" "));
+    });
+
+    let status = 0;
+
+    try {
+      const response = await auth().handler(
+        new Request(`${ENV.BETTER_AUTH_URL}/api/auth/get-session`, {
+          headers: { cookie },
+        })
+      );
+
+      ({ status } = response);
+    } finally {
+      error.mockRestore();
+      setD1Binding(db.d1);
+    }
+
+    expect(status).toBe(500);
+
+    const text = logged.join("\n");
+
+    // The cause reaches the log; the statement, its parameters and the
+    // session token do not.
+    expect(text).toContain("query failed");
+    expect(text).toContain("D1_ERROR: unavailable");
+
+    for (const leak of ["Failed query", "params:", token]) {
+      expect(text).not.toContain(leak);
+    }
+  });
+});

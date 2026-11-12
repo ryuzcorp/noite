@@ -17,6 +17,7 @@ import { readBoundedText, tooLarge } from "../body";
 import { runnerConfig } from "../config";
 import type { RouteHandler } from "../config";
 import { originAllowed } from "../origin";
+import { routeFailure } from "../route-failure";
 
 /** The commit-shaped payload a caller posts (the runner validates its
  * contents). `expectedTip` is an agent's compare-and-set precondition; the
@@ -124,7 +125,13 @@ const sourceCaller = async (
     return new Response("origin not allowed", { status: 403 });
   }
 
-  const auth = await authenticateKey(request, env, key, { apps: ["manage"] });
+  let auth: Awaited<ReturnType<typeof authenticateKey>>;
+
+  try {
+    auth = await authenticateKey(request, env, key, { apps: ["manage"] });
+  } catch (error) {
+    return routeFailure("[source]", error);
+  }
 
   if (auth._tag === "Misconfigured") {
     return new Response(auth.message, { status: 500 });
@@ -139,7 +146,13 @@ const sourceCaller = async (
     });
   }
 
-  const verdict = await keyAppVerdict(auth.principal, { id: appId }, "push");
+  let verdict: Awaited<ReturnType<typeof keyAppVerdict>>;
+
+  try {
+    verdict = await keyAppVerdict(auth.principal, { id: appId }, "push");
+  } catch (error) {
+    return routeFailure("[source]", error);
+  }
 
   if (verdict._tag !== "Granted") {
     return new Response("forbidden", { status: 403 });
