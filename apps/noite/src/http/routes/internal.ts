@@ -2,6 +2,7 @@ import * as Schema from "effect/Schema";
 
 import { authFromEnv, MissingAuthSecretError } from "../../lib/auth";
 import { ensureDb } from "../../lib/db";
+import { errorLogText } from "../../lib/errors";
 import type { KeyPrincipal } from "../../lib/key-principal";
 import { parseAppRole } from "../../lib/roles";
 import {
@@ -314,7 +315,9 @@ export const handleGitAuth: RouteHandler = async (request, env) => {
     try {
       return await gitAuthCreate(principal, slug);
     } catch (error) {
-      console.error("[git-auth]", error);
+      // The create can fail after a database read (the adoption lookup), whose
+      // wrapped error is the SQL plus its parameters: log the cause chain only.
+      console.error("[git-auth]", errorLogText(error));
 
       return Response.json({ error: "forbidden", ok: false }, { status: 403 });
     }
