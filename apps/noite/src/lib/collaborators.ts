@@ -559,7 +559,9 @@ export const revokePendingInvite = (
  * `decideAccept` (lib/membership): no grant -> the invited role; a grant that
  * already at least matches -> unchanged; an invitation issued after the grant
  * -> applied (a stale invite never downgrades a newer grant); a downgrade that
- * would strand the app -> refused, invitation kept. */
+ * would strand the app -> refused (`last-admin`), and a grant the write could
+ * not land because the app's rows changed under it -> refused (`changed`);
+ * both keep the invitation. */
 export type AcceptOutcome =
   | {
       readonly _tag: "Accepted";
@@ -567,7 +569,7 @@ export type AcceptOutcome =
       readonly role: AppRole;
     }
   | { readonly _tag: "NotFound" }
-  | { readonly _tag: "Refused"; readonly reason: "last-admin" };
+  | { readonly _tag: "Refused"; readonly reason: "changed" | "last-admin" };
 
 const asStamp = (value: string | Date | null): string =>
   value instanceof Date ? value.toISOString() : String(value ?? "");
@@ -656,8 +658,15 @@ export const acceptPendingInvite = async (
   if (decision._tag === "Applies") {
     const write = await writeGrant(snapshot.appId, userId, decision.role);
 
-    if (write === "last-admin") {
-      return { _tag: "Refused", reason: "last-admin" };
+    if (write !== "applied") {
+      // The app's rows changed under the accept: a demotion the guard refused,
+      // or the grant vanished. Either way the invitation's role no longer
+      // applies, and the invitee is asked for a fresh one instead of being
+      // told the invite worked.
+      return {
+        _tag: "Refused",
+        reason: write === "last-admin" ? "last-admin" : "changed",
+      };
     }
   }
 

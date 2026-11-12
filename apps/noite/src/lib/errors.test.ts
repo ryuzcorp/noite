@@ -81,15 +81,14 @@ const queryError = (): Error =>
     }
   );
 
-test("a wrapped query error reads as its driver cause, never the SQL", () => {
+test("a wrapped query error reads as one fixed text, never its SQL or names", () => {
   const wrapped = new Cause.UnknownError(
     queryError(),
     "An error occurred in Effect.tryPromise"
   );
 
-  expect(errorMessage(wrapped)).toBe(
-    "UNIQUE constraint failed: app_collaborator.appId"
-  );
+  expect(errorMessage(wrapped)).toBe("Database query failed");
+  expect(errorMessage(queryError())).toBe("Database query failed");
   expect(errorMessage(wrapped)).not.toContain("Failed query");
   expect(errorMessage(wrapped)).not.toContain("params:");
 });
@@ -108,7 +107,7 @@ test("isQueryFailure sees the query through effect's wrapper", () => {
   expect(isQueryFailure(null)).toBe(false);
 });
 
-test("the server log keeps the cause a wrapper would hide", () => {
+test("the server log keeps the cause and drops the query's SQL and params", () => {
   const log = errorLogText(
     new Cause.UnknownError(
       queryError(),
@@ -119,6 +118,15 @@ test("the server log keeps the cause a wrapper would hide", () => {
   expect(log).toContain("An error occurred");
   expect(log).toContain("Caused by:");
   expect(log).toContain("UNIQUE constraint failed: app_collaborator.appId");
+
+  // F1: an auth-table write binds credentials, and the wrapper's own stack is
+  // the statement plus every parameter.
+  for (const leak of ["Failed query", "params:", "insert into"]) {
+    expect(log).not.toContain(leak);
+  }
+
+  expect(errorLogText(queryError())).not.toContain("Failed query");
+  expect(errorLogText(queryError())).not.toContain("params:");
 });
 
 test("a query error with no driver cause never reads as its SQL", () => {

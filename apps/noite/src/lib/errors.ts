@@ -8,8 +8,9 @@
  * `cause` is the real failure; unwrapping it here keeps that default out of
  * every UI, for every call site at once. Drizzle's `DrizzleQueryError` is the
  * other wrapper: its message is the whole SQL text plus every bound
- * parameter, so the driver failure in its `cause` is the only part fit to
- * read (and the part an operator needs). Non-Error throw values (a string, a
+ * parameter (an auth-table write binds credentials) and its cause names
+ * schema objects, so the user sees the fixed "Database query failed" and the
+ * cause goes only to `errorLogText`. Non-Error throw values (a string, a
  * rejected resource fetch) still render as text rather than "[object Object]".
  */
 import { Cause } from "effect";
@@ -57,19 +58,19 @@ const detail = (error: unknown, depth: number): string => {
     return String(error);
   }
 
+  if (asQueryError(error) !== null) {
+    // The wrapper's own text is the whole SQL statement plus every bound
+    // parameter, and its cause names schema objects: neither is the user's to
+    // read. The cause reaches the server log through `errorLogText`.
+    return "Database query failed";
+  }
+
   if (
     depth < MAX_CAUSE_DEPTH &&
-    isWrapper(error) &&
+    Cause.isUnknownError(error) &&
     error.cause !== undefined
   ) {
     return detail(error.cause, depth + 1);
-  }
-
-  if (asQueryError(error) !== null) {
-    // The loop above always unwraps a query to its driver failure; reaching
-    // here means there is none, and the wrapper's own text is the SQL plus
-    // every bound parameter — never the user's to read.
-    return "Database query failed";
   }
 
   // A server-side failure carries its HTTP status: a 5xx is an outage the
@@ -112,7 +113,9 @@ export const isQueryFailure = (error: unknown): boolean => {
 };
 
 /** The server log's text: every link of the cause chain, so a wrapped driver
- * failure is never hidden behind the wrapper's stack alone. */
+ * failure is never hidden behind the wrapper's stack alone. A query wrapper's
+ * own stack and message are the SQL statement and its bound parameters (an
+ * auth-table write binds credentials), so only its cause chain is printed. */
 // oxlint-disable-next-line anti-slop/no-unknown-parameters -- api.ts's catch boundary; see errorMessage.
 export const errorLogText = (error: unknown): string => {
   const parts: string[] = [];
@@ -125,7 +128,11 @@ export const errorLogText = (error: unknown): string => {
       break;
     }
 
-    parts.push(current.stack ?? `${current.name}: ${current.message}`);
+    parts.push(
+      asQueryError(current) === null
+        ? (current.stack ?? `${current.name}: ${current.message}`)
+        : `${current.name}: query failed`
+    );
 
     if (!(isWrapper(current) && current.cause !== undefined)) {
       break;
