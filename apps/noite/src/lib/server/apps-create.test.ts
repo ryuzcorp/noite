@@ -20,7 +20,7 @@ import type { RunnerMock } from "../../testing/runner-mock";
 import { ensureDb, setD1Binding } from "../db";
 import { errorMessage } from "../errors";
 import { CREATE_TIMEOUT_MS } from "../runner";
-import { ActionFailure } from "./api";
+import { ActionFailure, actionErrorResponse } from "./api";
 import { CREATE_RECOVERY_MS, createAppForUser } from "./apps.server";
 
 interface GrantCall {
@@ -29,9 +29,11 @@ interface GrantCall {
   userId: string;
 }
 
-/** Grants requested during the current test; `grantFails` simulates D1 down. */
+/** Grants requested during the current test; `grantFails` simulates D1 down
+ * (or a specific failure through `grantFailure`). */
 let grants: GrantCall[] = [];
 let grantFails = true;
+let grantFailure = new Error("D1 is down");
 
 /** The rows `listCollaboratorRows` reports for the app under test: the
  * adoption rule reads them, so a test can say "removed", "push only" or
@@ -43,12 +45,12 @@ let collaboratorRows: { role: string; userId: string }[] = [];
 mock.module("../collaborators", () => ({
   grantCollaborator: (appId: string, userId: string, role: string) => {
     if (grantFails) {
-      return Promise.reject(new Error("D1 is down"));
+      return Promise.reject(grantFailure);
     }
 
     grants.push({ appId, role, userId });
 
-    return Promise.resolve();
+    return Promise.resolve("applied" as const);
   },
   listCollaboratorRows: () =>
     Promise.resolve(
@@ -74,12 +76,16 @@ beforeEach(() => {
   collaboratorRows = [];
   grants = [];
   grantFails = true;
+  grantFailure = new Error("D1 is down");
   runner?.restore();
   runner = installRunnerMock([]);
 });
 
 afterAll(() => {
   runner.restore();
+  // The collaborator module is mocked for this file only: another test file
+  // that writes real grants must not inherit the double.
+  mock.restore();
 });
 
 describe("create recovery budget", () => {
@@ -245,5 +251,79 @@ describe("createAppForUser", () => {
     ).rejects.toThrow(/slug already taken/u);
 
     expect(grants).toEqual([]);
+  });
+});
+
+/** A drizzle `DrizzleQueryError` as `withDb` carries it out: its own message
+ * is the SQL text plus every bound parameter, and the driver failure is the
+ * `cause`. */
+const queryFailure = (): Error =>
+  Object.assign(
+    new Error(
+      `Failed query: insert into "app_collaborator" ("appId","id","role","userId") values (?,?,?,?)\nparams: one,grant-race,admin,u-1`
+    ),
+    {
+      cause: new Error(
+        "D1_ERROR: UNIQUE constraint failed: app_collaborator.appId, app_collaborator.userId"
+      ),
+      params: ["one", "grant-race", "admin", "u-1"],
+      query:
+        'insert into "app_collaborator" ("appId","id","role","userId") values (?,?,?,?)',
+    }
+  );
+
+describe("the creator grant races the sidebar heal", () => {
+  test("a heal that already wrote the admin grant keeps the app alive", async () => {
+    // The create's insert collided with the heal's row (the sidebar SSE
+    // stream heals every grant-less creator's app every 2 s). The account is
+    // an admin now, so rolling the app back would cancel the template import
+    // the user already holds.
+    grantFails = true;
+    grantFailure = queryFailure();
+    collaboratorRows = [{ role: "admin", userId: "u-1" }];
+
+    const app = await createAppForUser({
+      account: { id: "u-1", name: "One" },
+      name: "One",
+      slug: "one",
+    });
+
+    expect(app.id).toBe("app-1");
+    // No rollback: the app the heal made visible stays.
+    expect(runner.calls).toEqual(["apps.create"]);
+    expect(runner.apps).toHaveLength(1);
+  });
+
+  test("a grant that did not stick answers a stable 422 with no SQL", async () => {
+    grantFails = true;
+    grantFailure = queryFailure();
+
+    let thrown: unknown;
+
+    try {
+      await createAppForUser({
+        account: { id: "u-1", name: "One" },
+        name: "One",
+        slug: "one",
+      });
+    } catch (error) {
+      thrown = error;
+    }
+
+    expect(thrown).toBeInstanceOf(ActionFailure);
+    const response = actionErrorResponse(thrown);
+
+    expect(response.status).toBe(422);
+
+    const body = await response.text();
+
+    expect(JSON.parse(body)).toEqual({
+      errors: { form: "Could not record your access to the app" },
+    });
+    // Never the query, its table or its bound parameters.
+    expect(body).not.toContain("app_collaborator");
+    expect(body).not.toContain("params:");
+    expect(runner.calls).toEqual(["apps.create", "apps.delete"]);
+    expect(runner.apps).toEqual([]);
   });
 });

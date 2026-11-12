@@ -3,7 +3,12 @@ import { expect, test } from "bun:test";
 import { Cause } from "effect";
 
 import { ApiError } from "./api";
-import { errorMessage, operationMessage } from "./errors";
+import {
+  errorLogText,
+  errorMessage,
+  isQueryFailure,
+  operationMessage,
+} from "./errors";
 
 test("an Error reads as its message", () => {
   expect(errorMessage(new Error("boom"))).toBe("boom");
@@ -60,4 +65,67 @@ test("operationMessage names the operation before the server's text", () => {
   expect(operationMessage("Creating the app failed", wrapped)).toBe(
     "Creating the app failed: object store timed out while minting credentials"
   );
+});
+
+/** Drizzle's `DrizzleQueryError`: the wrapper's message is the SQL text and
+ * every bound parameter, the driver failure is the `cause`. */
+const queryError = (): Error =>
+  Object.assign(
+    new Error(
+      `Failed query: insert into "app_collaborator" ("appId","userId") values (?,?)\nparams: app-1,u-creator`
+    ),
+    {
+      cause: new Error("UNIQUE constraint failed: app_collaborator.appId"),
+      params: ["app-1", "u-creator"],
+      query: 'insert into "app_collaborator" ("appId","userId") values (?,?)',
+    }
+  );
+
+test("a wrapped query error reads as its driver cause, never the SQL", () => {
+  const wrapped = new Cause.UnknownError(
+    queryError(),
+    "An error occurred in Effect.tryPromise"
+  );
+
+  expect(errorMessage(wrapped)).toBe(
+    "UNIQUE constraint failed: app_collaborator.appId"
+  );
+  expect(errorMessage(wrapped)).not.toContain("Failed query");
+  expect(errorMessage(wrapped)).not.toContain("params:");
+});
+
+test("isQueryFailure sees the query through effect's wrapper", () => {
+  expect(isQueryFailure(queryError())).toBe(true);
+  expect(
+    isQueryFailure(
+      new Cause.UnknownError(
+        queryError(),
+        "An error occurred in Effect.tryPromise"
+      )
+    )
+  ).toBe(true);
+  expect(isQueryFailure(new Error("D1 is down"))).toBe(false);
+  expect(isQueryFailure(null)).toBe(false);
+});
+
+test("the server log keeps the cause a wrapper would hide", () => {
+  const log = errorLogText(
+    new Cause.UnknownError(
+      queryError(),
+      "An error occurred in Effect.tryPromise"
+    )
+  );
+
+  expect(log).toContain("An error occurred");
+  expect(log).toContain("Caused by:");
+  expect(log).toContain("UNIQUE constraint failed: app_collaborator.appId");
+});
+
+test("a query error with no driver cause never reads as its SQL", () => {
+  const bare = Object.assign(new Error("Failed query: select * from secret"), {
+    params: ["secret"],
+    query: "select * from secret",
+  });
+
+  expect(errorMessage(bare)).toBe("Database query failed");
 });

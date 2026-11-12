@@ -6,8 +6,6 @@
 
 import { afterAll, beforeAll, beforeEach, expect, mock, test } from "bun:test";
 
-import * as Effect from "effect/Effect";
-
 import { createTestD1 } from "../../testing/d1";
 import { installRunnerMock, makeApp } from "../../testing/runner-mock";
 import type { RunnerMock } from "../../testing/runner-mock";
@@ -17,7 +15,7 @@ import { createAppForUser } from "./apps.server";
 // The grant hits tables the test D1 does not migrate; the rollback path owns
 // that coverage (apps-create.test.ts). Here it succeeds.
 mock.module("../collaborators", () => ({
-  grantCollaborator: () => Effect.void,
+  grantCollaborator: () => Promise.resolve("applied" as const),
 }));
 
 /** The JSON-RPC params the create action sends for a template source. */
@@ -47,6 +45,9 @@ beforeEach(() => {
 
 afterAll(() => {
   runner.restore();
+  // The collaborator module is mocked for this file only: another test file
+  // that writes real grants must not inherit the double.
+  mock.restore();
 });
 
 test("a template create imports its folder from the templates repo", async () => {

@@ -27,7 +27,7 @@ import { defineHandler } from "void";
 import type { TypedHandler } from "void";
 
 import { MAX_BODY_BYTES, readBoundedText, tooLarge } from "../../http/body";
-import { errorMessage } from "../errors";
+import { errorLogText, errorMessage } from "../errors";
 
 // oxlint-disable-next-line unicorn/throw-new-error -- Schema.TaggedError factory (same pattern as lib/auth.ts)
 export class ActionFailure extends Schema.TaggedError<ActionFailure>()(
@@ -71,10 +71,7 @@ export const actionErrorResponse = (error: unknown): Response => {
     return Response.json({ errors: { form: error.message } }, { status: 422 });
   }
 
-  console.error(
-    "[api]",
-    error instanceof Error ? (error.stack ?? error.message) : String(error)
-  );
+  console.error("[api]", errorLogText(error));
 
   return Response.json({ error: "Internal error" }, { status: 500 });
 };

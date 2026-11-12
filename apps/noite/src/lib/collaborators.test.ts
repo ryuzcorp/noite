@@ -24,8 +24,13 @@ import {
   requireAppRoleBySlug,
   revokePendingInvite,
   upsertPendingInvite,
+  writeGrant,
 } from "./collaborators";
 import { ensureDb, setD1Binding } from "./db";
+
+type D1Binding = Parameters<typeof setD1Binding>[0];
+
+type Prepared = ReturnType<D1Binding["prepare"]>;
 
 let db: TestD1;
 let runner: RunnerMock;
@@ -85,6 +90,135 @@ const denied = async (work: Promise<unknown>) => {
 
   return failed;
 };
+
+/** Run `inject` once, immediately before the next prepared statement whose
+ * SQL matches: how a test lands another writer's row between `writeGrant`'s
+ * read and its insert, with no clock and no sleep. */
+const injectBefore = (
+  inner: D1Binding,
+  matches: (sql: string) => boolean,
+  inject: () => void
+): D1Binding => {
+  let armed = true;
+
+  const track = (sql: string, stmt: Prepared): Prepared => {
+    const fire = () => {
+      if (armed && matches(sql)) {
+        armed = false;
+        inject();
+      }
+    };
+
+    // SAFETY: every member mirrors the wrapped statement's own surface; only
+    // the `fire` hook is added, and the binding's generic overload is kept.
+    return {
+      all: () => {
+        fire();
+
+        return stmt.all();
+      },
+      bind: (...params: unknown[]) => track(sql, stmt.bind(...params)),
+      first: (column?: string) => {
+        fire();
+
+        return column === undefined ? stmt.first() : stmt.first(column);
+      },
+      raw: (...args: never[]) => {
+        fire();
+
+        return stmt.raw(...args);
+      },
+      run: () => {
+        fire();
+
+        return stmt.run();
+      },
+    } as Prepared;
+  };
+
+  // SAFETY: the binding's own members are spread in; only `prepare` is
+  // intercepted, and `withSession` returns this same wrapper so the connection
+  // drizzle opens from it keeps the interception.
+  // oxlint-disable-next-line anti-slop/no-chained-type-assertions -- test double for a platform binding (the same pattern as testing/d1.ts).
+  const wrapped = {
+    ...inner,
+    prepare: (sql: string) => track(sql, inner.prepare(sql)),
+    withSession: () => wrapped,
+  } as unknown as D1Binding;
+
+  return wrapped;
+};
+
+const GRANT_INSERT = /\binsert into "?app_collaborator"?/iu;
+
+/** Put a grant row in place the way another isolate's write would, and run
+ * `work` against a binding that fires it mid-write. */
+const withCompetingGrant = async (
+  competing: { role: string; userId: string },
+  work: () => Promise<void>
+): Promise<void> => {
+  setD1Binding(
+    injectBefore(
+      db.d1,
+      (sql) => GRANT_INSERT.test(sql),
+      () => {
+        db.raw.run(
+          `INSERT INTO app_collaborator (id, appId, userId, role) VALUES ('competing', ?, ?, ?)`,
+          [APP.id, competing.userId, competing.role]
+        );
+      }
+    )
+  );
+
+  try {
+    await work();
+  } finally {
+    setD1Binding(db.d1);
+  }
+};
+
+describe("writeGrant against a concurrent writer", () => {
+  test("a competing admin insert in the window is adopted, not thrown on", async () => {
+    // The sidebar's grant-less-creator heal (or the create itself, from the
+    // other side of the race) wrote the row between the UPDATE and the
+    // INSERT. The unique (appId, userId) row must not throw: the create, whose
+    // grant this is, would roll the whole app back and cancel its import.
+    await withCompetingGrant(
+      { role: "admin", userId: "u-creator" },
+      async () => {
+        expect(await writeGrant(APP.id, "u-creator", "admin")).toBe("applied");
+      }
+    );
+
+    const rows = await listCollaboratorRows(APP.id);
+
+    expect(rows.map((row) => [row.userId, row.role])).toEqual([
+      ["u-creator", "admin"],
+    ]);
+  });
+
+  test("a competing lower role is upgraded by the same guard the UPDATE applies", async () => {
+    await withCompetingGrant({ role: "view", userId: "u-push" }, async () => {
+      expect(await writeGrant(APP.id, "u-push", "admin")).toBe("applied");
+    });
+
+    const rows = await listCollaboratorRows(APP.id);
+
+    expect(rows.map((row) => row.role)).toEqual(["admin"]);
+  });
+
+  test("a competing row that would strand the app is still refused", async () => {
+    // The window's row is this app's only admin: demoting it must report
+    // `last-admin` exactly as the UPDATE path does, not silently downgrade.
+    await withCompetingGrant({ role: "admin", userId: "u-view" }, async () => {
+      expect(await writeGrant(APP.id, "u-view", "push")).toBe("last-admin");
+    });
+
+    const rows = await listCollaboratorRows(APP.id);
+
+    expect(rows.map((row) => row.role)).toEqual(["admin"]);
+  });
+});
 
 describe("access gate", () => {
   test("a grant decides the role, in order view < push < admin", async () => {

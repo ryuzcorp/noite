@@ -35,14 +35,21 @@ const findApp = async (
 };
 
 /** What one grant write did. `last-admin` is the invariant refusing a
- * demotion that would leave the app with nobody to manage it. */
+ * demotion that would leave the app with nobody to manage it; `missing` is
+ * the row being absent even after the write. */
 export type GrantWrite = "applied" | "last-admin" | "missing";
 
 /** Write one account's role. The last-admin invariant lives *inside* the
  * statement — `UPDATE … WHERE role <> 'admin' OR <another admin exists>` — so
  * two concurrent demotions cannot both pass a count check and strand the app,
- * and the re-read names the outcome. An account with no grant gets an INSERT
- * (adding a grant can never remove the last admin). */
+ * and the re-read names the outcome. An account with no grant gets a
+ * conflict-safe INSERT (adding a grant can never remove the last admin): two
+ * writers must not collide on the unique (appId, userId) row, because the
+ * loser used to throw and its caller — `createAppForUser` — rolled the whole
+ * app back. When a competing writer lands the row inside our window, the
+ * stored role decides: ours already → `applied`; a different role → the same
+ * guarded UPDATE runs once more on that row, so the conflict path enforces
+ * exactly what the UPDATE path does. */
 export const writeGrant = (
   appId: string,
   userId: string,
@@ -51,7 +58,8 @@ export const writeGrant = (
   withDb(async () => {
     const db = getDb();
 
-    await db.run(sql`
+    const guardedUpdate = () =>
+      db.run(sql`
       UPDATE app_collaborator SET role = ${role}
        WHERE appId = ${appId} AND userId = ${userId}
          AND (
@@ -61,31 +69,64 @@ export const writeGrant = (
          )
     `);
 
-    const rows = await db
-      .select({ role: appCollaboratorTable.role })
-      .from(appCollaboratorTable)
-      .where(
-        and(
-          eq(appCollaboratorTable.appId, appId),
-          eq(appCollaboratorTable.userId, userId)
+    const storedRole = async (): Promise<AppRole | null> => {
+      const rows = await db
+        .select({ role: appCollaboratorTable.role })
+        .from(appCollaboratorTable)
+        .where(
+          and(
+            eq(appCollaboratorTable.appId, appId),
+            eq(appCollaboratorTable.userId, userId)
+          )
         )
-      )
-      .limit(1);
+        .limit(1);
 
-    const [found] = rows;
+      const [found] = rows;
 
-    if (found) {
-      return found.role === role ? "applied" : "last-admin";
+      return found ? parseAppRole(found.role) : null;
+    };
+
+    await guardedUpdate();
+
+    let stored = await storedRole();
+
+    if (stored === null) {
+      // A concurrent writer (the sidebar's grant-less-creator heal, an invite
+      // accept) may insert the row between the UPDATE and this INSERT.
+      // `onConflictDoNothing` turns that race into a no-op instead of a
+      // unique-constraint throw.
+      await db
+        .insert(appCollaboratorTable)
+        .values({
+          appId,
+          id: crypto.randomUUID(),
+          role,
+          userId,
+        })
+        .onConflictDoNothing({
+          target: [appCollaboratorTable.appId, appCollaboratorTable.userId],
+        });
+
+      stored = await storedRole();
+
+      if (stored === null) {
+        return "missing";
+      }
+
+      if (stored !== role) {
+        // The competing row holds another role: apply the guard the UPDATE
+        // path enforces (an admin request upgrades; a demotion that would
+        // strand the app is refused).
+        await guardedUpdate();
+        stored = await storedRole();
+      }
     }
 
-    await db.insert(appCollaboratorTable).values({
-      appId,
-      id: crypto.randomUUID(),
-      role,
-      userId,
-    });
+    if (stored === null) {
+      return "missing";
+    }
 
-    return "applied";
+    return stored === role ? "applied" : "last-admin";
   });
 
 /** Grant a role, keeping the last-admin invariant (see `writeGrant`). Callers
@@ -297,30 +338,12 @@ export const listAppsForCollaborator = async (
     );
 
     if (!any[0]) {
-      try {
-        // oxlint-disable-next-line eslint/no-await-in-loop -- the write follows this app's read
-        await grantCollaborator(app.id, userId, "admin");
-      } catch (error) {
-        // The page and its SSE stream can heal the same app at once; the
-        // unique (appId, userId) row means the loser reads the winner's.
-        // oxlint-disable-next-line eslint/no-await-in-loop -- one conflict check for this app
-        const raced = await withDb(() =>
-          getDb()
-            .select({ id: appCollaboratorTable.id })
-            .from(appCollaboratorTable)
-            .where(
-              and(
-                eq(appCollaboratorTable.appId, app.id),
-                eq(appCollaboratorTable.userId, userId)
-              )
-            )
-            .limit(1)
-        );
-
-        if (!raced[0]) {
-          throw error;
-        }
-      }
+      // The page and its SSE stream can heal the same app at once, and the
+      // create's own grant can land in this window: `writeGrant`'s insert is
+      // conflict-safe, so the loser no longer throws and the row is the same
+      // either way.
+      // oxlint-disable-next-line eslint/no-await-in-loop -- the write follows this app's read
+      await grantCollaborator(app.id, userId, "admin");
 
       granted.add(app.id);
     }

@@ -1,0 +1,4 @@
+### Fixed
+
+- Creating an app no longer fails (or deletes the app it just created, cancelling a template import) when the sidebar's grant-less-creator heal writes the creator's admin grant at the same moment. The grant write's insert is now conflict-safe on the unique `(appId, userId)` row — the loser reads the winner's row instead of throwing — and a create whose grant fails but leaves the caller an admin keeps the app. A demotion through that path still applies the same last-admin guard the update path does.
+- A failed database write in an action no longer echoes the SQL text and bound parameters into the 422 body: Drizzle's query error is unwrapped to its driver cause for the message, a create that cannot record the grant answers "Could not record your access to the app", and the server log now includes the full cause chain.
