@@ -622,26 +622,26 @@ const DeployFeedList = ({
   };
 
   return (
-    <div class="flex w-full flex-col gap-4">
+    <div class="flex w-full flex-col gap-2 pb-2">
       {retrying() ? (
-        <p class="text-error m-0 text-sm">
+        <p class="text-error m-0 px-4 pt-2 text-sm">
           Deploy stream disconnected — retrying…
         </p>
       ) : null}
-      {problem() ? <p class="text-error m-0 text-sm">{problem()}</p> : null}
+      {problem() ? (
+        <p class="text-error m-0 px-4 pt-2 text-sm">{problem()}</p>
+      ) : null}
       {paused === null ? null : (
-        <p class="text-warning m-0 text-sm">{paused}</p>
+        <p class="text-warning m-0 px-4 pt-2 text-sm">{paused}</p>
       )}
-      <ul class="list bg-base-100 dark:bg-base-200 border-base-300 rounded-box w-full border shadow-md">
+      <ul class="list divide-base-300 w-full divide-y p-0">
         {feedLoading(feed.state()) ? (
-          <li class="px-4 pt-4 pb-4">
+          <li class="px-4 py-4">
             <ListSkeleton rows={2} />
           </li>
         ) : null}
         {loaded() && items().length === 0 && !retrying() && !problem() ? (
-          <li class="text-base-content/70 px-4 pt-4 pb-4 text-sm">
-            {emptyText}
-          </li>
+          <li class="text-base-content/70 px-4 py-4 text-sm">{emptyText}</li>
         ) : null}
         {items().map((d) => (
           <DeployRow
@@ -695,8 +695,8 @@ export const DeployList = ({
           </button>
         ) : null}
       </div>
-      <div class="flex w-full flex-col gap-2">
-        <div class="bg-base-100 dark:bg-base-200 border-base-300 rounded-box flex w-full flex-wrap items-center gap-x-3 gap-y-2 border px-4 py-3 shadow-md">
+      <div class="rounded-box border-base-300 bg-base-200 w-full overflow-hidden border shadow-md">
+        <div class="bg-base-100 border-base-300 flex w-full flex-wrap items-center gap-x-3 gap-y-2 border-b px-4 py-3">
           <span class="text-lg font-semibold">Production</span>
           {app ? (
             <DeployGroupMeta

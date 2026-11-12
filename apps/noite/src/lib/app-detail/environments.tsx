@@ -470,137 +470,154 @@ const GroupApp = defineApp({
           collectRef(box, el);
         }}
       >
-        <div class="bg-base-100 dark:bg-base-200 border-base-300 rounded-box flex w-full flex-col gap-2 border px-4 py-3 shadow-md">
-          <div class="flex w-full flex-wrap items-center gap-x-3 gap-y-2">
-            <button
-              type="button"
-              class="btn btn-sm btn-ghost btn-square -ml-2 shrink-0"
-              aria-expanded={model.expanded}
-              aria-label={`${model.expanded ? "Hide" : "Show"} ${env.label} deploy history`}
-              onclick={() => {
-                dispatch(GroupMsg.ExpandedToggled());
-              }}
-            >
-              {model.expanded ? <ChevronUp /> : <ChevronDown />}
-            </button>
-            <span class="text-lg font-semibold">{env.label}</span>
-            {tracks ? (
-              <span class="text-base-content/60 inline-flex items-center gap-1 text-xs">
-                <GitBranch class="h-3 w-3" />
-                {tracks}
-              </span>
-            ) : null}
-            <DeployGroupMeta
-              appId={props.appId}
-              desiredState={env.desiredState}
-              host={environmentHost(props.subdomain, env.label)}
-              sha={env.lastDeploySha}
-              status={env.status}
-              url={url}
-            />
-            {header.stopped ? (
-              <span class="badge badge-sm" title="desired_state = stopped">
-                Stopped
-              </span>
-            ) : null}
-            <span class="ml-auto flex items-center gap-1">
-              {caps.admin ? (
-                <label
-                  class="mr-2 flex cursor-pointer items-center gap-1.5 text-xs"
-                  title="Public: anyone with the URL. Off: app members only."
-                >
-                  <input
-                    type="checkbox"
-                    class="toggle toggle-xs"
-                    aria-label={`Public ${env.label}`}
-                    checked={env.public}
-                    disabled={pending}
-                    onchange={(event) => {
-                      dispatch(
-                        GroupMsg.PublicRequested({
-                          value: event.currentTarget.checked,
-                        })
-                      );
-                    }}
-                  />
-                  Public
-                </label>
-              ) : (
-                <span class="text-base-content/70 mr-2 inline-flex items-center gap-1 text-xs">
-                  {env.public ? null : <Lock class="h-3 w-3" />}
-                  {env.public ? "Public" : "Members only"}
-                </span>
-              )}
-              {caps.push ? (
-                <button
-                  type="button"
-                  class="btn btn-sm btn-ghost"
-                  disabled={pending}
-                  onclick={() => {
-                    dispatch(GroupMsg.RedeployRequested());
-                  }}
-                >
-                  <Refresh />
-                  {model.op._tag === "Deploying" ? "Redeploying…" : "Redeploy"}
-                </button>
-              ) : null}
+        {/* Layer card (kumo-ui.com/components/layer-card): the environment's
+         * identity, status and actions are the header strip, and its deploy
+         * history is the body. `bg-base-100` on the header and `bg-base-200`
+         * on the body is the one token pair that reads the same way in both
+         * themes — the light theme's base-100 is lighter than its base-200,
+         * the dark theme's is darker — so the strip never needs a `dark:`
+         * override. */}
+        <div class="rounded-box border-base-300 bg-base-200 w-full overflow-hidden border shadow-md">
+          <div class="bg-base-100 border-base-300 flex w-full flex-col gap-2 border-b px-4 py-3">
+            <div class="flex w-full flex-wrap items-center gap-x-3 gap-y-2">
               <button
                 type="button"
-                class={`btn btn-sm btn-ghost ${model.varsOpen ? "btn-active" : ""}`}
-                aria-expanded={model.varsOpen}
+                class="btn btn-sm btn-ghost btn-square -ml-2 shrink-0"
+                aria-expanded={model.expanded}
+                aria-label={`${model.expanded ? "Hide" : "Show"} ${env.label} deploy history`}
                 onclick={() => {
-                  dispatch(GroupMsg.VarsToggled());
+                  dispatch(GroupMsg.ExpandedToggled());
                 }}
               >
-                <Key />
-                Variables
+                {model.expanded ? <ChevronUp /> : <ChevronDown />}
               </button>
-              {caps.admin ? (
+              <span class="text-lg font-semibold">{env.label}</span>
+              {tracks ? (
+                <span class="text-base-content/60 inline-flex items-center gap-1 text-xs">
+                  <GitBranch class="h-3 w-3" />
+                  {tracks}
+                </span>
+              ) : null}
+              <DeployGroupMeta
+                appId={props.appId}
+                desiredState={env.desiredState}
+                host={environmentHost(props.subdomain, env.label)}
+                sha={env.lastDeploySha}
+                status={env.status}
+                url={url}
+              />
+              {header.stopped ? (
+                <span class="badge badge-sm" title="desired_state = stopped">
+                  Stopped
+                </span>
+              ) : null}
+              <span class="ml-auto flex items-center gap-1">
+                {caps.admin ? (
+                  <label
+                    class="mr-2 flex cursor-pointer items-center gap-1.5 text-xs"
+                    title="Public: anyone with the URL. Off: app members only."
+                  >
+                    <input
+                      type="checkbox"
+                      class="toggle toggle-xs"
+                      aria-label={`Public ${env.label}`}
+                      checked={env.public}
+                      disabled={pending}
+                      onchange={(event) => {
+                        dispatch(
+                          GroupMsg.PublicRequested({
+                            value: event.currentTarget.checked,
+                          })
+                        );
+                      }}
+                    />
+                    Public
+                  </label>
+                ) : (
+                  <span class="text-base-content/70 mr-2 inline-flex items-center gap-1 text-xs">
+                    {env.public ? null : <Lock class="h-3 w-3" />}
+                    {env.public ? "Public" : "Members only"}
+                  </span>
+                )}
+                {caps.push ? (
+                  <button
+                    type="button"
+                    class="btn btn-sm btn-ghost"
+                    disabled={pending}
+                    onclick={() => {
+                      dispatch(GroupMsg.RedeployRequested());
+                    }}
+                  >
+                    <Refresh />
+                    {model.op._tag === "Deploying"
+                      ? "Redeploying…"
+                      : "Redeploy"}
+                  </button>
+                ) : null}
                 <button
                   type="button"
-                  class="btn btn-sm btn-ghost btn-square hover:text-error"
-                  disabled={pending}
-                  aria-label={`Delete ${env.label}`}
-                  title="Delete environment"
-                  onclick={async () => {
-                    const ok = await confirmDialog({
-                      confirmLabel: "Delete",
-                      title: `Delete ${env.label}?`,
-                    });
-
-                    if (ok !== "confirm") {
-                      return;
-                    }
-
-                    dispatch(GroupMsg.DeleteRequested());
+                  class={`btn btn-sm btn-ghost ${model.varsOpen ? "btn-active" : ""}`}
+                  aria-expanded={model.varsOpen}
+                  onclick={() => {
+                    dispatch(GroupMsg.VarsToggled());
                   }}
                 >
-                  <Trash />
+                  <Key />
+                  Variables
                 </button>
-              ) : null}
-            </span>
-          </div>
-          {alertText ? <p class="text-error m-0 text-xs">{alertText}</p> : null}
-          {header.stopped ? (
-            <p class="m-0 text-xs opacity-70">
-              This environment is stopped: it is not serving traffic, and a
-              deploy will not start it.
-            </p>
-          ) : null}
-          {header.error ? (
-            <p class="text-error m-0 text-xs break-words">{header.error}</p>
-          ) : null}
-          {model.varsOpen ? (
-            <div class="border-base-300 w-full border-t pt-2">
-              <EnvironmentVars
-                appId={props.appId}
-                envId={env.id}
-                myRole={props.myRole}
-              />
+                {caps.admin ? (
+                  <button
+                    type="button"
+                    class="btn btn-sm btn-ghost btn-square hover:text-error"
+                    disabled={pending}
+                    aria-label={`Delete ${env.label}`}
+                    title="Delete environment"
+                    onclick={async () => {
+                      const ok = await confirmDialog({
+                        confirmLabel: "Delete",
+                        title: `Delete ${env.label}?`,
+                      });
+
+                      if (ok !== "confirm") {
+                        return;
+                      }
+
+                      dispatch(GroupMsg.DeleteRequested());
+                    }}
+                  >
+                    <Trash />
+                  </button>
+                ) : null}
+              </span>
             </div>
-          ) : null}
+            {alertText ? (
+              <p class="text-error m-0 text-xs">{alertText}</p>
+            ) : null}
+            {header.stopped ? (
+              <p class="m-0 text-xs opacity-70">
+                This environment is stopped: it is not serving traffic, and a
+                deploy will not start it.
+              </p>
+            ) : null}
+            {header.error ? (
+              <p class="text-error m-0 text-xs break-words">{header.error}</p>
+            ) : null}
+          </div>
+          {/* The card body: the override editor (`push` holders only) and the
+           * deploy history, on the body's `bg-base-200`. */}
+          <div class="w-full">
+            {model.varsOpen ? (
+              <div class="px-4 py-3">
+                <EnvironmentVars
+                  appId={props.appId}
+                  envId={env.id}
+                  myRole={props.myRole}
+                />
+              </div>
+            ) : null}
+            {model.expanded ? props.children : null}
+          </div>
         </div>
-        {model.expanded ? props.children : null}
       </section>
     );
   },
