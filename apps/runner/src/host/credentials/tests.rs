@@ -10,10 +10,10 @@ use std::sync::{Arc, Mutex};
 use futures::future::BoxFuture;
 
 use super::{
-    cached_operator_token, decrypt, delete_app_operator_tokens, delete_operator_token, encrypt,
-    ensure, ensure_operator_token_row, fleet_credentials, mint_operator_token, operator_token,
-    orphan_sweep, orphan_sweep_due, prefix_policy, revoke_app, revoke_environment, sweep,
-    tenant_process_credentials, AppCredentials, CredentialProvider, Credentials, MintedKey,
+    cached_operator_token, decrypt, delete_app_operator_tokens, delete_environment,
+    delete_operator_token, encrypt, ensure, ensure_operator_token_row, fleet_credentials,
+    mint_operator_token, operator_token, orphan_sweep, orphan_sweep_due, prefix_policy, revoke_app,
+    sweep, tenant_process_credentials, AppCredentials, CredentialProvider, Credentials, MintedKey,
     ProviderSetting, Scope, StoreAccess,
 };
 use crate::config::{config_for_tests, Config, Tenancy};
@@ -294,7 +294,7 @@ async fn environment_teardown_revokes_only_its_key() {
     ensure(&pool, &cfg, &provider, &env_scope())
         .await
         .expect("env mint");
-    revoke_environment(&pool, &cfg, "env-1")
+    delete_environment(&pool, &cfg, "env-1")
         .await
         .expect("revoke");
     assert_eq!(provider.revoked(), vec!["user-2".to_string()]);

@@ -133,11 +133,18 @@ pub async fn ensure_app_build_uid(
     // build from running as the uid that still owns the departed tenant's
     // files (SPEC, Tenant isolation; the hostile suite's cross-build probe).
     for _ in 0..16 {
+        // The scan and the claim are one IMMEDIATE transaction: the app
+        // delete moves a uid to `app_purge` in its own transaction, and the
+        // unique index only covers `app`, so a scan taken before that move
+        // would let a second app claim a uid a tombstone now owns. With the
+        // write lock held, a delete either lands before the scan (and the
+        // tombstone is seen) or waits for the claim to commit.
+        let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
         let used: Vec<i64> = sqlx::query_scalar(
             "SELECT build_uid FROM app WHERE build_uid IS NOT NULL \
              UNION SELECT build_uid FROM app_purge WHERE build_uid IS NOT NULL",
         )
-        .fetch_all(pool)
+        .fetch_all(&mut *tx)
         .await?;
         let Some(uid) = pick_build_uid(base, range, &used) else {
             return Err(sqlx::Error::Protocol(format!(
@@ -149,10 +156,11 @@ pub async fn ensure_app_build_uid(
             sqlx::query("UPDATE app SET build_uid = ? WHERE id = ? AND build_uid IS NULL")
                 .bind(i64::from(uid))
                 .bind(app_id)
-                .execute(pool)
+                .execute(&mut *tx)
                 .await;
         match updated {
             Ok(_) => {}
+            // Dropping `tx` rolls the failed claim back.
             Err(sqlx::Error::Database(e)) if e.is_unique_violation() => continue,
             Err(e) => return Err(e),
         }
@@ -160,9 +168,10 @@ pub async fn ensure_app_build_uid(
         // either way the row's value is now the truth.
         let claimed: Option<i64> = sqlx::query_scalar("SELECT build_uid FROM app WHERE id = ?")
             .bind(app_id)
-            .fetch_optional(pool)
+            .fetch_optional(&mut *tx)
             .await?
             .flatten();
+        tx.commit().await?;
         return Ok(claimed.and_then(|v| u32::try_from(v).ok()));
     }
     Err(sqlx::Error::Protocol(

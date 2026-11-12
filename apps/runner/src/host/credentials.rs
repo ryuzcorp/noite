@@ -726,14 +726,26 @@ pub async fn revoke_app(pool: &sqlx::SqlitePool, cfg: &Config, app_id: &str) -> 
     Ok(())
 }
 
-/// One environment's key (its teardown).
-pub async fn revoke_environment(
+/// Remove one environment: mark its live key `revoking` and drop its row as
+/// one step under the mint fence ([`ensure`] holds the same fence from its
+/// prefix check through the key insert). A mint that already passed its check
+/// either lands first — and this marks the key it inserted — or, seeing the
+/// row gone, refuses. Without the fence a mint could insert a live key after
+/// the row was deleted, which nothing would ever mark again (the boot
+/// reconcile has already run and the sweep reads only `revoking` rows). The
+/// store delete is the periodic [`sweep`]'s job, run here after the row is
+/// gone.
+pub async fn delete_environment(
     pool: &sqlx::SqlitePool,
     cfg: &Config,
     env_id: &str,
 ) -> anyhow::Result<()> {
-    if let Some(row) = db::live_scoped_credential(pool, &format!("env:{env_id}")).await? {
-        db::mark_scoped_credential_revoking(pool, &row.handle).await?;
+    {
+        let _guard = db::mutate_fence().await;
+        if let Some(row) = db::live_scoped_credential(pool, &format!("env:{env_id}")).await? {
+            db::mark_scoped_credential_revoking(pool, &row.handle).await?;
+        }
+        db::delete_environment_row(pool, env_id).await?;
     }
     sweep(pool, cfg).await;
     Ok(())

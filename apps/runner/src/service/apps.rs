@@ -222,7 +222,8 @@ async fn create_inner(
             // this guard): every pending-purge tombstone for it is satisfied.
             // A failure only leaves them for the resume pass, which re-checks
             // the row and wipes an empty prefix — never fail the create for it.
-            if let Err(e) = db::clear_app_purges(&state.pool, slug).await {
+            if let Err(e) = purge::clear_purges_if_no_rename(&state.config, &state.pool, slug).await
+            {
                 tracing::warn!(slug, error = %e, "could not clear the slug's purge tombstones");
             }
         }
@@ -933,7 +934,9 @@ async fn delete_inner(state: &AppState, id: &str) -> Result<(), ApiError> {
                 }
             };
             if satisfied {
-                if let Err(e) = db::clear_app_purges(&state.pool, &slug).await {
+                if let Err(e) =
+                    purge::clear_purges_if_no_rename(&state.config, &state.pool, &slug).await
+                {
                     tracing::warn!(slug, error = %e, "could not clear the slug's purge tombstones");
                 }
             }
@@ -1964,6 +1967,182 @@ mod tests {
         create(&state, "B", "ob-new", Some("u1"), None)
             .await
             .expect("the slug is usable once the target is clean");
+        drop(dir);
+    }
+
+    /// A pending rename keeps the deleted app's build uid reserved: its
+    /// target may hold `builds/`/`cache/` trees that uid owns, so the source
+    /// wipe must not clear the tombstone that records it. The uid returns only
+    /// after the resume pass wiped the target and dropped the marker.
+    #[tokio::test]
+    async fn a_deleted_apps_uid_stays_reserved_until_the_pending_target_is_wiped() {
+        let (state, dir) = test_state(10).await;
+        let app = db::create_app(
+            &state.pool,
+            &state.config,
+            db::NewApp {
+                name: "Uid",
+                slug: "uid-old",
+                user_id: "u1",
+                subdomain: "uid-old.localhost",
+                listen: 30684,
+                internal: 30685,
+            },
+        )
+        .await
+        .expect("app row");
+        let uid = crate::db::alloc::ensure_app_build_uid(&state.pool, Some(51000), 4, &app.id)
+            .await
+            .expect("uid")
+            .expect("a uid is allocated");
+        assert_eq!(uid, 51000);
+        crate::host::rename::write_rename_marker_for_test(
+            &state.config,
+            &app.id,
+            "uid-old",
+            "uid-new",
+        )
+        .await
+        .expect("failed attempt marker");
+
+        let app_done = crate::service::detached::finished(&format!("app:{}", app.id));
+        let wipe_done = crate::service::detached::finished("purge:uid-old");
+        let _ = delete(&state, &app.id).await.expect("delete answers");
+        tokio::time::timeout(Duration::from_secs(30), app_done.notified())
+            .await
+            .expect("the delete finished");
+        tokio::time::timeout(Duration::from_secs(30), wipe_done.notified())
+            .await
+            .expect("the source wipe finished");
+        assert!(
+            db::pending_purges(&state.pool)
+                .await
+                .expect("tombstones")
+                .contains(&"uid-old".to_string()),
+            "the source wipe keeps the tombstone while the rename marker exists"
+        );
+
+        let next = db::create_app(
+            &state.pool,
+            &state.config,
+            db::NewApp {
+                name: "Next",
+                slug: "uid-next",
+                user_id: "u1",
+                subdomain: "uid-next.localhost",
+                listen: 30686,
+                internal: 30687,
+            },
+        )
+        .await
+        .expect("next app");
+        assert_eq!(
+            crate::db::alloc::ensure_app_build_uid(&state.pool, Some(51000), 4, &next.id)
+                .await
+                .expect("uid"),
+            Some(51001),
+            "the dead app's uid is not allocatable while its target is unwiped"
+        );
+
+        crate::host::rename::resume_pending_renames(
+            &state.config,
+            &state.pool,
+            &state.procs,
+            &state.logs,
+            &state.deploying,
+            state.wal.sync(),
+        )
+        .await;
+        assert!(
+            db::pending_purges(&state.pool)
+                .await
+                .expect("tombstones")
+                .is_empty(),
+            "the resume pass cleared the tombstone once the target was wiped"
+        );
+        let later = db::create_app(
+            &state.pool,
+            &state.config,
+            db::NewApp {
+                name: "Later",
+                slug: "uid-later",
+                user_id: "u1",
+                subdomain: "uid-later.localhost",
+                listen: 30688,
+                internal: 30689,
+            },
+        )
+        .await
+        .expect("later app");
+        assert_eq!(
+            crate::db::alloc::ensure_app_build_uid(&state.pool, Some(51000), 4, &later.id)
+                .await
+                .expect("uid"),
+            Some(51000),
+            "the uid is free once the target is wiped"
+        );
+        drop(dir);
+    }
+
+    /// A marker names its app: a third app re-created on a freed source slug
+    /// must not be able to forget the dead app's marker (which would leave
+    /// that app's moved target unprotected and never wiped).
+    #[tokio::test]
+    async fn a_reused_source_slug_does_not_forget_another_apps_marker() {
+        let (state, dir) = test_state(10).await;
+        let old = db::create_app(
+            &state.pool,
+            &state.config,
+            db::NewApp {
+                name: "Old",
+                slug: "fm-old",
+                user_id: "u1",
+                subdomain: "fm-old.localhost",
+                listen: 30690,
+                internal: 30691,
+            },
+        )
+        .await
+        .expect("app row");
+        crate::host::rename::write_rename_marker_for_test(
+            &state.config,
+            &old.id,
+            "fm-old",
+            "fm-target",
+        )
+        .await
+        .expect("failed attempt marker");
+        let done = crate::service::detached::finished(&format!("app:{}", old.id));
+        let _ = delete(&state, &old.id).await.expect("delete answers");
+        tokio::time::timeout(Duration::from_secs(30), done.notified())
+            .await
+            .expect("the delete finished");
+
+        // A third app takes the freed source slug and renames it away.
+        let new = create(&state, "New", "fm-old", Some("u1"), None)
+            .await
+            .expect("the source slug is free");
+        rename(&state, &new.id, None, Some("fm-new"))
+            .await
+            .expect("the third app's rename");
+        assert!(
+            crate::host::rename::target_reserved(&state.config, "fm-target").await,
+            "the dead app's marker and its target survive the source slug's reuse"
+        );
+
+        crate::host::rename::resume_pending_renames(
+            &state.config,
+            &state.pool,
+            &state.procs,
+            &state.logs,
+            &state.deploying,
+            state.wal.sync(),
+        )
+        .await;
+        assert!(
+            !crate::host::rename::target_reserved(&state.config, "fm-target").await,
+            "the dead app's target is wiped and its marker resolved"
+        );
         drop(dir);
     }
 

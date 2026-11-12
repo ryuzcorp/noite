@@ -92,11 +92,13 @@ pub async fn teardown(
     // before the next restart would inherit the dead fleet's watermark and
     // skip its first compactions.
     crate::host::metrics::forget_fleet(&fleet_key);
-    // The environment's key must not outlive its prefix (SPEC, Scoped
-    // credentials); the app's own key is untouched. The boot retirement has no
-    // later sweep for a row it deletes, so there a failed revoke keeps the row
-    // (and `kind`) for the next boot instead of dropping the only retry.
-    if let Err(e) = crate::host::credentials::revoke_environment(pool, cfg, env.id).await {
+    // The environment's key and its row go together, under the mint fence
+    // (SPEC, Scoped credentials): a key must not outlive its prefix, and a
+    // concurrent mint must see the row gone and refuse. The app's own key is
+    // untouched. The boot retirement has no later sweep for a row it deletes,
+    // so there a failed revoke keeps the row (and `kind`) for the next boot
+    // instead of dropping the only retry.
+    if let Err(e) = crate::host::credentials::delete_environment(pool, cfg, env.id).await {
         if strict_credentials {
             return Err(e).with_context(|| {
                 format!(
@@ -106,6 +108,9 @@ pub async fn teardown(
             });
         }
         tracing::warn!(env_id = %env.id, error = %format!("{e:#}"), "environment deleted but credential revoke failed");
+        // Parity with the old best-effort path: the wipe is done and the row
+        // must not linger because a credential write failed.
+        db::delete_environment_row(pool, env.id).await?;
     }
     // Its operator token goes too (row and process cache), so a reused
     // label mints fresh.
@@ -114,7 +119,6 @@ pub async fn teardown(
     {
         tracing::warn!(env_id = %env.id, error = %e, "environment deleted but operator token row remains");
     }
-    db::delete_environment_row(pool, env.id).await?;
     tracing::info!(
         slug = %env.app_slug,
         label = %env.label,

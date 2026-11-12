@@ -28,14 +28,16 @@ mod metrics;
 pub mod prs;
 mod void_cohost;
 
+#[cfg(test)]
+pub use apps::clear_app_purges;
 pub use apps::{
-    add_domain, app_ids, clear_app_purges, count_apps_for_user, create_app, delete_app,
+    add_domain, app_ids, clear_app_purges_for_app, count_apps_for_user, create_app, delete_app,
     domain_claim, finish_app_import, get_app, get_app_by_domain, get_app_by_slug, get_app_limit,
     list_all_apps, list_app_domains, list_app_limits, list_apps, list_domains_for,
-    patch_app_desired, pending_purges, rebind_local_subdomains, remove_domain, rename_app,
-    rename_app_name, set_app_asleep, set_app_awake, set_app_import_source, set_app_limit,
-    set_deployed_config, verified_domain_owner, verify_domain, write_app_status, NewApp,
-    VerifyOutcome,
+    patch_app_desired, pending_purges, purge_app_ids, rebind_local_subdomains, remove_domain,
+    rename_app, rename_app_name, set_app_asleep, set_app_awake, set_app_import_source,
+    set_app_limit, set_deployed_config, verified_domain_owner, verify_domain, write_app_status,
+    NewApp, VerifyOutcome,
 };
 pub use compaction::{
     bump_metric_version, delete_compactions_for, get_compacted_hours, get_metric_version,

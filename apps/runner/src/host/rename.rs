@@ -226,25 +226,40 @@ pub(crate) async fn target_reserved(cfg: &Config, slug: &str) -> bool {
     tokio::fs::metadata(rename_marker(cfg, slug)).await.is_ok()
 }
 
-/// Remove every marker whose source slug is `from`: once the app left that
-/// slug (a successful rename, a delete, a different rename), an attempt that
-/// started there can never be resumed and must not block its target.
-pub(crate) async fn forget_markers_from(cfg: &Config, from: &str) -> usize {
-    let mut removed = 0;
-    for marker in pending_renames(cfg).await {
-        if marker.from == from {
-            clear_rename_marker(cfg, &marker.to).await;
-            removed += 1;
-        }
-    }
-    removed
+/// Whether an unfinished rename of `app_id` is still on disk. A marker whose
+/// app row is gone keeps that app's build uid reserved (the purge tombstone
+/// carries it): the moved `builds/`/`cache/` trees under its target are still
+/// owned by the uid until the resume pass wipes them.
+pub(crate) async fn app_has_pending_rename(cfg: &Config, app_id: &str) -> bool {
+    pending_renames(cfg)
+        .await
+        .iter()
+        .any(|marker| marker.app_id == app_id)
 }
 
 /// fsync a directory, so an entry just created or renamed into it survives a
 /// power loss. A failure is the caller's to propagate: a marker that may not
-/// be on disk must never vouch for a move that already started.
+/// be on disk must never vouch for a move that already started. Filesystems
+/// that cannot fsync a directory (`EINVAL`/`ENOTSUP` — some overlay and
+/// network mounts) are the one exception: renaming must still work there, so
+/// the unsupported call is a loud warning rather than a failed rename.
 async fn sync_dir(path: &std::path::Path) -> std::io::Result<()> {
-    tokio::fs::File::open(path).await?.sync_all().await
+    match tokio::fs::File::open(path).await?.sync_all().await {
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::InvalidInput | std::io::ErrorKind::Unsupported
+            ) =>
+        {
+            tracing::warn!(
+                path = %path.display(),
+                error = %e,
+                "directory fsync unsupported here; a rename marker may not survive a power loss"
+            );
+            Ok(())
+        }
+        other => other,
+    }
 }
 
 /// Durably record that `app_id` started moving `from` → `to` before the first
@@ -473,6 +488,15 @@ pub async fn rename_app(
             slug = new_slug,
             "resuming a rename whose target already holds this app's moved data"
         );
+        // A retry may find the marker an earlier attempt could not confirm on
+        // disk (the final directory fsync failed and the write reported an
+        // error, leaving the file behind). Sync it now: a marker that may not
+        // survive a crash must not vouch for data this retry moves.
+        if let Some(dir) = marker.parent() {
+            sync_dir(dir)
+                .await
+                .with_context(|| format!("fsync rename marker directory {}", dir.display()))?;
+        }
     } else {
         match crate::host::purge::purge_slug(
             cfg,
@@ -496,7 +520,7 @@ pub async fn rename_app(
                 // A tombstone left behind would let the purge resume pass wipe
                 // the target *after* this rename moved objects into it: fail
                 // before moving anything instead.
-                crate::db::clear_app_purges(pool, new_slug)
+                crate::host::purge::clear_purges_if_no_rename(cfg, pool, new_slug)
                     .await
                     .with_context(|| {
                         format!("clear the target slug's purge tombstone for {new_slug}")
@@ -513,9 +537,10 @@ pub async fn rename_app(
     let renamed = rename_slugged(cfg, pool, procs, logs, &app, new_name, new_slug).await?;
     // The row is committed to the target: the move is no longer resumable (a
     // retry takes the name-only branch), so the marker has done its job.
-    // Attempts that started from the old slug are dead for the same reason.
+    // Markers left by other apps on the old slug are *not* touched here: a
+    // slug freed by this rename can be re-created by another app, and its
+    // markers are its own (the resume pass resolves stale ones per app).
     clear_rename_marker(cfg, new_slug).await;
-    forget_markers_from(cfg, &app.slug).await;
     // The old generation ends here: its S3 prefix moved to the new slug, so
     // its seq marker must go too — otherwise a future slug reuse would skip
     // its restarted seq as stale. `applied[new_slug]` starts empty, so the
@@ -543,6 +568,15 @@ async fn wipe_orphaned_target(
     // The guard makes "no row owns this slug" authoritative: a create or
     // rename inserts its row under it and only after wiping the prefixes.
     let _guard = git_sync.lock(&marker.to).await;
+    // Overlapping passes (boot and the loop) can both have scanned this
+    // marker. If one already resolved it — or a new rename replaced it —
+    // this pass's snapshot is stale, and wiping would destroy the newer
+    // attempt's moved data. Only the marker still on disk may act.
+    let current = read_marker(&rename_marker(cfg, &marker.to)).await;
+    if current.as_ref() != Some(marker) {
+        tracing::debug!(target = %marker.to, "orphaned rename target skipped: its marker changed since the scan");
+        return Ok(());
+    }
     if db::get_app_by_slug(pool, &marker.to).await?.is_none() {
         crate::host::purge::purge_slug(
             cfg,
@@ -555,15 +589,18 @@ async fn wipe_orphaned_target(
             false,
         )
         .await?;
-        // The prefix is empty and no row owns the slug: every tombstone for
-        // it is satisfied (a failure only leaves it for the purge resume).
-        if let Err(e) = db::clear_app_purges(pool, &marker.to).await {
-            tracing::warn!(slug = %marker.to, error = %e, "wiped an orphaned rename target but could not clear its purge tombstones");
-        }
     }
     // A row owns the slug again: its own create wiped the prefixes before it
     // inserted the row, so nothing of the old attempt is left to preserve.
     clear_rename_marker(cfg, &marker.to).await;
+    // The marker that kept this app's build uid reserved is gone, and no other
+    // unfinished rename holds it: its purge tombstones (which carry the uid)
+    // can go now — the target's moved `builds/`/`cache/` trees are wiped.
+    if !app_has_pending_rename(cfg, &marker.app_id).await {
+        if let Err(e) = db::clear_app_purges_for_app(pool, &marker.app_id).await {
+            tracing::warn!(app_id = %marker.app_id, error = %e, "wiped an orphaned rename target but could not clear the app's purge tombstones");
+        }
+    }
     Ok(())
 }
 
@@ -573,8 +610,10 @@ async fn wipe_orphaned_target(
 /// reserved (a create or another rename onto it is refused). A marker whose
 /// app row is gone is resolved by wiping what it moved to the target (the
 /// objects belong to nobody) before the marker is dropped, so a failed delete
-/// never discards a target that still holds data. Other stale markers — the
-/// app already at another slug — are removed so they cannot block a slug.
+/// never discards a target that still holds data. A marker whose row already
+/// names the target is removed (the attempt committed; only its cleanup was
+/// lost); one naming any other slug is left alone — that app may still own
+/// what the attempt moved.
 pub async fn resume_pending_renames(
     cfg: &Config,
     pool: &sqlx::SqlitePool,
@@ -599,10 +638,20 @@ pub async fn resume_pending_renames(
         let live = app.as_ref().is_some_and(|app| app.slug == marker.from);
         if !live {
             if app.is_some() {
-                // The app left the slug (another rename committed, or the row
-                // was changed): the attempt can never resume, and whatever it
-                // moved is the app's own data under the target it now owns.
-                clear_rename_marker(cfg, &marker.to).await;
+                // The row already names the target: the attempt committed and
+                // only its marker survived (a crash before the cleanup). An
+                // app at any other slug may still own what the attempt moved,
+                // so its marker is left for a later rename/recovery.
+                if app.as_ref().is_some_and(|app| app.slug == marker.to)
+                    && marker_names_rename(
+                        &rename_marker(cfg, &marker.to),
+                        &marker.app_id,
+                        &marker.from,
+                    )
+                    .await
+                {
+                    clear_rename_marker(cfg, &marker.to).await;
+                }
                 continue;
             }
             // The app is gone: whatever the attempt moved under the target

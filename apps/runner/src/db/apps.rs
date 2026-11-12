@@ -458,6 +458,13 @@ pub async fn rename_app(
     git_prefix: &str,
     fleet_bucket: &str,
 ) -> sqlx::Result<()> {
+    // The mint fence: `credentials::ensure` validates its scope's prefix and
+    // inserts the key row under this same lock. A mint that already passed its
+    // check would otherwise insert a live key for the old prefix after this
+    // write committed — and after the rename's revoke pass — leaving a key on
+    // a prefix the app no longer owns. Holding it here (callers order it after
+    // `AppLock` and the slug guards) makes the two atomic.
+    let _fence = super::mutate_fence().await;
     let done = sqlx::query(
         r#"UPDATE app SET name = ?, slug = ?, subdomain = ?,
            git_prefix = ?, fleet_bucket = ?, updated_at = ? WHERE id = ?"#,
@@ -628,9 +635,34 @@ pub async fn app_ids(pool: &SqlitePool) -> sqlx::Result<Vec<String>> {
 /// Drop every tombstone for `slug`: a wipe of its prefixes finished while no
 /// app row owned it, so all of them are satisfied (one slug can carry more
 /// than one when a freed slug was re-created and deleted again).
+///
+/// Test-only: production paths clear through
+/// [`crate::host::purge::clear_purges_if_no_rename`], which also keeps a
+/// tombstone whose app still has an unfinished rename.
+#[cfg(test)]
 pub async fn clear_app_purges(pool: &SqlitePool, slug: &str) -> sqlx::Result<u64> {
     let done = sqlx::query("DELETE FROM main.app_purge WHERE slug = ?")
         .bind(slug)
+        .execute(pool)
+        .await?;
+    Ok(done.rows_affected())
+}
+
+/// The app ids behind the tombstones of `slug`: one slug can carry several
+/// when it was freed, re-created and deleted again.
+pub async fn purge_app_ids(pool: &SqlitePool, slug: &str) -> sqlx::Result<Vec<String>> {
+    sqlx::query_scalar("SELECT app_id FROM main.app_purge WHERE slug = ? ORDER BY created_at")
+        .bind(slug)
+        .fetch_all(pool)
+        .await
+}
+
+/// Drop every tombstone of one deleted app, whatever slug it names. Used once
+/// its last unfinished rename is resolved: the tombstones carry the build uid
+/// that kept the app's moved trees reserved.
+pub async fn clear_app_purges_for_app(pool: &SqlitePool, app_id: &str) -> sqlx::Result<u64> {
+    let done = sqlx::query("DELETE FROM main.app_purge WHERE app_id = ?")
+        .bind(app_id)
         .execute(pool)
         .await?;
     Ok(done.rows_affected())

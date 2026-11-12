@@ -34,15 +34,32 @@ const CI_CONFIG_NAME: &str = "noite.ci.yaml";
 /// not the slug: a freed slug is re-created by another tenant, and a
 /// slug-keyed volume was inherited by that new app's first build — one
 /// tenant's package caches readable by another, and never removed by the
-/// delete's wipe (merge-group e2e finding, 2026-11-12).
-pub fn ci_cache_volume(app_id: &str) -> String {
-    format!("{}{app_id}", ci_cache_volume_prefix())
+/// delete's wipe (merge-group e2e finding, 2026-11-12). The name also carries
+/// this install's tag: two installs can share one container daemon, and each
+/// sweep must only see (and remove) the volumes it created.
+pub fn ci_cache_volume(cfg: &Config, app_id: &str) -> String {
+    format!("{}{app_id}", ci_cache_volume_install_prefix(cfg))
 }
 
-/// Every CI cache volume's name starts with this: the reconcile sweep lists
-/// by it and treats the rest of the name as an app id.
+/// Every CI cache volume's name starts with this; only the ones carrying this
+/// install's tag belong to it.
 pub fn ci_cache_volume_prefix() -> &'static str {
     "noite-ci-cache-"
+}
+
+/// The per-install volume namespace: [`ci_cache_volume_prefix`] plus the
+/// install tag. The tag is stable across restarts and distinct per store
+/// (endpoint, bucket, region), exactly like the credential principal tag.
+pub fn ci_cache_volume_install_prefix(cfg: &Config) -> String {
+    format!(
+        "{}{}-",
+        ci_cache_volume_prefix(),
+        crate::host::credentials::install_tag(
+            &cfg.s3_endpoint_as_configured,
+            &cfg.s3_bucket,
+            &cfg.aws_region
+        )
+    )
 }
 
 /// Per-app exclusive lock shared by deploy and purge/delete so S3 fleets/git
@@ -929,7 +946,7 @@ async fn deploy_inner(
                     cpus: cores.saturating_sub(1).max(1) as f64,
                     uid: sandbox_id.unwrap_or(0),
                     gid: sandbox_id.unwrap_or(0),
-                    cache_volume: Some(ci_cache_volume(&app.id)),
+                    cache_volume: Some(ci_cache_volume(cfg, &app.id)),
                     env: ci_env,
                     container_prefix: "noite-ci".to_string(),
                     artifact_dir: Some("dist".to_string()),
@@ -2735,24 +2752,37 @@ pub async fn deploy_tip(
 #[cfg(test)]
 mod tests {
     use super::{
-        activate_after_staged_migrate, ci_cache_volume, ci_cache_volume_prefix,
-        contained_deploy_root, failure_summary, go_arch, has_build_script, log_migrate_warnings,
-        migrate_void_app, migrate_void_app_staged, parse_wrangler_build, probe_staged_generation,
-        quoted, route_live, wipe_worktree, without_runner_keys, DeployTarget, MigrateInputs,
-        Progress,
+        activate_after_staged_migrate, ci_cache_volume, ci_cache_volume_install_prefix,
+        ci_cache_volume_prefix, contained_deploy_root, failure_summary, go_arch, has_build_script,
+        log_migrate_warnings, migrate_void_app, migrate_void_app_staged, parse_wrangler_build,
+        probe_staged_generation, quoted, route_live, wipe_worktree, without_runner_keys,
+        DeployTarget, MigrateInputs, Progress,
     };
     use crate::models::DeployStatus;
     use serde_json::json;
 
     /// The CI cache volume is keyed by the app id, so a slug freed by a delete
     /// and taken by another app never mounts the departed tenant's package
-    /// caches. The legacy slug-keyed name is still derived, only to be
-    /// removed by the wipe.
+    /// caches — and by this install's tag, so two installs sharing a container
+    /// daemon never sweep away each other's caches.
     #[test]
-    fn the_ci_cache_volume_is_keyed_by_app_id() {
-        assert_eq!(ci_cache_volume("6f1e-4a"), "noite-ci-cache-6f1e-4a");
-        assert_ne!(ci_cache_volume("6f1e-4a"), ci_cache_volume("6f1e-4b"));
-        assert!(ci_cache_volume("6f1e-4a").starts_with(ci_cache_volume_prefix()));
+    fn the_ci_cache_volume_is_keyed_by_app_id_and_install() {
+        let cfg = crate::config::config_for_tests();
+        let prefix = ci_cache_volume_prefix();
+        let name = ci_cache_volume(&cfg, "6f1e-4a");
+        assert!(name.starts_with(&ci_cache_volume_install_prefix(&cfg)));
+        assert!(name.starts_with(prefix));
+        assert!(name.ends_with("-6f1e-4a"));
+        assert_ne!(
+            ci_cache_volume(&cfg, "6f1e-4a"),
+            ci_cache_volume(&cfg, "6f1e-4b")
+        );
+        let mut other = crate::config::config_for_tests();
+        other.s3_bucket = format!("{}-other", cfg.s3_bucket);
+        assert!(
+            !name.starts_with(&ci_cache_volume_install_prefix(&other)),
+            "another install's namespace is not ours"
+        );
     }
 
     /// A client that waits for the deploy row (the CLI, the UI, the e2e)

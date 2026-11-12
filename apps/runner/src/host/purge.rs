@@ -192,20 +192,23 @@ fn no_such_volume(stderr: &str) -> bool {
 /// runs it detached, outside the slug guard, and [`reconcile_ci_caches`] is
 /// the durable retry. The tombstone clear never waits on it.
 pub async fn remove_ci_cache_volume(cfg: &Config, app_id: &str) -> anyhow::Result<()> {
-    let name = crate::host::deploy::ci_cache_volume(app_id);
+    let name = crate::host::deploy::ci_cache_volume(cfg, app_id);
     remove_ci_volume(cfg, &name).await
 }
 
 /// Remove every CI cache volume that no live app owns.
 ///
-/// The volume is keyed by app id ([`crate::host::deploy::ci_cache_volume`]),
-/// so a volume named after a slug, a deleted app, or an app whose wipe died
-/// is garbage nobody mounts again. This pass is the durable cleanup for all
-/// of them (the delete's own removal is a fast path): it lists the volumes by
-/// the shared prefix and drops every name whose suffix is not an existing
-/// app's id. Non-fatal throughout — it runs at boot and on the slow loop
-/// tick, never under a slug guard, and a failing pass only leaves the volumes
-/// for the next one.
+/// The volume is keyed by this install's tag and the app id
+/// ([`crate::host::deploy::ci_cache_volume`]), so a volume named after a slug,
+/// a deleted app, or an app whose wipe died is garbage nobody mounts again.
+/// This pass is the durable cleanup for all of them (the delete's own removal
+/// is a fast path): it lists the volumes by the shared prefix and drops every
+/// name in *this install's* namespace whose suffix is not an existing app's
+/// id. Volumes without this install's tag belong to another install sharing
+/// the daemon (or to a build from before the tag existed) and are never
+/// touched. Non-fatal throughout — it runs at boot and on the slow loop tick,
+/// never under a slug guard, and a failing pass only leaves the volumes for
+/// the next one.
 pub async fn reconcile_ci_caches(cfg: &Config, pool: &sqlx::SqlitePool) -> usize {
     let listed = tokio::process::Command::new(&cfg.ci_docker_bin)
         .args([
@@ -250,10 +253,14 @@ pub async fn reconcile_ci_caches(cfg: &Config, pool: &sqlx::SqlitePool) -> usize
             return 0;
         }
     };
+    let ours = crate::host::deploy::ci_cache_volume_install_prefix(cfg);
     let listing = String::from_utf8_lossy(&listed.stdout);
     let mut removed = 0;
     for name in listing.lines().map(str::trim) {
-        let Some(suffix) = name.strip_prefix(crate::host::deploy::ci_cache_volume_prefix()) else {
+        // Only this install's namespace: a foreign install's volume (or a
+        // pre-tag name) is not ours to remove, and treating its suffix as a
+        // local app id would delete another installation's active cache.
+        let Some(suffix) = name.strip_prefix(&ours) else {
             continue;
         };
         if live.contains(suffix) {
@@ -267,6 +274,31 @@ pub async fn reconcile_ci_caches(cfg: &Config, pool: &sqlx::SqlitePool) -> usize
         }
     }
     removed
+}
+
+/// Clear the purge tombstones of `slug` once its prefixes are empty — unless a
+/// deleted app's unfinished rename still exists. Its target may hold the
+/// `builds/`/`cache/` trees that app's build uid owns, and the tombstone is
+/// the allocator's record of that uid; the rename resume pass clears the
+/// tombstone after it wipes the target and drops the marker.
+pub(crate) async fn clear_purges_if_no_rename(
+    cfg: &Config,
+    pool: &sqlx::SqlitePool,
+    slug: &str,
+) -> sqlx::Result<u64> {
+    let mut cleared = 0;
+    for app_id in crate::db::purge_app_ids(pool, slug).await? {
+        if crate::host::rename::app_has_pending_rename(cfg, &app_id).await {
+            tracing::info!(
+                slug,
+                app_id = %app_id,
+                "keeping a deleted app's purge tombstone: an unfinished rename still owns its build uid"
+            );
+            continue;
+        }
+        cleared += crate::db::clear_app_purges_for_app(pool, &app_id).await?;
+    }
+    Ok(cleared)
 }
 
 /// Resume every wipe the durable tombstones (`app_purge`) still owe.
@@ -369,7 +401,7 @@ pub async fn resume_pending(
         };
         match satisfied {
             Ok(true) => {
-                match crate::db::clear_app_purges(pool, &slug).await {
+                match clear_purges_if_no_rename(cfg, pool, &slug).await {
                     Ok(_) => report.cleared += 1,
                     Err(e) => {
                         tracing::warn!(slug, error = %e, "pending purge wiped the slug but could not clear its tombstone");
@@ -1129,44 +1161,48 @@ mod tests {
         .expect("app")
     }
 
-    /// The sweep keeps a live app's id-keyed volume and removes every other
-    /// name under the prefix: a legacy slug-keyed volume, a deleted app's
-    /// volume, and an id the database no longer knows.
+    /// The sweep keeps a live app's id-keyed volume and removes the dead
+    /// app's, but only inside this install's namespace: a pre-tag name and
+    /// another install's tagged name are not ours to delete.
     #[tokio::test]
-    async fn the_sweep_keeps_live_ids_and_removes_every_other_volume() {
+    async fn the_sweep_keeps_live_ids_and_removes_only_this_installs_volumes() {
         let base = std::env::temp_dir().join(format!("noite-ci-sweep-{}", crate::models::new_id()));
         std::fs::create_dir_all(&base).expect("temp dir");
         let pool = db::connect("sqlite::memory:").await.expect("memory db");
         let live = app_with_slug(&pool, "live-app").await;
         let dead = app_with_slug(&pool, "dead-app").await;
         db::delete_app(&pool, &dead.id).await.expect("delete row");
-        let live_name = crate::host::deploy::ci_cache_volume(&live.id);
-        let dead_name = crate::host::deploy::ci_cache_volume(&dead.id);
+        let mut cfg = crate::config::config_for_tests();
+        let live_name = crate::host::deploy::ci_cache_volume(&cfg, &live.id);
+        let dead_name = crate::host::deploy::ci_cache_volume(&cfg, &dead.id);
         let legacy = format!("{}old-slug", crate::host::deploy::ci_cache_volume_prefix());
+        let mut other = crate::config::config_for_tests();
+        other.s3_bucket = format!("{}-other", cfg.s3_bucket);
+        let foreign = crate::host::deploy::ci_cache_volume(&other, &dead.id);
         let (bin, log) = cli_stub(
             &base,
-            &[&live_name, &dead_name, &legacy],
+            &[&live_name, &dead_name, &legacy, &foreign],
             1,
             "Error: no such volume",
         );
-        let mut cfg = crate::config::config_for_tests();
         cfg.ci_docker_bin = bin;
 
         let removed = reconcile_ci_caches(&cfg, &pool).await;
         assert_eq!(
-            removed, 2,
-            "the dead and legacy names go, the live one stays"
+            removed, 1,
+            "only this install's dead volume goes; the live one and the foreign names stay"
         );
         let calls = std::fs::read_to_string(&log).expect("cli log");
         assert!(
             calls.contains(&format!("volume rm -f {dead_name}")),
             "{calls}"
         );
-        assert!(calls.contains(&format!("volume rm -f {legacy}")), "{calls}");
-        assert!(
-            !calls.contains(&format!("volume rm -f {live_name}")),
-            "a live app's cache is never removed: {calls}"
-        );
+        for untouched in [&live_name, &legacy, &foreign] {
+            assert!(
+                !calls.contains(&format!("volume rm -f {untouched}")),
+                "{untouched} is not ours to remove: {calls}"
+            );
+        }
         pool.close().await;
         let _ = std::fs::remove_dir_all(&base);
     }
