@@ -458,7 +458,7 @@ pub async fn rename_app(
     git_prefix: &str,
     fleet_bucket: &str,
 ) -> sqlx::Result<()> {
-    sqlx::query(
+    let done = sqlx::query(
         r#"UPDATE app SET name = ?, slug = ?, subdomain = ?,
            git_prefix = ?, fleet_bucket = ?, updated_at = ? WHERE id = ?"#,
     )
@@ -471,6 +471,12 @@ pub async fn rename_app(
     .bind(id)
     .execute(pool)
     .await?;
+    // The row can be gone when a delete committed between the caller's read and
+    // this write (a rename and a delete claim the same app): an "applied" write
+    // that touched nothing would let the caller report a move it never made.
+    if done.rows_affected() == 0 {
+        return Err(sqlx::Error::RowNotFound);
+    }
     Ok(())
 }
 

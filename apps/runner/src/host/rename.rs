@@ -157,6 +157,34 @@ pub async fn rename_app(
     else {
         anyhow::bail!("deploy in flight; retry rename shortly");
     };
+    // The row above was read *before* the claim. A delete claims the app too,
+    // so it can have committed while we waited: moving the prefixes of a row
+    // that no longer exists would resurrect the deleted tenant's `git/`,
+    // `fleets/` and `envs/` data under our target slug, where no row and no
+    // purge tombstone points at it (review finding, 2026-11-12). Nothing else
+    // can change the row while the claim is ours, so this read is the one the
+    // whole move must act on.
+    let app = db::get_app(pool, app_id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("app not found"))?;
+    // The caller's requested slug is now the app's slug: a name-only write,
+    // no move (the same branch the read above takes when nothing changed).
+    if new_slug == app.slug {
+        db::rename_app(
+            pool,
+            app_id,
+            name.unwrap_or(&app.name),
+            &app.slug,
+            &app.subdomain,
+            &app.git_prefix,
+            &app.fleet_bucket,
+        )
+        .await?;
+        return db::get_app(pool, app_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("app not found"));
+    }
+    let new_name = name.unwrap_or(&app.name);
     // A background wipe of a just-deleted app on the target slug is a chore
     // with no owner: ask it to yield before we queue on its guard, exactly like
     // create does. Whatever it leaves behind is wiped below, under the guard.
