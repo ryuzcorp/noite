@@ -139,6 +139,9 @@ pub fn bundle_present(cfg: &Config) -> bool {
     // `dist/wrangler.json` (or `.jsonc`) at the bundle root is what
     // `celld deploy` reads; a build that only emits `dist/ssr/wrangler.json`
     // is not deployable, and `main` says so on `/ready` instead of skipping.
+    // `apps/noite/scripts/emit-celld-config.ts` derives that root manifest
+    // after `vite build` (it must run outside Vite: a `closeBundle` hook
+    // races Void's own emit).
     let dir = Path::new(&cfg.control_bundle_dir);
     dir.join("wrangler.json").exists() || dir.join("wrangler.jsonc").exists()
 }

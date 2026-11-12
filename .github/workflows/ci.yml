@@ -76,7 +76,7 @@ jobs:
     # bundled image the item verified.
     services:
       rustfs:
-        image: docker.io/rustfs/rustfs:1.0.3
+        image: docker.io/rustfs/rustfs:1.0.5
         env:
           RUSTFS_ACCESS_KEY: noiteaccess
           RUSTFS_SECRET_KEY: noitesecretnoitesecretnoite12

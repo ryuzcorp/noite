@@ -728,9 +728,9 @@ pub(crate) struct S3Object {
 /// The `Contents` entries of one ListObjectsV2 response as the rest of the
 /// crate reads them, leaving the prefixes and continuation token in place.
 /// ListObjectsV2 requires `Key`, `LastModified`, `Size` and `ETag` on every
-/// entry; a store that omits one is not speaking the protocol, so this fails
-/// instead of inventing a version (`git_store` keys objects by ETag) or a
-/// size.
+/// entry; a store that omits one — or sends an empty tag/date, which is not a
+/// value either — is not speaking the protocol, so this fails instead of
+/// inventing a version (`git_store` keys objects by ETag) or a size.
 fn listed_objects(
     response: &mut rusty_s3::actions::ListObjectsV2Response,
 ) -> anyhow::Result<Vec<S3Object>> {
@@ -741,9 +741,15 @@ fn listed_objects(
             let missing = |field: &str| anyhow::anyhow!("s3 LIST object {key} has no {field}");
 
             Ok(S3Object {
-                last_modified: o.last_modified.ok_or_else(|| missing("LastModified"))?,
+                last_modified: o
+                    .last_modified
+                    .filter(|value| !value.is_empty())
+                    .ok_or_else(|| missing("LastModified"))?,
                 size: o.size.ok_or_else(|| missing("Size"))?,
-                etag: o.etag.ok_or_else(|| missing("ETag"))?,
+                etag: o
+                    .etag
+                    .filter(|value| !value.is_empty())
+                    .ok_or_else(|| missing("ETag"))?,
                 key,
             })
         })
@@ -1280,6 +1286,31 @@ mod tests {
             let mut incomplete = response(&contents);
             let Err(err) = listed_objects(&mut incomplete) else {
                 panic!("missing {field} was accepted");
+            };
+            assert_eq!(err.to_string(), format!("s3 LIST object k has no {field}"));
+        }
+
+        for (field, contents) in [
+            (
+                "ETag",
+                content(
+                    "<ETag></ETag>",
+                    "<LastModified>2026-09-29T00:00:00.000Z</LastModified>",
+                    "<Size>42</Size>",
+                ),
+            ),
+            (
+                "LastModified",
+                content(
+                    "<ETag>\"abc\"</ETag>",
+                    "<LastModified></LastModified>",
+                    "<Size>42</Size>",
+                ),
+            ),
+        ] {
+            let mut empty = response(&contents);
+            let Err(err) = listed_objects(&mut empty) else {
+                panic!("empty {field} was accepted");
             };
             assert_eq!(err.to_string(), format!("s3 LIST object k has no {field}"));
         }
