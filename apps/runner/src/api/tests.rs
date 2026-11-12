@@ -1533,6 +1533,56 @@ async fn branch_deploy_resolves_that_branchs_tip() {
     assert_eq!(row.actor.as_deref(), Some("refs/heads/feature"));
     assert_eq!(row.sha.as_deref(), Some(feature_sha.as_str()));
 
+    // A name that looks like a sha is still a branch name.
+    git(
+        &work,
+        &[
+            "push",
+            "-q",
+            bare.to_str().expect("mirror path"),
+            "HEAD:refs/heads/20240101",
+        ],
+    )
+    .await;
+    let dated =
+        crate::service::deploys::prepare_branch_deploy(&h.state, &app.id, "20240101", Some("push"))
+            .await
+            .expect("a hex-looking branch name deploys");
+    assert_eq!(dated.sha, feature_sha);
+
+    // The branch deploy lands: a rollback to its sha must read the branch's own
+    // bundle (the main one does not hold this sha on a cold mirror).
+    crate::db::upsert_deploy(
+        &h.state.pool,
+        Some(&prepared.deploy_id),
+        &app.id,
+        None,
+        crate::models::DeployStatus::Building,
+        Some(&feature_sha),
+        "",
+    )
+    .await
+    .expect("building");
+    crate::db::upsert_deploy(
+        &h.state.pool,
+        Some(&prepared.deploy_id),
+        &app.id,
+        None,
+        crate::models::DeployStatus::Success,
+        Some(&feature_sha),
+        "",
+    )
+    .await
+    .expect("success");
+    let rollback = crate::service::deploys::prepare_rollback(&h.state, &app.id, &feature_sha, None)
+        .await
+        .expect("rollback to a branch deploy");
+    assert_eq!(
+        rollback.key,
+        format!("git/{}/refs/heads/feature/{feature_sha}.bundle", app.slug),
+        "a rollback of a branch deploy reads the branch bundle, not main's"
+    );
+
     // A ref the caller cannot see is refused before anything is queued.
     let hidden = crate::service::deploys::prepare_branch_deploy(
         &h.state,

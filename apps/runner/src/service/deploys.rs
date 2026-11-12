@@ -107,7 +107,8 @@ pub struct PreparedRollback {
     app: crate::models::App,
     /// Production, or the preview environment the sha came from.
     target: deploy::DeployTarget,
-    key: String,
+    /// The tip bundle the run reads: the ref the successful deploy came from.
+    pub key: String,
     pool: sqlx::SqlitePool,
     cfg: std::sync::Arc<crate::config::Config>,
     procs: crate::host::supervisor::ProcMap,
@@ -169,7 +170,7 @@ pub async fn prepare_rollback(
         Some(env_id) => Some(super::environments::env_or_404(state, &app.id, env_id).await?),
         None => None,
     };
-    match db::get_success_deploy(
+    let success = match db::get_success_deploy(
         &state.pool,
         &app.id,
         &sha,
@@ -177,16 +178,25 @@ pub async fn prepare_rollback(
     )
     .await
     {
-        Ok(Some(_)) => {}
+        Ok(Some(row)) => row,
         Ok(None) => return Err(ApiError::not_found("no successful deploy at that sha")),
         Err(e) => return Err(ApiError::internal(e.to_string())),
-    }
-    // The bundle lives under the ref the deploy came from: `git/<slug>/<ref>/`
-    // for a preview (mirroring `after_receive`), the main tip for production.
-    let key = match &environment {
-        Some(env) => format!("git/{}/{}/{sha}.bundle", app.slug, env.git_ref),
-        None => format!("git/{}/refs/heads/main/{sha}.bundle", app.slug),
     };
+    // The bundle lives under the ref the deploy came from: `git/<slug>/<ref>/`
+    // for a preview (mirroring `after_receive`); for production the main tip —
+    // or the branch a one-off branch deploy recorded, so rolling back to its
+    // sha fetches the bundle that exists instead of assuming `refs/heads/main`.
+    let reference = match &environment {
+        Some(env) => env.git_ref.clone(),
+        None => match success.intent {
+            crate::models::DeployIntent::Branch => success
+                .actor
+                .clone()
+                .unwrap_or_else(|| "refs/heads/main".to_string()),
+            _ => "refs/heads/main".to_string(),
+        },
+    };
+    let key = format!("git/{}/{}/{sha}.bundle", app.slug, reference);
     let target = match environment {
         Some(env) => deploy::DeployTarget::Environment(Box::new(env)),
         None => deploy::DeployTarget::Production,
@@ -359,9 +369,11 @@ pub async fn deploy_branch(
 }
 
 /// The full branch ref for a caller's reference: a branch name gains the
-/// `refs/heads/` prefix, an already-qualified ref is kept. Anything else
-/// (`refs/tags/…`, a sha) is refused here so the history label and the bundle
-/// key always name a branch.
+/// `refs/heads/` prefix, an already-qualified branch ref is kept. Anything
+/// under another `refs/` namespace (tags, hidden previews) is refused here so
+/// the history label and the bundle key always name a branch. A name that
+/// looks like a sha (`deadbeef`, `20240101`) is still a branch name: the
+/// picker only sends branches, and resolution below has no sha fallback.
 fn branch_ref(reference: &str) -> Result<String, ApiError> {
     let name = reference.trim();
     if name.is_empty() {
@@ -369,7 +381,7 @@ fn branch_ref(reference: &str) -> Result<String, ApiError> {
     }
     let refname = if name.starts_with("refs/heads/") {
         name.to_string()
-    } else if name.starts_with("refs/") || sha_valid(name) {
+    } else if name.starts_with("refs/") {
         return Err(ApiError::bad("deploy ref must be a branch"));
     } else {
         format!("refs/heads/{name}")
