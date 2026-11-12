@@ -4,8 +4,11 @@ use axum::{
 };
 use thiserror::Error;
 
-/// HTTP-facing runner errors. Internal causes use `{:#}` so clients see the
-/// chain (celld stderr, aws rm, etc.) instead of a bare context label.
+/// HTTP-facing runner errors. The message is what the client sees, so it must
+/// never carry store internals (bucket, prefixes, work-dir paths, stderr, a
+/// presigned URL): a path that would (create/delete) builds it with
+/// `service::apps::step_failure`, which logs the full chain under a short `ref`
+/// and returns the step plus a failure class.
 #[derive(Debug, Error)]
 pub enum ApiError {
     #[error("{0}")]

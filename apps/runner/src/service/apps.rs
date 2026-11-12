@@ -320,7 +320,10 @@ async fn create_inner(
         .map_err(|e| ApiError::internal(e.to_string()))?;
     db::set_app_import_source(&state.pool, &app.id, Some(&stored))
         .await
-        .map_err(|e| ApiError::internal(e.to_string()))?;
+        .map_err(|e| {
+            let step = step_failure("could not store the import source", &e.to_string());
+            ApiError::internal(format!("create {slug}: {step}"))
+        })?;
     db::write_app_status(
         &state.pool,
         &app.id,
@@ -330,7 +333,10 @@ async fn create_inner(
         WriteGuard::Table,
     )
     .await
-    .map_err(|e| ApiError::internal(e.to_string()))?;
+    .map_err(|e| {
+        let step = step_failure("could not mark the app as importing", &e.to_string());
+        ApiError::internal(format!("create {slug}: {step}"))
+    })?;
     let app = app_or_404(state, &app.id).await?;
     // A row created a moment ago cannot be held by another attempt, so the
     // claim always succeeds here.
@@ -607,6 +613,18 @@ fn ensure_not_deleting(id: &str) -> Result<(), ApiError> {
     Ok(())
 }
 
+/// A delete's row read: keep the 404/conflict vocabulary, but a DB failure is
+/// a step with a failure class and a `ref`, never the raw driver chain.
+fn delete_read_error(id: &str, error: ApiError) -> ApiError {
+    match error {
+        ApiError::Internal(detail) => {
+            let step = step_failure("could not read the app", &detail);
+            ApiError::internal(format!("delete {id}: {step}"))
+        }
+        other => other,
+    }
+}
+
 /// An app's delete claim, released on drop — however the task ends, a panic
 /// included, so a marker can never hide an app from every listing until a
 /// restart.
@@ -619,7 +637,9 @@ impl Drop for DeletionGuard {
 }
 
 pub async fn delete(state: &AppState, id: &str) -> Result<Deletion, ApiError> {
-    let app = app_or_404(state, id).await?;
+    let app = app_or_404(state, id)
+        .await
+        .map_err(|e| delete_read_error(id, e))?;
     if !DELETIONS.begin(&app.id) {
         return Ok(Deletion::InProgress);
     }
@@ -661,7 +681,9 @@ pub async fn delete(state: &AppState, id: &str) -> Result<Deletion, ApiError> {
 }
 
 async fn delete_inner(state: &AppState, id: &str) -> Result<(), ApiError> {
-    let app = app_or_404(state, id).await?;
+    let app = app_or_404(state, id)
+        .await
+        .map_err(|e| delete_read_error(id, e))?;
     // Same lock as deploy: wait out an in-flight build before stopping
     // anything. The row is deleted while the claim is still held (R-01): a
     // waiter that acquires after us must find no row and bail instead of
