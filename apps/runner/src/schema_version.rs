@@ -15,7 +15,7 @@ use sqlx::SqliteConnection;
 pub const FIRST_COMPACTED_VERSION: i64 = 100;
 
 /// Version a database has after every migration ran.
-pub const SCHEMA_VERSION: i64 = FIRST_COMPACTED_VERSION + 5;
+pub const SCHEMA_VERSION: i64 = FIRST_COMPACTED_VERSION + 6;
 
 /// One upgrade step: the statements that take a database from `version - 1`
 /// to `version`. Empty at the compacted baseline; append above it to change
@@ -67,6 +67,34 @@ pub const MIGRATIONS: &[Migration] = &[
         // error, and their duration reads from `updated_at` like a new one.
         version: FIRST_COMPACTED_VERSION + 5,
         sql: "ALTER TABLE main.deploy ADD COLUMN error TEXT;",
+    },
+    Migration {
+        // 106: the durable record of a deleted app's pending wipe. Before it,
+        // a delete dropped the row first and kept the wipe only in memory, so
+        // a crash, an S3 failure or a wipe stopped by a re-create that then
+        // aborted left the tenant's git/D1/DO/env data in the bucket with
+        // nothing to resume it. Rows are written in the same transaction as
+        // the app DELETE (`db::delete_app`) and cleared once the prefixes are
+        // empty (`host::purge::resume_pending` and the wipe's own callers).
+        //
+        // `build_uid` is the deleted app's per-app build uid, which the wipe
+        // still owns: the row delete frees the uid at once, but its
+        // `builds/<slug>` and `cache/<slug>` trees survive, owned by that
+        // uid, until the wipe removes them. Handing the uid to a new app in
+        // that window ran its build with the departed tenant's files
+        // readable (merge-group e2e, 2026-11-12: a hostile build read a
+        // sibling's package caches). `delete_app` writes it with the
+        // tombstone, `db::alloc::ensure_app_build_uid` reserves it, and a
+        // NULL says the app never had one.
+        version: FIRST_COMPACTED_VERSION + 6,
+        sql: "CREATE TABLE IF NOT EXISTS main.app_purge (\
+                app_id TEXT PRIMARY KEY NOT NULL, \
+                slug TEXT NOT NULL, \
+                created_at TEXT NOT NULL, \
+                build_uid INTEGER\
+              ); \
+              CREATE INDEX IF NOT EXISTS main.idx_app_purge_slug \
+              ON app_purge(slug);",
     },
 ];
 
@@ -271,6 +299,48 @@ mod tests {
             .await
             .expect("columns");
         assert_eq!(columns, 1);
+    }
+
+    /// The 106 step adds the durable pending-purge table (with the build uid
+    /// the wipe still owns) to a stamped database, so an install that
+    /// upgrades mid-delete keeps the record of every wipe it still owes.
+    #[tokio::test]
+    async fn the_app_purge_step_upgrades_a_stamped_database() {
+        let mut conn = memory().await;
+        sqlx::raw_sql(
+            "CREATE TABLE main.app (id TEXT PRIMARY KEY, slug TEXT); \
+             CREATE TABLE main.deploy (id TEXT PRIMARY KEY, app_id TEXT, environment_id TEXT, \
+                                       sha TEXT, status TEXT, intent TEXT, error TEXT, \
+                                       created_at TEXT); \
+             PRAGMA main.user_version = 105;",
+        )
+        .execute(&mut conn)
+        .await
+        .expect("seed a 105 database");
+        apply(
+            &mut conn,
+            "CREATE TABLE IF NOT EXISTS main.app (id TEXT PRIMARY KEY, slug TEXT);",
+            SCHEMA_VERSION,
+            MIGRATIONS,
+        )
+        .await
+        .expect("migrate forward");
+        assert_eq!(version(&mut conn).await, SCHEMA_VERSION);
+        let found: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM main.sqlite_master WHERE type = 'table' \
+             AND name = 'app_purge'",
+        )
+        .fetch_one(&mut conn)
+        .await
+        .expect("table lookup");
+        assert_eq!(found, 1);
+        let uid_column: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM pragma_table_info('app_purge') WHERE name = 'build_uid'",
+        )
+        .fetch_one(&mut conn)
+        .await
+        .expect("column lookup");
+        assert_eq!(uid_column, 1, "the tombstone carries the uid the wipe owns");
     }
 
     /// The 102 step adds the budget's covering index to a stamped database.

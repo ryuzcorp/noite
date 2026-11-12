@@ -414,6 +414,15 @@ pub async fn edge_fallback(State(state): State<AppState>, headers: HeaderMap) ->
     // A tenant hostname resolves by slug; anything else may be a custom
     // hostname registered for one app (`app_domain`).
     let (slug, app) = app_for_host(&state, host).await;
+    // A claimed delete is gone as far as this page is concerned, even before
+    // its row is dropped: the delete marks the app stopped first, and a
+    // stopped row used to answer "Paused" for the whole teardown (the reported
+    // "deleted app still shows the paused page"). The app is not paused; it is
+    // going away.
+    let deleting = app
+        .as_ref()
+        .is_some_and(|app| crate::service::apps::deleting(&app.id));
+    let app = if deleting { None } else { app };
     let Some(app) = app else {
         return match slug {
             Some(slug) => page(

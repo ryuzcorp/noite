@@ -458,7 +458,14 @@ pub async fn rename_app(
     git_prefix: &str,
     fleet_bucket: &str,
 ) -> sqlx::Result<()> {
-    sqlx::query(
+    // The mint fence: `credentials::ensure` validates its scope's prefix and
+    // inserts the key row under this same lock. A mint that already passed its
+    // check would otherwise insert a live key for the old prefix after this
+    // write committed — and after the rename's revoke pass — leaving a key on
+    // a prefix the app no longer owns. Holding it here (callers order it after
+    // `AppLock` and the slug guards) makes the two atomic.
+    let _fence = super::mutate_fence().await;
+    let done = sqlx::query(
         r#"UPDATE app SET name = ?, slug = ?, subdomain = ?,
            git_prefix = ?, fleet_bucket = ?, updated_at = ? WHERE id = ?"#,
     )
@@ -471,6 +478,28 @@ pub async fn rename_app(
     .bind(id)
     .execute(pool)
     .await?;
+    // The row can be gone when a delete committed between the caller's read and
+    // this write (a rename and a delete claim the same app): an "applied" write
+    // that touched nothing would let the caller report a move it never made.
+    if done.rows_affected() == 0 {
+        return Err(sqlx::Error::RowNotFound);
+    }
+    Ok(())
+}
+
+/// Update only the display name. A rename that changes no slug must never
+/// write the whole row from a row read earlier: a concurrent slug rename that
+/// landed in between would be reverted to the stale slug/prefix.
+pub async fn rename_app_name(pool: &SqlitePool, id: &str, name: &str) -> sqlx::Result<()> {
+    let done = sqlx::query("UPDATE app SET name = ?, updated_at = ? WHERE id = ?")
+        .bind(name)
+        .bind(now_iso())
+        .bind(id)
+        .execute(pool)
+        .await?;
+    if done.rows_affected() == 0 {
+        return Err(sqlx::Error::RowNotFound);
+    }
     Ok(())
 }
 
@@ -510,12 +539,133 @@ pub async fn rebind_local_subdomains(pool: &SqlitePool, base_domain: &str) -> sq
     Ok(rewritten)
 }
 
+/// Hard-delete an app row and record what the delete still owes, in one
+/// transaction.
+///
+/// Three writes, all or nothing:
+/// - `DELETE FROM app` (its environments/deploys cascade);
+/// - `INSERT INTO app_purge` — the durable tombstone [`crate::host::purge`]
+///   resumes at boot and on the reconcile loop. Before it, the wipe lived
+///   only in the process, so a crash, an S3 failure or a wipe stopped by a
+///   re-create that then aborted left the tenant's bucket data behind with
+///   nothing to retry it. The app's `build_uid` rides along: the row delete
+///   frees the uid, but its `builds/<slug>` and `cache/<slug>` trees stay
+///   owned by it until the wipe removes them, so the allocator reserves it
+///   from the tombstone
+///   ([`crate::db::alloc::ensure_app_build_uid`]) — otherwise a new app's
+///   first build could run as the uid that still owns another tenant's files
+///   (merge-group e2e, 2026-11-12);
+/// - the app's and its environments' scoped keys `revoking`. The slug is
+///   free once this returns, so a still-`live` row would keep handing a
+///   valid key to the old owner after a new app took the same prefix
+///   (review finding, 2026-11-12). Only the row state changes here; the
+///   store-side revoke is the background sweep's job and retries.
+///
+/// `BEGIN IMMEDIATE`, not a deferred begin: this transaction reads the
+/// slug (and the uid it must reserve) before it writes, and a deferred
+/// transaction that reads first then writes is refused the moment another
+/// connection commits in between — `SQLITE_BUSY_SNAPSHOT`, reported as
+/// `database is locked` and *not* retried by `busy_timeout`, because the
+/// connection's read snapshot is already stale. It is the only
+/// read-before-write transaction on a pool other tasks share (`connect`'s
+/// schema apply reads first too, but on a pool nothing else holds yet). A
+/// delete always runs next to the previous delete's background wipe (its
+/// tombstone clear), so that interleaving is routine rather than rare:
+/// it flaked `api::tests::apps_delete_agrees` in CI. Taking the write lock
+/// up front makes a concurrent writer wait (through the connection's
+/// `busy_timeout`) instead of making this transaction fail, and the row is
+/// read after the lock, so the snapshot it sees is the one it deletes.
+///
+/// It also holds the mint fence itself ([`super::credentials::mutate_fence`]),
+/// so there is no unfenced delete to call: a mint for this app either commits
+/// its row first (marked `revoking` below, swept by the caller) or starts
+/// after the row is gone and refuses.
 pub async fn delete_app(pool: &SqlitePool, id: &str) -> sqlx::Result<()> {
-    sqlx::query("DELETE FROM app WHERE id = ?")
+    let _fence = super::credentials::mutate_fence().await;
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    let row: Option<(String, Option<i64>)> =
+        sqlx::query_as("SELECT slug, build_uid FROM main.app WHERE id = ?")
+            .bind(id)
+            .fetch_optional(&mut *tx)
+            .await?;
+    sqlx::query("DELETE FROM main.app WHERE id = ?")
         .bind(id)
+        .execute(&mut *tx)
+        .await?;
+    if let Some((slug, build_uid)) = row {
+        sqlx::query(
+            "INSERT OR REPLACE INTO main.app_purge (app_id, slug, created_at, build_uid) \
+             VALUES (?, ?, datetime('now'), ?)",
+        )
+        .bind(id)
+        .bind(&slug)
+        .bind(build_uid)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "UPDATE main.scoped_credential SET state = ?, updated_at = datetime('now') \
+             WHERE app_id = ? AND state = ?",
+        )
+        .bind(super::credentials::ScopedCredentialState::Revoking)
+        .bind(id)
+        .bind(super::credentials::ScopedCredentialState::Live)
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await?;
+    Ok(())
+}
+
+/// Every pending wipe's slug, oldest first. One row per deleted app id, but
+/// the wipe is per slug, so the slug is what a pass needs.
+pub async fn pending_purges(pool: &SqlitePool) -> sqlx::Result<Vec<String>> {
+    sqlx::query_scalar("SELECT slug FROM main.app_purge ORDER BY created_at, app_id")
+        .fetch_all(pool)
+        .await
+}
+
+/// Every existing app id: the CI cache sweep keeps the volumes these own and
+/// removes the rest.
+pub async fn app_ids(pool: &SqlitePool) -> sqlx::Result<Vec<String>> {
+    sqlx::query_scalar("SELECT id FROM main.app")
+        .fetch_all(pool)
+        .await
+}
+
+/// Drop every tombstone for `slug`: a wipe of its prefixes finished while no
+/// app row owned it, so all of them are satisfied (one slug can carry more
+/// than one when a freed slug was re-created and deleted again).
+///
+/// Test-only: production paths clear through
+/// [`crate::host::purge::clear_purges_if_no_rename`], which also keeps a
+/// tombstone whose app still has an unfinished rename.
+#[cfg(test)]
+pub async fn clear_app_purges(pool: &SqlitePool, slug: &str) -> sqlx::Result<u64> {
+    let done = sqlx::query("DELETE FROM main.app_purge WHERE slug = ?")
+        .bind(slug)
         .execute(pool)
         .await?;
-    Ok(())
+    Ok(done.rows_affected())
+}
+
+/// The app ids behind the tombstones of `slug`: one slug can carry several
+/// when it was freed, re-created and deleted again.
+pub async fn purge_app_ids(pool: &SqlitePool, slug: &str) -> sqlx::Result<Vec<String>> {
+    sqlx::query_scalar("SELECT app_id FROM main.app_purge WHERE slug = ? ORDER BY created_at")
+        .bind(slug)
+        .fetch_all(pool)
+        .await
+}
+
+/// Drop every tombstone of one deleted app, whatever slug it names. Only
+/// [`crate::host::purge::clear_purges_if_no_rename`] calls it, after the
+/// slug's wipe finished and no unfinished rename of the app holds its uid.
+pub async fn clear_app_purges_for_app(pool: &SqlitePool, app_id: &str) -> sqlx::Result<u64> {
+    let done = sqlx::query("DELETE FROM main.app_purge WHERE app_id = ?")
+        .bind(app_id)
+        .execute(pool)
+        .await?;
+    Ok(done.rows_affected())
 }
 
 /// The one writer of `app.status` (the machine is
@@ -930,5 +1080,102 @@ mod tests {
             .await
             .expect_err("missing table");
         assert!(!rival_won(&missing), "other failures are not rival wins");
+    }
+
+    /// A name-only write must not carry a stale slug/prefix back: a concurrent
+    /// slug rename that commits after the caller read the row has to survive.
+    #[tokio::test]
+    async fn a_name_only_update_leaves_the_slug_and_prefix_alone() {
+        let pool = connect("sqlite::memory:").await.expect("memory db");
+        insert_app(&pool, "a1", "old", "old.localhost").await;
+        // Another rename commits after the caller read the row.
+        rename_app(
+            &pool,
+            "a1",
+            "old",
+            "new",
+            "new.localhost",
+            "git/new/",
+            "s3://noite/fleets/new",
+        )
+        .await
+        .expect("slug rename");
+        rename_app_name(&pool, "a1", "Renamed")
+            .await
+            .expect("name write");
+        let app = get_app(&pool, "a1").await.expect("read").expect("row");
+        assert_eq!(app.name, "Renamed");
+        assert_eq!(app.slug, "new", "a name write must not revert the slug");
+        assert_eq!(app.subdomain, "new.localhost");
+        assert_eq!(app.git_prefix, "git/new/");
+        assert_eq!(app.fleet_bucket, "s3://noite/fleets/new");
+    }
+
+    /// A delete never runs alone: the previous delete's background wipe
+    /// (`clear_app_purges`), the credential sweep and the reconcile loop all
+    /// commit on the same database while it runs. `delete_app` reads the slug
+    /// before it writes, so a deferred begin would let one of those commits
+    /// land between the read and the `DELETE` — `SQLITE_BUSY_SNAPSHOT`,
+    /// reported as `database is locked` and never retried by the busy
+    /// timeout — and the app would stay undeleted with an internal error. The
+    /// transaction takes the write lock up front (`BEGIN IMMEDIATE`), so the
+    /// concurrent writer waits instead. This failed with the deferred begin.
+    #[tokio::test]
+    async fn a_concurrent_writer_never_fails_the_delete() {
+        let dir = std::env::temp_dir().join(format!("noite-delete-app-{}", new_id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let url = format!("sqlite:{}?mode=rwc", dir.join("noite.sqlite").display());
+        let pool = connect(&url).await.expect("connect");
+
+        // Stands in for the wipe's tombstone clear: a writer that commits
+        // between this transaction's read and its write.
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let writer = tokio::spawn({
+            let pool = pool.clone();
+            let stop = stop.clone();
+            async move {
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    sqlx::query(
+                        "INSERT OR REPLACE INTO main.app_purge (app_id, slug, created_at) \
+                         VALUES ('noise', 'noise', datetime('now'))",
+                    )
+                    .execute(&pool)
+                    .await
+                    .expect("concurrent writer");
+                    // No wall-clock throttle: the loop's own commit is the
+                    // pace, and yielding keeps the delete's task scheduled.
+                    tokio::task::yield_now().await;
+                }
+            }
+        });
+
+        let mut failed = Vec::new();
+        for i in 0..40 {
+            let id = format!("app-{i}");
+            let slug = format!("slug-{i}");
+            insert_app(&pool, &id, &slug, &format!("{slug}.localhost")).await;
+            if let Err(e) = delete_app(&pool, &id).await {
+                failed.push(format!("{id}: {e}"));
+            } else {
+                assert!(
+                    get_app(&pool, &id).await.expect("lookup").is_none(),
+                    "{id} was deleted"
+                );
+                let tombstone: i64 =
+                    sqlx::query_scalar("SELECT count(*) FROM main.app_purge WHERE app_id = ?")
+                        .bind(&id)
+                        .fetch_one(&pool)
+                        .await
+                        .expect("tombstone");
+                assert_eq!(tombstone, 1, "{id} keeps its purge tombstone");
+            }
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        writer.await.expect("writer task");
+        assert!(
+            failed.is_empty(),
+            "a concurrent writer failed the delete: {failed:?}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

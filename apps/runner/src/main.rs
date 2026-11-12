@@ -537,6 +537,83 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
+    // A delete that committed but never finished its wipe (a crash, a restart
+    // or an upgrade mid-wipe, an S3 failure) leaves a durable tombstone in
+    // `app_purge`; a wipe a re-create stopped leaves one too when that create
+    // aborted. Resume them in the background — non-fatal, like the sweeps
+    // above, and paced: each takes its slug's guard and yields to a create
+    // that wants the slug back.
+    {
+        let state = state.clone();
+        service::detached::spawn("purge:resume".to_string(), async move {
+            let report = host::purge::resume_pending(
+                &state.pool,
+                &state.config,
+                &state.procs,
+                &state.logs,
+                state.wal.sync(),
+            )
+            .await;
+            if report.noteworthy() {
+                tracing::info!(
+                    pending = report.pending,
+                    cleared = report.cleared,
+                    failed = report.failed,
+                    "resumed pending app purges"
+                );
+            }
+        });
+    }
+    // An unfinished rename reserves its target slug with a marker that a
+    // delete no longer drops (the target can hold the deleted app's moved
+    // objects, which belong to nobody). Resuming them at boot — not only on
+    // the loop's slow tick — both continues a crashed move and wipes such an
+    // orphaned target, so its slug is never blocked by a stale reservation.
+    {
+        let state = state.clone();
+        service::detached::spawn("rename:resume".to_string(), async move {
+            let resumed = host::rename::resume_pending_renames(
+                &state.config,
+                &state.pool,
+                &state.procs,
+                &state.logs,
+                &state.deploying,
+                state.wal.sync(),
+            )
+            .await;
+            if resumed > 0 {
+                tracing::info!(resumed, "resumed unfinished renames");
+            }
+        });
+    }
+    // CI cache volumes no live app owns: a legacy slug-keyed name, a deleted
+    // app whose wipe died, a rename. Detached and non-fatal, like the sweeps
+    // below; the slow loop tick runs it again.
+    {
+        let state = state.clone();
+        service::detached::spawn("ci-cache:sweep".to_string(), async move {
+            let removed = host::purge::reconcile_ci_caches(&state.config, &state.pool).await;
+            if removed > 0 {
+                tracing::info!(removed, "removed orphaned CI cache volumes");
+            }
+        });
+    }
+    // Credential rows whose app row is gone (a delete that died before the
+    // atomic mark, or a database from an older build) are marked/dropped
+    // before anything can be minted on a re-created slug's prefix. Local-only
+    // and non-fatal: the loop's first `sweep` does the store side.
+    match host::credentials::reconcile_orphans(&state.pool).await {
+        Ok(rows) if !rows.nothing() => tracing::info!(
+            keys_marked = rows.keys_marked,
+            tokens_dropped = rows.tokens_dropped,
+            "reconciled orphaned credential rows"
+        ),
+        Ok(_) => {}
+        Err(e) => {
+            tracing::warn!(error = %format!("{e:#}"), "orphan credential row reconcile failed")
+        }
+    }
+
     let cfg_loop = (*config).clone();
     let shutdown_loop = shutdown.clone();
     tokio::spawn(host::loop_::run_forever(
@@ -546,6 +623,7 @@ async fn main() -> anyhow::Result<()> {
         control_pid.clone(),
         logs.clone(),
         deploying.clone(),
+        state.wal.sync().clone(),
         metrics,
         ready.clone(),
         shutdown_loop,

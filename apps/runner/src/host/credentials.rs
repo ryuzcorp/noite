@@ -484,17 +484,6 @@ fn root_keys(cfg: &Config) -> AppCredentials {
     }
 }
 
-/// Serializes every mint and revoke: two callers ensuring one scope at once
-/// (a fleet spawn racing a deploy) would otherwise mint two keys for it.
-/// The orphan sweep relies on this too: an in-flight mint holds `MUTATE`
-/// until its row commits, so waiting for the lock is the fence that keeps a
-/// half-minted key from reading as orphaned.
-///
-/// `MUTATE` is per-process: the sweep assumes a single runner owns the DB
-/// (the `owner.json` fence in SPEC, Runner state). Two runners sharing one
-/// SQLite file would break the in-flight guarantee.
-static MUTATE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
 fn unresolved() -> anyhow::Error {
     anyhow::anyhow!(
         "credential provider not resolved (NOITE_CREDENTIAL_PROVIDER=auto needs the boot probe)"
@@ -533,6 +522,23 @@ pub async fn tenant_process_credentials(
     }
 }
 
+/// The prefix the scope names *today*, read from the current app row (and,
+/// for an environment scope, the current environment row). `None` when the
+/// app — or that environment — no longer exists. A rename changes the app's
+/// slug, so a scope built from a pre-rename snapshot does not match this.
+async fn current_prefix(pool: &sqlx::SqlitePool, scope: &Scope) -> anyhow::Result<Option<String>> {
+    let Some(app) = db::get_app(pool, scope.app_id()).await? else {
+        return Ok(None);
+    };
+    Ok(Some(match scope {
+        Scope::App { .. } => format!("fleets/{}/", app.slug),
+        Scope::Environment { env_id, .. } => match db::get_environment(pool, env_id).await? {
+            Some(env) if env.app_id == app.id => format!("envs/{}/{}/", env.app_slug, env.label),
+            _ => return Ok(None),
+        },
+    }))
+}
+
 /// The scope's live key, minting one when it has none that fits.
 async fn ensure(
     pool: &sqlx::SqlitePool,
@@ -543,7 +549,30 @@ async fn ensure(
     let scope_key = scope.key();
     let prefix = scope.prefix();
     let store = store_id(cfg, provider);
-    let _guard = MUTATE.lock().await;
+    let _guard = db::mutate_fence().await;
+    // The app delete removes its row under this same lock: a mint for an app
+    // that is being deleted must not start at all. A mint already in flight
+    // completed before the delete's transaction, which marks its row
+    // `revoking`; see `db::delete_app`.
+    //
+    // The scope is what the caller *asked* for, and a fleet spawn builds it
+    // from its app snapshot before requesting credentials: after a slug rename
+    // that snapshot names a prefix the app no longer owns. The app id still
+    // exists, so the existence check alone would hand that spawn (or mint) a
+    // key for the old slug — which another app can have taken by now, giving
+    // the old app a key to the new owner's objects. Compare against the rows
+    // as they are now, under the same fence the rename's row write takes.
+    match current_prefix(pool, scope).await? {
+        Some(current) if current == prefix => {}
+        Some(current) => anyhow::bail!(
+            "scope {scope_key} names {prefix}, but app {} now lives under {current}; no scoped key is minted for a prefix it no longer owns",
+            scope.app_id()
+        ),
+        None => anyhow::bail!(
+            "app {} no longer exists; no scoped key is minted for {prefix}",
+            scope.app_id()
+        ),
+    }
     if let Some(row) = db::live_scoped_credential(pool, &scope_key).await? {
         if row.prefix == prefix && row.store == store {
             match decrypt(&cfg.runner_token, &scope_key, &row.nonce, &row.ciphertext)
@@ -569,15 +598,38 @@ async fn ensure(
     }
     // A key that still reaches this prefix must be gone before a new owner
     // gets the prefix: a slug or label reused after a delete would otherwise
-    // share its data with whoever kept the old key.
-    for pending in db::revoking_scoped_credentials(pool).await? {
-        if pending.prefix == prefix && pending.store == store {
-            revoke_row(pool, provider, &pending).await.map_err(|e| {
-                anyhow::anyhow!(
-                    "a previous key for {prefix} is not revoked yet, so no new key is minted: {e:#}"
-                )
-            })?;
+    // share its data with whoever kept the old key. Two shapes count:
+    // - a row already `revoking` (a teardown started, its store delete not
+    //   landed yet);
+    // - a still-`live` row whose app row no longer exists — a delete that died
+    //   before its atomic mark, or a database from before that mark. The
+    //   periodic sweep only reads `revoking` rows, so this shape would
+    //   otherwise keep a valid key on the prefix forever.
+    for row in db::scoped_credentials_for_prefix(pool, &prefix).await? {
+        if row.store != store {
+            continue;
         }
+        // A `live` row is stale when its app is gone *or* when the app no
+        // longer names this prefix: a rename commits the row update and only
+        // then marks the old keys, so a crash (or a failed mark) in between
+        // leaves the old key reaching a prefix a different app now owns.
+        let stale = match row.state {
+            db::ScopedCredentialState::Revoking => true,
+            db::ScopedCredentialState::Live => !live_row_owns_prefix(pool, &row).await?,
+        };
+        if !stale {
+            continue;
+        }
+        if row.state == db::ScopedCredentialState::Live {
+            // Stop handing it out before the store call: a crash between the
+            // two must leave a row the sweep retries, never a live key.
+            db::mark_scoped_credential_revoking(pool, &row.handle).await?;
+        }
+        revoke_row(pool, provider, &row).await.map_err(|e| {
+            anyhow::anyhow!(
+                "a previous key for {prefix} is not revoked yet, so no new key is minted: {e:#}"
+            )
+        })?;
     }
     let minted = provider
         .mint(&cfg.s3_bucket, &prefix)
@@ -625,6 +677,28 @@ async fn ensure(
     })
 }
 
+/// Whether a `live` credential row still reaches the prefix its scope names
+/// today. `false` when the owning app (or environment) row is gone, or when
+/// that scope now lives under another prefix — a rename whose key mark never
+/// ran. [`ensure`] revokes such a row before it mints for the reused prefix.
+async fn live_row_owns_prefix(
+    pool: &sqlx::SqlitePool,
+    row: &db::ScopedCredential,
+) -> anyhow::Result<bool> {
+    let Some(app) = db::get_app(pool, &row.app_id).await? else {
+        return Ok(false);
+    };
+    let expected = match row.scope.strip_prefix("env:") {
+        Some(env_id) => match db::get_environment(pool, env_id).await? {
+            Some(env) => format!("envs/{}/{}/", env.app_slug, env.label),
+            None => return Ok(false),
+        },
+        // `app:<id>` and anything else this table holds name the app scope.
+        None => format!("fleets/{}/", app.slug),
+    };
+    Ok(expected == row.prefix)
+}
+
 #[derive(serde::Deserialize, serde::Serialize)]
 struct StoredKey {
     access_key: String,
@@ -652,17 +726,114 @@ pub async fn revoke_app(pool: &sqlx::SqlitePool, cfg: &Config, app_id: &str) -> 
     Ok(())
 }
 
-/// Revoke one environment's key (its teardown).
-pub async fn revoke_environment(
+/// Remove one environment: mark its live key `revoking` and drop its row as
+/// one step under the mint fence ([`ensure`] holds the same fence from its
+/// prefix check through the key insert). A mint that already passed its check
+/// either lands first — and this marks the key it inserted — or, seeing the
+/// row gone, refuses. Without the fence a mint could insert a live key after
+/// the row was deleted, which nothing would ever mark again (the boot
+/// reconcile has already run and the sweep reads only `revoking` rows). The
+/// store delete is the periodic [`sweep`]'s job, run here after the row is
+/// gone.
+pub async fn delete_environment(
     pool: &sqlx::SqlitePool,
     cfg: &Config,
     env_id: &str,
 ) -> anyhow::Result<()> {
-    if let Some(row) = db::live_scoped_credential(pool, &format!("env:{env_id}")).await? {
-        db::mark_scoped_credential_revoking(pool, &row.handle).await?;
+    {
+        let _guard = db::mutate_fence().await;
+        if let Some(row) = db::live_scoped_credential(pool, &format!("env:{env_id}")).await? {
+            db::mark_scoped_credential_revoking(pool, &row.handle).await?;
+        }
+        db::delete_environment_row(pool, env_id).await?;
     }
     sweep(pool, cfg).await;
     Ok(())
+}
+
+/// Rows the boot reconcile cleaned up.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct OrphanRows {
+    /// Scoped keys newly marked `revoking` (their store delete is pending).
+    pub keys_marked: usize,
+    /// Operator-token rows dropped.
+    pub tokens_dropped: usize,
+    /// Rows the pass could not mark/drop. One bad row never stops the others;
+    /// a later pass (or the next boot) retries these.
+    pub failed: usize,
+}
+
+impl OrphanRows {
+    pub fn nothing(&self) -> bool {
+        self.keys_marked == 0 && self.tokens_dropped == 0 && self.failed == 0
+    }
+}
+
+/// Boot reconcile of credential rows whose app row is gone.
+///
+/// A delete marks its scoped keys `revoking` in the row-delete transaction, but
+/// a database written by an older build (or a row orphaned by any other path)
+/// can still hold a `live` key for an app that no longer exists — and the same
+/// goes for `fleet_operator_token` rows. Nothing would ever look at a live one
+/// again: [`sweep`] reads only `revoking` rows, and the orphan *store* pass
+/// protects any handle a row still names. Marking/dropping them here lets the
+/// periodic sweep revoke the store side, so a re-created slug can never be
+/// handed a key or token minted for its predecessor.
+///
+/// Local-only (no store call) and non-fatal: boot logs a failure and leaves the
+/// rows for the next boot; the loop's first tick runs [`sweep`].
+pub async fn reconcile_orphans(pool: &sqlx::SqlitePool) -> anyhow::Result<OrphanRows> {
+    // Same fence as `sweep`/`ensure`: a mint that commits a row while this
+    // reads must be serialized with the read-and-mark, so the pass can never
+    // mark a key that a concurrent ensure just minted for a live app (and the
+    // token cache eviction is only consistent with its row under this lock).
+    let _guard = db::mutate_fence().await;
+    let mut report = OrphanRows::default();
+    for row in db::orphan_scoped_credentials(pool).await? {
+        if row.state != db::ScopedCredentialState::Live {
+            continue;
+        }
+        // Per-row failures are counted, never fatal to the pass: one bad row
+        // (a transient lock, a foreign key) must not keep every other orphan
+        // key reachable.
+        match db::mark_scoped_credential_revoking(pool, &row.handle).await {
+            Ok(()) => {
+                report.keys_marked += 1;
+                tracing::info!(
+                    scope = %row.scope,
+                    app_id = %row.app_id,
+                    "marked an orphaned scoped key for revocation"
+                );
+            }
+            Err(e) => {
+                report.failed += 1;
+                tracing::warn!(
+                    scope = %row.scope,
+                    app_id = %row.app_id,
+                    error = %e,
+                    "could not mark an orphaned scoped key; a later pass retries it"
+                );
+            }
+        }
+    }
+    for scope in db::orphan_operator_token_scopes(pool).await? {
+        match db::remove_operator_token_row(pool, &scope).await {
+            Ok(()) => {
+                forget_operator_token(&scope);
+                report.tokens_dropped += 1;
+                tracing::info!(scope = %scope, "dropped an orphaned operator token");
+            }
+            Err(e) => {
+                report.failed += 1;
+                tracing::warn!(
+                    scope = %scope,
+                    error = %e,
+                    "could not drop an orphaned operator token; a later pass retries it"
+                );
+            }
+        }
+    }
+    Ok(report)
 }
 
 /// Scope key of the reserved control fleet's operator token row. Tenant
@@ -723,11 +894,11 @@ fn forget_operator_token(scope_key: &str) {
 
 /// Drop one fleet's stored operator token *and* its cached copy. This is the
 /// only way the row is deleted: [`db::remove_operator_token_row`] alone would
-/// leave the cache pointing at a token no row backs. Holds `MUTATE` so a
+/// leave the cache pointing at a token no row backs. Holds the mint fence so a
 /// concurrent [`operator_token`] cannot mint and cache between the row delete
 /// and the eviction.
 pub async fn delete_operator_token(pool: &sqlx::SqlitePool, scope_key: &str) -> sqlx::Result<()> {
-    let _guard = MUTATE.lock().await;
+    let _guard = db::mutate_fence().await;
     db::remove_operator_token_row(pool, scope_key).await?;
     forget_operator_token(scope_key);
     Ok(())
@@ -735,11 +906,11 @@ pub async fn delete_operator_token(pool: &sqlx::SqlitePool, scope_key: &str) -> 
 
 /// Drop every operator token of one app and its environments, evicting each
 /// scope's cached copy (app delete; a recreated slug mints fresh tokens).
-/// Holds `MUTATE` across the scope read and the delete for the same reason:
+/// Holds the mint fence across the scope read and the delete for the same reason:
 /// a token minted in that window would otherwise stay cached for a row this
 /// delete removes.
 pub async fn delete_app_operator_tokens(pool: &sqlx::SqlitePool, app_id: &str) -> sqlx::Result<()> {
-    let _guard = MUTATE.lock().await;
+    let _guard = db::mutate_fence().await;
     let scopes = db::operator_token_scopes_for_app(pool, app_id).await?;
     db::remove_app_operator_token_rows(pool, app_id).await?;
     for scope in scopes {
@@ -773,7 +944,7 @@ pub async fn operator_token(
     if let Some(token) = cached_operator_token(scope_key) {
         return Ok(token);
     }
-    let _guard = MUTATE.lock().await;
+    let _guard = db::mutate_fence().await;
     if let Some(token) = cached_operator_token(scope_key) {
         return Ok(token);
     }
@@ -834,7 +1005,7 @@ pub async fn sweep(pool: &sqlx::SqlitePool, cfg: &Config) -> usize {
         return pending.len();
     };
     let store = store_id(cfg, provider.as_ref());
-    let _guard = MUTATE.lock().await;
+    let _guard = db::mutate_fence().await;
     let mut left = 0;
     for row in pending {
         if row.store != store {
@@ -960,12 +1131,12 @@ pub fn orphan_sweep_due(
 /// can never see because it only acts on rows.
 ///
 /// Safety, in order:
-/// - the store listing runs without `MUTATE`: holding the mint lock across
+/// - the store listing runs without the mint fence: holding it across
 ///   network I/O would stall every fleet spawn and deploy for the whole
-///   pass. Each candidate is fenced instead — take `MUTATE`, re-check that
+///   pass. Each candidate is fenced instead — take the fence, re-check that
 ///   no row names it, revoke that one key, release — so a key being minted
 ///   (no row committed yet) can never be judged orphaned: an in-flight mint
-///   holds `MUTATE` until its row commits, so waiting for the lock is the
+///   holds the fence until its row commits, so waiting for it is the
 ///   fence;
 /// - revokes only install-bound principals the listing returns (tag in the
 ///   IAM path and name on AWS, in the attached policy on MinIO/RustFS),
@@ -978,7 +1149,7 @@ pub fn orphan_sweep_due(
 /// Rows minted in another store keep [`sweep`]'s handling: any row, in any
 /// store, protects its handle.
 ///
-/// Assumes one runner owns the DB (see `MUTATE`): `MUTATE` is per-process.
+/// Assumes one runner owns the DB (see `db::mutate_fence`): it is per-process.
 pub async fn orphan_sweep(pool: &sqlx::SqlitePool, cfg: &Config) -> OrphanSweepReport {
     let Credentials::Scoped(provider) = &cfg.credentials else {
         static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -1031,7 +1202,7 @@ pub async fn orphan_sweep(pool: &sqlx::SqlitePool, cfg: &Config) -> OrphanSweepR
         if !provider.manages(handle) || known.contains(handle.as_str()) {
             continue;
         }
-        let _guard = MUTATE.lock().await;
+        let _guard = db::mutate_fence().await;
         match db::scoped_credential_handle_exists(pool, handle).await {
             Ok(true) => continue,
             Ok(false) => {}

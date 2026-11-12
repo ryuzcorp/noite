@@ -10,10 +10,10 @@ use std::sync::{Arc, Mutex};
 use futures::future::BoxFuture;
 
 use super::{
-    cached_operator_token, decrypt, delete_app_operator_tokens, delete_operator_token, encrypt,
-    ensure, ensure_operator_token_row, fleet_credentials, mint_operator_token, operator_token,
-    orphan_sweep, orphan_sweep_due, prefix_policy, revoke_app, revoke_environment, sweep,
-    tenant_process_credentials, AppCredentials, CredentialProvider, Credentials, MintedKey,
+    cached_operator_token, decrypt, delete_app_operator_tokens, delete_environment,
+    delete_operator_token, encrypt, ensure, ensure_operator_token_row, fleet_credentials,
+    mint_operator_token, operator_token, orphan_sweep, orphan_sweep_due, prefix_policy, revoke_app,
+    sweep, tenant_process_credentials, AppCredentials, CredentialProvider, Credentials, MintedKey,
     ProviderSetting, Scope, StoreAccess,
 };
 use crate::config::{config_for_tests, Config, Tenancy};
@@ -166,6 +166,23 @@ async fn memory_db() -> sqlx::SqlitePool {
         .execute(&pool)
         .await
         .expect("test schema");
+    // `ensure` refuses to mint for an app with no row, and now also for a
+    // scope whose prefix is not the app's current one: the seeded rows name
+    // exactly what the scope helpers (`app-1` / `env-1`) ask for.
+    sqlx::query(
+        "INSERT INTO app (id, slug, name, subdomain, git_prefix, fleet_bucket, created_at, updated_at) \
+         VALUES ('app-1', 'shop', 'seed', 'shop.localhost', 'git/shop/', 's3://noite/fleets/shop', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+    )
+    .execute(&pool)
+    .await
+    .expect("seed app row");
+    sqlx::query(
+        "INSERT INTO environment (id, app_id, label, kind, git_ref, fleet_bucket, created_at, updated_at) \
+         VALUES ('env-1', 'app-1', 'preview', 'branch', 'refs/heads/preview', 's3://noite/envs/shop/preview', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+    )
+    .execute(&pool)
+    .await
+    .expect("seed environment row");
     pool
 }
 
@@ -215,7 +232,19 @@ async fn rename_mints_fresh_and_revokes_old() {
     let before = ensure(&pool, &cfg, &provider, &app_scope())
         .await
         .expect("mint");
-    // The slug moved: the stored prefix no longer matches.
+    // The slug moved: the row now names the new prefix, so the stored key's
+    // prefix no longer matches and the app no longer owns it.
+    db::rename_app(
+        &pool,
+        "app-1",
+        "shop",
+        "store",
+        "store.localhost",
+        "git/store/",
+        "s3://noite/fleets/store/",
+    )
+    .await
+    .expect("row moved");
     revoke_app(&pool, &cfg, "app-1").await.expect("revoke");
     assert_eq!(provider.revoked(), vec!["user-1".to_string()]);
     let renamed = Scope::App {
@@ -265,7 +294,7 @@ async fn environment_teardown_revokes_only_its_key() {
     ensure(&pool, &cfg, &provider, &env_scope())
         .await
         .expect("env mint");
-    revoke_environment(&pool, &cfg, "env-1")
+    delete_environment(&pool, &cfg, "env-1")
         .await
         .expect("revoke");
     assert_eq!(provider.revoked(), vec!["user-2".to_string()]);
@@ -1577,4 +1606,436 @@ fn stripping_endpoint_userinfo_keeps_the_store_identity() {
         format!("{}|{configured}|{}", provider.name(), cfg.s3_bucket),
         "stored rows keep matching their store"
     );
+}
+
+/// A row and a slug for the credential tests: `db::delete_app` needs the app
+/// row it writes its purge tombstone from, and the key rows carry its id.
+async fn app_row(pool: &sqlx::SqlitePool, slug: &str) -> crate::models::App {
+    db::create_app(
+        pool,
+        &config_for_tests(),
+        db::NewApp {
+            name: slug,
+            slug,
+            user_id: "u1",
+            subdomain: "unused.localhost",
+            listen: 30500,
+            internal: 30501,
+        },
+    )
+    .await
+    .expect("app row")
+}
+
+/// F2: the row delete marks the app's and its environments' keys `revoking` in
+/// the same transaction, so an interrupted delete cannot leave a `live` key
+/// behind — and a same-slug create still revokes the old key at the store
+/// before it mints for the new owner's prefix.
+#[tokio::test]
+async fn interrupted_delete_then_recreate_revokes_the_old_key_first() {
+    let pool = memory_db().await;
+    let (cfg, provider) = test_config(FakeProvider::new());
+    let old = app_row(&pool, "reused").await;
+    let old_scope = Scope::App {
+        app_id: old.id.clone(),
+        slug: "reused".into(),
+    };
+    ensure(&pool, &cfg, &provider, &old_scope)
+        .await
+        .expect("old key");
+    // The delete starts and then dies before the store revoke (the sweep never
+    // runs): the transaction already marked the row.
+    db::delete_app(&pool, &old.id).await.expect("delete row");
+    assert!(
+        db::live_scoped_credential(&pool, &old_scope.key())
+            .await
+            .expect("read")
+            .is_none(),
+        "the delete's transaction stops handing the key out"
+    );
+
+    // Tenant B takes the same slug while the old key still exists at the store.
+    let new = app_row(&pool, "reused").await;
+    let new_scope = Scope::App {
+        app_id: new.id.clone(),
+        slug: "reused".into(),
+    };
+    provider.state.lock().expect("fake lock").fail_revoke = true;
+    let blocked = ensure(&pool, &cfg, &provider, &new_scope).await;
+    assert!(
+        blocked.is_err(),
+        "no key is minted on a prefix an older key still reaches"
+    );
+    assert_eq!(provider.mint_count(), 1, "nothing minted over the old key");
+
+    provider.state.lock().expect("fake lock").fail_revoke = false;
+    let fresh = ensure(&pool, &cfg, &provider, &new_scope)
+        .await
+        .expect("mint after the revoke");
+    assert!(fresh.access_key.contains("fleets/reused/"));
+    assert_eq!(
+        provider.revoked(),
+        vec!["user-1".to_string()],
+        "the old key is revoked before the new owner's is minted"
+    );
+    assert_eq!(provider.mint_count(), 2);
+    pool.close().await;
+}
+
+/// F2: a key a delete never got to mark (a crash before the atomic mark, or a
+/// database from an older build) is still `live` but its app row is gone. Minting
+/// for a re-created slug revokes it first — the periodic sweep only reads
+/// `revoking` rows, so nothing else would.
+#[tokio::test]
+async fn a_live_key_of_a_deleted_app_is_revoked_before_the_reused_prefix() {
+    let pool = memory_db().await;
+    let (cfg, provider) = test_config(FakeProvider::new());
+    let old = app_row(&pool, "reused2").await;
+    let old_scope = Scope::App {
+        app_id: old.id.clone(),
+        slug: "reused2".into(),
+    };
+    ensure(&pool, &cfg, &provider, &old_scope)
+        .await
+        .expect("old key");
+    // The interrupted delete of the old build: the app row is gone, the key row
+    // was never marked.
+    sqlx::query("DELETE FROM main.app WHERE id = ?")
+        .bind(&old.id)
+        .execute(&pool)
+        .await
+        .expect("row gone");
+    sqlx::query("UPDATE main.scoped_credential SET state = 'live' WHERE handle = 'user-1'")
+        .execute(&pool)
+        .await
+        .expect("still live");
+
+    let new = app_row(&pool, "reused2").await;
+    let new_scope = Scope::App {
+        app_id: new.id.clone(),
+        slug: "reused2".into(),
+    };
+    let fresh = ensure(&pool, &cfg, &provider, &new_scope)
+        .await
+        .expect("mint after the orphan revoke");
+    assert!(fresh.access_key.contains("fleets/reused2/"));
+    assert_eq!(
+        provider.revoked(),
+        vec!["user-1".to_string()],
+        "the orphaned live key is revoked before the new one is minted"
+    );
+    pool.close().await;
+}
+
+/// A rename commits the row update and only then marks the old prefix's key
+/// `revoking`; a crash in between leaves the old key `live`. A new app that
+/// takes that freed prefix must have it revoked before it mints its own key,
+/// or the old holder could read the new owner's objects.
+#[tokio::test]
+async fn a_live_key_whose_app_moved_away_is_revoked_before_the_reused_prefix() {
+    let pool = memory_db().await;
+    let (cfg, provider) = test_config(FakeProvider::new());
+    let old = app_row(&pool, "reused3").await;
+    let old_scope = Scope::App {
+        app_id: old.id.clone(),
+        slug: "reused3".into(),
+    };
+    ensure(&pool, &cfg, &provider, &old_scope)
+        .await
+        .expect("old key");
+    // The rename's row write lands; the process dies before `revoke_app`
+    // marks the row. The app row still exists, so the "app is gone" shape
+    // does not cover this.
+    db::rename_app(
+        &pool,
+        &old.id,
+        "reused3",
+        "other",
+        "other.localhost",
+        "git/other/",
+        "s3://noite/fleets/other/",
+    )
+    .await
+    .expect("row moved");
+    assert!(
+        db::live_scoped_credential(&pool, &old_scope.key())
+            .await
+            .expect("read")
+            .is_some(),
+        "the crash left the old prefix's key live"
+    );
+
+    let new = app_row(&pool, "reused3").await;
+    let new_scope = Scope::App {
+        app_id: new.id.clone(),
+        slug: "reused3".into(),
+    };
+    let fresh = ensure(&pool, &cfg, &provider, &new_scope)
+        .await
+        .expect("mint after the stale-prefix revoke");
+    assert!(fresh.access_key.contains("fleets/reused3/"));
+    assert_eq!(
+        provider.revoked(),
+        vec!["user-1".to_string()],
+        "the key whose app moved away is revoked before the new owner mints"
+    );
+    pool.close().await;
+}
+
+/// A fleet spawn builds its scope from an app snapshot taken before a slug
+/// rename. The app id still exists, so the existence check alone would let
+/// `ensure` return or mint a key for the slug A left — which another app can
+/// own by now, handing A a key into B's objects. The current rows decide.
+#[tokio::test]
+async fn a_scope_from_a_pre_rename_snapshot_is_refused_and_mints_nothing() {
+    let pool = memory_db().await;
+    let (cfg, provider) = test_config(FakeProvider::new());
+    let a = app_row(&pool, "s1").await;
+    let stale = Scope::App {
+        app_id: a.id.clone(),
+        slug: "s1".into(),
+    };
+    ensure(&pool, &cfg, &provider, &stale)
+        .await
+        .expect("A's key");
+    // A's rename commits its row (a crash before `revoke_app` leaves the old
+    // key live — the stale snapshot replays the scope it read before).
+    db::rename_app(
+        &pool,
+        &a.id,
+        "s1",
+        "s2",
+        "s2.localhost",
+        "git/s2/",
+        "s3://noite/fleets/s2/",
+    )
+    .await
+    .expect("row moved");
+    // B takes the slug A used to own.
+    let _ = app_row(&pool, "s1").await;
+
+    let refused = ensure(&pool, &cfg, &provider, &stale)
+        .await
+        .expect_err("A's stale scope no longer names A's prefix");
+    assert!(
+        format!("{refused:#}").contains("no longer owns"),
+        "the refusal names the stale prefix, got {refused:#}"
+    );
+    assert_eq!(provider.mint_count(), 1, "nothing is minted for B's prefix");
+    assert!(
+        provider.revoked().is_empty(),
+        "B's key/prefix is not touched by A's stale request"
+    );
+
+    // The rename's own revoke (what `rename_slugged` does after the row
+    // write) removes the old row, so the current scope can mint.
+    revoke_app(&pool, &cfg, &a.id)
+        .await
+        .expect("revoke after rename");
+
+    // A's current scope still works.
+    let current = Scope::App {
+        app_id: a.id.clone(),
+        slug: "s2".into(),
+    };
+    let key = ensure(&pool, &cfg, &provider, &current)
+        .await
+        .expect("A's current prefix mints");
+    assert!(key.access_key.contains("fleets/s2/"));
+    pool.close().await;
+}
+
+/// A scoped key or operator token whose *environment* row is gone (a teardown
+/// that could not mark/drop it and still removed the row) is an orphan too:
+/// the app row surviving must not keep the key reachable forever.
+#[tokio::test]
+async fn boot_reconcile_marks_an_environment_key_whose_environment_row_is_gone() {
+    let pool = memory_db().await;
+    let (cfg, provider) = test_config(FakeProvider::new());
+    let app = app_row(&pool, "envowner").await;
+    let env = db::create_environment(
+        &pool,
+        &cfg,
+        db::NewEnvironment {
+            app_id: &app.id,
+            slug: "envowner",
+            label: "preview",
+            kind: crate::models::EnvironmentKind::Branch,
+            git_ref: "refs/heads/preview",
+            created_by: "u1",
+            listen: 30660,
+            internal: 30661,
+        },
+    )
+    .await
+    .expect("environment row");
+    let scope = Scope::Environment {
+        env_id: env.id.clone(),
+        app_id: app.id.clone(),
+        slug: "envowner".into(),
+        label: "preview".into(),
+    };
+    ensure(&pool, &cfg, &provider, &scope)
+        .await
+        .expect("environment key");
+    operator_token(
+        &pool,
+        &cfg.runner_token,
+        &format!("env:{}", env.id),
+        &app.id,
+    )
+    .await
+    .expect("environment token");
+    // The non-strict teardown path: the row goes, the credential rows stay.
+    sqlx::query("DELETE FROM main.environment WHERE id = ?")
+        .bind(&env.id)
+        .execute(&pool)
+        .await
+        .expect("drop environment row");
+
+    let report = super::reconcile_orphans(&pool).await.expect("reconcile");
+
+    assert_eq!(report.keys_marked, 1, "the environment key is marked");
+    assert_eq!(
+        report.tokens_dropped, 1,
+        "the environment token row is gone"
+    );
+    assert!(
+        db::live_scoped_credential(&pool, &scope.key())
+            .await
+            .expect("read")
+            .is_none(),
+        "the environment key is never handed out again"
+    );
+    assert!(db::get_operator_token(&pool, &format!("env:{}", env.id))
+        .await
+        .expect("read")
+        .is_none());
+    // The app itself is untouched.
+    assert!(db::live_scoped_credential(&pool, "app:envowner")
+        .await
+        .expect("read")
+        .is_none());
+    pool.close().await;
+}
+
+/// A mint that finishes after the app row was deleted must not leave a live
+/// key behind (the sweep reads only `revoking` rows, so nothing would ever
+/// revoke it): the fenced delete and the post-mint owner check close that.
+#[tokio::test]
+async fn a_mint_after_the_app_row_is_gone_leaves_no_live_key() {
+    let pool = memory_db().await;
+    let (cfg, provider) = test_config(FakeProvider::new());
+    let app = app_row(&pool, "vanished").await;
+    let scope = Scope::App {
+        app_id: app.id.clone(),
+        slug: "vanished".into(),
+    };
+    db::delete_app(&pool, &app.id).await.expect("fenced delete");
+
+    let refused = ensure(&pool, &cfg, &provider, &scope).await;
+
+    assert!(refused.is_err(), "no key is handed out for a deleted app");
+    assert!(
+        db::live_scoped_credential(&pool, &scope.key())
+            .await
+            .expect("read")
+            .is_none(),
+        "no live credential row is inserted for the deleted app"
+    );
+    assert_eq!(
+        provider.mint_count(),
+        0,
+        "no key is minted once the app row is gone"
+    );
+    pool.close().await;
+}
+
+/// F2: the boot reconcile marks orphaned `scoped_credential` rows and drops
+/// orphaned `fleet_operator_token` rows (keeping the control fleet's, which
+/// has no app row by design), so the periodic sweep can revoke the store side.
+#[tokio::test]
+async fn boot_reconcile_marks_key_and_token_rows_whose_app_is_gone() {
+    let pool = memory_db().await;
+    let (cfg, provider) = test_config(FakeProvider::new());
+    let kept = app_row(&pool, "kept").await;
+    let kept_scope = Scope::App {
+        app_id: kept.id.clone(),
+        slug: "kept".into(),
+    };
+    ensure(&pool, &cfg, &provider, &kept_scope)
+        .await
+        .expect("kept key");
+    let gone = app_row(&pool, "gone").await;
+    let gone_scope = Scope::App {
+        app_id: gone.id.clone(),
+        slug: "gone".into(),
+    };
+    ensure(&pool, &cfg, &provider, &gone_scope)
+        .await
+        .expect("orphan key");
+    // The old build's interrupted delete: the app row goes, the key row stays
+    // live (the delete's atomic mark never ran).
+    sqlx::query("DELETE FROM main.app WHERE id = ?")
+        .bind(&gone.id)
+        .execute(&pool)
+        .await
+        .expect("orphan the app row");
+    operator_token(&pool, &cfg.runner_token, "app:gone", &gone.id)
+        .await
+        .expect("orphan token");
+    operator_token(&pool, &cfg.runner_token, "env:gone-env", &gone.id)
+        .await
+        .expect("orphan env token");
+    operator_token(
+        &pool,
+        &cfg.runner_token,
+        super::CONTROL_OPERATOR_SCOPE,
+        "_control",
+    )
+    .await
+    .expect("control token");
+
+    let report = super::reconcile_orphans(&pool).await.expect("reconcile");
+    assert_eq!(
+        report,
+        super::OrphanRows {
+            keys_marked: 1,
+            tokens_dropped: 2,
+            failed: 0,
+        }
+    );
+    assert!(
+        db::live_scoped_credential(&pool, &gone_scope.key())
+            .await
+            .expect("read")
+            .is_none(),
+        "the orphaned key is marked, never handed out again"
+    );
+    assert!(db::live_scoped_credential(&pool, &kept_scope.key())
+        .await
+        .expect("read")
+        .is_some());
+    assert!(
+        db::get_operator_token(&pool, "app:gone")
+            .await
+            .expect("read")
+            .is_none(),
+        "the orphaned token row is gone"
+    );
+    assert!(
+        db::get_operator_token(&pool, super::CONTROL_OPERATOR_SCOPE)
+            .await
+            .expect("read")
+            .is_some(),
+        "the control fleet's token row has no app row and is kept"
+    );
+    assert_eq!(cached_operator_token("app:gone"), None, "cache evicted");
+    assert_eq!(
+        sweep(&pool, &cfg).await,
+        0,
+        "the marked key is revoked by the sweep, not left pending"
+    );
+    assert_eq!(provider.revoked(), vec!["user-2".to_string()]);
+    pool.close().await;
 }

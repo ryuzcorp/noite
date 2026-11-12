@@ -31,6 +31,9 @@ pub async fn run_forever(
     control_pid: Arc<std::sync::atomic::AtomicU32>,
     logs: LogState,
     deploying: Deploying,
+    // The process's per-slug publish guard: the purge resume pass takes a
+    // slug's guard exactly like create/delete/rename do.
+    git_sync: ryuz_git::GitSync,
     mut metrics: MetricsState,
     ready: Arc<AtomicBool>,
     shutdown: Arc<AtomicBool>,
@@ -55,11 +58,32 @@ pub async fn run_forever(
     // One cheap SELECT per tick when nothing pends; a failed sweep backs
     // off a minute instead of hammering a struggling store.
     let mut last_cred_sweep: Option<Instant> = None;
+    // The boot pass that marks credential/token rows whose app is gone can
+    // fail (or finish partially) while the database is still recovering. The
+    // `sweep` below only reads rows already `revoking`, and the store-side
+    // orphan pass protects any row, so a missed live row would stay reachable
+    // until the next restart: retry it here, before the sweep — a minute
+    // apart at first, then every ten minutes until it completes. Idempotent
+    // and local-only.
+    let mut orphan_rows_at: Option<Instant> = Some(Instant::now());
+    let mut orphan_rows_attempts: u8 = 0;
     // Orphan scoped-key reconcile (SPEC, Scoped credentials): the store
     // listed against the DB, revoking what no row names. `None` runs on
     // the first tick, then every ten minutes — a full listing on every
     // tick would hammer the store's IAM.
     let mut last_orphan_sweep: Option<Instant> = None;
+    // Durable app-purge tombstones (`app_purge`): a delete whose wipe never
+    // finished — a crash, a restart, an S3 failure, a wipe a create stopped
+    // and then aborted — is resumed on a slow tick. The boot pass covers the
+    // common case; this catches a store that was down at boot. One pass at a
+    // time, off the tick, and paced like every background wipe.
+    let mut last_purge_resume = Instant::now();
+    // Unfinished renames (their durable markers) are resumed here too: a crash
+    // mid-move must not wait for a client retry, and until it resolves the
+    // target slug stays reserved. None resumes on the first tick.
+    let mut last_rename_resume: Option<Instant> = None;
+    let rename_resuming = Arc::new(AtomicBool::new(false));
+    let purge_resuming = Arc::new(AtomicBool::new(false));
     loop {
         tick.tick().await;
         if shutdown.load(Ordering::Relaxed) {
@@ -111,6 +135,49 @@ pub async fn run_forever(
                 flag.store(false, Ordering::SeqCst);
             });
         }
+        if orphan_rows_at.is_some_and(|at| Instant::now() >= at) {
+            orphan_rows_attempts = orphan_rows_attempts.saturating_add(1);
+            let complete = match crate::host::credentials::reconcile_orphans(&pool).await {
+                Ok(rows) if rows.failed == 0 => {
+                    if !rows.nothing() {
+                        tracing::info!(
+                            keys_marked = rows.keys_marked,
+                            tokens_dropped = rows.tokens_dropped,
+                            "reconciled orphaned credential rows"
+                        );
+                    }
+                    true
+                }
+                Ok(rows) => {
+                    tracing::warn!(
+                        failed = rows.failed,
+                        "orphan credential row reconcile is incomplete"
+                    );
+                    false
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %format!("{e:#}"),
+                        "orphan credential row reconcile failed; retrying"
+                    );
+                    false
+                }
+            };
+            orphan_rows_at = if complete {
+                None
+            } else if orphan_rows_attempts < 5 {
+                Some(Instant::now() + Duration::from_secs(60))
+            } else {
+                // A live orphan key outside the `revoking`-only sweep must not
+                // wait for a restart: keep trying at a slow cadence.
+                if orphan_rows_attempts == 5 {
+                    tracing::warn!(
+                        "orphan credential row reconcile still incomplete; retrying every 10 minutes"
+                    );
+                }
+                Some(Instant::now() + Duration::from_secs(10 * 60))
+            };
+        }
         // Scoped-key revocation retries (SPEC, Scoped credentials): a store
         // delete refused at revoke time stays marked until the store accepts.
         if last_cred_sweep.is_none_or(|at| at.elapsed() >= Duration::from_secs(60)) {
@@ -119,6 +186,75 @@ pub async fn run_forever(
             if left > 0 {
                 tracing::warn!(left, "scoped keys still awaiting revocation");
             }
+        }
+        // Durable app-purge tombstones (`app_purge`): a delete whose wipe never
+        // finished is resumed here every five minutes — off the tick, because
+        // a wipe of a real data set takes seconds and holds its slug's guard.
+        if last_purge_resume.elapsed() >= Duration::from_secs(5 * 60)
+            && !purge_resuming.swap(true, Ordering::SeqCst)
+        {
+            last_purge_resume = Instant::now();
+            let (pool2, cfg2, procs2, logs2, sync2, flag) = (
+                pool.clone(),
+                cfg.clone(),
+                procs.clone(),
+                logs.clone(),
+                git_sync.clone(),
+                purge_resuming.clone(),
+            );
+            tokio::spawn(async move {
+                let report =
+                    crate::host::purge::resume_pending(&pool2, &cfg2, &procs2, &logs2, &sync2)
+                        .await;
+                if report.noteworthy() {
+                    tracing::info!(
+                        pending = report.pending,
+                        cleared = report.cleared,
+                        failed = report.failed,
+                        "resumed pending app purges"
+                    );
+                }
+                // CI cache volumes no live app owns (a legacy slug-keyed
+                // name, a wipe that died, a rename): the delete's own removal
+                // is the fast path, this is the durable one. Never under a
+                // slug guard.
+                let removed = crate::host::purge::reconcile_ci_caches(&cfg2, &pool2).await;
+                if removed > 0 {
+                    tracing::info!(removed, "removed orphaned CI cache volumes");
+                }
+                flag.store(false, Ordering::SeqCst);
+            });
+        }
+        // Unfinished renames: the marker also reserves the target slug, so a
+        // resume pass that never runs would block that slug forever.
+        if last_rename_resume.is_none_or(|at| at.elapsed() >= Duration::from_secs(5 * 60))
+            && !rename_resuming.swap(true, Ordering::SeqCst)
+        {
+            last_rename_resume = Some(Instant::now());
+            let (pool2, cfg2, procs2, logs2, deploying2, sync2, flag) = (
+                pool.clone(),
+                cfg.clone(),
+                procs.clone(),
+                logs.clone(),
+                deploying.clone(),
+                git_sync.clone(),
+                rename_resuming.clone(),
+            );
+            tokio::spawn(async move {
+                let resumed = crate::host::rename::resume_pending_renames(
+                    &cfg2,
+                    &pool2,
+                    &procs2,
+                    &logs2,
+                    &deploying2,
+                    &sync2,
+                )
+                .await;
+                if resumed > 0 {
+                    tracing::info!(resumed, "resumed unfinished renames");
+                }
+                flag.store(false, Ordering::SeqCst);
+            });
         }
         if crate::host::credentials::orphan_sweep_due(
             last_orphan_sweep,

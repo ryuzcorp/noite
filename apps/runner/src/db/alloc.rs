@@ -15,9 +15,9 @@ use super::apps::list_all_apps;
 /// then dies at bind with "celld exited before answering its health gate".
 /// A claim holds this lock from the pick until the row insert commits, so a
 /// concurrent claim always sees the earlier claim's ports. Single-process
-/// invariant, like `service::apps::CREATE_LOCK` (which stays outermost: app
-/// create holds `CREATE_LOCK` across purge → insert and the port claim
-/// inside it; environment creates hold only this lock).
+/// invariant: an app create holds its slug's push guard across purge → insert
+/// (so two creates for one slug never claim ports at once) and the port claim
+/// inside it; environment creates hold only this lock.
 static PORT_ALLOC_LOCK: LazyLock<tokio::sync::Mutex<()>> =
     LazyLock::new(|| tokio::sync::Mutex::new(()));
 
@@ -99,7 +99,9 @@ pub fn pick_build_uid(base: u32, range: u32, used: &[i64]) -> Option<u32> {
 /// A stable per-app build uid (SPEC, Tenant isolation): allocated on the
 /// app's first build and remembered on its row, so two concurrent builds —
 /// of one app or of two different apps — run as different uids and cannot
-/// read each other's worktree or cache. `None` when uid drops are disabled
+/// read each other's worktree or cache. A deleted app's uid stays reserved by
+/// its `app_purge` tombstone until the wipe that removes the trees it owns
+/// lands, so no new build inherits them. `None` when uid drops are disabled
 /// (`RUNNER_BUILD_UID_BASE=none`, dev/single) or the app row is gone.
 pub async fn ensure_app_build_uid(
     pool: &SqlitePool,
@@ -123,11 +125,27 @@ pub async fn ensure_app_build_uid(
     }
     // Two apps allocating at once can pick the same lowest free uid; the
     // unique index arbitrates and the loser re-picks.
+    //
+    // A deleted app's uid is not free yet: `db::delete_app` frees it with the
+    // row, but its `builds/<slug>` and `cache/<slug>` trees stay owned by it
+    // until the background wipe removes them, and the `app_purge` tombstone
+    // keeps the uid until then. Reserving it is what stops a new app's first
+    // build from running as the uid that still owns the departed tenant's
+    // files (SPEC, Tenant isolation; the hostile suite's cross-build probe).
     for _ in 0..16 {
-        let used: Vec<i64> =
-            sqlx::query_scalar("SELECT build_uid FROM app WHERE build_uid IS NOT NULL")
-                .fetch_all(pool)
-                .await?;
+        // The scan and the claim are one IMMEDIATE transaction: the app
+        // delete moves a uid to `app_purge` in its own transaction, and the
+        // unique index only covers `app`, so a scan taken before that move
+        // would let a second app claim a uid a tombstone now owns. With the
+        // write lock held, a delete either lands before the scan (and the
+        // tombstone is seen) or waits for the claim to commit.
+        let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+        let used: Vec<i64> = sqlx::query_scalar(
+            "SELECT build_uid FROM app WHERE build_uid IS NOT NULL \
+             UNION SELECT build_uid FROM app_purge WHERE build_uid IS NOT NULL",
+        )
+        .fetch_all(&mut *tx)
+        .await?;
         let Some(uid) = pick_build_uid(base, range, &used) else {
             return Err(sqlx::Error::Protocol(format!(
                 "per-app build uid range {base}..{} exhausted; raise RUNNER_BUILD_UID_RANGE",
@@ -138,10 +156,11 @@ pub async fn ensure_app_build_uid(
             sqlx::query("UPDATE app SET build_uid = ? WHERE id = ? AND build_uid IS NULL")
                 .bind(i64::from(uid))
                 .bind(app_id)
-                .execute(pool)
+                .execute(&mut *tx)
                 .await;
         match updated {
             Ok(_) => {}
+            // Dropping `tx` rolls the failed claim back.
             Err(sqlx::Error::Database(e)) if e.is_unique_violation() => continue,
             Err(e) => return Err(e),
         }
@@ -149,9 +168,10 @@ pub async fn ensure_app_build_uid(
         // either way the row's value is now the truth.
         let claimed: Option<i64> = sqlx::query_scalar("SELECT build_uid FROM app WHERE id = ?")
             .bind(app_id)
-            .fetch_optional(pool)
+            .fetch_optional(&mut *tx)
             .await?
             .flatten();
+        tx.commit().await?;
         return Ok(claimed.and_then(|v| u32::try_from(v).ok()));
     }
     Err(sqlx::Error::Protocol(
@@ -291,7 +311,8 @@ mod tests {
             .await
             .expect("stored uid");
         assert_eq!(stored, Some(10031));
-        // Deleting an app is the only way its uid comes back.
+        // A delete that owes no wipe (`delete_app` always writes the
+        // tombstone, which would keep the uid reserved) frees it here.
         sqlx::query("DELETE FROM app WHERE id = 'a'")
             .execute(&pool)
             .await
@@ -326,6 +347,52 @@ mod tests {
         assert_eq!(
             ensure_app_build_uid(&pool, None, 4, "b").await.unwrap(),
             None
+        );
+        pool.close().await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A delete frees the app row but not its build uid: the uid still owns
+    /// the departed tenant's `builds/<slug>` and `cache/<slug>` trees until
+    /// the wipe recorded in `app_purge` removes them, so the allocator keeps
+    /// it out of the pool. Handing it out earlier ran a new app's first build
+    /// as the uid that still owned another tenant's package caches
+    /// (merge-group e2e, 2026-11-12: the hostile build read a sibling's
+    /// `cache/mcp-e2e/{jup,bun,home}`).
+    #[tokio::test]
+    async fn a_deleted_apps_uid_stays_reserved_until_its_wipe_lands() {
+        let dir = std::env::temp_dir().join(format!("noite-uid-wipe-{}", new_id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let url = format!("sqlite:{}?mode=rwc", dir.join("noite.sqlite").display());
+        let pool = connect(&url).await.expect("boot");
+        insert_app(&pool, "gone", "gone").await;
+        assert_eq!(
+            ensure_app_build_uid(&pool, Some(10030), 4, "gone")
+                .await
+                .unwrap(),
+            Some(10030)
+        );
+        crate::db::apps::delete_app(&pool, "gone")
+            .await
+            .expect("delete");
+        insert_app(&pool, "next", "next").await;
+        assert_eq!(
+            ensure_app_build_uid(&pool, Some(10030), 4, "next")
+                .await
+                .unwrap(),
+            Some(10031),
+            "the uid of a wipe still owed is never handed to a new app"
+        );
+        // The wipe landed (the caller cleared the tombstone): the uid returns.
+        crate::db::apps::clear_app_purges(&pool, "gone")
+            .await
+            .expect("clear the tombstone");
+        insert_app(&pool, "later", "later").await;
+        assert_eq!(
+            ensure_app_build_uid(&pool, Some(10030), 4, "later")
+                .await
+                .unwrap(),
+            Some(10030)
         );
         pool.close().await;
         let _ = std::fs::remove_dir_all(&dir);

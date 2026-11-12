@@ -124,6 +124,7 @@ jobs:
           app_ingest_key
           app_insight
           app_limit
+          app_purge
           app_user_prop
           deploy
           environment

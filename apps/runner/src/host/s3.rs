@@ -925,6 +925,10 @@ async fn list_page(
     {
         Ok(resp) => resp,
         Err(e) => {
+            // `without_url`: reqwest's Display carries the full presigned URL
+            // (access-key id plus a live signature), and this text reaches the
+            // caller through the S3 error chain.
+            let e = e.without_url();
             return Err(S3Fail::Retryable(anyhow::anyhow!(
                 "s3 list {prefix} transport: {e:#}"
             )));
@@ -1072,22 +1076,141 @@ pub async fn s3_rm_dir_except(
     s3_delete_keys(cfg, bucket, &victims).await
 }
 
-/// Recursive delete of one prefix (app purge, deleted-ref cleanup). Empty
-/// prefixes are a no-op, so retries after a partial delete stay quiet.
+/// The smallest gap between two batches of a **background** wipe. A
+/// `DeleteObjects` is the heaviest request this process sends; back-to-back
+/// batches kept a bundled RustFS busy enough on a 2 GB host that a tenant
+/// deploy's own S3 client (celld's `object_store`) timed out sending requests
+/// (owner report, 2026-11-12). Pacing a background wipe is cheap; a starved
+/// deploy is not.
+const WIPE_BATCH_GAP: Duration = Duration::from_millis(50);
+
+/// How many keys one background-wipe `DeleteObjects` carries. Smaller than the
+/// store's 1000-key page on purpose: a 1000-key delete blocks a small store for
+/// seconds, and every other S3 caller (a deploy, a create's credential mint)
+/// queues behind it.
+const WIPE_BATCH_KEYS: usize = 250;
+
+/// The pacing state of **every** background wipe in this process: the previous
+/// batch's start. One token, held across the batch request itself, so concurrent
+/// background wipes (N deletes and the resume pass) cannot multiply the store's
+/// load: one `DeleteObjects` of a background wipe is in flight at a time, with
+/// [`WIPE_BATCH_GAP`] between starts. The create/rename authoritative wipe and
+/// request-path wipes never take it: they run for a slug their caller already
+/// holds the guard for, and must not queue behind another tenant's background
+/// wipe (that wait is the create-blocking bug this PR fixes).
+struct WipePace;
+
+impl WipePace {
+    /// Run one background-wipe batch under the process-wide pace. `false`:
+    /// `stop` was asked while this batch waited for the pace, so it was not
+    /// sent — a create that wants the slug must not queue behind unrelated
+    /// wipes, and a stopped wipe must not add one more batch.
+    async fn run_batch(
+        &self,
+        cfg: &Config,
+        bucket: &str,
+        keys: &[String],
+        stop: &(dyn Fn() -> bool + Send + Sync),
+    ) -> anyhow::Result<bool> {
+        static PACE: std::sync::LazyLock<tokio::sync::Mutex<Option<tokio::time::Instant>>> =
+            std::sync::LazyLock::new(|| tokio::sync::Mutex::new(None));
+        let mut last = PACE.lock().await;
+        if let Some(at) = *last {
+            let elapsed = at.elapsed();
+            if elapsed < WIPE_BATCH_GAP {
+                // Observe a stop while waiting for the pace, without waking
+                // once per slice for nothing.
+                let deadline = tokio::time::Instant::now() + (WIPE_BATCH_GAP - elapsed);
+                loop {
+                    if stop() {
+                        return Ok(false);
+                    }
+                    let now = tokio::time::Instant::now();
+                    if now >= deadline {
+                        break;
+                    }
+                    tokio::time::sleep((deadline - now).min(Duration::from_millis(10))).await;
+                }
+            }
+        }
+        // Checked *after* the wait and immediately before sending: the pause
+        // is exactly where a create's stop arrives.
+        if stop() {
+            return Ok(false);
+        }
+        *last = Some(tokio::time::Instant::now());
+        // Held across the request: releasing it first would let N wipes send
+        // their batches concurrently, which is the load this exists to cap.
+        s3_delete_keys(cfg, bucket, keys).await?;
+        Ok(true)
+    }
+}
+
+/// Recursive delete of one prefix (deleted-ref cleanup, environment teardown).
+/// Empty prefixes are a no-op, so retries after a partial delete stay quiet.
+/// A request-path wipe is not paced: the caller already bounds it, and it must
+/// never queue behind a background purge.
 pub async fn s3_rm_prefix(cfg: &Config, bucket: &str, prefix: &str) -> anyhow::Result<()> {
-    // Delete page by page, never listing the whole prefix first: a purge cut
-    // by the caller's bound (or a huge telemetry/D1 history) must make
-    // progress, and a retry must not re-walk everything before deleting.
+    rm_prefix_loop(cfg, bucket, prefix, &|| false, None).await?;
+    Ok(())
+}
+
+/// [`s3_rm_prefix`] for a **background** purge: paced (see
+/// [`WIPE_BATCH_GAP`] and [`WipePace`] — the pace is process-wide, so N
+/// concurrent wipes cannot multiply the store's load), batches capped at
+/// [`WIPE_BATCH_KEYS`], and stoppable between batches — answers `false` when
+/// `stop` asked the wipe to end before the prefix was empty. A caller that
+/// stops keeps whatever is left and must wipe from scratch later (deletes are
+/// idempotent, so a partial wipe is a safe starting point).
+///
+/// Page by page, never listing the whole prefix first, so a wipe cut by a
+/// caller's bound (or a huge telemetry/D1 history) makes progress and a retry
+/// never re-walks everything before deleting.
+pub async fn s3_rm_prefix_paced(
+    cfg: &Config,
+    bucket: &str,
+    prefix: &str,
+    stop: &(dyn Fn() -> bool + Send + Sync),
+) -> anyhow::Result<bool> {
+    rm_prefix_loop(cfg, bucket, prefix, stop, Some(WipePace)).await
+}
+
+async fn rm_prefix_loop(
+    cfg: &Config,
+    bucket: &str,
+    prefix: &str,
+    stop: &(dyn Fn() -> bool + Send + Sync),
+    pace: Option<WipePace>,
+) -> anyhow::Result<bool> {
     loop {
-        let (objects, _, _) = with_s3_retry("list", prefix, || {
+        if stop() {
+            return Ok(false);
+        }
+        let page = with_s3_retry("list", prefix, || {
             list_page(cfg, bucket, prefix, None, None)
         })
         .await?;
-        if objects.is_empty() {
-            return Ok(());
+        if page.0.is_empty() {
+            return Ok(true);
         }
-        let keys: Vec<String> = objects.into_iter().map(|o| o.key).collect();
-        s3_delete_keys(cfg, bucket, &keys).await?;
+        let keys: Vec<String> = page.0.into_iter().map(|o| o.key).collect();
+        let batch = match &pace {
+            Some(_) => WIPE_BATCH_KEYS,
+            None => 1000,
+        };
+        for chunk in keys.chunks(batch) {
+            if stop() {
+                return Ok(false);
+            }
+            match &pace {
+                Some(pace) => {
+                    if !pace.run_batch(cfg, bucket, chunk, stop).await? {
+                        return Ok(false);
+                    }
+                }
+                None => s3_delete_keys(cfg, bucket, chunk).await?,
+            }
+        }
     }
 }
 
