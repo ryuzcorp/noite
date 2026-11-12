@@ -548,18 +548,20 @@ pub async fn rebind_local_subdomains(pool: &SqlitePool, base_domain: &str) -> sq
 ///   (review finding, 2026-11-12). Only the row state changes here; the
 ///   store-side revoke is the background sweep's job and retries.
 ///
-/// `BEGIN IMMEDIATE`, not a deferred begin: this is the one transaction in
-/// `db/` that reads before it writes (the slug `SELECT` above), and a
-/// deferred transaction that reads first then writes is refused the moment
-/// another connection commits in between — `SQLITE_BUSY_SNAPSHOT`, reported
-/// as `database is locked` and *not* retried by `busy_timeout`, because the
-/// connection's read snapshot is already stale. A delete always runs next to
-/// the previous delete's background wipe (`clear_app_purges`), so that
-/// interleaving is routine rather than rare: it flaked
-/// `api::tests::apps_delete_agrees` in CI. Taking the write lock up front
-/// makes a concurrent writer wait (through the connection's `busy_timeout`)
-/// instead of making this transaction fail, and the row is read after the
-/// lock, so the snapshot it sees is the one it deletes.
+/// `BEGIN IMMEDIATE`, not a deferred begin: this transaction reads the slug
+/// before it writes, and a deferred transaction that reads first then writes
+/// is refused the moment another connection commits in between —
+/// `SQLITE_BUSY_SNAPSHOT`, reported as `database is locked` and *not*
+/// retried by `busy_timeout`, because the connection's read snapshot is
+/// already stale. It is the only read-before-write transaction on a pool
+/// other tasks share (`connect`'s schema apply reads first too, but on a
+/// pool nothing else holds yet). A delete always runs next to the previous
+/// delete's background wipe (`clear_app_purges`), so that interleaving is
+/// routine rather than rare: it flaked `api::tests::apps_delete_agrees` in
+/// CI. Taking the write lock up front makes a concurrent writer wait
+/// (through the connection's `busy_timeout`) instead of making this
+/// transaction fail, and the row is read after the lock, so the snapshot it
+/// sees is the one it deletes.
 pub async fn delete_app(pool: &SqlitePool, id: &str) -> sqlx::Result<()> {
     let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
     let slug: Option<String> = sqlx::query_scalar("SELECT slug FROM main.app WHERE id = ?")
