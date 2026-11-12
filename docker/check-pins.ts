@@ -697,17 +697,37 @@ const onlineProbesForDownload = (download: PinnedDownload): OnlineProbe[] => {
   return probes;
 };
 
+/**
+ * What the CLI's online flags select. The tarball/registry pins are immutable
+ * for a version, so `--online` always probes them; image tags are not (an
+ * official image re-pushes the same tag for a base-OS update), so their index
+ * digests are probed only when `--online-images` asks for the drift check.
+ */
+export interface OnlineSelection {
+  images: boolean;
+  online: boolean;
+}
+
+/** `--online-images` implies `--online`: images are the extra, never the base. */
+export const parseOnlineFlags = (argv: string[]): OnlineSelection => ({
+  images: argv.includes("--online-images"),
+  online: argv.includes("--online") || argv.includes("--online-images"),
+});
+
 /** Every pin as a lookup of what the publisher serves today. */
 export const onlineProbes = (
   report: IntegrityReport,
-  files: PinFiles
+  files: PinFiles,
+  { images }: Pick<OnlineSelection, "images">
 ): OnlineProbe[] => {
-  const probes: OnlineProbe[] = report.images.map((image) => ({
-    digest: image.digest,
-    kind: "image",
-    name: image.name,
-    url: image.name,
-  }));
+  const probes: OnlineProbe[] = images
+    ? report.images.map((image) => ({
+        digest: image.digest,
+        kind: "image",
+        name: image.name,
+        url: image.name,
+      }))
+    : [];
 
   for (const download of report.downloads) {
     probes.push(...onlineProbesForDownload(download));
