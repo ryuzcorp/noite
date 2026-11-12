@@ -273,6 +273,12 @@ pub(crate) fn teardown_finished(env: &Environment) -> std::sync::Arc<tokio::sync
 /// failure logs and continues. A repo without a manifest is skipped: there is
 /// no durable ref state to contradict the row, so guessing would risk wiping a
 /// live environment from a transient store error.
+///
+/// The manifest read is deliberately outside the slug guard because this runs
+/// before the listener binds (and before the reconcile loop starts): nothing
+/// can push, rename or create between the read and the wipe. Do not call it
+/// from a live listener or the reconcile tick without re-checking the ref
+/// under the guard.
 pub async fn sweep_orphan_branch_environments(state: &crate::AppState) -> usize {
     let environments = match db::list_all_environments(&state.pool).await {
         Ok(rows) => rows,
@@ -281,28 +287,42 @@ pub async fn sweep_orphan_branch_environments(state: &crate::AppState) -> usize 
             return 0;
         }
     };
-    // One manifest read per app, cached across its environments. `None` means
-    // "unknown, skip" (no manifest, or the read failed).
-    let mut manifests: HashMap<String, Option<ryuz_git::RefsManifest>> = HashMap::new();
+    // One manifest read per app, issued concurrently: the store call has its
+    // own 30 s timeout, and this runs before the listener binds, so a
+    // degraded object store must not add that wait once per app.
+    let wal = &state.wal;
+    let mut slugs: Vec<&str> = environments
+        .iter()
+        .filter(|env| env.kind == EnvironmentKind::Branch)
+        .map(|env| env.app_slug.as_str())
+        .collect();
+    slugs.sort_unstable();
+    slugs.dedup();
+    let reads = slugs
+        .into_iter()
+        .map(|slug| async move { (slug, wal.read_manifest(slug).await) });
+    // `None` means "unknown, skip" (no manifest, or the read failed).
+    let manifests: HashMap<String, Option<ryuz_git::RefsManifest>> =
+        futures::future::join_all(reads)
+            .await
+            .into_iter()
+            .map(|(slug, read)| match read {
+                Ok(manifest) => (slug.to_string(), manifest),
+                Err(e) => {
+                    tracing::warn!(
+                        slug,
+                        error = %e,
+                        "orphan environment sweep: could not read the manifest"
+                    );
+                    (slug.to_string(), None)
+                }
+            })
+            .collect();
     let mut swept = 0;
     for env in environments
         .iter()
         .filter(|env| env.kind == EnvironmentKind::Branch)
     {
-        if !manifests.contains_key(&env.app_slug) {
-            let manifest = match state.wal.read_manifest(&env.app_slug).await {
-                Ok(manifest) => manifest,
-                Err(e) => {
-                    tracing::warn!(
-                        slug = %env.app_slug,
-                        error = %e,
-                        "orphan environment sweep: could not read the manifest"
-                    );
-                    None
-                }
-            };
-            manifests.insert(env.app_slug.clone(), manifest);
-        }
         let Some(manifest) = manifests.get(&env.app_slug).and_then(Option::as_ref) else {
             continue;
         };
