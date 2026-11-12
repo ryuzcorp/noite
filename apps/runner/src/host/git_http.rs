@@ -714,9 +714,10 @@ pub async fn receive_pack(
     // the next fallback sweep — the bundle and manifest are already stored.
     match after_receive(&state, &app, &bare, &before).await {
         Ok(moved) => {
-            // A deleted branch deletes its environment, before the tips are
-            // fanned out (a ref that is gone has no environment left to
-            // deploy).
+            // A deleted ref's environment is torn down on its own task, so the
+            // push does not wait for a fleet drain; `moved.tips` below holds
+            // the refs that still exist, so nothing deploys into a gone
+            // environment in the meantime.
             crate::host::env_teardown::on_refs_deleted(&state, &app, &moved.deleted).await;
             if !app.is_stopped() {
                 for tip in &moved.tips {

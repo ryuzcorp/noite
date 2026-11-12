@@ -112,8 +112,13 @@ pub async fn get_environment_by_label(
         .await
 }
 
-/// The environment tracking one git ref in an app. At most one row exists
-/// per ref.
+/// The environment tracking one git ref in an app. `git_ref` is not unique:
+/// while a deleted branch's row is being torn down (the wipe runs in its own
+/// task), the branch can already be re-created and mint a second row for the
+/// same ref with a suffixed label. The newest row is the live one — deploying
+/// or tearing down into the dying row would hit a prefix that is being
+/// emptied. `created_at` is millisecond ISO-8601, so `id` breaks a tie
+/// deterministically.
 pub async fn get_environment_by_ref(
     pool: &SqlitePool,
     app_id: &str,
@@ -121,7 +126,8 @@ pub async fn get_environment_by_ref(
 ) -> sqlx::Result<Option<Environment>> {
     let sql = format!(
         "SELECT {ENV_COLS} FROM environment e JOIN app a ON a.id = e.app_id \
-         WHERE e.app_id = ? AND e.git_ref = ?"
+         WHERE e.app_id = ? AND e.git_ref = ? \
+         ORDER BY e.created_at DESC, e.id DESC LIMIT 1"
     );
     sqlx::query_as::<_, Environment>(sqlx::AssertSqlSafe(sql))
         .bind(app_id)
@@ -639,6 +645,49 @@ mod tests {
         );
         pool.close().await;
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A branch deleted and immediately re-created while its old row is still
+    /// being torn down leaves two rows on one `git_ref`; the deploy side must
+    /// resolve the newest (the live one), deterministically, never the dying
+    /// row whose prefix is being emptied.
+    #[tokio::test]
+    async fn by_ref_resolves_the_newest_row() {
+        let pool = connect("sqlite::memory:").await.expect("boot");
+        let cfg = crate::config::config_for_tests();
+        let app = seed(&pool).await;
+        let dying = create_environment(&pool, &cfg, new(&app.id, "gone", "refs/heads/gone"))
+            .await
+            .expect("dying row");
+        // Pin the old row's timestamp instead of racing the millisecond clock.
+        sqlx::query("UPDATE environment SET created_at = ? WHERE id = ?")
+            .bind("2020-01-01T00:00:00.000Z")
+            .bind(&dying.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let mut fresh = new(&app.id, "gone-2", "refs/heads/gone");
+        fresh.listen = 30012;
+        fresh.internal = 30013;
+        let live = create_environment(&pool, &cfg, fresh)
+            .await
+            .expect("re-created row");
+
+        let found = get_environment_by_ref(&pool, &app.id, "refs/heads/gone")
+            .await
+            .unwrap()
+            .expect("lookup");
+        assert_eq!(found.id, live.id, "the newest row is the live one");
+        // Deterministic on a repeat, not just ordered by insertion luck.
+        assert_eq!(
+            get_environment_by_ref(&pool, &app.id, "refs/heads/gone")
+                .await
+                .unwrap()
+                .unwrap()
+                .id,
+            live.id
+        );
+        pool.close().await;
     }
 
     #[tokio::test]
