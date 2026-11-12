@@ -10,7 +10,8 @@ import { resourceValue, resourceError } from "../../resource";
 import { d1Schema, d1Tables, invalidateD1 } from "../../resources";
 import type { D1Cell, D1Column, D1Filter, D1RowsQuery } from "../../runner";
 import { searchParam } from "../../search-param";
-import { Toaster, useToasts } from "../shared";
+import { LoadError } from "../../ui/load-error";
+import { EmptyState, Toaster, useToasts } from "../shared";
 import { TableDefinition } from "./definition";
 import { RowsGrid } from "./grid";
 import { nextEditorQuery } from "./query";
@@ -329,7 +330,18 @@ export const D1Editor = ({
   if (!tablesData) {
     if (loadError) {
       return (
-        <p class="text-error m-0 p-4 text-sm">{errorMessage(loadError)}</p>
+        <div class="flex flex-col items-start gap-3 p-4">
+          <LoadError error={loadError} label="Couldn't list the D1 tables" />
+          <button
+            type="button"
+            class="btn btn-sm"
+            onclick={() => {
+              void tablesRes.refetch();
+            }}
+          >
+            Retry
+          </button>
+        </div>
       );
     }
 
@@ -343,7 +355,10 @@ export const D1Editor = ({
 
   if (current === undefined) {
     return (
-      <p class="m-0 p-4 text-sm opacity-60">This database has no tables yet.</p>
+      <EmptyState
+        hint="A migration or the app's first request creates them."
+        title="This database has no tables yet"
+      />
     );
   }
 

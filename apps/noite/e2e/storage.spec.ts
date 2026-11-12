@@ -88,6 +88,31 @@ test("the overview lists the app's storage resources by id", async ({
   ).toHaveAttribute("href", new RegExp(`/storage/${appId}/d1%3Ademo$`, "u"));
 });
 
+test("the D1 tables view lists a database past five tables", async ({
+  page,
+  request,
+}) => {
+  const appId = storageApp();
+  const port = await appListenPort(request, appId);
+
+  // Six tables: celld applies workerd's SQLite budget to every cell, where
+  // `SQLITE_LIMIT_COMPOUND_SELECT` is 5. The row counts used to be one
+  // `SELECT … UNION ALL …` over the whole list, so a sixth table broke the
+  // listing (and the incomplete-looking SQL was reported as a raw celld
+  // error instead of a table list).
+  const created = await request.get(`${tenant(port)}/d1-many-tables`);
+  expect(created.ok()).toBe(true);
+
+  await page.goto(D1_ROOT(appId));
+
+  const rail = page.getByRole("navigation", { name: "Tables" });
+  const names = /extra_[1-6]/u;
+
+  // Every one of the six tables is in the rail; the count itself is not
+  // pinned, because the deploy canary may already have created `visits`.
+  await expect(rail.getByRole("button", { name: names })).toHaveCount(6);
+});
+
 test("a Worker-written object appears in the browser with its type", async ({
   page,
   request,
