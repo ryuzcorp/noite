@@ -35,9 +35,9 @@ pub use apps::{
     domain_claim, finish_app_import, get_app, get_app_by_domain, get_app_by_slug, get_app_limit,
     list_all_apps, list_app_domains, list_app_limits, list_apps, list_domains_for,
     patch_app_desired, pending_purges, purge_app_ids, rebind_local_subdomains, remove_domain,
-    rename_app, rename_app_name, set_app_asleep, set_app_awake, set_app_import_source,
-    set_app_limit, set_deployed_config, verified_domain_owner, verify_domain, write_app_status,
-    NewApp, VerifyOutcome,
+    rename_app, rename_app_name, rename_app_slug, set_app_asleep, set_app_awake,
+    set_app_import_source, set_app_limit, set_deployed_config, verified_domain_owner,
+    verify_domain, write_app_status, NewApp, VerifyOutcome,
 };
 pub use compaction::{
     bump_metric_version, delete_compactions_for, get_compacted_hours, get_metric_version,
