@@ -254,10 +254,21 @@ const DEPLOY_FACTS = {
  * the sweep or a web commit — nothing to add to the row — while a rollback
  * names the release it re-runs and a redeploy names the action. */
 interface DeployIntentFacts {
-  readonly label: (sha: string | null) => string | null;
+  /** `actor` is the row's actor: a branch deploy records its branch ref
+   * there, so the history can name branch and sha together. */
+  readonly label: (sha: string | null, actor: string | null) => string | null;
 }
 
+const branchName = (actor: string | null): string =>
+  (actor ?? "branch").replace(/^refs\/heads\//u, "");
+
 const DEPLOY_INTENTS: Record<DeployIntent, DeployIntentFacts> = {
+  branch: {
+    label: (sha, actor) =>
+      `Deploy ${branchName(actor)}${
+        sha === null ? "" : `@${sha.slice(0, 12)}`
+      }`,
+  },
   deploy: { label: () => null },
   redeploy: { label: () => "Redeploy" },
   rollback: {
@@ -273,9 +284,10 @@ const isDeployIntent = (raw: string): raw is DeployIntent =>
  * unmodelled intent reads as a plain deploy, never as another trigger. */
 export const deployIntentLabel = (
   raw: string,
-  sha: string | null
+  sha: string | null,
+  actor: string | null = null
 ): string | null =>
-  isDeployIntent(raw) ? DEPLOY_INTENTS[raw].label(sha) : null;
+  isDeployIntent(raw) ? DEPLOY_INTENTS[raw].label(sha, actor) : null;
 
 const isDeployStatus = (raw: string): raw is DeployStatus =>
   Object.hasOwn(DEPLOY_FACTS, raw);

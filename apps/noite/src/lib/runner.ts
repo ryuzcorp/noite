@@ -633,6 +633,16 @@ export const runnerRollback = (
     }
   );
 
+/** Deploy one branch's current tip to production once (the UI's Deploy
+ * button with another branch picked); the production branch itself is
+ * untouched. */
+export const runnerDeployBranch = (id: string, ref: string, role = "") =>
+  runnerRpc<{ deployId: string; ok: boolean; sha: string }>("deploys.deploy", {
+    id,
+    ref,
+    role: role === "" ? undefined : role,
+  });
+
 /** Deploy history, optionally in one preview environment (absent/"" is
  * production): the initial snapshot behind the live Deployments list. */
 export const runnerListDeploys = (id: string, environmentId = "") =>

@@ -326,6 +326,16 @@ struct RollbackParams {
 }
 
 #[derive(Deserialize)]
+struct DeployBranchParams {
+    id: String,
+    /// A branch name (`main`) or its full ref (`refs/heads/main`).
+    r#ref: String,
+    /// The caller's role in the app; the deploy needs `push`.
+    #[serde(default)]
+    role: Option<String>,
+}
+
+#[derive(Deserialize)]
 struct DeployLogParams {
     id: String,
     deploy_id: String,
@@ -1035,6 +1045,20 @@ async fn dispatch_call(
                 )
                 .await
                 .map(|(deploy_id, sha)| json!({ "ok": true, "sha": sha, "deployId": deploy_id })),
+            )
+        }
+        "deploys.deploy" => {
+            let p: DeployBranchParams = match parse(params, &id) {
+                Ok(p) => p,
+                Err(e) => return e,
+            };
+            complete(
+                id,
+                service::deploys::deploy_branch(state, &p.id, &p.r#ref, p.role.as_deref())
+                    .await
+                    .map(
+                        |(deploy_id, sha)| json!({ "ok": true, "sha": sha, "deployId": deploy_id }),
+                    ),
             )
         }
         "git.remote" => {

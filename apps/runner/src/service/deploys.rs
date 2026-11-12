@@ -223,6 +223,148 @@ pub async fn prepare_rollback(
     })
 }
 
+/// A validated branch deploy whose queued row already exists: a watcher sees
+/// it before the spawned task is even scheduled.
+pub struct PreparedBranchDeploy {
+    pub deploy_id: String,
+    pub sha: String,
+    /// The tip bundle the run reads: that branch's own ref, never production's.
+    pub key: String,
+    app: crate::models::App,
+    pool: sqlx::SqlitePool,
+    cfg: std::sync::Arc<crate::config::Config>,
+    procs: crate::host::supervisor::ProcMap,
+    logs: crate::host::logs::LogState,
+    deploying: deploy::Deploying,
+}
+
+impl PreparedBranchDeploy {
+    /// Build the branch's tip into production. Explicit: a branch tip equal to
+    /// the live sha still builds, the way Redeploy does.
+    pub async fn run(self) {
+        let Self {
+            deploy_id,
+            sha,
+            key,
+            app,
+            pool,
+            cfg,
+            procs,
+            logs,
+            deploying,
+        } = self;
+        deploy::deploy_app(
+            &pool,
+            &cfg,
+            &procs,
+            &logs,
+            &deploying,
+            app,
+            deploy::DeployTarget::Production,
+            &key,
+            Some(&sha),
+            deploy::DeployTrigger::Explicit,
+            Some(&deploy_id),
+        )
+        .await;
+    }
+}
+
+/// Resolve `reference` to one branch's current tip and pre-create its deploy
+/// row. The row records `DeployIntent::Branch` and the branch ref in `actor`,
+/// so the history reads `Deploy <branch>@<sha>`.
+pub async fn prepare_branch_deploy(
+    state: &AppState,
+    id: &str,
+    reference: &str,
+    role: Option<&str>,
+) -> Result<PreparedBranchDeploy, ApiError> {
+    // The UI's Deploy button is the same operator surface as Redeploy, so it
+    // carries the same push gate.
+    super::environments::require_push(role)?;
+    let app = app_or_404(state, id).await?;
+    let branch = branch_ref(reference)?;
+    let bare = crate::host::forge::read_mirror(state, &app.slug)
+        .await
+        .map_err(ApiError::from_anyhow)?;
+    let sha = crate::host::forge::resolve_user_ref(&bare, &branch)
+        .await
+        .map_err(|e| {
+            let msg = format!("{e:#}");
+            if msg.contains("not found") {
+                ApiError::not_found(msg)
+            } else {
+                ApiError::bad(msg)
+            }
+        })?;
+    // The bundle `after_receive` wrote for that branch's tip, never the
+    // production one: the branch's commit is materialized from its own ref.
+    let key = format!("git/{}/{}/{sha}.bundle", app.slug, branch);
+    let deploy_id = db::queue_deploy(
+        &state.pool,
+        &app.id,
+        None,
+        crate::models::DeployIntent::Branch,
+        &sha,
+        Some(branch.as_str()),
+    )
+    .await
+    .map_err(|e| ApiError::internal(e.to_string()))?;
+    Ok(PreparedBranchDeploy {
+        deploy_id,
+        sha,
+        key,
+        app,
+        pool: state.pool.clone(),
+        cfg: state.config.clone(),
+        procs: state.procs.clone(),
+        logs: state.logs.clone(),
+        deploying: state.deploying.clone(),
+    })
+}
+
+/// Deploy one branch's current tip to production, once. The production
+/// branch itself (and the automatic tip pipeline) is not touched: a later
+/// push to it deploys exactly as before, which is the rollback rule in
+/// `host::loop_::sweep_needs_tip` (a git tip the history already built is
+/// never pulled back over a release).
+///
+/// `reference` is a branch name (`main`) or its full ref
+/// (`refs/heads/main`); it goes through the same caller-reference guard the
+/// source views use, so a reserved namespace can never be resolved here.
+/// Returns the new deploy id and the sha; progress follows on the deploys
+/// stream.
+pub async fn deploy_branch(
+    state: &AppState,
+    id: &str,
+    reference: &str,
+    role: Option<&str>,
+) -> Result<(String, String), ApiError> {
+    let prepared = prepare_branch_deploy(state, id, reference, role).await?;
+    let out = (prepared.deploy_id.clone(), prepared.sha.clone());
+    tokio::spawn(async move { prepared.run().await });
+    Ok(out)
+}
+
+/// The full branch ref for a caller's reference: a branch name gains the
+/// `refs/heads/` prefix, an already-qualified ref is kept. Anything else
+/// (`refs/tags/…`, a sha) is refused here so the history label and the bundle
+/// key always name a branch.
+fn branch_ref(reference: &str) -> Result<String, ApiError> {
+    let name = reference.trim();
+    if name.is_empty() {
+        return Err(ApiError::bad("branch is required"));
+    }
+    let refname = if name.starts_with("refs/heads/") {
+        name.to_string()
+    } else if name.starts_with("refs/") || sha_valid(name) {
+        return Err(ApiError::bad("deploy ref must be a branch"));
+    } else {
+        format!("refs/heads/{name}")
+    };
+    Ok(refname)
+}
+
 /// Re-run the pipeline at an old successful tip bundle (immutable per-sha),
 /// for production or one preview environment. Returns the new deploy id and
 /// the sha; progress follows on that target's stream.

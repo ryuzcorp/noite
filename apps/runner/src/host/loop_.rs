@@ -1002,6 +1002,91 @@ mod tests {
         pool.close().await;
     }
 
+    /// A one-off deploy of another branch's tip leaves production serving that
+    /// sha while the production branch's tip is a different, already-built
+    /// release. The fallback sweep must not pull the production tip back: the
+    /// same rule that protects a rollback protects this — a tip the history
+    /// holds a success for is a release the operator moved off on purpose. The
+    /// production branch still deploys on its next push (the push fast path),
+    /// which is the promised behaviour, not a sweep.
+    #[tokio::test]
+    async fn sweep_skips_the_production_tip_after_a_branch_deploy() {
+        use crate::models::DeployIntent;
+        let cfg = crate::config::config_for_tests();
+        let pool = db::connect("sqlite::memory:").await.expect("memory db");
+        let app = db::create_app(
+            &pool,
+            &cfg,
+            db::NewApp {
+                name: "branch-deploy",
+                slug: "branch-deploy",
+                user_id: "local",
+                subdomain: "branch-deploy.localhost",
+                listen: 30410,
+                internal: 30411,
+            },
+        )
+        .await
+        .expect("app");
+        // The production branch's tip was built and live before the branch
+        // deploy: that success row is what keeps the sweep away afterwards.
+        db::upsert_deploy(
+            &pool,
+            None,
+            &app.id,
+            None,
+            DeployStatus::Success,
+            Some("main1111"),
+            "",
+        )
+        .await
+        .expect("main deploy");
+        // The operator's one-off deploy of `feature`: its own row, then the
+        // success the run records. Production now serves `feature2222`.
+        let deploy_id = db::queue_deploy(
+            &pool,
+            &app.id,
+            None,
+            DeployIntent::Branch,
+            "feature2222",
+            Some("refs/heads/feature"),
+        )
+        .await
+        .expect("queue branch deploy");
+        db::upsert_deploy(
+            &pool,
+            Some(&deploy_id),
+            &app.id,
+            None,
+            DeployStatus::Building,
+            Some("feature2222"),
+            "",
+        )
+        .await
+        .expect("branch deploy building");
+        db::upsert_deploy(
+            &pool,
+            Some(&deploy_id),
+            &app.id,
+            None,
+            DeployStatus::Success,
+            Some("feature2222"),
+            "",
+        )
+        .await
+        .expect("branch deploy success");
+        let fresh = db::get_app(&pool, &app.id).await.unwrap().expect("app row");
+        assert_eq!(fresh.last_deploy_sha.as_deref(), Some("feature2222"));
+
+        assert!(
+            !sweep_needs_tip(&pool, &fresh, &deploy::DeployTarget::Production, "main1111")
+                .await
+                .unwrap(),
+            "the production tip was already built: the sweep must not revert the branch deploy"
+        );
+        pool.close().await;
+    }
+
     /// The owner rule (2026-11-10): two consecutive failed deploys of the same
     /// sha pause the fallback sweep, a new sha is a new budget, and a cancel
     /// keeps the sweep off too.

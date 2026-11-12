@@ -35,14 +35,25 @@
 //!   Loading --> LookupFailed: TargetsFailed
 //!   Found --> Redeploying: RedeployRequested
 //!   Found --> RollingBack: RollbackRequested
+//!   Idle --> Deploying: BranchDeployRequested
+//!   Found --> Deploying: BranchDeployRequested
+//!   Found --> Found: BranchPicked
 //!   Redeploying --> Loading: Succeeded (reload targets)
 //!   RollingBack --> Loading: Succeeded (reload targets)
+//!   Deploying --> Loading: Succeeded (reload targets)
 //!   Redeploying --> ActionFailed: Failed
 //!   RollingBack --> ActionFailed: Failed
+//!   Deploying --> ActionFailed: Failed
 //!   LookupFailed --> Loading: TargetsOpened
 //!   ActionFailed --> Loading: TargetsOpened
 //!   None --> Loading: TargetsOpened
 //! ```
+//!
+//! The header's Deploy button also carries a branch picker: with the
+//! production branch selected (the default) it is exactly the Redeploy above;
+//! with any other branch selected it runs a one-off production deploy of that
+//! branch's tip (`Deploy <branch>@<sha>`) and leaves the production branch
+//! setting alone, so its next push deploys as usual.
 //!
 //! A failed lookup is its own state (`LookupFailed`), rendered as a failure
 //! with a retry — never as "no earlier deploy to roll back to".
@@ -261,8 +272,9 @@ export type DropdownAction = Data.TaggedEnum<{
   Idle: Record<never, never>;
   Redeploying: Record<never, never>;
   RollingBack: Record<never, never>;
+  Deploying: Record<never, never>;
   Failed: {
-    readonly kind: "redeploy" | "rollback";
+    readonly kind: "branch" | "redeploy" | "rollback";
     readonly error: string;
   };
 }>;
@@ -272,12 +284,18 @@ export const DropdownActionTypes = Data.taggedEnum<DropdownAction>();
 export interface DropdownModel {
   readonly appId: string;
   readonly action: DropdownAction;
+  /** The branch picked in the Deploy picker; `null` is the production branch
+   * (the default), which behaves exactly like Redeploy. */
+  readonly branch: string | null;
   /** The release serving right now: a target equal to it is not a rollback. */
   readonly liveSha: string | null;
   readonly lookup: Lookup;
 }
 
 export type DropdownMessage = Data.TaggedEnum<{
+  BranchDeployFailed: { readonly error: string };
+  BranchDeployRequested: { readonly branch: string };
+  BranchPicked: { readonly branch: string };
   RollbackFailed: { readonly error: string };
   RollbackRequested: { readonly sha: string };
   RedeployFailed: { readonly error: string };
@@ -326,6 +344,26 @@ const loadTargets = (appId: string): Cmd<DropdownMessage> =>
     })
   );
 
+/** A one-off production deploy of another branch's tip. The row it creates
+ * records `Deploy <branch>@<sha>`; the production branch is untouched. */
+const deployBranchCall = (
+  appId: string,
+  branch: string
+): Cmd<DropdownMessage> =>
+  attempt<DropdownMessage>(
+    async () => {
+      await api<{ ok: true }>("/api/apps/deployBranch", {
+        appId,
+        ref: branch,
+      });
+    },
+    () => DropdownMsg.Succeeded(),
+    (error) =>
+      DropdownMsg.BranchDeployFailed({
+        error: operationMessage("Deploying the branch failed", error),
+      })
+  );
+
 /** Both header actions re-run the pipeline at a sha; only the failure a
  * user reads back differs. */
 const rollbackCall = (
@@ -350,11 +388,65 @@ export const rollbackTarget = (
   liveSha: string | null
 ): string => candidates.find((sha) => sha !== "" && sha !== liveSha) ?? "";
 
+/** The branch picker's transitions, split out so the dropdown's own switch
+ * stays the rollback/redeploy table: `null` means the message is not the
+ * picker's. */
+const branchStep = (
+  model: DropdownModel,
+  message: DropdownMessage
+): Step<DropdownModel, DropdownMessage> | null => {
+  switch (message._tag) {
+    case "BranchPicked": {
+      return { model: { ...model, branch: message.branch } };
+    }
+
+    case "BranchDeployRequested": {
+      if (model.action._tag !== "Idle" || !message.branch) {
+        return { model };
+      }
+
+      return {
+        cmd: keyed(
+          `branch-deploy:${model.appId}`,
+          deployBranchCall(model.appId, message.branch)
+        ),
+        model: {
+          ...model,
+          action: DropdownActionTypes.Deploying(),
+          branch: message.branch,
+        },
+      };
+    }
+
+    case "BranchDeployFailed": {
+      return {
+        model: {
+          ...model,
+          action: DropdownActionTypes.Failed({
+            error: message.error,
+            kind: "branch",
+          }),
+        },
+      };
+    }
+
+    default: {
+      return null;
+    }
+  }
+};
+
 /** The one transition function for the Deploy dropdown. */
 export const updateDropdown = (
   model: DropdownModel,
   message: DropdownMessage
 ): Step<DropdownModel, DropdownMessage> => {
+  const branch = branchStep(model, message);
+
+  if (branch !== null) {
+    return branch;
+  }
+
   switch (message._tag) {
     case "TargetsOpened": {
       return {

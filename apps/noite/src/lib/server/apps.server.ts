@@ -21,6 +21,7 @@ import {
   runnerGetAppBySlug,
   runnerDeleteApp,
   runnerCancelDeploy,
+  runnerDeployBranch,
   runnerDeployLog,
   runnerGitRemote,
   runnerListApps,
@@ -644,6 +645,29 @@ export const rollback = apiAction(
 
     try {
       return await runnerRollback(appId, sha, environmentId ?? "", role);
+    } catch (error) {
+      failRunner(error);
+    }
+  }
+);
+
+const DeployBranchArgs = Schema.Struct({
+  appId: Schema.String,
+  /** A branch name (`main`) or its full `refs/heads/*` ref. */
+  ref: Schema.String,
+});
+
+/** Deploy another branch's current tip to production once (push-gated): the
+ * production branch keeps deploying on its own pushes. Progress follows on the
+ * deploys stream like a normal deploy. */
+export const deployBranch = apiAction(
+  DeployBranchArgs,
+  async ({ appId, ref }, { env, request }) => {
+    const user = await sessionUser(request, env);
+    const { role } = await requireAppRole(appId, user.id, "push");
+
+    try {
+      return await runnerDeployBranch(appId, ref, role);
     } catch (error) {
       failRunner(error);
     }

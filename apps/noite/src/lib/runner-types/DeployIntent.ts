@@ -10,10 +10,11 @@
  *   [*] --> Deploy: a push, a web commit or the tip sweep
  *   [*] --> Rollback: an operator re-runs an old successful sha
  *   [*] --> Redeploy: an environment deploy at its ref's head
+ *   [*] --> Branch: an operator deploys another branch's tip to production
  * ```
  *
  * The intent is set once, when the row is created, and never changes: it
  * describes the request that started the run, so a rollback whose pipeline
  * then fails is still a rollback.
  */
-export type DeployIntent = "deploy" | "rollback" | "redeploy";
+export type DeployIntent = "deploy" | "rollback" | "redeploy" | "branch";
