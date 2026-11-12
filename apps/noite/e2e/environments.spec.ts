@@ -99,8 +99,10 @@ test(
     await expect(
       page.getByRole("link", { name: /feature\.envs\./u })
     ).toBeVisible({ timeout: 30_000 });
+    // A group for the branch exists (scoped to the group card: the header's
+    // Deploy branch picker also carries a "feature" option, which is hidden).
     await expect(
-      page.getByText("feature", { exact: true }).first()
+      page.locator('section[id^="environment-"]').filter({ hasText: "feature" })
     ).toBeVisible();
 
     // The environment serves the branch's deploy on its own host. (Code mode no
