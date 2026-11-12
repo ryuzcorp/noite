@@ -205,7 +205,7 @@ const DEPLOY_FACTS = {
   building: {
     finished: false,
     inFlight: true,
-    label: "building",
+    label: "Building",
     succeeded: false,
   },
   // The operator's stop: a finished row that is not a failure. It keeps its
@@ -219,19 +219,19 @@ const DEPLOY_FACTS = {
   deploying: {
     finished: false,
     inFlight: true,
-    label: "deploying",
+    label: "Deploying",
     succeeded: false,
   },
   failed: {
     finished: true,
     inFlight: false,
-    label: "failed",
+    label: "Failed",
     succeeded: false,
   },
   queued: {
     finished: false,
     inFlight: true,
-    label: "queued",
+    label: "Queued",
     succeeded: false,
   },
   // The sweep closed a row nothing reported on: a timeout, not a build
@@ -245,7 +245,7 @@ const DEPLOY_FACTS = {
   success: {
     finished: true,
     inFlight: false,
-    label: "success",
+    label: "Succeeded",
     succeeded: true,
   },
 } as const satisfies Record<DeployStatus, DeployStatusFacts>;
