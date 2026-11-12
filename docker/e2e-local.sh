@@ -391,15 +391,20 @@ while [ "$attempt" -lt 100 ]; do
         echo "error: $restarts container restarts during the lane"
         rc=1
       fi
+      # Since the reconcile tick pushes only when the table changed (#262), a
+      # short shard sees few pushes: the boot push plus one per app/route
+      # change. Two pushes and generation 2 still prove a post-boot push
+      # landed without reloading; a fixed count tracks shard size, not the
+      # property.
       pushes="$(printf '%s\n' "$edge_log" | grep -c "edge_routes: table pushed" || true)"
-      if [ "$pushes" -lt 5 ]; then
-        echo "error: expected at least 5 route-table pushes, found $pushes (pushes never ran?)"
+      if [ "$pushes" -lt 2 ]; then
+        echo "error: expected a route-table push after boot, found $pushes push(es) (pushes never ran?)"
         rc=1
       fi
       # The module logs through Caddy's zap logger: "generation":N (JSON),
       # not generation=N.
       maxgen="$(printf '%s\n' "$edge_log" | grep -o '"generation":[0-9]*' | grep -o "[0-9]*" | sort -n | tail -1)"
-      if [ -z "$maxgen" ] || [ "$maxgen" -lt 5 ]; then
+      if [ -z "$maxgen" ] || [ "$maxgen" -lt 2 ]; then
         echo "error: route-table generation never advanced (max ${maxgen:-none})"
         rc=1
       fi
