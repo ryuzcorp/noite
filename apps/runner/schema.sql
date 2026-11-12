@@ -335,10 +335,17 @@ CREATE TABLE IF NOT EXISTS app_branch_rule (
 -- prefixes finished with no app row owning the slug — the delete's background
 -- chore, a same-slug create/rename's authoritative wipe, or the resume pass
 -- (`host::purge::resume_pending`) at boot and on the reconcile loop.
+--
+-- `build_uid` is the deleted app's per-app build uid (SPEC, Tenant
+-- isolation), reserved here for as long as the wipe is owed: its
+-- `builds/<slug>` and `cache/<slug>` trees still exist and are owned by that
+-- uid until the wipe removes them, so the allocator must not hand it to a new
+-- app before then (`db::alloc::ensure_app_build_uid`).
 CREATE TABLE IF NOT EXISTS app_purge (
   app_id TEXT PRIMARY KEY NOT NULL,
   slug TEXT NOT NULL,
-  created_at TEXT NOT NULL
+  created_at TEXT NOT NULL,
+  build_uid INTEGER
 );
 
 CREATE INDEX IF NOT EXISTS idx_app_purge_slug ON app_purge(slug);

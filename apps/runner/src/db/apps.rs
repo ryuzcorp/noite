@@ -541,44 +541,52 @@ pub async fn rebind_local_subdomains(pool: &SqlitePool, base_domain: &str) -> sq
 ///   resumes at boot and on the reconcile loop. Before it, the wipe lived
 ///   only in the process, so a crash, an S3 failure or a wipe stopped by a
 ///   re-create that then aborted left the tenant's bucket data behind with
-///   nothing to retry it;
+///   nothing to retry it. The app's `build_uid` rides along: the row delete
+///   frees the uid, but its `builds/<slug>` and `cache/<slug>` trees stay
+///   owned by it until the wipe removes them, so the allocator reserves it
+///   from the tombstone
+///   ([`crate::db::alloc::ensure_app_build_uid`]) — otherwise a new app's
+///   first build could run as the uid that still owns another tenant's files
+///   (merge-group e2e, 2026-11-12);
 /// - the app's and its environments' scoped keys `revoking`. The slug is
 ///   free once this returns, so a still-`live` row would keep handing a
 ///   valid key to the old owner after a new app took the same prefix
 ///   (review finding, 2026-11-12). Only the row state changes here; the
 ///   store-side revoke is the background sweep's job and retries.
 ///
-/// `BEGIN IMMEDIATE`, not a deferred begin: this transaction reads the slug
-/// before it writes, and a deferred transaction that reads first then writes
-/// is refused the moment another connection commits in between —
-/// `SQLITE_BUSY_SNAPSHOT`, reported as `database is locked` and *not*
-/// retried by `busy_timeout`, because the connection's read snapshot is
-/// already stale. It is the only read-before-write transaction on a pool
-/// other tasks share (`connect`'s schema apply reads first too, but on a
-/// pool nothing else holds yet). A delete always runs next to the previous
-/// delete's background wipe (`clear_app_purges`), so that interleaving is
-/// routine rather than rare: it flaked `api::tests::apps_delete_agrees` in
-/// CI. Taking the write lock up front makes a concurrent writer wait
-/// (through the connection's `busy_timeout`) instead of making this
-/// transaction fail, and the row is read after the lock, so the snapshot it
-/// sees is the one it deletes.
+/// `BEGIN IMMEDIATE`, not a deferred begin: this transaction reads the
+/// slug (and the uid it must reserve) before it writes, and a deferred
+/// transaction that reads first then writes is refused the moment another
+/// connection commits in between — `SQLITE_BUSY_SNAPSHOT`, reported as
+/// `database is locked` and *not* retried by `busy_timeout`, because the
+/// connection's read snapshot is already stale. It is the only
+/// read-before-write transaction on a pool other tasks share (`connect`'s
+/// schema apply reads first too, but on a pool nothing else holds yet). A
+/// delete always runs next to the previous delete's background wipe
+/// (`clear_app_purges`), so that interleaving is routine rather than rare:
+/// it flaked `api::tests::apps_delete_agrees` in CI. Taking the write lock
+/// up front makes a concurrent writer wait (through the connection's
+/// `busy_timeout`) instead of making this transaction fail, and the row is
+/// read after the lock, so the snapshot it sees is the one it deletes.
 pub async fn delete_app(pool: &SqlitePool, id: &str) -> sqlx::Result<()> {
     let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
-    let slug: Option<String> = sqlx::query_scalar("SELECT slug FROM main.app WHERE id = ?")
-        .bind(id)
-        .fetch_optional(&mut *tx)
-        .await?;
+    let row: Option<(String, Option<i64>)> =
+        sqlx::query_as("SELECT slug, build_uid FROM main.app WHERE id = ?")
+            .bind(id)
+            .fetch_optional(&mut *tx)
+            .await?;
     sqlx::query("DELETE FROM main.app WHERE id = ?")
         .bind(id)
         .execute(&mut *tx)
         .await?;
-    if let Some(slug) = slug {
+    if let Some((slug, build_uid)) = row {
         sqlx::query(
-            "INSERT OR REPLACE INTO main.app_purge (app_id, slug, created_at) \
-             VALUES (?, ?, datetime('now'))",
+            "INSERT OR REPLACE INTO main.app_purge (app_id, slug, created_at, build_uid) \
+             VALUES (?, ?, datetime('now'), ?)",
         )
         .bind(id)
         .bind(&slug)
+        .bind(build_uid)
         .execute(&mut *tx)
         .await?;
         sqlx::query(

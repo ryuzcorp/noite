@@ -15,7 +15,7 @@ use sqlx::SqliteConnection;
 pub const FIRST_COMPACTED_VERSION: i64 = 100;
 
 /// Version a database has after every migration ran.
-pub const SCHEMA_VERSION: i64 = FIRST_COMPACTED_VERSION + 6;
+pub const SCHEMA_VERSION: i64 = FIRST_COMPACTED_VERSION + 7;
 
 /// One upgrade step: the statements that take a database from `version - 1`
 /// to `version`. Empty at the compacted baseline; append above it to change
@@ -84,6 +84,19 @@ pub const MIGRATIONS: &[Migration] = &[
               ); \
               CREATE INDEX IF NOT EXISTS main.idx_app_purge_slug \
               ON app_purge(slug);",
+    },
+    Migration {
+        // 107: the build uid a deleted app's wipe still owns. The row delete
+        // frees the uid at once, but its `builds/<slug>` and `cache/<slug>`
+        // trees survive, owned by that uid, until the background wipe removes
+        // them. Handing the uid to a new app in that window ran its build
+        // with the departed tenant's files readable (merge-group e2e,
+        // 2026-11-12: the hostile build read a sibling's package caches).
+        // `db::delete_app` writes it with the tombstone and
+        // `db::alloc::ensure_app_build_uid` reserves it until that tombstone
+        // is cleared by the wipe.
+        version: FIRST_COMPACTED_VERSION + 7,
+        sql: "ALTER TABLE main.app_purge ADD COLUMN build_uid INTEGER;",
     },
 ];
 
@@ -323,6 +336,42 @@ mod tests {
         .await
         .expect("table lookup");
         assert_eq!(found, 1);
+    }
+
+    /// The 107 step adds the reserved build uid to the pending-purge
+    /// tombstones of a stamped database, so an install that upgrades with a
+    /// wipe still owed keeps that uid out of the allocator's way.
+    #[tokio::test]
+    async fn the_app_purge_uid_step_upgrades_a_stamped_database() {
+        let mut conn = memory().await;
+        sqlx::raw_sql(
+            "CREATE TABLE main.app (id TEXT PRIMARY KEY, slug TEXT); \
+             CREATE TABLE main.deploy (id TEXT PRIMARY KEY, app_id TEXT, environment_id TEXT, \
+                                       sha TEXT, status TEXT, intent TEXT, error TEXT, \
+                                       created_at TEXT); \
+             CREATE TABLE main.app_purge (app_id TEXT PRIMARY KEY NOT NULL, slug TEXT NOT NULL, \
+                                          created_at TEXT NOT NULL); \
+             PRAGMA main.user_version = 106;",
+        )
+        .execute(&mut conn)
+        .await
+        .expect("seed a 106 database");
+        apply(
+            &mut conn,
+            "CREATE TABLE IF NOT EXISTS main.app (id TEXT PRIMARY KEY, slug TEXT);",
+            SCHEMA_VERSION,
+            MIGRATIONS,
+        )
+        .await
+        .expect("migrate forward");
+        assert_eq!(version(&mut conn).await, SCHEMA_VERSION);
+        let columns: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM pragma_table_info('app_purge') WHERE name = 'build_uid'",
+        )
+        .fetch_one(&mut conn)
+        .await
+        .expect("column lookup");
+        assert_eq!(columns, 1);
     }
 
     /// The 102 step adds the budget's covering index to a stamped database.
