@@ -564,11 +564,23 @@ pub async fn purge_slug(
 
 /// Remove the `.<slug>.recreated-<ts>` salvage dirs `move_dir` leaves under
 /// the per-app trees. Matching is by exact prefix, leading dot included, so a
-/// slug that is a prefix of another (`ab` vs `abc`) never loses its data.
+/// slug that is a prefix of another (`ab` vs `abc`) never loses its data. The
+/// bare-repo trees name their entries `<slug>.git`, so their salvage dirs are
+/// `.<slug>.git.recreated-…`; `envs/` holds the per-environment durability and
+/// is swept the same way as the rest of the app's local data.
 async fn remove_recreated_siblings(cfg: &Config, slug: &str) -> anyhow::Result<()> {
     let root = exec::work_root(cfg);
-    let prefix = format!(".{slug}.recreated-");
-    for tree in ["projects", "fleets", "builds", "cache"] {
+    let plain = format!(".{slug}.recreated-");
+    let git = format!(".{slug}.git.recreated-");
+    for (tree, prefix) in [
+        ("repos", git.as_str()),
+        ("git-http", git.as_str()),
+        ("projects", plain.as_str()),
+        ("fleets", plain.as_str()),
+        ("builds", plain.as_str()),
+        ("cache", plain.as_str()),
+        ("envs", plain.as_str()),
+    ] {
         let parent = root.join(tree);
         let Ok(mut entries) = tokio::fs::read_dir(&parent).await else {
             continue;
@@ -578,7 +590,7 @@ async fn remove_recreated_siblings(cfg: &Config, slug: &str) -> anyhow::Result<(
             let Some(name) = name.to_str() else {
                 continue;
             };
-            if !name.starts_with(&prefix) {
+            if !name.starts_with(prefix) {
                 continue;
             }
             let path = entry.path();
@@ -779,8 +791,60 @@ mod tests {
         cfg.work_dir = scratch.path().join("work").to_string_lossy().into_owned();
         cfg.s3_endpoint = crate::testutil::spawn_s3_stub().await;
         let root = crate::host::exec::work_root(&cfg);
-        for tree in ["projects", "fleets", "builds", "cache"] {
-            for name in ["ab", ".ab.recreated-100", ".abc.recreated-100", "abc"] {
+        // `repos/` and `git-http/` name their entries `<slug>.git`, so their
+        // salvage dirs carry the `.git` infix; the rest are plain.
+        for (tree, own, salvage, other, other_salvage) in [
+            (
+                "repos",
+                "ab.git",
+                ".ab.git.recreated-100",
+                "abc.git",
+                ".abc.git.recreated-100",
+            ),
+            (
+                "git-http",
+                "ab.git",
+                ".ab.git.recreated-100",
+                "abc.git",
+                ".abc.git.recreated-100",
+            ),
+            (
+                "projects",
+                "ab",
+                ".ab.recreated-100",
+                "abc",
+                ".abc.recreated-100",
+            ),
+            (
+                "fleets",
+                "ab",
+                ".ab.recreated-100",
+                "abc",
+                ".abc.recreated-100",
+            ),
+            (
+                "builds",
+                "ab",
+                ".ab.recreated-100",
+                "abc",
+                ".abc.recreated-100",
+            ),
+            (
+                "cache",
+                "ab",
+                ".ab.recreated-100",
+                "abc",
+                ".abc.recreated-100",
+            ),
+            (
+                "envs",
+                "ab",
+                ".ab.recreated-100",
+                "abc",
+                ".abc.recreated-100",
+            ),
+        ] {
+            for name in [own, salvage, other_salvage, other] {
                 let path = root.join(tree).join(name);
                 std::fs::create_dir_all(&path).expect("fixture dir");
                 std::fs::write(path.join("keep.json"), "{}").expect("fixture file");
@@ -801,21 +865,71 @@ mod tests {
         .await
         .expect("purge");
         assert_eq!(ended, Purged::Done);
-        for tree in ["projects", "fleets", "builds", "cache"] {
+        for (tree, own, salvage, other, other_salvage) in [
+            (
+                "repos",
+                "ab.git",
+                ".ab.git.recreated-100",
+                "abc.git",
+                ".abc.git.recreated-100",
+            ),
+            (
+                "git-http",
+                "ab.git",
+                ".ab.git.recreated-100",
+                "abc.git",
+                ".abc.git.recreated-100",
+            ),
+            (
+                "projects",
+                "ab",
+                ".ab.recreated-100",
+                "abc",
+                ".abc.recreated-100",
+            ),
+            (
+                "fleets",
+                "ab",
+                ".ab.recreated-100",
+                "abc",
+                ".abc.recreated-100",
+            ),
+            (
+                "builds",
+                "ab",
+                ".ab.recreated-100",
+                "abc",
+                ".abc.recreated-100",
+            ),
+            (
+                "cache",
+                "ab",
+                ".ab.recreated-100",
+                "abc",
+                ".abc.recreated-100",
+            ),
+            (
+                "envs",
+                "ab",
+                ".ab.recreated-100",
+                "abc",
+                ".abc.recreated-100",
+            ),
+        ] {
             assert!(
-                !root.join(tree).join(".ab.recreated-100").exists(),
+                !root.join(tree).join(salvage).exists(),
                 "{tree}: the slug's salvage dir is removed"
             );
             assert!(
-                !root.join(tree).join("ab").exists(),
+                !root.join(tree).join(own).exists(),
                 "{tree}: the slug's own dir is wiped"
             );
             assert!(
-                root.join(tree).join(".abc.recreated-100").exists(),
+                root.join(tree).join(other_salvage).exists(),
                 "{tree}: a longer slug's salvage dir is untouched"
             );
             assert!(
-                root.join(tree).join("abc").exists(),
+                root.join(tree).join(other).exists(),
                 "{tree}: a longer slug's dir is untouched"
             );
         }

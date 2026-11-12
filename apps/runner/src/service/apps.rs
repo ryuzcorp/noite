@@ -2093,6 +2093,75 @@ mod tests {
         drop(dir);
     }
 
+    /// The marker is not an ownership proof: a cancel must refuse a target a
+    /// row owns again (a re-create or a stale marker) instead of stopping that
+    /// tenant's fleet and moving its data into the cancelling app.
+    #[tokio::test]
+    async fn a_cancel_never_moves_a_target_that_a_row_owns_again() {
+        let (state, dir) = test_state(10).await;
+        let app = db::create_app(
+            &state.pool,
+            &state.config,
+            db::NewApp {
+                name: "Canceller",
+                slug: "co-old",
+                user_id: "u1",
+                subdomain: "co-old.localhost",
+                listen: 30650,
+                internal: 30651,
+            },
+        )
+        .await
+        .expect("app row");
+        crate::host::rename::write_rename_marker_with_attempts_for_test(
+            &state.config,
+            &app.id,
+            "co-old",
+            "co-new",
+            3,
+            "storage move failed",
+        )
+        .await
+        .expect("pending marker");
+        // Another app now owns the target (a row inserted before the marker
+        // could be resolved, as an upgrade or a direct insert can leave it).
+        db::create_app(
+            &state.pool,
+            &state.config,
+            db::NewApp {
+                name: "Owner",
+                slug: "co-new",
+                user_id: "u2",
+                subdomain: "co-new.localhost",
+                listen: 30652,
+                internal: 30653,
+            },
+        )
+        .await
+        .expect("owner row");
+        let root = crate::host::exec::work_root(&state.config);
+        let theirs = root.join("fleets").join("co-new");
+        std::fs::create_dir_all(&theirs).expect("owner dir");
+        std::fs::write(theirs.join("their.bin"), "theirs").expect("owner file");
+
+        let refused = rename(&state, &app.id, None, Some("co-old"))
+            .await
+            .expect_err("the target has an owner now");
+        assert!(
+            matches!(&refused, ApiError::Conflict(message) if message.contains("slug already taken")),
+            "the cancel refuses a re-owned target, got {refused:?}"
+        );
+        assert!(
+            theirs.join("their.bin").exists(),
+            "the owner's data is untouched"
+        );
+        assert!(
+            crate::host::rename::target_reserved(&state.config, "co-new").await,
+            "the marker is left for the resume pass to resolve"
+        );
+        drop(dir);
+    }
+
     /// A pending rename to one target blocks a rename to another: the earlier
     /// attempt may already have moved objects there, and committing a
     /// different target would clear its marker and leave them owned by

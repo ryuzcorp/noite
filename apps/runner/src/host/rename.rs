@@ -400,10 +400,28 @@ async fn write_marker(cfg: &Config, marker: &PendingRename) -> anyhow::Result<()
     Ok(())
 }
 
-/// Persist one failed automatic resume pass. A failed write is only warned
-/// about: the marker (and the reservation it carries) is what protects the
-/// moved data, while the count only bounds automatic retries.
-async fn record_resume_failure(cfg: &Config, marker: &PendingRename, class: &str) -> PendingRename {
+/// Persist one failed automatic resume pass, but only if the marker still is
+/// the snapshot the pass scanned: a cancel, a commit or another pass may have
+/// replaced or dropped it while this one ran, and writing the snapshot back
+/// would resurrect a reservation (or a rename the owner just cancelled). The
+/// target's guard is what makes the check and the write atomic. A failed write
+/// is only warned about: the marker protects the moved data, while the count
+/// only bounds automatic retries.
+async fn record_resume_failure(
+    cfg: &Config,
+    git_sync: &ryuz_git::GitSync,
+    marker: &PendingRename,
+    class: &str,
+) -> Option<PendingRename> {
+    let _guard = git_sync.lock(&marker.to).await;
+    let current = read_marker(&rename_marker(cfg, &marker.to)).await;
+    if current.as_ref() != Some(marker) {
+        tracing::debug!(
+            target = %marker.to,
+            "rename marker changed while its resume pass ran; the failure is not recorded"
+        );
+        return None;
+    }
     let mut next = marker.clone();
     next.attempts = next.attempts.saturating_add(1);
     next.last_failure = Some(class.to_string());
@@ -415,7 +433,7 @@ async fn record_resume_failure(cfg: &Config, marker: &PendingRename, class: &str
             "could not record a failed rename resume pass"
         );
     }
-    next
+    Some(next)
 }
 
 /// Reset a marker's failed-pass count: a manual retry (or cancel) is a fresh
@@ -459,6 +477,12 @@ fn failure_class(err: &anyhow::Error) -> String {
     } else {
         let root = err.root_cause().to_string();
         let line = root.lines().next().unwrap_or("move failed").trim();
+        // A transport error can carry a presigned store URL; this string is
+        // persisted in the marker and shown to the tenant. Never let a URL
+        // through, whatever context it arrives under.
+        if line.contains("://") {
+            return "move failed".to_string();
+        }
         return line.chars().take(80).collect();
     };
     class.to_string()
@@ -577,11 +601,17 @@ pub async fn rename_app(
 
 /// Who asked for the rename. Only a manual retry resets the marker's
 /// failed-pass count and continues past the automatic bound; the resume pass
-/// must never do either.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RenameOrigin {
+/// must never do either, and it carries the marker snapshot it acted on so a
+/// concurrent cancel or commit cannot be replayed as a fresh rename.
+enum RenameOrigin<'a> {
     Manual,
-    Auto,
+    Auto(&'a PendingRename),
+}
+
+impl RenameOrigin<'_> {
+    fn is_manual(&self) -> bool {
+        matches!(self, RenameOrigin::Manual)
+    }
 }
 
 // Same reason as `rename_app`: the params are the rename's whole context.
@@ -596,7 +626,7 @@ async fn rename_app_inner(
     app_id: &str,
     name: Option<&str>,
     slug: Option<&str>,
-    origin: RenameOrigin,
+    origin: RenameOrigin<'_>,
 ) -> anyhow::Result<App> {
     let app = db::get_app(pool, app_id)
         .await?
@@ -615,22 +645,9 @@ async fn rename_app_inner(
                 .find(|marker| marker.app_id == app.id && marker.from == app.slug)
             {
                 return cancel_pending_rename(
-                    cfg, pool, procs, deploying, git_sync, &app, name, &pending,
+                    cfg, pool, procs, logs, deploying, git_sync, &app, name, &pending,
                 )
                 .await;
-            }
-        }
-    }
-    // A manual retry of the pending target is a fresh decision by the owner:
-    // reset the failed-pass count (and the automatic bound with it) before
-    // anything can fail. Done before the guards so even a 409 for an
-    // in-flight deploy counts as the owner's retry.
-    if origin == RenameOrigin::Manual {
-        if let Some(requested) = slug {
-            if let Some(pending) = pending_renames(cfg).await.into_iter().find(|marker| {
-                marker.app_id == app.id && marker.from == app.slug && marker.to == requested
-            }) {
-                reset_resume_attempts(cfg, &pending).await;
             }
         }
     }
@@ -707,6 +724,26 @@ async fn rename_app_inner(
     // after. Taken after the AppLock (ordering: AppLock → push_guard), in
     // lexical order so opposite renames cannot invert.
     let (_old_push, _new_push) = git_sync.lock_pair(&app.slug, new_slug).await;
+    // The automatic pass acts on a marker snapshot it scanned before it had
+    // either guard. A cancel, a commit or another pass can have resolved that
+    // marker in between — replaying the snapshot as a fresh rename would undo
+    // the cancel, purge a prefix that no longer belongs to this app, or
+    // recreate a reservation for a slug a new owner now holds. Only the exact
+    // snapshot still on disk may act; anything else is a no-op for this pass.
+    let marker = rename_marker(cfg, new_slug);
+    let existing = read_marker(&marker).await;
+    if let RenameOrigin::Auto(expected) = origin {
+        if existing.as_ref() != Some(expected) {
+            tracing::debug!(
+                app_id = %app.id,
+                target = %new_slug,
+                "resume pass skipped: its rename marker changed since the scan"
+            );
+            return db::get_app(pool, app_id)
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("app not found"));
+        }
+    }
     // R-03: the service layer's check ran before these guards. A create for
     // this slug (or another rename onto it) may have landed in between, and
     // moving our prefixes onto a live slug would overwrite that app's git
@@ -720,11 +757,18 @@ async fn rename_app_inner(
     // Another unfinished rename owns this target: its moved objects may be
     // the only copy left, so taking the slug and wiping it would destroy them.
     // Only this app's own retry may continue past the reservation.
-    let marker = rename_marker(cfg, new_slug);
-    let existing = read_marker(&marker).await;
     let resuming = existing
         .as_ref()
         .is_some_and(|pending| pending.app_id == app.id && pending.from == app.slug);
+    // A manual retry of the pending target is the owner's fresh decision:
+    // reset the failed-pass count (and the automatic bound with it). Done
+    // under both guards, on the marker read under them, so it cannot rewrite
+    // a snapshot a cancel or another pass already replaced.
+    if origin.is_manual() && resuming {
+        if let Some(current) = existing.as_ref() {
+            reset_resume_attempts(cfg, current).await;
+        }
+    }
     // The file itself is the reservation, exactly like `target_reserved`: a
     // marker this pass cannot parse still guards moved data (and the resume
     // pass will remove it if it is truly malformed).
@@ -829,6 +873,7 @@ async fn cancel_pending_rename(
     cfg: &Config,
     pool: &sqlx::SqlitePool,
     procs: &ProcMap,
+    logs: &LogState,
     deploying: &Deploying,
     git_sync: &ryuz_git::GitSync,
     app: &App,
@@ -857,10 +902,24 @@ async fn cancel_pending_rename(
     if !marker_names_rename(&rename_marker(cfg, &pending.to), &app.id, &app.slug).await {
         anyhow::bail!("the pending rename changed; retry shortly");
     }
-    // No row names the target, so a fleet there can only be a leftover of the
-    // attempt: stop it before moving its state back.
+    // The marker is not an ownership proof: under the guards, re-check the
+    // target exactly like the forward move. A marker that outlived a re-create
+    // must never let this cancel stop that tenant's fleet, move its dirs or
+    // empty its prefixes into ours.
+    if let Some(other) = db::get_app_by_slug(pool, &pending.to).await? {
+        if other.id != app.id {
+            anyhow::bail!("slug already taken");
+        }
+    }
+    // Mirror the forward move: stop the source's production and environment
+    // fleets (the reconcile loop respawns them from the pre-move row while the
+    // cancel waits) and settle before moving data under a dying node. The
+    // target can only hold a leftover of the attempt (no row names it).
+    supervisor::stop_fleet(procs, &app.slug, supervisor::StopGrace::NORMAL).await;
+    supervisor::stop_environment_fleets(procs, &app.slug, supervisor::StopGrace::NORMAL).await;
     supervisor::stop_fleet(procs, &pending.to, supervisor::StopGrace::NORMAL).await;
     supervisor::stop_environment_fleets(procs, &pending.to, supervisor::StopGrace::NORMAL).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
     let root = exec::work_root(cfg);
     let pairs = vec![
         (
@@ -915,6 +974,23 @@ async fn cancel_pending_rename(
         &format!("s3://{}/{}", cfg.s3_bucket, cfg.envs_prefix(&app.slug)),
     )
     .await?;
+    // The forward move pointed every environment row (and its in-memory log
+    // ring) at the target prefix; put them back on the app's slug, or preview
+    // deploys keep writing into a prefix this call frees.
+    let envs = db::list_all_environments(pool).await.unwrap_or_default();
+    for env in envs.iter().filter(|env| env.app_id == app.id) {
+        db::set_environment_bucket(pool, &env.id, &cfg.envs_uri(&app.slug, &env.label)).await?;
+        let from = supervisor::env_fleet_key(&pending.to, &env.label);
+        let to = supervisor::env_fleet_key(&app.slug, &env.label);
+        let ring = logs.lock().await.remove(&from).unwrap_or_default();
+        if !ring.is_empty() {
+            logs.lock().await.insert(to, ring);
+        }
+    }
+    let ring = logs.lock().await.remove(&pending.to).unwrap_or_default();
+    if !ring.is_empty() {
+        logs.lock().await.insert(app.slug.clone(), ring);
+    }
     // The target is ours no longer: the marker is what reserved it, and the
     // app row (still on its slug) is untouched.
     clear_rename_marker(cfg, &pending.to).await;
@@ -1095,7 +1171,7 @@ pub async fn resume_pending_renames(
             &marker.app_id,
             None,
             Some(&marker.to),
-            RenameOrigin::Auto,
+            RenameOrigin::Auto(&marker),
         )
         .await
         {
@@ -1109,7 +1185,13 @@ pub async fn resume_pending_renames(
             }
             Err(e) => {
                 let class = failure_class(&e);
-                let next = record_resume_failure(cfg, &marker, &class).await;
+                let Some(next) = record_resume_failure(cfg, git_sync, &marker, &class).await else {
+                    // The marker this pass scanned is gone or was replaced
+                    // (a cancel, a commit, another pass): the failure belongs
+                    // to an attempt that no longer exists, so nothing is
+                    // written and no stuck event is raised.
+                    continue;
+                };
                 if next.attempts >= MAX_RESUME_ATTEMPTS {
                     record_stuck_event(pool, &next, &class).await;
                     tracing::warn!(
@@ -1300,8 +1382,42 @@ async fn rename_slugged(
 #[cfg(test)]
 mod tests {
     use super::{
-        move_dir, parse_listing_keys, pending_renames, write_rename_marker, PendingRename,
+        move_dir, parse_listing_keys, pending_renames, record_resume_failure, write_rename_marker,
+        PendingRename,
     };
+
+    /// A resume pass failing after a cancel or commit resolved its marker must
+    /// not write the stale snapshot back: that would resurrect the reservation
+    /// (and a later cancel would act on it). The compare-and-swap under the
+    /// target's guard only ever updates the marker it scanned.
+    #[tokio::test]
+    async fn a_stale_resume_snapshot_does_not_recreate_its_marker() {
+        let base =
+            std::env::temp_dir().join(format!("noite-rename-stale-{}", crate::models::new_id()));
+        let mut cfg = crate::config::config_for_tests();
+        cfg.work_dir = base.join("work").to_string_lossy().into_owned();
+        write_rename_marker(&cfg, "app-id", "old", "slug")
+            .await
+            .expect("marker");
+        let stale = pending_renames(&cfg)
+            .await
+            .into_iter()
+            .next()
+            .expect("scanned marker");
+        super::forget_target_marker(&cfg, "slug").await;
+        let git_sync = ryuz_git::GitSync::default();
+        assert!(
+            record_resume_failure(&cfg, &git_sync, &stale, "storage move failed")
+                .await
+                .is_none(),
+            "a resolved marker is not rewritten"
+        );
+        assert!(
+            pending_renames(&cfg).await.is_empty(),
+            "the cancel/commit stays resolved"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
 
     /// R-06: an empty `Contents` is the only "nothing to move" shape. Garbage
     /// and a missing `Contents` are errors — the move must fail instead of
