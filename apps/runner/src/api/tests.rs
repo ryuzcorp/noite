@@ -1874,6 +1874,71 @@ async fn environment_caps_and_labels() {
     h.finish().await;
 }
 
+/// A retired `kind='workspace'` row is invisible to model reads, but its
+/// `(app_id, label)` still occupies the unique index until the boot teardown
+/// removes it: a branch environment that sanitizes to the same label must
+/// take a suffix, not fail the insert.
+#[tokio::test]
+async fn environment_create_suffixes_a_label_a_retired_row_holds() {
+    let h = Harness::new().await;
+    let app = h.seed_app("env-legacy-label").await;
+    // A mirror carrying `feature`, the ref the create checks.
+    let bare = crate::host::git_http::http_bare(&h.state.config, &app.slug);
+    let work = h.dir.join("env-legacy-label-work");
+    std::fs::create_dir_all(&work).expect("worktree");
+    std::fs::write(work.join("index.ts"), "export const a = 1;\n").expect("source");
+    git(&work, &["init", "-q", "--initial-branch=main", "."]).await;
+    git(&work, &["add", "-A"]).await;
+    git(&work, &["commit", "-qm", "init"]).await;
+    std::fs::create_dir_all(bare.parent().expect("mirror parent")).expect("mirror parent");
+    git(
+        &h.dir,
+        &[
+            "init",
+            "-q",
+            "--bare",
+            "--initial-branch=main",
+            bare.to_str().expect("mirror path"),
+        ],
+    )
+    .await;
+    git(
+        &work,
+        &[
+            "push",
+            "-q",
+            bare.to_str().expect("mirror path"),
+            "HEAD:refs/heads/main",
+            "HEAD:refs/heads/feature",
+        ],
+    )
+    .await;
+    // The row a failed upgrade teardown left for the next boot.
+    sqlx::query(
+        "INSERT INTO environment (id, app_id, label, kind, git_ref, created_by, \
+         fleet_bucket, listen_port, internal_port, desired_state, created_at, updated_at) \
+         VALUES ('legacy-label', ?, 'feature', 'workspace', 'refs/previews/user/wip', '', \
+         ?, 32000, 32001, 'running', '2020-01-01T00:00:00.000Z', '2020-01-01T00:00:00.000Z')",
+    )
+    .bind(&app.id)
+    .bind(h.state.config.envs_uri(&app.slug, "feature"))
+    .execute(&h.state.pool)
+    .await
+    .expect("legacy workspace row");
+
+    let (status, body) = h
+        .rest(
+            "POST",
+            &format!("/v1/apps/{}/environments", app.id),
+            Some(json!({ "branch": "feature", "role": "push" })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["label"], json!("feature-2"), "{body}");
+    assert_eq!(body["kind"], json!("branch"), "{body}");
+    h.finish().await;
+}
+
 /// Live logs follow the deploy target: the app's own ring by default, one
 /// environment's ring when asked (and never production's lines), and an
 /// environment of another app is a 404 rather than that app's slug key.

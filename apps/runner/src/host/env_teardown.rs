@@ -1068,11 +1068,39 @@ mod tests {
             supervisor::FleetEntry::test_entry(child),
         );
 
+        // While the row survives (the teardown retries at the next boot), the
+        // model reads skip it instead of failing on the retired kind.
+        assert!(db::get_environment(&pool, &env_id)
+            .await
+            .expect("get")
+            .is_none());
+        assert!(db::list_environments(&pool, &app.id)
+            .await
+            .expect("list")
+            .is_empty());
+        assert!(db::list_all_environments(&pool)
+            .await
+            .expect("list all")
+            .is_empty());
+        assert!(
+            db::get_environment_by_ref(&pool, &app.id, "refs/previews/user/wip")
+                .await
+                .expect("by ref")
+                .is_none()
+        );
+        assert!(db::environment_route(&pool, "tear", "wip")
+            .await
+            .expect("route")
+            .is_none());
+        assert!(db::list_environment_routes(&pool)
+            .await
+            .expect("routes")
+            .is_empty());
+
         assert_eq!(
             retire_workspace_environments(&state).await.expect("retire"),
             1
         );
-
         // The row is gone: a model read of the table works again.
         assert!(db::list_environments(&pool, &app.id)
             .await
