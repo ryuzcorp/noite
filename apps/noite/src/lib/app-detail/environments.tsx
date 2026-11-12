@@ -69,24 +69,12 @@ import {
 import type { StatusTone } from "./lifecycle";
 
 /** A git ref as the name a group header can show: `refs/heads/x` and
- * `refs/tags/x` are the name itself, while a workspace preview's hidden
- * `refs/previews/<user>/<branch>` carries the *user* segment the UI has no use
- * for — the branch is what the environment tracks. */
+ * `refs/tags/x` are the name itself. */
 const trackedRef = (gitRef: string): string => {
   for (const prefix of ["refs/heads/", "refs/tags/"]) {
     if (gitRef.startsWith(prefix)) {
       return gitRef.slice(prefix.length);
     }
-  }
-
-  const preview = "refs/previews/";
-
-  if (gitRef.startsWith(preview)) {
-    // Only the user segment goes: a branch name may hold slashes of its own.
-    const rest = gitRef.slice(preview.length);
-    const slash = rest.indexOf("/");
-
-    return slash === -1 ? rest : rest.slice(slash + 1);
   }
 
   return gitRef;
@@ -440,15 +428,9 @@ const GroupApp = defineApp({
     const header = environmentHeaderState(env);
     const pending = groupBusy(model);
 
-    // Say what it tracks only when the label is not the branch (a workspace
-    // preview, or a branch name the label had to sanitize).
-    let tracks: string | null = null;
-
-    if (env.kind === "workspace") {
-      tracks = `Preview of ${branch}`;
-    } else if (branch !== env.label) {
-      tracks = branch;
-    }
+    // Say what it tracks only when the label is not the branch (a branch name
+    // the label had to sanitize).
+    const tracks = branch === env.label ? null : branch;
 
     // Scroll a deep-linked group into view once, waiting out the first ref.
     const box = atom.lazy(newLiveRef<HTMLElement>)();
@@ -804,10 +786,7 @@ export const CreateEnvironmentDialog = ({
     .filter(
       (one) =>
         one.name !== refs?.defaultBranch &&
-        !envs.some(
-          (env) =>
-            env.kind === "branch" && env.gitRef === `refs/heads/${one.name}`
-        )
+        !envs.some((env) => env.gitRef === `refs/heads/${one.name}`)
     )
     .map((one) => one.name);
 

@@ -47,15 +47,20 @@ pub type GitWal = ryuz_git::Wal<ryuz_git::RefsCodec>;
 
 /// Build the process's git WAL over [`GitStore`].
 ///
-/// Mirror root, layout, storage mode and ref filters match what the
-/// smart-HTTP adapter has always used, so existing mirrors, manifests and tip
-/// bundles keep working unchanged.
+/// Mirror root, layout and storage mode match what the smart-HTTP adapter has
+/// always used, so existing mirrors, manifests and tip bundles keep working
+/// unchanged. The retired `refs/previews/*` refs are no longer hidden here:
+/// nothing lists or writes them, and source reads refuse them (`valid_ref`).
 pub fn build_wal(cfg: &Config) -> GitWal {
     let store: DynStore = Arc::new(GitStore::new(cfg));
     let config = ryuz_git::WalConfig::new(
         exec::work_root(cfg).join("git-http"),
         ryuz_git::Layout::new("git"),
     )
+    // The storage layer still recognizes the retired namespace so the boot
+    // sweep can delete the refs an upgrade left (and so a manifest refresh
+    // does not lose track of them before that); no writer creates them, pushes
+    // to the namespace are denied, and Git never advertises it.
     .with_hidden_refs([crate::host::git_http::PREVIEW_REF_PREFIX.to_string()])
     .with_extra_ref_prefixes([crate::host::git_http::PREVIEW_REF_PREFIX.to_string()])
     .with_storage(ryuz_git::StorageMode::Bundle);

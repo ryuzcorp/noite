@@ -4,8 +4,7 @@
 //! fallback for bundles written behind the runner's back.
 //!
 //! A tip is per ref, not per app: `refs/heads/main` deploys production, and
-//! any ref a preview environment tracks (`refs/heads/<branch>`,
-//! `refs/previews/<userId>/<branch>`) deploys that environment.
+//! `refs/heads/<branch>` deploys that branch's environment.
 use crate::config::Config;
 use crate::host::s3;
 
@@ -20,7 +19,7 @@ pub struct TipBundle {
 /// One moved ref's tip bundle.
 #[derive(Debug, Clone)]
 pub struct RefTip {
-    /// Full ref name (`refs/heads/<branch>`, `refs/previews/<user>/<branch>`).
+    /// Full ref name (`refs/heads/<branch>`).
     pub git_ref: String,
     pub bundle: TipBundle,
 }

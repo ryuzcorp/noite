@@ -11,11 +11,11 @@ import type { EnvironmentKind } from "./EnvironmentKind";
  */
 export type Environment = { id: string, appId: string, label: string, 
 /**
- * `EnvironmentKind` as stored: `branch` or `workspace`.
+ * `EnvironmentKind` as stored: `branch`.
  */
 kind: EnvironmentKind, 
 /**
- * `refs/heads/<branch>` or `refs/previews/<userId>/<branch>`.
+ * `refs/heads/<branch>`.
  */
 gitRef: string, createdBy: string, fleetBucket: string, listenPort: number | null, internalPort: number | null, 
 /**

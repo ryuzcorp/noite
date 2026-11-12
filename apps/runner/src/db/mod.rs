@@ -57,13 +57,12 @@ pub use env::{
 };
 pub use environments::{
     count_environments, count_environments_for_app, create_environment, delete_env_override,
-    delete_environment, environment_route, environment_tenant_env, environment_worker_settings,
-    expired_workspace_environments, get_env_override, get_environment, get_environment_by_label,
-    get_environment_by_ref, insert_env_override_provisioned, list_all_environments,
-    list_env_override, list_environment_routes, list_environments, set_env_override,
-    set_env_override_provisioned, set_environment_asleep, set_environment_awake,
-    set_environment_bucket, set_environment_public, write_environment_status, EnvironmentRoute,
-    NewEnvironment,
+    delete_environment_row, environment_route, environment_tenant_env, environment_worker_settings,
+    get_env_override, get_environment, get_environment_by_label, get_environment_by_ref,
+    insert_env_override_provisioned, list_all_environments, list_env_override,
+    list_environment_routes, list_environments, set_env_override, set_env_override_provisioned,
+    set_environment_asleep, set_environment_awake, set_environment_bucket, set_environment_public,
+    write_environment_status, EnvironmentRoute, NewEnvironment,
 };
 pub use errors::{
     count_error_issues, get_error_issue, insert_error_event, list_error_events, list_error_hours,

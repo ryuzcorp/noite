@@ -4,20 +4,11 @@
 //! The host is `<label>.<slug>.<base>` and the bucket prefix is
 //! `envs/<slug>/<label>`, so a label is a DNS label: lowercase letters,
 //! digits and single `-` separators, at most 40 characters, never leading or
-//! trailing `-`, and never one of the platform's own labels (`preview`,
-//! `app-0` — the pod host and the in-browser preview host).
+//! trailing `-`.
 
 /// Longest label, in bytes: a DNS label is 63, but 40 leaves room for the
 /// collision suffix and reads better in a hostname.
 pub const MAX_LABEL: usize = 40;
-
-/// Labels the platform itself serves at `<slug>.<base>` scope-adjacent hosts
-/// (the pod host is `pod-<app id>.<base>`). An environment may never take one.
-pub const RESERVED_LABELS: &[&str] = &["preview", "app-0"];
-
-/// The pod host's label prefix (`host::edge::POD_HOST_PREFIX`): an environment
-/// label that starts with it could be mistaken for one in a hostname.
-pub const RESERVED_PREFIX: &str = "pod-";
 
 /// A branch name or arbitrary string as a DNS label: lowercased, every run of
 /// anything else folded to one `-`, trimmed to [`MAX_LABEL`], no leading or
@@ -51,18 +42,13 @@ fn truncate(mut out: String) -> String {
     }
 }
 
-fn reserved(label: &str) -> bool {
-    RESERVED_LABELS.contains(&label) || label.starts_with(RESERVED_PREFIX)
-}
-
 fn free(label: &str, taken: &[String]) -> bool {
-    !reserved(label) && !taken.iter().any(|t| t == label)
+    !taken.iter().any(|t| t == label)
 }
 
 /// The first free label at or after `candidate`: the candidate itself, else
 /// `candidate-2`, `candidate-3`, … (the candidate is trimmed to make room for
-/// the suffix, so the result is always ≤ [`MAX_LABEL`]). Reserved labels count
-/// as taken, so a branch literally named `preview` never takes the pod host.
+/// the suffix, so the result is always ≤ [`MAX_LABEL`]).
 pub fn unique_label(candidate: &str, taken: &[String]) -> String {
     if free(candidate, taken) {
         return candidate.to_string();
@@ -81,33 +67,6 @@ pub fn unique_label(candidate: &str, taken: &[String]) -> String {
         }
         n += 1;
     }
-}
-
-/// Short, stable, human-readable stand-in for a user id: the first six
-/// alphanumerics of it, lowercased (`anon` when there are none).
-pub fn short_user(user_id: &str) -> String {
-    let short: String = user_id
-        .chars()
-        .filter(char::is_ascii_alphanumeric)
-        .take(6)
-        .collect::<String>()
-        .to_ascii_lowercase();
-    if short.is_empty() {
-        "anon".to_string()
-    } else {
-        short
-    }
-}
-
-/// A workspace preview's label: `<branch>-<user short id>`, so each (user,
-/// branch) pair is one environment and the owner is visible in the host.
-pub fn workspace_label(branch: &str, user_id: &str) -> String {
-    let suffix = format!("-{}", short_user(user_id));
-    let head: String = sanitize_label(branch)
-        .chars()
-        .take(MAX_LABEL.saturating_sub(suffix.len()))
-        .collect();
-    format!("{}{suffix}", head.trim_end_matches('-'))
 }
 
 #[cfg(test)]
@@ -159,28 +118,12 @@ mod tests {
     }
 
     #[test]
-    fn reserved_labels_are_never_handed_out() {
-        // The pod host (`app-0.preview.<slug>.<base>`) owns both names, with
-        // nothing else taken.
-        assert_eq!(unique_label("preview", &[]), "preview-2");
-        assert_eq!(unique_label("app-0", &[]), "app-0-2");
-        // A branch that sanitizes onto a reserved label gets the suffix too.
-        assert_eq!(unique_label(&sanitize_label("APP-0"), &[]), "app-0-2");
-        assert_eq!(sanitize_label("Preview"), "preview");
-    }
-
-    #[test]
-    fn workspace_labels_carry_the_owner() {
-        assert_eq!(
-            workspace_label("feature/login", "3f1a9c22-0000-4000-8000-000000000001"),
-            "feature-login-3f1a9c"
-        );
-        // A short or unusable id still yields a label.
-        assert_eq!(workspace_label("main", "u1"), "main-u1");
-        assert_eq!(workspace_label("main", "-"), "main-anon");
-        // The cap holds with both halves at their worst.
-        let label = workspace_label(&"x".repeat(80), &"y".repeat(40));
-        assert!(label.len() <= MAX_LABEL, "{label}");
-        assert!(!label.ends_with('-'));
+    fn any_free_platform_adjacent_label_is_handed_out() {
+        // The pod and preview hosts are gone, so their old labels are ordinary
+        // branch labels now: only a real collision gets a suffix.
+        assert_eq!(unique_label("preview", &[]), "preview");
+        assert_eq!(unique_label("app-0", &[]), "app-0");
+        assert_eq!(unique_label("pod-abc", &[]), "pod-abc");
+        assert_eq!(unique_label("preview", &taken(&["preview"])), "preview-2");
     }
 }

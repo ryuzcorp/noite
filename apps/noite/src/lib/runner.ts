@@ -156,8 +156,6 @@ export type { PrDetail } from "./runner-types/PrDetail";
 
 export type { PrList } from "./runner-types/PrList";
 
-export type { PreviewResult } from "./runner-types/PreviewResult";
-
 export type { PrReview } from "./runner-types/PrReview";
 
 export type { PrSummary } from "./runner-types/PrSummary";
@@ -175,8 +173,6 @@ export type { SourceCommitBody } from "./runner-types/SourceCommitBody";
 export type { SourceCommitFile } from "./runner-types/SourceCommitFile";
 
 export type { SourceCommitMove } from "./runner-types/SourceCommitMove";
-
-export type { SourceFile } from "./runner-types/SourceFile";
 
 export type { StorageItem } from "./runner-types/StorageItem";
 

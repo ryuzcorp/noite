@@ -1119,10 +1119,6 @@ pub struct Config {
     /// this bounds the host, which is what keeps a crowd of previews from
     /// shedding production (SPEC, Limits).
     pub max_environments: u32,
-    /// Hours a workspace preview lives without a deploy
-    /// (`RUNNER_ENVIRONMENT_TTL_H`, 168 = 7 days — ROADMAP); 0 disables the
-    /// expiry sweep.
-    pub environment_ttl_h: u64,
     /// celld's shedding threshold in MiB (`CELLD_MAX_RSS_MB`); 0 leaves
     /// celld's default. Fleets in their own cgroup leaf measure the leaf
     /// (`CELLD_MEMORY_SCOPE=self`), so the default is 80% of the fleet's own
@@ -1532,12 +1528,6 @@ impl Config {
             max_environments: env_num(
                 "RUNNER_MAX_ENVIRONMENTS",
                 25,
-                "a non-negative integer",
-                &mut env_problems,
-            ),
-            environment_ttl_h: env_num(
-                "RUNNER_ENVIRONMENT_TTL_H",
-                168,
                 "a non-negative integer",
                 &mut env_problems,
             ),
@@ -2178,7 +2168,6 @@ pub(crate) fn config_for_tests() -> Config {
         max_apps_per_user: 10,
         max_environments_per_app: 5,
         max_environments: 25,
-        environment_ttl_h: 168,
         fleet_max_rss_mb: 0,
         fleet_memory_mb: 512,
         fleet_memory_max_mb: 512,
@@ -2368,7 +2357,6 @@ mod tests {
         "RUNNER_MAX_APPS_PER_USER",
         "RUNNER_MAX_ENVIRONMENTS_PER_APP",
         "RUNNER_MAX_ENVIRONMENTS",
-        "RUNNER_ENVIRONMENT_TTL_H",
         "RUNNER_FLEET_MAX_RSS_MB",
         "RUNNER_FLEET_MEMORY_MB",
         "RUNNER_FLEET_MEMORY_MAX_MB",
@@ -2666,7 +2654,6 @@ mod tests {
             assert_eq!(cfg.max_apps_per_user, 10);
             assert_eq!(cfg.max_environments_per_app, 5);
             assert_eq!(cfg.max_environments, 25);
-            assert_eq!(cfg.environment_ttl_h, 168);
             assert_eq!(cfg.fleet_max_rss_mb, 0);
             assert_eq!(cfg.fleet_idle_evict_s, 120);
             assert_eq!(cfg.fleet_lease_ttl_ms, 60_000);

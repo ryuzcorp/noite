@@ -90,7 +90,6 @@ These are install-level variables (Compose, the image environment). Per-app valu
 | `RUNNER_MAX_APPS_PER_USER` | `10` | Per-account app quota, enforced on create | runner-owned |
 | `RUNNER_MAX_ENVIRONMENTS_PER_APP` | `5` | [Preview environments](/apps/environments) per app, enforced at create | runner-owned |
 | `RUNNER_MAX_ENVIRONMENTS` | `25` | Preview environments per instance, enforced at create | runner-owned |
-| `RUNNER_ENVIRONMENT_TTL_H` | `168` | Hours without a deploy before a workspace preview is swept (7 days); `0` disables the sweep | runner-owned |
 | `RUNNER_FLEET_MAX_RSS_MB` | `0` | → `CELLD_MAX_RSS_MB` when non-zero; container-wide shed threshold by design (celld measures container-scale working set), never per-fleet; `0` = celld default (80% of container memory) | worker-passthrough (fleet) |
 | `RUNNER_FLEET_MEMORY_MB` | `512` | Per-fleet `memory.max` in MiB (own cgroup per fleet); per-app override in Settings → Limits; needs the multi-only cgroup grant (`docker/compose.multi.yaml`) — without it fleets share the container cgroup | runner-owned |
 | `RUNNER_FLEET_MEMORY_MAX_MB` | default cap | Ceiling for a per-app memory override in MiB; in `multi` a tenant can only lower its cap, never raise it past this. Single installs ignore it | runner-owned |

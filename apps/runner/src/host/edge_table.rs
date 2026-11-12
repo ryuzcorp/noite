@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::Config;
 use crate::db::{self, EnvironmentRoute};
-use crate::host::edge::{self, POD_HOST_PREFIX};
+use crate::host::edge;
 use crate::models::{App, AppDomain, AppLimit};
 
 fn is_zero(v: &u32) -> bool {
@@ -34,7 +34,6 @@ pub enum EdgeKind {
     Custom,
     Env,
     EnvParked,
-    Preview,
     Fallback,
     Deny,
 }
@@ -376,27 +375,8 @@ pub fn build_table(
             "custom domain",
         );
     }
-    // Preview + environment hosts, under every tenant base.
+    // Environment hosts, under every tenant base.
     for base in cfg.tenant_bases() {
-        for app in apps {
-            // The pod host: one stable label under the base
-            // (`pod-<app id>.<base>`), so the instance's own `*.<base>`
-            // certificate covers it — the old `app-0.preview.<slug>` needed a
-            // certificate no standard wildcard provides.
-            insert_app_route(
-                &mut exact,
-                &platform,
-                format!("{POD_HOST_PREFIX}{}.{base}", app.id).to_lowercase(),
-                client_zoned(
-                    cfg,
-                    EdgeKind::Preview,
-                    cfg.caddy_control_upstream.clone(),
-                    &platform_client_zone("preview"),
-                    cfg.edge.client_rpm,
-                ),
-                "pod host",
-            );
-        }
         for env in envs {
             let Some(app) = apps.iter().find(|a| a.id == env.app_id) else {
                 continue;
@@ -773,10 +753,10 @@ mod tests {
     }
 
     /// Zone names are namespaced by owner, so a slug that spells a platform
-    /// name (`control`, `preview`, `fallback`) cannot share that host's
-    /// per-visitor budget.
+    /// name (`control`, `fallback`) cannot share that host's per-visitor
+    /// budget.
     #[test]
-    fn app_slugs_never_share_a_platform_zone() {
+    fn platform_hosts_and_tenants_keep_separate_zones() {
         let cfg = config_for_tests();
         let apps: Vec<App> = ["control", "preview", "fallback"]
             .iter()
@@ -788,17 +768,13 @@ mod tests {
         for route in t.exact.values().chain(wildcard_routes) {
             let platform_route = matches!(
                 route.kind,
-                EdgeKind::Control
-                    | EdgeKind::Api
-                    | EdgeKind::Git
-                    | EdgeKind::Preview
-                    | EdgeKind::Fallback
+                EdgeKind::Control | EdgeKind::Api | EdgeKind::Git | EdgeKind::Fallback
             );
             if platform_route && !route.client_zone.is_empty() {
                 platform.insert(route.client_zone.clone());
             }
         }
-        for kind in ["control", "api", "git", "preview", "fallback"] {
+        for kind in ["control", "api", "git", "fallback"] {
             assert!(
                 platform.contains(&format!("platform:client:{kind}")),
                 "platform zone {kind} missing from {platform:?}"
@@ -985,16 +961,15 @@ mod tests {
         assert_eq!(wild.route.kind, EdgeKind::Fallback);
     }
 
+    /// The retired pod host leaves no route behind: an app's only hosts are
+    /// its tenant/custom names and its environments'.
     #[test]
-    fn preview_hosts_allowlist_and_deny_wildcards() {
+    fn no_pod_host_route_is_generated() {
         let cfg = config_for_tests();
         let app = test_app("myapp");
         let pod_host = format!("pod-{}.localhost", app.id).to_lowercase();
         let t = build_table(&cfg, &[app], &[], &[], &[]);
-        let pod = t.exact.get(&pod_host).expect("pod host");
-        assert_eq!(pod.kind, EdgeKind::Preview);
-        assert_eq!(pod.upstream, cfg.caddy_control_upstream);
-        // No wildcard: every pod host is an exact, single-label host.
+        assert!(!t.exact.contains_key(&pod_host), "pod host is gone");
         assert!(
             t.wildcards.iter().all(|w| !w.suffix.contains(".preview.")),
             "no preview wildcard is left"
@@ -1205,7 +1180,8 @@ mod tests {
     }
 
     /// A table that changed is pushed at once, without waiting for the
-    /// generation probe to notice anything.
+    /// generation probe to notice anything. Only a deployed app adds a route
+    /// (the pod host that used to make a fresh app visible is gone).
     #[tokio::test]
     async fn a_changed_table_is_pushed_immediately() {
         let (pool, mut cfg, dir) = push_env().await;
@@ -1214,7 +1190,7 @@ mod tests {
 
         push_routes(&pool, &cfg).await.unwrap();
         assert_eq!(admin.posts(), 1);
-        crate::db::create_app(
+        let app = crate::db::create_app(
             &pool,
             &cfg,
             crate::db::NewApp {
@@ -1228,6 +1204,11 @@ mod tests {
         )
         .await
         .expect("seed app");
+        sqlx::query("UPDATE app SET status = 'running', last_deploy_sha = 'abc1234' WHERE id = ?")
+            .bind(&app.id)
+            .execute(&pool)
+            .await
+            .expect("deployed app");
 
         assert_eq!(push_routes(&pool, &cfg).await.unwrap(), Pushed::Accepted);
         assert_eq!(admin.posts(), 2, "a changed table is pushed at once");

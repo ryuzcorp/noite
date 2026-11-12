@@ -440,6 +440,15 @@ async fn main() -> anyhow::Result<()> {
     // route table through the admin API and never reload. No `/load` here:
     // Caddy boots from the file just written.
     host::caddy::write_static_caddyfile(&config).await?;
+    // A routes file written by an older runner can carry a kind this build's
+    // closed set no longer knows (the retired `preview` pod route). Caddy
+    // validates the file when it provisions, so it would refuse the whole
+    // table and answer 503 for every host until the first push. Rebuild the
+    // file from the rows first; a failure here leaves the old file for the
+    // reconcile loop's first tick.
+    if let Err(e) = host::edge_table::push_routes(&pool, &config).await {
+        tracing::warn!(error = %format!("{e:#}"), "edge routes rebuild before Caddy boot");
+    }
     let caddy_child = host::children::supervise_caddy(&config);
 
     let procs = host::supervisor::new_procs();
@@ -498,6 +507,22 @@ async fn main() -> anyhow::Result<()> {
         source_maps: host::sourcemaps::SourceMapCache::new(),
         control_boot: control_boot.clone(),
     };
+
+    // Retired workspace previews (`source.preview`, removed): an upgraded
+    // install still holds their rows, fleets and bucket prefixes, and the
+    // environment model no longer decodes one. Tear them down before the
+    // reconcile loop (or any request) lists environments; a failure aborts the
+    // boot so the next start retries instead of running on a database whose
+    // next environment read would fail.
+    let retired = host::env_teardown::retire_workspace_environments(&state).await?;
+    if retired > 0 {
+        tracing::info!(retired, "removed retired workspace preview environments");
+        // The route table is rebuilt from the rows; land the removal before
+        // the first request instead of waiting for the loop's first tick.
+        if let Err(e) = host::edge_table::push_routes(&state.pool, &state.config).await {
+            tracing::warn!(error = %format!("{e:#}"), "edge push after retiring workspace previews");
+        }
+    }
 
     let cfg_loop = (*config).clone();
     let shutdown_loop = shutdown.clone();

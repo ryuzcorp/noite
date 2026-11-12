@@ -57,22 +57,6 @@ pub async fn tree(
     serde_json::to_value(tree).map_err(|e| ApiError::internal(e.to_string()))
 }
 
-/// `source.bundle`: every text source at `ref`, for the editor's language
-/// service. An empty `ref` means "no ref" — the UI's "deployed" choice sends
-/// none, and a stray empty string must not 400.
-pub async fn bundle(
-    state: &AppState,
-    id: &str,
-    reference: Option<&str>,
-) -> Result<serde_json::Value, ApiError> {
-    let reference = reference.filter(|r| !r.is_empty());
-    let (_app, bare, rev) = app_with_rev(state, id, reference).await?;
-    let bundle = source::bundle(&bare, &rev)
-        .await
-        .map_err(ApiError::from_anyhow)?;
-    serde_json::to_value(bundle).map_err(|e| ApiError::internal(e.to_string()))
-}
-
 /// Blob reads distinguish "no such file" (404) and an invalid path (400) from
 /// a real mirror failure (500). The old code answered 404 for all three.
 fn blob_error(e: anyhow::Error) -> ApiError {
@@ -97,26 +81,6 @@ pub async fn blob(
         .await
         .map_err(blob_error)?;
     serde_json::to_value(blob).map_err(|e| ApiError::internal(e.to_string()))
-}
-
-/// The `source.archive` target, with the Workspace caps already checked from
-/// the tree listing: an over-cap repo is a 413, an unknown ref a 404. The
-/// caller streams `git archive` from the returned mirror + rev.
-pub async fn archive_target(
-    state: &AppState,
-    id: &str,
-    reference: Option<&str>,
-) -> Result<(PathBuf, String), ApiError> {
-    let (_app, bare, rev) = app_with_rev(state, id, reference).await?;
-    source::archive_guard(&bare, &rev).await.map_err(|e| {
-        let msg = format!("{e:#}");
-        if msg.contains("too large") {
-            ApiError::too_large(msg)
-        } else {
-            ApiError::from_anyhow(e)
-        }
-    })?;
-    Ok((bare, rev))
 }
 
 /// One browser-edited file: validated path + content, text or a base64
@@ -180,8 +144,7 @@ pub struct SourceCommitBody {
 
 /// Browser edits are input validation first (400), a lost CAS race is a real
 /// 409 conflict, and an unknown branch to start from is a 404. A genuine
-/// git/exec failure stays 500. `service::environments` reuses it for
-/// `source.preview`, so both commit surfaces report identically.
+/// git/exec failure stays 500.
 pub(super) fn commit_error(e: anyhow::Error) -> ApiError {
     let msg = format!("{e:#}");
     if msg.contains("tip moved") {

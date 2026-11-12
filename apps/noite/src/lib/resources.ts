@@ -269,10 +269,7 @@ export interface SessionView {
   session: { impersonatedBy: string | null };
   user: {
     email: string;
-    /** The viewer's user id: the segment of their hidden preview refs
-     * (`refs/previews/<id>/<branch>`), and what tells their own workspace
-     * preview from another collaborator's. Never a secret — an environment's
-     * host is minted from it. */
+    /** The viewer's user id (stable across sessions; never a secret). */
     id: string;
     name: string;
     /** Server-set first-run marker; null until `completeOnboarding`. */

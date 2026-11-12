@@ -388,10 +388,6 @@ async fn reconcile_once(
         }
     }
 
-    if sweep_due {
-        sweep_expired_environments(pool, cfg, procs, logs).await;
-    }
-
     // Best-effort on the tick: a failed push must not abort the
     // reconcile (orphan sweeps, metrics) every tick while it persists.
     if let Err(e) = edge_table::push_routes(pool, cfg).await {
@@ -411,38 +407,6 @@ async fn reconcile_once(
         tracing::debug!("build in flight; skipping the telemetry tick");
     }
     Ok(())
-}
-
-/// Remove workspace previews with no deploy for `RUNNER_ENVIRONMENT_TTL_H`
-/// (ROADMAP: 7 days). Branch environments are never swept here — they live
-/// until their branch or their owner deletes them.
-async fn sweep_expired_environments(
-    pool: &SqlitePool,
-    cfg: &Config,
-    procs: &ProcMap,
-    logs: &LogState,
-) {
-    if cfg.environment_ttl_h == 0 {
-        return;
-    }
-    let cutoff = (chrono::Utc::now() - chrono::Duration::hours(cfg.environment_ttl_h as i64))
-        .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
-    let Ok(expired) = db::expired_workspace_environments(pool, &cutoff).await else {
-        return;
-    };
-    for env in expired {
-        tracing::info!(
-            fleet = %format!("{}.{}", env.app_slug, env.label),
-            "workspace preview expired; removing"
-        );
-        if let Err(e) = crate::host::env_teardown::teardown(cfg, pool, procs, logs, &env).await {
-            tracing::warn!(
-                fleet = %format!("{}.{}", env.app_slug, env.label),
-                error = %format!("{e:#}"),
-                "expired environment teardown failed"
-            );
-        }
-    }
 }
 
 /// Whether the row this tick snapshotted still wants a fleet: the app exists,
@@ -702,108 +666,6 @@ mod tests {
         assert!(!still_wanted(&pool, &app.id).await.expect("stopped"));
     }
 
-    /// The expiry sweep removes workspace previews with no deploy for the TTL
-    /// and never touches a branch environment (ROADMAP, lifecycle).
-    /// `expired_workspace_environments` is the query it drives; this proves the
-    /// sweep wires it to a real teardown.
-    #[tokio::test]
-    async fn expiry_sweep_removes_only_stale_workspace_previews() {
-        use crate::models::EnvironmentKind;
-        let base =
-            std::env::temp_dir().join(format!("noite-env-expiry-{}", crate::models::new_id()));
-        let mut cfg = crate::config::config_for_tests();
-        cfg.work_dir = base.join("work").to_string_lossy().into_owned();
-        cfg.s3_endpoint = crate::testutil::spawn_s3_stub().await;
-        cfg.environment_ttl_h = 168;
-        let pool = db::connect("sqlite::memory:").await.expect("memory db");
-        let app = db::create_app(
-            &pool,
-            &cfg,
-            db::NewApp {
-                name: "ttl",
-                slug: "ttl",
-                user_id: "local",
-                subdomain: "ttl.localhost",
-                listen: 30300,
-                internal: 30301,
-            },
-        )
-        .await
-        .expect("app");
-        let workspace = db::create_environment(
-            &pool,
-            &cfg,
-            db::NewEnvironment {
-                app_id: &app.id,
-                slug: "ttl",
-                label: "wip-user",
-                kind: EnvironmentKind::Workspace,
-                git_ref: "refs/previews/user/wip",
-                created_by: "user",
-                listen: 30310,
-                internal: 30311,
-            },
-        )
-        .await
-        .expect("workspace env");
-        let branch = db::create_environment(
-            &pool,
-            &cfg,
-            db::NewEnvironment {
-                app_id: &app.id,
-                slug: "ttl",
-                label: "kept",
-                kind: EnvironmentKind::Branch,
-                git_ref: "refs/heads/kept",
-                created_by: "user",
-                listen: 30320,
-                internal: 30321,
-            },
-        )
-        .await
-        .expect("branch env");
-        // Age the workspace preview (and its deploy clock) past the TTL.
-        sqlx::query(
-            "UPDATE environment SET created_at = '2020-01-01T00:00:00.000Z', \
-                     last_deployed_at = NULL WHERE id = ?",
-        )
-        .bind(&workspace.id)
-        .execute(&pool)
-        .await
-        .unwrap();
-
-        let procs = supervisor::new_procs();
-        let logs = crate::host::logs::new_state();
-        sweep_expired_environments(&pool, &cfg, &procs, &logs).await;
-
-        assert!(
-            db::get_environment(&pool, &workspace.id)
-                .await
-                .unwrap()
-                .is_none(),
-            "the stale workspace preview is gone"
-        );
-        assert!(db::get_environment(&pool, &branch.id)
-            .await
-            .unwrap()
-            .is_some());
-
-        // TTL 0 disables the sweep entirely.
-        cfg.environment_ttl_h = 0;
-        sqlx::query("UPDATE environment SET created_at = '2020-01-01T00:00:00.000Z' WHERE id = ?")
-            .bind(&branch.id)
-            .execute(&pool)
-            .await
-            .unwrap();
-        sweep_expired_environments(&pool, &cfg, &procs, &logs).await;
-        assert!(db::get_environment(&pool, &branch.id)
-            .await
-            .unwrap()
-            .is_some());
-        pool.close().await;
-        let _ = std::fs::remove_dir_all(&base);
-    }
-
     /// The fallback tip sweep must not undo a rollback. A sha the history holds
     /// a success for is a release the operator moved off on purpose; only a tip
     /// nothing here built (an out-of-band bundle write) needs the sweep, and a
@@ -893,8 +755,8 @@ mod tests {
                 app_id: &app.id,
                 slug: "rollback",
                 label: "wip",
-                kind: EnvironmentKind::Workspace,
-                git_ref: "refs/previews/user/wip",
+                kind: EnvironmentKind::Branch,
+                git_ref: "refs/heads/wip",
                 created_by: "user",
                 listen: 30350,
                 internal: 30351,

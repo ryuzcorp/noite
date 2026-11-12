@@ -426,11 +426,8 @@ export const BranchPicker = ({
               current={branch.name === value}
               defaultBranch={defaultBranch}
               envId={
-                envs.find(
-                  (env) =>
-                    env.kind === "branch" &&
-                    env.gitRef === `refs/heads/${branch.name}`
-                )?.id ?? null
+                envs.find((env) => env.gitRef === `refs/heads/${branch.name}`)
+                  ?.id ?? null
               }
               onPick={pick}
               onEnvironment={(target) => {
@@ -460,9 +457,7 @@ export const BranchPicker = ({
                   picker.set(startAction(picker(), "delete-confirm", target));
 
                   const tracked = envs.find(
-                    (env) =>
-                      env.kind === "branch" &&
-                      env.gitRef === `refs/heads/${target}`
+                    (env) => env.gitRef === `refs/heads/${target}`
                   );
 
                   const lines = [`Deleting ${target} is permanent.`];

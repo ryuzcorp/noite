@@ -72,6 +72,17 @@ pub enum PolicyDecision {
 /// Structural policy: deletes need `admin`; anything below `push` is denied.
 /// Fast-forward checks need the repo and run separately via [`updates_needing_ff`].
 pub fn check_push_policy(role: &str, cmds: &[PushCommand]) -> PolicyDecision {
+    // The retired preview namespace stays closed to every role: nothing tracks
+    // it any more, and a write there would reintroduce refs the storage layer
+    // no longer snapshots.
+    if cmds.iter().any(|cmd| {
+        cmd.refname
+            .starts_with(crate::host::git_http::PREVIEW_REF_PREFIX)
+    }) {
+        return PolicyDecision::Deny(
+            "rule push-policy: refs/previews/* is retired and may not be written".into(),
+        );
+    }
     if role == "admin" {
         return PolicyDecision::Allow;
     }
@@ -81,6 +92,12 @@ pub fn check_push_policy(role: &str, cmds: &[PushCommand]) -> PolicyDecision {
         ));
     }
     for cmd in cmds {
+        if !(cmd.refname.starts_with("refs/heads/") || cmd.refname.starts_with("refs/tags/")) {
+            return PolicyDecision::Deny(format!(
+                "rule push-policy: 'push' may only update refs/heads/* and refs/tags/* (got {})",
+                cmd.refname
+            ));
+        }
         if is_zero_oid(&cmd.new) {
             return PolicyDecision::Deny(format!(
                 "rule push-policy: 'push' may not delete {} (admin only)",
@@ -202,6 +219,21 @@ mod tests {
             check_push_policy("admin", &cmds),
             PolicyDecision::Allow
         ));
+    }
+
+    #[test]
+    fn policy_denies_the_retired_preview_namespace() {
+        let cmds = vec![PushCommand {
+            old: "0".repeat(40),
+            new: "b".repeat(40),
+            refname: "refs/previews/user/feat".into(),
+        }];
+        for role in ["push", "admin"] {
+            match check_push_policy(role, &cmds) {
+                PolicyDecision::Deny(msg) => assert!(msg.contains("retired"), "{msg}"),
+                PolicyDecision::Allow => panic!("preview ref allowed for {role}"),
+            }
+        }
     }
 
     #[test]

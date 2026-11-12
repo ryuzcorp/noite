@@ -119,8 +119,7 @@ async fn tls_ask_admits_existing_environment_hosts_only() {
         tls_ask(state, "feat-x.test.localhost:443").await,
         StatusCode::OK
     );
-    // A label no environment owns mints nothing (nor does a foreign base, or
-    // one of the labels the preview hosts own).
+    // A label no environment owns mints nothing, nor does a foreign base.
     assert_eq!(
         tls_ask(state, "nope.test.localhost").await,
         StatusCode::NOT_FOUND
@@ -142,16 +141,8 @@ async fn tls_ask_admits_existing_environment_hosts_only() {
         tls_ask(state, "test.localhost").await,
         StatusCode::NOT_FOUND
     );
-    // The pod host is admitted for any existing app.
-    let pod_host = format!("pod-{}.localhost", app.id);
-    assert_eq!(tls_ask(state, &pod_host).await, StatusCode::OK);
-    // A pod host naming an app that does not exist mints nothing.
-    assert_eq!(
-        tls_ask(state, "pod-00000000-0000-0000-0000-000000000000.localhost").await,
-        StatusCode::NOT_FOUND
-    );
     // Deleting the environment takes its host away with it.
-    crate::db::delete_environment(&state.pool, &env.id)
+    crate::db::delete_environment_row(&state.pool, &env.id)
         .await
         .expect("delete");
     assert_eq!(tls_ask(state, ENV_HOST).await, StatusCode::NOT_FOUND);

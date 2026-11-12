@@ -1,5 +1,5 @@
-//! Byte helpers shared by the source tree, its workspace and the storage
-//! views: a byte count as a person reads it, and standard base64 both ways.
+//! Byte helpers shared by the source tree and the storage views: a byte count
+//! as a person reads it, and standard base64 both ways.
 
 const BYTE_UNITS = ["B", "KB", "MB", "GB", "TB"] as const;
 

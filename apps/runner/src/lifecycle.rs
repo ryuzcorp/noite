@@ -55,10 +55,10 @@ pub fn slug_ok(cfg: &Config, slug: &str) -> bool {
     if slug == crate::host::control::SLUG {
         return false;
     }
-    // `pod-<uuid>` is a pod host label (`host::edge::POD_HOST_PREFIX`): an app
-    // with that slug would collide with the Code-mode origin of the app whose
-    // id it spells.
-    if crate::host::edge::pod_label_id(slug).is_some() {
+    // The retired pod-origin namespace (`pod-<uuid>`): browsers may still hold
+    // a certificate and origin storage for the host whose app had that id, so
+    // no tenant may claim it. Other `pod-` names were never pod hosts.
+    if crate::host::edge::retired_pod_label(slug) {
         return false;
     }
     let platform: std::collections::HashSet<String> = crate::host::edge_table::platform_routes(cfg)
@@ -120,14 +120,15 @@ mod tests {
     }
 
     #[test]
-    fn pod_host_labels_are_not_slugs() {
-        // The Code-mode origin of the app whose id this spells.
+    fn only_the_retired_pod_host_shape_is_unclaimable() {
+        // `pod-<uuid>` served a pod origin: a stale tab or bookmark there
+        // still loads whatever owns the name, so it stays reserved.
         assert!(!slug_ok(
             &config_for_tests(),
             "pod-0f4b0f6e-5a8e-4a0e-9c3f-2b1d0c9e8f7a"
         ));
-        // Ordinary slugs and near misses stay available.
-        for ok in ["pod", "podcast", "pod-123", "mypod-x"] {
+        // Every other `pod-` name was never a pod host and stays available.
+        for ok in ["pod", "podcast", "pod-staging", "pod-123", "mypod-x"] {
             assert!(slug_ok(&config_for_tests(), ok), "should accept {ok}");
         }
     }

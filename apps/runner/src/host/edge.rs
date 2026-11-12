@@ -16,6 +16,23 @@ use axum::{
 use crate::config::is_localhost_domain;
 use crate::AppState;
 
+/// The retired pod host's label prefix (`pod-<app id>.<base>`).
+pub const RETIRED_POD_PREFIX: &str = "pod-";
+
+/// Whether `label` is the **retired pod host** shape, `pod-<uuid>`. Only that
+/// exact shape ever served a pod origin, so only it stays unclaimable: an app
+/// called `pod-staging` was never a pod host and keeps its name.
+pub fn retired_pod_label(label: &str) -> bool {
+    let Some(id) = label.strip_prefix(RETIRED_POD_PREFIX) else {
+        return false;
+    };
+    id.len() == 36
+        && id.chars().enumerate().all(|(i, c)| match i {
+            8 | 13 | 18 | 23 => c == '-',
+            _ => c.is_ascii_hexdigit(),
+        })
+}
+
 /// Tenant slug from a Host header, if it addresses `{slug}.{base}` under any
 /// tenant base (configured domain plus LAN/extra DNS names) and is not one
 /// of the platform hosts (bare bases, control, api, git).
@@ -42,64 +59,10 @@ pub fn parse_edge_slug(host: &str, bases: &[String], control_sub: &str) -> Optio
         if slug == control_sub || slug == "api" || slug == "git" {
             return None;
         }
-        if pod_label_id(slug).is_some() {
+        if slug.starts_with(RETIRED_POD_PREFIX) && retired_pod_label(slug) {
             return None;
         }
         return Some(slug.to_string());
-    }
-    None
-}
-
-/// The pod host's label prefix. One **stable** hostname per app,
-/// `pod-<app id>.<base>`: on-demand TLS issues a certificate once per app
-/// instead of one per preview session (the pod's instance id is random per
-/// boot), and it sits exactly **one label** under the base so the instance's
-/// own `*.<base>` certificate covers it. The old `app-0.preview.<slug>.<base>`
-/// shape needed a certificate no standard wildcard provides, so the frame
-/// could never load behind a proxy (Cloudflare's Universal SSL covers one
-/// label). The pod boots with path URLs on this origin, so nothing interpolates
-/// an instance id into a hostname.
-pub const POD_HOST_PREFIX: &str = "pod-";
-
-/// The app id in a pod host label (`pod-<uuid>`), lowercased. `None` for any
-/// other label.
-pub fn pod_label_id(label: &str) -> Option<String> {
-    let id = label.strip_prefix(POD_HOST_PREFIX)?;
-    let shape = id.len() == 36
-        && id.chars().enumerate().all(|(i, c)| match i {
-            8 | 13 | 18 | 23 => c == '-',
-            _ => c.is_ascii_hexdigit(),
-        });
-    shape.then(|| id.to_lowercase())
-}
-
-/// The app id from a pod host (`pod-<app id>.<base>`): the app's own preview
-/// origin, one label under the instance wildcard. `None` for anything else — a
-/// plain tenant host, another base, or any other pod label.
-pub fn parse_pod_host(host: &str, bases: &[String]) -> Option<String> {
-    let bare = host
-        .split_once(':')
-        .map(|(h, _)| h)
-        .unwrap_or(host)
-        .trim()
-        .trim_end_matches('.')
-        .to_lowercase();
-    if bare.is_empty() {
-        return None;
-    }
-    for base in bases {
-        if base.trim().is_empty() {
-            continue;
-        }
-        let Some(label) = bare.strip_suffix(format!(".{base}").as_str()) else {
-            continue;
-        };
-        if label.contains('.') {
-            continue;
-        }
-        if let Some(id) = pod_label_id(label) {
-            return Some(id);
-        }
     }
     None
 }
@@ -109,11 +72,10 @@ pub fn parse_pod_host(host: &str, bases: &[String]) -> Option<String> {
 /// its redeploys, so the address must not change per commit, and on-demand TLS
 /// then issues one certificate per environment instead of one per push.
 ///
-/// `None` for everything else. A tenant host has one label below the base, and
-/// so does the pod host (`pod-<app id>.<base>`), so neither can be read as
-/// `<label>.<slug>`; the platform labels the labeler refuses to mint
-/// ([`crate::host::env_label`]) are refused here as well, so a hand-written
-/// host must not become an environment either.
+/// `None` for everything else. A tenant host has one label below the base,
+/// so it cannot be read as `<label>.<slug>`; whether the resulting pair names
+/// a real environment is the database's question (`tls_ask` and the gate ask
+/// it), so a hand-written host cannot become one on its own.
 pub fn parse_env_host(host: &str, bases: &[String]) -> Option<(String, String)> {
     let bare = host
         .split_once(':')
@@ -136,12 +98,6 @@ pub fn parse_env_host(host: &str, bases: &[String]) -> Option<(String, String)> 
             continue;
         };
         if label.is_empty() || slug.is_empty() || slug.contains('.') {
-            continue;
-        }
-        // The labels the preview hosts own are refused here exactly as the
-        // labeler refuses to mint them, so a hand-written host can never
-        // shadow `preview.{slug}` or the pod host's label.
-        if crate::host::env_label::RESERVED_LABELS.contains(&label) {
             continue;
         }
         return Some((slug.to_string(), label.to_string()));
@@ -562,16 +518,6 @@ pub async fn tls_ask(
     ) {
         return StatusCode::OK;
     }
-    // A pod host (`pod-<app id>.<base>`) is the app's own origin for the
-    // in-browser pod, so an existing app is enough — its fleet need not be up.
-    // Anything else falls through to the tenant/custom checks, and a pod host
-    // naming no app gets 404 (no cert minted).
-    if let Some(id) = parse_pod_host(domain, &cfg.tenant_bases()) {
-        return match crate::db::get_app(&state.pool, &id).await {
-            Ok(Some(_)) => StatusCode::OK,
-            _ => StatusCode::NOT_FOUND,
-        };
-    }
     // An environment host (`<label>.<slug>.<base>`) is ours when the
     // environment exists: its own stable host means one certificate per
     // environment, and the fleet need not be up (a newly created environment
@@ -672,7 +618,7 @@ mod tests {
     }
 
     #[test]
-    fn environment_hosts_never_collide_with_tenant_pod_or_platform_hosts() {
+    fn environment_hosts_never_collide_with_tenant_hosts() {
         let bases = bases(&["noite.now", "localhost", "noite.local"]);
         // A tenant host has one label below the base.
         assert_eq!(parse_env_host("test.noite.now", &bases), None);
@@ -680,14 +626,22 @@ mod tests {
         assert_eq!(parse_env_host("api.noite.now", &bases), None);
         assert_eq!(parse_env_host("git.noite.now", &bases), None);
         assert_eq!(parse_env_host("noite.now", &bases), None);
-        // The pod host is one label deeper, and the label catch-all under it
-        // (`*.preview.{slug}.{base}`) is not an environment either.
+        // Three labels below the base are not an environment either (the old
+        // `app-0.preview.{slug}.{base}` shape): `<label>.<slug>` is exactly
+        // two.
         assert_eq!(parse_env_host("app-0.preview.test.noite.now", &bases), None);
         assert_eq!(parse_env_host("pod-1.preview.test.noite.now", &bases), None);
         assert_eq!(parse_env_host("x.preview.test.noite.now", &bases), None);
-        // Labels the preview hosts own are refused, like the labeler does.
-        assert_eq!(parse_env_host("preview.test.noite.now", &bases), None);
-        assert_eq!(parse_env_host("app-0.test.noite.now", &bases), None);
+        // Any two-label pair *may* be an environment host now that the preview
+        // hosts are gone; the row is what decides (tls_ask, the gate).
+        assert_eq!(
+            parse_env_host("preview.test.noite.now", &bases),
+            Some(("test".to_string(), "preview".to_string()))
+        );
+        assert_eq!(
+            parse_env_host("app-0.test.noite.now", &bases),
+            Some(("test".to_string(), "app-0".to_string()))
+        );
         // A custom domain is not on a tenant base at all.
         assert_eq!(parse_env_host("feat-x.test.example.com", &bases), None);
         assert_eq!(parse_env_host("feat-x.test.evil.noite.now", &bases), None);
@@ -704,10 +658,9 @@ mod tests {
     }
 
     #[test]
-    fn environment_host_threads_are_not_tenants() {
+    fn environment_hosts_are_not_tenant_hosts() {
         // No host may resolve to two different fleets: whatever the tenant
-        // parser claims, the environment parser must refuse, and the pod host
-        // belongs to neither (`parse_pod_host` owns it).
+        // parser claims, the environment parser must refuse.
         let bases = bases(&["noite.now", "noite.local", "localhost"]);
         for host in [
             "feat-x.test.noite.now",
@@ -728,18 +681,10 @@ mod tests {
                 "{host}: env {env:?} tenant {tenant:?}"
             );
         }
-        for host in [
-            "pod-0f4b0f6e-5a8e-4a0e-9c3f-2b1d0c9e8f7a.noite.now",
-            "x.preview.test.noite.now",
-        ] {
-            assert_eq!(parse_env_host(host, &bases), None);
-            assert_eq!(parse_edge_slug(host, &bases, "app"), None);
-        }
-        assert_eq!(
-            parse_pod_host("pod-0f4b0f6e-5a8e-4a0e-9c3f-2b1d0c9e8f7a.noite.now", &bases),
-            Some("0f4b0f6e-5a8e-4a0e-9c3f-2b1d0c9e8f7a".to_string()),
-            "the pod host keeps its own parser"
-        );
+        // A four-label host is neither: the old pod/preview shapes are gone.
+        let host = "x.preview.test.noite.now";
+        assert_eq!(parse_env_host(host, &bases), None);
+        assert_eq!(parse_edge_slug(host, &bases, "app"), None);
     }
 
     #[test]
@@ -783,40 +728,6 @@ mod tests {
         assert!(tls_ask_static_ok("API.NOITE.NOW.", "noite.now", "app", &[]));
         assert!(!tls_ask_static_ok(".", "noite.now", "app", &[]));
     }
-    #[test]
-    fn parses_pod_hosts() {
-        let bases = bases(&["noite.now", "noite.local"]);
-        // One stable label per app: every other pod label is refused, and the
-        // shape is exactly one label under the base (the wildcard certificate).
-        let pod = "pod-0f4b0f6e-5a8e-4a0e-9c3f-2b1d0c9e8f7a.noite.now";
-        assert_eq!(
-            parse_pod_host(pod, &bases),
-            Some("0f4b0f6e-5a8e-4a0e-9c3f-2b1d0c9e8f7a".to_string())
-        );
-        assert_eq!(
-            parse_pod_host(&pod.replace("noite.now", "noite.local"), &bases),
-            Some("0f4b0f6e-5a8e-4a0e-9c3f-2b1d0c9e8f7a".to_string())
-        );
-        // The old multi-label shape (a certificate no wildcard covers) and a
-        // bare `preview` label are not pod hosts.
-        assert_eq!(parse_pod_host("app-0.preview.test.noite.now", &bases), None);
-        assert_eq!(parse_pod_host("preview.test.noite.now", &bases), None);
-        // A malformed id, a dotted label, a foreign base, a tenant host.
-        assert_eq!(parse_pod_host("pod-1234.noite.now", &bases), None);
-        assert_eq!(
-            parse_pod_host(
-                "pod-0f4b0f6e-5a8e-4a0e-9c3f-2b1d0c9e8f7a.x.noite.now",
-                &bases
-            ),
-            None
-        );
-        assert_eq!(
-            parse_pod_host("pod-0f4b0f6e-5a8e-4a0e-9c3f-2b1d0c9e8f7a.evil.com", &bases),
-            None
-        );
-        assert_eq!(parse_pod_host("test.noite.now", &bases), None);
-        assert_eq!(parse_pod_host("app-0.noite.now", &bases), None);
-    }
 
     #[test]
     fn rejects_platform_hosts() {
@@ -831,6 +742,19 @@ mod tests {
         assert_eq!(parse_edge_slug("api.noite.now", &prod, "app"), None);
         assert_eq!(parse_edge_slug("git.noite.now", &prod, "app"), None);
         assert_eq!(parse_edge_slug("app.noite.now", &prod, "app"), None);
+        // The retired pod origin namespace stays unroutable.
+        assert_eq!(
+            parse_edge_slug(
+                "pod-0f4b0f6e-5a8e-4a0e-9c3f-2b1d0c9e8f7a.noite.now",
+                &prod,
+                "app"
+            ),
+            None
+        );
+        assert_eq!(
+            parse_edge_slug("pod-staging.noite.now", &prod, "app"),
+            Some("pod-staging".to_string())
+        );
         assert_eq!(parse_edge_slug("a.b.localhost", &dev, ""), None);
         assert_eq!(parse_edge_slug("", &dev, ""), None);
     }

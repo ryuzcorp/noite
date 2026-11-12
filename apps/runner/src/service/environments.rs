@@ -1,10 +1,9 @@
 //! Preview environments (ROADMAP, Preview environments): list, create from a
-//! branch, delete, toggle public, redeploy, variable overrides, and the
-//! workspace preview (`source.preview`).
+//! branch, delete, toggle public, redeploy, and variable overrides.
 //!
 //! Role gates mirror `service::prs`: the control UI resolves the caller's app
 //! role and passes it, and the runner re-checks it here. `view` reads, `push`
-//! creates / deploys / previews / sets variables, `admin` deletes and flips an
+//! creates / deploys / sets variables, `admin` deletes and flips an
 //! environment public. `environments.*`, `domains.*` and `env.*` predate the
 //! role-carrying surfaces and gate only in the UI; these are new, so they gate
 //! here too.
@@ -14,9 +13,8 @@ use crate::db;
 use crate::host::deploy::{self, DeployTarget, DeployTrigger};
 use crate::host::env_label;
 use crate::host::git_identity::Actor;
-use crate::host::{env_teardown, forge, git_http, git_identity, web_commit};
+use crate::host::{env_teardown, forge};
 use crate::models::{App, AppEnv, Environment, EnvironmentKind};
-use crate::service::source::SourceCommitBody;
 use crate::AppState;
 
 use super::apps::app_or_404;
@@ -62,13 +60,13 @@ pub async fn list(
 }
 
 /// Fill each environment's automatic-deploy state from its own deploy rows.
-/// A preview's budget is its own: production's failures never pause it.
+/// An environment's budget is its own: production's failures never pause it.
 async fn annotate_auto_deploy(state: &AppState, envs: &mut [Environment]) {
     crate::host::auto_deploy::annotate_environments(&state.pool, envs).await;
 }
 
 /// Load one environment of one app, or 404.
-/// The push gate a preview-target operation shares with `deploy`.
+/// The push gate an environment-target operation shares with `deploy`.
 pub(crate) fn require_push(role: Option<&str>) -> Result<(), ApiError> {
     require(role, "push")
 }
@@ -204,8 +202,6 @@ pub async fn create(
     if let Err(e) = crate::host::edge_table::push_routes(&state.pool, &state.config).await {
         tracing::warn!(error = %format!("{e:#}"), "caddy rewrite after environment create");
     }
-    // The create's deploy is part of the create, whose own row records
-    // `created_by`; only an explicit redeploy carries a caller's label.
     spawn_deploy(state, &app, env.clone(), &sha, None).await?;
     let mut envs = [env];
     annotate_auto_deploy(state, &mut envs).await;
@@ -241,9 +237,16 @@ async fn delete_inner(
     require(role, "admin")?;
     let app = app_or_404(state, id).await?;
     let env = env_or_404(state, &app.id, env_id).await?;
-    env_teardown::teardown(&state.config, &state.pool, &state.procs, &state.logs, &env)
-        .await
-        .map_err(|e| ApiError::internal(format!("{e:#}")))?;
+    env_teardown::teardown(
+        &state.config,
+        &state.pool,
+        &state.procs,
+        &state.logs,
+        (&env).into(),
+        false,
+    )
+    .await
+    .map_err(|e| ApiError::internal(format!("{e:#}")))?;
     if let Err(e) = crate::host::edge_table::push_routes(&state.pool, &state.config).await {
         tracing::warn!(error = %format!("{e:#}"), "caddy rewrite after environment delete");
     }
@@ -290,17 +293,19 @@ pub async fn deploy(
     let bare = forge::read_mirror(state, &app.slug)
         .await
         .map_err(ApiError::from_anyhow)?;
-    // The stored row's ref, written by `create` or the preview route, is
-    // internal: resolving it is the preview deploy's own path, so the raw
-    // form is deliberate here.
-    let sha = forge::resolve_ref(&bare, &env.git_ref).await.map_err(|e| {
-        let msg = format!("{e:#}");
-        if msg.contains("not found") {
-            ApiError::not_found(msg)
-        } else {
-            ApiError::bad(msg)
-        }
-    })?;
+    // The stored row's ref is a branch env's `refs/heads/*` (`create` is the
+    // only writer now that previews are gone); it still goes through the
+    // caller-reference guard so a row can never resolve a reserved namespace.
+    let sha = forge::resolve_user_ref(&bare, &env.git_ref)
+        .await
+        .map_err(|e| {
+            let msg = format!("{e:#}");
+            if msg.contains("not found") {
+                ApiError::not_found(msg)
+            } else {
+                ApiError::bad(msg)
+            }
+        })?;
     let deploy_id = spawn_deploy(state, &app, env, &sha, actor).await?;
     Ok((deploy_id, sha))
 }
@@ -415,143 +420,4 @@ pub async fn vars_delete(
     db::delete_env_override(&state.pool, env_id, name)
         .await
         .map_err(|e| ApiError::internal(e.to_string()))
-}
-
-/// What `source.preview` answers: the (user, branch) environment it deployed,
-/// the commit it snapshotted, and the deploy row to stream.
-#[derive(Debug, Clone, serde::Serialize, ts_rs::TS)]
-#[serde(rename_all = "camelCase")]
-#[ts(export)]
-pub struct PreviewResult {
-    pub environment: Environment,
-    pub sha: String,
-    pub deploy_id: String,
-}
-
-/// The hidden ref one (user, branch) pair previews from. The user segment is
-/// label-sanitized so an exotic user id cannot make an un-writable ref name,
-/// and `refs/previews/` is never advertised or listed.
-pub fn preview_ref(user_id: &str, branch: &str) -> String {
-    format!(
-        "{}{}/{branch}",
-        git_http::PREVIEW_REF_PREFIX,
-        env_label::sanitize_label(user_id)
-    )
-}
-
-/// `source.preview`: snapshot the workspace's uncommitted changes as one commit
-/// on top of the branch head, publish it to the (user, branch) hidden ref,
-/// then deploy that environment (creating it on first use). The branch itself
-/// is never moved and no pull request sees the commit.
-pub async fn preview(
-    state: &AppState,
-    id: &str,
-    body: &SourceCommitBody,
-) -> Result<PreviewResult, ApiError> {
-    require(body.role.as_deref(), "push")?;
-    let app = app_or_404(state, id).await?;
-    let branch = body.branch.as_deref().unwrap_or(forge::DEFAULT_BRANCH);
-    if !forge::valid_branch_name(branch) {
-        return Err(ApiError::bad(format!("invalid branch name {branch:?}")));
-    }
-    let git_ref = preview_ref(&body.actor.user_id, branch);
-    let existing = db::get_environment_by_ref(&state.pool, &app.id, &git_ref)
-        .await
-        .map_err(|e| ApiError::internal(e.to_string()))?;
-    let env = match existing {
-        Some(env) => env,
-        None => {
-            check_caps(state, &app.id).await?;
-            // Ports are claimed, not just picked: the claim holds the allocator
-            // lock until the row below lands (SPEC, Ports).
-            let ports = db::alloc::claim_ports_in(
-                &state.pool,
-                state.config.fleet_port_min,
-                state.config.fleet_port_max,
-            )
-            .await
-            .map_err(|e| match e {
-                db::alloc::AllocError::Exhausted { .. } => ApiError::conflict(format!(
-                    "fleet port range {}-{} exhausted; raise NOITE_FLEET_PORTS",
-                    state.config.fleet_port_min, state.config.fleet_port_max
-                )),
-                other => ApiError::internal(other.to_string()),
-            })?;
-            // The label is computed under the claim (see `create` above).
-            let label = env_label::unique_label(
-                &env_label::workspace_label(branch, &body.actor.user_id),
-                &taken_labels(state, &app.id).await?,
-            );
-            let env = db::create_environment(
-                &state.pool,
-                &state.config,
-                db::NewEnvironment {
-                    app_id: &app.id,
-                    slug: &app.slug,
-                    label: &label,
-                    kind: EnvironmentKind::Workspace,
-                    git_ref: &git_ref,
-                    created_by: &body.actor.user_id,
-                    listen: ports.listen,
-                    internal: ports.internal,
-                },
-            )
-            .await
-            .map_err(|e| ApiError::internal(e.to_string()))?;
-            drop(ports);
-            if let Err(e) = crate::host::edge_table::push_routes(&state.pool, &state.config).await {
-                tracing::warn!(error = %format!("{e:#}"), "caddy rewrite after preview create");
-            }
-            env
-        }
-    };
-    // The workspace snapshot: files validated and committed exactly like a
-    // browser edit, but onto the hidden ref.
-    let actor = git_identity::noreply(&state.config, &body.actor.user_id, &body.actor.name);
-    let mut files: Vec<web_commit::WebFile> = Vec::with_capacity(body.files.len());
-    for f in &body.files {
-        let encoding = f.encoding.unwrap_or(web_commit::WebEncoding::Utf8);
-        let content = encoding.decode(&f.path, &f.content).map_err(commit_error)?;
-        files.push(web_commit::WebFile {
-            path: f.path.clone(),
-            content,
-        });
-    }
-    let moves: Vec<web_commit::WebMove> = body
-        .moves
-        .iter()
-        .map(|m| web_commit::WebMove {
-            from: m.from.clone(),
-            to: m.to.clone(),
-        })
-        .collect();
-    let sha = web_commit::web_commit_preview(
-        state,
-        &app,
-        &actor,
-        &body.message,
-        web_commit::WebChanges {
-            files: &files,
-            moves: &moves,
-            deletes: &body.deletes,
-        },
-        &git_ref,
-        branch,
-    )
-    .await
-    .map_err(commit_error)?;
-    // A preview commit's deploy follows the commit, which already carries
-    // the author; only an explicit redeploy carries a caller's label.
-    let deploy_id = spawn_deploy(state, &app, env.clone(), &sha, None).await?;
-    Ok(PreviewResult {
-        environment: env,
-        sha,
-        deploy_id,
-    })
-}
-
-/// The commit vocabulary from `service::source`, reused for the preview
-/// snapshot so both surfaces report the same way.
-fn commit_error(e: anyhow::Error) -> ApiError {
-    super::source::commit_error(e)
 }

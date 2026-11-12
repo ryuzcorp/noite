@@ -1,9 +1,8 @@
-//! Preview environments (thin adapters over `service::environments`) and the
-//! workspace preview (`source.preview`).
+//! Preview environments (thin adapters over `service::environments`).
 //!
 //! Role gates live in the service layer: `role` is required on every mutating
-//! call (`push` to create/deploy/preview and set variables, `admin` to delete
-//! and to flip an environment public) and on reads (`view`).
+//! call (`push` to create/deploy and set variables, `admin` to delete and to
+//! flip an environment public) and on reads (`view`).
 use axum::{
     extract::{Path, Query, State},
     response::IntoResponse,
@@ -156,17 +155,4 @@ pub async fn delete_environment_env(
     service::environments::vars_delete(&state, &id, &env_id, &name, q.role.as_deref())
         .await
         .map(|()| Json(json!({ "ok": true })))
-}
-
-/// `source.preview`: snapshot the workspace as a commit on the hidden
-/// `refs/previews/<userId>/<branch>` ref and deploy its environment, creating
-/// it on first use.
-pub async fn app_source_preview(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-    Json(body): Json<service::source::SourceCommitBody>,
-) -> impl IntoResponse {
-    service::environments::preview(&state, &id, &body)
-        .await
-        .map(Json)
 }

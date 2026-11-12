@@ -183,7 +183,14 @@ fn is_hex_sha(reference: &str) -> bool {
 }
 
 /// A ref the forge will hand to git: a branch or tag name, or a full-ish sha.
+/// A `refs/`-prefixed name must be under `refs/heads/` or `refs/tags/`: the
+/// retired `refs/previews/*` refs (and anything else hidden) must not be
+/// readable through `source.tree`/`source.blob`.
 fn valid_ref(reference: &str) -> bool {
+    if let Some(rest) = reference.strip_prefix("refs/") {
+        let readable = rest.starts_with("heads/") || rest.starts_with("tags/");
+        return readable && valid_branch_name(reference);
+    }
     is_hex_sha(reference) || valid_branch_name(reference)
 }
 
@@ -412,9 +419,8 @@ async fn ensure_app_row(state: &AppState, app: &App) -> anyhow::Result<()> {
     }
 }
 
-/// [`publish_ref`] for a full ref name: `refs/heads/<branch>` (a branch) or
-/// `refs/previews/<userId>/<branch>` (a workspace preview's hidden ref, which
-/// is never advertised or browsed). Anything else is refused.
+/// [`publish_ref`] for a full ref name: `refs/heads/<branch>`. Anything else
+/// is refused.
 pub async fn publish_refname(
     state: &AppState,
     app: &App,
@@ -437,13 +443,10 @@ pub async fn publish_refname(
     // for it would create the *next* app's history (the tip sweep would
     // deploy it). Checked under the lock so create/rename cannot interleave.
     ensure_app_row(state, app).await?;
-    let bare = read_mirror_locked(state, &app.slug).await?;
-    if refname.starts_with(crate::host::git_http::PREVIEW_REF_PREFIX) {
-        // A mirror hydrated before preview environments existed has no hidden
-        // refs configured yet, and this is the first write that can create
-        // one.
-        hide_preview_refs(&bare).await;
-    }
+    // Sync the mirror inside the guard before the CAS: a cold mirror has no
+    // refs for the expected-old precondition, and the locked variants would
+    // self-deadlock if they re-took the lock.
+    read_mirror_locked(state, &app.slug).await?;
     let updates = match (expected_old, new) {
         (old, Some(sha)) => vec![ryuz_git::RefUpdate::set(refname, old, sha)],
         (Some(old), None) => vec![ryuz_git::RefUpdate::delete(refname, Some(old))],
@@ -501,48 +504,121 @@ pub async fn publish_refname(
     Ok(())
 }
 
-/// A ref a server-side move may write: a branch, or a workspace preview's
-/// hidden ref (`refs/previews/<userId>/<branch>`).
+/// A ref a server-side move may write: a branch.
 pub fn publishable_ref(refname: &str) -> bool {
     match refname.strip_prefix("refs/heads/") {
         Some(branch) => valid_branch_name(branch),
-        None => match refname.strip_prefix(crate::host::git_http::PREVIEW_REF_PREFIX) {
-            Some(rest) => {
-                let (user, branch) = rest.split_once('/').unwrap_or_default();
-                !user.is_empty()
-                    && user.len() <= 64
-                    && valid_branch_name(branch)
-                    && !user.contains('/')
-            }
-            None => false,
-        },
+        None => false,
     }
 }
 
-/// Make `refs/previews/*` invisible to every git client of this mirror: a
-/// clone or `ls-refs` never advertises them, and a fetch of one is refused.
-/// Idempotent (a plain config write) and cheap, so it runs on repo init and on
-/// the first preview ref written into an older mirror.
-pub async fn hide_preview_refs(bare: &Path) {
-    let git_dir = format!("--git-dir={}", bare.display());
-    for key in ["uploadpack.hideRefs", "transfer.hideRefs"] {
-        if let Err(e) = exec::run_cmd(
-            "git",
-            &[
-                &git_dir,
-                "config",
-                key,
-                crate::host::git_http::PREVIEW_REF_PREFIX,
-            ],
-            None,
-            &[],
-            Duration::from_secs(15),
+/// The retired refs still in one app's durable manifest. Read without
+/// touching the mirror, so the install-wide boot sweep skips an app whose
+/// manifest never held the namespace instead of syncing every mirror.
+async fn retired_refs_in_manifest(state: &AppState, slug: &str) -> anyhow::Result<Vec<String>> {
+    let Some(manifest) = state.wal.read_manifest(slug).await? else {
+        return Ok(Vec::new());
+    };
+    let refs =
+        <ryuz_git::RefsCodec as ryuz_git::ManifestCodec>::state(&ryuz_git::RefsCodec, &manifest);
+    Ok(refs
+        .refs
+        .into_keys()
+        .filter(|name| name.starts_with(crate::host::git_http::PREVIEW_REF_PREFIX))
+        .collect())
+}
+
+/// Remove every ref under the retired `refs/previews/` namespace from one
+/// app's push mirror and its manifest, so old hidden snapshots are gone from
+/// the durable state too (a rehydrate cannot bring them back) and a later
+/// push's snapshot does not disagree with a manifest that still lists them.
+/// Idempotent; returns how many refs it removed. A ref another runner already
+/// deleted is not an error.
+pub async fn delete_retired_refs(state: &AppState, slug: &str) -> anyhow::Result<usize> {
+    let retired = crate::host::git_http::PREVIEW_REF_PREFIX;
+    let known = retired_refs_in_manifest(state, slug).await?;
+    let mirror = state.wal.mirror_path(slug);
+    let local = if mirror.join("HEAD").exists() {
+        git_out(
+            &mirror,
+            &["for-each-ref", "--format=%(objectname) %(refname)", retired],
         )
         .await
-        {
-            tracing::warn!(error = %format!("{e:#}"), "could not hide preview refs");
+        .unwrap_or_default()
+    } else {
+        String::new()
+    };
+    if known.is_empty() && local.trim().is_empty() {
+        return Ok(0);
+    }
+    let _push_guard = state.wal.lock(slug).await;
+    let bare = state.wal.ensure_synced_locked(slug).await?;
+    let out = git_out(
+        &bare,
+        &["for-each-ref", "--format=%(objectname) %(refname)", retired],
+    )
+    .await?;
+    let updates: Vec<ryuz_git::RefUpdate> = out
+        .lines()
+        .filter_map(|line| {
+            let (sha, refname) = line.trim().split_once(' ')?;
+            refname
+                .starts_with(retired)
+                .then(|| ryuz_git::RefUpdate::delete(refname.trim(), Some(sha.trim())))
+        })
+        .collect();
+    if updates.is_empty() {
+        return Ok(0);
+    }
+    let count = updates.len();
+    // The bundles go first, and the wipe is verified: if a prefix cannot be
+    // listed or still holds objects, the refs stay in the mirror and the
+    // manifest (and the boot marker stays unset) so the next boot retries —
+    // once the refs are gone the prefixes are unreachable and would leak the
+    // retired snapshots forever.
+    for update in &updates {
+        crate::host::git_http::delete_ref_prefix(&state.config, slug, &update.refname).await;
+        let prefix = format!("git/{slug}/{}/", update.refname);
+        let listing =
+            crate::host::s3::s3_list_prefix(&state.config, &state.config.s3_bucket, &prefix)
+                .await
+                .with_context(|| format!("list the retired bundle prefix {prefix}"))?;
+        let remaining = serde_json::from_str::<serde_json::Value>(&listing)
+            .ok()
+            .and_then(|v| v.get("Contents").and_then(|c| c.as_array()).cloned())
+            .map(|a| !a.is_empty())
+            .unwrap_or(true);
+        if remaining {
+            anyhow::bail!("retired bundles remain under {prefix}; retrying on the next boot");
         }
     }
+    let outcome = match state.wal.publish_locked(slug, &updates).await {
+        Ok(outcome) => outcome,
+        Err(ryuz_git::WalError::RefConflict { .. }) => {
+            // Two runners can sweep the same install (a restart overlapping
+            // the old process). The loser's CAS fails; if the winner already
+            // removed everything there is nothing left to do.
+            if retired_refs_in_manifest(state, slug).await?.is_empty() {
+                return Ok(0);
+            }
+            return Err(anyhow!(
+                "the retired preview refs of {slug} changed during the sweep"
+            ));
+        }
+        Err(e) => return Err(anyhow!("{e:#}")),
+    };
+    for moved in &outcome.moved {
+        if let Some(bundle) = &moved.bundle {
+            crate::host::git_http::prune_old_bundles(&state.config, slug, &moved.refname, bundle)
+                .await;
+        }
+    }
+    for deleted in &outcome.deleted {
+        // Best-effort here (the strict wipe already ran): a ref the WAL
+        // removed from the mirror may still have its (empty) prefix.
+        crate::host::git_http::delete_ref_prefix(&state.config, slug, deleted).await;
+    }
+    Ok(count)
 }
 
 /// `git merge-tree --write-tree` of `ours` and `theirs` in the push mirror.
@@ -1577,9 +1653,21 @@ mod tests {
             "{}user_1/feature",
             crate::host::git_http::PREVIEW_REF_PREFIX
         );
-        publish_refname(&h.state, &h.app, &preview, None, Some(&preview_only))
+        // Seeded out-of-band: the runner no longer writes the reserved
+        // namespace (pushes there are refused), but an upgraded mirror still
+        // holds one.
+        h.state
+            .wal
+            .publish_locked(
+                &h.app.slug,
+                &[ryuz_git::RefUpdate::set(
+                    &preview,
+                    None::<String>,
+                    &preview_only,
+                )],
+            )
             .await
-            .expect("publish preview ref");
+            .expect("seed preview ref");
         let short = &main[..7];
 
         // The bare spellings matter too: git's DWIM rewrites `previews/…` to
@@ -2554,9 +2642,14 @@ mod tests {
             "{}user_2/feature",
             crate::host::git_http::PREVIEW_REF_PREFIX
         );
-        publish_refname(&h.state, &h.app, &preview, None, Some(&main))
+        h.state
+            .wal
+            .publish_locked(
+                &h.app.slug,
+                &[ryuz_git::RefUpdate::set(&preview, None::<String>, &main)],
+            )
             .await
-            .expect("publish preview ref");
+            .expect("seed preview ref");
         let files = vec![text_file("feature.txt", "wip\n")];
 
         // `fromSha` naming the preview ref is refused before any object write.
@@ -3595,10 +3688,10 @@ mod tests {
         h.finish().await;
     }
 
-    /// The archive streams the committed tree (binary, executable, symlink)
-    /// and the listing carries each blob's sha and mode.
+    /// The tree listing carries each blob's sha and mode (binary,
+    /// executable, symlink included).
     #[tokio::test]
-    async fn source_archive_round_trips() {
+    async fn source_tree_carries_blob_sha_and_mode() {
         use std::os::unix::fs::PermissionsExt;
 
         let h = Harness::new("archive").await;
@@ -3644,113 +3737,14 @@ mod tests {
             .to_string();
         assert_eq!(binary["sha"], json!(blob), "tree carries the blob id");
 
-        let request = axum::http::Request::builder()
-            .method("GET")
-            .uri(format!("/v1/apps/{}/source/archive?ref=main", app.id))
-            .header("authorization", "Bearer test-token")
-            .body(axum::body::Body::empty())
-            .expect("build request");
-        let response = router.clone().oneshot(request).await.expect("dispatch");
-        assert_eq!(response.status(), axum::http::StatusCode::OK);
-        assert_eq!(
-            response
-                .headers()
-                .get(axum::http::header::CONTENT_TYPE)
-                .and_then(|v| v.to_str().ok()),
-            Some("application/x-tar")
-        );
-        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .expect("tar body");
-        let tar = h.dir.join("archive.tar");
-        std::fs::write(&tar, &bytes).expect("write tar");
-        let out = h.dir.join("untar");
-        std::fs::create_dir_all(&out).expect("untar dir");
-        exec::run_cmd(
-            "tar",
-            &[
-                "-xf",
-                tar.to_str().expect("tar path"),
-                "-C",
-                out.to_str().expect("out path"),
-            ],
-            None,
-            &[],
-            Duration::from_secs(60),
-        )
-        .await
-        .expect("untar");
-        assert_eq!(
-            std::fs::read(out.join("bin.dat")).expect("bin"),
-            vec![0x00_u8, 0xff, 0x01, 0x80]
-        );
-        assert_eq!(
-            std::fs::read_to_string(out.join("dir/file.txt")).expect("text"),
-            "hello\n"
-        );
-        let meta = std::fs::symlink_metadata(out.join("run.sh")).expect("run.sh");
-        assert_ne!(meta.permissions().mode() & 0o111, 0, "exec bit survives");
-        let link = std::fs::symlink_metadata(out.join("link")).expect("link");
-        assert!(link.file_type().is_symlink(), "symlink survives");
-        assert_eq!(
-            std::fs::read_link(out.join("link")).expect("link target"),
-            std::path::PathBuf::from("bin.dat")
-        );
-
         h.finish().await;
     }
 
-    /// A checkout over the Workspace caps is refused from the listing, before
-    /// the archive streams.
+    /// The TLS ask mints nothing for the retired pod origin: its slug
+    /// namespace is reserved and no app can own it.
     #[tokio::test]
-    async fn source_archive_refuses_a_repo_over_the_cap() {
-        let h = Harness::new("archivecap").await;
-        let app = h.app.clone();
-        let bare = h.mirror().await;
-        let work = Work::new(&h.dir.join("scratch")).await;
-        // Sparse: 100 MiB + 1 without writing the bytes.
-        let big = std::fs::File::create(work.dir.join("big.bin")).expect("create");
-        big.set_len(crate::host::source::MAX_WORKSPACE_BYTES + 1)
-            .expect("set len");
-        drop(big);
-        work.commit("huge").await;
-        let tips = seed_objects(&bare, &work).await;
-        for (branch, sha) in &tips {
-            publish_ref(&h.state, &app, branch, None, Some(sha.as_str()))
-                .await
-                .expect("publish");
-        }
-
-        let router = crate::api::router::router(h.state.clone());
-        let request = axum::http::Request::builder()
-            .method("GET")
-            .uri(format!("/v1/apps/{}/source/archive?ref=main", app.id))
-            .header("authorization", "Bearer test-token")
-            .body(axum::body::Body::empty())
-            .expect("build request");
-        let response = router.clone().oneshot(request).await.expect("dispatch");
-        assert_eq!(response.status(), axum::http::StatusCode::PAYLOAD_TOO_LARGE);
-        let text = String::from_utf8_lossy(
-            &axum::body::to_bytes(response.into_body(), usize::MAX)
-                .await
-                .expect("body"),
-        )
-        .to_string();
-        assert!(
-            text.contains("repository too large for Code mode"),
-            "{text}"
-        );
-
-        h.finish().await;
-    }
-
-    /// The TLS ask admits a preview host for an existing app only: the pod runs
-    /// in the browser, so the fleet need not be up, but an unknown slug gets no
-    /// certificate.
-    #[tokio::test]
-    async fn tls_ask_admits_preview_hosts_for_existing_apps() {
+    async fn tls_ask_admits_no_retired_pod_host() {
         let h = Harness::new("previewtls").await;
-        // The pod label spells the app id, so this one needs a real row id.
         let app = crate::db::create_app(
             &h.state.pool,
             &h.state.config,
@@ -3766,24 +3760,208 @@ mod tests {
         .await
         .expect("seed app");
         let router = crate::api::router::router(h.state.clone());
+        // A pod-shaped host names no live app and cannot become one.
         assert_eq!(
             ask_tls(&router, &format!("pod-{}.localhost", app.id)).await,
-            axum::http::StatusCode::OK
-        );
-        // Only that one stable label is admitted: a random pod host gets no
-        // certificate (no per-session issuance, no CA-limit drain).
-        assert_eq!(
-            ask_tls(&router, "pod-1234.localhost").await,
             axum::http::StatusCode::NOT_FOUND
         );
         assert_eq!(
             ask_tls(&router, "app-0.preview.ghost.localhost").await,
             axum::http::StatusCode::NOT_FOUND
         );
-        // The bare tenant host still needs a deployed, running fleet.
+        h.finish().await;
+    }
+
+    #[test]
+    fn preview_refs_are_not_readable() {
+        // Source reads accept branches, tags and shas; the retired hidden
+        // namespace stays unreachable by an explicit ref.
+        assert!(valid_ref("main"));
+        assert!(valid_ref("feature/x"));
+        assert!(valid_ref("refs/heads/main"));
+        assert!(valid_ref("refs/tags/v1"));
+        assert!(valid_ref("0123456789abcdef0123456789abcdef01234567"));
+        assert!(!valid_ref("refs/previews/user/feature"));
+        assert!(!valid_ref("refs/pull/1/head"));
+        assert!(!valid_ref("refs/"));
+    }
+
+    /// The retirement sweep removes every `refs/previews/*` ref from the
+    /// mirror and the durable manifest, so the next push's snapshot agrees
+    /// with the manifest and a rehydrate cannot bring the hidden snapshots
+    /// back.
+    #[tokio::test]
+    async fn retired_preview_refs_are_deleted_from_mirror_and_manifest() {
+        let h = Harness::new("retiredrefs").await;
+        let app = h.app.clone();
+        let bare = h.mirror().await;
+        let work = Work::new(&h.dir.join("scratch")).await;
+        work.write("a.txt", "a\n");
+        let sha = work.commit("one").await;
+        let tips = seed_objects(&bare, &work).await;
+        for (branch, sha) in &tips {
+            publish_ref(&h.state, &app, branch, None, Some(sha.as_str()))
+                .await
+                .expect("publish");
+        }
+        // The old preview writer put the snapshot on a hidden ref; publish it
+        // through the same WAL so the manifest carries it.
+        h.state
+            .wal
+            .publish_locked(
+                &app.slug,
+                &[ryuz_git::RefUpdate::set(
+                    "refs/previews/user/wip",
+                    None::<String>,
+                    sha.as_str(),
+                )],
+            )
+            .await
+            .expect("preview ref");
+        assert!(
+            !git(&bare, &["show-ref", "--verify", "refs/previews/user/wip"])
+                .await
+                .is_empty()
+        );
+
         assert_eq!(
-            ask_tls(&router, "previewtls.localhost").await,
-            axum::http::StatusCode::NOT_FOUND
+            delete_retired_refs(&h.state, &app.slug)
+                .await
+                .expect("sweep"),
+            1
+        );
+        assert!(
+            exec::run_cmd(
+                "git",
+                &[
+                    &format!("--git-dir={}", bare.display()),
+                    "show-ref",
+                    "--verify",
+                    "refs/previews/user/wip",
+                ],
+                None,
+                &[],
+                Duration::from_secs(15),
+            )
+            .await
+            .is_err(),
+            "the hidden ref is gone"
+        );
+        // A later branch push still records: the snapshot and the manifest
+        // no longer disagree.
+        publish_ref(&h.state, &app, "next", None, Some(sha.as_str()))
+            .await
+            .expect("branch push after cleanup");
+        assert_eq!(
+            delete_retired_refs(&h.state, &app.slug)
+                .await
+                .expect("idempotent sweep"),
+            0
+        );
+        h.finish().await;
+    }
+
+    /// A push's snapshot holds branches and tags only, while the WAL tracks
+    /// the retired namespace too. `after_receive` folds in whatever preview
+    /// refs the mirror still holds, so a leftover ref is carried through
+    /// unchanged instead of being read as a create the manifest already has
+    /// (which would fail the push the runner already accepted).
+    #[tokio::test]
+    async fn a_push_records_beside_a_leftover_preview_ref() {
+        let h = Harness::new("leftoverpreview").await;
+        let app = h.app.clone();
+        let bare = h.mirror().await;
+        let work = Work::new(&h.dir.join("scratch")).await;
+        work.write("a.txt", "a\n");
+        let sha = work.commit("one").await;
+        let tips = seed_objects(&bare, &work).await;
+        for (branch, sha) in &tips {
+            publish_ref(&h.state, &app, branch, None, Some(sha.as_str()))
+                .await
+                .expect("publish");
+        }
+        // The pre-upgrade preview writer's hidden ref, still in the manifest
+        // (the boot sweep has not run in this test).
+        h.state
+            .wal
+            .publish_locked(
+                &app.slug,
+                &[ryuz_git::RefUpdate::set(
+                    "refs/previews/user/wip",
+                    None::<String>,
+                    sha.as_str(),
+                )],
+            )
+            .await
+            .expect("preview ref");
+
+        // What a real push leaves behind: the snapshot is taken before
+        // receive-pack moves the branch in the mirror, and it lists branches
+        // and tags only.
+        let before = crate::host::git_http::list_refs(&bare)
+            .await
+            .expect("push snapshot");
+        assert!(!before.contains_key("refs/previews/user/wip"));
+        git(&bare, &["update-ref", "refs/heads/next", &sha]).await;
+
+        let moved = crate::host::git_http::after_receive(&h.state, &app, &bare, &before)
+            .await
+            .expect("push records beside the retired ref");
+        assert!(
+            moved
+                .tips
+                .iter()
+                .any(|tip| tip.git_ref == "refs/heads/next"),
+            "the pushed branch's tip is recorded"
+        );
+        h.finish().await;
+    }
+
+    /// Two runners can sweep the same install (a restart overlapping the old
+    /// process). The loser of the CAS finds the ref already gone and reports
+    /// success, not an error that would keep the install's marker unset.
+    #[tokio::test]
+    async fn concurrent_sweeps_tolerate_an_already_gone_ref() {
+        let h = Harness::new("racesweep").await;
+        let app = h.app.clone();
+        let bare = h.mirror().await;
+        let work = Work::new(&h.dir.join("scratch")).await;
+        work.write("a.txt", "a\n");
+        let sha = work.commit("one").await;
+        let tips = seed_objects(&bare, &work).await;
+        for (branch, sha) in &tips {
+            publish_ref(&h.state, &app, branch, None, Some(sha.as_str()))
+                .await
+                .expect("publish");
+        }
+        h.state
+            .wal
+            .publish_locked(
+                &app.slug,
+                &[ryuz_git::RefUpdate::set(
+                    "refs/previews/user/wip",
+                    None::<String>,
+                    sha.as_str(),
+                )],
+            )
+            .await
+            .expect("preview ref");
+
+        let (a, b) = tokio::join!(
+            delete_retired_refs(&h.state, &app.slug),
+            delete_retired_refs(&h.state, &app.slug),
+        );
+        let counts = [a.expect("first sweep"), b.expect("second sweep")];
+        assert_eq!(
+            counts.iter().sum::<usize>(),
+            1,
+            "exactly one sweep deletes the ref: {counts:?}"
+        );
+        assert_eq!(
+            delete_retired_refs(&h.state, &app.slug)
+                .await
+                .expect("idempotent"),
+            0
         );
         h.finish().await;
     }

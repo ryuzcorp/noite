@@ -11,13 +11,13 @@ On the app page's **Deployments** tab each environment is its own group, below *
 | --- | --- |
 | Host | `<label>.<slug>.<base>` — e.g. `staging.my-app.noite.now` |
 | Storage | Fresh and empty: `s3://<bucket>/envs/<slug>/<label>`, so celld creates new D1 databases, Durable Object state and R2 buckets on the environment's first deploy |
-| Tracks | `refs/heads/<branch>` (a branch environment) or `refs/previews/<user>/<branch>` (a workspace preview) |
-| Label | Derived from the branch: lowercased, separators to `-`, trimmed to a DNS label (≤ 40 chars), with a suffix on collision. `preview` and `app-0` are reserved |
+| Tracks | `refs/heads/<branch>` |
+| Label | Derived from the branch: lowercased, separators to `-`, trimmed to a DNS label (≤ 40 chars), with a suffix on collision |
 | Access | Members only by default; a per-environment **Public** switch |
 
 ## Create one
 
-**Create environment** at the top of the Deployments tab asks for a branch (the picker lists the app's branches) and deploys its head. The branch must exist; `main` is refused. The label is derived from the branch name — there is no free-text label, so a branch named `preview` gets `preview-2` when `preview` is taken.
+**Create environment** at the top of the Deployments tab asks for a branch (the picker lists the app's branches) and deploys its head. The branch must exist; `main` is refused. The label is derived from the branch name — there is no free-text label, so a branch named `preview` gets `preview`, or `preview-2` when that label is taken.
 
 Creating an environment counts against the caps in [Limits](/reference/limits#quotas): `RUNNER_MAX_ENVIRONMENTS_PER_APP` (5) per app and `RUNNER_MAX_ENVIRONMENTS` (25) per instance. Both are enforced in the runner, so neither the CLI nor an agent can go over them.
 
@@ -33,21 +33,20 @@ An environment inherits the app's variables ([Configure](/apps/configure#environ
 
 An environment is **members only** by default. Its sites run an access gate (`forward_auth` in the generated Caddyfile): a request without the gate's cookie is redirected to the control UI (`/api/env-auth?env=&app=&return=`), which checks the session and the app's `view` role and mints a short-lived token (60 s). A signed-out visitor lands on the login screen with the environment as its `return`, so signing in comes straight back. The runner's edge verifies that token and sets a host-only, `HttpOnly`, `SameSite=Lax` `__noite_env` cookie on the environment's own host, valid for 12 hours — so signing in to the control UI once is enough, and the cookie never travels to the control UI, to production, or to another environment. The gate reads it and then strips it from the `Cookie` header, so the environment's app never sees it.
 
-An admin can flip **Public** on an environment (e.g. `staging`) to serve it to anyone with the URL — no gate. The environment site carries `Cross-Origin-Resource-Policy: same-site`, which is what lets [Code mode](/apps/source)'s Preview panel frame it. Inside that frame (and only there) the page also gets `Cross-Origin-Embedder-Policy: credentialless`, because the Code mode page is cross-origin isolated: cross-origin images, scripts and fonts still load, but without cookies. Open the environment in its own tab to see it exactly as visitors do.
+An admin can flip **Public** on an environment (e.g. `staging`) to serve it to anyone with the URL — no gate. The environment site carries `Cross-Origin-Resource-Policy: same-site`, and a same-site frame gets `Cross-Origin-Embedder-Policy: credentialless` (cross-origin images, scripts and fonts still load, without cookies). Open the environment in its own tab to see it exactly as visitors do.
 
 ### Framed loads reach the app as page loads
 
-The Preview panel frames the environment (and production, for the default branch). A browser marks a framed load `Sec-Fetch-Dest: iframe` (a new tab sends `document`), and an app that renders only `document` navigations — oxidejs 0.6's worker, for one — would answer the frame with its own 404 while the same URL renders fine in a tab. So the edge rewrites `Sec-Fetch-Dest` to `document` on the way to the app when the frame is same-site (`Sec-Fetch-Site: same-site`, which is the control UI framing it); a cross-site page embedding the app still sends its own `iframe`. Only the request changes: the app's own `X-Frame-Options` or CSP `frame-ancestors` still decide whether the browser shows the frame. Production gets the same framing headers and rewrite, on framed loads only.
+A browser marks a framed load `Sec-Fetch-Dest: iframe` (a new tab sends `document`), and an app that renders only `document` navigations — oxidejs 0.6's worker, for one — would answer the frame with its own 404 while the same URL renders fine in a tab. So the edge rewrites `Sec-Fetch-Dest` to `document` on the way to the app when the frame is same-site (`Sec-Fetch-Site: same-site`); a cross-site page embedding the app still sends its own `iframe`. Only the request changes: the app's own `X-Frame-Options` or CSP `frame-ancestors` still decide whether the browser shows the frame. Production gets the same framing headers and rewrite.
 
 ## Code mode
 
-[Code mode](/apps/source)'s **Preview** panel frames what is deployed for the browsed branch and follows it: while the workspace has uncommitted changes it frames the viewer's own **workspace preview** (`refs/previews/<user>/<branch>`, never a branch), otherwise the branch's environment — production for the default branch — and every push to the branch redeploys its environment, so the frame reloads once that deploy succeeds (until then the previous build is what serves). **Deploy preview** snapshots the uncommitted changes onto that hidden ref and deploys that environment, leaving the branch and the changes exactly as they were; a preview whose snapshot is older than the latest edit says so, with the deploy beside it.
+[Code mode](/apps/source) is a light editor: its edits are committed to a branch, and the branch's environment (or production for the default branch) serves the result once that deploy succeeds. The old **Preview** panel, its workspace previews on hidden refs, and the timer that expired them were removed with the in-browser pod; uncommitted work is never deployed. An upgraded install's remaining workspace-preview environments are torn down when the runner boots.
 
 ## Lifecycle
 
 - **Scale to zero.** Like an app, an environment's fleet sleeps after the install's idle threshold without requests (15 minutes on a ≤ 2 GiB host, 6 hours at ≤ 4 GiB, else 24 hours; `RUNNER_SLEEP_AFTER_MIN`/`RUNNER_SLEEP_AFTER_H`, or its owning app's Sleep after override) and wakes on the next one ([Limits](/reference/limits#sleep-scale-to-zero)).
 - **Branch deletion deletes its environment** — as does **Delete** in the environment's group (which also removes its fleet, its storage and its deploys).
-- **Workspace previews expire** after `RUNNER_ENVIRONMENT_TTL_H` hours (168 = 7 days) without a deploy.
 
 Each environment host needs its own certificate: the edge mints one on demand, ask-gated to an existing environment of a real app. The caps bound how many certificates one domain can ask for.
 

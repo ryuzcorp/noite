@@ -246,9 +246,7 @@ fn unauthorized() -> Response {
 
 /// Create a bare repo whose HEAD points at the default branch (A0), so a fresh
 /// repo advertises "empty repository" (+ push instructions) instead of an
-/// unborn `master`, and a browser commit can create `main`. Hidden preview
-/// refs (`refs/previews/*`) are configured away from advertising here, so a
-/// `git clone`/`ls-refs` of a repository that has them never shows them.
+/// unborn `master`, and a browser commit can create `main`.
 pub(crate) async fn init_bare(repo: &Path) -> anyhow::Result<()> {
     tokio::fs::create_dir_all(repo).await?;
     let path = repo.to_string_lossy().into_owned();
@@ -261,7 +259,6 @@ pub(crate) async fn init_bare(repo: &Path) -> anyhow::Result<()> {
         Duration::from_secs(30),
     )
     .await?;
-    crate::host::forge::hide_preview_refs(repo).await;
     Ok(())
 }
 
@@ -280,11 +277,12 @@ pub(crate) async fn init_repos(state: &AppState, slug: &str) -> anyhow::Result<(
     Ok(())
 }
 
-/// Every ref the runner tracks in a mirror: branches, tags, and the
-/// **hidden** preview refs (`refs/previews/<userId>/<branch>`, which workspace
-/// previews commit to). Hidden refs ride along here so their tip bundle is
-/// written and their manifest entry exists, but they are never advertised
-/// (`uploadpack.hideRefs`), listed as branches, or used as PR heads.
+/// The reserved hidden preview namespace. Nothing writes it any more, the
+/// boot sweep deletes what an upgrade left, every caller-ref surface refuses
+/// it, and the Git advertisement and fetch paths hide it.
+pub const PREVIEW_REF_PREFIX: &str = "refs/previews/";
+
+/// Every ref the runner tracks in a mirror: branches and tags.
 pub(crate) async fn list_refs(bare: &Path) -> anyhow::Result<HashMap<String, String>> {
     let out = exec::run_cmd(
         "git",
@@ -307,34 +305,8 @@ pub(crate) async fn list_refs(bare: &Path) -> anyhow::Result<HashMap<String, Str
         };
         map.insert(name.trim().to_string(), sha.trim().to_lowercase());
     }
-    // `for-each-ref` exits 0 with empty output when nothing matches, unlike
-    // `show-ref <pattern>` (exit 1), so the preview listing cannot take the
-    // branch/tag listing down with it.
-    let previews = exec::run_cmd(
-        "git",
-        &[
-            &format!("--git-dir={}", bare.display()),
-            "for-each-ref",
-            "--format=%(objectname) %(refname)",
-            PREVIEW_REF_PREFIX,
-        ],
-        None,
-        &[],
-        Duration::from_secs(15),
-    )
-    .await
-    .unwrap_or_default();
-    for line in previews.lines() {
-        let Some((sha, name)) = line.split_once(' ') else {
-            continue;
-        };
-        map.insert(name.trim().to_string(), sha.trim().to_lowercase());
-    }
     Ok(map)
 }
-
-/// Where workspace previews commit: a hidden ref per (user, branch) pair.
-pub const PREVIEW_REF_PREFIX: &str = "refs/previews/";
 
 /// Drop superseded tip bundles for a ref (keep the live one). Runs only
 /// after the manifest flip, so concurrent readers already moved on.
@@ -397,8 +369,8 @@ pub(crate) struct MovedRefs {
 /// changed ref and flips the manifest once, then the superseded bundles and
 /// deleted-ref prefixes are pruned. Returns a tip per moved ref
 /// (production's `refs/heads/main` and every branch a preview environment
-/// may track), so a push to `refs/heads/<branch>` or
-/// `refs/previews/<userId>/<branch>` reaches the deploy pipeline.
+/// may track), so a push to `refs/heads/<branch>` reaches the deploy
+/// pipeline.
 ///
 /// The caller holds the slug's lock (`receive_pack`, `forge::publish_refname`
 /// take it across the whole mutation), so the locked record runs inside it:
@@ -406,14 +378,42 @@ pub(crate) struct MovedRefs {
 pub(crate) async fn after_receive(
     state: &AppState,
     app: &App,
-    _bare: &Path,
+    bare: &Path,
     before: &HashMap<String, String>,
 ) -> anyhow::Result<MovedRefs> {
+    let mut refs: std::collections::BTreeMap<String, String> = before
+        .iter()
+        .map(|(name, sha)| (name.clone(), sha.clone()))
+        .collect();
+    // The WAL tracks the retired preview namespace (so the boot sweep can
+    // delete what an upgrade left), and its snapshot must cover the same refs
+    // or a surviving preview ref reads as a create while the manifest already
+    // has it — that conflict would fail the whole push. Carry whatever the
+    // mirror still holds through unchanged.
+    let git_dir = format!("--git-dir={}", bare.display());
+    let retired = exec::run_cmd(
+        "git",
+        &[
+            &git_dir,
+            "for-each-ref",
+            "--format=%(objectname) %(refname)",
+            PREVIEW_REF_PREFIX,
+        ],
+        None,
+        &[],
+        Duration::from_secs(30),
+    )
+    .await?;
+    for line in retired.lines() {
+        let Some((sha, refname)) = line.trim().split_once(' ') else {
+            continue;
+        };
+        if refname.starts_with(PREVIEW_REF_PREFIX) {
+            refs.insert(refname.to_string(), sha.to_string());
+        }
+    }
     let snapshot = ryuz_git::git::RefSnapshot {
-        refs: before
-            .iter()
-            .map(|(name, sha)| (name.clone(), sha.clone()))
-            .collect(),
+        refs,
         head: None,
         peeled: Default::default(),
     };
@@ -507,7 +507,14 @@ pub async fn info_refs(
     };
     let out = match exec::run_cmd(
         "git",
-        &[prog, "--stateless-rpc", "--advertise-refs", bare_arg],
+        &[
+            "-c",
+            &format!("uploadpack.hideRefs={PREVIEW_REF_PREFIX}"),
+            prog,
+            "--stateless-rpc",
+            "--advertise-refs",
+            bare_arg,
+        ],
         None,
         &[],
         Duration::from_secs(30),
@@ -557,7 +564,13 @@ pub async fn upload_pack(
     };
     match exec::run_cmd_stdin(
         "git",
-        &["upload-pack", "--stateless-rpc", bare_arg],
+        &[
+            "-c",
+            &format!("uploadpack.hideRefs={PREVIEW_REF_PREFIX}"),
+            "upload-pack",
+            "--stateless-rpc",
+            bare_arg,
+        ],
         &body,
         None,
         &[],
@@ -717,7 +730,12 @@ pub async fn receive_pack(
         }
         Err(e) => {
             tracing::error!(slug = %app.slug, error = %format!("{e:#}"), "git receive sync to s3 failed");
-            return (StatusCode::CONFLICT, format!("{e:#}")).into_response();
+            // The pusher gets a stable message; the cause stays in the log.
+            return (
+                StatusCode::CONFLICT,
+                "noite: the push could not be recorded; retry, and contact the operator if it persists",
+            )
+                .into_response();
         }
     }
     // Pull requests follow their head branch: the push moved `refs/heads/*`,
