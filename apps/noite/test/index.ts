@@ -52,6 +52,30 @@ export default {
       return Response.json({ key: "test.txt", stored: true });
     }
 
+    // Visiting /d1-many-tables creates six tables. The storage e2e uses it
+    // to prove the D1 editor lists a database past SQLite's five-term
+    // compound-SELECT budget, which celld applies to every cell.
+    if (url.pathname === "/d1-many-tables" && request.method === "GET") {
+      const tables = [
+        "extra_1",
+        "extra_2",
+        "extra_3",
+        "extra_4",
+        "extra_5",
+        "extra_6",
+      ];
+
+      await env.DB.batch(
+        tables.map((name) =>
+          env.DB.prepare(
+            `CREATE TABLE IF NOT EXISTS ${name} (id INTEGER PRIMARY KEY)`
+          )
+        )
+      );
+
+      return Response.json({ tables });
+    }
+
     // Minimal R2 demo: PUT /files/<key> stores the body, GET /files/<key>
     // reads it back, GET /files lists keys as JSON.
     if (url.pathname === "/files" && request.method === "GET") {
