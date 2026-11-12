@@ -21,6 +21,48 @@ use crate::AppState;
 /// `QUOTA_LOCK`.
 static QUOTA_LOCK: LazyLock<tokio::sync::Mutex<()>> = LazyLock::new(|| tokio::sync::Mutex::new(()));
 
+/// What a failing operation tells its caller: the step, a failure class in
+/// tenant words, and a short ref whose full chain (store error text, bucket,
+/// work-dir path, stderr) is in the runner log. The raw detail is never part of
+/// the client message: prefixes, bucket names and local paths are internals,
+/// and a transport error can carry a presigned URL (review finding, 2026-11-12).
+fn step_failure(step: &str, detail: &str) -> String {
+    let id = crate::models::new_id();
+    let reference = &id[..8];
+    tracing::warn!(reference, step, error = detail, "app request step failed");
+    format!("{step}: {} (ref {reference})", failure_class(detail))
+}
+
+/// The failure class a step reports, from the raw chain. Kept coarse on
+/// purpose: it tells the tenant what they can do (retry now, retry later, ask
+/// the operator), never which path or bucket broke.
+fn failure_class(detail: &str) -> &'static str {
+    let text = detail.to_ascii_lowercase();
+    if text.contains("timed out") || text.contains("timeout") {
+        "timed out"
+    } else if text.contains("accessdenied")
+        || text.contains("access denied")
+        || text.contains("forbidden")
+        || text.contains("403")
+    {
+        "the storage service denied the request"
+    } else if text.contains("notempty") || text.contains("not empty") {
+        "the data is not empty yet"
+    } else if text.contains("nosuchbucket") || text.contains("not found") || text.contains("404") {
+        "the storage service could not find the data"
+    } else if text.contains("connect")
+        || text.contains("transport")
+        || text.contains("unavailable")
+        || text.contains("slowdown")
+        || text.contains("503")
+        || text.contains("502")
+    {
+        "the storage service is unavailable"
+    } else {
+        "an internal error"
+    }
+}
+
 /// Fill the derived fields of a row on its way out: [`App::fleet_hold`] (the
 /// supervisor's crash or OOM backoff, process state) and [`App::auto_deploy`]
 /// (the automatic-deploy budget, derived from the deploy rows). Neither is a
@@ -146,9 +188,8 @@ async fn create_inner(
         Ok(Some(_)) => return Err(ApiError::conflict("slug already taken")),
         Ok(None) => {}
         Err(e) => {
-            return Err(ApiError::internal(format!(
-                "create {slug}: could not check the slug: {e}"
-            )))
+            let step = step_failure("could not check the slug", &e.to_string());
+            return Err(ApiError::internal(format!("create {slug}: {step}")));
         }
     }
     // Always wipe leftover S3/local data for this slug before the new row lands
@@ -166,16 +207,23 @@ async fn create_inner(
     )
     .await
     {
-        Ok(purge::Purged::Done) => {}
+        Ok(purge::Purged::Done) => {
+            // The prefixes are empty and no row owns the slug (checked under
+            // this guard): every pending-purge tombstone for it is satisfied.
+            // A failure only leaves them for the resume pass, which re-checks
+            // the row and wipes an empty prefix — never fail the create for it.
+            if let Err(e) = db::clear_app_purges(&state.pool, slug).await {
+                tracing::warn!(slug, error = %e, "could not clear the slug's purge tombstones");
+            }
+        }
         Ok(purge::Purged::Stopped) => {
             return Err(ApiError::internal(format!(
                 "create {slug}: the leftover wipe was stopped before it finished; retry the create"
             )))
         }
         Err(e) => {
-            return Err(ApiError::internal(format!(
-                "create {slug}: could not clear the deleted app's data: {e:#}"
-            )))
+            let step = step_failure("could not clear the deleted app's data", &format!("{e:#}"));
+            return Err(ApiError::internal(format!("create {slug}: {step}")));
         }
     }
     let subdomain = format!("{slug}.{}", state.config.base_domain);
@@ -193,18 +241,19 @@ async fn create_inner(
             }
             Ok(_) => {}
             Err(e) => {
-                return Err(ApiError::internal(format!(
-                    "create {slug}: could not count the account's apps: {e}"
-                )))
+                let step = step_failure("could not count the account's apps", &e.to_string());
+                return Err(ApiError::internal(format!("create {slug}: {step}")));
             }
         }
     }
     // A0: both bare mirrors exist, HEAD at `main`, before the app row does — a
     // failure here leaves no half-created app behind.
     if let Err(e) = git_http::init_repos(state, slug).await {
-        return Err(ApiError::internal(format!(
-            "create {slug}: could not initialize the git repositories: {e:#}"
-        )));
+        let step = step_failure(
+            "could not initialize the git repositories",
+            &format!("{e:#}"),
+        );
+        return Err(ApiError::internal(format!("create {slug}: {step}")));
     }
     // No credential row: only a scoped provider (Phase 4) mints one.
     // Ports are claimed, not just picked: the claim holds the allocator lock
@@ -238,9 +287,8 @@ async fn create_inner(
                 }
                 Ok(_) => {}
                 Err(e) => {
-                    return Err(ApiError::internal(format!(
-                        "create {slug}: could not count the account's apps: {e}"
-                    )))
+                    let step = step_failure("could not count the account's apps", &e.to_string());
+                    return Err(ApiError::internal(format!("create {slug}: {step}")));
                 }
             }
         }
@@ -257,7 +305,10 @@ async fn create_inner(
             },
         )
         .await
-        .map_err(|e| ApiError::internal(format!("create {slug}: could not store the app: {e}")))?
+        .map_err(|e| {
+            let step = step_failure("could not store the app", &e.to_string());
+            ApiError::internal(format!("create {slug}: {step}"))
+        })?
     };
     drop(ports);
     let Some(git) = git_source else {
@@ -640,9 +691,8 @@ async fn delete_inner(state: &AppState, id: &str) -> Result<(), ApiError> {
             ))
         }
         Err(e) => {
-            return Err(ApiError::internal(format!(
-                "delete {id}: could not read the app: {e}"
-            )))
+            let step = step_failure("could not read the app", &e.to_string());
+            return Err(ApiError::internal(format!("delete {id}: {step}")));
         }
     };
     // The delete claim (taken by `delete` before this task starts) is what
@@ -663,10 +713,8 @@ async fn delete_inner(state: &AppState, id: &str) -> Result<(), ApiError> {
     // is respawned in that window by the reconcile loop or by a wake. A failed
     // delete leaves the app stopped, which a retried delete finishes.
     if let Err(e) = db::patch_app_desired(&state.pool, &app.id, DesiredState::Stopped).await {
-        return Err(ApiError::internal(format!(
-            "delete {}: could not stop the app: {e}",
-            app.slug
-        )));
+        let step = step_failure("could not stop the app", &e.to_string());
+        return Err(ApiError::internal(format!("delete {}: {step}", app.slug)));
     }
     // Stop what serves the slug now. This is the cheap part of the teardown;
     // the expensive part (local dirs + three S3 prefixes) runs as a background
@@ -679,13 +727,13 @@ async fn delete_inner(state: &AppState, id: &str) -> Result<(), ApiError> {
     // `app_for_slug`), so from this moment the slug answers "no app" — the
     // reported "paused page for a deleted app" was the row lingering, stopped,
     // for the whole wipe. The slug is free here too, so a re-create does not
-    // wait for the wipe.
+    // wait for the wipe. `delete_app` writes the purge tombstone and marks the
+    // app's scoped keys `revoking` in the same transaction, so nothing below
+    // can be lost (and no old key outlives the freed slug) if this task dies.
     let delete_result = db::delete_app(&state.pool, id).await;
     delete_result.map_err(|e| {
-        ApiError::internal(format!(
-            "delete {}: could not remove the app row: {e}",
-            app.slug
-        ))
+        let step = step_failure("could not remove the app row", &e.to_string());
+        ApiError::internal(format!("delete {}: {step}", app.slug))
     })?;
     // A reconcile tick (or a wake) that listed the app before the stop above
     // can still have started the fleet again; with the row gone nothing else
@@ -725,9 +773,14 @@ async fn delete_inner(state: &AppState, id: &str) -> Result<(), ApiError> {
         let slug = app.slug.clone();
         super::detached::spawn(format!("purge:{slug}"), async move {
             let guard = state.wal.lock(&slug).await;
-            match db::get_app_by_slug(&state.pool, &slug).await {
+            // Clear the durable tombstone(s) for the slug once the prefixes
+            // are empty (this wipe's `Done`, or the taker's authoritative wipe
+            // when a row exists again). A stopped or failed wipe keeps them,
+            // so `purge::resume_pending` retries at boot and on the loop.
+            let satisfied = match db::get_app_by_slug(&state.pool, &slug).await {
                 Ok(Some(_)) => {
                     tracing::debug!(slug, "purge skipped: the slug was re-created");
+                    true
                 }
                 Ok(None) => {
                     let out = purge::purge_slug(
@@ -741,19 +794,28 @@ async fn delete_inner(state: &AppState, id: &str) -> Result<(), ApiError> {
                     )
                     .await;
                     match out {
-                        Ok(purge::Purged::Done) => {}
+                        Ok(purge::Purged::Done) => true,
                         Ok(purge::Purged::Stopped) => {
                             tracing::info!(slug, "purge stopped: the slug is being re-created");
+                            false
                         }
                         Err(e) => {
-                            // The row is gone, so nothing retries this: say what
-                            // was left behind, loudly, at the operator's level.
-                            tracing::warn!(slug, error = %format!("{e:#}"), "background purge failed; the slug's data may be partly left");
+                            // The tombstone is where a retry comes from: this is
+                            // an operator-visible warning, not the end of the
+                            // story.
+                            tracing::warn!(slug, error = %format!("{e:#}"), "background purge failed; the slug's data is left for the resume pass");
+                            false
                         }
                     }
                 }
                 Err(e) => {
                     tracing::warn!(slug, error = %e, "purge skipped: could not check whether the slug was re-created");
+                    false
+                }
+            };
+            if satisfied {
+                if let Err(e) = db::clear_app_purges(&state.pool, &slug).await {
+                    tracing::warn!(slug, error = %e, "could not clear the slug's purge tombstones");
                 }
             }
             drop(guard);
@@ -1275,6 +1337,223 @@ mod tests {
         drop(dir);
     }
 
+    /// A store that models objects, so a test can seed a leftover under a freed
+    /// slug and watch a wipe delete it: LIST answers what the map holds under
+    /// the requested prefix, a batch delete removes exactly the keys its body
+    /// names.
+    struct ObjectStore {
+        endpoint: String,
+        objects: std::sync::Arc<std::sync::Mutex<std::collections::BTreeSet<String>>>,
+    }
+
+    impl ObjectStore {
+        fn insert(&self, key: &str) {
+            self.objects
+                .lock()
+                .expect("object store lock")
+                .insert(key.to_string());
+        }
+
+        fn has(&self, key: &str) -> bool {
+            self.objects
+                .lock()
+                .expect("object store lock")
+                .contains(key)
+        }
+    }
+
+    async fn spawn_object_store() -> ObjectStore {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind object store");
+        let endpoint = format!("http://{}", listener.local_addr().expect("store addr"));
+        let objects: std::sync::Arc<std::sync::Mutex<std::collections::BTreeSet<String>>> =
+            std::sync::Arc::default();
+        let seen = objects.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                let objects = seen.clone();
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    // Read a whole request: headers, then the `Content-Length`
+                    // body (a batch delete's key list).
+                    let mut buf = Vec::new();
+                    let mut chunk = [0u8; 4096];
+                    let mut body_start = None;
+                    let mut want = 0usize;
+                    loop {
+                        let n = sock.read(&mut chunk).await.unwrap_or(0);
+                        if n == 0 {
+                            break;
+                        }
+                        buf.extend_from_slice(&chunk[..n]);
+                        if body_start.is_none() {
+                            if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                                body_start = Some(pos + 4);
+                                let head = String::from_utf8_lossy(&buf[..pos]).to_string();
+                                want = head
+                                    .lines()
+                                    .find_map(|line| {
+                                        let (name, value) = line.split_once(':')?;
+                                        if name.eq_ignore_ascii_case("content-length") {
+                                            value.trim().parse::<usize>().ok()
+                                        } else {
+                                            None
+                                        }
+                                    })
+                                    .unwrap_or(0);
+                            }
+                        }
+                        if let Some(start) = body_start {
+                            if buf.len() >= start + want {
+                                break;
+                            }
+                        }
+                        if buf.len() > 262_144 {
+                            break;
+                        }
+                    }
+                    let request_line = String::from_utf8_lossy(&buf)
+                        .lines()
+                        .next()
+                        .unwrap_or_default()
+                        .to_string();
+                    let mut parts = request_line.split_whitespace();
+                    let method = parts.next().unwrap_or_default().to_string();
+                    let target = parts.next().unwrap_or_default().to_string();
+                    let (_, query) = target.split_once('?').unwrap_or((&target, ""));
+                    let body = String::from_utf8_lossy(&buf[body_start.unwrap_or(buf.len())..])
+                        .to_string();
+                    let status = "200 OK";
+                    let payload = if query.contains("list-type") {
+                        let prefix = query
+                            .split('&')
+                            .find_map(|pair| pair.strip_prefix("prefix="))
+                            .unwrap_or("")
+                            .replace("%2F", "/")
+                            .replace("%2f", "/");
+                        let mut page = String::from(
+                            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+                             <ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
+                             <Name>noite</Name><MaxKeys>1000</MaxKeys><IsTruncated>false</IsTruncated>",
+                        );
+                        for key in objects
+                            .lock()
+                            .expect("object store lock")
+                            .iter()
+                            .filter(|key| key.starts_with(&prefix))
+                        {
+                            page.push_str(&format!(
+                                "<Contents><Key>{key}</Key>\
+                                 <LastModified>2026-01-01T00:00:00.000Z</LastModified>\
+                                 <ETag>&quot;x&quot;</ETag><Size>1</Size></Contents>"
+                            ));
+                        }
+                        page.push_str("</ListBucketResult>");
+                        page
+                    } else if method == "POST" {
+                        let mut removed = String::new();
+                        let mut guard = objects.lock().expect("object store lock");
+                        for key in body
+                            .split("<Key>")
+                            .skip(1)
+                            .filter_map(|rest| rest.split_once("</Key>").map(|(key, _)| key))
+                        {
+                            guard.remove(key);
+                            removed.push_str(&format!("<Deleted><Key>{key}</Key></Deleted>"));
+                        }
+                        format!(
+                            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+                             <DeleteResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
+                             {removed}</DeleteResult>"
+                        )
+                    } else {
+                        String::new()
+                    };
+                    let resp = format!(
+                        "HTTP/1.1 {status}\r\nContent-Type: application/xml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+                        payload.len()
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+        ObjectStore { endpoint, objects }
+    }
+
+    /// A rename onto a slug freed by a delete wipes the leftover prefixes
+    /// before moving its own objects in. The row is dropped before the wipe
+    /// now, so "slug free" no longer implies "prefix empty" — without the
+    /// target wipe the renamed app would inherit the deleted tenant's git
+    /// history and celld durability (review finding, 2026-11-12).
+    #[tokio::test]
+    async fn rename_onto_a_freed_slug_wipes_its_leftover_prefixes() {
+        let store = spawn_object_store().await;
+        let (state, dir) = test_state_with_s3(10, store.endpoint.clone()).await;
+        // Rows directly: this test is about the wipe/rename order, and a
+        // full `create` would need the stub to model git manifests too.
+        let keeper = db::create_app(
+            &state.pool,
+            &state.config,
+            db::NewApp {
+                name: "Keeper",
+                slug: "ps-old",
+                user_id: "u1",
+                subdomain: "ps-old.localhost",
+                listen: 30600,
+                internal: 30601,
+            },
+        )
+        .await
+        .expect("keeper row");
+        let gone = db::create_app(
+            &state.pool,
+            &state.config,
+            db::NewApp {
+                name: "Gone",
+                slug: "ps-target",
+                user_id: "u1",
+                subdomain: "ps-target.localhost",
+                listen: 30610,
+                internal: 30611,
+            },
+        )
+        .await
+        .expect("gone row");
+        // The delete's own row transaction (its background chore is not what
+        // this test is about): the row is gone and the tombstone is written.
+        db::delete_app(&state.pool, &gone.id)
+            .await
+            .expect("delete row");
+        store.insert("git/ps-target/leftover.bundle");
+        store.insert("fleets/ps-target/durable.sqlite");
+
+        let renamed = rename(&state, &keeper.id, None, Some("ps-target"))
+            .await
+            .expect("rename onto a freed slug");
+
+        assert_eq!(renamed.slug, "ps-target");
+        assert!(
+            !store.has("git/ps-target/leftover.bundle"),
+            "the freed slug's git prefix must be wiped before the move"
+        );
+        assert!(
+            !store.has("fleets/ps-target/durable.sqlite"),
+            "the freed slug's fleet durability must be wiped before the move"
+        );
+        assert!(
+            db::pending_purges(&state.pool)
+                .await
+                .expect("tombstones")
+                .is_empty(),
+            "the target wipe satisfies the pending-purge tombstone"
+        );
+        drop(dir);
+    }
+
     /// R-02: a slug rename holds both slugs' push guards across the whole
     /// move, so a rename queued behind a push serializes instead of moving
     /// prefixes under a live git+S3+manifest write.
@@ -1658,6 +1937,53 @@ mod tests {
             entered,
             release,
             armed,
+        }
+    }
+
+    /// F4: a failing step names itself and a failure class, never the store's
+    /// internals (bucket, prefixes, work-dir paths, stderr), and carries the
+    /// same short ref the runner log line does.
+    #[test]
+    fn step_failures_name_the_step_and_hide_internals() {
+        let cases = [
+            (
+                "s3 list git/shop/ transport: operation timed out",
+                "timed out",
+            ),
+            (
+                "s3 delete-keys failed: AccessDenied access denied",
+                "denied",
+            ),
+            (
+                "clear S3 prefix s3://noite/fleets/shop/: connection refused",
+                "unavailable",
+            ),
+            (
+                "remove /data/work/projects/shop: Directory not empty",
+                "not empty",
+            ),
+            ("NoSuchBucket: s3://noite/x", "could not find"),
+            ("database is locked", "internal error"),
+        ];
+        for (detail, class) in cases {
+            let message = step_failure("could not clear the deleted app's data", detail);
+            assert!(message.contains(class), "{message} must name {class}");
+            assert!(
+                !message.contains("s3://"),
+                "{message} must not name the bucket"
+            );
+            assert!(
+                !message.contains("git/shop/"),
+                "{message} must not name a prefix"
+            );
+            assert!(
+                !message.contains("/data/work"),
+                "{message} must not name a path"
+            );
+            assert!(
+                message.contains("(ref "),
+                "{message} must carry the log ref"
+            );
         }
     }
 

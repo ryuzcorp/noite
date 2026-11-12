@@ -1578,3 +1578,202 @@ fn stripping_endpoint_userinfo_keeps_the_store_identity() {
         "stored rows keep matching their store"
     );
 }
+
+/// A row and a slug for the credential tests: `db::delete_app` needs the app
+/// row it writes its purge tombstone from, and the key rows carry its id.
+async fn app_row(pool: &sqlx::SqlitePool, slug: &str) -> crate::models::App {
+    db::create_app(
+        pool,
+        &config_for_tests(),
+        db::NewApp {
+            name: slug,
+            slug,
+            user_id: "u1",
+            subdomain: "unused.localhost",
+            listen: 30500,
+            internal: 30501,
+        },
+    )
+    .await
+    .expect("app row")
+}
+
+/// F2: the row delete marks the app's and its environments' keys `revoking` in
+/// the same transaction, so an interrupted delete cannot leave a `live` key
+/// behind — and a same-slug create still revokes the old key at the store
+/// before it mints for the new owner's prefix.
+#[tokio::test]
+async fn interrupted_delete_then_recreate_revokes_the_old_key_first() {
+    let pool = memory_db().await;
+    let (cfg, provider) = test_config(FakeProvider::new());
+    let old = app_row(&pool, "shop").await;
+    let old_scope = Scope::App {
+        app_id: old.id.clone(),
+        slug: "shop".into(),
+    };
+    ensure(&pool, &cfg, &provider, &old_scope)
+        .await
+        .expect("old key");
+    // The delete starts and then dies before the store revoke (the sweep never
+    // runs): the transaction already marked the row.
+    db::delete_app(&pool, &old.id).await.expect("delete row");
+    assert!(
+        db::live_scoped_credential(&pool, &old_scope.key())
+            .await
+            .expect("read")
+            .is_none(),
+        "the delete's transaction stops handing the key out"
+    );
+
+    // Tenant B takes the same slug while the old key still exists at the store.
+    let new = app_row(&pool, "shop").await;
+    let new_scope = Scope::App {
+        app_id: new.id.clone(),
+        slug: "shop".into(),
+    };
+    provider.state.lock().expect("fake lock").fail_revoke = true;
+    let blocked = ensure(&pool, &cfg, &provider, &new_scope).await;
+    assert!(
+        blocked.is_err(),
+        "no key is minted on a prefix an older key still reaches"
+    );
+    assert_eq!(provider.mint_count(), 1, "nothing minted over the old key");
+
+    provider.state.lock().expect("fake lock").fail_revoke = false;
+    let fresh = ensure(&pool, &cfg, &provider, &new_scope)
+        .await
+        .expect("mint after the revoke");
+    assert!(fresh.access_key.contains("fleets/shop/"));
+    assert_eq!(
+        provider.revoked(),
+        vec!["user-1".to_string()],
+        "the old key is revoked before the new owner's is minted"
+    );
+    assert_eq!(provider.mint_count(), 2);
+    pool.close().await;
+}
+
+/// F2: a key a delete never got to mark (a crash before the atomic mark, or a
+/// database from an older build) is still `live` but its app row is gone. Minting
+/// for a re-created slug revokes it first — the periodic sweep only reads
+/// `revoking` rows, so nothing else would.
+#[tokio::test]
+async fn a_live_key_of_a_deleted_app_is_revoked_before_the_reused_prefix() {
+    let pool = memory_db().await;
+    let (cfg, provider) = test_config(FakeProvider::new());
+    let old = app_row(&pool, "shop").await;
+    let old_scope = Scope::App {
+        app_id: old.id.clone(),
+        slug: "shop".into(),
+    };
+    ensure(&pool, &cfg, &provider, &old_scope)
+        .await
+        .expect("old key");
+    // The interrupted delete of the old build: the app row is gone, the key row
+    // was never marked.
+    sqlx::query("DELETE FROM main.app WHERE id = ?")
+        .bind(&old.id)
+        .execute(&pool)
+        .await
+        .expect("row gone");
+    sqlx::query("UPDATE main.scoped_credential SET state = 'live' WHERE handle = 'user-1'")
+        .execute(&pool)
+        .await
+        .expect("still live");
+
+    let new = app_row(&pool, "shop").await;
+    let new_scope = Scope::App {
+        app_id: new.id.clone(),
+        slug: "shop".into(),
+    };
+    let fresh = ensure(&pool, &cfg, &provider, &new_scope)
+        .await
+        .expect("mint after the orphan revoke");
+    assert!(fresh.access_key.contains("fleets/shop/"));
+    assert_eq!(
+        provider.revoked(),
+        vec!["user-1".to_string()],
+        "the orphaned live key is revoked before the new one is minted"
+    );
+    pool.close().await;
+}
+
+/// F2: the boot reconcile marks orphaned `scoped_credential` rows and drops
+/// orphaned `fleet_operator_token` rows (keeping the control fleet's, which
+/// has no app row by design), so the periodic sweep can revoke the store side.
+#[tokio::test]
+async fn boot_reconcile_marks_key_and_token_rows_whose_app_is_gone() {
+    let pool = memory_db().await;
+    let (cfg, provider) = test_config(FakeProvider::new());
+    let kept = app_row(&pool, "kept").await;
+    let kept_scope = Scope::App {
+        app_id: kept.id.clone(),
+        slug: "kept".into(),
+    };
+    ensure(&pool, &cfg, &provider, &kept_scope)
+        .await
+        .expect("kept key");
+    let gone_scope = Scope::App {
+        app_id: "gone".into(),
+        slug: "gone".into(),
+    };
+    ensure(&pool, &cfg, &provider, &gone_scope)
+        .await
+        .expect("orphan key");
+    operator_token(&pool, &cfg.runner_token, "app:gone", "gone")
+        .await
+        .expect("orphan token");
+    operator_token(&pool, &cfg.runner_token, "env:gone-env", "gone")
+        .await
+        .expect("orphan env token");
+    operator_token(
+        &pool,
+        &cfg.runner_token,
+        super::CONTROL_OPERATOR_SCOPE,
+        "_control",
+    )
+    .await
+    .expect("control token");
+
+    let report = super::reconcile_orphans(&pool).await.expect("reconcile");
+    assert_eq!(
+        report,
+        super::OrphanRows {
+            keys_marked: 1,
+            tokens_dropped: 2,
+        }
+    );
+    assert!(
+        db::live_scoped_credential(&pool, &gone_scope.key())
+            .await
+            .expect("read")
+            .is_none(),
+        "the orphaned key is marked, never handed out again"
+    );
+    assert!(db::live_scoped_credential(&pool, &kept_scope.key())
+        .await
+        .expect("read")
+        .is_some());
+    assert!(
+        db::get_operator_token(&pool, "app:gone")
+            .await
+            .expect("read")
+            .is_none(),
+        "the orphaned token row is gone"
+    );
+    assert!(
+        db::get_operator_token(&pool, super::CONTROL_OPERATOR_SCOPE)
+            .await
+            .expect("read")
+            .is_some(),
+        "the control fleet's token row has no app row and is kept"
+    );
+    assert_eq!(cached_operator_token("app:gone"), None, "cache evicted");
+    assert_eq!(
+        sweep(&pool, &cfg).await,
+        0,
+        "the marked key is revoked by the sweep, not left pending"
+    );
+    assert_eq!(provider.revoked(), vec!["user-2".to_string()]);
+    pool.close().await;
+}

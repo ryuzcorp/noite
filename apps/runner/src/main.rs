@@ -537,6 +537,49 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
+    // A delete that committed but never finished its wipe (a crash, a restart
+    // or an upgrade mid-wipe, an S3 failure) leaves a durable tombstone in
+    // `app_purge`; a wipe a re-create stopped leaves one too when that create
+    // aborted. Resume them in the background — non-fatal, like the sweeps
+    // above, and paced: each takes its slug's guard and yields to a create
+    // that wants the slug back.
+    {
+        let state = state.clone();
+        service::detached::spawn("purge:resume".to_string(), async move {
+            let report = host::purge::resume_pending(
+                &state.pool,
+                &state.config,
+                &state.procs,
+                &state.logs,
+                state.wal.sync(),
+            )
+            .await;
+            if report.noteworthy() {
+                tracing::info!(
+                    pending = report.pending,
+                    cleared = report.cleared,
+                    failed = report.failed,
+                    "resumed pending app purges"
+                );
+            }
+        });
+    }
+    // Credential rows whose app row is gone (a delete that died before the
+    // atomic mark, or a database from an older build) are marked/dropped
+    // before anything can be minted on a re-created slug's prefix. Local-only
+    // and non-fatal: the loop's first `sweep` does the store side.
+    match host::credentials::reconcile_orphans(&state.pool).await {
+        Ok(rows) if !rows.nothing() => tracing::info!(
+            keys_marked = rows.keys_marked,
+            tokens_dropped = rows.tokens_dropped,
+            "reconciled orphaned credential rows"
+        ),
+        Ok(_) => {}
+        Err(e) => {
+            tracing::warn!(error = %format!("{e:#}"), "orphan credential row reconcile failed")
+        }
+    }
+
     let cfg_loop = (*config).clone();
     let shutdown_loop = shutdown.clone();
     tokio::spawn(host::loop_::run_forever(
@@ -546,6 +589,7 @@ async fn main() -> anyhow::Result<()> {
         control_pid.clone(),
         logs.clone(),
         deploying.clone(),
+        state.wal.sync().clone(),
         metrics,
         ready.clone(),
         shutdown_loop,

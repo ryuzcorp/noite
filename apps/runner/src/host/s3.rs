@@ -1090,23 +1090,30 @@ const WIPE_BATCH_GAP: Duration = Duration::from_millis(50);
 /// queues behind it.
 const WIPE_BATCH_KEYS: usize = 250;
 
-/// The pacing state of one background wipe: the previous batch's start, so the
-/// gap holds within the wipe without ever making another caller wait.
-#[derive(Default)]
-struct WipePace {
-    last: Option<tokio::time::Instant>,
-}
+/// The pacing state of **every** background wipe in this process: the previous
+/// batch's start. One token, held across the batch request itself, so concurrent
+/// wipes (N deletes, the resume pass, a rename's target wipe) cannot multiply
+/// the store's load: one `DeleteObjects` of a background wipe is in flight at a
+/// time, with [`WIPE_BATCH_GAP`] between starts. A request-path wipe never
+/// takes it.
+struct WipePace;
 
 impl WipePace {
-    /// Wait out the gap since the previous batch.
-    async fn wait(&mut self) {
-        if let Some(at) = self.last {
+    /// Run one background-wipe batch under the process-wide pace.
+    async fn run_batch(&self, cfg: &Config, bucket: &str, keys: &[String]) -> anyhow::Result<()> {
+        static PACE: std::sync::LazyLock<tokio::sync::Mutex<Option<tokio::time::Instant>>> =
+            std::sync::LazyLock::new(|| tokio::sync::Mutex::new(None));
+        let mut last = PACE.lock().await;
+        if let Some(at) = *last {
             let elapsed = at.elapsed();
             if elapsed < WIPE_BATCH_GAP {
                 tokio::time::sleep(WIPE_BATCH_GAP - elapsed).await;
             }
         }
-        self.last = Some(tokio::time::Instant::now());
+        *last = Some(tokio::time::Instant::now());
+        // Held across the request: releasing it first would let N wipes send
+        // their batches concurrently, which is the load this exists to cap.
+        s3_delete_keys(cfg, bucket, keys).await
     }
 }
 
@@ -1120,11 +1127,12 @@ pub async fn s3_rm_prefix(cfg: &Config, bucket: &str, prefix: &str) -> anyhow::R
 }
 
 /// [`s3_rm_prefix`] for a **background** purge: paced (see
-/// [`WIPE_BATCH_GAP`]), batches capped at [`WIPE_BATCH_KEYS`], and stoppable
-/// between batches — answers `false` when `stop` asked the wipe to end before
-/// the prefix was empty. A caller that stops keeps whatever is left and must
-/// wipe from scratch later (deletes are idempotent, so a partial wipe is a safe
-/// starting point).
+/// [`WIPE_BATCH_GAP`] and [`WipePace`] — the pace is process-wide, so N
+/// concurrent wipes cannot multiply the store's load), batches capped at
+/// [`WIPE_BATCH_KEYS`], and stoppable between batches — answers `false` when
+/// `stop` asked the wipe to end before the prefix was empty. A caller that
+/// stops keeps whatever is left and must wipe from scratch later (deletes are
+/// idempotent, so a partial wipe is a safe starting point).
 ///
 /// Page by page, never listing the whole prefix first, so a wipe cut by a
 /// caller's bound (or a huge telemetry/D1 history) makes progress and a retry
@@ -1135,7 +1143,7 @@ pub async fn s3_rm_prefix_paced(
     prefix: &str,
     stop: &(dyn Fn() -> bool + Send + Sync),
 ) -> anyhow::Result<bool> {
-    rm_prefix_loop(cfg, bucket, prefix, stop, Some(WipePace::default())).await
+    rm_prefix_loop(cfg, bucket, prefix, stop, Some(WipePace)).await
 }
 
 async fn rm_prefix_loop(
@@ -1143,7 +1151,7 @@ async fn rm_prefix_loop(
     bucket: &str,
     prefix: &str,
     stop: &(dyn Fn() -> bool + Send + Sync),
-    mut pace: Option<WipePace>,
+    pace: Option<WipePace>,
 ) -> anyhow::Result<bool> {
     loop {
         if stop() {
@@ -1165,10 +1173,10 @@ async fn rm_prefix_loop(
             if stop() {
                 return Ok(false);
             }
-            if let Some(pace) = pace.as_mut() {
-                pace.wait().await;
+            match &pace {
+                Some(pace) => pace.run_batch(cfg, bucket, chunk).await?,
+                None => s3_delete_keys(cfg, bucket, chunk).await?,
             }
-            s3_delete_keys(cfg, bucket, chunk).await?;
         }
     }
 }

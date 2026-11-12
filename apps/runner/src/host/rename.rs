@@ -195,7 +195,20 @@ pub async fn rename_app(
     )
     .await?
     {
-        crate::host::purge::Purged::Done => {}
+        crate::host::purge::Purged::Done => {
+            // The target prefix is empty while we hold its guard: every
+            // pending-purge tombstone for the slug is satisfied, and this app
+            // owns the row from the move below. A failure only leaves the
+            // tombstone for `purge::resume_pending`, which re-checks the row
+            // (we hold the guard until the row write) and wipes again.
+            if let Err(e) = crate::db::clear_app_purges(pool, new_slug).await {
+                tracing::warn!(
+                    slug = new_slug,
+                    error = %e,
+                    "could not clear the target slug's purge tombstones"
+                );
+            }
+        }
         crate::host::purge::Purged::Stopped => {
             anyhow::bail!("the leftover wipe for the target slug was stopped")
         }

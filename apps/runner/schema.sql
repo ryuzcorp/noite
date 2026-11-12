@@ -327,6 +327,22 @@ CREATE TABLE IF NOT EXISTS app_branch_rule (
     CHECK (required_approvals BETWEEN 0 AND 2)
 );
 
+-- Pending app purges: one row per hard-deleted app whose `git/`, `fleets/`
+-- and `envs/` prefixes (and local dirs) still have to be emptied. Written in
+-- the same transaction as the app row's DELETE, so a crash, an S3 failure or a
+-- wipe stopped by a re-create can never lose the fact that the tenant's data
+-- is still in the bucket. The row is removed only when a wipe of the slug's
+-- prefixes finished with no app row owning the slug — the delete's background
+-- chore, a same-slug create/rename's authoritative wipe, or the resume pass
+-- (`host::purge::resume_pending`) at boot and on the reconcile loop.
+CREATE TABLE IF NOT EXISTS app_purge (
+  app_id TEXT PRIMARY KEY NOT NULL,
+  slug TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_app_purge_slug ON app_purge(slug);
+
 -- Scoped bucket keys per tenant scope (SPEC, Scoped credentials): one row per
 -- scope (`app:<app_id>`, `env:<env_id>`). Nonce + AES-GCM ciphertext over
 -- JSON {access_key, secret_key}; the KEK derives from RUNNER_TOKEN via HKDF,

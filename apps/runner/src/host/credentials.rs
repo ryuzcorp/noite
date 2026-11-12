@@ -569,15 +569,34 @@ async fn ensure(
     }
     // A key that still reaches this prefix must be gone before a new owner
     // gets the prefix: a slug or label reused after a delete would otherwise
-    // share its data with whoever kept the old key.
-    for pending in db::revoking_scoped_credentials(pool).await? {
-        if pending.prefix == prefix && pending.store == store {
-            revoke_row(pool, provider, &pending).await.map_err(|e| {
-                anyhow::anyhow!(
-                    "a previous key for {prefix} is not revoked yet, so no new key is minted: {e:#}"
-                )
-            })?;
+    // share its data with whoever kept the old key. Two shapes count:
+    // - a row already `revoking` (a teardown started, its store delete not
+    //   landed yet);
+    // - a still-`live` row whose app row no longer exists — a delete that died
+    //   before its atomic mark, or a database from before that mark. The
+    //   periodic sweep only reads `revoking` rows, so this shape would
+    //   otherwise keep a valid key on the prefix forever.
+    for row in db::scoped_credentials_for_prefix(pool, &prefix).await? {
+        if row.store != store {
+            continue;
         }
+        let stale = match row.state {
+            db::ScopedCredentialState::Revoking => true,
+            db::ScopedCredentialState::Live => db::get_app(pool, &row.app_id).await?.is_none(),
+        };
+        if !stale {
+            continue;
+        }
+        if row.state == db::ScopedCredentialState::Live {
+            // Stop handing it out before the store call: a crash between the
+            // two must leave a row the sweep retries, never a live key.
+            db::mark_scoped_credential_revoking(pool, &row.handle).await?;
+        }
+        revoke_row(pool, provider, &row).await.map_err(|e| {
+            anyhow::anyhow!(
+                "a previous key for {prefix} is not revoked yet, so no new key is minted: {e:#}"
+            )
+        })?;
     }
     let minted = provider
         .mint(&cfg.s3_bucket, &prefix)
@@ -652,7 +671,7 @@ pub async fn revoke_app(pool: &sqlx::SqlitePool, cfg: &Config, app_id: &str) -> 
     Ok(())
 }
 
-/// Revoke one environment's key (its teardown).
+/// One environment's key (its teardown).
 pub async fn revoke_environment(
     pool: &sqlx::SqlitePool,
     cfg: &Config,
@@ -663,6 +682,56 @@ pub async fn revoke_environment(
     }
     sweep(pool, cfg).await;
     Ok(())
+}
+
+/// Rows the boot reconcile cleaned up.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct OrphanRows {
+    /// Scoped keys newly marked `revoking` (their store delete is pending).
+    pub keys_marked: usize,
+    /// Operator-token rows dropped.
+    pub tokens_dropped: usize,
+}
+
+impl OrphanRows {
+    pub fn nothing(&self) -> bool {
+        self.keys_marked == 0 && self.tokens_dropped == 0
+    }
+}
+
+/// Boot reconcile of credential rows whose app row is gone.
+///
+/// A delete marks its scoped keys `revoking` in the row-delete transaction, but
+/// a database written by an older build (or a row orphaned by any other path)
+/// can still hold a `live` key for an app that no longer exists — and the same
+/// goes for `fleet_operator_token` rows. Nothing would ever look at a live one
+/// again: [`sweep`] reads only `revoking` rows, and the orphan *store* pass
+/// protects any handle a row still names. Marking/dropping them here lets the
+/// periodic sweep revoke the store side, so a re-created slug can never be
+/// handed a key or token minted for its predecessor.
+///
+/// Local-only (no store call) and non-fatal: boot logs a failure and leaves the
+/// rows for the next boot; the loop's first tick runs [`sweep`].
+pub async fn reconcile_orphans(pool: &sqlx::SqlitePool) -> anyhow::Result<OrphanRows> {
+    let mut report = OrphanRows::default();
+    for row in db::orphan_scoped_credentials(pool).await? {
+        if row.state == db::ScopedCredentialState::Live {
+            db::mark_scoped_credential_revoking(pool, &row.handle).await?;
+            report.keys_marked += 1;
+            tracing::info!(
+                scope = %row.scope,
+                app_id = %row.app_id,
+                "marked an orphaned scoped key for revocation"
+            );
+        }
+    }
+    for scope in db::orphan_operator_token_scopes(pool).await? {
+        db::remove_operator_token_row(pool, &scope).await?;
+        forget_operator_token(&scope);
+        report.tokens_dropped += 1;
+        tracing::info!(scope = %scope, "dropped an orphaned operator token");
+    }
+    Ok(report)
 }
 
 /// Scope key of the reserved control fleet's operator token row. Tenant

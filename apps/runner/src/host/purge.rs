@@ -112,6 +112,129 @@ pub fn stop(slug: &str) -> bool {
     }
 }
 
+/// Whether a wipe of `slug` is already registered: a delete's chore or an
+/// earlier resume pass (`resume_pending` leaves such a slug alone).
+pub fn is_running(slug: &str) -> bool {
+    running().contains_key(slug)
+}
+
+/// What one [`resume_pending`] pass found and did.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PurgeResume {
+    /// Tombstones read from `app_purge`.
+    pub pending: usize,
+    /// Tombstones cleared because their slug's prefixes are empty.
+    pub cleared: usize,
+    /// Tombstones whose wipe failed (the S3 store, a local dir): left for the
+    /// next pass.
+    pub failed: usize,
+}
+
+impl PurgeResume {
+    /// Whether the pass has anything an operator should see in the log.
+    pub fn noteworthy(&self) -> bool {
+        self.cleared > 0 || self.failed > 0
+    }
+}
+
+/// Resume every wipe the durable tombstones (`app_purge`) still owe.
+///
+/// A hard delete writes its tombstone in the same transaction as the row
+/// (`db::delete_app`), so a crash, an S3 failure or a wipe a re-create
+/// stopped can never lose the fact that the tenant's `git/`, `fleets/` and
+/// `envs/` data is still in the bucket. This pass runs at boot and on the
+/// reconcile loop's slow tick, paced like every background wipe (the S3
+/// batches are serialized process-wide, see `s3::s3_rm_prefix_paced`), and is
+/// stoppable: a create or rename that wants the slug calls [`stop`] like it
+/// does for the delete's own chore and then wipes authoritatively.
+///
+/// Each slug is handled like that chore: take its push guard, then skip (and
+/// clear) when a row already owns the slug — the create/rename that inserted
+/// it wiped the prefixes under this same guard, so every tombstone for the
+/// slug is satisfied. A wipe that ends `Done` with no row, or that is stopped
+/// and then finished by the taker, clears the tombstones too; an error keeps
+/// them for the next pass. Never fatal: the caller logs and boots on.
+pub async fn resume_pending(
+    pool: &sqlx::SqlitePool,
+    cfg: &Config,
+    procs: &ProcMap,
+    log_state: &LogState,
+    git_sync: &ryuz_git::GitSync,
+) -> PurgeResume {
+    let tombstones = match crate::db::pending_purges(pool).await {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::warn!(error = %e, "pending app purges unreadable; leaving them for the next pass");
+            return PurgeResume::default();
+        }
+    };
+    let mut report = PurgeResume {
+        pending: tombstones.len(),
+        ..PurgeResume::default()
+    };
+    for slug in tombstones {
+        // A delete's own chore (or an earlier pass) is already wiping it; two
+        // wipes of one prefix would only duplicate the store load.
+        if is_running(&slug) {
+            continue;
+        }
+        let registered = begin(&slug);
+        // Holding the guard is what makes the check and the clear authoritative:
+        // a create/rename inserts its row under this same guard and only after
+        // wiping the prefixes, so "no row now" cannot change under the wipe.
+        let guard = git_sync.lock(&slug).await;
+        // `Ok(true)`: the prefixes are empty (or the taker's wipe made them so)
+        // and every tombstone for the slug can go. `Ok(false)`: a create took
+        // the slug and stopped the wipe; it clears the tombstone itself once its
+        // own wipe is done.
+        let satisfied = match crate::db::get_app_by_slug(pool, &slug).await {
+            Ok(Some(_)) => {
+                tracing::debug!(slug, "pending purge satisfied: a new app owns the slug");
+                Ok(true)
+            }
+            Ok(None) => match purge_slug(
+                cfg,
+                procs,
+                log_state,
+                git_sync,
+                &slug,
+                supervisor::StopGrace::FOR_DELETE,
+                Some(registered.stop()),
+            )
+            .await
+            {
+                Ok(Purged::Done) => {
+                    tracing::info!(slug, "resumed purge emptied the slug's data");
+                    Ok(true)
+                }
+                Ok(Purged::Stopped) => {
+                    tracing::info!(slug, "resumed purge stopped: the slug is being reused");
+                    Ok(false)
+                }
+                Err(e) => Err(e),
+            },
+            Err(e) => Err(e.into()),
+        };
+        match satisfied {
+            Ok(true) => match crate::db::clear_app_purges(pool, &slug).await {
+                Ok(_) => report.cleared += 1,
+                Err(e) => {
+                    tracing::warn!(slug, error = %e, "pending purge wiped the slug but could not clear its tombstone");
+                    report.failed += 1;
+                }
+            },
+            Ok(false) => {}
+            Err(e) => {
+                tracing::warn!(slug, error = %format!("{e:#}"), "pending purge failed; retrying on a later pass");
+                report.failed += 1;
+            }
+        }
+        drop(guard);
+        drop(registered);
+    }
+    report
+}
+
 /// Wipe every on-disk and S3 artifact for `slug`. Does **not** touch the DB row
 /// — callers decide when to delete that (create wipes before inserting the
 /// new row; delete deletes the row first).
@@ -420,5 +543,240 @@ mod tests {
         assert!(second.stop().stopped());
         drop(second);
         assert!(!stop("registry-slug"), "nothing left to stop");
+    }
+
+    /// A store that refuses every request with a final 4xx, so the resume pass
+    /// sees a deterministic S3 failure (no internal retry/backoff).
+    async fn spawn_denied_s3() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind denied s3");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf = vec![0u8; 4096];
+                    let _ = sock.read(&mut buf).await;
+                    let body = "<?xml version=\"1.0\"?><Error><Code>AccessDenied</Code><Message>denied</Message></Error>";
+                    let resp = format!(
+                        "HTTP/1.1 403 Forbidden\r\nContent-Type: application/xml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    /// One slug's deleted app with its purge still owed: a row insert, a local
+    /// dir a wipe must remove, then the hard delete that writes the tombstone.
+    async fn tombstoned_slug(
+        cfg: &Config,
+        slug: &'static str,
+    ) -> (sqlx::SqlitePool, crate::models::App) {
+        let pool = db::connect("sqlite::memory:").await.expect("memory db");
+        let app = db::create_app(
+            &pool,
+            cfg,
+            db::NewApp {
+                name: slug,
+                slug,
+                user_id: "local",
+                subdomain: &format!("{slug}.localhost"),
+                listen: 30300,
+                internal: 30301,
+            },
+        )
+        .await
+        .expect("app");
+        let dir = crate::host::exec::work_root(cfg)
+            .join("projects")
+            .join(slug);
+        std::fs::create_dir_all(&dir).expect("seed dir");
+        std::fs::write(dir.join("deploy.json"), "{}").expect("seed file");
+        db::delete_app(&pool, &app.id).await.expect("delete row");
+        (pool, app)
+    }
+
+    /// F1: a delete that dropped the row and then died (a crash, a restart or
+    /// an upgrade mid-wipe) leaves the durable tombstone; the boot resume wipes
+    /// the slug and clears it.
+    #[tokio::test]
+    async fn a_crash_between_the_row_delete_and_the_wipe_is_resumed() {
+        let scratch = crate::testutil::TempDir::new("noite-purge-resume");
+        let mut cfg = crate::config::config_for_tests();
+        cfg.work_dir = scratch.path().join("work").to_string_lossy().into_owned();
+        cfg.s3_endpoint = crate::testutil::spawn_s3_stub().await;
+        let (pool, _app) = tombstoned_slug(&cfg, "resumed").await;
+        assert_eq!(
+            db::pending_purges(&pool).await.expect("tombstones"),
+            vec!["resumed".to_string()],
+            "the row delete must write the tombstone in the same transaction"
+        );
+
+        let report = resume_pending(
+            &pool,
+            &cfg,
+            &crate::host::supervisor::new_procs(),
+            &crate::host::logs::new_state(),
+            &ryuz_git::GitSync::default(),
+        )
+        .await;
+
+        assert_eq!(report.pending, 1);
+        assert_eq!(report.cleared, 1);
+        assert_eq!(report.failed, 0);
+        assert!(
+            db::pending_purges(&pool)
+                .await
+                .expect("tombstones")
+                .is_empty(),
+            "a finished wipe clears the tombstone"
+        );
+        assert!(
+            !crate::host::exec::work_root(&cfg)
+                .join("projects")
+                .join("resumed")
+                .exists(),
+            "the resumed wipe removed the local dir"
+        );
+        pool.close().await;
+    }
+
+    /// F1: a create stops the delete's wipe and then aborts before inserting
+    /// (a lost slug race, a quota refusal); the stopped wipe left the tombstone
+    /// and the next resume pass finishes it.
+    #[tokio::test]
+    async fn a_stopped_wipe_is_resumed_when_its_create_aborted() {
+        let scratch = crate::testutil::TempDir::new("noite-purge-stopped-resume");
+        let mut cfg = crate::config::config_for_tests();
+        cfg.work_dir = scratch.path().join("work").to_string_lossy().into_owned();
+        cfg.s3_endpoint = crate::testutil::spawn_s3_stub().await;
+        let (pool, _app) = tombstoned_slug(&cfg, "aborted").await;
+        let git_sync = ryuz_git::GitSync::default();
+        let registered = begin("aborted");
+        registered.stop().stop();
+        let ended = purge_slug(
+            &cfg,
+            &crate::host::supervisor::new_procs(),
+            &crate::host::logs::new_state(),
+            &git_sync,
+            "aborted",
+            crate::host::supervisor::StopGrace::FOR_DELETE,
+            Some(registered.stop()),
+        )
+        .await
+        .expect("purge");
+        drop(registered);
+        assert_eq!(ended, Purged::Stopped);
+        assert_eq!(
+            db::pending_purges(&pool).await.expect("tombstones").len(),
+            1,
+            "a stopped wipe keeps the tombstone"
+        );
+
+        let report = resume_pending(
+            &pool,
+            &cfg,
+            &crate::host::supervisor::new_procs(),
+            &crate::host::logs::new_state(),
+            &git_sync,
+        )
+        .await;
+        assert_eq!(report.cleared, 1);
+        assert!(db::pending_purges(&pool)
+            .await
+            .expect("tombstones")
+            .is_empty());
+        assert!(!crate::host::exec::work_root(&cfg)
+            .join("projects")
+            .join("aborted")
+            .exists());
+        pool.close().await;
+    }
+
+    /// F1: an S3 failure during the resume keeps the tombstone (nothing is
+    /// lost) and the next pass, once the store answers again, finishes it.
+    #[tokio::test]
+    async fn an_s3_error_keeps_the_tombstone_for_the_next_pass() {
+        let scratch = crate::testutil::TempDir::new("noite-purge-s3-retry");
+        let mut cfg = crate::config::config_for_tests();
+        cfg.work_dir = scratch.path().join("work").to_string_lossy().into_owned();
+        cfg.s3_endpoint = spawn_denied_s3().await;
+        let (pool, _app) = tombstoned_slug(&cfg, "retried").await;
+        let git_sync = ryuz_git::GitSync::default();
+        let procs = crate::host::supervisor::new_procs();
+        let logs = crate::host::logs::new_state();
+
+        let failed = resume_pending(&pool, &cfg, &procs, &logs, &git_sync).await;
+        assert_eq!(failed.failed, 1);
+        assert_eq!(failed.cleared, 0);
+        assert_eq!(
+            db::pending_purges(&pool).await.expect("tombstones").len(),
+            1,
+            "a failed wipe must not clear its tombstone"
+        );
+
+        let mut healthy = cfg.clone();
+        healthy.s3_endpoint = crate::testutil::spawn_s3_stub().await;
+        let cleared = resume_pending(&pool, &healthy, &procs, &logs, &git_sync).await;
+        assert_eq!(cleared.cleared, 1);
+        assert_eq!(cleared.failed, 0);
+        assert!(db::pending_purges(&pool)
+            .await
+            .expect("tombstones")
+            .is_empty());
+        pool.close().await;
+    }
+
+    /// The resume pass never wipes a prefix a live app owns: a create or rename
+    /// that took the freed slug already wiped it under the same guard, so the
+    /// tombstone is satisfied and cleared without touching anything.
+    #[tokio::test]
+    async fn a_resumed_tombstone_leaves_a_reowned_slug_alone() {
+        let scratch = crate::testutil::TempDir::new("noite-purge-reowned");
+        let mut cfg = crate::config::config_for_tests();
+        cfg.work_dir = scratch.path().join("work").to_string_lossy().into_owned();
+        cfg.s3_endpoint = crate::testutil::spawn_s3_stub().await;
+        let (pool, _app) = tombstoned_slug(&cfg, "reowned").await;
+        db::create_app(
+            &pool,
+            &cfg,
+            db::NewApp {
+                name: "successor",
+                slug: "reowned",
+                user_id: "local",
+                subdomain: "reowned.localhost",
+                listen: 30310,
+                internal: 30311,
+            },
+        )
+        .await
+        .expect("successor row");
+        let dir = crate::host::exec::work_root(&cfg)
+            .join("projects")
+            .join("reowned");
+        std::fs::create_dir_all(&dir).expect("successor dir");
+
+        let report = resume_pending(
+            &pool,
+            &cfg,
+            &crate::host::supervisor::new_procs(),
+            &crate::host::logs::new_state(),
+            &ryuz_git::GitSync::default(),
+        )
+        .await;
+        assert_eq!(report.cleared, 1);
+        assert!(db::pending_purges(&pool)
+            .await
+            .expect("tombstones")
+            .is_empty());
+        assert!(dir.exists(), "the new owner's data must survive the resume");
+        pool.close().await;
     }
 }

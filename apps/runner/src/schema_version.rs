@@ -15,7 +15,7 @@ use sqlx::SqliteConnection;
 pub const FIRST_COMPACTED_VERSION: i64 = 100;
 
 /// Version a database has after every migration ran.
-pub const SCHEMA_VERSION: i64 = FIRST_COMPACTED_VERSION + 5;
+pub const SCHEMA_VERSION: i64 = FIRST_COMPACTED_VERSION + 6;
 
 /// One upgrade step: the statements that take a database from `version - 1`
 /// to `version`. Empty at the compacted baseline; append above it to change
@@ -67,6 +67,23 @@ pub const MIGRATIONS: &[Migration] = &[
         // error, and their duration reads from `updated_at` like a new one.
         version: FIRST_COMPACTED_VERSION + 5,
         sql: "ALTER TABLE main.deploy ADD COLUMN error TEXT;",
+    },
+    Migration {
+        // 106: the durable record of a deleted app's pending wipe. Before it,
+        // a delete dropped the row first and kept the wipe only in memory, so
+        // a crash, an S3 failure or a wipe stopped by a re-create that then
+        // aborted left the tenant's git/D1/DO/env data in the bucket with
+        // nothing to resume it. Rows are written in the same transaction as
+        // the app DELETE (`db::delete_app`) and cleared once the prefixes are
+        // empty (`host::purge::resume_pending` and the wipe's own callers).
+        version: FIRST_COMPACTED_VERSION + 6,
+        sql: "CREATE TABLE IF NOT EXISTS main.app_purge (\
+                app_id TEXT PRIMARY KEY NOT NULL, \
+                slug TEXT NOT NULL, \
+                created_at TEXT NOT NULL\
+              ); \
+              CREATE INDEX IF NOT EXISTS main.idx_app_purge_slug \
+              ON app_purge(slug);",
     },
 ];
 

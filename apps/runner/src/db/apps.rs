@@ -510,12 +510,71 @@ pub async fn rebind_local_subdomains(pool: &SqlitePool, base_domain: &str) -> sq
     Ok(rewritten)
 }
 
+/// Hard-delete an app row and record what the delete still owes, in one
+/// transaction.
+///
+/// Three writes, all or nothing:
+/// - `DELETE FROM app` (its environments/deploys cascade);
+/// - `INSERT INTO app_purge` — the durable tombstone [`crate::host::purge`]
+///   resumes at boot and on the reconcile loop. Before it, the wipe lived
+///   only in the process, so a crash, an S3 failure or a wipe stopped by a
+///   re-create that then aborted left the tenant's bucket data behind with
+///   nothing to retry it;
+/// - the app's and its environments' scoped keys `revoking`. The slug is
+///   free once this returns, so a still-`live` row would keep handing a
+///   valid key to the old owner after a new app took the same prefix
+///   (review finding, 2026-11-12). Only the row state changes here; the
+///   store-side revoke is the background sweep's job and retries.
 pub async fn delete_app(pool: &SqlitePool, id: &str) -> sqlx::Result<()> {
-    sqlx::query("DELETE FROM app WHERE id = ?")
+    let mut tx = pool.begin().await?;
+    let slug: Option<String> = sqlx::query_scalar("SELECT slug FROM main.app WHERE id = ?")
         .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?;
+    sqlx::query("DELETE FROM main.app WHERE id = ?")
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+    if let Some(slug) = slug {
+        sqlx::query(
+            "INSERT OR REPLACE INTO main.app_purge (app_id, slug, created_at) \
+             VALUES (?, ?, datetime('now'))",
+        )
+        .bind(id)
+        .bind(&slug)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "UPDATE main.scoped_credential SET state = ?, updated_at = datetime('now') \
+             WHERE app_id = ? AND state = ?",
+        )
+        .bind(super::credentials::ScopedCredentialState::Revoking)
+        .bind(id)
+        .bind(super::credentials::ScopedCredentialState::Live)
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await?;
+    Ok(())
+}
+
+/// Every pending wipe's slug, oldest first. One row per deleted app id, but
+/// the wipe is per slug, so the slug is what a pass needs.
+pub async fn pending_purges(pool: &SqlitePool) -> sqlx::Result<Vec<String>> {
+    sqlx::query_scalar("SELECT slug FROM main.app_purge ORDER BY created_at, app_id")
+        .fetch_all(pool)
+        .await
+}
+
+/// Drop every tombstone for `slug`: a wipe of its prefixes finished while no
+/// app row owned it, so all of them are satisfied (one slug can carry more
+/// than one when a freed slug was re-created and deleted again).
+pub async fn clear_app_purges(pool: &SqlitePool, slug: &str) -> sqlx::Result<u64> {
+    let done = sqlx::query("DELETE FROM main.app_purge WHERE slug = ?")
+        .bind(slug)
         .execute(pool)
         .await?;
-    Ok(())
+    Ok(done.rows_affected())
 }
 
 /// The one writer of `app.status` (the machine is

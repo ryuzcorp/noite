@@ -31,6 +31,9 @@ pub async fn run_forever(
     control_pid: Arc<std::sync::atomic::AtomicU32>,
     logs: LogState,
     deploying: Deploying,
+    // The process's per-slug publish guard: the purge resume pass takes a
+    // slug's guard exactly like create/delete/rename do.
+    git_sync: ryuz_git::GitSync,
     mut metrics: MetricsState,
     ready: Arc<AtomicBool>,
     shutdown: Arc<AtomicBool>,
@@ -60,6 +63,13 @@ pub async fn run_forever(
     // the first tick, then every ten minutes — a full listing on every
     // tick would hammer the store's IAM.
     let mut last_orphan_sweep: Option<Instant> = None;
+    // Durable app-purge tombstones (`app_purge`): a delete whose wipe never
+    // finished — a crash, a restart, an S3 failure, a wipe a create stopped
+    // and then aborted — is resumed on a slow tick. The boot pass covers the
+    // common case; this catches a store that was down at boot. One pass at a
+    // time, off the tick, and paced like every background wipe.
+    let mut last_purge_resume = Instant::now();
+    let purge_resuming = Arc::new(AtomicBool::new(false));
     loop {
         tick.tick().await;
         if shutdown.load(Ordering::Relaxed) {
@@ -119,6 +129,36 @@ pub async fn run_forever(
             if left > 0 {
                 tracing::warn!(left, "scoped keys still awaiting revocation");
             }
+        }
+        // Durable app-purge tombstones (`app_purge`): a delete whose wipe never
+        // finished is resumed here every five minutes — off the tick, because
+        // a wipe of a real data set takes seconds and holds its slug's guard.
+        if last_purge_resume.elapsed() >= Duration::from_secs(5 * 60)
+            && !purge_resuming.swap(true, Ordering::SeqCst)
+        {
+            last_purge_resume = Instant::now();
+            let (pool2, cfg2, procs2, logs2, sync2, flag) = (
+                pool.clone(),
+                cfg.clone(),
+                procs.clone(),
+                logs.clone(),
+                git_sync.clone(),
+                purge_resuming.clone(),
+            );
+            tokio::spawn(async move {
+                let report =
+                    crate::host::purge::resume_pending(&pool2, &cfg2, &procs2, &logs2, &sync2)
+                        .await;
+                if report.noteworthy() {
+                    tracing::info!(
+                        pending = report.pending,
+                        cleared = report.cleared,
+                        failed = report.failed,
+                        "resumed pending app purges"
+                    );
+                }
+                flag.store(false, Ordering::SeqCst);
+            });
         }
         if crate::host::credentials::orphan_sweep_due(
             last_orphan_sweep,

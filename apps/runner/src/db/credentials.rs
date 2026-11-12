@@ -175,6 +175,51 @@ pub async fn delete_scoped_credential(pool: &SqlitePool, handle: &str) -> sqlx::
     Ok(())
 }
 
+/// Every key row reaching `prefix`, `live` or `revoking`, whatever app it was
+/// minted for. [`crate::host::credentials::ensure`] reads it before it mints:
+/// a key whose app row is gone is a previous owner of the prefix (a delete
+/// that never reached its revoke) and must be revoked before a new owner gets
+/// the same objects.
+pub async fn scoped_credentials_for_prefix(
+    pool: &SqlitePool,
+    prefix: &str,
+) -> sqlx::Result<Vec<ScopedCredential>> {
+    let rows: Vec<ScopedRow> = sqlx::query_as(
+        "SELECT scope, app_id, handle, prefix, store, state, nonce, ciphertext \
+         FROM main.scoped_credential WHERE prefix = ? ORDER BY updated_at",
+    )
+    .bind(prefix)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.into_iter().map(ScopedCredential::from_row).collect())
+}
+
+/// Every key row whose app row no longer exists (boot reconcile). The row may
+/// be `live` when a delete was interrupted before the atomic mark, or
+/// `revoking` when the store delete never landed.
+pub async fn orphan_scoped_credentials(pool: &SqlitePool) -> sqlx::Result<Vec<ScopedCredential>> {
+    let rows: Vec<ScopedRow> = sqlx::query_as(
+        "SELECT scope, app_id, handle, prefix, store, state, nonce, ciphertext \
+         FROM main.scoped_credential \
+         WHERE app_id NOT IN (SELECT id FROM main.app) ORDER BY updated_at",
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.into_iter().map(ScopedCredential::from_row).collect())
+}
+
+/// The scopes of operator-token rows whose app row no longer exists (boot
+/// reconcile). The reserved control fleet's row (`app_id = '_control'`) never
+/// has an app row and is kept.
+pub async fn orphan_operator_token_scopes(pool: &SqlitePool) -> sqlx::Result<Vec<String>> {
+    sqlx::query_scalar(
+        "SELECT scope FROM main.fleet_operator_token \
+         WHERE app_id <> '_control' AND app_id NOT IN (SELECT id FROM main.app)",
+    )
+    .fetch_all(pool)
+    .await
+}
+
 /// Every `scoped_credential` handle, live or revoking: the orphan sweep
 /// keeps any listed principal one of these names.
 pub async fn all_scoped_credential_handles(pool: &SqlitePool) -> sqlx::Result<Vec<String>> {
