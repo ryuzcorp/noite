@@ -178,13 +178,39 @@ const checkImages = (dockerfile: string, failures: string[]): PinnedImage[] => {
   const seen = new Set<string>();
   const args = argDefaults(dockerfile);
 
-  for (const match of dockerfile.matchAll(
-    /^FROM\s+(?:--platform=\S+\s+)?(?<ref>\S+)(?:\s+AS\s+\S+)?\s*$/gmu
-  )) {
-    const ref = match.groups?.ref ?? "";
+  const fromLines = [...dockerfile.matchAll(/^[ \t]*FROM\b[^\n]*$/gimu)].map(
+    (match) => match[0]
+  );
+
+  // Stage names first: only a ref declared as an earlier stage may be
+  // unpinned. A bare `FROM alpine` is an external image, not a stage.
+  const stages = new Set<string>();
+
+  for (const line of fromLines) {
+    const stage =
+      /^[ \t]*FROM[ \t]+\S+[ \t]+AS[ \t]+(?<stage>\S+)[ \t]*$/imu.exec(line)
+        ?.groups?.stage;
+
+    if (stage) {
+      stages.add(stage);
+    }
+  }
+
+  for (const line of fromLines) {
+    const parsed =
+      /^[ \t]*FROM[ \t]+(?:--platform=\S+[ \t]+)?(?<ref>\S+)(?:[ \t]+AS[ \t]+\S+)?[ \t]*$/imu.exec(
+        line
+      );
+
+    if (!parsed?.groups) {
+      failures.push(`image: cannot parse ${line.trim()}`);
+      continue;
+    }
+
+    const ref = parsed.groups.ref ?? "";
 
     // An earlier stage (`FROM base AS dev`): resolved inside the build.
-    if (/^[A-Za-z0-9_.-]+$/u.test(ref)) {
+    if (stages.has(ref)) {
       continue;
     }
 
@@ -244,6 +270,17 @@ const checkImages = (dockerfile: string, failures: string[]): PinnedImage[] => {
   return images;
 };
 
+/** Comments describe the rule; they must not satisfy a check. */
+const withoutComments = (text: string): string =>
+  text
+    .split("\n")
+    .filter((line) => !/^\s*#/u.test(line))
+    .join("\n");
+
+/** Continuation lines joined, comments dropped: one command per line. */
+const executableText = (text: string): string =>
+  withoutComments(text).replaceAll("\\\n", " ");
+
 const checkDownloads = (
   files: PinFiles,
   failures: string[]
@@ -257,6 +294,8 @@ const checkDownloads = (
       spec.file === "dockerfile"
         ? "docker/Dockerfile"
         : "docker/install-sidecars.sh";
+
+    const bare = withoutComments(text);
 
     const versions =
       spec.file === "dockerfile"
@@ -304,7 +343,7 @@ const checkDownloads = (
         continue;
       }
 
-      if (!text.includes(`\${${varName}}`)) {
+      if (!bare.includes(`\${${varName}}`)) {
         failures.push(
           `${spec.name}: ${varName} is never used; the install must select it per arch`
         );
@@ -313,19 +352,19 @@ const checkDownloads = (
       digests[arch] = digest;
     }
 
-    if (!text.includes(spec.sumRef)) {
+    if (!bare.includes(spec.sumRef)) {
       failures.push(
         `${spec.name}: the install must verify the download with ${spec.sumRef}`
       );
     }
 
-    if (!text.includes(`${spec.algo}sum -c -`)) {
+    if (!bare.includes(`${spec.algo}sum -c -`)) {
       failures.push(
         `${spec.name}: the install must run ${spec.algo}sum -c - on the downloaded tarball`
       );
     }
 
-    const urlCount = text.split(spec.url).length - 1;
+    const urlCount = bare.split(spec.url).length - 1;
 
     if (urlCount !== 1) {
       failures.push(
@@ -346,7 +385,7 @@ const checkChecksumsAreUsed = (files: PinFiles, failures: string[]): void => {
     ["docker/install-sidecars.sh", files.sidecars],
   ] as const) {
     for (const match of text.matchAll(
-      /^(?:ARG )?(?<name>[A-Z0-9][A-Z0-9_]*_SHA(?:256|512))=(?<value>\S+)$/gmu
+      /^(?:ARG )?(?<name>[A-Z0-9][A-Z0-9_]*_SHA(?:256|512)(?:_[A-Z0-9]+)?)=(?<value>\S+)$/gmu
     )) {
       const name = match.groups?.name ?? "";
 
@@ -359,26 +398,51 @@ const checkChecksumsAreUsed = (files: PinFiles, failures: string[]): void => {
   }
 };
 
+const escapeRegExp = (value: string): string =>
+  value.replaceAll(/[.*+?^${}()|[\]\\]/gu, "\\$&");
+
+const FILES = [
+  ["docker/Dockerfile", "dockerfile"],
+  ["docker/install-sidecars.sh", "sidecars"],
+] as const;
+
 /** Downloads must land in a file first: `curl … | tar` cannot be checked. */
-const checkNoUnverifiedPipes = (files: PinFiles, failures: string[]): void => {
-  for (const [where, text] of [
-    ["docker/Dockerfile", files.dockerfile],
-    ["docker/install-sidecars.sh", files.sidecars],
-  ] as const) {
-    const flattened = text
-      .split("\n")
-      .filter((line) => !/^\s*#/u.test(line))
-      .join("\n")
-      .replaceAll("\\\n", " ");
+const checkDownloadsAreVerified = (
+  files: PinFiles,
+  failures: string[]
+): void => {
+  for (const [where, key] of FILES) {
+    const text = executableText(files[key]);
 
     if (
       /\bcurl\b(?:(?!&&|;)[^\n])*\|(?:(?!&&|;)[^\n])*\b(?:tar|sh|bash)\b/u.test(
-        flattened
+        text
       )
     ) {
       failures.push(
         `${where}: a download is piped into tar/sh; download it, verify the checksum, then unpack`
       );
+    }
+
+    // Every downloaded archive must be the file a checksum line verifies,
+    // not merely a URL some spec happens to allow.
+    const archives = [
+      ...text.matchAll(
+        /\bcurl\b[^\n]*?(?:-o|--output)[ \t]+(?<path>\S*\.(?:tgz|tar\.gz|tar\.xz|tar\.bz2|zip))\b/gu
+      ),
+    ].map((match) => match.groups?.path ?? "");
+
+    for (const path of archives) {
+      const verified = new RegExp(
+        `${escapeRegExp(path)}"?\\s*\\|\\s*sha(?:256|512)sum -c -`,
+        "u"
+      ).test(text);
+
+      if (!verified) {
+        failures.push(
+          `${where}: ${path} is downloaded but no checksum line verifies it`
+        );
+      }
     }
   }
 };
@@ -448,7 +512,7 @@ export const checkIntegrityPins = (files: PinFiles): IntegrityReport => {
   const downloads = checkDownloads(files, failures);
 
   checkChecksumsAreUsed(files, failures);
-  checkNoUnverifiedPipes(files, failures);
+  checkDownloadsAreVerified(files, failures);
 
   return { downloads, failures, images };
 };
@@ -493,6 +557,50 @@ export const githubAssetDigest = (
 
   return found?.digest?.replace(/^sha256:/u, "");
 };
+
+/** A fetched publisher document compared with the digest the pin claims. */
+export const verifyFetchedPin = (
+  probe: Exclude<OnlineProbe, { kind: "image" }>,
+  text: string
+): string | undefined => {
+  if (probe.kind === "shasums") {
+    const entries = parseShasums(text);
+
+    for (const [file, expected] of Object.entries(probe.entries)) {
+      if (entries[file] !== expected) {
+        return `online: ${probe.url} lists ${file} as ${entries[file] ?? "nothing"}, but the pin is ${expected}`;
+      }
+    }
+
+    return undefined;
+  }
+
+  if (probe.kind === "npm-integrity") {
+    // SAFETY: registry.npmjs.org's per-version document; only
+    // `dist.integrity` is read, and a missing field is reported below.
+    const versionDoc = JSON.parse(text) as { dist?: { integrity?: string } };
+    const integrity = versionDoc.dist?.integrity;
+
+    return npmIntegrityHex(integrity ?? "") === probe.digest
+      ? undefined
+      : `online: ${probe.url} publishes ${integrity ?? "no integrity"}, but the pin is ${probe.digest}`;
+  }
+
+  const hex = githubAssetDigest(text, probe.asset);
+
+  return hex === probe.digest
+    ? undefined
+    : `online: ${probe.url} publishes ${probe.asset} as ${hex ?? "no digest"}, but the pin is ${probe.digest}`;
+};
+
+/** The index digest a tag resolves to compared with the digest it pins. */
+export const verifyImageDigest = (
+  probe: Extract<OnlineProbe, { kind: "image" }>,
+  digest: string
+): string | undefined =>
+  digest === `sha256:${probe.digest}`
+    ? undefined
+    : `online: ${probe.url} now resolves to ${digest || "nothing"}, but the pin is sha256:${probe.digest}`;
 
 // Where the publishers keep the digest each pin claims: the tag's index
 // digest, the signed SHASUMS file, npm's per-version `dist.integrity`, the

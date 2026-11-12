@@ -8,6 +8,8 @@ import {
   npmIntegrityHex,
   onlineProbes,
   parseShasums,
+  verifyFetchedPin,
+  verifyImageDigest,
 } from "./check-pins";
 import type { PinFiles } from "./check-pins";
 
@@ -227,6 +229,70 @@ describe("checkIntegrityPins", () => {
       expect.stringContaining("but platforms.mdx documents 0.0.1")
     );
   });
+
+  test("the Caddy builder's digest is checked too (the line is easy to miss)", () => {
+    const files = repoFiles();
+
+    const report = checkIntegrityPins({
+      ...files,
+      dockerfile: files.dockerfile.replace(`@\${CADDY_DIGEST}`, ""),
+    });
+
+    expect(report.failures).toContainEqual(
+      expect.stringContaining(
+        `FROM docker.io/library/caddy:\${CADDY_VERSION}-builder must be image:tag@\${DIGEST}`
+      )
+    );
+  });
+
+  test("an indented or lowercase FROM is still parsed and checked", () => {
+    const files = repoFiles();
+
+    const report = checkIntegrityPins({
+      ...files,
+      dockerfile: files.dockerfile.replace(
+        `FROM docker.io/library/node:\${NODE_VERSION}-slim@\${NODE_DIGEST} AS node`,
+        `  from docker.io/library/node:\${NODE_VERSION}-slim AS node`
+      ),
+    });
+
+    expect(report.failures).toContainEqual(
+      expect.stringContaining(
+        `FROM docker.io/library/node:\${NODE_VERSION}-slim must be image:tag@\${DIGEST}`
+      )
+    );
+  });
+
+  test("a bare external image is not mistaken for an earlier stage", () => {
+    const files = repoFiles();
+
+    const report = checkIntegrityPins({
+      ...files,
+      dockerfile: files.dockerfile.replace(
+        "FROM docker.io/library/rust:",
+        "FROM alpine\nFROM docker.io/library/rust:"
+      ),
+    });
+
+    expect(report.failures).toContainEqual(
+      expect.stringContaining(`FROM alpine must be image:tag@\${DIGEST}`)
+    );
+  });
+
+  test("a newly added archive download without a checksum line fails", () => {
+    const files = repoFiles();
+
+    const report = checkIntegrityPins({
+      ...files,
+      sidecars: `${files.sidecars}\ncurl -fsSL -o /tmp/extra.tgz "https://example.com/extra.tgz"\n`,
+    });
+
+    expect(report.failures).toContainEqual(
+      expect.stringContaining(
+        "/tmp/extra.tgz is downloaded but no checksum line verifies it"
+      )
+    );
+  });
 });
 
 describe("onlineProbes", () => {
@@ -257,6 +323,17 @@ describe("onlineProbes", () => {
     );
 
     expect(slim).toHaveLength(1);
+
+    // Every digest-pinned FROM reaches the online leg, the builder included.
+    const caddyVersion = /ARG CADDY_VERSION=(?<version>\S+)/u.exec(
+      files.dockerfile
+    )?.groups?.version;
+
+    const names = probes
+      .filter((probe) => probe.kind === "image")
+      .map((probe) => probe.name);
+
+    expect(names).toContain(`docker.io/library/caddy:${caddyVersion}-builder`);
   });
 
   test("jup, npm and pnpm are checked against their registry integrity", () => {
@@ -322,5 +399,97 @@ describe("publisher parsers", () => {
       "c6507206baf7793c6013dbd82368469a45f20dc0e17a6f92f204602f652ed2bc"
     );
     expect(githubAssetDigest(release, "missing.tar.gz")).toBeUndefined();
+  });
+});
+
+describe("online comparators", () => {
+  const sha512Empty =
+    "cf83e1357eefb8bdf1542850d66d8007d620e4050b5715dc83f4a921d36ce9ce47d0d13c5d85f2b0ff8318d2877eec2f63b931bd47417a81a538327af927da3e";
+
+  test("a tag must resolve to exactly the pinned index digest", () => {
+    const probe = {
+      digest: "a".repeat(64),
+      kind: "image" as const,
+      name: "docker.io/library/x:1",
+      url: "docker.io/library/x:1",
+    };
+
+    expect(
+      verifyImageDigest(probe, `sha256:${"a".repeat(64)}`)
+    ).toBeUndefined();
+    expect(verifyImageDigest(probe, `sha256:${"b".repeat(64)}`)).toContain(
+      "now resolves to sha256:bbbb"
+    );
+    expect(verifyImageDigest(probe, "")).toContain("now resolves to nothing");
+  });
+
+  test("a SHASUMS entry must match the pinned checksum", () => {
+    const digest = "c".repeat(64);
+
+    const probe = {
+      entries: { "node-v1-linux-x64.tar.xz": digest },
+      kind: "shasums" as const,
+      name: "node",
+      url: "https://nodejs.org/download/release/v1/SHASUMS256.txt",
+    };
+
+    expect(
+      verifyFetchedPin(probe, `${digest}  node-v1-linux-x64.tar.xz\n`)
+    ).toBeUndefined();
+    expect(
+      verifyFetchedPin(probe, `${"d".repeat(64)}  node-v1-linux-x64.tar.xz\n`)
+    ).toContain("lists node-v1-linux-x64.tar.xz as");
+    expect(verifyFetchedPin(probe, "")).toContain("as nothing");
+  });
+
+  test("npm integrity must convert to the pinned sha512", () => {
+    const probe = {
+      digest: sha512Empty,
+      kind: "npm-integrity" as const,
+      name: "@esbuild/linux-x64",
+      url: "https://registry.npmjs.org/@esbuild/linux-x64/0.0.1",
+    };
+
+    expect(
+      verifyFetchedPin(
+        probe,
+        JSON.stringify({
+          dist: {
+            integrity:
+              "sha512-z4PhNX7vuL3xVChQ1m2AB9Yg5AULVxXcg/SpIdNs6c5H0NE8XYXysP+DGNKHfuwvY7kxvUdBeoGlODJ6+SfaPg==",
+          },
+        })
+      )
+    ).toBeUndefined();
+    expect(
+      verifyFetchedPin(probe, JSON.stringify({ dist: { integrity: "sha1-x" } }))
+    ).toContain("publishes sha1-x");
+  });
+
+  test("a GitHub release asset must carry the pinned digest", () => {
+    const probe = {
+      asset: "duckdb-cli-linux-amd64.tar.gz",
+      digest: "e".repeat(64),
+      kind: "github-asset" as const,
+      name: "duckdb amd64",
+      url: "https://api.github.com/repos/duckdb/duckdb/releases/tags/v2.0.0",
+    };
+
+    expect(
+      verifyFetchedPin(
+        probe,
+        JSON.stringify({
+          assets: [
+            {
+              digest: `sha256:${"e".repeat(64)}`,
+              name: "duckdb-cli-linux-amd64.tar.gz",
+            },
+          ],
+        })
+      )
+    ).toBeUndefined();
+    expect(verifyFetchedPin(probe, JSON.stringify({ assets: [] }))).toContain(
+      "as no digest"
+    );
   });
 });

@@ -86,7 +86,7 @@ FROM ${CELLD_IMAGE} AS celld
  # arm64 image does not run the Go toolchain under emulation.
  # The builder image's own CADDY_VERSION env (v-prefixed, from the tag above)
  # is the version xcaddy builds.
- FROM --platform=$BUILDPLATFORM docker.io/library/caddy:${CADDY_VERSION}-builder@${CADDY_DIGEST} AS caddy-build
+FROM --platform=$BUILDPLATFORM docker.io/library/caddy:${CADDY_VERSION}-builder@${CADDY_DIGEST} AS caddy-build
  ARG TARGETOS
  ARG TARGETARCH
  # The builder image is golang-based, so the module's own tests run here and

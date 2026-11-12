@@ -27,10 +27,9 @@ import path from "node:path";
 
 import {
   checkIntegrityPins,
-  githubAssetDigest,
-  npmIntegrityHex,
   onlineProbes,
-  parseShasums,
+  verifyFetchedPin,
+  verifyImageDigest,
 } from "./check-pins";
 import type { OnlineProbe } from "./check-pins";
 
@@ -494,43 +493,7 @@ const verifyImagePin = (
     return `online: could not inspect ${probe.url}: ${(result.stderr ?? "").trim() || "docker failed"}`;
   }
 
-  return digest === `sha256:${probe.digest}`
-    ? undefined
-    : `online: ${probe.url} now resolves to ${digest || "nothing"}, but the pin is sha256:${probe.digest}`;
-};
-
-const verifyFetchedPin = (
-  probe: Exclude<OnlineProbe, { kind: "image" }>,
-  text: string
-): string | undefined => {
-  if (probe.kind === "shasums") {
-    const entries = parseShasums(text);
-
-    for (const [file, expected] of Object.entries(probe.entries)) {
-      if (entries[file] !== expected) {
-        return `online: ${probe.url} lists ${file} as ${entries[file] ?? "nothing"}, but the pin is ${expected}`;
-      }
-    }
-
-    return undefined;
-  }
-
-  if (probe.kind === "npm-integrity") {
-    // SAFETY: registry.npmjs.org's per-version document; only
-    // `dist.integrity` is read, and a missing field is reported below.
-    const versionDoc = JSON.parse(text) as { dist?: { integrity?: string } };
-    const integrity = versionDoc.dist?.integrity;
-
-    return npmIntegrityHex(integrity ?? "") === probe.digest
-      ? undefined
-      : `online: ${probe.url} publishes ${integrity ?? "no integrity"}, but the pin is ${probe.digest}`;
-  }
-
-  const hex = githubAssetDigest(text, probe.asset);
-
-  return hex === probe.digest
-    ? undefined
-    : `online: ${probe.url} publishes ${probe.asset} as ${hex ?? "no digest"}, but the pin is ${probe.digest}`;
+  return verifyImageDigest(probe, digest);
 };
 
 if (process.argv.includes("--online")) {
