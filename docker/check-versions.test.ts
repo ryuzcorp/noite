@@ -294,6 +294,28 @@ describe("checkIntegrityPins", () => {
     expect(caddy?.digest).toMatch(/^[0-9a-f]{64}$/u);
   });
 
+  test("a later stage alias does not exempt an earlier bare FROM", () => {
+    const files = repoFiles();
+
+    const report = checkIntegrityPins({
+      ...files,
+      dockerfile: files.dockerfile
+        .replace(
+          "FROM docker.io/library/rust:",
+          "FROM alpine\nFROM docker.io/library/rust:"
+        )
+        .replace("FROM base AS dev", "FROM base AS dev\nFROM base AS alpine"),
+    });
+
+    // The alias `alpine` is declared after this line, so it is an external
+    // image here — exactly once, not silently exempted file-wide.
+    expect(
+      report.failures.filter((failure) =>
+        failure.includes(`FROM alpine must be image:tag@\${DIGEST}`)
+      )
+    ).toHaveLength(1);
+  });
+
   test("a newly added archive download without a checksum line fails", () => {
     const files = repoFiles();
 
@@ -305,6 +327,36 @@ describe("checkIntegrityPins", () => {
     expect(report.failures).toContainEqual(
       expect.stringContaining(
         "/tmp/extra.tgz is downloaded but no checksum line verifies it"
+      )
+    );
+  });
+
+  test("--output=<path> is checked like -o", () => {
+    const files = repoFiles();
+
+    const report = checkIntegrityPins({
+      ...files,
+      sidecars: `${files.sidecars}\ncurl -fsSL --output=/tmp/extra.tgz "https://example.com/extra.tgz"\n`,
+    });
+
+    expect(report.failures).toContainEqual(
+      expect.stringContaining(
+        "/tmp/extra.tgz is downloaded but no checksum line verifies it"
+      )
+    );
+  });
+
+  test("curl -O is refused because its path cannot be verified", () => {
+    const files = repoFiles();
+
+    const report = checkIntegrityPins({
+      ...files,
+      sidecars: `${files.sidecars}\ncurl -fsSL -O "https://example.com/three.tgz"\n`,
+    });
+
+    expect(report.failures).toContainEqual(
+      expect.stringContaining(
+        "curl -O/--remote-name saves a path no checksum line names"
       )
     );
   });

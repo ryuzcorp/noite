@@ -182,23 +182,13 @@ const checkImages = (dockerfile: string, failures: string[]): PinnedImage[] => {
     (match) => match[0]
   );
 
-  // Stage names first: only a ref declared as an earlier stage may be
-  // unpinned. A bare `FROM alpine` is an external image, not a stage.
+  // Only a ref declared as an EARLIER stage may be unpinned: one pass, so a
+  // later `FROM base AS alpine` cannot exempt an earlier bare `FROM alpine`.
   const stages = new Set<string>();
 
   for (const line of fromLines) {
-    const stage =
-      /^[ \t]*FROM[ \t]+\S+[ \t]+AS[ \t]+(?<stage>\S+)[ \t]*$/imu.exec(line)
-        ?.groups?.stage;
-
-    if (stage) {
-      stages.add(stage);
-    }
-  }
-
-  for (const line of fromLines) {
     const parsed =
-      /^[ \t]*FROM[ \t]+(?:--platform=\S+[ \t]+)?(?<ref>\S+)(?:[ \t]+AS[ \t]+\S+)?[ \t]*$/imu.exec(
+      /^[ \t]*FROM[ \t]+(?:--platform=\S+[ \t]+)?(?<ref>\S+)(?:[ \t]+AS[ \t]+(?<stage>\S+))?[ \t]*$/imu.exec(
         line
       );
 
@@ -208,10 +198,20 @@ const checkImages = (dockerfile: string, failures: string[]): PinnedImage[] => {
     }
 
     const ref = parsed.groups.ref ?? "";
+    const { stage } = parsed.groups;
 
-    // An earlier stage (`FROM base AS dev`): resolved inside the build.
+    // An earlier stage (`FROM base AS dev`): resolved inside the build. The
+    // alias is recorded only after this check, so a line cannot exempt itself.
     if (stages.has(ref)) {
+      if (stage) {
+        stages.add(stage);
+      }
+
       continue;
+    }
+
+    if (stage) {
+      stages.add(stage);
     }
 
     // The celld fork's pin has its own guard in check-versions.ts.
@@ -424,11 +424,23 @@ const checkDownloadsAreVerified = (
       );
     }
 
+    // `-O` writes the remote name into the cwd, a path no checksum line here
+    // names: the download cannot be verified.
+    if (
+      /\bcurl\b[^\n]*?(?:[ \t]-[A-Za-z]*O[A-Za-z]*\b|[ \t]--remote-name(?:-all)?\b)/u.test(
+        text
+      )
+    ) {
+      failures.push(
+        `${where}: curl -O/--remote-name saves a path no checksum line names; use -o <path>`
+      );
+    }
+
     // Every downloaded archive must be the file a checksum line verifies,
     // not merely a URL some spec happens to allow.
     const archives = [
       ...text.matchAll(
-        /\bcurl\b[^\n]*?(?:-o|--output)[ \t]+(?<path>\S*\.(?:tgz|tar\.gz|tar\.xz|tar\.bz2|zip))\b/gu
+        /\bcurl\b[^\n]*?(?:-o|--output)[ \t=]+(?<path>\S*\.(?:tgz|tar\.gz|tar\.xz|tar\.bz2|zip))\b/gu
       ),
     ].map((match) => match.groups?.path ?? "");
 
