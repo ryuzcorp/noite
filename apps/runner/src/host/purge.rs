@@ -206,6 +206,15 @@ pub async fn resume_pending(
         // a create/rename inserts its row under this same guard and only after
         // wiping the prefixes, so "no row now" cannot change under the wipe.
         let guard = git_sync.lock(&slug).await;
+        // A rename can have reserved the slug while this pass waited for the
+        // guard; re-check under it, exactly like the row check below.
+        if crate::host::rename::target_reserved(cfg, &slug).await {
+            tracing::debug!(
+                slug,
+                "pending purge skipped: a rename reserved the slug while we waited"
+            );
+            continue;
+        }
         // `Ok(true)`: the prefixes are empty (or the taker's wipe made them so)
         // and every tombstone for the slug can go. `Ok(false)`: a create took
         // the slug and stopped the wipe; it clears the tombstone itself once its

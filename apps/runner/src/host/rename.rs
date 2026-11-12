@@ -205,6 +205,8 @@ pub(crate) async fn pending_renames(cfg: &Config) -> Vec<PendingRename> {
     let mut out = Vec::new();
     while let Ok(Some(entry)) = entries.next_entry().await {
         let path = entry.path();
+        // `.json` only: a marker being written lives in a `.tmp` sibling, so a
+        // concurrent pass can never read (and delete) a partial file.
         if path.extension().and_then(|e| e.to_str()) != Some("json") {
             continue;
         }
@@ -252,14 +254,28 @@ async fn write_rename_marker(
         .parent()
         .ok_or_else(|| anyhow::anyhow!("rename marker has no parent: {}", path.display()))?;
     tokio::fs::create_dir_all(parent).await?;
-    tokio::fs::write(&path, format!("{app_id}\n{from}\n"))
-        .await
-        .with_context(|| format!("write rename marker {}", path.display()))?;
-    let file = tokio::fs::File::open(&path).await?;
-    file.sync_all().await?;
+    // Write-then-rename: a concurrent `pending_renames` must never observe a
+    // partial marker (it would treat it as malformed and delete it, losing the
+    // reservation of a move that may already have moved data). The temp name
+    // ends in `.tmp`, which the reader skips.
+    let tmp = parent.join(format!(".{to}.json-{}.tmp", crate::models::new_id()));
+    let write = async {
+        use tokio::io::AsyncWriteExt as _;
+        let mut file = tokio::fs::File::create(&tmp).await?;
+        file.write_all(format!("{app_id}\n{from}\n").as_bytes())
+            .await?;
+        file.sync_all().await?;
+        tokio::fs::rename(&tmp, &path).await?;
+        Ok::<(), std::io::Error>(())
+    }
+    .await;
+    if let Err(e) = write {
+        let _ = tokio::fs::remove_file(&tmp).await;
+        return Err(e).with_context(|| format!("write rename marker {}", path.display()));
+    }
     // The directory entry is what makes the file survive a crash; best-effort
-    // (`sync_all` on a directory is not portable), the content sync is the
-    // part that matters.
+    // (`sync_all` on a directory is not portable), the content sync above is
+    // the part that matters.
     if let Ok(dir) = tokio::fs::File::open(parent).await {
         let _ = dir.sync_all().await;
     }
@@ -676,7 +692,9 @@ async fn rename_slugged(
 
 #[cfg(test)]
 mod tests {
-    use super::{move_dir, parse_listing_keys};
+    use super::{
+        move_dir, parse_listing_keys, pending_renames, write_rename_marker, PendingRename,
+    };
 
     /// R-06: an empty `Contents` is the only "nothing to move" shape. Garbage
     /// and a missing `Contents` are errors — the move must fail instead of
@@ -739,6 +757,48 @@ mod tests {
         }
         assert_eq!(salvaged.len(), 1, "exactly one salvage dir is kept");
         assert!(salvaged[0].join("recreated.json").exists());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A marker write is atomic: a concurrent scan sees either no marker or a
+    /// complete one. A temp file mid-write must be ignored and left alone —
+    /// deleting it would drop the reservation of a move already under way.
+    #[tokio::test]
+    async fn a_marker_is_never_observed_partially_written() {
+        let base =
+            std::env::temp_dir().join(format!("noite-rename-atomic-{}", crate::models::new_id()));
+        let mut cfg = crate::config::config_for_tests();
+        cfg.work_dir = base.join("work").to_string_lossy().into_owned();
+        let dir = crate::host::exec::work_root(&cfg).join("rename");
+        std::fs::create_dir_all(&dir).expect("rename dir");
+        let inflight = dir.join(".slug.json-inflight.tmp");
+        std::fs::write(&inflight, "app-id\nold").expect("partial temp");
+
+        assert!(
+            pending_renames(&cfg).await.is_empty(),
+            "a temp file is not a marker"
+        );
+        assert!(inflight.exists(), "the in-flight temp is not deleted");
+
+        write_rename_marker(&cfg, "app-id", "old", "slug")
+            .await
+            .expect("atomic marker write");
+        assert_eq!(
+            pending_renames(&cfg).await,
+            vec![PendingRename {
+                app_id: "app-id".into(),
+                from: "old".into(),
+                to: "slug".into(),
+            }]
+        );
+        let temps: Vec<_> = std::fs::read_dir(&dir)
+            .expect("read dir")
+            .filter_map(|entry| {
+                let path = entry.ok()?.path();
+                (path.extension().and_then(|e| e.to_str()) == Some("tmp")).then_some(path)
+            })
+            .collect();
+        assert_eq!(temps, vec![inflight], "the write leaves no temp behind");
         let _ = std::fs::remove_dir_all(&base);
     }
 }

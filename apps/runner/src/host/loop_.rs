@@ -136,7 +136,7 @@ pub async fn run_forever(
             });
         }
         if orphan_rows_at.is_some_and(|at| Instant::now() >= at) {
-            orphan_rows_attempts += 1;
+            orphan_rows_attempts = orphan_rows_attempts.saturating_add(1);
             let complete = match crate::host::credentials::reconcile_orphans(&pool).await {
                 Ok(rows) if rows.failed == 0 => {
                     if !rows.nothing() {
