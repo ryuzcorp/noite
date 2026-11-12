@@ -290,6 +290,41 @@ mod tests {
         assert_eq!(columns, 1);
     }
 
+    /// The 106 step adds the durable pending-purge table to a stamped
+    /// database, so an install that upgrades mid-delete keeps the record of
+    /// every wipe it still owes.
+    #[tokio::test]
+    async fn the_app_purge_step_upgrades_a_stamped_database() {
+        let mut conn = memory().await;
+        sqlx::raw_sql(
+            "CREATE TABLE main.app (id TEXT PRIMARY KEY, slug TEXT); \
+             CREATE TABLE main.deploy (id TEXT PRIMARY KEY, app_id TEXT, environment_id TEXT, \
+                                       sha TEXT, status TEXT, intent TEXT, error TEXT, \
+                                       created_at TEXT); \
+             PRAGMA main.user_version = 105;",
+        )
+        .execute(&mut conn)
+        .await
+        .expect("seed a 105 database");
+        apply(
+            &mut conn,
+            "CREATE TABLE IF NOT EXISTS main.app (id TEXT PRIMARY KEY, slug TEXT);",
+            SCHEMA_VERSION,
+            MIGRATIONS,
+        )
+        .await
+        .expect("migrate forward");
+        assert_eq!(version(&mut conn).await, SCHEMA_VERSION);
+        let found: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM main.sqlite_master WHERE type = 'table' \
+             AND name = 'app_purge'",
+        )
+        .fetch_one(&mut conn)
+        .await
+        .expect("table lookup");
+        assert_eq!(found, 1);
+    }
+
     /// The 102 step adds the budget's covering index to a stamped database.
     #[tokio::test]
     async fn the_budget_index_step_upgrades_a_stamped_database() {
