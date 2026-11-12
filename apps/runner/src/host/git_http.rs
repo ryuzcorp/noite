@@ -730,7 +730,12 @@ pub async fn receive_pack(
         }
         Err(e) => {
             tracing::error!(slug = %app.slug, error = %format!("{e:#}"), "git receive sync to s3 failed");
-            return (StatusCode::CONFLICT, format!("{e:#}")).into_response();
+            // The pusher gets a stable message; the cause stays in the log.
+            return (
+                StatusCode::CONFLICT,
+                "noite: the push could not be recorded; retry, and contact the operator if it persists",
+            )
+                .into_response();
         }
     }
     // Pull requests follow their head branch: the push moved `refs/heads/*`,

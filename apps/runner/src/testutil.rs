@@ -130,6 +130,96 @@ pub async fn spawn_s3_stub_recording() -> (String, std::sync::Arc<std::sync::Mut
     (format!("http://{addr}"), seen)
 }
 
+/// [`spawn_s3_stub_recording`] where a read whose target mentions `fragment`
+/// answers `200` with garbage instead of `404` (a corrupt durable manifest),
+/// so one app's boot-time reader fails without the stub changing for others.
+pub async fn spawn_s3_stub_recording_corrupt(
+    fragment: String,
+) -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+    fn is_object_op(request: &[u8]) -> Option<bool> {
+        let line = request
+            .split(|byte| *byte == b'\n')
+            .next()
+            .and_then(|line| std::str::from_utf8(line).ok())?;
+        let target = line.split_whitespace().nth(1)?;
+        let mut halves = target.splitn(2, '?');
+        let path = halves.next().unwrap_or("");
+        let query = halves.next().unwrap_or("");
+        if query.contains("list-type") {
+            return Some(false);
+        }
+        Some(path.trim_start_matches('/').contains('/'))
+    }
+
+    fn is_read(request: &[u8]) -> bool {
+        request.starts_with(b"GET ") || request.starts_with(b"HEAD ")
+    }
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind s3 stub");
+    let addr = listener.local_addr().expect("stub addr");
+    let seen: std::sync::Arc<std::sync::Mutex<Vec<String>>> = std::sync::Arc::default();
+    let record = seen.clone();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut sock, _)) = listener.accept().await else {
+                break;
+            };
+            let record = record.clone();
+            let fragment = fragment.clone();
+            tokio::spawn(async move {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut buf = vec![0u8; 8192];
+                let read = sock.read(&mut buf).await.unwrap_or(0);
+                let line = String::from_utf8_lossy(&buf[..read])
+                    .lines()
+                    .next()
+                    .unwrap_or_default()
+                    .to_string();
+                if !line.is_empty() {
+                    record
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .push(line.clone());
+                }
+                let corrupt = is_object_op(&buf).unwrap_or(false)
+                    && is_read(&buf)
+                    && line.contains(&fragment);
+                let body = if corrupt {
+                    "{\"version\":\"garbage\""
+                } else if is_object_op(&buf).unwrap_or(false) && is_read(&buf) {
+                    concat!(
+                        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>",
+                        "<Error><Code>NoSuchKey</Code>",
+                        "<Message>missing</Message></Error>",
+                    )
+                } else {
+                    concat!(
+                        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>",
+                        "<ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">",
+                        "<Name>noite</Name><MaxKeys>1000</MaxKeys><IsTruncated>false</IsTruncated>",
+                        "</ListBucketResult>"
+                    )
+                };
+                let status = if corrupt {
+                    "200 OK"
+                } else if is_object_op(&buf).unwrap_or(false) && is_read(&buf) {
+                    "404 Not Found"
+                } else {
+                    "200 OK"
+                };
+                let resp = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/xml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = sock.write_all(resp.as_bytes()).await;
+            });
+        }
+    });
+    (format!("http://{addr}"), seen)
+}
+
 /// Whether any live process still carries `marker` in its command line.
 /// Process-group kill tests use it to prove no grandchild survived: a
 /// lingering zombie's cmdline reads empty, so only a truly live process

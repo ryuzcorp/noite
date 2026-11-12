@@ -512,13 +512,45 @@ pub fn publishable_ref(refname: &str) -> bool {
     }
 }
 
+/// The retired refs still in one app's durable manifest. Read without
+/// touching the mirror, so the install-wide boot sweep skips an app whose
+/// manifest never held the namespace instead of syncing every mirror.
+async fn retired_refs_in_manifest(state: &AppState, slug: &str) -> anyhow::Result<Vec<String>> {
+    let Some(manifest) = state.wal.read_manifest(slug).await? else {
+        return Ok(Vec::new());
+    };
+    let refs =
+        <ryuz_git::RefsCodec as ryuz_git::ManifestCodec>::state(&ryuz_git::RefsCodec, &manifest);
+    Ok(refs
+        .refs
+        .into_keys()
+        .filter(|name| name.starts_with(crate::host::git_http::RETIRED_PREVIEW_PREFIX))
+        .collect())
+}
+
 /// Remove every ref under the retired `refs/previews/` namespace from one
 /// app's push mirror and its manifest, so old hidden snapshots are gone from
 /// the durable state too (a rehydrate cannot bring them back) and a later
 /// push's snapshot does not disagree with a manifest that still lists them.
-/// Idempotent; returns how many refs it removed.
+/// Idempotent; returns how many refs it removed. A ref another runner already
+/// deleted is not an error.
 pub async fn delete_retired_refs(state: &AppState, slug: &str) -> anyhow::Result<usize> {
     let retired = crate::host::git_http::RETIRED_PREVIEW_PREFIX;
+    let known = retired_refs_in_manifest(state, slug).await?;
+    let mirror = state.wal.mirror_path(slug);
+    let local = if mirror.join("HEAD").exists() {
+        git_out(
+            &mirror,
+            &["for-each-ref", "--format=%(objectname) %(refname)", retired],
+        )
+        .await
+        .unwrap_or_default()
+    } else {
+        String::new()
+    };
+    if known.is_empty() && local.trim().is_empty() {
+        return Ok(0);
+    }
     let _push_guard = state.wal.lock(slug).await;
     let bare = state.wal.ensure_synced_locked(slug).await?;
     let out = git_out(
@@ -539,11 +571,21 @@ pub async fn delete_retired_refs(state: &AppState, slug: &str) -> anyhow::Result
         return Ok(0);
     }
     let count = updates.len();
-    let outcome = state
-        .wal
-        .publish_locked(slug, &updates)
-        .await
-        .map_err(|e| anyhow!("{e:#}"))?;
+    let outcome = match state.wal.publish_locked(slug, &updates).await {
+        Ok(outcome) => outcome,
+        Err(ryuz_git::WalError::RefConflict { .. }) => {
+            // Two runners can sweep the same install (a restart overlapping
+            // the old process). The loser's CAS fails; if the winner already
+            // removed everything there is nothing left to do.
+            if retired_refs_in_manifest(state, slug).await?.is_empty() {
+                return Ok(0);
+            }
+            return Err(anyhow!(
+                "the retired preview refs of {slug} changed during the sweep"
+            ));
+        }
+        Err(e) => return Err(anyhow!("{e:#}")),
+    };
     for moved in &outcome.moved {
         if let Some(bundle) = &moved.bundle {
             crate::host::git_http::prune_old_bundles(&state.config, slug, &moved.refname, bundle)
@@ -3831,6 +3873,55 @@ mod tests {
                 .iter()
                 .any(|tip| tip.git_ref == "refs/heads/next"),
             "the pushed branch's tip is recorded"
+        );
+        h.finish().await;
+    }
+
+    /// Two runners can sweep the same install (a restart overlapping the old
+    /// process). The loser of the CAS finds the ref already gone and reports
+    /// success, not an error that would keep the install's marker unset.
+    #[tokio::test]
+    async fn concurrent_sweeps_tolerate_an_already_gone_ref() {
+        let h = Harness::new("racesweep").await;
+        let app = h.app.clone();
+        let bare = h.mirror().await;
+        let work = Work::new(&h.dir.join("scratch")).await;
+        work.write("a.txt", "a\n");
+        let sha = work.commit("one").await;
+        let tips = seed_objects(&bare, &work).await;
+        for (branch, sha) in &tips {
+            publish_ref(&h.state, &app, branch, None, Some(sha.as_str()))
+                .await
+                .expect("publish");
+        }
+        h.state
+            .wal
+            .publish_locked(
+                &app.slug,
+                &[ryuz_git::RefUpdate::set(
+                    "refs/previews/user/wip",
+                    None::<String>,
+                    sha.as_str(),
+                )],
+            )
+            .await
+            .expect("preview ref");
+
+        let (a, b) = tokio::join!(
+            delete_retired_refs(&h.state, &app.slug),
+            delete_retired_refs(&h.state, &app.slug),
+        );
+        let counts = [a.expect("first sweep"), b.expect("second sweep")];
+        assert_eq!(
+            counts.iter().sum::<usize>(),
+            1,
+            "exactly one sweep deletes the ref: {counts:?}"
+        );
+        assert_eq!(
+            delete_retired_refs(&h.state, &app.slug)
+                .await
+                .expect("idempotent"),
+            0
         );
         h.finish().await;
     }

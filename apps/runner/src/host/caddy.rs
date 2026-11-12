@@ -176,6 +176,13 @@ fn matchers() -> Vec<String> {
         "@controish {".into(),
         "\texpression {http.vars.edge_route} == 'control'".into(),
         "}".into(),
+        // The control generation from before the pod was removed still serves
+        // these files until `ensure_deployed` swaps it; a 404 here keeps them
+        // from being fetchable under the control origin in that window.
+        "@retired_pod_assets {".into(),
+        "\tpath /noite-pod-host.html /noite-pod-host.js /__sw__.js /__worker__.js /__nodepod_bridge__*".into(),
+        "\texpression {http.vars.edge_route} == 'control'".into(),
+        "}".into(),
         "@tenant_framed {".into(),
         "\theader Sec-Fetch-Dest iframe".into(),
         "\texpression {http.vars.edge_route} == 'tenant'".into(),
@@ -230,6 +237,9 @@ fn route_block(cfg: &Config) -> Vec<String> {
         format!("\t\ttable {}", cfg.routes_path),
         "\t}".into(),
         "\thandle @deny {".into(),
+        "\t\trespond 404".into(),
+        "\t}".into(),
+        "\thandle @retired_pod_assets {".into(),
         "\t\trespond 404".into(),
         "\t}".into(),
     ];
@@ -546,6 +556,30 @@ mod tests {
     }
 
     #[test]
+    fn retired_pod_assets_are_a_permanent_control_404() {
+        let cfg = prod_config();
+        let out = static_caddyfile(&cfg);
+        // A stale control generation still serves these until it is swapped;
+        // the control origin must 404 them regardless.
+        assert!(out.contains("handle @retired_pod_assets {"), "{out}");
+        assert!(out.contains("/noite-pod-host.html"), "{out}");
+        assert!(out.contains("/__sw__.js"), "{out}");
+        assert!(out.contains("/__nodepod_bridge__*"), "{out}");
+        let at = out.find("@retired_pod_assets {").expect("deny matcher");
+        let block = &out[at..(at + 300).min(out.len())];
+        assert!(block.contains("/noite-pod-host.html"), "{block}");
+        assert!(block.contains("/__nodepod_bridge__*"), "{block}");
+        assert!(
+            block.contains("{http.vars.edge_route} == 'control'"),
+            "the 404 is scoped to the control host: {block}"
+        );
+        // It runs before the auth path and every proxy branch.
+        let deny = out.find("handle @retired_pod_assets").expect("deny");
+        let auth = out.find("handle @auth {").expect("auth");
+        assert!(deny < auth, "{out}");
+    }
+
+    #[test]
     fn fleet_proxy_retries_but_plain_proxy_does_not_hold() {
         let cfg = prod_config();
         let out = static_caddyfile(&cfg);
@@ -626,19 +660,25 @@ mod tests {
     }
 
     #[test]
-    fn the_static_config_serves_no_pod_assets() {
+    fn the_control_host_permanently_404s_the_retired_pod_assets() {
         let cfg = prod_config();
         let out = static_caddyfile(&cfg);
+        // The six retired pod files stay a permanent 404 on the control
+        // origin: the previous control generation serves them until
+        // `ensure_deployed` swaps it, and none of them is a real asset.
+        let at = out.find("@retired_pod_assets {").expect("deny matcher");
+        let block = &out[at..(at + 300).min(out.len())];
         for path in [
             "/noite-pod-host.html",
             "/noite-pod-host.js",
             "/__sw__.js",
             "/__worker__.js",
-            "/__nodepod_bridge__.html",
-            "/__nodepod_bridge__.js",
+            "/__nodepod_bridge__*",
         ] {
-            assert!(!out.contains(path), "{path} still denied/listed\n{out}");
+            assert!(block.contains(path), "{path} is denied\n{block}");
         }
+        assert!(out.contains("handle @retired_pod_assets {"), "{out}");
+        // The old pod proxy/allowlist plumbing is gone.
         assert!(!out.contains("@podblocked"), "{out}");
         assert!(!out.contains("@controlblocked"), "{out}");
         assert!(!out.contains("@hostframe"), "{out}");

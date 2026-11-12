@@ -179,10 +179,10 @@ const RETIRED_PREVIEWS_SWEPT: &str = "retired_previews_swept";
 /// removed), and delete the retired `refs/previews/*` refs an upgrade left in
 /// any app's mirror and durable manifest. `EnvironmentKind` no longer decodes
 /// `workspace`, so the rows must go before anything lists environments; a
-/// failure is returned rather than served, because the next environment read
-/// in this process would fail with them still there. Idempotent: teardown is
-/// (an empty prefix is a no-op), so a later boot retries whatever this one
-/// could not finish.
+/// failure is logged and left for the next boot (a boot loop would take the
+/// whole install down; the affected rows stay and the read of them reports
+/// the error until it is fixed). Idempotent: teardown is (an empty prefix is
+/// a no-op), so a later boot retries whatever this one could not finish.
 pub async fn retire_workspace_environments(state: &crate::AppState) -> anyhow::Result<usize> {
     let rows: Vec<RetiredWorkspace> = sqlx::query_as(
         r#"SELECT e.id, e.app_id, a.slug AS app_slug, e.label
@@ -201,8 +201,8 @@ pub async fn retire_workspace_environments(state: &crate::AppState) -> anyhow::R
     // branches and tags only, so a surviving preview ref in the manifest
     // would make every later push fail as a create of a ref the manifest
     // already has. The sweep is one-shot: nothing writes the namespace any
-    // more, and a failure aborts the boot before the marker is written, so
-    // the next start retries.
+    // more, and a failure is logged (never aborting the boot) and leaves the
+    // marker unset, so the next start retries.
     if db::get_setting(&state.pool, RETIRED_PREVIEWS_SWEPT)
         .await?
         .is_none()
@@ -210,13 +210,33 @@ pub async fn retire_workspace_environments(state: &crate::AppState) -> anyhow::R
         let apps = db::list_apps(&state.pool)
             .await
             .context("list apps for the retired preview ref sweep")?;
+        let mut all_swept = true;
         for app in &apps {
-            crate::host::forge::delete_retired_refs(state, &app.slug)
-                .await
-                .with_context(|| format!("delete the retired preview refs of {}", app.slug))?;
+            match crate::host::forge::delete_retired_refs(state, &app.slug).await {
+                Ok(0) => {}
+                Ok(refs) => {
+                    tracing::info!(slug = %app.slug, refs, "removed retired preview refs");
+                }
+                Err(e) => {
+                    // Never abort the boot for the sweep: one app with a
+                    // missing or corrupt manifest (or a second runner racing
+                    // the same install) must not brick the install. The
+                    // marker stays unset, so the next boot retries.
+                    tracing::warn!(
+                        slug = %app.slug,
+                        error = %format!("{e:#}"),
+                        "retired preview ref sweep failed; retrying on the next boot"
+                    );
+                    all_swept = false;
+                }
+            }
         }
-        db::set_setting(&state.pool, RETIRED_PREVIEWS_SWEPT, "1").await?;
-        tracing::info!(apps = apps.len(), "removed retired preview refs");
+        if all_swept {
+            db::set_setting(&state.pool, RETIRED_PREVIEWS_SWEPT, "1").await?;
+            tracing::info!(apps = apps.len(), "retired preview refs swept");
+        } else {
+            tracing::warn!("retired preview refs remain; the next boot retries the sweep");
+        }
     }
     let mut failed: Vec<String> = Vec::new();
     for row in rows {
@@ -251,10 +271,14 @@ pub async fn retire_workspace_environments(state: &crate::AppState) -> anyhow::R
         }
     }
     if !failed.is_empty() {
-        anyhow::bail!(
-            "could not tear down {} retired workspace preview(s): {}",
-            failed.len(),
-            failed.join(", ")
+        // Log-and-retry, not abort: a permanently failing teardown (an
+        // unreachable bucket, a bad row) would otherwise loop the boot
+        // forever. The rows stay `kind='workspace'`, so the next boot picks
+        // them up; the environment reads that cannot decode them report the
+        // error meanwhile.
+        tracing::warn!(
+            failed = %failed.join(", "),
+            "retired workspace previews remain; the next boot retries"
         );
     }
     Ok(total)
@@ -384,6 +408,82 @@ mod tests {
             .is_some());
         state.pool.clone().close().await;
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A sweep that cannot read one app's manifest (corrupt durable state, a
+    /// racing runner) logs and moves on: it must never abort the boot, and
+    /// the marker stays unset so the next boot retries everything.
+    #[tokio::test]
+    async fn a_corrupt_manifest_never_aborts_the_boot_sweep() {
+        let base = crate::testutil::TempDir::new("noite-env-corrupt");
+        let dir = base.path().to_path_buf();
+        let pool = db::connect("sqlite::memory:").await.expect("memory db");
+        let mut cfg = crate::config::config_for_tests();
+        cfg.work_dir = dir.join("work").to_string_lossy().into_owned();
+        cfg.routes_path = dir.join("routes.json").to_string_lossy().into_owned();
+        let corrupt_key = crate::host::git_store::build_wal(&cfg).manifest_key("orphan");
+        let (endpoint, seen) = crate::testutil::spawn_s3_stub_recording_corrupt(corrupt_key).await;
+        cfg.s3_endpoint = endpoint;
+        let state = crate::AppState {
+            pool: pool.clone(),
+            config: std::sync::Arc::new(cfg.clone()),
+            procs: supervisor::new_procs(),
+            logs: crate::host::logs::new_state(),
+            deploying: crate::host::deploy::new_deploying(),
+            log_notify: tokio::sync::watch::channel(0u64).0,
+            wal: crate::host::git_store::build_wal(&cfg),
+            tip_tx: crate::host::tips::channel().0,
+            ready: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            isolation: std::sync::Arc::new(tokio::sync::RwLock::new(
+                crate::host::isolation::IsolationStatus::default(),
+            )),
+            state_sync: crate::host::state::StateSync::new(),
+            dns: std::sync::Arc::new(crate::dns::FakeResolver::default()),
+            bucket_ok: std::sync::Arc::new(tokio::sync::RwLock::new((
+                true,
+                String::new(),
+                std::time::Instant::now(),
+            ))),
+            started_at: chrono::Utc::now(),
+            source_maps: Default::default(),
+            control_boot: Default::default(),
+        };
+        for (slug, listen) in [("orphan", 30300i64), ("healthy", 30310i64)] {
+            db::create_app(
+                &pool,
+                &state.config,
+                db::NewApp {
+                    name: slug,
+                    slug,
+                    user_id: "local",
+                    subdomain: "localhost",
+                    listen,
+                    internal: listen + 1,
+                },
+            )
+            .await
+            .expect("app");
+        }
+
+        assert_eq!(
+            retire_workspace_environments(&state)
+                .await
+                .expect("a corrupt manifest never aborts the boot"),
+            0
+        );
+        assert_eq!(
+            db::get_setting(&pool, RETIRED_PREVIEWS_SWEPT)
+                .await
+                .expect("setting"),
+            None,
+            "the marker stays unset so the next boot retries"
+        );
+        let lines = seen.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        assert!(
+            lines.iter().any(|line| line.contains("healthy")),
+            "the healthy app is still swept: {lines:?}"
+        );
+        pool.close().await;
     }
 
     /// The boot step for an install that upgraded past the workspace
