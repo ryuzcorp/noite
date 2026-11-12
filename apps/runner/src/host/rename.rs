@@ -593,14 +593,10 @@ async fn wipe_orphaned_target(
     // A row owns the slug again: its own create wiped the prefixes before it
     // inserted the row, so nothing of the old attempt is left to preserve.
     clear_rename_marker(cfg, &marker.to).await;
-    // The marker that kept this app's build uid reserved is gone, and no other
-    // unfinished rename holds it: its purge tombstones (which carry the uid)
-    // can go now — the target's moved `builds/`/`cache/` trees are wiped.
-    if !app_has_pending_rename(cfg, &marker.app_id).await {
-        if let Err(e) = db::clear_app_purges_for_app(pool, &marker.app_id).await {
-            tracing::warn!(app_id = %marker.app_id, error = %e, "wiped an orphaned rename target but could not clear the app's purge tombstones");
-        }
-    }
+    // The dead app's purge tombstone is NOT cleared here: it is the only
+    // durable retry for the *source* wipe, which this pass never checked.
+    // The purge resume clears it after its own (idempotent) source wipe,
+    // now that no marker holds the uid back (`clear_purges_if_no_rename`).
     Ok(())
 }
 

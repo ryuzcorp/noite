@@ -569,8 +569,8 @@ pub async fn rebind_local_subdomains(pool: &SqlitePool, base_domain: &str) -> sq
 /// connection's read snapshot is already stale. It is the only
 /// read-before-write transaction on a pool other tasks share (`connect`'s
 /// schema apply reads first too, but on a pool nothing else holds yet). A
-/// delete always runs next to the previous delete's background wipe
-/// (`clear_app_purges`), so that interleaving is routine rather than rare:
+/// delete always runs next to the previous delete's background wipe (its
+/// tombstone clear), so that interleaving is routine rather than rare:
 /// it flaked `api::tests::apps_delete_agrees` in CI. Taking the write lock
 /// up front makes a concurrent writer wait (through the connection's
 /// `busy_timeout`) instead of making this transaction fail, and the row is
@@ -657,9 +657,9 @@ pub async fn purge_app_ids(pool: &SqlitePool, slug: &str) -> sqlx::Result<Vec<St
         .await
 }
 
-/// Drop every tombstone of one deleted app, whatever slug it names. Used once
-/// its last unfinished rename is resolved: the tombstones carry the build uid
-/// that kept the app's moved trees reserved.
+/// Drop every tombstone of one deleted app, whatever slug it names. Only
+/// [`crate::host::purge::clear_purges_if_no_rename`] calls it, after the
+/// slug's wipe finished and no unfinished rename of the app holds its uid.
 pub async fn clear_app_purges_for_app(pool: &SqlitePool, app_id: &str) -> sqlx::Result<u64> {
     let done = sqlx::query("DELETE FROM main.app_purge WHERE app_id = ?")
         .bind(app_id)

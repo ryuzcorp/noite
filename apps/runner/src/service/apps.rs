@@ -1972,8 +1972,10 @@ mod tests {
 
     /// A pending rename keeps the deleted app's build uid reserved: its
     /// target may hold `builds/`/`cache/` trees that uid owns, so the source
-    /// wipe must not clear the tombstone that records it. The uid returns only
-    /// after the resume pass wiped the target and dropped the marker.
+    /// wipe must not clear the tombstone that records it. The rename resume
+    /// wipes the target and drops the marker but leaves the tombstone (the
+    /// only retry record for the source); the next purge resume re-wipes the
+    /// source and only then frees the uid.
     #[tokio::test]
     async fn a_deleted_apps_uid_stays_reserved_until_the_pending_target_is_wiped() {
         let (state, dir) = test_state(10).await;
@@ -2057,8 +2059,23 @@ mod tests {
             db::pending_purges(&state.pool)
                 .await
                 .expect("tombstones")
+                .contains(&"uid-old".to_string()),
+            "the rename resume never clears the source's tombstone"
+        );
+        crate::host::purge::resume_pending(
+            &state.pool,
+            &state.config,
+            &state.procs,
+            &state.logs,
+            state.wal.sync(),
+        )
+        .await;
+        assert!(
+            db::pending_purges(&state.pool)
+                .await
+                .expect("tombstones")
                 .is_empty(),
-            "the resume pass cleared the tombstone once the target was wiped"
+            "the purge resume clears the tombstone once no marker holds it"
         );
         let later = db::create_app(
             &state.pool,

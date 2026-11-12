@@ -92,12 +92,13 @@ pub async fn teardown(
     // before the next restart would inherit the dead fleet's watermark and
     // skip its first compactions.
     crate::host::metrics::forget_fleet(&fleet_key);
-    // The environment's key and its row go together, under the mint fence
-    // (SPEC, Scoped credentials): a key must not outlive its prefix, and a
-    // concurrent mint must see the row gone and refuse. The app's own key is
-    // untouched. The boot retirement has no later sweep for a row it deletes,
-    // so there a failed revoke keeps the row (and `kind`) for the next boot
-    // instead of dropping the only retry.
+    // The environment's key is marked `revoking` and its row deleted as one
+    // step under the mint fence (SPEC, Scoped credentials): a key must not
+    // outlive its prefix, and a concurrent mint must see the row gone and
+    // refuse. The store delete is the periodic sweep's (the `revoking` mark is
+    // its durable retry). The app's own key is untouched. Only a failed mark
+    // or row delete errors here; the boot retirement then keeps the row (and
+    // `kind`) for the next boot instead of dropping the only retry.
     if let Err(e) = crate::host::credentials::delete_environment(pool, cfg, env.id).await {
         if strict_credentials {
             return Err(e).with_context(|| {
