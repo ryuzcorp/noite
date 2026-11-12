@@ -104,7 +104,9 @@ const NAV_OFFSET = 64;
 
 /** The nearest ancestor that actually scrolls the sections: `DetailShell`
  * owns it (`overflow-auto`), but the page also renders in tests and short
- * viewports where the body is the scroller. `null` = the document. */
+ * viewports where the body is the scroller. `null` = the document. Resolved
+ * once, so it must not depend on the current content height: the sections
+ * grow from skeletons into the scrollable layout. */
 const scrollParentOf = (el: Element): HTMLElement | null => {
   for (let node = el.parentElement; node; node = node.parentElement) {
     if (node === document.body) {
@@ -113,10 +115,7 @@ const scrollParentOf = (el: Element): HTMLElement | null => {
 
     const { overflowY } = getComputedStyle(node);
 
-    if (
-      (overflowY === "auto" || overflowY === "scroll") &&
-      node.scrollHeight > node.clientHeight
-    ) {
+    if (overflowY === "auto" || overflowY === "scroll") {
       return node;
     }
   }
@@ -295,7 +294,9 @@ const SettingsSections = ({
           heading.getBoundingClientRect().top - top <= line;
 
         if (!landed) {
-          activeSection.set(anchor);
+          if (activeSection() !== anchor) {
+            activeSection.set(anchor);
+          }
 
           return;
         }
@@ -318,7 +319,11 @@ const SettingsSections = ({
             document.documentElement.scrollHeight - 2
           : root.scrollTop + root.clientHeight >= root.scrollHeight - 2;
 
-      activeSection.set((atEnd ? sections.at(-1) : next) ?? next);
+      const final = (atEnd ? sections.at(-1) : next) ?? next;
+
+      if (activeSection() !== final) {
+        activeSection.set(final);
+      }
     };
 
     const observer = new IntersectionObserver(
@@ -338,6 +343,15 @@ const SettingsSections = ({
     for (const { heading } of headings) {
       observer.observe(heading);
     }
+
+    // Scrolling is the steady-state trigger; the observer only catches a
+    // heading entering or leaving the band (a pick or deep-link leap, which
+    // the scroll events also see). The signal tears the listener down with
+    // the component.
+    (root ?? window).addEventListener("scroll", sync, {
+      passive: true,
+      signal,
+    });
 
     // A deep link is still scrolling sections into place; `sync` keeps the
     // linked section marked until its heading lands, so this first measure
