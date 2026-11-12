@@ -7,6 +7,7 @@ import { authorityOf, mayAdministerInstance } from "../authority";
 import type { InstanceAuthority } from "../authority";
 import { isInstanceAdmin, requireAppRole } from "../collaborators";
 import { ensureDb, resolveEnv } from "../db";
+import { errorLogText } from "../errors";
 import { fail } from "./api";
 import { controlAccessRefusal } from "./control-d1.server";
 
@@ -83,10 +84,7 @@ export const readSession = async (
     } catch (error) {
       // The cause stays in the log: the client gets the fixed 503 message
       // below, never a D1/better-auth internal string.
-      console.error(
-        "[session] store read failed",
-        error instanceof Error ? (error.stack ?? error.message) : String(error)
-      );
+      console.error("[session] store read failed", errorLogText(error));
 
       throw new SessionStoreUnavailableError({
         message: "The session store did not answer — retry in a moment.",

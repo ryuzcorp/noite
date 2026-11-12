@@ -6,7 +6,11 @@
  * and `Effect.try(() => …)`) reject with an `UnknownError` whose own message
  * is the library default "An error occurred in Effect.tryPromise" and whose
  * `cause` is the real failure; unwrapping it here keeps that default out of
- * every UI, for every call site at once. Non-Error throw values (a string, a
+ * every UI, for every call site at once. Drizzle's `DrizzleQueryError` is the
+ * other wrapper: its message is the whole SQL text plus every bound
+ * parameter (an auth-table write binds credentials) and its cause names
+ * schema objects, so the user sees the fixed "Database query failed" and the
+ * cause goes only to `errorLogText`. Non-Error throw values (a string, a
  * rejected resource fetch) still render as text rather than "[object Object]".
  */
 import { Cause } from "effect";
@@ -17,12 +21,48 @@ import { ApiError } from "./api";
  * walk a cyclic cause chain forever. */
 const MAX_CAUSE_DEPTH = 4;
 
+/** Drizzle's query error, recognized by its own shape: the class is exported
+ * only from `drizzle-orm/errors`, which this app does not depend on. */
+interface QueryError {
+  params: unknown[];
+  query: string;
+}
+
+// oxlint-disable-next-line anti-slop/no-unknown-parameters -- catch-site and wrapper values are unknown by construction; this is the one place that narrows them.
+const asQueryError = (error: unknown): (Error & QueryError) | null => {
+  if (!(error instanceof Error)) {
+    return null;
+  }
+
+  const candidate: Error & Partial<QueryError> = error;
+
+  // oxlint-disable-next-line anti-slop/no-runtime-typeof -- the wrapper is recognized by the fields the driver sets on it; no module this app depends on exports its class.
+  if (typeof candidate.query !== "string" || !Array.isArray(candidate.params)) {
+    return null;
+  }
+
+  // SAFETY: both fields were just checked, so the wrapper's shape is exact.
+  return candidate as Error & QueryError;
+};
+
+/** A wrapper whose cheap-to-ignore text hides the failure it carries. */
+const isWrapper = (error: Error): boolean =>
+  Cause.isUnknownError(error) || asQueryError(error) !== null;
+
 /** The text of the underlying failure, with the wrapper peeled off. Wrappers
- * are recognized by effect's own predicate, never by the English message. */
+ * are recognized by effect's own predicate or drizzle's shape, never by the
+ * English message. */
 // oxlint-disable-next-line anti-slop/no-unknown-parameters -- catch-site values are unknown by construction; this is the one place that narrows them.
 const detail = (error: unknown, depth: number): string => {
   if (!(error instanceof Error)) {
     return String(error);
+  }
+
+  if (asQueryError(error) !== null) {
+    // The wrapper's own text is the whole SQL statement plus every bound
+    // parameter, and its cause names schema objects: neither is the user's to
+    // read. The cause reaches the server log through `errorLogText`.
+    return "Database query failed";
   }
 
   if (
@@ -45,6 +85,64 @@ const detail = (error: unknown, depth: number): string => {
 
 // oxlint-disable-next-line anti-slop/no-unknown-parameters -- catch-site and resource().error values are unknown by construction; this narrows them to text.
 export const errorMessage = (error: unknown): string => detail(error, 0);
+
+/** Whether the failure chain wraps a database query: the SQL text and bound
+ * parameters live there, so a caller that answers the user has to substitute
+ * its own message instead of echoing the driver's. */
+// oxlint-disable-next-line anti-slop/no-unknown-parameters -- catch-site boundary, same as errorMessage.
+export const isQueryFailure = (error: unknown): boolean => {
+  let current = error;
+
+  for (let depth = 0; depth < MAX_CAUSE_DEPTH; depth += 1) {
+    if (!(current instanceof Error)) {
+      return false;
+    }
+
+    if (asQueryError(current) !== null) {
+      return true;
+    }
+
+    if (!(Cause.isUnknownError(current) && current.cause !== undefined)) {
+      return false;
+    }
+
+    current = current.cause;
+  }
+
+  return false;
+};
+
+/** The server log's text: every link of the cause chain, so a wrapped driver
+ * failure is never hidden behind the wrapper's stack alone. A query wrapper's
+ * own stack and message are the SQL statement and its bound parameters (an
+ * auth-table write binds credentials), so only its cause chain is printed. */
+// oxlint-disable-next-line anti-slop/no-unknown-parameters -- api.ts's catch boundary; see errorMessage.
+export const errorLogText = (error: unknown): string => {
+  const parts: string[] = [];
+  let current = error;
+
+  for (let depth = 0; depth <= MAX_CAUSE_DEPTH; depth += 1) {
+    if (!(current instanceof Error)) {
+      parts.push(String(current));
+
+      break;
+    }
+
+    parts.push(
+      asQueryError(current) === null
+        ? (current.stack ?? `${current.name}: ${current.message}`)
+        : `${current.name}: query failed`
+    );
+
+    if (!(isWrapper(current) && current.cause !== undefined)) {
+      break;
+    }
+
+    current = current.cause;
+  }
+
+  return parts.join("\nCaused by: ");
+};
 
 /** What the user sees for a failed operation: what it was trying to do, then
  * the server's own message (or the transport failure). One shape for every

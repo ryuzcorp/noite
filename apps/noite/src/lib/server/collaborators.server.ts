@@ -85,8 +85,12 @@ export const inviteCollaborator = apiAction(
       if (member) {
         const write = await grantCollaborator(appId, member.userId, nextRole);
 
-        if (write === "last-admin") {
-          return fail("Cannot demote the last admin");
+        if (write !== "applied") {
+          return fail(
+            write === "last-admin"
+              ? "Cannot demote the last admin"
+              : "That collaborator was removed meanwhile; reload and try again"
+          );
         }
 
         return { ok: true as const, status: "updated" as const };
@@ -156,7 +160,9 @@ export const acceptInvitation = apiAction(
 
     if (accepted._tag === "Refused") {
       return fail(
-        "This app would be left without an admin — ask another admin to change the invitation first."
+        accepted.reason === "last-admin"
+          ? "This app would be left without an admin — ask another admin to change the invitation first."
+          : "This app's access changed while you accepted — ask for a new invitation."
       );
     }
 
@@ -218,8 +224,12 @@ export const updateCollaboratorRole = apiAction(
 
     const write = await writeGrant(appId, userId, nextRole);
 
-    if (write === "last-admin") {
-      return fail("Cannot demote the last admin");
+    if (write !== "applied") {
+      return fail(
+        write === "last-admin"
+          ? "Cannot demote the last admin"
+          : "That collaborator was removed meanwhile; reload and try again"
+      );
     }
 
     return { ok: true as const };

@@ -15,6 +15,7 @@ import { Authority, authorityOf, authorityWire } from "../authority";
 import type { InstanceAuthority } from "../authority";
 import { dropAppCollaborators } from "../collaborators";
 import { getDb, withDb } from "../db";
+import { errorLogText } from "../errors";
 import {
   runnerControlFleet,
   runnerDeleteApp,
@@ -156,10 +157,7 @@ const requireAdmin = async (
 
     return { authority, email, id: user.id };
   } catch (error) {
-    console.error(
-      "[requireAdmin]",
-      error instanceof Error ? (error.stack ?? error.message) : String(error)
-    );
+    console.error("[requireAdmin]", errorLogText(error));
 
     return null;
   }

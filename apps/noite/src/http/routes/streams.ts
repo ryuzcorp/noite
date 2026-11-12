@@ -6,6 +6,7 @@ import {
 } from "../../lib/collaborators";
 import { CONTROL_APP_ID } from "../../lib/control-app";
 import { ensureDb } from "../../lib/db";
+import { errorLogText } from "../../lib/errors";
 import {
   METRICS_WINDOWS_HOURS,
   pollMetricsFrame,
@@ -162,7 +163,7 @@ export const handleAppsStream: RouteHandler = async (request, env) => {
           // Transient failure: log it and keep the stream alive; the next
           // poll heals. `eventStream`'s keep-alive comments hold celld's
           // ~60 s idle-stream expiry between polls.
-          console.error("apps stream poll failed", error);
+          console.error("apps stream poll failed", errorLogText(error));
         }
 
         if (json !== null && json !== last) {

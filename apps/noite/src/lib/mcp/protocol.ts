@@ -16,6 +16,7 @@ import { Data } from "effect";
 import type { JsonSchema } from "effect/JsonSchema";
 import * as Schema from "effect/Schema";
 
+import { errorMessage } from "../errors";
 import type { KeyPrincipal } from "../key-principal";
 
 /** Protocol revisions this server implements. Only the revision that defines
@@ -269,9 +270,13 @@ const callTool = async (
 
     // Strip the runner envelope ("runner rpc git.log: 404 …") so a tool error
     // reads as a sentence, like the push-to-create path does.
-    const message = (
-      error instanceof Error ? error.message : String(error)
-    ).replace(/^runner (?:rpc \S+: \d+|GET \S+: \d+) /u, "");
+    // `errorMessage` peels Effect's wrapper and replaces a database query
+    // failure with the fixed text: a tool error is a client string, never the
+    // SQL statement or its bound parameters.
+    const message = errorMessage(error).replace(
+      /^runner (?:rpc \S+: \d+|GET \S+: \d+) /u,
+      ""
+    );
 
     // A refusal keeps `isError: true` (the spec's tool-execution error) and
     // carries its code in `structuredContent`, which the spec leaves to the

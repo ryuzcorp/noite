@@ -29,6 +29,7 @@ import { authenticateKey, bearerKey } from "../../lib/server/key-auth.server";
 import { MAX_BODY_BYTES, readBoundedText, tooLarge } from "../body";
 import type { RouteHandler } from "../config";
 import { originAllowed } from "../origin";
+import { routeFailure } from "../route-failure";
 
 const unauthorized = (message = "missing or invalid API key"): Response =>
   Response.json(
@@ -86,9 +87,15 @@ export const handleMcp: RouteHandler = async (request, env) => {
   // without the scope stays indistinguishable from an unknown one. An expired
   // key is the one exception: its holder already knows it, and the reason is
   // what tells them to mint a new one.
-  const auth = await authenticateKey(request, env, bearerKey(request), {
-    apps: ["manage"],
-  });
+  let auth: Awaited<ReturnType<typeof authenticateKey>>;
+
+  try {
+    auth = await authenticateKey(request, env, bearerKey(request), {
+      apps: ["manage"],
+    });
+  } catch (error) {
+    return routeFailure("[mcp]", error);
+  }
 
   if (auth._tag === "Misconfigured") {
     return new Response(auth.message, { status: 500 });

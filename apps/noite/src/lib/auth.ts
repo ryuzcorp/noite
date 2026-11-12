@@ -16,7 +16,7 @@ import * as Schema from "effect/Schema";
 
 import type { InstanceAuthority } from "./authority";
 import { getAuthDb, resolveEnv } from "./db";
-import { errorMessage } from "./errors";
+import { errorLogText, errorMessage } from "./errors";
 import { isLocalhostDomain } from "./local-host";
 import { fail } from "./server/api";
 import { revokeApiKeysForUser } from "./server/api-keys.server";
@@ -254,6 +254,36 @@ export const createAuth = (env: KitEnv, baseURL: string) =>
     },
     baseURL,
     database: getAuthDb(),
+    // A non-API failure is rethrown instead of answered by the router, whose
+    // own `console.error("# SERVER_ERROR:", error)` prints it raw. `handleAuth`
+    // catches it, logs the cause chain and answers a generic 500; real API
+    // errors still become their own responses.
+    onAPIError: { throw: true },
+    // better-auth's internal catches (the session lookup, key verification,
+    // passkeys) log the failure themselves, before any of our boundaries. A
+    // database failure there is drizzle's statement plus every bound value — a
+    // session token among them — so every `Error` argument goes through the
+    // cause-chain formatter. Levels are unchanged (the default threshold keeps
+    // info/debug out).
+    logger: {
+      // oxlint-disable-next-line anti-slop/no-unknown-parameters -- better-auth hands the raw logged values; the formatter narrows them.
+      log: (level, message, ...args) => {
+        const text = [
+          `[auth] ${level}: ${message}`,
+          ...args.map((arg) =>
+            arg instanceof Error ? errorLogText(arg) : String(arg)
+          ),
+        ];
+
+        if (level === "error") {
+          console.error(...text);
+        } else if (level === "warn") {
+          console.warn(...text);
+        } else {
+          console.log(...text);
+        }
+      },
+    },
     // A ban revokes the account's machine credentials in the same flow as
     // the session deletion: the admin plugin's `banUser` (and a direct
     // `POST /api/auth/admin/ban-user`) both write `banned: true` through
@@ -274,7 +304,10 @@ export const createAuth = (env: KitEnv, baseURL: string) =>
             try {
               await revokeApiKeysForUser(user.id);
             } catch (error) {
-              console.error("[auth] ban key revocation failed", error);
+              console.error(
+                "[auth] ban key revocation failed",
+                errorLogText(error)
+              );
             }
           },
         },
@@ -329,7 +362,7 @@ export const createAuth = (env: KitEnv, baseURL: string) =>
         try {
           await revokeApiKeysForUser(userId);
         } catch (error) {
-          console.error("[auth] unban key sweep failed", error);
+          console.error("[auth] unban key sweep failed", errorLogText(error));
         }
       }),
       before: createAuthMiddleware(async (ctx) => {

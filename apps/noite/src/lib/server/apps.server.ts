@@ -12,6 +12,8 @@ import {
   listCollaboratorRows,
   requireAppRole,
 } from "../collaborators";
+import type { GrantWrite } from "../collaborators";
+import { isQueryFailure } from "../errors";
 import {
   CREATE_TIMEOUT_MS,
   isSlugTaken,
@@ -266,6 +268,11 @@ const adoptSlowCreate = async (
  * Beyond the create's own recovery window such a row is not a retry of ours. */
 const LOST_GRANT_MS = 15 * 60 * 1000;
 
+/** The user-facing text when the create's admin grant did not stick. A
+ * database failure's own message wraps the SQL text and every bound
+ * parameter, so it never reaches the browser. */
+const GRANT_FAILED = "Could not record your access to the app";
+
 /** The row a failed create may adopt, and whether it still needs its grant.
  * `user_id` is the creator field, not access: a creator can be removed, so
  * adopting on that field alone would hand a removed or demoted collaborator
@@ -389,12 +396,9 @@ export const createAppForUser = async (input: {
     return app;
   }
 
-  try {
-    await grantCollaborator(app.id, input.account.id, "admin");
-  } catch (grantError) {
-    // Rollback is best-effort, but a failed rollback is its own state: an app
-    // exists with no collaborator grant, so say so instead of swallowing it.
-
+  // Rollback is best-effort, but a failed rollback is its own state: an app
+  // exists with no collaborator grant, so say so instead of swallowing it.
+  const rollback = async (): Promise<void> => {
     let rolledBack = true;
 
     try {
@@ -410,8 +414,45 @@ export const createAppForUser = async (input: {
         "has no collaborator grant"
       );
     }
+  };
 
-    failUnknown(grantError);
+  let write: GrantWrite;
+
+  try {
+    write = await grantCollaborator(app.id, input.account.id, "admin");
+  } catch (grantError) {
+    // The sidebar's grant-less-creator heal runs every 2 s and can write this
+    // very grant while the create's write is in flight, as can a second
+    // create of the same app. A write that failed but left the caller admin
+    // is a success: deleting the app here would cancel a template import the
+    // caller already holds.
+    const rows = await listCollaboratorRows(app.id).catch(() => []);
+
+    if (
+      rows.some(
+        (row) => row.userId === input.account.id && row.role === "admin"
+      )
+    ) {
+      return app;
+    }
+
+    await rollback();
+
+    // A database failure wraps the SQL text and every bound parameter in its
+    // message: name the operation instead of echoing the query.
+    if (isQueryFailure(grantError)) {
+      fail(GRANT_FAILED);
+    }
+
+    return failUnknown(grantError);
+  }
+
+  // A write that did not stick (`missing`: the row went away under it) leaves
+  // the app unopenable, exactly like a failed one. Outside the `try`, so this
+  // refusal rolls back once and is not re-handled as a write error.
+  if (write !== "applied") {
+    await rollback();
+    fail(GRANT_FAILED);
   }
 
   return app;

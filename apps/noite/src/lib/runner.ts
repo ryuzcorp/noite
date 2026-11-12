@@ -1,6 +1,7 @@
 /* oxlint-disable eslint/max-classes-per-file -- the two runner error classes are the transport contract: a caught runner error is one of them. */
 import { SOURCE_FORWARD_TIMEOUT_MS } from "./commit-source";
 import { controlEnv, hydrateControlEnv } from "./control-env";
+import { errorMessage } from "./errors";
 // Wire types, generated from the Rust structs in apps/runner into
 // ./runner-types (never edit those files by hand). Regenerate with `cargo
 // test` in apps/runner; CI fails on drift. The `Runner*` names are the UI's
@@ -285,7 +286,7 @@ export const runnerFailureOf = (error: unknown): RunnerFailure => {
     return { kind: "http", path: error.path, status: error.status };
   }
 
-  const message = error instanceof Error ? error.message : String(error);
+  const message = errorMessage(error);
 
   return error instanceof Error &&
     (error.name === "TimeoutError" || error.name === "AbortError")
