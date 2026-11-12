@@ -1258,6 +1258,267 @@ async fn source_bundle_agrees() {
     h.finish().await;
 }
 
+/// Every surface that accepts a caller-supplied ref refuses the runner's
+/// hidden namespace (`refs/previews/…`, another user's workspace snapshot)
+/// with a 4xx instead of resolving it, while branches and shas keep working.
+#[tokio::test]
+async fn caller_refs_refuse_hidden_preview_refs() {
+    let h = Harness::new().await;
+    let app = h.seed_app("ref-guard").await;
+
+    // A push mirror with one commit on `main`, plus a hidden preview ref on
+    // the same commit (what another user's workspace preview writes).
+    let bare = crate::host::git_http::http_bare(&h.state.config, &app.slug);
+    let work = h.dir.join("ref-guard-work");
+    std::fs::create_dir_all(work.join("src")).expect("worktree");
+    std::fs::write(work.join("src/index.ts"), "export const a = 1;\n").expect("source");
+    git(&work, &["init", "-q", "--initial-branch=main", "."]).await;
+    git(&work, &["add", "-A"]).await;
+    git(&work, &["commit", "-qm", "init"]).await;
+    let sha = git(&work, &["rev-parse", "HEAD"]).await.trim().to_string();
+    std::fs::create_dir_all(bare.parent().expect("mirror parent")).expect("mirror parent");
+    git(
+        &h.dir,
+        &[
+            "init",
+            "-q",
+            "--bare",
+            "--initial-branch=main",
+            bare.to_str().expect("mirror path"),
+        ],
+    )
+    .await;
+    git(
+        &work,
+        &[
+            "push",
+            "-q",
+            bare.to_str().expect("mirror path"),
+            "HEAD:refs/heads/main",
+            "HEAD:refs/heads/feature",
+        ],
+    )
+    .await;
+    // A commit only the hidden workspace-preview ref carries: the sha a
+    // deploy or environment row would disclose to a view-only caller.
+    git(&work, &["commit", "-q", "--allow-empty", "-m", "wip"]).await;
+    let preview_only = git(&work, &["rev-parse", "HEAD"]).await.trim().to_string();
+    git(
+        &work,
+        &[
+            "push",
+            "-q",
+            bare.to_str().expect("mirror path"),
+            "HEAD:refs/previews/user_1/feature",
+        ],
+    )
+    .await;
+    // A bundle fetch leaves this behind in a rehydrated mirror.
+    std::fs::write(
+        bare.join("FETCH_HEAD"),
+        format!("{preview_only}\t\tbranch 'feature' of /tmp/x\n"),
+    )
+    .expect("fetch head");
+
+    let preview = "refs/previews/user_1/feature";
+    // git's DWIM expands the bare spelling to the same hidden ref.
+    let bare_preview = "previews/user_1/feature";
+    let short = &sha[..7];
+
+    // Reads: repo_tree / repo_blob / git_log / git_commit / git_compare.
+    for (name, path, fragment) in [
+        (
+            "tree",
+            format!("/v1/apps/{}/tree?ref={preview}", app.id),
+            "invalid ref",
+        ),
+        (
+            "blob",
+            format!("/v1/apps/{}/blob/src/index.ts?ref={preview}", app.id),
+            "invalid ref",
+        ),
+        (
+            "log",
+            format!("/v1/apps/{}/git/log?ref={preview}", app.id),
+            "invalid ref",
+        ),
+        (
+            "tree-bare",
+            format!("/v1/apps/{}/tree?ref={bare_preview}", app.id),
+            "invalid ref",
+        ),
+        (
+            "tree-sha",
+            format!("/v1/apps/{}/tree?ref={preview_only}", app.id),
+            "not found",
+        ),
+        (
+            "fetch-head",
+            format!("/v1/apps/{}/tree?ref=FETCH_HEAD", app.id),
+            "not found",
+        ),
+        (
+            "compare",
+            format!("/v1/apps/{}/git/compare?base=main&head={preview}", app.id),
+            "invalid ref",
+        ),
+    ] {
+        let (status, body) = h.rest("GET", &path, None).await;
+        assert!(
+            status.is_client_error(),
+            "{name} resolved a hidden ref: {status} {body}"
+        );
+        assert!(body.to_string().contains(fragment), "{name} -> {body}");
+    }
+    // `git rev-parse` would reach the hidden tip through the pseudo-ref, so
+    // the pinned sha proves the fixture is real.
+    let raw = crate::host::exec::run_cmd(
+        "git",
+        &[
+            &format!("--git-dir={}", bare.display()),
+            "rev-parse",
+            "--verify",
+            "FETCH_HEAD",
+        ],
+        None,
+        &[],
+        std::time::Duration::from_secs(10),
+    )
+    .await
+    .expect("raw fetch head");
+    assert_eq!(raw.trim(), preview_only);
+    let (status, body) = h
+        .rest(
+            "GET",
+            &format!("/v1/apps/{}/git/commits/{preview}", app.id),
+            None,
+        )
+        .await;
+    assert!(status.is_client_error(), "git_commit: {status} {body}");
+    // The same reads still resolve a branch and a sha.
+    for query in ["?ref=main", &format!("?ref={short}")] {
+        let (status, _) = h
+            .rest("GET", &format!("/v1/apps/{}/tree{query}", app.id), None)
+            .await;
+        assert_eq!(status, StatusCode::OK, "tree{query}");
+        let (status, _) = h
+            .rest(
+                "GET",
+                &format!("/v1/apps/{}/blob/src/index.ts{query}", app.id),
+                None,
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "blob{query}");
+        let (status, _) = h
+            .rest("GET", &format!("/v1/apps/{}/git/log{query}", app.id), None)
+            .await;
+        assert_eq!(status, StatusCode::OK, "log{query}");
+    }
+
+    // Environment create: the existence check must not leak a preview ref.
+    let (status, body) = h
+        .rest(
+            "POST",
+            &format!("/v1/apps/{}/environments", app.id),
+            Some(json!({ "branch": preview, "role": "push" })),
+        )
+        .await;
+    assert!(
+        status.is_client_error(),
+        "environment create: {status} {body}"
+    );
+    assert!(body.to_string().contains("invalid ref"), "{body}");
+    let (status, body) = h
+        .rest(
+            "POST",
+            &format!("/v1/apps/{}/environments", app.id),
+            Some(json!({ "branch": "feature", "role": "push" })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "a real branch: {body}");
+
+    // Branch create: `from` may be a branch or sha, never the hidden ref.
+    let (status, body) = h
+        .rest(
+            "POST",
+            &format!("/v1/apps/{}/git/branches", app.id),
+            Some(json!({ "name": "leak", "from": preview })),
+        )
+        .await;
+    assert!(status.is_client_error(), "branch create: {status} {body}");
+    assert!(body.to_string().contains("invalid ref"), "{body}");
+    let refs = crate::host::git_http::list_refs(&bare).await.expect("refs");
+    assert!(!refs.contains_key("refs/heads/leak"), "nothing published");
+    // A branch and a sha still start a branch (no publish happens on refusal;
+    // the accepted forms are covered by the forge tests, whose S3 stub can
+    // store the manifest the publish writes).
+
+    // PR head/base: only a branch name, never a raw ref (or the bare spelling
+    // git DWIMs into the hidden namespace).
+    let actor = json!({ "userId": "user_1", "name": "Ada" });
+    for head in [preview, bare_preview] {
+        let (status, body) = h
+            .rest(
+                "POST",
+                &format!("/v1/apps/{}/pull_requests", app.id),
+                Some(json!({ "actor": actor, "title": "t", "base": "main", "head": head })),
+            )
+            .await;
+        assert!(status.is_client_error(), "pr create: {status} {body}");
+        assert!(body.to_string().contains("invalid branch name"), "{body}");
+    }
+    // A plain branch still gets past the name check (it has nothing to review).
+    let (status, body) = h
+        .rest(
+            "POST",
+            &format!("/v1/apps/{}/pull_requests", app.id),
+            Some(json!({ "actor": actor, "title": "t", "base": "main", "head": "feature" })),
+        )
+        .await;
+    assert!(status.is_client_error(), "pr create: {status} {body}");
+    assert!(body.to_string().contains("no commits"), "{body}");
+
+    // Web commit: `fromSha` and `expectedTip` are caller refs too.
+    let files = json!([{ "path": "src/new.ts", "content": "export {};\n" }]);
+    let (status, body) = h
+        .rest(
+            "POST",
+            &format!("/v1/apps/{}/source/commit", app.id),
+            Some(json!({
+                "actor": actor,
+                "branch": "leak-commit",
+                "files": files,
+                "fromSha": preview,
+                "message": "leak",
+            })),
+        )
+        .await;
+    assert!(status.is_client_error(), "web commit: {status} {body}");
+    assert!(body.to_string().contains("invalid ref"), "{body}");
+    let (status, body) = h
+        .rest(
+            "POST",
+            &format!("/v1/apps/{}/source/commit", app.id),
+            Some(json!({
+                "actor": actor,
+                "branch": "tip-commit",
+                "files": files,
+                "expectedTip": preview,
+                "message": "leak",
+            })),
+        )
+        .await;
+    assert!(status.is_client_error(), "web commit tip: {status} {body}");
+    assert!(body.to_string().contains("invalid ref"), "{body}");
+    let refs = crate::host::git_http::list_refs(&bare).await.expect("refs");
+    assert!(!refs.contains_key("refs/heads/leak-commit"));
+    assert!(!refs.contains_key("refs/heads/tip-commit"));
+    // The accepted branch/sha forms are covered by the forge web-commit test,
+    // whose S3 stub can store the manifest a publish writes.
+
+    h.finish().await;
+}
+
 /// A git command in `dir`, panicking with git's output on failure.
 async fn git(dir: &std::path::Path, args: &[&str]) -> String {
     crate::host::exec::run_cmd(

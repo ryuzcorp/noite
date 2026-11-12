@@ -421,6 +421,9 @@ struct PrCreateParams {
     body: String,
     base: String,
     head: String,
+    /// How a machine signs the row; absent for a person.
+    #[serde(rename = "authorLabel", default)]
+    author_label: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -452,6 +455,9 @@ struct PrCommentParams {
     side: Option<String>,
     #[serde(rename = "commitSha", default)]
     commit_sha: Option<String>,
+    /// How a machine signs the row; absent for a person.
+    #[serde(rename = "authorLabel", default)]
+    author_label: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -473,6 +479,9 @@ struct PrReviewParams {
     actor: Actor,
     role: String,
     state: String,
+    /// How a machine signs the row; absent for a person.
+    #[serde(rename = "authorLabel", default)]
+    author_label: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -1185,8 +1194,17 @@ async fn dispatch_call(
             };
             complete(
                 id,
-                service::prs::create(state, &p.id, &p.actor, &p.title, &p.body, &p.base, &p.head)
-                    .await,
+                service::prs::create(
+                    state,
+                    &p.id,
+                    &p.actor,
+                    &p.title,
+                    &p.body,
+                    &p.base,
+                    &p.head,
+                    p.author_label.as_deref(),
+                )
+                .await,
             )
         }
         "prs.update" => {
@@ -1227,6 +1245,7 @@ async fn dispatch_call(
                     p.line,
                     p.side.as_deref(),
                     p.commit_sha.as_deref(),
+                    p.author_label.as_deref(),
                 )
                 .await,
             )
@@ -1274,7 +1293,16 @@ async fn dispatch_call(
             };
             complete(
                 id,
-                service::prs::review(state, &p.id, p.number, &p.actor, &p.role, &p.state).await,
+                service::prs::review(
+                    state,
+                    &p.id,
+                    p.number,
+                    &p.actor,
+                    &p.role,
+                    &p.state,
+                    p.author_label.as_deref(),
+                )
+                .await,
             )
         }
         "prs.merge" => {

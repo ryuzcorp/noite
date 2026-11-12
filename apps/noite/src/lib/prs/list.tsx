@@ -123,7 +123,7 @@ export const PrsList = ({
                 <div class="text-base-content/70 flex flex-wrap items-center gap-x-1.5 text-xs">
                   <span class="font-mono">#{pull.number}</span>
                   <span aria-hidden="true">·</span>
-                  <span>{nameFor(names, pull.authorId)}</span>
+                  <span>{nameFor(names, pull.authorId, pull.authorLabel)}</span>
                   <span aria-hidden="true">·</span>
                   <span class="font-mono">
                     <Link

@@ -33,6 +33,8 @@ pub struct PrSummary {
     pub title: String,
     pub body: String,
     pub author_id: String,
+    /// How a machine signed it ('<user> via key <name>'); `None` for a person.
+    pub author_label: Option<String>,
     pub base: String,
     pub head: String,
     pub state: PrState,
@@ -55,6 +57,7 @@ pub struct PrSummary {
 pub struct PrComment {
     pub id: String,
     pub author_id: String,
+    pub author_label: Option<String>,
     pub body: String,
     pub path: Option<String>,
     pub line: Option<i64>,
@@ -71,6 +74,7 @@ pub struct PrComment {
 pub struct PrReview {
     pub id: String,
     pub reviewer_id: String,
+    pub author_label: Option<String>,
     pub state: ReviewState,
     pub commit_sha: String,
     pub created_at: String,
@@ -177,6 +181,7 @@ fn summary(row: &PullRequestRow, comment_count: i64) -> PrSummary {
         title: row.title.clone(),
         body: row.body.clone(),
         author_id: row.author_id.clone(),
+        author_label: row.author_label.clone(),
         base: row.base.clone(),
         head: row.head.clone(),
         state: row.state,
@@ -195,6 +200,7 @@ fn review_view(row: &PrReviewRow) -> PrReview {
     PrReview {
         id: row.id.clone(),
         reviewer_id: row.reviewer_id.clone(),
+        author_label: row.author_label.clone(),
         state: row.state,
         commit_sha: row.commit_sha.clone(),
         created_at: row.created_at.clone(),
@@ -357,6 +363,7 @@ async fn detail(
         .map(|comment| PrComment {
             id: comment.id.clone(),
             author_id: comment.author_id.clone(),
+            author_label: comment.author_label.clone(),
             body: comment.body.clone(),
             path: comment.path.clone(),
             line: comment.line,
@@ -438,6 +445,7 @@ pub async fn get(state: &AppState, id: &str, number: i64) -> Result<PrDetail, Ap
 
 /// Open a PR. Both branches must exist, they must differ, and only one open
 /// PR may exist for the pair.
+#[allow(clippy::too_many_arguments)] // one argument per field the caller supplies
 pub async fn create(
     state: &AppState,
     id: &str,
@@ -446,22 +454,34 @@ pub async fn create(
     body: &str,
     base: &str,
     head: &str,
+    author_label: Option<&str>,
 ) -> Result<PrDetail, ApiError> {
     let title = title.trim();
     if title.is_empty() {
         return Err(ApiError::bad("title is required"));
     }
-    if !forge::valid_branch_name(base) || !forge::valid_branch_name(head) {
+    // A pull request names two branches. A raw ref is refused outright: a
+    // hidden `refs/previews/<user>/<branch>` workspace snapshot must never
+    // become a PR head (its owner never committed it), and a tag or sha is
+    // not a branch here.
+    if !forge::valid_user_branch_name(base)
+        || !forge::valid_user_branch_name(head)
+        || forge::is_reserved_ref(base)
+        || forge::is_reserved_ref(head)
+    {
         return Err(ApiError::bad("invalid branch name"));
     }
     if base == head {
         return Err(ApiError::bad("head and base must be different branches"));
     }
     let (app, bare) = app_repo(state, id).await?;
-    let head_sha = forge::resolve_ref(&bare, head)
+    // `resolve_user_ref` refuses the runner's own namespaces, including the
+    // bare `previews/…` spelling git rewrites to `refs/previews/…`: a hidden
+    // workspace snapshot can never become a PR head.
+    let head_sha = forge::resolve_user_ref(&bare, head)
         .await
         .map_err(|_| ApiError::not_found(format!("branch {head:?} not found")))?;
-    let base_sha = forge::resolve_ref(&bare, base)
+    let base_sha = forge::resolve_user_ref(&bare, base)
         .await
         .map_err(|_| ApiError::not_found(format!("branch {base:?} not found")))?;
     // A pull request with nothing on its head is meaningless: refuse it with a
@@ -500,6 +520,7 @@ pub async fn create(
         base,
         head,
         &head_sha,
+        author_label,
     )
     .await
     .map_err(|e| ApiError::conflict(format!("could not open the pull request: {e}")))?;
@@ -564,7 +585,7 @@ pub async fn update(
         Some("open") => {
             let reopenable = row.state == PrState::Closed;
             if reopenable {
-                if forge::resolve_ref(&bare, &row.head).await.is_err() {
+                if forge::resolve_user_ref(&bare, &row.head).await.is_err() {
                     return Err(ApiError::conflict(
                         "the head branch no longer exists; push it again before reopening",
                     ));
@@ -629,6 +650,7 @@ pub async fn comment(
     line: Option<i64>,
     side: Option<&str>,
     commit_sha: Option<&str>,
+    author_label: Option<&str>,
 ) -> Result<PrComment, ApiError> {
     if role == "view" {
         return Err(ApiError::bad("viewers may not comment"));
@@ -662,12 +684,20 @@ pub async fn comment(
     } else {
         None
     };
-    let stored = prs::insert_comment(&state.pool, &row.id, &actor.user_id, body, target_ref)
-        .await
-        .map_err(internal_error)?;
+    let stored = prs::insert_comment(
+        &state.pool,
+        &row.id,
+        &actor.user_id,
+        author_label,
+        body,
+        target_ref,
+    )
+    .await
+    .map_err(internal_error)?;
     Ok(PrComment {
         id: stored.id,
         author_id: stored.author_id,
+        author_label: stored.author_label,
         body: stored.body,
         path: stored.path,
         line: stored.line,
@@ -755,6 +785,7 @@ pub async fn review(
     actor: &Actor,
     role: &str,
     review_state: &str,
+    author_label: Option<&str>,
 ) -> Result<PrDetail, ApiError> {
     if role == "view" {
         return Err(ApiError::bad("viewers may not review"));
@@ -772,7 +803,7 @@ pub async fn review(
     if row.author_id == actor.user_id {
         return Err(ApiError::bad("you cannot review your own pull request"));
     }
-    let head_sha = forge::resolve_ref(&bare, &row.head)
+    let head_sha = forge::resolve_user_ref(&bare, &row.head)
         .await
         .map_err(|_| ApiError::conflict("the head branch no longer exists"))?;
     // The insert itself re-checks `open`: a close between the read above and
@@ -781,6 +812,7 @@ pub async fn review(
         &state.pool,
         &row.id,
         &actor.user_id,
+        author_label,
         review_state,
         &head_sha,
     )
@@ -819,10 +851,10 @@ pub async fn merge(
         .await
         .map_err(internal_error)?;
 
-    let base_sha = forge::resolve_ref(&bare, &row.base)
+    let base_sha = forge::resolve_user_ref(&bare, &row.base)
         .await
         .map_err(|_| ApiError::conflict(format!("base branch {:?} is gone", row.base)))?;
-    let head_sha = forge::resolve_ref(&bare, &row.head)
+    let head_sha = forge::resolve_user_ref(&bare, &row.head)
         .await
         .map_err(|_| ApiError::conflict(format!("head branch {:?} is gone", row.head)))?;
 
@@ -1003,6 +1035,7 @@ mod tests {
         PrReview {
             id: id.into(),
             reviewer_id: reviewer.into(),
+            author_label: None,
             state,
             commit_sha: sha.into(),
             created_at: at.into(),
@@ -1096,6 +1129,7 @@ mod tests {
             title: "t".into(),
             body: String::new(),
             author_id: "u".into(),
+            author_label: None,
             base: "main".into(),
             head: "feat".into(),
             state: PrState::Open,
@@ -1442,6 +1476,96 @@ mod tests {
         (base, head)
     }
 
+    /// How a row was signed travels with the row: a machine's label
+    /// ('<user> via key <name>') comes back on the PR, its comments and its
+    /// reviews, and a person's row stays `None` so the UI keeps the account
+    /// name it resolves from D1.
+    #[tokio::test]
+    async fn machine_labels_round_trip_and_people_stay_null() {
+        let h = Harness::new("prlabel").await;
+        let app_id = h.app.id.clone();
+        let machine = prs::insert_pr(
+            &h.state.pool,
+            &app_id,
+            1,
+            "t",
+            "",
+            "user_1",
+            "main",
+            "feat",
+            "sha_a",
+            Some("Ada via key ci"),
+        )
+        .await
+        .expect("insert machine pr");
+        let person = prs::insert_pr(
+            &h.state.pool,
+            &app_id,
+            2,
+            "t",
+            "",
+            "user_2",
+            "main",
+            "other",
+            "sha_b",
+            None,
+        )
+        .await
+        .expect("insert person pr");
+
+        assert_eq!(machine.author_label.as_deref(), Some("Ada via key ci"));
+        assert_eq!(
+            summary(&machine, 0).author_label.as_deref(),
+            Some("Ada via key ci")
+        );
+        assert_eq!(person.author_label, None);
+        assert_eq!(summary(&person, 0).author_label, None);
+
+        let comment = prs::insert_comment(
+            &h.state.pool,
+            &machine.id,
+            "user_1",
+            Some("Ada via key ci"),
+            "hi",
+            None,
+        )
+        .await
+        .expect("comment");
+        assert_eq!(comment.author_label.as_deref(), Some("Ada via key ci"));
+
+        let review = prs::insert_review(
+            &h.state.pool,
+            &machine.id,
+            "user_9",
+            Some("Grace via key review-bot"),
+            ReviewState::Approved,
+            "sha_a",
+        )
+        .await
+        .expect("review")
+        .expect("open");
+        assert_eq!(
+            review_view(&review).author_label.as_deref(),
+            Some("Grace via key review-bot")
+        );
+
+        // The stored rows read back the same way through the detail path's
+        // own list queries.
+        let comments = prs::list_comments(&h.state.pool, &machine.id)
+            .await
+            .expect("comments");
+        assert_eq!(comments[0].author_label.as_deref(), Some("Ada via key ci"));
+        let reviews = prs::list_reviews(&h.state.pool, &machine.id)
+            .await
+            .expect("reviews");
+        assert_eq!(
+            reviews[0].author_label.as_deref(),
+            Some("Grace via key review-bot")
+        );
+
+        h.finish().await;
+    }
+
     /// A close that races a completed merge must not rewrite the row: the
     /// CAS `open -> closed` refuses and the merge fields survive (before the
     /// CAS, `close_pr ... WHERE id = ?` turned the row into `closed` with a
@@ -1460,6 +1584,7 @@ mod tests {
             "main",
             "feat",
             "sha_a",
+            None,
         )
         .await
         .expect("insert");
@@ -1507,6 +1632,7 @@ mod tests {
             "main",
             "feat",
             "sha_a",
+            None,
         )
         .await
         .expect("insert");
@@ -1549,6 +1675,7 @@ mod tests {
             "main",
             "feat",
             "sha_a",
+            None,
         )
         .await
         .expect("insert");
@@ -1585,6 +1712,7 @@ mod tests {
             "main",
             "feat",
             "sha_a",
+            None,
         )
         .await
         .expect("insert");
@@ -1596,6 +1724,7 @@ mod tests {
                 &h.state.pool,
                 &pr.id,
                 "user_b",
+                None,
                 ReviewState::Approved,
                 "sha_a"
             )
@@ -1625,6 +1754,7 @@ mod tests {
             "main",
             "feat",
             "sha_a",
+            None,
         )
         .await
         .expect("insert");
@@ -1632,6 +1762,7 @@ mod tests {
             &h.state.pool,
             &pr.id,
             "user_b",
+            None,
             ReviewState::Approved,
             "sha_a",
         )
@@ -1670,16 +1801,18 @@ mod tests {
             "main",
             "feat",
             "sha",
+            None,
         )
         .await
         .expect("insert");
-        prs::insert_comment(&h.state.pool, &pr.id, "user_a", "hi", None)
+        prs::insert_comment(&h.state.pool, &pr.id, "user_a", None, "hi", None)
             .await
             .expect("comment");
         prs::insert_comment(
             &h.state.pool,
             &pr.id,
             "user_a",
+            None,
             "line",
             Some(("a.txt", 3, "new", "sha")),
         )
@@ -1689,6 +1822,7 @@ mod tests {
             &h.state.pool,
             &pr.id,
             "user_b",
+            None,
             ReviewState::Approved,
             "sha",
         )
@@ -1719,9 +1853,11 @@ mod tests {
         let bare = h.mirror().await;
         let (base, _head) = clean_pair(&h, &bare).await;
         let author = actor("user_author", "Author");
-        let detail = create(&h.state, &h.app.id, &author, "Add b", "", "main", "feat")
-            .await
-            .expect("open");
+        let detail = create(
+            &h.state, &h.app.id, &author, "Add b", "", "main", "feat", None,
+        )
+        .await
+        .expect("open");
         assert_eq!(detail.merge_state, MergeState::Mergeable);
         let merger = actor("user_merger", "Merger");
         let merged = merge(
@@ -1787,6 +1923,7 @@ mod tests {
             "",
             "main",
             "feat",
+            None,
         )
         .await
         .expect("open");
@@ -1821,9 +1958,11 @@ mod tests {
             .await
             .expect("rules");
         let author = actor("user_author", "Author");
-        create(&h.state, &h.app.id, &author, "Add b", "", "main", "feat")
-            .await
-            .expect("open");
+        create(
+            &h.state, &h.app.id, &author, "Add b", "", "main", "feat", None,
+        )
+        .await
+        .expect("open");
         let err = merge(
             &h.state,
             &h.app.id,
@@ -1874,6 +2013,7 @@ mod tests {
             "",
             "main",
             "same",
+            None,
         )
         .await
         .expect_err("refused");
@@ -1883,6 +2023,46 @@ mod tests {
             }
             other => panic!("expected bad request, got {other:?}"),
         }
+        h.finish().await;
+    }
+
+    /// A pull request names two branches. A hidden workspace preview ref
+    /// (`refs/previews/<user>/<branch>`) holds another collaborator's
+    /// uncommitted snapshot and must never become a PR head, so any raw ref
+    /// (a preview, a tag) is refused here; a bare name or sha resolves as it
+    /// always has.
+    #[tokio::test]
+    async fn create_refuses_a_ref_instead_of_a_branch() {
+        let h = Harness::new("prrefhead").await;
+        let bare = h.mirror().await;
+        let (_base, head) = clean_pair(&h, &bare).await;
+        // The workspace snapshot a browser preview commits to.
+        let preview = format!(
+            "{}user_1/feature",
+            crate::host::git_http::PREVIEW_REF_PREFIX
+        );
+        forge::publish_refname(&h.state, &h.app, &preview, None, Some(&head))
+            .await
+            .expect("publish preview ref");
+        let author = actor("user_author", "Author");
+
+        for refname in [
+            preview.as_str(),
+            "previews/user_1/feature",
+            "refs/heads/feature",
+            "refs/tags/v1",
+        ] {
+            let err = create(&h.state, &h.app.id, &author, "t", "", "main", refname, None)
+                .await
+                .expect_err("a ref is not a branch name");
+            match err {
+                ApiError::BadRequest(message) => {
+                    assert!(message.contains("invalid branch name"), "{message}");
+                }
+                other => panic!("expected bad request, got {other:?}"),
+            }
+        }
+
         h.finish().await;
     }
 
@@ -1914,6 +2094,7 @@ mod tests {
             "main",
             "gone",
             "deadbeef",
+            None,
         )
         .await
         .expect("insert");

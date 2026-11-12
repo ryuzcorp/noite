@@ -125,8 +125,13 @@ pub async fn branch_create(
     if !forge::valid_branch_name(name) {
         return Err(ApiError::bad(format!("invalid branch name {name:?}")));
     }
+    // `from` may be a branch, a tag or a sha; `resolve_user_ref` refuses the
+    // runner's own namespaces, so a hidden workspace preview ref cannot start
+    // an advertised branch (and publish another collaborator's snapshot).
     let (app, bare) = app_repo(state, id).await?;
-    let sha = forge::resolve_ref(&bare, from).await.map_err(forge_error)?;
+    let sha = forge::resolve_user_ref(&bare, from)
+        .await
+        .map_err(forge_error)?;
     forge::publish_ref(state, &app, name, None, Some(&sha))
         .await
         .map_err(forge_error)?;

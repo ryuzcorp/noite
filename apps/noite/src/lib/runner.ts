@@ -1,4 +1,5 @@
 /* oxlint-disable eslint/max-classes-per-file -- the two runner error classes are the transport contract: a caught runner error is one of them. */
+import { SOURCE_FORWARD_TIMEOUT_MS } from "./commit-source";
 import { controlEnv, hydrateControlEnv } from "./control-env";
 // Wire types, generated from the Rust structs in apps/runner into
 // ./runner-types (never edit those files by hand). Regenerate with `cargo
@@ -853,6 +854,8 @@ export const runnerPrCreate = (
   id: string,
   body: {
     actor: { name: string; userId: string };
+    /** How a machine signs the pull request; absent for a person. */
+    authorLabel?: string;
     base: string;
     body?: string;
     head: string;
@@ -877,6 +880,8 @@ export const runnerPrComment = (
   number: number,
   body: {
     actor: { name: string; userId: string };
+    /** How a machine signs the comment; absent for a person. */
+    authorLabel?: string;
     body: string;
     commitSha?: string;
     line?: number;
@@ -914,6 +919,8 @@ export const runnerPrReview = (
   number: number,
   body: {
     actor: { name: string; userId: string };
+    /** How a machine signs the review; absent for a person. */
+    authorLabel?: string;
     role: string;
     state: "approved" | "changes_requested";
   }
@@ -949,6 +956,20 @@ export const runnerSourceTree = (id: string, ref?: string) =>
 
 export const runnerSourceBlob = (id: string, path: string, ref?: string) =>
   runnerRpc<RunnerBlob>("source.blob", { id, path, ref });
+
+/** Commit source edits server-side (the MCP `commit_files` path): the same
+ * runner endpoint the control route forwards a browser's body to, so both
+ * surfaces make the identical commit and answer `{ sha }`. The runner is the
+ * authority on paths, sizes and encodings. */
+export const runnerSourceCommit = (id: string, body: SourceCommitBody) =>
+  runnerFetch<{ sha: string }>(
+    `/v1/apps/${encodeURIComponent(id)}/source/commit`,
+    {
+      body: JSON.stringify(body),
+      method: "POST",
+      signal: AbortSignal.timeout(SOURCE_FORWARD_TIMEOUT_MS),
+    }
+  );
 
 // Preview environments (ROADMAP: Preview environments). The runner enforces
 // the app role on every call, so the UI resolves the caller's role and passes

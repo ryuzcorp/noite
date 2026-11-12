@@ -9,8 +9,8 @@ use sqlx::{FromRow, SqlitePool};
 use crate::models::{new_id, now_iso, PrState, ReviewState};
 
 /// Columns every `pull_request` query selects, in struct order.
-pub const PR_COLS: &str = "id, app_id, number, title, body, author_id, base, head, state, \
-     head_sha, merge_sha, merged_by, closed_by, created_at, updated_at, closed_at, merged_at";
+pub const PR_COLS: &str = "id, app_id, number, title, body, author_id, author_label, base, head, \
+     state, head_sha, merge_sha, merged_by, closed_by, created_at, updated_at, closed_at, merged_at";
 
 #[derive(Debug, Clone, FromRow)]
 pub struct PullRequestRow {
@@ -20,6 +20,7 @@ pub struct PullRequestRow {
     pub title: String,
     pub body: String,
     pub author_id: String,
+    pub author_label: Option<String>,
     pub base: String,
     pub head: String,
     pub state: PrState,
@@ -37,6 +38,7 @@ pub struct PrCommentRow {
     pub id: String,
     pub pr_id: String,
     pub author_id: String,
+    pub author_label: Option<String>,
     pub body: String,
     pub path: Option<String>,
     pub line: Option<i64>,
@@ -50,6 +52,7 @@ pub struct PrCommentRow {
 pub struct PrReviewRow {
     pub id: String,
     pub reviewer_id: String,
+    pub author_label: Option<String>,
     pub state: ReviewState,
     pub commit_sha: String,
     pub created_at: String,
@@ -76,14 +79,15 @@ pub async fn insert_pr(
     base: &str,
     head: &str,
     head_sha: &str,
+    author_label: Option<&str>,
 ) -> sqlx::Result<PullRequestRow> {
     let now = now_iso();
     let id = new_id();
     sqlx::query(
         "INSERT INTO pull_request \
-         (id, app_id, number, title, body, author_id, base, head, state, head_sha, \
+         (id, app_id, number, title, body, author_id, author_label, base, head, state, head_sha, \
           created_at, updated_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?)",
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?)",
     )
     .bind(&id)
     .bind(app_id)
@@ -91,6 +95,7 @@ pub async fn insert_pr(
     .bind(title)
     .bind(body)
     .bind(author_id)
+    .bind(author_label)
     .bind(base)
     .bind(head)
     .bind(head_sha)
@@ -105,6 +110,7 @@ pub async fn insert_pr(
         title: title.to_string(),
         body: body.to_string(),
         author_id: author_id.to_string(),
+        author_label: author_label.map(str::to_string),
         base: base.to_string(),
         head: head.to_string(),
         state: PrState::Open,
@@ -422,6 +428,7 @@ pub async fn insert_comment(
     pool: &SqlitePool,
     pr_id: &str,
     author_id: &str,
+    author_label: Option<&str>,
     body: &str,
     target: Option<(&str, i64, &str, &str)>,
 ) -> sqlx::Result<PrCommentRow> {
@@ -435,12 +442,13 @@ pub async fn insert_comment(
     };
     sqlx::query(
         "INSERT INTO pr_comment \
-         (id, pr_id, author_id, body, path, line, side, commit_sha, created_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+         (id, pr_id, author_id, author_label, body, path, line, side, commit_sha, created_at) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(&id)
     .bind(pr_id)
     .bind(author_id)
+    .bind(author_label)
     .bind(body)
     .bind(path)
     .bind(line)
@@ -453,6 +461,7 @@ pub async fn insert_comment(
         id,
         pr_id: pr_id.to_string(),
         author_id: author_id.to_string(),
+        author_label: author_label.map(str::to_string),
         body: body.to_string(),
         path: path.map(str::to_string),
         line,
@@ -506,19 +515,22 @@ pub async fn insert_review(
     pool: &SqlitePool,
     pr_id: &str,
     reviewer_id: &str,
+    author_label: Option<&str>,
     state: ReviewState,
     commit_sha: &str,
 ) -> sqlx::Result<Option<PrReviewRow>> {
     let id = new_id();
     let now = now_iso();
     let done = sqlx::query(
-        "INSERT INTO pr_review (id, pr_id, reviewer_id, state, commit_sha, created_at) \
-         SELECT ?, ?, ?, ?, ?, ? WHERE EXISTS \
+        "INSERT INTO pr_review \
+         (id, pr_id, reviewer_id, author_label, state, commit_sha, created_at) \
+         SELECT ?, ?, ?, ?, ?, ?, ? WHERE EXISTS \
          (SELECT 1 FROM pull_request WHERE id = ? AND state = 'open')",
     )
     .bind(&id)
     .bind(pr_id)
     .bind(reviewer_id)
+    .bind(author_label)
     .bind(state)
     .bind(commit_sha)
     .bind(&now)
@@ -531,6 +543,7 @@ pub async fn insert_review(
     Ok(Some(PrReviewRow {
         id,
         reviewer_id: reviewer_id.to_string(),
+        author_label: author_label.map(str::to_string),
         state,
         commit_sha: commit_sha.to_string(),
         created_at: now,

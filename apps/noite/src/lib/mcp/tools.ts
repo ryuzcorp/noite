@@ -1,12 +1,18 @@
 /* eslint-disable func-names -- Effect.gen uses anonymous generators */
 /**
  * The MCP tool table (alpha.4 A4). Every tool runs as the account its API key
- * belongs to and passes the very same gates the UI's server actions do
- * (`roleFor` through `requireAppRole`), so an agent can do exactly what a
- * signed-in collaborator of that role can: reads are `view`, variables are
- * `admin`, and creating an app goes through the one `createAppForUser` path A5
- * uses. Tools call the wave 1 runner client functions; nothing here duplicates
- * another surface's logic.
+ * belongs to and passes the very same gates the UI's server actions do, so an
+ * agent can do exactly what a collaborator of that role can: reads are `view`,
+ * variables are `admin`, and creating an app goes through the one
+ * `createAppForUser` path A5 uses. Tools call the wave 1 runner client
+ * functions; nothing here duplicates another surface's logic.
+ *
+ * The second half of the table is the agent loop (code → pull request →
+ * preview → merge → deploy → rollback) with no UI in it: `commit_files` and
+ * the `*_branch`, `*_pr`, `rollback`/`redeploy`/`cancel_deploy` and
+ * `wait_for_deploy` tools. They answer refusals an agent can act on
+ * (`refusals.ts`) and every one resolves its app through `requireGatedApp`,
+ * the same gate the read tools use.
  *
  * Each tool declares its arguments once, as an Effect schema: that is both the
  * parser the transport runs and the `inputSchema` it publishes, so an agent
@@ -23,6 +29,7 @@ import { keyCoversApp } from "../key-principal";
 import type { KeyPrincipal } from "../key-principal";
 import type { AppRole } from "../roles";
 import {
+  runnerCancelDeploy,
   runnerDeleteEnv,
   runnerDeployLog,
   runnerEnvironmentCreate,
@@ -33,21 +40,35 @@ import {
   runnerEnvironmentVarSet,
   runnerEnvironmentVars,
   runnerEnvironmentsList,
+  runnerGitBranchCreate,
+  runnerGitBranchDelete,
   runnerGitCommit,
   runnerGitLog,
   runnerGitRefs,
   runnerGitRemote,
+  runnerListDeploys,
   runnerListEnv,
+  runnerPrComment,
+  runnerPrCreate,
+  runnerPrGet,
+  runnerPrMerge,
+  runnerPrReview,
+  runnerPrUpdate,
+  runnerPrsList,
+  runnerRollback,
   runnerRpc,
   runnerRpcBatch,
   runnerSetEnv,
   runnerSourceBlob,
+  runnerSourceCommit,
   runnerSourceTree,
 } from "../runner";
 import type {
   GitCommitDetail,
   GitLog,
   GitRefs,
+  PrDetail,
+  PrSummary,
   RunnerApp,
   RunnerBlob,
   RunnerDeploy,
@@ -55,13 +76,25 @@ import type {
   RunnerErrorList,
   RunnerGitRemote,
   RunnerTree,
+  SourceCommitBody,
 } from "../runner";
 import { createAppForUser, slugError } from "../server/apps.server";
 import { redactEnv } from "../server/env.server";
 import { keyAppVerdict } from "../server/key-access.server";
-import { keyActor } from "../server/key-attribution.server";
+import { keyActor, userDisplayName } from "../server/key-attribution.server";
+import {
+  deployWaitGate,
+  MAX_CONCURRENT_WAITS,
+  MAX_WAIT_SECONDS,
+  realSleep,
+  waitForDeploy,
+} from "./deploy-wait";
+import type { DeployWait } from "./deploy-wait";
+import { prChecks } from "./pr-checks";
+import type { PreviewFacts } from "./pr-checks";
 import { defineTool, McpToolError } from "./protocol";
 import type { McpToolDefinition } from "./protocol";
+import { attempt, denyAs, refused } from "./refusals";
 
 /** What each role lets a tool do, in the words of the error a denied caller
  * reads. */
@@ -286,6 +319,242 @@ const toCreateSource = (
   }
 
   return { id: source.template, kind: "template" };
+};
+
+/** Raw refs are not part of `commit_files`'s contract: `base` and
+ * `expectedTip` are a branch, a tag or a sha. The runner refuses its own ref
+ * namespaces (notably the hidden `refs/previews/…` workspace snapshots) before
+ * resolving them; refusing a raw ref here gives the agent a code without a
+ * round trip, and the runner stays the boundary. */
+const isRawRef = (value: string): boolean => value.trim().startsWith("refs/");
+
+/** The branch a commit targets, with the preconditions the runner would
+ * otherwise only discover mid-write: `base` is meaningless for a branch that
+ * already exists, and `expectedTip` must match the tip the caller read. Both
+ * refusals name the numbers an agent needs to retry. */
+const checkedCommitTarget = (
+  refs: GitRefs,
+  wanted: string | undefined,
+  base: string | undefined,
+  wantedTip: string | undefined
+) => {
+  const branch = (wanted ?? "").trim() || refs.defaultBranch;
+  const existing = refs.branches.find((row) => row.name === branch);
+  const expectedTip = (wantedTip ?? "").trim();
+
+  for (const [field, value] of [
+    ["base", base],
+    ["expectedTip", wantedTip],
+  ] as const) {
+    if (value !== undefined && isRawRef(value)) {
+      throw refused(
+        "invalid",
+        `"${field}" is a raw ref; pass a branch, tag or commit sha instead.`
+      );
+    }
+  }
+
+  if (base !== undefined && existing) {
+    throw refused(
+      "invalid",
+      `branch "${branch}" already exists at ${sha10(existing.sha)}; "base" only starts a branch that does not exist yet.`
+    );
+  }
+
+  if (expectedTip === "") {
+    return { branch, expectedTip };
+  }
+
+  if (!existing) {
+    throw refused(
+      "stale_tip",
+      `branch "${branch}" does not exist, so it is not at ${expectedTip}.`
+    );
+  }
+
+  // `expectedTip` may be abbreviated the way git prints one; seven characters
+  // is the shortest unambiguous prefix git itself accepts.
+  const atExpectedTip =
+    existing.sha === expectedTip ||
+    (expectedTip.length >= 7 && existing.sha.startsWith(expectedTip));
+
+  if (!atExpectedTip) {
+    throw refused(
+      "stale_tip",
+      `branch "${branch}" is at ${sha10(existing.sha)}, not ${expectedTip}.`
+    );
+  }
+
+  return { branch, expectedTip };
+};
+
+/** The app one loop tool names, with a denial coded `forbidden` (the helper
+ * stays the only place the gate is decided). */
+const requireGatedApp = async (
+  principal: KeyPrincipal,
+  ref: string,
+  need: AppRole
+): Promise<{ app: RunnerApp; role: AppRole }> =>
+  await denyAs(() => requireApp(principal, ref, need), "forbidden");
+
+/** One bounded `wait_for_deploy` poll. The key holds one gate slot for the
+ * whole call (a burst of long polls would otherwise park the isolate for 45 s
+ * each), and a key at its limit is refused before the first read. */
+const boundedWait = async (
+  appId: string,
+  environmentId: string,
+  wanted: { readonly deployId?: string; readonly sha?: string },
+  key: string,
+  budgetMs: number
+): Promise<DeployWait> => {
+  if (!deployWaitGate.enter(key)) {
+    throw refused(
+      "too_many_waits",
+      `${MAX_CONCURRENT_WAITS} wait_for_deploy calls are already in flight for this key; wait for one to answer before re-arming.`
+    );
+  }
+
+  try {
+    return await waitForDeploy(
+      {
+        now: Date.now,
+        read: async (): Promise<RunnerDeploy | null> => {
+          const rows = await runnerListDeploys(appId, environmentId);
+
+          if (wanted.deployId !== undefined) {
+            return rows.find((row) => row.id === wanted.deployId) ?? null;
+          }
+
+          if (wanted.sha !== undefined) {
+            return rows.find((row) => row.sha === wanted.sha) ?? null;
+          }
+
+          return rows.at(0) ?? null;
+        },
+        sleep: realSleep,
+      },
+      budgetMs
+    );
+  } finally {
+    deployWaitGate.leave(key);
+  }
+};
+
+/** The deploy a commit triggered, if the runner has queued one: production's
+ * row for the sha, else the row of the preview environment that tracks the
+ * branch. `null` while nothing is queued yet — the caller then waits with
+ * `wait_for_deploy` (the tip sweep has not run). */
+const commitDeploy = async (
+  app: RunnerApp,
+  role: AppRole,
+  branch: string,
+  sha: string
+): Promise<{ deploy: RunnerDeploy | null; environment: string | null }> => {
+  const production = await runnerListDeploys(app.id);
+  const direct = production.find((deploy) => deploy.sha === sha);
+
+  if (direct) {
+    return { deploy: direct, environment: null };
+  }
+
+  const environments = await appEnvironments(app.id, role);
+
+  const tracked = environments.find(
+    (env) => env.gitRef === `refs/heads/${branch}`
+  );
+
+  if (!tracked) {
+    return { deploy: null, environment: null };
+  }
+
+  const rows = await runnerListDeploys(app.id, tracked.id);
+
+  return {
+    deploy: rows.find((deploy) => deploy.sha === sha) ?? null,
+    environment: tracked.label,
+  };
+};
+
+/** The preview environment that tracks a pull request's head branch, with the
+ * deploy of its head commit: `get_pr`'s linked environment and its checks. */
+const prPreview = async (
+  app: RunnerApp,
+  role: AppRole,
+  head: string,
+  headSha: string
+): Promise<PreviewFacts | null> => {
+  const environments = await appEnvironments(app.id, role);
+
+  const env = environments.find(
+    (candidate) => candidate.gitRef === `refs/heads/${head}`
+  );
+
+  if (!env) {
+    return null;
+  }
+
+  const remote = await runnerGitRemote(app.id);
+  const rows = await runnerListDeploys(app.id, env.id);
+
+  return {
+    deploy: rows.find((deploy) => deploy.sha === headSha) ?? null,
+    label: env.label,
+    lastError: env.lastError,
+    url: envUrl(remote.url, app.subdomain, env.label),
+  };
+};
+
+/** One pull request as the list and the merge tools report it: the fields an
+ * agent acts on, in the same shape every tool answers. */
+const prRow = (pr: PrSummary) => ({
+  authorId: pr.authorId,
+  base: pr.base,
+  closedAt: pr.closedAt,
+  commentCount: pr.commentCount,
+  head: pr.head,
+  headSha: pr.headSha,
+  mergeSha: pr.mergeSha,
+  number: pr.number,
+  state: pr.state,
+  title: pr.title,
+  updatedAt: pr.updatedAt,
+});
+
+/** One pull request's detail: state, mergeability, reviews, checks and the
+ * linked preview environment. */
+const prDetailRow = (detail: PrDetail, preview: PreviewFacts | null) => {
+  const pr = detail.pullRequest;
+  const { compare } = detail;
+
+  return {
+    ahead: compare?.ahead ?? 0,
+    approvals: detail.approvals,
+    behind: compare?.behind ?? 0,
+    checks: prChecks(detail, preview).map((check) => ({
+      detail: check.detail,
+      name: check.name,
+      state: check.state,
+    })),
+    commits: compare?.commits.length ?? 0,
+    conflicts: compare?.conflicts ?? [],
+    environment:
+      preview === null
+        ? null
+        : { deploy: preview.deploy, label: preview.label, url: preview.url },
+    mergeState: detail.mergeState,
+    mergeable: compare?.mergeable ?? false,
+    pullRequest: prRow(pr),
+    requirePr: detail.requirePr,
+    requiredApprovals: detail.requiredApprovals,
+    reviews: detail.reviews.map((review) => ({
+      commitSha: review.commitSha,
+      createdAt: review.createdAt,
+      dismissedAt: review.dismissedAt,
+      reviewerId: review.reviewerId,
+      state: review.state,
+    })),
+    truncated: compare?.truncated ?? false,
+  };
 };
 
 export const MCP_TOOLS: readonly McpToolDefinition[] = [
@@ -1108,6 +1377,782 @@ export const MCP_TOOLS: readonly McpToolDefinition[] = [
           detail.patch,
           detail.truncated ? "(patch truncated)" : "",
         ].join("\n"),
+      };
+    },
+  }),
+
+  // ---- The agent loop: write, review, ship ----
+  //
+  // The write half of the loop (code → pull request → preview → merge →
+  // deploy → rollback) with no UI in it. Every tool resolves its app through
+  // `requireGatedApp` (the one gate, whose effective role the runner trusts),
+  // forwards that role, and answers a refusal an agent can act on
+  // (`refusals.ts`): a protected branch, a tip that moved, a pull request that
+  // will not merge, a role it does not hold.
+
+  defineTool({
+    description:
+      "Commit file writes, deletes and moves to a branch — creating that branch from `base` when it does not exist yet — and answer the commit sha plus the deploy it triggered. `expectedTip` is the compare-and-set: the commit is refused if the branch moved since you read it.",
+    name: "commit_files",
+    params: appParams({
+      base: Schema.optional(SourceRef).annotate({
+        description:
+          "Ref a new branch starts from (default: the default branch). Only for a branch that does not exist yet.",
+      }),
+      branch: Schema.optional(
+        Schema.String.check(Schema.isNonEmpty()).annotate({
+          description:
+            "Branch to commit to (default: the app's default branch). A branch that does not exist is created.",
+        })
+      ),
+      deletes: Schema.optional(
+        Schema.Array(PathRef).annotate({
+          description: "Repository-relative paths to remove.",
+        })
+      ),
+      expectedTip: Schema.optional(SourceRef).annotate({
+        description:
+          "Compare-and-set: refuse the commit unless the branch is still at this commit.",
+      }),
+      files: Schema.optional(
+        Schema.Array(
+          Schema.Struct({
+            content: Schema.String.annotate({
+              description:
+                "File contents: text, or base64 bytes when `encoding` is base64.",
+            }),
+            // The runner's wire value is `utf8` (`WebEncoding`), not a WHATWG
+            // label: `utf-8` would never be accepted.
+            // oxlint-disable-next-line unicorn/text-encoding-identifier-case -- see above.
+            encoding: Schema.optional(Schema.Literals(["utf8", "base64"])),
+            path: PathRef,
+          })
+        ).annotate({ description: "Files to write (add or replace)." })
+      ),
+      message: Schema.String.check(Schema.isNonEmpty()).annotate({
+        description: "Commit message (1-500 chars).",
+      }),
+      moves: Schema.optional(
+        Schema.Array(Schema.Struct({ from: PathRef, to: PathRef })).annotate({
+          description: "Files to move without re-reading them.",
+        })
+      ),
+    }),
+    run: async (
+      { principal },
+      {
+        app: ref,
+        base,
+        branch: wantedBranch,
+        deletes: wantedDeletes,
+        expectedTip: wantedTip,
+        files: wantedFiles,
+        message,
+        moves: wantedMoves,
+      }
+    ) => {
+      const { app, role } = await requireGatedApp(principal, ref, "push");
+      const files = [...(wantedFiles ?? [])];
+      const moves = [...(wantedMoves ?? [])];
+      const deletes = [...(wantedDeletes ?? [])];
+
+      if (files.length === 0 && moves.length === 0 && deletes.length === 0) {
+        throw new McpToolError(
+          "commit_files needs at least one `files`, `moves` or `deletes` entry.",
+          { invalid: true }
+        );
+      }
+
+      const refs = await runnerGitRefs(app.id);
+
+      const { branch, expectedTip } = checkedCommitTarget(
+        refs,
+        wantedBranch,
+        base,
+        wantedTip
+      );
+
+      const body: SourceCommitBody = {
+        actor: await keyActor(principal),
+        branch,
+        files,
+        message,
+        role,
+      };
+
+      if (base !== undefined) {
+        body.fromSha = base;
+      }
+
+      if (deletes.length > 0) {
+        body.deletes = deletes;
+      }
+
+      if (expectedTip !== "") {
+        body.expectedTip = expectedTip;
+      }
+
+      if (moves.length > 0) {
+        body.moves = moves;
+      }
+
+      const { sha } = await attempt(() => runnerSourceCommit(app.id, body));
+      const triggered = await commitDeploy(app, role, branch, sha);
+
+      const where =
+        triggered.environment === null
+          ? app.slug
+          : `${app.slug}/${triggered.environment}`;
+
+      return {
+        structured: {
+          appId: app.id,
+          branch,
+          deletes: deletes.length,
+          deploy: triggered.deploy,
+          environment: triggered.environment,
+          files: files.length + moves.length,
+          sha,
+          slug: app.slug,
+        },
+        text: [
+          `${where}: committed ${sha10(sha)} to ${branch} — ${files.length} written, ${moves.length} moved, ${deletes.length} deleted.`,
+          triggered.deploy === null
+            ? "No deploy is queued yet: wait_for_deploy with this sha follows it when the runner starts it."
+            : `Deploy ${triggered.deploy.id} is ${triggered.deploy.status} — follow it with wait_for_deploy (sha ${sha10(sha)}).`,
+        ].join("\n"),
+      };
+    },
+  }),
+  defineTool({
+    description:
+      "Create a branch at a ref or commit, without touching the default branch. An existing name is refused (branch_exists).",
+    name: "create_branch",
+    params: appParams({
+      from: Schema.optional(SourceRef).annotate({
+        description:
+          "Ref or commit the branch starts at (default: the default branch's head).",
+      }),
+      name: Schema.String.check(Schema.isNonEmpty()).annotate({
+        description: "New branch name (no spaces or '..').",
+      }),
+    }),
+    run: async ({ principal }, { app: ref, from, name }) => {
+      const { app } = await requireGatedApp(principal, ref, "push");
+      const refs = await runnerGitRefs(app.id);
+      const existing = refs.branches.find((row) => row.name === name);
+
+      if (existing) {
+        throw refused(
+          "branch_exists",
+          `branch "${name}" already exists at ${sha10(existing.sha)}.`
+        );
+      }
+
+      const start = (from ?? "").trim() || refs.defaultBranch;
+
+      const created = await attempt(() =>
+        runnerGitBranchCreate(app.id, name, start)
+      );
+
+      return {
+        structured: { appId: app.id, branch: created, slug: app.slug },
+        text: `Created ${name} in ${app.slug} at ${sha10(created.sha)} (from ${start}). Commit to it with commit_files.`,
+      };
+    },
+  }),
+  defineTool({
+    description:
+      "Delete a branch and its preview environment. The default branch is refused (protected_branch).",
+    name: "delete_branch",
+    params: appParams({
+      name: Schema.String.check(Schema.isNonEmpty()).annotate({
+        description: "Branch to delete.",
+      }),
+    }),
+    run: async ({ principal }, { app: ref, name }) => {
+      const { app } = await requireGatedApp(principal, ref, "admin");
+      const refs = await runnerGitRefs(app.id);
+
+      if (name === refs.defaultBranch) {
+        throw refused(
+          "protected_branch",
+          `"${name}" is the default branch and cannot be deleted.`
+        );
+      }
+
+      await attempt(() => runnerGitBranchDelete(app.id, name));
+
+      return {
+        structured: {
+          appId: app.id,
+          deleted: name,
+          ok: true,
+          slug: app.slug,
+        },
+        text: `Deleted ${name} from ${app.slug}; its preview environment, if it had one, is gone too.`,
+      };
+    },
+  }),
+  defineTool({
+    description:
+      "Pull requests for this app, newest first, with the open/closed/merged counts. `state` filters the list (default all).",
+    name: "list_prs",
+    params: appParams({
+      limit: Schema.optional(
+        Schema.Number.check(
+          Schema.isInt(),
+          Schema.isGreaterThanOrEqualTo(1),
+          Schema.isLessThanOrEqualTo(100)
+        ).annotate({ description: "How many to return (default 30)." })
+      ),
+      skip: Schema.optional(
+        Schema.Number.check(
+          Schema.isInt(),
+          Schema.isGreaterThanOrEqualTo(0)
+        ).annotate({ description: "How many to skip (paging)." })
+      ),
+      state: Schema.optional(
+        Schema.Literals(["all", "closed", "merged", "open"]).annotate({
+          description: "Which pull requests to list (default all).",
+        })
+      ),
+    }),
+    run: async ({ principal }, { app: ref, limit, skip, state }) => {
+      const { app } = await requireGatedApp(principal, ref, "view");
+
+      const list = await runnerPrsList(app.id, {
+        limit: limit ?? 30,
+        skip,
+        state,
+      });
+
+      const rows = list.pullRequests.map(prRow);
+      const counts = `${list.counts.open} open, ${list.counts.closed} closed, ${list.counts.merged} merged`;
+
+      return {
+        structured: {
+          appId: app.id,
+          counts: list.counts,
+          pullRequests: rows,
+          slug: app.slug,
+        },
+        text:
+          rows.length === 0
+            ? `${app.slug}: no ${state ?? "all"} pull requests (${counts}).`
+            : [
+                `${rows.length} pull request${rows.length === 1 ? "" : "s"} in ${app.slug} (${counts}):`,
+                ...list.pullRequests.map(
+                  (pr) =>
+                    `- #${pr.number} ${pr.title} — ${pr.state}, ${pr.head} → ${pr.base} @ ${sha10(pr.headSha)}, ${pr.commentCount} comment${pr.commentCount === 1 ? "" : "s"}`
+                ),
+              ].join("\n"),
+      };
+    },
+  }),
+  defineTool({
+    description:
+      "One pull request: state, mergeability, reviews, approvals, the checks that gate merging, and the preview environment that tracks its head branch.",
+    name: "get_pr",
+    params: appParams({
+      number: Schema.Number.check(
+        Schema.isInt(),
+        Schema.isGreaterThanOrEqualTo(1)
+      ).annotate({ description: "Pull request number." }),
+    }),
+    run: async ({ principal }, { app: ref, number }) => {
+      const { app, role } = await requireGatedApp(principal, ref, "view");
+      const detail = await attempt(() => runnerPrGet(app.id, number));
+
+      const preview = await prPreview(
+        app,
+        role,
+        detail.pullRequest.head,
+        detail.pullRequest.headSha
+      );
+
+      const row = prDetailRow(detail, preview);
+
+      return {
+        structured: { ...row, appId: app.id, slug: app.slug },
+        text: [
+          `${app.slug} #${number} ${detail.pullRequest.title} — ${detail.pullRequest.state}, ${detail.pullRequest.head} → ${detail.pullRequest.base} @ ${sha10(detail.pullRequest.headSha)}`,
+          `merge: ${detail.mergeState} (${detail.approvals}/${detail.requiredApprovals} approvals${detail.requirePr ? ", pull requests required" : ""})`,
+          `checks: ${row.checks.map((check) => `${check.name}=${check.state}`).join(", ")}`,
+          ...(row.conflicts.length === 0
+            ? []
+            : [`conflicts: ${row.conflicts.join(", ")}`]),
+          ...(preview === null
+            ? []
+            : [
+                `preview: ${preview.label} at ${preview.url}${preview.deploy === null ? " (nothing deployed yet)" : ` — deploy ${preview.deploy.status}`}`,
+              ]),
+        ].join("\n"),
+      };
+    },
+  }),
+  defineTool({
+    description:
+      "Open a pull request from a branch (needs the push role). Fails when the branches are the same, a branch is missing, or an open pull request already exists for the pair.",
+    name: "create_pr",
+    params: appParams({
+      base: Schema.optional(SourceRef).annotate({
+        description:
+          "Branch to merge into (default: the app's default branch).",
+      }),
+      body: Schema.optional(Schema.String).annotate({
+        description: "Description (Markdown).",
+      }),
+      head: Schema.String.check(Schema.isNonEmpty()).annotate({
+        description: "Branch with the changes.",
+      }),
+      title: Schema.String.check(Schema.isNonEmpty()).annotate({
+        description: "Title.",
+      }),
+    }),
+    run: async ({ principal }, { app: ref, base, body, head, title }) => {
+      const { app, role } = await requireGatedApp(principal, ref, "push");
+      const refs = await runnerGitRefs(app.id);
+      const actor = await keyActor(principal);
+
+      const detail = await attempt(() =>
+        runnerPrCreate(app.id, {
+          actor,
+          authorLabel: actor.name,
+          base: (base ?? "").trim() || refs.defaultBranch,
+          body,
+          head,
+          title,
+        })
+      );
+
+      const preview = await prPreview(
+        app,
+        role,
+        detail.pullRequest.head,
+        detail.pullRequest.headSha
+      );
+
+      const row = prDetailRow(detail, preview);
+
+      return {
+        structured: { ...row, appId: app.id, slug: app.slug },
+        text: [
+          `Opened #${detail.pullRequest.number} in ${app.slug}: ${title} (${head} → ${detail.pullRequest.base}).`,
+          `merge: ${detail.mergeState}; checks: ${row.checks.map((check) => `${check.name}=${check.state}`).join(", ")}`,
+          "Comment with comment_pr, review with review_pr, merge with merge_pr.",
+        ].join("\n"),
+      };
+    },
+  }),
+  defineTool({
+    description:
+      "Comment on a pull request's conversation, or on one diff line when `path`, `line`, `side` and `sha` are all given (needs the push role).",
+    name: "comment_pr",
+    params: appParams({
+      body: Schema.String.check(Schema.isNonEmpty()).annotate({
+        description: "Comment text (Markdown).",
+      }),
+      line: Schema.optional(
+        Schema.Number.check(
+          Schema.isInt(),
+          Schema.isGreaterThanOrEqualTo(1)
+        ).annotate({
+          description: "Diff line number (with `path` and `side`).",
+        })
+      ),
+      number: Schema.Number.check(
+        Schema.isInt(),
+        Schema.isGreaterThanOrEqualTo(1)
+      ).annotate({ description: "Pull request number." }),
+      path: Schema.optional(PathRef).annotate({
+        description: "Repo-relative file the line belongs to.",
+      }),
+      sha: Schema.optional(SourceRef).annotate({
+        description: "The head commit the line anchors to (the PR's headSha).",
+      }),
+      side: Schema.optional(
+        Schema.Literals(["new", "old"]).annotate({
+          description: "Which side of the diff the line is on.",
+        })
+      ),
+    }),
+    run: async (
+      { principal },
+      { app: ref, body, line, number, path, sha, side }
+    ) => {
+      const { app, role } = await requireGatedApp(principal, ref, "push");
+      const actor = await keyActor(principal);
+
+      const comment = await attempt(() =>
+        runnerPrComment(app.id, number, {
+          actor,
+          authorLabel: actor.name,
+          body,
+          commitSha: sha,
+          line,
+          path,
+          role,
+          side,
+        })
+      );
+
+      return {
+        structured: { appId: app.id, comment, slug: app.slug },
+        text: `Commented on #${number} in ${app.slug}${path === undefined ? "" : ` (${path}${line === undefined ? "" : `:${line}`})`} — ${comment.id}.`,
+      };
+    },
+  }),
+  defineTool({
+    description:
+      "Approve a pull request or request changes (needs the push role). Nobody reviews their own pull request; say why with comment_pr.",
+    name: "review_pr",
+    params: appParams({
+      number: Schema.Number.check(
+        Schema.isInt(),
+        Schema.isGreaterThanOrEqualTo(1)
+      ).annotate({ description: "Pull request number." }),
+      state: Schema.Literals(["approved", "changes_requested"]).annotate({
+        description: "`approved` lets it merge; `changes_requested` blocks it.",
+      }),
+    }),
+    run: async ({ principal }, { app: ref, number, state }) => {
+      const { app, role } = await requireGatedApp(principal, ref, "push");
+      const actor = await keyActor(principal);
+
+      const detail = await attempt(() =>
+        runnerPrReview(app.id, number, {
+          actor,
+          authorLabel: actor.name,
+          role,
+          state,
+        })
+      );
+
+      const preview = await prPreview(
+        app,
+        role,
+        detail.pullRequest.head,
+        detail.pullRequest.headSha
+      );
+
+      return {
+        structured: {
+          ...prDetailRow(detail, preview),
+          appId: app.id,
+          slug: app.slug,
+        },
+        text: `Recorded ${state.replace("_", " ")} on #${number} in ${app.slug}. merge: ${detail.mergeState} (${detail.approvals}/${detail.requiredApprovals} approvals).`,
+      };
+    },
+  }),
+  defineTool({
+    description:
+      "Squash-merge a pull request into its base branch (needs the push role). Branch protection is enforced: the merge is refused on conflicts, a missing branch, or too few approvals. The merge deploy follows on the base branch.",
+    name: "merge_pr",
+    params: appParams({
+      deleteBranch: Schema.optional(Schema.Boolean).annotate({
+        description: "Delete the head branch (and its preview) after merging.",
+      }),
+      message: Schema.optional(Schema.String).annotate({
+        description:
+          "Merge commit body (default: the branch's commit subjects).",
+      }),
+      number: Schema.Number.check(
+        Schema.isInt(),
+        Schema.isGreaterThanOrEqualTo(1)
+      ).annotate({ description: "Pull request number." }),
+      title: Schema.optional(Schema.String).annotate({
+        description: "Merge commit title (default: the pull request's title).",
+      }),
+    }),
+    run: async (
+      { principal },
+      { app: ref, deleteBranch, message, number, title }
+    ) => {
+      const { app, role } = await requireGatedApp(principal, ref, "push");
+      const actor = await keyActor(principal);
+      const before = await attempt(() => runnerPrGet(app.id, number));
+
+      const authorName =
+        (await userDisplayName(before.pullRequest.authorId)) || undefined;
+
+      const detail = await attempt(() =>
+        runnerPrMerge(app.id, number, {
+          actor,
+          authorName,
+          deleteBranch,
+          message,
+          role,
+          title,
+        })
+      );
+
+      const preview = await prPreview(
+        app,
+        role,
+        detail.pullRequest.head,
+        detail.pullRequest.headSha
+      );
+
+      const mergeSha = detail.pullRequest.mergeSha ?? "";
+
+      return {
+        structured: {
+          ...prDetailRow(detail, preview),
+          appId: app.id,
+          mergeSha: detail.pullRequest.mergeSha,
+          slug: app.slug,
+        },
+        text: [
+          `Merged #${number} into ${detail.pullRequest.base} as ${sha10(mergeSha)}${deleteBranch ? `, deleting ${detail.pullRequest.head}` : ""}.`,
+          `The deploy of ${detail.pullRequest.base} starts now — wait_for_deploy with sha ${mergeSha} follows it.`,
+        ].join("\n"),
+      };
+    },
+  }),
+  defineTool({
+    description:
+      "Close a pull request without merging it (needs the push role). It stays closed until reopened in the UI.",
+    name: "close_pr",
+    params: appParams({
+      number: Schema.Number.check(
+        Schema.isInt(),
+        Schema.isGreaterThanOrEqualTo(1)
+      ).annotate({ description: "Pull request number." }),
+    }),
+    run: async ({ principal }, { app: ref, number }) => {
+      const { app, role } = await requireGatedApp(principal, ref, "push");
+      const actor = await keyActor(principal);
+
+      const detail = await attempt(() =>
+        runnerPrUpdate(app.id, number, { actor, role, state: "closed" })
+      );
+
+      return {
+        structured: {
+          appId: app.id,
+          pullRequest: prRow(detail.pullRequest),
+          slug: app.slug,
+        },
+        text: `Closed #${number} in ${app.slug} (${detail.pullRequest.head} → ${detail.pullRequest.base}).`,
+      };
+    },
+  }),
+  defineTool({
+    description:
+      "Re-run a previous successful deploy's sha — production, or one preview environment with `environment` (needs the push role). The runner proves the sha was successful in that target.",
+    name: "rollback",
+    params: appParams({
+      environment: Schema.optional(EnvironmentRef).annotate({
+        description: "Preview environment to roll back (default: production).",
+      }),
+      sha: SourceRef,
+    }),
+    run: async ({ principal }, { app: ref, environment, sha }) => {
+      const { app, role } = await requireGatedApp(principal, ref, "push");
+
+      const env =
+        environment === undefined
+          ? null
+          : await denyAs(
+              () => requireEnvironment(app, role, environment),
+              "not_found"
+            );
+
+      const result = await attempt(() =>
+        runnerRollback(app.id, sha, env?.id ?? "", role)
+      );
+
+      const where = env === null ? app.slug : `${app.slug}/${env.label}`;
+
+      return {
+        structured: {
+          appId: app.id,
+          deployId: result.deployId,
+          environment: env?.label ?? null,
+          ok: result.ok,
+          sha: result.sha,
+          slug: app.slug,
+        },
+        text: `Rolling ${where} back to ${sha10(result.sha)} (deploy ${result.deployId}) — wait_for_deploy follows it.`,
+      };
+    },
+  }),
+  defineTool({
+    description:
+      "Re-run the deploy that is live now (the UI's Redeploy), at the sha production is serving. Nothing deployed yet is refused (no_deploy).",
+    name: "redeploy",
+    params: AppParams,
+    run: async ({ principal }, { app: ref }) => {
+      const { app, role } = await requireGatedApp(principal, ref, "push");
+      const live = app.lastDeploySha;
+
+      if (live === null) {
+        throw refused(
+          "no_deploy",
+          `${app.slug} has no successful deploy to re-run; commit to its default branch first.`
+        );
+      }
+
+      const result = await attempt(() =>
+        runnerRollback(app.id, live, "", role)
+      );
+
+      return {
+        structured: {
+          appId: app.id,
+          deployId: result.deployId,
+          environment: null,
+          ok: result.ok,
+          sha: result.sha,
+          slug: app.slug,
+        },
+        text: `Re-deploying ${app.slug} at ${sha10(result.sha)} (deploy ${result.deployId}) — wait_for_deploy follows it.`,
+      };
+    },
+  }),
+  defineTool({
+    description:
+      "Stop an in-flight deploy (needs the push role). The runner kills the running step and closes the deploy as cancelled; a deploy that already finished is refused (not_open).",
+    name: "cancel_deploy",
+    params: appParams({
+      deployId: Schema.String.check(Schema.isNonEmpty()).annotate({
+        description: "Deploy id from deploy_status.",
+      }),
+    }),
+    run: async ({ principal }, { app: ref, deployId }) => {
+      const { app } = await requireGatedApp(principal, ref, "push");
+
+      const result = await attempt(() => runnerCancelDeploy(app.id, deployId));
+
+      return {
+        structured: {
+          appId: app.id,
+          deployId,
+          ok: result.ok,
+          slug: app.slug,
+        },
+        text: `Cancelled deploy ${deployId} in ${app.slug}.`,
+      };
+    },
+  }),
+  defineTool({
+    description:
+      "Wait for a deploy to finish: one bounded long poll (at most `maxWaitSeconds`, default 25) that answers as soon as the row is terminal, or with the row it last saw and a resume hint. The transport is stateless — call it again to keep waiting.",
+    name: "wait_for_deploy",
+    params: appParams({
+      deployId: Schema.optional(
+        Schema.String.check(Schema.isNonEmpty()).annotate({
+          description: "Wait for this deploy id (default: the newest row).",
+        })
+      ),
+      environment: Schema.optional(EnvironmentRef).annotate({
+        description:
+          "Wait on one preview environment's deploy (default: production).",
+      }),
+      maxWaitSeconds: Schema.optional(
+        Schema.Number.check(
+          Schema.isInt(),
+          Schema.isGreaterThanOrEqualTo(1),
+          Schema.isLessThanOrEqualTo(MAX_WAIT_SECONDS)
+        ).annotate({
+          description: `How long this call waits, at most ${MAX_WAIT_SECONDS} seconds (default 25).`,
+        })
+      ),
+      sha: Schema.optional(SourceRef).annotate({
+        description:
+          "Wait for the deploy of this commit instead of the newest row.",
+      }),
+    }),
+    run: async (
+      { principal },
+      { app: ref, deployId, environment, maxWaitSeconds, sha }
+    ) => {
+      const { app, role } = await requireGatedApp(principal, ref, "view");
+
+      const env =
+        environment === undefined
+          ? null
+          : await denyAs(
+              () => requireEnvironment(app, role, environment),
+              "not_found"
+            );
+
+      const environmentId = env?.id ?? "";
+      const budgetSeconds = maxWaitSeconds ?? 25;
+      let wanted = "no deploy row";
+
+      if (deployId !== undefined) {
+        wanted = `deploy ${deployId}`;
+      } else if (sha !== undefined) {
+        wanted = `the deploy of ${sha}`;
+      }
+
+      const outcome = await boundedWait(
+        app.id,
+        environmentId,
+        { deployId, sha },
+        principal.keyId,
+        budgetSeconds * 1000
+      );
+
+      const where = env === null ? app.slug : `${app.slug}/${env.label}`;
+
+      // The resume call is the same tool with the same arguments: an agent
+      // that only read the text can re-arm without reconstructing anything.
+      const resume = {
+        arguments: {
+          app: ref,
+          deployId: deployId ?? null,
+          environment: environment ?? null,
+          maxWaitSeconds: budgetSeconds,
+          sha: sha ?? null,
+        },
+        tool: "wait_for_deploy",
+      };
+
+      if (outcome._tag === "Settled") {
+        return {
+          structured: {
+            appId: app.id,
+            deploy: outcome.deploy,
+            done: true,
+            environment: env?.label ?? null,
+            resume: null,
+            slug: app.slug,
+            status: outcome.deploy.status,
+          },
+          text: `${where}: deploy ${outcome.deploy.id} is ${outcome.deploy.status}${outcome.deploy.sha === null ? "" : ` at ${sha10(outcome.deploy.sha)}`}.`,
+        };
+      }
+
+      if (outcome._tag === "Waiting") {
+        return {
+          structured: {
+            appId: app.id,
+            deploy: outcome.deploy,
+            done: false,
+            environment: env?.label ?? null,
+            resume,
+            slug: app.slug,
+            status: outcome.deploy.status,
+          },
+          text: `${where}: deploy ${outcome.deploy.id} is still ${outcome.deploy.status} after ${budgetSeconds}s. Call wait_for_deploy again with the same arguments to keep waiting.`,
+        };
+      }
+
+      return {
+        structured: {
+          appId: app.id,
+          deploy: null,
+          done: false,
+          environment: env?.label ?? null,
+          resume,
+          slug: app.slug,
+          status: null,
+        },
+        text: `${where}: ${wanted} has not appeared after ${budgetSeconds}s. The runner may not have queued it — call wait_for_deploy again, and check deploy_status.`,
       };
     },
   }),

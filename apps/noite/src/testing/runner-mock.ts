@@ -2,6 +2,8 @@
 //! Test-only stand-in for the Rust runner's JSON-RPC endpoint: installs a
 //! `fetch` that answers `/rpc` calls from an in-memory app table and records
 //! which methods were called.
+import type * as Schema from "effect/Schema";
+
 import { controlEnv } from "../lib/control-env";
 import type { RunnerApp } from "../lib/runner";
 
@@ -37,6 +39,10 @@ export interface RunnerMock {
 }
 
 export interface RunnerMockOptions {
+  /** Answers the RPC methods this double does not model (prs.*, git.*,
+   * deploys.*, environments.*). Return a `RpcRefusal` to refuse like the
+   * runner would; `undefined` keeps answering `-32004`. */
+  resolve?: (call: RpcCall) => Schema.Json | RpcRefusal | undefined;
   /** Runs before the canned `apps.create` answer. Return `"timeout"` to make
    * the call abort the way `AbortSignal.timeout` does when the runner
    * outlives the control plane's bound — the test can push the row it landed
@@ -52,8 +58,9 @@ interface RpcCall {
   params: Record<string, string>;
 }
 
-/** A JSON-RPC error the runner would answer with (e.g. a slug conflict). */
-class RpcFailure {
+/** A JSON-RPC error the runner would answer with (e.g. a slug conflict). A
+ * test can return one from `answers` to refuse like the runner would. */
+export class RpcRefusal {
   readonly code: number;
   readonly message: string;
 
@@ -103,7 +110,7 @@ export const installRunnerMock = (
         }
 
         if (mock.apps.some((app) => app.slug === call.params.slug)) {
-          return new RpcFailure(409, "slug already taken");
+          return new RpcRefusal(409, "slug already taken");
         }
 
         const created = makeApp({
@@ -131,7 +138,7 @@ export const installRunnerMock = (
       }
 
       default: {
-        return null;
+        return options.resolve?.(call) ?? null;
       }
     }
   };
@@ -146,7 +153,7 @@ export const installRunnerMock = (
     mock.requests.push(body.params);
     const result = answer(body);
 
-    if (result instanceof RpcFailure) {
+    if (result instanceof RpcRefusal) {
       return {
         error: { code: result.code, message: result.message },
         id: body.id,

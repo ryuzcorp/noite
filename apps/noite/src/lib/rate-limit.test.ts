@@ -130,7 +130,9 @@ describe("limitedClass", () => {
     expect(limitedClass("/api/42/envelope")).toBe("envelope");
     expect(limitedClass("/api/42/envelope/")).toBe("envelope");
     expect(limitedClass("/api/streams")).toBe("stream");
+    expect(limitedClass("/mcp")).toBe("mcp");
     expect(limitedClass("/api/apps/stream")).toBeNull();
     expect(limitedClass("/api/apps/envelope")).toBeNull();
+    expect(limitedClass("/mcp/extra")).toBeNull();
   });
 });

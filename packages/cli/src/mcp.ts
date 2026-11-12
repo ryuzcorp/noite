@@ -128,8 +128,9 @@ export type CallInput =
 /** The protocol revision this client speaks (the header the server checks). */
 export const PROTOCOL_VERSION = "2025-06-18";
 
-/** How long one call may take: a runner RPC behind an action is bounded at
- * 15 s, so this fails well before a CI step's own patience runs out. */
+/** How long one call may take by default: a runner RPC behind an action is
+ * bounded at 15 s, so this fails well before a CI step's own patience runs
+ * out. `wait_for_deploy` passes its own, longer bound. */
 const TIMEOUT_MS = 30_000;
 
 /** Classify one call result. This is the only place the ladder lives: the
@@ -209,11 +210,14 @@ export const classifyCall = (
 
 /** Call one MCP tool as the API key's account. A tool-level failure (a
  * refused role, a missing app, a denied key) fails here with the tool's own
- * message, which is what the user must read. */
+ * message, which is what the user must read. `timeoutMs` is for the one tool
+ * that waits on purpose (`wait_for_deploy`): its own bound plus the write it
+ * answers with. */
 export const callTool = <T>(
   connection: { readonly appUrl: string; readonly token: string },
   name: string,
-  args: ToolArgs
+  args: ToolArgs,
+  options?: { readonly timeoutMs?: number }
 ): Effect.Effect<ToolCall<T>, Error> =>
   Effect.gen(function* run() {
     const { appUrl, token } = connection;
@@ -235,7 +239,7 @@ export const callTool = <T>(
             "mcp-protocol-version": PROTOCOL_VERSION,
           },
           method: "POST",
-          signal: AbortSignal.timeout(TIMEOUT_MS),
+          signal: AbortSignal.timeout(options?.timeoutMs ?? TIMEOUT_MS),
         }),
     }).pipe(
       Effect.map((response) => ({ response, tag: "Response" as const })),

@@ -11,6 +11,7 @@ import {
 } from "./status";
 
 const review = (over: Partial<PrReview> = {}): PrReview => ({
+  authorLabel: null,
   commitSha: "head1",
   createdAt: "2026-01-01T00:00:00Z",
   dismissedAt: null,
@@ -41,6 +42,7 @@ const detail = (over: Partial<PrDetail> = {}): PrDetail => ({
   mergeState: "mergeable",
   pullRequest: {
     authorId: "u1",
+    authorLabel: null,
     base: "main",
     body: "",
     closedAt: null,

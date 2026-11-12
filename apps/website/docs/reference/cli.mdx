@@ -75,3 +75,29 @@ An environment is named by its **label** (e.g. `staging`) or its id. The app is 
 These commands do not use Git: they talk to the control UI's MCP endpoint ([Agents](/reference/mcp)), so they need the control UI's **origin** rather than the git base. `--app-url`/`NOITE_APP_URL` names it; without either it is derived from `--url`: `https://git.<domain>` → `https://app.<domain>`, and the bare base on a localhost install (`http://git.noite.localhost:9080` → `http://noite.localhost:9080`, where control runs).
 
 The same flags (`--slug`, `--token`, `--url`, `--app-url`) apply to every subcommand. Nothing is written to `$GITHUB_OUTPUT`, and no PR comment is posted: these are interactive commands, not the deploy step.
+
+## The agent loop from a terminal
+
+Every command below is a thin client of the [MCP tools](/reference/mcp#the-agent-loop): the role gates, the merge rules and the wording are the server's own, so the CLI and an agent cannot disagree.
+
+```bash
+noite pr list --slug my-app                    # --state open|closed|merged|all, --limit N
+noite pr view 12 --slug my-app                 # state, mergeability, reviews, checks, preview
+noite pr create --head feature-x --title "Add the thing" --slug my-app
+noite pr merge 12 --slug my-app --delete-branch
+noite logs --slug my-app --limit 100           # --environment staging for a preview
+noite rollback --sha 1a2b3c4 --slug my-app     # --environment staging for a preview
+```
+
+`noite deploy` keeps its push behaviour and gains two subcommands, which carry the same connection flags as every other command:
+
+```bash
+noite deploy status --slug my-app              # this app's deploy state and recent deploys
+noite deploy wait --slug my-app                # bounded long poll, re-armed until it settles
+noite deploy wait --slug my-app --sha 1a2b3c4 --max-wait 25 --timeout 900
+noite deploy wait --slug my-app --environment staging
+```
+
+`deploy wait` re-calls `wait_for_deploy` (at most 25 s per call by default) until the deploy reaches a terminal status, then prints it; `--timeout` (default 900 s) bounds the whole wait. `--deploy-id`, `--sha` and `--environment` choose which row it follows.
+
+Every one of these talks to the control UI's MCP endpoint, so they need the control origin rather than the git base: `--app-url`/`NOITE_APP_URL`, else derived from `--url` as described above.

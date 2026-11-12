@@ -112,6 +112,13 @@ enum WebTarget<'a> {
 /// defaults to `main`; a branch that does not exist yet is created, from
 /// `fromSha` when given, else from `main`, else as a root commit. Returns the
 /// new commit sha.
+///
+/// `expected_tip` is the caller's compare-and-set precondition (an agent's
+/// `commit_files`): the branch must still be at that commit — a ref or sha that
+/// resolves to it — or the commit is refused with "tip moved" instead of
+/// silently growing on top of a tip another writer moved. `None` keeps the
+/// read-then-write behaviour a browser edit has always had.
+#[allow(clippy::too_many_arguments)] // the commit surface: one call per field the body carries
 pub async fn web_commit(
     state: &AppState,
     app: &App,
@@ -120,6 +127,7 @@ pub async fn web_commit(
     changes: WebChanges<'_>,
     branch: Option<&str>,
     from_sha: Option<&str>,
+    expected_tip: Option<&str>,
 ) -> anyhow::Result<String> {
     commit_into(
         state,
@@ -129,6 +137,7 @@ pub async fn web_commit(
         changes,
         WebTarget::Branch(branch),
         from_sha,
+        expected_tip,
     )
     .await
 }
@@ -154,6 +163,7 @@ pub async fn web_commit_preview(
         changes,
         WebTarget::Preview { git_ref, branch },
         None,
+        None,
     )
     .await
 }
@@ -167,6 +177,7 @@ async fn commit_into(
     changes: WebChanges<'_>,
     target: WebTarget<'_>,
     from_sha: Option<&str>,
+    expected_tip: Option<&str>,
 ) -> anyhow::Result<String> {
     let WebChanges {
         files,
@@ -240,7 +251,7 @@ async fn commit_into(
             let parent = match &existing {
                 Some(sha) => Some(sha.clone()),
                 None => match from_sha {
-                    Some(from) => Some(forge::resolve_ref(&bare, from).await?),
+                    Some(from) => Some(forge::resolve_user_ref(&bare, from).await?),
                     None => refs.get(&format!("refs/heads/{DEFAULT_BRANCH}")).cloned(),
                 },
             };
@@ -261,6 +272,21 @@ async fn commit_into(
             (git_ref.to_string(), parent)
         }
     };
+    // The caller's precondition, checked before any object is written: a tip
+    // that moved since it read the branch is refused, and its commit never
+    // lands. The publish below carries the same value, so the window between
+    // this check and the ref write cannot let a racing push through either.
+    let expected_old = match expected_tip {
+        Some(tip) => {
+            let tip_sha = forge::resolve_user_ref(&bare, tip).await?;
+            let current = refs.get(&refname).cloned();
+            if current.as_deref() != Some(tip_sha.as_str()) {
+                bail!("tip moved under this update: {refname} is {current:?}, expected {tip_sha}");
+            }
+            Some(tip_sha)
+        }
+        None => refs.get(&refname).cloned(),
+    };
     let sha = build_commit(
         &bare,
         parent.as_deref(),
@@ -271,14 +297,7 @@ async fn commit_into(
         deletes,
     )
     .await?;
-    forge::publish_refname(
-        state,
-        app,
-        &refname,
-        refs.get(&refname).map(String::as_str),
-        Some(&sha),
-    )
-    .await?;
+    forge::publish_refname(state, app, &refname, expected_old.as_deref(), Some(&sha)).await?;
     Ok(sha)
 }
 

@@ -34,6 +34,9 @@ pub struct CreateBody {
     pub body: String,
     pub base: String,
     pub head: String,
+    /// How a machine signs the row; absent for a person.
+    #[serde(default)]
+    pub author_label: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -55,6 +58,9 @@ pub struct CommentBody {
     pub actor: Actor,
     pub role: String,
     pub body: String,
+    /// How a machine signs the row; absent for a person.
+    #[serde(default)]
+    pub author_label: Option<String>,
     #[serde(default)]
     pub path: Option<String>,
     #[serde(default)]
@@ -80,6 +86,9 @@ pub struct ReviewBody {
     pub actor: Actor,
     pub role: String,
     pub state: String,
+    /// How a machine signs the row; absent for a person.
+    #[serde(default)]
+    pub author_label: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -140,6 +149,7 @@ pub async fn create_pr(
         &body.body,
         &body.base,
         &body.head,
+        body.author_label.as_deref(),
     )
     .await
     .map(Json)
@@ -180,6 +190,7 @@ pub async fn add_comment(
         body.line,
         body.side.as_deref(),
         body.commit_sha.as_deref(),
+        body.author_label.as_deref(),
     )
     .await
     .map(Json)
@@ -216,9 +227,17 @@ pub async fn add_review(
     Path((id, number)): Path<(String, i64)>,
     Json(body): Json<ReviewBody>,
 ) -> impl IntoResponse {
-    service::prs::review(&state, &id, number, &body.actor, &body.role, &body.state)
-        .await
-        .map(Json)
+    service::prs::review(
+        &state,
+        &id,
+        number,
+        &body.actor,
+        &body.role,
+        &body.state,
+        body.author_label.as_deref(),
+    )
+    .await
+    .map(Json)
 }
 
 pub async fn merge_pr(

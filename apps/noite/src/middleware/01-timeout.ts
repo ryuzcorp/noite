@@ -21,11 +21,20 @@
  * (`RUN_WORKER_FIRST` in `void.config.ts` excludes it), so this exemption
  * covers the paths that still reach the Worker: a missing file's fall
  * through, and a direct-to-worker request.
+ *
+ * `/mcp` carries its own, longer bound: one `tools/call` may deliberately wait
+ * (`wait_for_deploy`, capped at 60 s), so the action bound would cut a healthy
+ * answer into a 504 the caller cannot read.
  */
 import { defineMiddleware } from "void";
 
 /** Bound every bounded route: a hung handler fails fast, never hangs. */
 export const TIMEOUT_MS = 15_000;
+
+/** The MCP endpoint's bound: `wait_for_deploy`'s 60 s cap plus the write it
+ * answers with. The edge has no response deadline of its own (Caddy's
+ * progress-based `write_idle` is 1 m, and this answers inside it). */
+export const MCP_TIMEOUT_MS = 65_000;
 
 /** How one path is bounded. One closed type; `routeTimeout` is the only
  * function that decides it. */
@@ -50,11 +59,17 @@ const exemptWhy = (path: string): "download" | "static" | "stream" | null => {
   return null;
 };
 
-/** The one timeout decision for a request path. */
+/** The one timeout decision for a request path. `boundedMs` is the action
+ * bound; `/mcp` answers on its own bound because a tool call may wait on
+ * purpose ({@link MCP_TIMEOUT_MS}). */
 export const routeTimeout = (
   path: string,
   boundedMs: number = TIMEOUT_MS
 ): RouteTimeout => {
+  if (path === "/mcp") {
+    return { kind: "bounded", ms: MCP_TIMEOUT_MS };
+  }
+
   const why = exemptWhy(path);
 
   return why === null

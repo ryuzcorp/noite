@@ -4,4 +4,8 @@ import type { PrState } from "./PrState";
 /**
  * A PR as the list and detail pages show it.
  */
-export type PrSummary = { number: number, title: string, body: string, authorId: string, base: string, head: string, state: PrState, headSha: string, mergeSha: string | null, mergedBy: string | null, createdAt: string, updatedAt: string, closedAt: string | null, mergedAt: string | null, commentCount: number, };
+export type PrSummary = { number: number, title: string, body: string, authorId: string, 
+/**
+ * How a machine signed it ('<user> via key <name>'); `None` for a person.
+ */
+authorLabel: string | null, base: string, head: string, state: PrState, headSha: string, mergeSha: string | null, mergedBy: string | null, createdAt: string, updatedAt: string, closedAt: string | null, mergedAt: string | null, commentCount: number, };

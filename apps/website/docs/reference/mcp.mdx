@@ -99,6 +99,53 @@ Every environment tool reports the environment's URL, `<label>.<slug>.<base>`, a
 
 `create_app` takes a `source` of `blank`, `{ kind: "github", url, ref? }` or `{ kind: "template", template }`, and enforces the same per-account app limit as the UI ([Limits](/reference/limits)). A GitHub import obeys the same rules as the UI: public `https://github.com/<owner>/<repo>` only, one-time copy, 500 MiB and 10 minutes ([Create an app](/apps/create#import-from-github)).
 
+## The agent loop
+
+The tools above read; these write. Each one takes `app` and answers a **refusal** an agent can act on — as `structuredContent.refusal` on the error result, with a stable `code` (`protected_branch`, `stale_tip`, `not_mergeable`, `not_open`, `forbidden`, `no_deploy`, `branch_exists`, `branch_missing`, `not_found`, `invalid`, `conflict`) plus a `hint`:
+
+| Tool | Does | Role |
+| --- | --- | --- |
+| `commit_files` | Writes, deletes and moves files on a branch (creating it from `base` when it does not exist), as one commit. `expectedTip` is a compare-and-set: a branch that moved is refused with `stale_tip`. Answers the commit sha and the deploy it triggered, if any. | `push` |
+| `create_branch` | Creates a branch at a ref or commit. An existing name is `branch_exists`. | `push` |
+| `delete_branch` | Deletes a branch and its preview environment. The default branch is `protected_branch`. | `admin` |
+| `list_prs` | Pull requests, newest first, with the open/closed/merged counts. `state` filters the list. | `view` |
+| `get_pr` | One pull request: state, mergeability, reviews, approvals, the checks that gate merging, and the preview environment tracking the head branch. | `view` |
+| `create_pr` | Opens a pull request from a branch. | `push` |
+| `comment_pr` | Comments on the conversation, or on one diff line when the full anchor is given. | `push` |
+| `review_pr` | Approves or requests changes (never your own pull request). | `push` |
+| `merge_pr` | Squash-merges, respecting branch protection: conflicts, a missing branch and too few approvals are refusals, not errors. `deleteBranch` removes the head branch and its preview. | `push` |
+| `close_pr` | Closes a pull request without merging. | `push` |
+| `rollback` | Re-runs a previous successful deploy's sha — production, or one environment. | `push` |
+| `redeploy` | Re-runs the deploy that is live now (the UI's Redeploy). Nothing deployed yet is `no_deploy`. | `push` |
+| `cancel_deploy` | Stops an in-flight deploy. A finished one is `not_open`. | `push` |
+| `wait_for_deploy` | One bounded long poll of a deploy row: returns the moment it is terminal, or after `maxWaitSeconds` (≤ 60) with the row it last saw and a `resume` hint. The transport is stateless — call it again to keep waiting. | `view` |
+
+A typical loop, all with one API key:
+
+```text
+create_app            → slug, git remote
+commit_files          → sha (expectedTip = the tip you last read)
+create_pr             → number, merge state
+wait_for_deploy       → the preview deploy of the head commit
+merge_pr              → merge sha
+wait_for_deploy       → the deploy of the merge on the base branch
+rollback              → re-run a previous sha, if the deploy goes wrong
+```
+
+The same loop is on the command line: `noite pr`, `noite rollback`, `noite logs`, `noite deploy status|wait` ([CLI](/reference/cli)).
+
+### Committing with a key, without MCP
+
+`POST /api/apps/{id}/source/commit` takes the same profile key as `Authorization: Bearer noite_…` (scope **App Management**), gated on that app exactly like `/mcp`, so an agent or a CI step can commit straight from its own HTTP client:
+
+```bash
+curl -X POST https://app.<domain>/api/apps/<app-id>/source/commit \
+  -H "Authorization: Bearer noite_…" -H "content-type: application/json" \
+  -d '{"message":"fix typo","branch":"main","expectedTip":"<sha>","files":[{"path":"README.md","content":"# hi\n"}]}'
+```
+
+`expectedTip` is optional and is the same compare-and-set `commit_files` uses.
+
 ## Pushing instead
 
 `create_app` is not the only way in. An agent with git access can push to a slug that does not exist yet and create the app that way; it becomes the pusher's, with them as admin ([Create by pushing](/apps/create#create-by-pushing)). For everything else, `repo_*` reads and the `deploy_*`, `app_*` and `env_*` tools cover the same ground the app detail page does.

@@ -256,6 +256,10 @@ CREATE TABLE IF NOT EXISTS pull_request (
   title TEXT NOT NULL,
   body TEXT NOT NULL DEFAULT '',
   author_id TEXT NOT NULL,
+  -- How a machine (an API key's MCP tools) signs this row: '<user> via key
+  -- <name>'. NULL on anything a person wrote, which keeps the UI on the
+  -- account name it resolves from D1.
+  author_label TEXT,
   base TEXT NOT NULL DEFAULT 'main',
   head TEXT NOT NULL,
   state TEXT NOT NULL CHECK (state IN ('open','closed','merged')),
@@ -281,6 +285,7 @@ CREATE TABLE IF NOT EXISTS pr_comment (
   id TEXT PRIMARY KEY NOT NULL,
   pr_id TEXT NOT NULL REFERENCES pull_request(id) ON DELETE CASCADE,
   author_id TEXT NOT NULL,
+  author_label TEXT,
   body TEXT NOT NULL,
   path TEXT,
   line INTEGER,
@@ -298,6 +303,7 @@ CREATE TABLE IF NOT EXISTS pr_review (
   id TEXT PRIMARY KEY NOT NULL,
   pr_id TEXT NOT NULL REFERENCES pull_request(id) ON DELETE CASCADE,
   reviewer_id TEXT NOT NULL,
+  author_label TEXT,
   state TEXT NOT NULL CHECK (state IN ('approved','changes_requested')),
   commit_sha TEXT NOT NULL,
   created_at TEXT NOT NULL,

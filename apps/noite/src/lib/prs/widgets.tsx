@@ -16,11 +16,14 @@ import type { DiffSide, LineAnchor } from "./data";
 import { invalidatePr } from "./resources";
 import { prStateFacts, reviewStateFacts } from "./status";
 
-/** A user id's display name, or "Former user" when the account is gone. */
+/** How one row is signed: the label a machine wrote ('<user> via key <ci>')
+ * wins over the account name, which stays the fallback for anything a person
+ * wrote (and for a label the row predates). */
 export const nameFor = (
   names: Record<string, string> | undefined,
-  id: string
-): string => names?.[id] ?? "Former user";
+  id: string,
+  label: string | null = null
+): string => label ?? names?.[id] ?? "Former user";
 
 export const PrStateBadge = ({ state }: { state: PrState }) => {
   const facts = prStateFacts(state);
@@ -314,10 +317,15 @@ export const CommentCard = ({
 
   return (
     <article class="border-base-300 flex gap-3 rounded-lg border p-3">
-      <Avatar label={nameFor(names, comment.authorId)} size="sm" />
+      <Avatar
+        label={nameFor(names, comment.authorId, comment.authorLabel)}
+        size="sm"
+      />
       <div class="flex min-w-0 flex-1 flex-col gap-2">
         <div class="flex flex-wrap items-center gap-x-2 gap-y-1 text-sm">
-          <span class="font-medium">{nameFor(names, comment.authorId)}</span>
+          <span class="font-medium">
+            {nameFor(names, comment.authorId, comment.authorLabel)}
+          </span>
           <span class="text-base-content/70 text-xs">
             {formatAgo(comment.createdAt)}
           </span>
@@ -404,10 +412,15 @@ export const ReviewCard = ({
 
   return (
     <article class="border-base-300 flex items-center gap-3 rounded-lg border p-3">
-      <Avatar label={nameFor(names, review.reviewerId)} size="sm" />
+      <Avatar
+        label={nameFor(names, review.reviewerId, review.authorLabel)}
+        size="sm"
+      />
       <div class="min-w-0 flex-1">
         <div class="flex flex-wrap items-center gap-x-2 gap-y-1 text-sm">
-          <span class="font-medium">{nameFor(names, review.reviewerId)}</span>
+          <span class="font-medium">
+            {nameFor(names, review.reviewerId, review.authorLabel)}
+          </span>
           <span class={`badge badge-sm ${facts.badge}`}>{facts.label}</span>
           {review.dismissedAt ? (
             <span class="badge badge-sm badge-ghost">Dismissed</span>
