@@ -72,6 +72,16 @@ pub fn slug_ok(cfg: &Config, slug: &str) -> bool {
     {
         return false;
     }
+    slug_grammar_ok(slug)
+}
+
+/// The slug *grammar* alone (`^[a-z0-9]([a-z0-9-]{0,46}[a-z0-9])?$`): shape
+/// and path safety, with no live-config reservations. Persisted state (a
+/// rename marker) is validated with this one: whether a slug is a configured
+/// control host today says nothing about a marker written before that config,
+/// and dropping the marker would release the target and the build uid it
+/// guards.
+pub fn slug_grammar_ok(slug: &str) -> bool {
     static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     let re = RE.get_or_init(|| {
         // Static invariant: a compile-time literal, so construction never fails.

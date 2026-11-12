@@ -168,6 +168,8 @@ async fn move_s3_prefix_keep_destination(cfg: &Config, from: &str, to: &str) -> 
     }
     // One listing of the destination prefix is cheaper and less racy than a
     // HEAD per moved key: every key already there is newer by definition.
+    // The snapshot is sound because the caller holds the AppLock and both
+    // slugs' push guards, which exclude every writer of either prefix.
     let existing_json = s3::s3_list_prefix(cfg, &bucket, &to_key).await?;
     let existing: std::collections::HashSet<String> = parse_listing_keys(&existing_json, to, from)?
         .into_iter()
@@ -197,8 +199,9 @@ async fn move_s3_prefix_keep_destination(cfg: &Config, from: &str, to: &str) -> 
 /// other's. The salvage belongs to the app, not to the slug: a rename that
 /// commits off `from` must take `.from.recreated-*` with it, or the next create
 /// of that slug would sweep the app's parked data as the new tenant's own. The
-/// same holds for a cancel leaving the target's name. Failures are the
-/// caller's to log: the rename/cancel itself has already committed.
+/// same holds for a cancel leaving the target's name. One failed rename does
+/// not stop the rest; any failure is returned so the caller can decide (the
+/// cancel keeps its marker, the committed rename only warns).
 async fn relocate_salvage(cfg: &Config, from: &str, to: &str) -> anyhow::Result<()> {
     if from == to {
         return Ok(());
@@ -208,6 +211,7 @@ async fn relocate_salvage(cfg: &Config, from: &str, to: &str) -> anyhow::Result<
     let plain_to = format!(".{to}.recreated-");
     let git_from = format!(".{from}.git.recreated-");
     let git_to = format!(".{to}.git.recreated-");
+    let mut failures = 0_usize;
     for (tree, from_prefix, to_prefix) in [
         ("repos", git_from.as_str(), git_to.as_str()),
         ("git-http", git_from.as_str(), git_to.as_str()),
@@ -230,16 +234,19 @@ async fn relocate_salvage(cfg: &Config, from: &str, to: &str) -> anyhow::Result<
                 continue;
             };
             let dest = parent.join(format!("{to_prefix}{suffix}"));
-            tokio::fs::rename(entry.path(), &dest)
-                .await
-                .with_context(|| {
-                    format!(
-                        "relocate rename salvage {} → {}",
-                        entry.path().display(),
-                        dest.display()
-                    )
-                })?;
+            if let Err(e) = tokio::fs::rename(entry.path(), &dest).await {
+                failures += 1;
+                tracing::warn!(
+                    from = %entry.path().display(),
+                    to = %dest.display(),
+                    error = %e,
+                    "could not relocate a rename salvage dir"
+                );
+            }
         }
+    }
+    if failures > 0 {
+        anyhow::bail!("{failures} rename salvage dir(s) could not be relocated");
     }
     Ok(())
 }
@@ -358,9 +365,10 @@ async fn marker_belongs_to(path: &std::path::Path, app_id: &str) -> bool {
     )
 }
 
-/// Every unfinished rename on disk, oldest first. Malformed markers — and
-/// markers naming a slug that is not grammar-valid — are removed: they reserve
-/// nothing, and no pass may turn one into a path or an S3 prefix.
+/// Every unfinished rename on disk, oldest first. Malformed markers are
+/// removed (they reserve nothing). A marker whose slug fails the grammar is
+/// skipped — never unlinked — so its target stays reserved: its slugs may be
+/// out of grammar only because the live config (control hosts) changed.
 pub(crate) async fn pending_renames(cfg: &Config) -> Vec<PendingRename> {
     let dir = exec::work_root(cfg).join("rename");
     let Ok(mut entries) = tokio::fs::read_dir(&dir).await else {
@@ -376,20 +384,21 @@ pub(crate) async fn pending_renames(cfg: &Config) -> Vec<PendingRename> {
         }
         match read_marker(&path).await {
             // Every slug in a marker becomes a path segment or an S3 prefix in
-            // the resume/cancel passes. The slugs that write a marker are
-            // validated upstream, but a marker is disk state: reject anything
-            // that is not a slug before it can name a path.
+            // the resume/cancel passes, so only the grammar (shape and path
+            // safety) is enforced here. Live-config reservations are not: a
+            // control-host rename must not delete a marker written before that
+            // config, which would release the target and the build uid it
+            // guards. Skip it (never unlink) and let the reservation stand.
             Some(marker)
-                if !crate::lifecycle::slug_ok(cfg, &marker.from)
-                    || !crate::lifecycle::slug_ok(cfg, &marker.to) =>
+                if !crate::lifecycle::slug_grammar_ok(&marker.from)
+                    || !crate::lifecycle::slug_grammar_ok(&marker.to) =>
             {
                 tracing::warn!(
                     path = %path.display(),
                     from = %marker.from,
                     to = %marker.to,
-                    "rename marker names an invalid slug; removing it"
+                    "rename marker names a slug outside the grammar; skipping it and keeping its reservation"
                 );
-                let _ = tokio::fs::remove_file(&path).await;
             }
             Some(marker) => out.push(marker),
             None => {
@@ -576,13 +585,20 @@ enum FailureRecord {
 /// Reset a marker's failed-pass count: a manual retry (or cancel) is a fresh
 /// decision by the app's owner, so the automatic bound starts over.
 async fn reset_resume_attempts(cfg: &Config, marker: &PendingRename) {
-    if marker.attempts == 0 && marker.last_failure.is_none() && marker.last_attempt_at.is_none() {
+    if marker.attempts == 0
+        && marker.last_failure.is_none()
+        && marker.last_attempt_at.is_none()
+        && !marker.cancelling
+    {
         return;
     }
     let mut next = marker.clone();
     next.attempts = 0;
     next.last_failure = None;
     next.last_attempt_at = None;
+    // A manual forward retry is the latest owner decision: it also clears a
+    // cancel a crash may have recorded before the retry was issued.
+    next.cancelling = false;
     if let Err(e) = write_marker(cfg, &next).await {
         tracing::warn!(
             target = %next.to,
@@ -1632,8 +1648,8 @@ async fn rename_slugged(
 #[cfg(test)]
 mod tests {
     use super::{
-        move_dir, parse_listing_keys, pending_renames, record_resume_failure, write_rename_marker,
-        PendingRename,
+        move_dir, parse_listing_keys, pending_renames, record_resume_failure, target_reserved,
+        write_rename_marker, PendingRename,
     };
 
     /// A resume pass failing after a cancel or commit resolved its marker must
@@ -1708,10 +1724,11 @@ mod tests {
     }
 
     /// Marker slugs are path and prefix segments in the resume/cancel passes.
-    /// A marker naming an invalid slug is removed, exactly like a malformed
-    /// one, instead of ever reaching a path.
+    /// A marker outside the slug grammar is skipped — never turned into a path
+    /// — but it is not unlinked: the reservation it carries still guards data
+    /// this pass may simply not understand.
     #[tokio::test]
-    async fn a_marker_with_an_invalid_slug_is_dropped() {
+    async fn a_marker_outside_the_grammar_is_skipped_but_kept() {
         let base =
             std::env::temp_dir().join(format!("noite-rename-bad-slug-{}", crate::models::new_id()));
         let mut cfg = crate::config::config_for_tests();
@@ -1719,11 +1736,74 @@ mod tests {
         let dir = crate::host::exec::work_root(&cfg).join("rename");
         std::fs::create_dir_all(&dir).expect("rename dir");
         std::fs::write(dir.join("evil.json"), "app-id\n../etc\n").expect("bad marker");
-        assert!(pending_renames(&cfg).await.is_empty());
+        assert!(pending_renames(&cfg).await.is_empty(), "the pass skips it");
         assert!(
-            !dir.join("evil.json").exists(),
-            "the invalid marker is gone"
+            dir.join("evil.json").exists(),
+            "the reservation is never dropped by a validation pass"
         );
+        assert!(
+            target_reserved(&cfg, "evil").await,
+            "the target stays reserved"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A marker written before a control host was configured still passes the
+    /// marker validation: `slug_ok` (live config) is not the grammar, and
+    /// deleting the marker would release its target and the uid it guards.
+    #[tokio::test]
+    async fn a_control_host_slug_marker_survives_and_stays_reserved() {
+        let base = std::env::temp_dir().join(format!(
+            "noite-rename-control-slug-{}",
+            crate::models::new_id()
+        ));
+        let mut cfg = crate::config::config_for_tests();
+        cfg.work_dir = base.join("work").to_string_lossy().into_owned();
+        assert!(
+            crate::lifecycle::slug_grammar_ok("api"),
+            "the control host is grammar-valid"
+        );
+        assert!(
+            !crate::lifecycle::slug_ok(&cfg, "api"),
+            "and reserved by the live config"
+        );
+        write_rename_marker(&cfg, "app-id", "old", "api")
+            .await
+            .expect("marker");
+        assert_eq!(pending_renames(&cfg).await.len(), 1, "the marker survives");
+        assert!(
+            target_reserved(&cfg, "api").await,
+            "its target is still reserved"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A manual forward retry clears a `cancelling` flag a crash left behind:
+    /// the latest owner decision wins.
+    #[tokio::test]
+    async fn a_manual_reset_clears_a_recorded_cancel() {
+        let base = std::env::temp_dir().join(format!(
+            "noite-rename-reset-cancel-{}",
+            crate::models::new_id()
+        ));
+        let mut cfg = crate::config::config_for_tests();
+        cfg.work_dir = base.join("work").to_string_lossy().into_owned();
+        super::write_cancelling_marker_for_test(&cfg, "app-id", "old", "new")
+            .await
+            .expect("cancelling marker");
+        let marker = pending_renames(&cfg)
+            .await
+            .into_iter()
+            .next()
+            .expect("marker");
+        assert!(marker.cancelling);
+        super::reset_resume_attempts(&cfg, &marker).await;
+        let marker = pending_renames(&cfg)
+            .await
+            .into_iter()
+            .next()
+            .expect("marker");
+        assert!(!marker.cancelling, "the retry's decision is the newest");
         let _ = std::fs::remove_dir_all(&base);
     }
 
