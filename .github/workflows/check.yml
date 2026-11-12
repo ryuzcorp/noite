@@ -63,6 +63,14 @@ jobs:
         run: |
           pinned=$(sed -n 's/^ARG CELLD_DIGEST=//p' docker/Dockerfile)
           gh attestation verify "oci://ghcr.io/ryuzcorp/celld@$pinned" --repo ryuzcorp/celld
+      # Every other image and tarball pin, against the publisher: the tag's
+      # index digest, Node's signed SHASUMS256.txt, npm's dist.integrity and
+      # the GitHub release asset digest. A bump that changes a version but not
+      # its checksum fails here instead of at some later build.
+      - name: image and tarball pins are published
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bun docker/check-versions.ts --online
       # Script unit tests: docker/ (including the test-hygiene checker,
       # docker/check-tests.test.ts) and the CI scripts (bun skips dot
       # directories unless they're named explicitly).

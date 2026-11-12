@@ -40,7 +40,25 @@ ARG CADDY_VERSION=2.11.9
 # a local path, so no version pin — but its go.mod must require exactly
 # CADDY_VERSION above (docker/check-versions.ts asserts it), or Go's
 # minimum version selection would silently raise the Caddy xcaddy builds.
+# The builder image is digest-pinned like every other FROM below: the
+# multi-arch index digest comes from
+# `docker buildx imagetools inspect --format '{{.Manifest.Digest}}'`.
+ARG CADDY_DIGEST=sha256:345264d8c6b50f44f4a4d507d4e6b6bcae40eef2f210d70f76e717fd8cc31baf
 ARG NODE_VERSION=24.22.3
+# The Node tarballs' sha256, per arch, from the release's signed
+# SHASUMS256.txt (nodejs.org/download/release/v${NODE_VERSION}/); the install
+# below verifies the download before it unpacks it.
+ARG NODE_SHA256_X64=4f2b175a6d53a5c617a80dba2676238a0688cef28c6da4eba35c7d844e66fcfb
+ARG NODE_SHA256_ARM64=6e51a2ada00f0011cc266f65d98922b403d7ad88f809ca2aa615a5fe1ce6e86c
+ARG NODE_DIGEST=sha256:dc26ae92c9fb15cf6b1d63e20f0944b2efe0f115b20e00be48fb23fceb061c54
+# The build and dev toolchains, tag plus index digest. `RUST_VERSION` is a
+# major pin (`rust:1-bookworm`), `BUN_VERSION` a minor one (`1.4-debian` and
+# `1.4-slim` share it but not their digest). Keep the tags for readability.
+ARG RUST_VERSION=1
+ARG RUST_DIGEST=sha256:e6f2cff35d0f309acf8433b4f05878ed77092602c5065cc81801177da0bb3a9c
+ARG BUN_VERSION=1.4
+ARG BUN_DEBIAN_DIGEST=sha256:93d5032fe06d163427822dc1598f420363759bb18155c9cc90eb1be05a64a19e
+ARG BUN_SLIM_DIGEST=sha256:1846adf22496bd711036aae8be147e57bdebbaea2e5264e3e0b5af1db187d9a4
 # jup (https://github.com/unjs/jup) runs the tenant's npm, pnpm or Yarn at
 # the version the project pins. The npm tarball's sha512, as hex.
 ARG JUP_VERSION=0.6.6
@@ -68,7 +86,7 @@ FROM ${CELLD_IMAGE} AS celld
  # arm64 image does not run the Go toolchain under emulation.
  # The builder image's own CADDY_VERSION env (v-prefixed, from the tag above)
  # is the version xcaddy builds.
- FROM --platform=$BUILDPLATFORM docker.io/library/caddy:${CADDY_VERSION}-builder AS caddy-build
+FROM --platform=$BUILDPLATFORM docker.io/library/caddy:${CADDY_VERSION}-builder@${CADDY_DIGEST} AS caddy-build
  ARG TARGETOS
  ARG TARGETARCH
  # The builder image is golang-based, so the module's own tests run here and
@@ -83,10 +101,10 @@ FROM ${CELLD_IMAGE} AS celld
 
 # The pinned Node's binary, for the ui-build stage below (`COPY --from` cannot
 # expand variables, so the pin lives in a stage of its own).
-FROM docker.io/library/node:${NODE_VERSION}-slim AS node
+FROM docker.io/library/node:${NODE_VERSION}-slim@${NODE_DIGEST} AS node
 
 # --- runner binary ----------------------------------------------------------
-FROM docker.io/library/rust:1-bookworm AS runner-build
+FROM docker.io/library/rust:${RUST_VERSION}-bookworm@${RUST_DIGEST} AS runner-build
 WORKDIR /src
 RUN apt-get update && apt-get install -y --no-install-recommends pkg-config libssl-dev \
   && rm -rf /var/lib/apt/lists/*
@@ -118,7 +136,7 @@ RUN --mount=type=cache,id=noite-cargo-registry,target=/usr/local/cargo/registry,
 # vite runs under real Node (bun run honours the `node` shebang when a node is
 # on PATH): vite.config.ts loads cloudflare.config.ts through @cloudflare/config,
 # which refuses Bun. Only the binary is copied, from the pinned Node version.
-FROM docker.io/oven/bun:1.4-debian AS ui-build
+FROM docker.io/oven/bun:${BUN_VERSION}-debian@${BUN_DEBIAN_DIGEST} AS ui-build
 COPY --from=node /usr/local/bin/node /usr/local/bin/node
 WORKDIR /app
 COPY apps/noite/package.json apps/noite/bun.lock ./
@@ -139,7 +157,7 @@ RUN bun run build \
 # `dist/worker.js` + `dist/meta.json`. Only dist/ leaves this stage (copied
 # into `noite` below); the runner deploys it as `noite-void-sandbox` (a later
 # change renders the config).
-FROM docker.io/oven/bun:1.4-slim AS void-sandbox-build
+FROM docker.io/oven/bun:${BUN_VERSION}-slim@${BUN_SLIM_DIGEST} AS void-sandbox-build
 WORKDIR /app
 COPY apps/void-sandbox/package.json apps/void-sandbox/bun.lock ./
 RUN --mount=type=cache,id=noite-bun-cache,target=/root/.bun/install/cache,sharing=locked \
@@ -150,10 +168,12 @@ RUN bun run build && test -s dist/worker.js && test -s dist/meta.json
  # --- runtime shared by `noite` and `dev` -----------------------------------
  # Runtime base is the slim variant (T6.3): ui-build stays on full debian
  # (build tools); the runtime only needs bun + apt-installed bins.
-FROM docker.io/oven/bun:1.4-slim AS base
+FROM docker.io/oven/bun:${BUN_VERSION}-slim@${BUN_SLIM_DIGEST} AS base
 LABEL org.opencontainers.image.licenses="Apache-2.0"
 ARG TARGETARCH
 ARG NODE_VERSION
+ARG NODE_SHA256_X64
+ARG NODE_SHA256_ARM64
 ARG JUP_VERSION
 ARG JUP_SHA512
 ARG NPM_VERSION
@@ -188,13 +208,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
   && sh /tmp/install-sidecars.sh && rm /tmp/install-sidecars.sh \
   && arch="$(dpkg --print-architecture)" \
   && case "${arch}" in \
-       amd64) NODE_PKG=linux-x64 ;; \
-       arm64) NODE_PKG=linux-arm64 ;; \
+       amd64) NODE_PKG=linux-x64; NODE_SHA256="${NODE_SHA256_X64}" ;; \
+       arm64) NODE_PKG=linux-arm64; NODE_SHA256="${NODE_SHA256_ARM64}" ;; \
        *) echo "unsupported arch: ${arch}" >&2; exit 1 ;; \
      esac \
-  && curl -fsSL "https://nodejs.org/download/release/v${NODE_VERSION}/node-v${NODE_VERSION}-${NODE_PKG}.tar.xz" \
-    | tar -xJ --no-same-owner -C /usr/local --strip-components=1 "node-v${NODE_VERSION}-${NODE_PKG}/bin/node" \
-  && node --version | grep -q "^v${NODE_VERSION%%.*}" \
+  && curl -fsSL -o /tmp/node.tar.xz "https://nodejs.org/download/release/v${NODE_VERSION}/node-v${NODE_VERSION}-${NODE_PKG}.tar.xz" \
+  && echo "${NODE_SHA256}  /tmp/node.tar.xz" | sha256sum -c - \
+  && tar -xJ --no-same-owner -f /tmp/node.tar.xz -C /usr/local --strip-components=1 "node-v${NODE_VERSION}-${NODE_PKG}/bin/node" \
+  && rm /tmp/node.tar.xz \
+  && [ "$(node --version)" = "v${NODE_VERSION}" ] \
   && curl -fsSL -o /tmp/jup.tgz "https://registry.npmjs.org/jup/-/jup-${JUP_VERSION}.tgz" \
   && echo "${JUP_SHA512}  /tmp/jup.tgz" | sha512sum -c - \
   && mkdir -p /opt/jup && tar -xzf /tmp/jup.tgz --no-same-owner -C /opt/jup --strip-components=1 \
@@ -277,6 +299,13 @@ FROM base AS dev
 # The Rust toolchain + cargo-watch for the runner (vite dev runs on base's
 # Node). No baked runner or bundle: the sources are bind-mounted
 # (docker/compose.dev.yaml).
+# rustup's bootstrap binary from its own archive, with the sha256 rustup
+# publishes next to it (`…/archive/<version>/<target>/rustup-init.sha256`).
+# The dev target only, but a `curl | sh` installer is still an unverified
+# download.
+ARG RUSTUP_VERSION=1.29.3
+ARG RUSTUP_SHA256_X64=b1c8cb14e30889e7e2999e6b69e62d9e9b9ffc0f4df8180564d306d9680e6c55
+ARG RUSTUP_SHA256_ARM64=9f608c142e0e38a78957d0661ba1dfaf0b6fb37184cfaa4b9a0aa57af6184282
 RUN apt-get update && apt-get install -y --no-install-recommends \
       pkg-config libssl-dev gcc libc6-dev inotify-tools \
   && rm -rf /var/lib/apt/lists/*
@@ -284,8 +313,18 @@ ENV RUSTUP_HOME=/usr/local/rustup \
     CARGO_HOME=/usr/local/cargo \
     PATH="/usr/local/cargo/bin:/usr/local/bin:${PATH}" \
     CARGO_TERM_COLOR=always
-RUN curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal --no-modify-path \
-  && cargo install cargo-watch --locked
+RUN set -eu; \
+    case "$(dpkg --print-architecture)" in \
+      amd64) RUSTUP_TARGET=x86_64; RUSTUP_SHA256="${RUSTUP_SHA256_X64}" ;; \
+      arm64) RUSTUP_TARGET=aarch64; RUSTUP_SHA256="${RUSTUP_SHA256_ARM64}" ;; \
+      *) echo "unsupported arch: $(dpkg --print-architecture)" >&2; exit 1 ;; \
+    esac; \
+    curl -fsSL -o /tmp/rustup-init "https://static.rust-lang.org/rustup/archive/${RUSTUP_VERSION}/${RUSTUP_TARGET}-unknown-linux-gnu/rustup-init"; \
+    echo "${RUSTUP_SHA256}  /tmp/rustup-init" | sha256sum -c -; \
+    chmod +x /tmp/rustup-init; \
+    /tmp/rustup-init -y --profile minimal --no-modify-path; \
+    rm /tmp/rustup-init; \
+    cargo install cargo-watch --locked
 # No control bundle in dev: the runner skips fleet #0 and vite dev serves the
 # UI on the same 127.0.0.1:8090.
 ENV CONTROL_BUNDLE_DIR=/nonexistent

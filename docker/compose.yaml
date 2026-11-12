@@ -234,7 +234,11 @@ services:
       start_period: 180s
 
   rustfs:
-    image: docker.io/rustfs/rustfs:1.0.5
+    # Tag plus its multi-arch index digest (`docker buildx imagetools inspect
+    # docker.io/rustfs/rustfs:1.0.5`): the tag alone lets a re-push change the
+    # store under a running install. docker/check-versions.ts keeps the tag in
+    # step with platforms.mdx and this line in step with the CI service below.
+    image: docker.io/rustfs/rustfs:1.0.5@sha256:b81d16a90ee25bd9511280127ca1471788c6e874cf0f0da759645f46b2dc1d74
     restart: unless-stopped
     command: ["/data"]
     environment:

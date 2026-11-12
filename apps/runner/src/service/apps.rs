@@ -2828,18 +2828,25 @@ mod tests {
             .expect("create");
         gated.armed.store(true, std::sync::atomic::Ordering::SeqCst);
         let purged = crate::service::detached::finished(&format!("purge:{}", app.slug));
+        let freed = crate::service::detached::finished(&format!("app:{}", app.id));
 
+        // A loaded runner may answer before the detached delete work is done
+        // (`DELETE_ANSWER_WITHIN`): `Done` and `InProgress` are both correct.
+        // The work's own end — not the answer or a wall clock — is the signal
+        // that the row is gone and the slug released.
         let answered = delete(&state, &app.id).await.expect("delete answers");
-        assert_eq!(answered, Deletion::Done);
-        // The wipe is parked on its first S3 request, so nothing below can be
-        // explained by the wipe having finished.
-        tokio::time::timeout(Duration::from_secs(5), gated.entered.notified())
+        assert!(matches!(answered, Deletion::Done | Deletion::InProgress));
+        tokio::time::timeout(Duration::from_secs(120), freed.notified())
+            .await
+            .expect("the delete never finished freeing the slug");
+        // The background wipe is parked at the gate's first S3 request. The
+        // registration proves it has not finished: nothing but the release
+        // below can wake it.
+        tokio::time::timeout(Duration::from_secs(30), gated.entered.notified())
             .await
             .expect("the delete never started a background wipe");
         assert!(
-            tokio::time::timeout(Duration::from_millis(200), purged.notified())
-                .await
-                .is_err(),
+            purge::is_running("slow-wipe"),
             "the wipe finished before the gate released it"
         );
         assert!(

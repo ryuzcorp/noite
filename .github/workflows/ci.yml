@@ -72,11 +72,12 @@ jobs:
     permissions:
       contents: read
     # The scoped-credential integration test mints and enforces real keys
-    # against this store (SPEC, Scoped credentials); the pin matches the
-    # bundled image the item verified.
+    # against this store (SPEC, Scoped credentials); the pin is the bundled
+    # image docker/compose.yaml serves, tag and digest (check-versions.ts
+    # fails the drift).
     services:
       rustfs:
-        image: docker.io/rustfs/rustfs:1.0.5
+        image: docker.io/rustfs/rustfs:1.0.5@sha256:b81d16a90ee25bd9511280127ca1471788c6e874cf0f0da759645f46b2dc1d74
         env:
           RUSTFS_ACCESS_KEY: noiteaccess
           RUSTFS_SECRET_KEY: noitesecretnoitesecretnoite12
@@ -128,15 +129,25 @@ jobs:
   # apps/noite's standalone lockfile and `bun run build`s inside docker, which
   # neither the worker job above (workspace-root install) nor any other PR job
   # replicates — every past image-only breakage (trustedDependencies,
-  # .assetsignore handling, SSR snapshot atoms) was green here. Single
-  # platform plus the shared GHA cache (same scope as the release build, so
-  # main's layers warm the PR build) keeps it incremental. Built once per run
-  # and handed to the e2e lanes as an artifact, so no lane rebuilds it
-  # (every lane paid ~280 s for its own build before).
+  # .assetsignore handling, SSR snapshot atoms) was green here. Both
+  # platforms: the arm64 leg is what exercises the per-arch pins (the Node
+  # tarball, esbuild's and DuckDB's assets), which an amd64-only build cannot.
+  # Only the amd64 image is loaded and handed to the e2e lanes as an artifact,
+  # so no lane rebuilds it (every lane paid ~280 s for its own build before).
   image:
-    runs-on: ubuntu-latest
-    # ~3x the 6.2 min p95 (50 runs, 2026-11-11); the cold build was 5.4 min.
-    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runs-on: ubuntu-latest
+            lane: true
+          - platform: linux/arm64
+            runs-on: ubuntu-24.04-arm
+            lane: false
+    runs-on: ${{ matrix.runs-on }}
+    # ~3x the 11.6 min arm64 / 6.2 min amd64 p95 (49 runs each, 2026-11-11).
+    timeout-minutes: 35
     permissions:
       contents: read
     steps:
@@ -147,17 +158,20 @@ jobs:
           context: .
           file: docker/Dockerfile
           target: noite
+          platforms: ${{ matrix.platform }}
           push: false
-          load: true
+          load: ${{ matrix.lane }}
           tags: noite:ci
-          cache-from: type=gha,scope=noite-linux/amd64
-          cache-to: type=gha,mode=max,scope=noite-linux/amd64
+          cache-from: type=gha,scope=noite-${{ matrix.platform }}
+          cache-to: type=gha,mode=max,scope=noite-${{ matrix.platform }}
       - name: save lane image
+        if: matrix.lane
         run: |
           mkdir -p /tmp/noite-image
           docker save noite:ci | zstd -T0 -3 -o /tmp/noite-image/noite-ci.tar.zst
           ls -la /tmp/noite-image
       - name: upload lane image
+        if: matrix.lane
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: noite-ci-image
