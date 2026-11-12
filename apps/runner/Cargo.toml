@@ -42,7 +42,7 @@ constant_time_eq = "0.6"
 regex = "1"
 base64 = "0.23"
 zstd = "0.14"
-rusty-s3 = "0.10.2"
+rusty-s3 = "0.11.0"
 # Per-deploy source maps for error symbolication (host/sourcemaps.rs):
 # getsentry's parser/composer (BSD-3-Clause, like the repo's other permissive
 # deps). Pinned by the lockfile; `cargo build --locked` enforces it.

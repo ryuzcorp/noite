@@ -103,7 +103,7 @@ export class NoiteSandboxAdmission extends DurableObject<ControllerEnv> {
   #serialize<T>(operation: () => Promise<T>): Promise<T> {
     // oxlint-disable-next-line promise/prefer-await-to-then -- the queue links continuations; awaiting here would serialize the caller instead of the work.
     const result = this.#tail.then(operation);
-    // oxlint-disable-next-line promise/prefer-await-to-then -- see above: the tail must advance without blocking this call.
+    // oxlint-disable-next-line promise/prefer-await-to-then, promise/prefer-catch -- see above: the tail must advance without blocking this call.
     this.#tail = result.then(settleTail, settleTail);
 
     return result;

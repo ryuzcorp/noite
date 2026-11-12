@@ -2,6 +2,7 @@
 .ilha
 .celld
 .void
+.cloudflare
 .void-wrangler.jsonc
 .wrangler
 .dev.vars

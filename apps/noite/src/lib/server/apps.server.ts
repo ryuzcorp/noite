@@ -394,10 +394,14 @@ export const createAppForUser = async (input: {
   } catch (grantError) {
     // Rollback is best-effort, but a failed rollback is its own state: an app
     // exists with no collaborator grant, so say so instead of swallowing it.
-    const rolledBack = await runnerDeleteApp(app.id).then(
-      () => true,
-      () => false
-    );
+
+    let rolledBack = true;
+
+    try {
+      await runnerDeleteApp(app.id);
+    } catch {
+      rolledBack = false;
+    }
 
     if (!rolledBack) {
       console.error(
@@ -472,10 +476,14 @@ export const remove = apiAction(AppId, async (appId, { env, request }) => {
     // The runner accepted the delete: a cleanup failure is logged, never
     // reported as a failed delete (the app is gone either way). Nothing
     // cascades grants now that the app row lives in the runner.
-    const cleaned = await dropAppCollaborators(appId).then(
-      () => true,
-      () => false
-    );
+
+    let cleaned = true;
+
+    try {
+      await dropAppCollaborators(appId);
+    } catch {
+      cleaned = false;
+    }
 
     if (!cleaned) {
       console.error(

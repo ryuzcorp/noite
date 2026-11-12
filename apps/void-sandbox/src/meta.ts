@@ -10,7 +10,7 @@
  */
 
 /** Exact `void` npm version this bundle builds against. */
-export const VOID_VERSION = "1.5.0";
+export const VOID_VERSION = "1.8.0";
 
 /** Major of `VOID_VERSION`, kept as a literal so drift fails loudly. */
 export const VOID_MAJOR = 1;
