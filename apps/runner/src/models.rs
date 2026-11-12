@@ -639,7 +639,11 @@ pub enum EnvironmentKind {
 }
 
 impl EnvironmentKind {
-    pub fn as_str(self) -> &'static str {
+    /// Every kind the model can decode. `db::environments` builds its SQL
+    /// predicate from this list, so a kind change is one edit here.
+    pub const ALL: [Self; 1] = [Self::Branch];
+
+    pub const fn as_str(self) -> &'static str {
         match self {
             Self::Branch => "branch",
         }

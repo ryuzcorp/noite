@@ -21,6 +21,20 @@ pub(super) const ENV_COLS: &str = r#"e.id, e.app_id, e.label, e.kind, e.git_ref,
     e.woke_at, e.last_deploy_sha, e.last_deployed_at, e.public, e.last_error, e.created_at,
     e.updated_at, a.slug AS app_slug"#;
 
+/// SQL predicate matching only the kinds [`EnvironmentKind`] can decode. A
+/// boot teardown that failed leaves retired `kind='workspace'` rows behind, and
+/// one such row must not break every listing; the teardown itself reads its
+/// rows field by field (`host::env_teardown`) and deletes them by id
+/// ([`delete_environment_row`]).
+fn decodable_kinds() -> String {
+    let kinds = EnvironmentKind::ALL
+        .iter()
+        .map(|kind| format!("'{}'", kind.as_str()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("e.kind IN ({kinds})")
+}
+
 /// What the edge and the Caddyfile writer need about one environment, from one
 /// query: identity, host label, fleet ports and whether it should be routed.
 #[derive(Debug, Clone, sqlx::FromRow)]
@@ -87,8 +101,10 @@ pub async fn create_environment(
 /// `Config::envs_uri` where the row is created; a live row carries it in
 /// `fleet_bucket`.
 pub async fn get_environment(pool: &SqlitePool, id: &str) -> sqlx::Result<Option<Environment>> {
+    let kinds = decodable_kinds();
     let sql = format!(
-        "SELECT {ENV_COLS} FROM environment e JOIN app a ON a.id = e.app_id WHERE e.id = ?"
+        "SELECT {ENV_COLS} FROM environment e JOIN app a ON a.id = e.app_id \
+         WHERE {kinds} AND e.id = ?"
     );
     sqlx::query_as::<_, Environment>(sqlx::AssertSqlSafe(sql))
         .bind(id)
@@ -101,9 +117,10 @@ pub async fn get_environment_by_label(
     app_id: &str,
     label: &str,
 ) -> sqlx::Result<Option<Environment>> {
+    let kinds = decodable_kinds();
     let sql = format!(
         "SELECT {ENV_COLS} FROM environment e JOIN app a ON a.id = e.app_id \
-         WHERE e.app_id = ? AND e.label = ?"
+         WHERE {kinds} AND e.app_id = ? AND e.label = ?"
     );
     sqlx::query_as::<_, Environment>(sqlx::AssertSqlSafe(sql))
         .bind(app_id)
@@ -124,9 +141,10 @@ pub async fn get_environment_by_ref(
     app_id: &str,
     git_ref: &str,
 ) -> sqlx::Result<Option<Environment>> {
+    let kinds = decodable_kinds();
     let sql = format!(
         "SELECT {ENV_COLS} FROM environment e JOIN app a ON a.id = e.app_id \
-         WHERE e.app_id = ? AND e.git_ref = ? \
+         WHERE {kinds} AND e.app_id = ? AND e.git_ref = ? \
          ORDER BY e.created_at DESC, e.id DESC LIMIT 1"
     );
     sqlx::query_as::<_, Environment>(sqlx::AssertSqlSafe(sql))
@@ -137,9 +155,10 @@ pub async fn get_environment_by_ref(
 }
 
 pub async fn list_environments(pool: &SqlitePool, app_id: &str) -> sqlx::Result<Vec<Environment>> {
+    let kinds = decodable_kinds();
     let sql = format!(
         "SELECT {ENV_COLS} FROM environment e JOIN app a ON a.id = e.app_id \
-         WHERE e.app_id = ? ORDER BY e.created_at DESC"
+         WHERE {kinds} AND e.app_id = ? ORDER BY e.created_at DESC"
     );
     sqlx::query_as::<_, Environment>(sqlx::AssertSqlSafe(sql))
         .bind(app_id)
@@ -150,9 +169,10 @@ pub async fn list_environments(pool: &SqlitePool, app_id: &str) -> sqlx::Result<
 /// Every environment of every app: what the reconcile loop walks to spawn
 /// fleets and route the edge.
 pub async fn list_all_environments(pool: &SqlitePool) -> sqlx::Result<Vec<Environment>> {
+    let kinds = decodable_kinds();
     let sql = format!(
         "SELECT {ENV_COLS} FROM environment e JOIN app a ON a.id = e.app_id \
-         ORDER BY e.created_at ASC"
+         WHERE {kinds} ORDER BY e.created_at ASC"
     );
     sqlx::query_as::<_, Environment>(sqlx::AssertSqlSafe(sql))
         .fetch_all(pool)
@@ -162,8 +182,10 @@ pub async fn list_all_environments(pool: &SqlitePool) -> sqlx::Result<Vec<Enviro
 /// Every environment the edge should route (the Caddyfile writer and the TLS
 /// gate read these once per reconcile).
 pub async fn list_environment_routes(pool: &SqlitePool) -> sqlx::Result<Vec<EnvironmentRoute>> {
+    let kinds = decodable_kinds();
     let sql = format!(
-        "SELECT {ROUTE_COLS} FROM environment e JOIN app a ON a.id = e.app_id ORDER BY e.label"
+        "SELECT {ROUTE_COLS} FROM environment e JOIN app a ON a.id = e.app_id \
+         WHERE {kinds} ORDER BY e.label"
     );
     sqlx::query_as::<_, EnvironmentRoute>(sqlx::AssertSqlSafe(sql))
         .fetch_all(pool)
@@ -177,9 +199,10 @@ pub async fn environment_route(
     slug: &str,
     label: &str,
 ) -> sqlx::Result<Option<EnvironmentRoute>> {
+    let kinds = decodable_kinds();
     let sql = format!(
         "SELECT {ROUTE_COLS} FROM environment e JOIN app a ON a.id = e.app_id \
-         WHERE a.slug = ? AND e.label = ?"
+         WHERE {kinds} AND a.slug = ? AND e.label = ?"
     );
     sqlx::query_as::<_, EnvironmentRoute>(sqlx::AssertSqlSafe(sql))
         .bind(slug)
@@ -645,6 +668,80 @@ mod tests {
         );
         pool.close().await;
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A failed boot teardown (`host::env_teardown`) leaves its retired
+    /// `kind='workspace'` row behind for the next boot: the schema still
+    /// accepts the value, so upgraded installs carry such rows. Every model
+    /// read must skip it rather than fail to decode it, while the teardown's
+    /// delete-by-id path keeps working.
+    #[tokio::test]
+    async fn legacy_workspace_rows_are_invisible_to_model_reads() {
+        let pool = connect("sqlite::memory:").await.expect("boot");
+        let cfg = crate::config::config_for_tests();
+        let app = seed(&pool).await;
+        let live = create_environment(&pool, &cfg, new(&app.id, "feature", "refs/heads/feat"))
+            .await
+            .expect("live environment");
+        let legacy_id = new_id();
+        let ts = crate::models::now_iso();
+        sqlx::query(
+            r#"INSERT INTO environment (
+                 id, app_id, label, kind, git_ref, created_by, fleet_bucket,
+                 listen_port, internal_port, desired_state, created_at, updated_at
+               ) VALUES (?, ?, 'wip', 'workspace', 'refs/previews/user/wip', 'user_1',
+                         ?, 30020, 30021, 'running', ?, ?)"#,
+        )
+        .bind(&legacy_id)
+        .bind(&app.id)
+        .bind(cfg.envs_uri("env-app", "wip"))
+        .bind(&ts)
+        .bind(&ts)
+        .execute(&pool)
+        .await
+        .expect("retired workspace row");
+
+        // Model reads answer (they used to fail decoding the row) and skip it.
+        assert!(get_environment(&pool, &legacy_id).await.unwrap().is_none());
+        let listed = list_environments(&pool, &app.id).await.unwrap();
+        assert_eq!(
+            listed.iter().map(|env| env.id.as_str()).collect::<Vec<_>>(),
+            vec![live.id.as_str()]
+        );
+        let all = list_all_environments(&pool).await.unwrap();
+        assert_eq!(
+            all.iter().map(|env| env.id.as_str()).collect::<Vec<_>>(),
+            vec![live.id.as_str()]
+        );
+        assert!(
+            get_environment_by_ref(&pool, &app.id, "refs/previews/user/wip")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        // The edge never learns a legacy row's host.
+        assert!(environment_route(&pool, "env-app", "wip")
+            .await
+            .unwrap()
+            .is_none());
+        let routes = list_environment_routes(&pool).await.unwrap();
+        assert_eq!(
+            routes
+                .iter()
+                .map(|route| route.label.as_str())
+                .collect::<Vec<_>>(),
+            vec!["feature"]
+        );
+
+        // The retirement path deletes the row by id, without decoding it.
+        delete_environment_row(&pool, &legacy_id).await.unwrap();
+        let (remaining,): (i64,) = sqlx::query_as("SELECT count(*) FROM environment WHERE id = ?")
+            .bind(&legacy_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(remaining, 0);
+        pool.close().await;
     }
 
     /// A branch deleted and immediately re-created while its old row is still
