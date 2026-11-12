@@ -35,6 +35,9 @@ let grants: GrantCall[] = [];
 let grantFails = true;
 let grantFailure = new Error("D1 is down");
 
+/** What a grant write that does not throw reports. */
+let grantResult: "applied" | "last-admin" | "missing" = "applied";
+
 /** The rows `listCollaboratorRows` reports for the app under test: the
  * adoption rule reads them, so a test can say "removed", "push only" or
  * "still an admin". */
@@ -50,7 +53,7 @@ mock.module("../collaborators", () => ({
 
     grants.push({ appId, role, userId });
 
-    return Promise.resolve("applied" as const);
+    return Promise.resolve(grantResult);
   },
   listCollaboratorRows: () =>
     Promise.resolve(
@@ -77,6 +80,7 @@ beforeEach(() => {
   grants = [];
   grantFails = true;
   grantFailure = new Error("D1 is down");
+  grantResult = "applied";
   runner?.restore();
   runner = installRunnerMock([]);
 });
@@ -292,6 +296,34 @@ describe("the creator grant races the sidebar heal", () => {
     // No rollback: the app the heal made visible stays.
     expect(runner.calls).toEqual(["apps.create"]);
     expect(runner.apps).toHaveLength(1);
+  });
+
+  test("a grant write that reports the row gone rolls back exactly once", async () => {
+    // `missing` is a refusal, not a thrown write error: it must not fall into
+    // the write-error recovery, which would delete the app a second time or,
+    // seeing an admin row, report success for an app already sent for deletion.
+    grantFails = false;
+    grantResult = "missing";
+    collaboratorRows = [{ role: "admin", userId: "u-1" }];
+
+    let thrown: unknown;
+
+    try {
+      await createAppForUser({
+        account: { id: "u-1", name: "One" },
+        name: "One",
+        slug: "one",
+      });
+    } catch (error) {
+      thrown = error;
+    }
+
+    expect(thrown).toBeInstanceOf(ActionFailure);
+    expect(errorMessage(thrown)).toBe(
+      "Could not record your access to the app"
+    );
+    expect(runner.calls).toEqual(["apps.create", "apps.delete"]);
+    expect(runner.apps).toEqual([]);
   });
 
   test("a grant that did not stick answers a stable 422 with no SQL", async () => {

@@ -151,16 +151,21 @@ const injectBefore = (
 
 const GRANT_INSERT = /\binsert into "?app_collaborator"?/iu;
 
+// A statement that *starts* with SELECT: the guarded UPDATE also contains a
+// `SELECT count(*) FROM app_collaborator` subquery and must not match.
+const GRANT_READ = /^\s*select\b[^;]*\bfrom "?app_collaborator"?/iu;
+
 /** Put a grant row in place the way another isolate's write would, and run
  * `work` against a binding that fires it mid-write. */
 const withCompetingGrant = async (
   competing: { role: string; userId: string },
-  work: () => Promise<void>
+  work: () => Promise<void>,
+  before: RegExp = GRANT_INSERT
 ): Promise<void> => {
   setD1Binding(
     injectBefore(
       db.d1,
-      (sql) => GRANT_INSERT.test(sql),
+      (sql) => before.test(sql),
       () => {
         db.raw.run(
           `INSERT INTO app_collaborator (id, appId, userId, role) VALUES ('competing', ?, ?, ?)`,
@@ -201,6 +206,23 @@ describe("writeGrant against a concurrent writer", () => {
     await withCompetingGrant({ role: "view", userId: "u-push" }, async () => {
       expect(await writeGrant(APP.id, "u-push", "admin")).toBe("applied");
     });
+
+    const rows = await listCollaboratorRows(APP.id);
+
+    expect(rows.map((row) => row.role)).toEqual(["admin"]);
+  });
+
+  test("a competing lower role that lands before the first read is upgraded too", async () => {
+    // The UPDATE found no row, then another writer inserted one before the
+    // read: the stored role differs, so the guarded UPDATE must run again
+    // instead of reporting `last-admin` (which the create treats as failure).
+    await withCompetingGrant(
+      { role: "view", userId: "u-push" },
+      async () => {
+        expect(await writeGrant(APP.id, "u-push", "admin")).toBe("applied");
+      },
+      GRANT_READ
+    );
 
     const rows = await listCollaboratorRows(APP.id);
 

@@ -12,6 +12,7 @@ import {
   listCollaboratorRows,
   requireAppRole,
 } from "../collaborators";
+import type { GrantWrite } from "../collaborators";
 import { isQueryFailure } from "../errors";
 import {
   CREATE_TIMEOUT_MS,
@@ -415,15 +416,10 @@ export const createAppForUser = async (input: {
     }
   };
 
-  try {
-    const write = await grantCollaborator(app.id, input.account.id, "admin");
+  let write: GrantWrite;
 
-    // A write that did not stick (`missing`: the row went away under it)
-    // leaves the app unopenable, exactly like a failed one.
-    if (write !== "applied") {
-      await rollback();
-      fail(GRANT_FAILED);
-    }
+  try {
+    write = await grantCollaborator(app.id, input.account.id, "admin");
   } catch (grantError) {
     // The sidebar's grant-less-creator heal runs every 2 s and can write this
     // very grant while the create's write is in flight, as can a second
@@ -448,7 +444,15 @@ export const createAppForUser = async (input: {
       fail(GRANT_FAILED);
     }
 
-    failUnknown(grantError);
+    return failUnknown(grantError);
+  }
+
+  // A write that did not stick (`missing`: the row went away under it) leaves
+  // the app unopenable, exactly like a failed one. Outside the `try`, so this
+  // refusal rolls back once and is not re-handled as a write error.
+  if (write !== "applied") {
+    await rollback();
+    fail(GRANT_FAILED);
   }
 
   return app;

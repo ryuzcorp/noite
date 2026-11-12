@@ -108,18 +108,15 @@ export const writeGrant = (
         });
 
       stored = await storedRole();
+    }
 
-      if (stored === null) {
-        return "missing";
-      }
-
-      if (stored !== role) {
-        // The competing row holds another role: apply the guard the UPDATE
-        // path enforces (an admin request upgrades; a demotion that would
-        // strand the app is refused).
-        await guardedUpdate();
-        stored = await storedRole();
-      }
+    if (stored !== null && stored !== role) {
+      // A competing row holds another role — whether it landed before our
+      // first read (the UPDATE then found nothing) or inside the INSERT
+      // window: apply the guard the UPDATE path enforces once more (an admin
+      // request upgrades; a demotion that would strand the app is refused).
+      await guardedUpdate();
+      stored = await storedRole();
     }
 
     if (stored === null) {
