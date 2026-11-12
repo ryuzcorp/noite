@@ -640,7 +640,9 @@ const CreateForm = (model: CreateModel, dispatch: Dispatch<Message>): View => {
               maxlength={48}
               autocomplete="off"
               spellcheck={false}
-              aria-invalid={status.verdict?.error ? "true" : "false"}
+              aria-invalid={
+                status.verdict?.error || status.slugError ? "true" : "false"
+              }
               aria-describedby="create-slug-status"
               value={model.slug}
               oninput={(e) => {

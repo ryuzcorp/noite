@@ -96,6 +96,25 @@ export const transportMessage = (error: unknown, timeoutMs: number): string => {
   return `network error: ${error instanceof Error ? error.message : String(error)}`;
 };
 
+/** `response.json()` with the request's transport mapping: the abort signal
+ * also covers the body read, so a body that stalls after the headers is the
+ * same user-facing timeout as a stalled connection. A malformed body is a
+ * protocol failure, not a transport one, and says so. */
+/* oxlint-disable anti-slop/no-unknown-returns -- the raw JSON boundary; `api` casts the value to the caller's type right after. */
+const readJson = async (
+  response: Response,
+  malformed: string
+): Promise<unknown> => {
+  try {
+    return await response.json();
+  } catch (error) {
+    throw error instanceof SyntaxError
+      ? new ApiError(response.status, malformed, null)
+      : new ApiError(0, transportMessage(error, API_TIMEOUT_MS), null);
+  }
+};
+/* oxlint-enable anti-slop/no-unknown-returns */
+
 /** POST `input` as JSON to a JSON-action endpoint and read the value back.
  * Rejects with `ApiError` whose `message` is the user-facing text. */
 // oxlint-disable-next-line anti-slop/no-unknown-parameters -- the JSON-action client boundary: the input shape is the endpoint's contract, serialized here.
@@ -117,20 +136,13 @@ export const api = async <T>(path: string, input: unknown): Promise<T> => {
 
   if (response.ok) {
     // SAFETY: the endpoint answers the action's value as JSON; the caller names its type.
-    return (await response.json()) as T;
+    return (await readJson(
+      response,
+      "the server sent an unreadable answer"
+    )) as T;
   }
 
-  let body: unknown;
-
-  try {
-    body = await response.json();
-  } catch {
-    throw new ApiError(
-      response.status,
-      `Request failed (${response.status})`,
-      null
-    );
-  }
+  const body = await readJson(response, `Request failed (${response.status})`);
 
   const errors = response.status === 422 ? apiErrors(body) : null;
 

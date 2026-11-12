@@ -86,6 +86,34 @@ describe("the JSON-action client", () => {
     expect(error.status).toBe(0);
   });
 
+  test("a body that stalls after the headers is the same timeout", async () => {
+    // The abort signal covers the body read too: `fetch` already resolved.
+    // SAFETY: only `ok`, `status` and a rejecting `json` are read by `api`.
+    stubFetch(() =>
+      Promise.resolve({
+        json: () =>
+          Promise.reject(
+            new DOMException("The operation was aborted", "AbortError")
+          ),
+        ok: true,
+        status: 200,
+      } as Response)
+    );
+
+    const error = await rejection(api("/api/apps/create", {}));
+
+    expect(error.message).toBe("the server didn't answer within 20 s");
+  });
+
+  test("a malformed answer is a protocol failure, not a timeout", async () => {
+    stubFetch(() => Promise.resolve(new Response("not json")));
+
+    const error = await rejection(api("/api/apps/create", {}));
+
+    expect(error.message).toBe("the server sent an unreadable answer");
+    expect(error.status).toBe(200);
+  });
+
   test("a timeout says how long the wait was, never hangs", async () => {
     stubFetch(() =>
       Promise.reject(

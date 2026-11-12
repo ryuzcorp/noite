@@ -4,7 +4,7 @@
  * and the transport reads it before any auth — a browser commit can be a
  * folder of uploads (see `apps/runner/src/host/web_commit.rs`). */
 
-import { errorBody, transportMessage } from "./api";
+import { ApiError, errorBody, transportMessage } from "./api";
 import type { SourceCommitFile, SourceCommitMove } from "./runner";
 
 /** Largest source body the route reads. Must match `MAX_COMMIT_BODY_BYTES` in
@@ -38,7 +38,9 @@ export const SOURCE_UPLOAD_TIMEOUT_MS = 120_000;
 /** Why the route refused: the runner's own `{error}` when the route forwarded
  * one, else the plain-text refusal it wrote itself, else the status. */
 const refusalText = async (res: Response): Promise<string> => {
-  const text = await res.text().catch(() => res.statusText);
+  const text = await res
+    .text()
+    .catch((error) => transportMessage(error, SOURCE_UPLOAD_TIMEOUT_MS));
 
   try {
     const forwarded = errorBody(JSON.parse(text));
@@ -73,11 +75,21 @@ const postSourceBody = async <T>(input: SourceCommitInput): Promise<T> => {
   }
 
   if (!res.ok) {
-    throw new Error(await refusalText(res));
+    // `ApiError`, not a plain Error: a 5xx keeps its status in the text.
+    throw new ApiError(res.status, await refusalText(res));
   }
 
-  // SAFETY: the route re-serves the runner's own JSON verbatim (`{ sha }`).
-  return (await res.json()) as T;
+  try {
+    // SAFETY: the route re-serves the runner's own JSON verbatim (`{ sha }`).
+    return (await res.json()) as T;
+  } catch (error) {
+    // A body read after the headers can hit the same abort as the request.
+    throw error instanceof SyntaxError
+      ? new Error("the server sent an unreadable answer")
+      : new Error(transportMessage(error, SOURCE_UPLOAD_TIMEOUT_MS), {
+          cause: error,
+        });
+  }
 };
 
 /** Commit browser drafts: session + push gate happen on the route before the
