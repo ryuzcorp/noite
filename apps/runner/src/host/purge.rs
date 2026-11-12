@@ -158,9 +158,13 @@ async fn remove_ci_volume(cfg: &Config, name: &str) -> anyhow::Result<()> {
         .args(["volume", "rm", "-f", name])
         .kill_on_drop(true)
         .output();
-    let out = tokio::time::timeout(Duration::from_secs(30), run)
-        .await
-        .map_err(|_| anyhow::anyhow!("remove CI cache volume {name}: timed out"))??;
+    let out = match tokio::time::timeout(Duration::from_secs(30), run).await {
+        Err(_) => anyhow::bail!("remove CI cache volume {name}: timed out"),
+        // No container CLI on this host: no workflow ever created a volume
+        // here, so there is nothing to remove.
+        Ok(Err(e)) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Ok(result) => result?,
+    };
     if out.status.success() {
         return Ok(());
     }
@@ -172,11 +176,15 @@ async fn remove_ci_volume(cfg: &Config, name: &str) -> anyhow::Result<()> {
     anyhow::bail!("remove CI cache volume {name}: {}", stderr.trim())
 }
 
-/// Whether the CLI said the volume is not there (docker and podman word it
-/// differently; podman says "object", and either may say "not found").
+/// Whether the CLI said the volume is not there (docker says "no such
+/// volume", podman "no such object" or "volume … not found"). Only these
+/// shapes: a bare "not found" can be a missing context or plugin, which is a
+/// failure the sweep must retry, not a removal.
 fn no_such_volume(stderr: &str) -> bool {
     let text = stderr.to_ascii_lowercase();
-    text.contains("no such volume") || text.contains("no such object") || text.contains("not found")
+    text.contains("no such volume")
+        || text.contains("no such object")
+        || (text.contains("volume") && text.contains("not found"))
 }
 
 /// The fast path after a delete: remove the deleted app's own CI cache volume.
@@ -230,6 +238,11 @@ pub async fn reconcile_ci_caches(cfg: &Config, pool: &sqlx::SqlitePool) -> usize
             return 0;
         }
     };
+    // Load-bearing order: list the volumes first, then snapshot the live ids.
+    // A volume only exists because a deploy of an existing row created it, so
+    // an id snapshot taken *after* the listing contains every live owner; a
+    // snapshot taken first would let an app created in between lose its new
+    // volume.
     let live: std::collections::HashSet<String> = match crate::db::app_ids(pool).await {
         Ok(ids) => ids.into_iter().collect(),
         Err(e) => {
