@@ -1086,7 +1086,9 @@ mod tests {
                     .execute(&pool)
                     .await
                     .expect("concurrent writer");
-                    tokio::time::sleep(std::time::Duration::from_micros(20)).await;
+                    // No wall-clock throttle: the loop's own commit is the
+                    // pace, and yielding keeps the delete's task scheduled.
+                    tokio::task::yield_now().await;
                 }
             }
         });
