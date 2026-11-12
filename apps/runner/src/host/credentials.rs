@@ -580,9 +580,13 @@ async fn ensure(
         if row.store != store {
             continue;
         }
+        // A `live` row is stale when its app is gone *or* when the app no
+        // longer names this prefix: a rename commits the row update and only
+        // then marks the old keys, so a crash (or a failed mark) in between
+        // leaves the old key reaching a prefix a different app now owns.
         let stale = match row.state {
             db::ScopedCredentialState::Revoking => true,
-            db::ScopedCredentialState::Live => db::get_app(pool, &row.app_id).await?.is_none(),
+            db::ScopedCredentialState::Live => !live_row_owns_prefix(pool, &row).await?,
         };
         if !stale {
             continue;
@@ -644,6 +648,28 @@ async fn ensure(
     })
 }
 
+/// Whether a `live` credential row still reaches the prefix its scope names
+/// today. `false` when the owning app (or environment) row is gone, or when
+/// that scope now lives under another prefix — a rename whose key mark never
+/// ran. [`ensure`] revokes such a row before it mints for the reused prefix.
+async fn live_row_owns_prefix(
+    pool: &sqlx::SqlitePool,
+    row: &db::ScopedCredential,
+) -> anyhow::Result<bool> {
+    let Some(app) = db::get_app(pool, &row.app_id).await? else {
+        return Ok(false);
+    };
+    let expected = match row.scope.strip_prefix("env:") {
+        Some(env_id) => match db::get_environment(pool, env_id).await? {
+            Some(env) => format!("envs/{}/{}/", env.app_slug, env.label),
+            None => return Ok(false),
+        },
+        // `app:<id>` and anything else this table holds name the app scope.
+        None => format!("fleets/{}/", app.slug),
+    };
+    Ok(expected == row.prefix)
+}
+
 #[derive(serde::Deserialize, serde::Serialize)]
 struct StoredKey {
     access_key: String,
@@ -691,11 +717,14 @@ pub struct OrphanRows {
     pub keys_marked: usize,
     /// Operator-token rows dropped.
     pub tokens_dropped: usize,
+    /// Rows the pass could not mark/drop. One bad row never stops the others;
+    /// a later pass (or the next boot) retries these.
+    pub failed: usize,
 }
 
 impl OrphanRows {
     pub fn nothing(&self) -> bool {
-        self.keys_marked == 0 && self.tokens_dropped == 0
+        self.keys_marked == 0 && self.tokens_dropped == 0 && self.failed == 0
     }
 }
 
@@ -720,21 +749,48 @@ pub async fn reconcile_orphans(pool: &sqlx::SqlitePool) -> anyhow::Result<Orphan
     let _guard = MUTATE.lock().await;
     let mut report = OrphanRows::default();
     for row in db::orphan_scoped_credentials(pool).await? {
-        if row.state == db::ScopedCredentialState::Live {
-            db::mark_scoped_credential_revoking(pool, &row.handle).await?;
-            report.keys_marked += 1;
-            tracing::info!(
-                scope = %row.scope,
-                app_id = %row.app_id,
-                "marked an orphaned scoped key for revocation"
-            );
+        if row.state != db::ScopedCredentialState::Live {
+            continue;
+        }
+        // Per-row failures are counted, never fatal to the pass: one bad row
+        // (a transient lock, a foreign key) must not keep every other orphan
+        // key reachable.
+        match db::mark_scoped_credential_revoking(pool, &row.handle).await {
+            Ok(()) => {
+                report.keys_marked += 1;
+                tracing::info!(
+                    scope = %row.scope,
+                    app_id = %row.app_id,
+                    "marked an orphaned scoped key for revocation"
+                );
+            }
+            Err(e) => {
+                report.failed += 1;
+                tracing::warn!(
+                    scope = %row.scope,
+                    app_id = %row.app_id,
+                    error = %e,
+                    "could not mark an orphaned scoped key; a later pass retries it"
+                );
+            }
         }
     }
     for scope in db::orphan_operator_token_scopes(pool).await? {
-        db::remove_operator_token_row(pool, &scope).await?;
-        forget_operator_token(&scope);
-        report.tokens_dropped += 1;
-        tracing::info!(scope = %scope, "dropped an orphaned operator token");
+        match db::remove_operator_token_row(pool, &scope).await {
+            Ok(()) => {
+                forget_operator_token(&scope);
+                report.tokens_dropped += 1;
+                tracing::info!(scope = %scope, "dropped an orphaned operator token");
+            }
+            Err(e) => {
+                report.failed += 1;
+                tracing::warn!(
+                    scope = %scope,
+                    error = %e,
+                    "could not drop an orphaned operator token; a later pass retries it"
+                );
+            }
+        }
     }
     Ok(report)
 }

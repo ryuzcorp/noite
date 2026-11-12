@@ -204,6 +204,7 @@ async fn create_inner(
         slug,
         supervisor::StopGrace::NORMAL,
         None,
+        false,
     )
     .await
     {
@@ -458,7 +459,10 @@ async fn rename_inner(
                 return Err(ApiError::conflict("slug already taken"))
             }
             Ok(_) => {}
-            Err(e) => return Err(ApiError::internal(e.to_string())),
+            Err(e) => {
+                let step = step_failure("could not check the slug", &e.to_string());
+                return Err(ApiError::internal(format!("rename {id}: {step}")));
+            }
         }
     }
     match rename::rename_app(
@@ -488,7 +492,10 @@ async fn rename_inner(
                 // the moves. Still a 409, never a 500.
                 Err(ApiError::conflict("slug already taken"))
             } else {
-                Err(ApiError::internal(msg))
+                // The raw chain can carry a presigned URL (the store's
+                // transport errors do); only the log gets it.
+                let step = step_failure("could not move the app", &msg);
+                Err(ApiError::internal(format!("rename {id}: {step}")))
             }
         }
     }
@@ -514,6 +521,11 @@ const DELETE_ANSWER_WITHIN: Duration = Duration::from_secs(3);
 /// stops a permanently stuck provider from leaking the detached task and its
 /// in-memory delete marker.
 const DELETE_CLEANUP_WITHIN: Duration = Duration::from_secs(30);
+
+/// How long the delete may spend revoking the app's store keys before it
+/// releases the slug. The row transaction already marked them `revoking`; this
+/// bound is only so a hung provider cannot keep the slug unusable.
+const REVOKE_BEFORE_RELEASE_WITHIN: Duration = Duration::from_secs(5);
 
 /// Where one app's delete is (RDEP-6). There is no DB column for it on
 /// purpose (a hard DELETE is the only removal path): the phases live in the
@@ -738,6 +750,10 @@ async fn delete_inner(state: &AppState, id: &str) -> Result<(), ApiError> {
         let step = step_failure("could not stop the app", &e.to_string());
         return Err(ApiError::internal(format!("delete {}: {step}", app.slug)));
     }
+    // Remember whether anything was running before the stops remove the map
+    // entries: the background wipe must still settle when it killed a node,
+    // and `any_fleet` inside it would see the map already empty.
+    let had_fleet = supervisor::any_fleet(&state.procs, &app.slug).await;
     // Stop what serves the slug now. This is the cheap part of the teardown;
     // the expensive part (local dirs + three S3 prefixes) runs as a background
     // chore below, after the slug is free.
@@ -768,6 +784,29 @@ async fn delete_inner(state: &AppState, id: &str) -> Result<(), ApiError> {
     // racing it. See the row re-check in the task: a create that already held
     // the guard when we registered would otherwise be wiped.
     let registered = purge::begin(&app.slug);
+    // Revoke the app's scoped keys at the store *before* the slug is free: the
+    // row delete only marked them `revoking`, and a holder of the old key could
+    // otherwise read or write a re-created app's objects in this window. The
+    // store call is bounded so a hanging provider cannot keep the slug
+    // unusable; whatever the bound leaves marked is retried by the cleanup
+    // below and by the periodic sweep.
+    match tokio::time::timeout(
+        REVOKE_BEFORE_RELEASE_WITHIN,
+        crate::host::credentials::revoke_app(&state.pool, &state.config, id),
+    )
+    .await
+    {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => tracing::warn!(
+            app_id = %id,
+            error = %format!("{e:#}"),
+            "app deleted but the store revocation failed; the sweep retries it"
+        ),
+        Err(_) => tracing::warn!(
+            app_id = %id,
+            "store revocation timed out before the slug was released; the cleanup retries it"
+        ),
+    }
     // The row is gone and no fleet can start under this slug any more:
     // release the slug's push guard and the app's deploy claim *now*, before
     // the edge push, the wipe and the best-effort cleanup below. Create and
@@ -813,6 +852,7 @@ async fn delete_inner(state: &AppState, id: &str) -> Result<(), ApiError> {
                         &slug,
                         supervisor::StopGrace::FOR_DELETE,
                         Some(registered.stop()),
+                        had_fleet,
                     )
                     .await;
                     match out {
@@ -1256,9 +1296,10 @@ mod tests {
         DELETIONS.finish(id);
     }
 
-    /// R-03: two apps renaming onto one slug serialize under CREATE_LOCK —
-    /// exactly one wins and the loser is a 409, with no prefix moves leaking
-    /// onto the target before the conflict.
+    /// R-03: two apps renaming onto one slug serialize under the target
+    /// slug's push guard (AppLock → slug guard) — exactly one wins and the
+    /// loser is a 409, with no prefix moves leaking onto the target before the
+    /// conflict.
     #[tokio::test]
     async fn concurrent_renames_onto_one_slug_leave_one_winner() {
         let (state, dir) = test_state(10).await;
@@ -1573,6 +1614,56 @@ mod tests {
                 .is_empty(),
             "the target wipe satisfies the pending-purge tombstone"
         );
+        drop(dir);
+    }
+
+    /// A rename that moved some objects and then died before the row update
+    /// leaves the moved data under the target while the row still names the
+    /// source. The retry must resume, not wipe the target as another tenant's
+    /// leftover: the durable marker records that the attempt belongs to this
+    /// app.
+    #[tokio::test]
+    async fn a_retried_rename_keeps_data_an_earlier_attempt_moved() {
+        let store = spawn_object_store().await;
+        let (state, dir) = test_state_with_s3(10, store.endpoint.clone()).await;
+        let app = db::create_app(
+            &state.pool,
+            &state.config,
+            db::NewApp {
+                name: "Retried",
+                slug: "rr-old",
+                user_id: "u1",
+                subdomain: "rr-old.localhost",
+                listen: 30620,
+                internal: 30621,
+            },
+        )
+        .await
+        .expect("app row");
+        // The first attempt moved this object, then failed before the row
+        // update (which still names `rr-old`).
+        store.insert("git/rr-new/already-moved.bundle");
+        store.insert("git/rr-old/still-there.bundle");
+        crate::host::rename::write_rename_marker_for_test(
+            &state.config,
+            &app.id,
+            "rr-old",
+            "rr-new",
+        )
+        .await
+        .expect("crashed attempt leaves its marker");
+
+        let renamed = rename(&state, &app.id, None, Some("rr-new"))
+            .await
+            .expect("retried rename");
+
+        assert_eq!(renamed.slug, "rr-new");
+        assert!(
+            store.has("git/rr-new/already-moved.bundle"),
+            "the retry must keep the data the earlier attempt already moved"
+        );
+        // (The stub does not model the copy/delete round-trip; the surviving
+        // target object above is the observable the retry must preserve.)
         drop(dir);
     }
 

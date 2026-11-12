@@ -436,6 +436,18 @@ pub async fn has_process(procs: &ProcMap, key: &str) -> bool {
     procs.lock().await.contains_key(key)
 }
 
+/// Whether any fleet of `slug` is supervised right now: the app's own fleet
+/// (key `slug`) or one of its preview environments (key `slug.label`). Purge
+/// uses it before stopping them, so a wipe that follows a stop still waits for
+/// the node it just killed.
+pub async fn any_fleet(procs: &ProcMap, slug: &str) -> bool {
+    procs
+        .lock()
+        .await
+        .keys()
+        .any(|key| key == slug || key.split_once('.').is_some_and(|(owner, _)| owner == slug))
+}
+
 /// The keys with a live child (running or spawning), not parked, held or
 /// stopped placeholders. Telemetry and the orphan sweep care about processes,
 /// not about which fleets are accounted for; `has_process` answers the latter.

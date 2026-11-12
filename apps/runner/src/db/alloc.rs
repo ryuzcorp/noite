@@ -15,9 +15,9 @@ use super::apps::list_all_apps;
 /// then dies at bind with "celld exited before answering its health gate".
 /// A claim holds this lock from the pick until the row insert commits, so a
 /// concurrent claim always sees the earlier claim's ports. Single-process
-/// invariant, like `service::apps::CREATE_LOCK` (which stays outermost: app
-/// create holds `CREATE_LOCK` across purge → insert and the port claim
-/// inside it; environment creates hold only this lock).
+/// invariant: an app create holds its slug's push guard across purge → insert
+/// (so two creates for one slug never claim ports at once) and the port claim
+/// inside it; environment creates hold only this lock.
 static PORT_ALLOC_LOCK: LazyLock<tokio::sync::Mutex<()>> =
     LazyLock::new(|| tokio::sync::Mutex::new(()));
 

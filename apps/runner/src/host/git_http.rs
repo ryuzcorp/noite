@@ -670,10 +670,9 @@ pub async fn receive_pack(
     }
     // Serialize pushes per slug: policy + fast-forward checks stay valid
     // through git + S3 + manifest with no interleaving push. This is the
-    // innermost lock (CREATE_LOCK → AppLock → the slug lock, see
-    // [`ryuz_git::GitSync`]): rename/purge/create hold this same guard across
-    // their own moves and wipes, so a push lands fully before or fully after
-    // those operations.
+    // innermost lock (AppLock → the slug lock, see [`ryuz_git::GitSync`]):
+    // rename/purge/create hold this same guard across their own moves and
+    // wipes, so a push lands fully before or fully after those operations.
     let _push_guard = state.wal.lock(&app.slug).await;
     let bare = match state.wal.ensure_synced_locked(&app.slug).await {
         Ok(b) => b,

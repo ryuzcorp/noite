@@ -1698,6 +1698,61 @@ async fn a_live_key_of_a_deleted_app_is_revoked_before_the_reused_prefix() {
     pool.close().await;
 }
 
+/// A rename commits the row update and only then marks the old prefix's key
+/// `revoking`; a crash in between leaves the old key `live`. A new app that
+/// takes that freed prefix must have it revoked before it mints its own key,
+/// or the old holder could read the new owner's objects.
+#[tokio::test]
+async fn a_live_key_whose_app_moved_away_is_revoked_before_the_reused_prefix() {
+    let pool = memory_db().await;
+    let (cfg, provider) = test_config(FakeProvider::new());
+    let old = app_row(&pool, "shop").await;
+    let old_scope = Scope::App {
+        app_id: old.id.clone(),
+        slug: "shop".into(),
+    };
+    ensure(&pool, &cfg, &provider, &old_scope)
+        .await
+        .expect("old key");
+    // The rename's row write lands; the process dies before `revoke_app`
+    // marks the row. The app row still exists, so the "app is gone" shape
+    // does not cover this.
+    db::rename_app(
+        &pool,
+        &old.id,
+        "shop",
+        "other",
+        "other.localhost",
+        "git/other/",
+        "s3://noite/fleets/other/",
+    )
+    .await
+    .expect("row moved");
+    assert!(
+        db::live_scoped_credential(&pool, &old_scope.key())
+            .await
+            .expect("read")
+            .is_some(),
+        "the crash left the old prefix's key live"
+    );
+
+    let new = app_row(&pool, "shop").await;
+    let new_scope = Scope::App {
+        app_id: new.id.clone(),
+        slug: "shop".into(),
+    };
+    let fresh = ensure(&pool, &cfg, &provider, &new_scope)
+        .await
+        .expect("mint after the stale-prefix revoke");
+    assert!(fresh.access_key.contains("fleets/shop/"));
+    assert_eq!(
+        provider.revoked(),
+        vec!["user-1".to_string()],
+        "the key whose app moved away is revoked before the new owner mints"
+    );
+    pool.close().await;
+}
+
 /// F2: the boot reconcile marks orphaned `scoped_credential` rows and drops
 /// orphaned `fleet_operator_token` rows (keeping the control fleet's, which
 /// has no app row by design), so the periodic sweep can revoke the store side.
@@ -1741,6 +1796,7 @@ async fn boot_reconcile_marks_key_and_token_rows_whose_app_is_gone() {
         super::OrphanRows {
             keys_marked: 1,
             tokens_dropped: 2,
+            failed: 0,
         }
     );
     assert!(

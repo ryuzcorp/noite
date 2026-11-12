@@ -53,24 +53,33 @@ impl PurgeStop {
     }
 }
 
-/// The background purges in flight, by slug. One per slug: a purge is only
-/// ever reusable through [`begin`], and [`RegisteredPurge`] removes the entry
-/// however the wipe ends (a panic included).
-static RUNNING: LazyLock<Mutex<HashMap<String, Arc<PurgeStop>>>> =
+/// One slug's shared stop handle and how many registrations hold it.
+type Registered = (Arc<PurgeStop>, usize);
+
+/// The background purges in flight, by slug: one shared [`PurgeStop`] per
+/// slug, plus how many registrations hold it. A second registration (the
+/// delete's chore racing a resume pass for the same slug, or two resume
+/// passes) joins the existing handle instead of replacing it, so one
+/// [`stop`] reaches every unfinished wipe of the slug. The entry goes when
+/// the last registration drops.
+static RUNNING: LazyLock<Mutex<HashMap<String, Registered>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
-fn running() -> std::sync::MutexGuard<'static, HashMap<String, Arc<PurgeStop>>> {
+fn running() -> std::sync::MutexGuard<'static, HashMap<String, Registered>> {
     RUNNING.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 /// Register a background purge for `slug`. The returned guard must live for
-/// the wipe's whole life: dropping it unregisters the handle.
+/// the wipe's whole life: dropping it unregisters this registration.
 pub fn begin(slug: &str) -> RegisteredPurge {
-    let stop = Arc::new(PurgeStop::default());
-    running().insert(slug.to_string(), stop.clone());
+    let mut map = running();
+    let (stop, held) = map
+        .entry(slug.to_string())
+        .or_insert_with(|| (Arc::new(PurgeStop::default()), 0));
+    *held += 1;
     RegisteredPurge {
         slug: slug.to_string(),
-        stop,
+        stop: stop.clone(),
     }
 }
 
@@ -89,12 +98,16 @@ impl RegisteredPurge {
 impl Drop for RegisteredPurge {
     fn drop(&mut self) {
         let mut map = running();
-        // Only our own handle goes: a later purge of the same slug must keep
-        // its own entry.
-        if map
-            .get(&self.slug)
-            .is_some_and(|live| Arc::ptr_eq(live, &self.stop))
-        {
+        let remove = match map.get_mut(&self.slug) {
+            // Only our own shared handle goes: a later generation's entry
+            // (the map was emptied and the slug re-registered) is not ours.
+            Some((live, held)) if Arc::ptr_eq(live, &self.stop) => {
+                *held = held.saturating_sub(1);
+                *held == 0
+            }
+            _ => false,
+        };
+        if remove {
             map.remove(&self.slug);
         }
     }
@@ -102,7 +115,7 @@ impl Drop for RegisteredPurge {
 
 /// Ask a background purge of `slug` to end. `true` when one was running.
 pub fn stop(slug: &str) -> bool {
-    let live = running().get(slug).cloned();
+    let live = running().get(slug).map(|(stop, _)| stop.clone());
     match live {
         Some(stop) => {
             stop.stop();
@@ -200,6 +213,7 @@ pub async fn resume_pending(
                 &slug,
                 supervisor::StopGrace::FOR_DELETE,
                 Some(registered.stop()),
+                false,
             )
             .await
             {
@@ -245,6 +259,13 @@ pub async fn resume_pending(
 ///
 /// `stop` is only for a background purge: `None` runs to completion, which is
 /// what create needs (the new row must not land on a half-wiped prefix).
+///
+/// `fleets_stopped` is the caller's `supervisor::any_fleet` answer from
+/// *before* it stopped this slug's fleets (delete does that before handing the
+/// wipe to the background). A stop removes the map entries, so the wipe cannot
+/// rediscover them; carrying the fact keeps the settle wait when a node was
+/// really killed (an `aws rm` racing a dying node corrupts its LTX chain).
+#[allow(clippy::too_many_arguments)] // matches the callers' state; a params struct would too
 pub async fn purge_slug(
     cfg: &Config,
     procs: &ProcMap,
@@ -253,6 +274,7 @@ pub async fn purge_slug(
     slug: &str,
     grace: supervisor::StopGrace,
     stop: Option<&PurgeStop>,
+    fleets_stopped: bool,
 ) -> anyhow::Result<Purged> {
     // The generation ends here: drop the seq marker first, so a failed purge
     // still converges on a full manifest sync instead of skipping a restarted
@@ -268,7 +290,7 @@ pub async fn purge_slug(
     let started = std::time::Instant::now();
     let ms =
         |since: std::time::Instant| u64::try_from(since.elapsed().as_millis()).unwrap_or(u64::MAX);
-    let had_fleet = supervisor::has_process(procs, slug).await;
+    let had_fleet = fleets_stopped || supervisor::any_fleet(procs, slug).await;
     supervisor::stop_fleet(procs, slug, grace).await;
     // Preview environments are fleets of their own (`slug.label`): they share
     // this app's data, so they go down before it is cleared. Their rows go
@@ -337,6 +359,12 @@ pub async fn purge_slug(
             _ => s3_envs_ms = ms_done,
         }
         step = std::time::Instant::now();
+    }
+    // A stop during the *last* prefix's wipe makes `clear_s3_prefix` return
+    // `Ok(())` with objects left behind; without this check the caller would
+    // see `Done` and clear the tombstone that owes the cleanup.
+    if hull_stopped() {
+        return Ok(Purged::Stopped);
     }
     tracing::info!(
         slug,
@@ -466,6 +494,7 @@ mod tests {
             "purge",
             crate::host::supervisor::StopGrace::NORMAL,
             None,
+            false,
         )
         .await
         .expect("purge");
@@ -519,6 +548,7 @@ mod tests {
             "stopped",
             crate::host::supervisor::StopGrace::NORMAL,
             Some(&stop),
+            false,
         )
         .await
         .expect("purge");
@@ -526,23 +556,150 @@ mod tests {
         let _ = std::fs::remove_dir_all(&cfg.work_dir);
     }
 
-    /// One registered handle per slug: a create's stop reaches the running
-    /// wipe, a finished wipe unregisters, and a later wipe's handle is not
-    /// removed by an earlier guard.
+    /// The delete path stops the app's fleets before it hands the wipe to the
+    /// background task, so the process map is already empty when the wipe
+    /// looks. The caller's carried fact keeps the settle wait that protects a
+    /// just-killed node's LTX chain from racing the `aws rm`.
+    #[tokio::test]
+    async fn a_wipe_after_a_caller_stop_still_settles() {
+        let scratch = crate::testutil::TempDir::new("noite-purge-settle");
+        let mut cfg = crate::config::config_for_tests();
+        cfg.work_dir = scratch.path().join("work").to_string_lossy().into_owned();
+        cfg.s3_endpoint = crate::testutil::spawn_s3_stub().await;
+        let git_sync = ryuz_git::GitSync::default();
+        let _push = git_sync.lock("settled").await;
+        let started = std::time::Instant::now();
+        let ended = purge_slug(
+            &cfg,
+            &crate::host::supervisor::new_procs(),
+            &crate::host::logs::new_state(),
+            &git_sync,
+            "settled",
+            crate::host::supervisor::StopGrace::NORMAL,
+            None,
+            true,
+        )
+        .await
+        .expect("purge");
+        assert_eq!(ended, Purged::Done);
+        assert!(
+            started.elapsed() >= Duration::from_millis(500),
+            "a wipe that follows the caller's stop must still settle"
+        );
+    }
+
+    /// One shared handle per slug: a second registration joins the running
+    /// wipe's stop, so a create's `stop` reaches every unfinished purge of the
+    /// slug (a delete's chore and a resume pass can overlap). The entry goes
+    /// with the last registration, and the next generation starts fresh.
     #[test]
     fn the_purge_registry_tracks_one_live_handle_per_slug() {
         let first = begin("registry-slug");
         assert!(stop("registry-slug"));
         assert!(first.stop().stopped());
-        // A second registration replaces the handle; the first guard must not
-        // unregister it when it goes.
         let second = begin("registry-slug");
+        assert!(
+            second.stop().stopped(),
+            "a second registration shares the live stop handle"
+        );
         drop(first);
-        assert!(!second.stop().stopped(), "a fresh handle starts unstopped");
-        assert!(stop("registry-slug"), "the live handle is still registered");
+        assert!(
+            stop("registry-slug"),
+            "the surviving registration keeps the handle live"
+        );
         assert!(second.stop().stopped());
         drop(second);
         assert!(!stop("registry-slug"), "nothing left to stop");
+        let next = begin("registry-slug");
+        assert!(!next.stop().stopped(), "a new generation starts unstopped");
+        drop(next);
+    }
+
+    /// A store that answers the first two listings empty and the third (the
+    /// `envs/` prefix) with one key, then sets the stop flag when it receives
+    /// that key's delete. The stop therefore lands during the *last* prefix.
+    async fn spawn_stop_on_last_listing(stop: Arc<PurgeStop>) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind stop s3");
+        let addr = listener.local_addr().expect("addr");
+        let listed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                let stop = stop.clone();
+                let listed = listed.clone();
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf = vec![0u8; 16384];
+                    let read = sock.read(&mut buf).await.unwrap_or(0);
+                    let request = String::from_utf8_lossy(&buf[..read]).to_string();
+                    let is_list = request.starts_with("GET ") && request.contains("list-type=2");
+                    let body = if request.starts_with("POST ") {
+                        // The only delete this purge sends is the envs/ key.
+                        stop.stop();
+                        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+                         <DeleteResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"></DeleteResult>"
+                            .to_string()
+                    } else if is_list && listed.fetch_add(1, Ordering::SeqCst) == 2 {
+                        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+                         <ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
+                         <Name>noite</Name><Prefix>envs/stoplast/</Prefix><MaxKeys>1000</MaxKeys>\
+                         <IsTruncated>false</IsTruncated>\
+                         <Contents><Key>envs/stoplast/feature/durable.sqlite</Key>\
+                         <LastModified>2026-11-12T00:00:00.000Z</LastModified>\
+                         <ETag>\"abc\"</ETag><Size>1</Size></Contents>\
+                         </ListBucketResult>"
+                            .to_string()
+                    } else {
+                        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+                         <ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
+                         <Name>noite</Name><MaxKeys>1000</MaxKeys>\
+                         <IsTruncated>false</IsTruncated></ListBucketResult>"
+                            .to_string()
+                    };
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/xml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    /// The stop checks between prefixes miss a stop that lands while the last
+    /// prefix is being wiped. `Done` there would let the caller clear the
+    /// tombstone that owes the leftover cleanup.
+    #[tokio::test]
+    async fn a_stop_during_the_last_prefix_is_not_reported_as_done() {
+        let scratch = crate::testutil::TempDir::new("noite-purge-last-stop");
+        let mut cfg = crate::config::config_for_tests();
+        cfg.work_dir = scratch.path().join("work").to_string_lossy().into_owned();
+        let stop = Arc::new(PurgeStop::default());
+        cfg.s3_endpoint = spawn_stop_on_last_listing(stop.clone()).await;
+        let git_sync = ryuz_git::GitSync::default();
+        let _push = git_sync.lock("stoplast").await;
+        let ended = purge_slug(
+            &cfg,
+            &crate::host::supervisor::new_procs(),
+            &crate::host::logs::new_state(),
+            &git_sync,
+            "stoplast",
+            crate::host::supervisor::StopGrace::NORMAL,
+            Some(stop.as_ref()),
+            false,
+        )
+        .await
+        .expect("purge");
+        assert_eq!(
+            ended,
+            Purged::Stopped,
+            "a stop during the last prefix must keep the tombstone"
+        );
     }
 
     /// A store that refuses every request with a final 4xx, so the resume pass
@@ -669,6 +826,7 @@ mod tests {
             "aborted",
             crate::host::supervisor::StopGrace::FOR_DELETE,
             Some(registered.stop()),
+            false,
         )
         .await
         .expect("purge");

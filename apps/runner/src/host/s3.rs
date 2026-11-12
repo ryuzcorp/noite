@@ -1101,21 +1101,48 @@ const WIPE_BATCH_KEYS: usize = 250;
 struct WipePace;
 
 impl WipePace {
-    /// Run one background-wipe batch under the process-wide pace.
-    async fn run_batch(&self, cfg: &Config, bucket: &str, keys: &[String]) -> anyhow::Result<()> {
+    /// Run one background-wipe batch under the process-wide pace. `false`:
+    /// `stop` was asked while this batch waited for the pace, so it was not
+    /// sent — a create that wants the slug must not queue behind unrelated
+    /// wipes, and a stopped wipe must not add one more batch.
+    async fn run_batch(
+        &self,
+        cfg: &Config,
+        bucket: &str,
+        keys: &[String],
+        stop: &(dyn Fn() -> bool + Send + Sync),
+    ) -> anyhow::Result<bool> {
         static PACE: std::sync::LazyLock<tokio::sync::Mutex<Option<tokio::time::Instant>>> =
             std::sync::LazyLock::new(|| tokio::sync::Mutex::new(None));
         let mut last = PACE.lock().await;
         if let Some(at) = *last {
             let elapsed = at.elapsed();
             if elapsed < WIPE_BATCH_GAP {
-                tokio::time::sleep(WIPE_BATCH_GAP - elapsed).await;
+                // Observe a stop while waiting for the pace, without waking
+                // once per slice for nothing.
+                let deadline = tokio::time::Instant::now() + (WIPE_BATCH_GAP - elapsed);
+                loop {
+                    if stop() {
+                        return Ok(false);
+                    }
+                    let now = tokio::time::Instant::now();
+                    if now >= deadline {
+                        break;
+                    }
+                    tokio::time::sleep((deadline - now).min(Duration::from_millis(10))).await;
+                }
             }
+        }
+        // Checked *after* the wait and immediately before sending: the pause
+        // is exactly where a create's stop arrives.
+        if stop() {
+            return Ok(false);
         }
         *last = Some(tokio::time::Instant::now());
         // Held across the request: releasing it first would let N wipes send
         // their batches concurrently, which is the load this exists to cap.
-        s3_delete_keys(cfg, bucket, keys).await
+        s3_delete_keys(cfg, bucket, keys).await?;
+        Ok(true)
     }
 }
 
@@ -1176,7 +1203,11 @@ async fn rm_prefix_loop(
                 return Ok(false);
             }
             match &pace {
-                Some(pace) => pace.run_batch(cfg, bucket, chunk).await?,
+                Some(pace) => {
+                    if !pace.run_batch(cfg, bucket, chunk, stop).await? {
+                        return Ok(false);
+                    }
+                }
                 None => s3_delete_keys(cfg, bucket, chunk).await?,
             }
         }

@@ -58,6 +58,14 @@ pub async fn run_forever(
     // One cheap SELECT per tick when nothing pends; a failed sweep backs
     // off a minute instead of hammering a struggling store.
     let mut last_cred_sweep: Option<Instant> = None;
+    // The boot pass that marks credential/token rows whose app is gone can
+    // fail (or finish partially) while the database is still recovering. The
+    // `sweep` below only reads rows already `revoking`, and the store-side
+    // orphan pass protects any row, so a missed live row would stay reachable
+    // until the next restart: retry it here, before the sweep, a bounded
+    // number of times. Idempotent and local-only.
+    let mut orphan_rows_at: Option<Instant> = Some(Instant::now());
+    let mut orphan_rows_attempts: u8 = 0;
     // Orphan scoped-key reconcile (SPEC, Scoped credentials): the store
     // listed against the DB, revoking what no row names. `None` runs on
     // the first tick, then every ten minutes — a full listing on every
@@ -120,6 +128,40 @@ pub async fn run_forever(
                 }
                 flag.store(false, Ordering::SeqCst);
             });
+        }
+        if orphan_rows_at.is_some_and(|at| Instant::now() >= at) {
+            orphan_rows_attempts += 1;
+            let (next, done) = match crate::host::credentials::reconcile_orphans(&pool).await {
+                Ok(rows) if rows.failed == 0 => {
+                    if !rows.nothing() {
+                        tracing::info!(
+                            keys_marked = rows.keys_marked,
+                            tokens_dropped = rows.tokens_dropped,
+                            "reconciled orphaned credential rows"
+                        );
+                    }
+                    (None, true)
+                }
+                Ok(rows) => {
+                    tracing::warn!(
+                        failed = rows.failed,
+                        "orphan credential row reconcile is incomplete"
+                    );
+                    (Some(Instant::now() + Duration::from_secs(60)), false)
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %format!("{e:#}"),
+                        "orphan credential row reconcile failed; retrying"
+                    );
+                    (Some(Instant::now() + Duration::from_secs(60)), false)
+                }
+            };
+            orphan_rows_at = if !done && orphan_rows_attempts < 5 {
+                next
+            } else {
+                None
+            };
         }
         // Scoped-key revocation retries (SPEC, Scoped credentials): a store
         // delete refused at revoke time stays marked until the store accepts.

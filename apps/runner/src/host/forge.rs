@@ -2359,6 +2359,7 @@ mod tests {
             &h.app.slug,
             crate::host::supervisor::StopGrace::NORMAL,
             None,
+            false,
         )
         .await
         .expect("purge");
