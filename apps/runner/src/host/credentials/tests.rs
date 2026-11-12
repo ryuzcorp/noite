@@ -166,16 +166,23 @@ async fn memory_db() -> sqlx::SqlitePool {
         .execute(&pool)
         .await
         .expect("test schema");
-    // `ensure` refuses to mint for an app with no row, so the scope helpers
-    // (`app-1` / `env-1`) need one. Its slug is unrelated on purpose: the
-    // check is "the app still exists", not "this prefix is its current one".
+    // `ensure` refuses to mint for an app with no row, and now also for a
+    // scope whose prefix is not the app's current one: the seeded rows name
+    // exactly what the scope helpers (`app-1` / `env-1`) ask for.
     sqlx::query(
         "INSERT INTO app (id, slug, name, subdomain, git_prefix, fleet_bucket, created_at, updated_at) \
-         VALUES ('app-1', 'seed-app', 'seed', 'seed.localhost', 'git/seed-app/', 's3://noite/fleets/seed-app', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+         VALUES ('app-1', 'shop', 'seed', 'shop.localhost', 'git/shop/', 's3://noite/fleets/shop', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
     )
     .execute(&pool)
     .await
     .expect("seed app row");
+    sqlx::query(
+        "INSERT INTO environment (id, app_id, label, kind, git_ref, fleet_bucket, created_at, updated_at) \
+         VALUES ('env-1', 'app-1', 'preview', 'branch', 'refs/heads/preview', 's3://noite/envs/shop/preview', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+    )
+    .execute(&pool)
+    .await
+    .expect("seed environment row");
     pool
 }
 
@@ -225,7 +232,19 @@ async fn rename_mints_fresh_and_revokes_old() {
     let before = ensure(&pool, &cfg, &provider, &app_scope())
         .await
         .expect("mint");
-    // The slug moved: the stored prefix no longer matches.
+    // The slug moved: the row now names the new prefix, so the stored key's
+    // prefix no longer matches and the app no longer owns it.
+    db::rename_app(
+        &pool,
+        "app-1",
+        "shop",
+        "store",
+        "store.localhost",
+        "git/store/",
+        "s3://noite/fleets/store/",
+    )
+    .await
+    .expect("row moved");
     revoke_app(&pool, &cfg, "app-1").await.expect("revoke");
     assert_eq!(provider.revoked(), vec!["user-1".to_string()]);
     let renamed = Scope::App {
@@ -1616,10 +1635,10 @@ async fn app_row(pool: &sqlx::SqlitePool, slug: &str) -> crate::models::App {
 async fn interrupted_delete_then_recreate_revokes_the_old_key_first() {
     let pool = memory_db().await;
     let (cfg, provider) = test_config(FakeProvider::new());
-    let old = app_row(&pool, "shop").await;
+    let old = app_row(&pool, "reused").await;
     let old_scope = Scope::App {
         app_id: old.id.clone(),
-        slug: "shop".into(),
+        slug: "reused".into(),
     };
     ensure(&pool, &cfg, &provider, &old_scope)
         .await
@@ -1636,10 +1655,10 @@ async fn interrupted_delete_then_recreate_revokes_the_old_key_first() {
     );
 
     // Tenant B takes the same slug while the old key still exists at the store.
-    let new = app_row(&pool, "shop").await;
+    let new = app_row(&pool, "reused").await;
     let new_scope = Scope::App {
         app_id: new.id.clone(),
-        slug: "shop".into(),
+        slug: "reused".into(),
     };
     provider.state.lock().expect("fake lock").fail_revoke = true;
     let blocked = ensure(&pool, &cfg, &provider, &new_scope).await;
@@ -1653,7 +1672,7 @@ async fn interrupted_delete_then_recreate_revokes_the_old_key_first() {
     let fresh = ensure(&pool, &cfg, &provider, &new_scope)
         .await
         .expect("mint after the revoke");
-    assert!(fresh.access_key.contains("fleets/shop/"));
+    assert!(fresh.access_key.contains("fleets/reused/"));
     assert_eq!(
         provider.revoked(),
         vec!["user-1".to_string()],
@@ -1671,10 +1690,10 @@ async fn interrupted_delete_then_recreate_revokes_the_old_key_first() {
 async fn a_live_key_of_a_deleted_app_is_revoked_before_the_reused_prefix() {
     let pool = memory_db().await;
     let (cfg, provider) = test_config(FakeProvider::new());
-    let old = app_row(&pool, "shop").await;
+    let old = app_row(&pool, "reused2").await;
     let old_scope = Scope::App {
         app_id: old.id.clone(),
-        slug: "shop".into(),
+        slug: "reused2".into(),
     };
     ensure(&pool, &cfg, &provider, &old_scope)
         .await
@@ -1691,15 +1710,15 @@ async fn a_live_key_of_a_deleted_app_is_revoked_before_the_reused_prefix() {
         .await
         .expect("still live");
 
-    let new = app_row(&pool, "shop").await;
+    let new = app_row(&pool, "reused2").await;
     let new_scope = Scope::App {
         app_id: new.id.clone(),
-        slug: "shop".into(),
+        slug: "reused2".into(),
     };
     let fresh = ensure(&pool, &cfg, &provider, &new_scope)
         .await
         .expect("mint after the orphan revoke");
-    assert!(fresh.access_key.contains("fleets/shop/"));
+    assert!(fresh.access_key.contains("fleets/reused2/"));
     assert_eq!(
         provider.revoked(),
         vec!["user-1".to_string()],
@@ -1716,10 +1735,10 @@ async fn a_live_key_of_a_deleted_app_is_revoked_before_the_reused_prefix() {
 async fn a_live_key_whose_app_moved_away_is_revoked_before_the_reused_prefix() {
     let pool = memory_db().await;
     let (cfg, provider) = test_config(FakeProvider::new());
-    let old = app_row(&pool, "shop").await;
+    let old = app_row(&pool, "reused3").await;
     let old_scope = Scope::App {
         app_id: old.id.clone(),
-        slug: "shop".into(),
+        slug: "reused3".into(),
     };
     ensure(&pool, &cfg, &provider, &old_scope)
         .await
@@ -1730,7 +1749,7 @@ async fn a_live_key_whose_app_moved_away_is_revoked_before_the_reused_prefix() {
     db::rename_app(
         &pool,
         &old.id,
-        "shop",
+        "reused3",
         "other",
         "other.localhost",
         "git/other/",
@@ -1746,20 +1765,83 @@ async fn a_live_key_whose_app_moved_away_is_revoked_before_the_reused_prefix() {
         "the crash left the old prefix's key live"
     );
 
-    let new = app_row(&pool, "shop").await;
+    let new = app_row(&pool, "reused3").await;
     let new_scope = Scope::App {
         app_id: new.id.clone(),
-        slug: "shop".into(),
+        slug: "reused3".into(),
     };
     let fresh = ensure(&pool, &cfg, &provider, &new_scope)
         .await
         .expect("mint after the stale-prefix revoke");
-    assert!(fresh.access_key.contains("fleets/shop/"));
+    assert!(fresh.access_key.contains("fleets/reused3/"));
     assert_eq!(
         provider.revoked(),
         vec!["user-1".to_string()],
         "the key whose app moved away is revoked before the new owner mints"
     );
+    pool.close().await;
+}
+
+/// A fleet spawn builds its scope from an app snapshot taken before a slug
+/// rename. The app id still exists, so the existence check alone would let
+/// `ensure` return or mint a key for the slug A left — which another app can
+/// own by now, handing A a key into B's objects. The current rows decide.
+#[tokio::test]
+async fn a_scope_from_a_pre_rename_snapshot_is_refused_and_mints_nothing() {
+    let pool = memory_db().await;
+    let (cfg, provider) = test_config(FakeProvider::new());
+    let a = app_row(&pool, "s1").await;
+    let stale = Scope::App {
+        app_id: a.id.clone(),
+        slug: "s1".into(),
+    };
+    ensure(&pool, &cfg, &provider, &stale)
+        .await
+        .expect("A's key");
+    // A's rename commits its row (a crash before `revoke_app` leaves the old
+    // key live — the stale snapshot replays the scope it read before).
+    db::rename_app(
+        &pool,
+        &a.id,
+        "s1",
+        "s2",
+        "s2.localhost",
+        "git/s2/",
+        "s3://noite/fleets/s2/",
+    )
+    .await
+    .expect("row moved");
+    // B takes the slug A used to own.
+    let _ = app_row(&pool, "s1").await;
+
+    let refused = ensure(&pool, &cfg, &provider, &stale)
+        .await
+        .expect_err("A's stale scope no longer names A's prefix");
+    assert!(
+        format!("{refused:#}").contains("no longer owns"),
+        "the refusal names the stale prefix, got {refused:#}"
+    );
+    assert_eq!(provider.mint_count(), 1, "nothing is minted for B's prefix");
+    assert!(
+        provider.revoked().is_empty(),
+        "B's key/prefix is not touched by A's stale request"
+    );
+
+    // The rename's own revoke (what `rename_slugged` does after the row
+    // write) removes the old row, so the current scope can mint.
+    revoke_app(&pool, &cfg, &a.id)
+        .await
+        .expect("revoke after rename");
+
+    // A's current scope still works.
+    let current = Scope::App {
+        app_id: a.id.clone(),
+        slug: "s2".into(),
+    };
+    let key = ensure(&pool, &cfg, &provider, &current)
+        .await
+        .expect("A's current prefix mints");
+    assert!(key.access_key.contains("fleets/s2/"));
     pool.close().await;
 }
 

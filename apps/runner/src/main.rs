@@ -564,6 +564,28 @@ async fn main() -> anyhow::Result<()> {
             }
         });
     }
+    // An unfinished rename reserves its target slug with a marker that a
+    // delete no longer drops (the target can hold the deleted app's moved
+    // objects, which belong to nobody). Resuming them at boot — not only on
+    // the loop's slow tick — both continues a crashed move and wipes such an
+    // orphaned target, so its slug is never blocked by a stale reservation.
+    {
+        let state = state.clone();
+        service::detached::spawn("rename:resume".to_string(), async move {
+            let resumed = host::rename::resume_pending_renames(
+                &state.config,
+                &state.pool,
+                &state.procs,
+                &state.logs,
+                &state.deploying,
+                state.wal.sync(),
+            )
+            .await;
+            if resumed > 0 {
+                tracing::info!(resumed, "resumed unfinished renames");
+            }
+        });
+    }
     // CI cache volumes no live app owns: a legacy slug-keyed name, a deleted
     // app whose wipe died, a rename. Detached and non-fatal, like the sweeps
     // below; the slow loop tick runs it again.

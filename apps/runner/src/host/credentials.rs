@@ -522,6 +522,23 @@ pub async fn tenant_process_credentials(
     }
 }
 
+/// The prefix the scope names *today*, read from the current app row (and,
+/// for an environment scope, the current environment row). `None` when the
+/// app — or that environment — no longer exists. A rename changes the app's
+/// slug, so a scope built from a pre-rename snapshot does not match this.
+async fn current_prefix(pool: &sqlx::SqlitePool, scope: &Scope) -> anyhow::Result<Option<String>> {
+    let Some(app) = db::get_app(pool, scope.app_id()).await? else {
+        return Ok(None);
+    };
+    Ok(Some(match scope {
+        Scope::App { .. } => format!("fleets/{}/", app.slug),
+        Scope::Environment { env_id, .. } => match db::get_environment(pool, env_id).await? {
+            Some(env) if env.app_id == app.id => format!("envs/{}/{}/", env.app_slug, env.label),
+            _ => return Ok(None),
+        },
+    }))
+}
+
 /// The scope's live key, minting one when it has none that fits.
 async fn ensure(
     pool: &sqlx::SqlitePool,
@@ -537,11 +554,24 @@ async fn ensure(
     // that is being deleted must not start at all. A mint already in flight
     // completed before the delete's transaction, which marks its row
     // `revoking`; see `db::delete_app`.
-    if db::get_app(pool, scope.app_id()).await?.is_none() {
-        anyhow::bail!(
+    //
+    // The scope is what the caller *asked* for, and a fleet spawn builds it
+    // from its app snapshot before requesting credentials: after a slug rename
+    // that snapshot names a prefix the app no longer owns. The app id still
+    // exists, so the existence check alone would hand that spawn (or mint) a
+    // key for the old slug — which another app can have taken by now, giving
+    // the old app a key to the new owner's objects. Compare against the rows
+    // as they are now, under the same fence the rename's row write takes.
+    match current_prefix(pool, scope).await? {
+        Some(current) if current == prefix => {}
+        Some(current) => anyhow::bail!(
+            "scope {scope_key} names {prefix}, but app {} now lives under {current}; no scoped key is minted for a prefix it no longer owns",
+            scope.app_id()
+        ),
+        None => anyhow::bail!(
             "app {} no longer exists; no scoped key is minted for {prefix}",
             scope.app_id()
-        );
+        ),
     }
     if let Some(row) = db::live_scoped_credential(pool, &scope_key).await? {
         if row.prefix == prefix && row.store == store {

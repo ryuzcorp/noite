@@ -494,6 +494,10 @@ async fn rename_inner(
             let msg = format!("{e:#}");
             if msg.contains("deploy in flight") {
                 Err(ApiError::conflict(msg))
+            } else if msg.contains("another rename of this app is pending") {
+                // An unfinished move to a different target still owns what it
+                // may have moved there; retry once it resolves.
+                Err(ApiError::conflict(msg))
             } else if msg.contains("invalid slug") || msg.contains("app not found") {
                 Err(ApiError::bad(msg))
             } else if msg.contains("slug already taken") || msg.contains("UNIQUE constraint") {
@@ -798,12 +802,13 @@ async fn delete_inner(state: &AppState, id: &str) -> Result<(), ApiError> {
     // wait for the wipe. `delete_app` writes the purge tombstone and marks the
     // app's scoped keys `revoking` in the same transaction, so nothing below
     // can be lost (and no old key outlives the freed slug) if this task dies.
-    // The slug is about to lose its owner: attempts that started from it can
-    // never be resumed, and no marker may survive over the freed slug. Forget
-    // them *before* the row goes, so a crash right after the delete cannot
-    // leave a stale reservation behind.
-    crate::host::rename::forget_markers_from(&state.config, &app.slug).await;
-    crate::host::rename::forget_target_marker(&state.config, &app.slug).await;
+    // A pending rename marker is deliberately *not* dropped here. It records
+    // that an unfinished attempt may already have moved this app's objects
+    // under the target slug; with the row gone, those objects belong to
+    // nobody. Keeping the marker reserves the target until the rename resume
+    // pass wipes it (under the target's guard) and only then removes the
+    // marker: a failed delete preserves it, a successful one leaves its
+    // target for that pass, and a boot-time pass covers a crash.
     // The row delete is fenced against credential minting: a mint that is
     // already in flight either commits first (this transaction marks its row
     // `revoking`, swept below) or sees the app gone and revokes its key.
@@ -1824,6 +1829,141 @@ mod tests {
             !crate::host::rename::target_reserved(&state.config, "rs-new").await,
             "the reservation is released once the row commits"
         );
+        drop(dir);
+    }
+
+    /// A pending rename to one target blocks a rename to another: the earlier
+    /// attempt may already have moved objects there, and committing a
+    /// different target would clear its marker and leave them owned by
+    /// nobody. The retry is a conflict until the pending move finishes.
+    #[tokio::test]
+    async fn a_rename_to_a_third_slug_waits_for_the_pending_target() {
+        let (state, dir) = test_state(10).await;
+        let app = db::create_app(
+            &state.pool,
+            &state.config,
+            db::NewApp {
+                name: "Pending",
+                slug: "rn-old",
+                user_id: "u1",
+                subdomain: "rn-old.localhost",
+                listen: 30680,
+                internal: 30681,
+            },
+        )
+        .await
+        .expect("app row");
+        // A's attempt at rn-old → rn-new failed before the row update.
+        crate::host::rename::write_rename_marker_for_test(
+            &state.config,
+            &app.id,
+            "rn-old",
+            "rn-new",
+        )
+        .await
+        .expect("failed attempt marker");
+
+        let refused = rename(&state, &app.id, None, Some("rn-other"))
+            .await
+            .expect_err("a different target is blocked by the pending move");
+        assert!(
+            matches!(&refused, ApiError::Conflict(message) if message.contains("pending")),
+            "the refusal is a retryable conflict, got {refused:?}"
+        );
+        let row = db::get_app(&state.pool, &app.id)
+            .await
+            .expect("read")
+            .expect("row");
+        assert_eq!(row.slug, "rn-old", "nothing moved");
+
+        // The pending move still resolves, and then the other target works.
+        let renamed = rename(&state, &app.id, None, Some("rn-new"))
+            .await
+            .expect("the pending target resumes");
+        assert_eq!(renamed.slug, "rn-new");
+        let again = rename(&state, &app.id, None, Some("rn-other"))
+            .await
+            .expect("a different target once nothing is pending");
+        assert_eq!(again.slug, "rn-other");
+        drop(dir);
+    }
+
+    /// A delete keeps a pending rename's marker: the target may already hold
+    /// the app's moved objects, which now belong to nobody. The slug stays
+    /// reserved until a resume pass wipes the target, and only then is the
+    /// marker dropped.
+    #[tokio::test]
+    async fn a_delete_keeps_the_marker_until_its_target_is_wiped() {
+        let (state, dir) = test_state(10).await;
+        let app = db::create_app(
+            &state.pool,
+            &state.config,
+            db::NewApp {
+                name: "Orphan",
+                slug: "ob-old",
+                user_id: "u1",
+                subdomain: "ob-old.localhost",
+                listen: 30682,
+                internal: 30683,
+            },
+        )
+        .await
+        .expect("app row");
+        crate::host::rename::write_rename_marker_for_test(
+            &state.config,
+            &app.id,
+            "ob-old",
+            "ob-new",
+        )
+        .await
+        .expect("failed attempt marker");
+        // The failed attempt got as far as moving an object to the target.
+        let moved = crate::host::exec::work_root(&state.config)
+            .join("fleets")
+            .join("ob-new");
+        std::fs::create_dir_all(&moved).expect("moved target dir");
+        std::fs::write(moved.join("object.bin"), "moved").expect("moved object");
+
+        let done = crate::service::detached::finished(&format!("app:{}", app.id));
+        let _ = delete(&state, &app.id).await.expect("delete answers");
+        tokio::time::timeout(Duration::from_secs(30), done.notified())
+            .await
+            .expect("the delete's detached work finished");
+
+        assert!(
+            crate::host::rename::target_reserved(&state.config, "ob-new").await,
+            "the delete leaves the pending marker in place"
+        );
+        assert!(
+            moved.join("object.bin").exists(),
+            "the delete does not touch the target it does not own"
+        );
+        let refused = create(&state, "B", "ob-new", Some("u1"), None)
+            .await
+            .expect_err("the target stays reserved until it is wiped");
+        assert!(
+            matches!(&refused, ApiError::Conflict(message) if message.contains("being renamed")),
+            "the create is a retryable conflict, got {refused:?}"
+        );
+
+        let resumed = crate::host::rename::resume_pending_renames(
+            &state.config,
+            &state.pool,
+            &state.procs,
+            &state.logs,
+            &state.deploying,
+            state.wal.sync(),
+        )
+        .await;
+        assert_eq!(resumed, 0, "there is no app left to rename");
+        assert!(!moved.exists(), "the orphaned target's data is wiped");
+        assert!(
+            !crate::host::rename::target_reserved(&state.config, "ob-new").await,
+            "the marker is dropped only after the wipe"
+        );
+        create(&state, "B", "ob-new", Some("u1"), None)
+            .await
+            .expect("the slug is usable once the target is clean");
         drop(dir);
     }
 

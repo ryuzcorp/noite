@@ -240,9 +240,16 @@ pub(crate) async fn forget_markers_from(cfg: &Config, from: &str) -> usize {
     removed
 }
 
+/// fsync a directory, so an entry just created or renamed into it survives a
+/// power loss. A failure is the caller's to propagate: a marker that may not
+/// be on disk must never vouch for a move that already started.
+async fn sync_dir(path: &std::path::Path) -> std::io::Result<()> {
+    tokio::fs::File::open(path).await?.sync_all().await
+}
+
 /// Durably record that `app_id` started moving `from` → `to` before the first
-/// object moves. `sync_all` on the file and its directory puts the fact on
-/// disk: the whole point is that it survives the crash the move might not.
+/// object moves. `sync_all` on the file **and both directories** puts the fact
+/// on disk: the whole point is that it survives the crash the move might not.
 async fn write_rename_marker(
     cfg: &Config,
     app_id: &str,
@@ -253,7 +260,27 @@ async fn write_rename_marker(
     let parent = path
         .parent()
         .ok_or_else(|| anyhow::anyhow!("rename marker has no parent: {}", path.display()))?;
-    tokio::fs::create_dir_all(parent).await?;
+    // A first creation of `rename/` must be durable in its own parent too;
+    // syncing only the new directory would leave its entry to be lost.
+    let created = match tokio::fs::create_dir(parent).await {
+        Ok(()) => true,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            tokio::fs::create_dir_all(parent).await?;
+            true
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => false,
+        Err(e) => {
+            return Err(e)
+                .with_context(|| format!("create rename marker directory {}", parent.display()))
+        }
+    };
+    if created {
+        if let Some(root) = parent.parent() {
+            sync_dir(root)
+                .await
+                .with_context(|| format!("fsync {}", root.display()))?;
+        }
+    }
     // Write-then-rename: a concurrent `pending_renames` must never observe a
     // partial marker (it would treat it as malformed and delete it, losing the
     // reservation of a move that may already have moved data). The temp name
@@ -273,12 +300,14 @@ async fn write_rename_marker(
         let _ = tokio::fs::remove_file(&tmp).await;
         return Err(e).with_context(|| format!("write rename marker {}", path.display()));
     }
-    // The directory entry is what makes the file survive a crash; best-effort
-    // (`sync_all` on a directory is not portable), the content sync above is
-    // the part that matters.
-    if let Ok(dir) = tokio::fs::File::open(parent).await {
-        let _ = dir.sync_all().await;
-    }
+    // The directory entry is what makes the file survive a crash: without it
+    // the marker can vanish while the app row still names the source, and a
+    // later create would wipe the unreserved target (the moved objects' only
+    // copy). Never report success — and so never start the move — on a
+    // failed sync.
+    sync_dir(parent)
+        .await
+        .with_context(|| format!("fsync rename marker directory {}", parent.display()))?;
     Ok(())
 }
 
@@ -383,6 +412,20 @@ pub async fn rename_app(
             .await?
             .ok_or_else(|| anyhow::anyhow!("app not found"));
     }
+    // An unfinished rename of *this* app to a different target may already
+    // have moved objects to it (a crash before the row update). Committing
+    // this target would clear that marker and leave the moved objects owned
+    // by nobody — a create of the other target could then wipe their only
+    // copy. Only the pending move may finish; the client retries this rename
+    // after it resumes (or its target is recovered).
+    for pending in pending_renames(cfg).await {
+        if pending.app_id == app.id && pending.from == app.slug && pending.to != new_slug {
+            anyhow::bail!(
+                "another rename of this app is pending (to {}); retry shortly",
+                pending.to
+            );
+        }
+    }
     // A background wipe of a just-deleted app on the target slug is a chore
     // with no owner: ask it to yield before we queue on its guard, exactly like
     // create does. Whatever it leaves behind is wiped below, under the guard.
@@ -481,12 +524,57 @@ pub async fn rename_app(
     Ok(renamed)
 }
 
+/// Wipe what an unfinished rename moved under a target whose app row is gone,
+/// then drop its marker. The moved objects belong to nobody now (a deleted
+/// tenant's data under a slug no row owns) and are the only copy, so the slug
+/// stays reserved — create/rename refuse it — until this succeeds.
+async fn wipe_orphaned_target(
+    cfg: &Config,
+    pool: &sqlx::SqlitePool,
+    procs: &ProcMap,
+    logs: &LogState,
+    git_sync: &ryuz_git::GitSync,
+    marker: &PendingRename,
+) -> anyhow::Result<()> {
+    // A delete's chore may still be wiping the target: stop it and do the
+    // work here, exactly like create does, instead of running two wipes of
+    // one prefix.
+    crate::host::purge::stop(&marker.to);
+    // The guard makes "no row owns this slug" authoritative: a create or
+    // rename inserts its row under it and only after wiping the prefixes.
+    let _guard = git_sync.lock(&marker.to).await;
+    if db::get_app_by_slug(pool, &marker.to).await?.is_none() {
+        crate::host::purge::purge_slug(
+            cfg,
+            procs,
+            logs,
+            git_sync,
+            &marker.to,
+            supervisor::StopGrace::FOR_DELETE,
+            None,
+            false,
+        )
+        .await?;
+        // The prefix is empty and no row owns the slug: every tombstone for
+        // it is satisfied (a failure only leaves it for the purge resume).
+        if let Err(e) = db::clear_app_purges(pool, &marker.to).await {
+            tracing::warn!(slug = %marker.to, error = %e, "wiped an orphaned rename target but could not clear its purge tombstones");
+        }
+    }
+    // A row owns the slug again: its own create wiped the prefixes before it
+    // inserted the row, so nothing of the old attempt is left to preserve.
+    clear_rename_marker(cfg, &marker.to).await;
+    Ok(())
+}
+
 /// Resume every rename an earlier attempt left unfinished (the durable
 /// markers). The loop runs this on its slow tick: a crash mid-move no longer
 /// needs a client retry, and until the move resolves the target slug stays
-/// reserved (a create or another rename onto it is refused). Stale markers —
-/// the app row is gone, already at another slug, or already at the target —
-/// are removed so they can never block a slug.
+/// reserved (a create or another rename onto it is refused). A marker whose
+/// app row is gone is resolved by wiping what it moved to the target (the
+/// objects belong to nobody) before the marker is dropped, so a failed delete
+/// never discards a target that still holds data. Other stale markers — the
+/// app already at another slug — are removed so they cannot block a slug.
 pub async fn resume_pending_renames(
     cfg: &Config,
     pool: &sqlx::SqlitePool,
@@ -510,9 +598,30 @@ pub async fn resume_pending_renames(
         };
         let live = app.as_ref().is_some_and(|app| app.slug == marker.from);
         if !live {
-            // The app left (deleted, or another rename completed): the attempt
-            // has nothing to resume and must not keep reserving the target.
-            clear_rename_marker(cfg, &marker.to).await;
+            if app.is_some() {
+                // The app left the slug (another rename committed, or the row
+                // was changed): the attempt can never resume, and whatever it
+                // moved is the app's own data under the target it now owns.
+                clear_rename_marker(cfg, &marker.to).await;
+                continue;
+            }
+            // The app is gone: whatever the attempt moved under the target
+            // belongs to nobody. Wipe it, then drop the marker; the slug stays
+            // reserved until the wipe is done.
+            match wipe_orphaned_target(cfg, pool, procs, logs, git_sync, &marker).await {
+                Ok(()) => tracing::info!(
+                    app_id = %marker.app_id,
+                    from = %marker.from,
+                    target = %marker.to,
+                    "wiped the target of a deleted app's unfinished rename"
+                ),
+                Err(e) => tracing::warn!(
+                    app_id = %marker.app_id,
+                    target = %marker.to,
+                    error = %format!("{e:#}"),
+                    "the target of a deleted app's unfinished rename is still pending; retrying on a later pass"
+                ),
+            }
             continue;
         }
         match rename_app(
