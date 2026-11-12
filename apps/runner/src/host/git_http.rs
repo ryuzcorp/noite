@@ -277,10 +277,10 @@ pub(crate) async fn init_repos(state: &AppState, slug: &str) -> anyhow::Result<(
     Ok(())
 }
 
-/// The retired hidden preview namespace. Nothing writes it, the boot sweep
-/// deletes what an upgrade left, and the Git advertisement and fetch paths
-/// hide it.
-pub const RETIRED_PREVIEW_PREFIX: &str = "refs/previews/";
+/// The reserved hidden preview namespace. Nothing writes it any more, the
+/// boot sweep deletes what an upgrade left, every caller-ref surface refuses
+/// it, and the Git advertisement and fetch paths hide it.
+pub const PREVIEW_REF_PREFIX: &str = "refs/previews/";
 
 /// Every ref the runner tracks in a mirror: branches and tags.
 pub(crate) async fn list_refs(bare: &Path) -> anyhow::Result<HashMap<String, String>> {
@@ -397,7 +397,7 @@ pub(crate) async fn after_receive(
             &git_dir,
             "for-each-ref",
             "--format=%(objectname) %(refname)",
-            RETIRED_PREVIEW_PREFIX,
+            PREVIEW_REF_PREFIX,
         ],
         None,
         &[],
@@ -408,7 +408,7 @@ pub(crate) async fn after_receive(
         let Some((sha, refname)) = line.trim().split_once(' ') else {
             continue;
         };
-        if refname.starts_with(RETIRED_PREVIEW_PREFIX) {
+        if refname.starts_with(PREVIEW_REF_PREFIX) {
             refs.insert(refname.to_string(), sha.to_string());
         }
     }
@@ -509,7 +509,7 @@ pub async fn info_refs(
         "git",
         &[
             "-c",
-            &format!("uploadpack.hideRefs={RETIRED_PREVIEW_PREFIX}"),
+            &format!("uploadpack.hideRefs={PREVIEW_REF_PREFIX}"),
             prog,
             "--stateless-rpc",
             "--advertise-refs",
@@ -566,7 +566,7 @@ pub async fn upload_pack(
         "git",
         &[
             "-c",
-            &format!("uploadpack.hideRefs={RETIRED_PREVIEW_PREFIX}"),
+            &format!("uploadpack.hideRefs={PREVIEW_REF_PREFIX}"),
             "upload-pack",
             "--stateless-rpc",
             bare_arg,

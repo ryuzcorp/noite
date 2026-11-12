@@ -77,7 +77,7 @@ pub fn check_push_policy(role: &str, cmds: &[PushCommand]) -> PolicyDecision {
     // no longer snapshots.
     if cmds.iter().any(|cmd| {
         cmd.refname
-            .starts_with(crate::host::git_http::RETIRED_PREVIEW_PREFIX)
+            .starts_with(crate::host::git_http::PREVIEW_REF_PREFIX)
     }) {
         return PolicyDecision::Deny(
             "rule push-policy: refs/previews/* is retired and may not be written".into(),

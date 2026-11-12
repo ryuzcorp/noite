@@ -61,8 +61,8 @@ pub fn build_wal(cfg: &Config) -> GitWal {
     // sweep can delete the refs an upgrade left (and so a manifest refresh
     // does not lose track of them before that); no writer creates them, pushes
     // to the namespace are denied, and Git never advertises it.
-    .with_hidden_refs([crate::host::git_http::RETIRED_PREVIEW_PREFIX.to_string()])
-    .with_extra_ref_prefixes([crate::host::git_http::RETIRED_PREVIEW_PREFIX.to_string()])
+    .with_hidden_refs([crate::host::git_http::PREVIEW_REF_PREFIX.to_string()])
+    .with_extra_ref_prefixes([crate::host::git_http::PREVIEW_REF_PREFIX.to_string()])
     .with_storage(ryuz_git::StorageMode::Bundle);
     GitWal::new(store, Arc::new(config), Arc::new(ryuz_git::RefsCodec))
 }

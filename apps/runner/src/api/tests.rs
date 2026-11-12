@@ -1469,7 +1469,8 @@ async fn git(dir: &std::path::Path, args: &[&str]) -> String {
     .unwrap_or_else(|e| panic!("git {args:?}: {e:#}"))
 }
 
-/// Seed one branch environment of `app` directly (no mirror needed).async fn seed_env(
+/// Seed one branch environment of `app` directly (no mirror needed).
+async fn seed_env(
     h: &Harness,
     app: &crate::models::App,
     label: &str,

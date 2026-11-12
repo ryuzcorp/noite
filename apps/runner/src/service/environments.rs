@@ -293,17 +293,19 @@ pub async fn deploy(
     let bare = forge::read_mirror(state, &app.slug)
         .await
         .map_err(ApiError::from_anyhow)?;
-    // The stored row's ref, written by `create` or the preview route, is
-    // internal: resolving it is the preview deploy's own path, so the raw
-    // form is deliberate here.
-    let sha = forge::resolve_ref(&bare, &env.git_ref).await.map_err(|e| {
-        let msg = format!("{e:#}");
-        if msg.contains("not found") {
-            ApiError::not_found(msg)
-        } else {
-            ApiError::bad(msg)
-        }
-    })?;
+    // The stored row's ref is a branch env's `refs/heads/*` (`create` is the
+    // only writer now that previews are gone); it still goes through the
+    // caller-reference guard so a row can never resolve a reserved namespace.
+    let sha = forge::resolve_user_ref(&bare, &env.git_ref)
+        .await
+        .map_err(|e| {
+            let msg = format!("{e:#}");
+            if msg.contains("not found") {
+                ApiError::not_found(msg)
+            } else {
+                ApiError::bad(msg)
+            }
+        })?;
     let deploy_id = spawn_deploy(state, &app, env, &sha, actor).await?;
     Ok((deploy_id, sha))
 }

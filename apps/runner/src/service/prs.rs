@@ -2041,9 +2041,14 @@ mod tests {
             "{}user_1/feature",
             crate::host::git_http::PREVIEW_REF_PREFIX
         );
-        forge::publish_refname(&h.state, &h.app, &preview, None, Some(&head))
+        h.state
+            .wal
+            .publish_locked(
+                &h.app.slug,
+                &[ryuz_git::RefUpdate::set(&preview, None::<String>, &head)],
+            )
             .await
-            .expect("publish preview ref");
+            .expect("seed preview ref");
         let author = actor("user_author", "Author");
 
         for refname in [

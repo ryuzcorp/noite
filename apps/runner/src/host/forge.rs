@@ -524,7 +524,7 @@ async fn retired_refs_in_manifest(state: &AppState, slug: &str) -> anyhow::Resul
     Ok(refs
         .refs
         .into_keys()
-        .filter(|name| name.starts_with(crate::host::git_http::RETIRED_PREVIEW_PREFIX))
+        .filter(|name| name.starts_with(crate::host::git_http::PREVIEW_REF_PREFIX))
         .collect())
 }
 
@@ -535,7 +535,7 @@ async fn retired_refs_in_manifest(state: &AppState, slug: &str) -> anyhow::Resul
 /// Idempotent; returns how many refs it removed. A ref another runner already
 /// deleted is not an error.
 pub async fn delete_retired_refs(state: &AppState, slug: &str) -> anyhow::Result<usize> {
-    let retired = crate::host::git_http::RETIRED_PREVIEW_PREFIX;
+    let retired = crate::host::git_http::PREVIEW_REF_PREFIX;
     let known = retired_refs_in_manifest(state, slug).await?;
     let mirror = state.wal.mirror_path(slug);
     let local = if mirror.join("HEAD").exists() {
@@ -1630,9 +1630,21 @@ mod tests {
             "{}user_1/feature",
             crate::host::git_http::PREVIEW_REF_PREFIX
         );
-        publish_refname(&h.state, &h.app, &preview, None, Some(&preview_only))
+        // Seeded out-of-band: the runner no longer writes the reserved
+        // namespace (pushes there are refused), but an upgraded mirror still
+        // holds one.
+        h.state
+            .wal
+            .publish_locked(
+                &h.app.slug,
+                &[ryuz_git::RefUpdate::set(
+                    &preview,
+                    None::<String>,
+                    &preview_only,
+                )],
+            )
             .await
-            .expect("publish preview ref");
+            .expect("seed preview ref");
         let short = &main[..7];
 
         // The bare spellings matter too: git's DWIM rewrites `previews/…` to
@@ -2607,9 +2619,14 @@ mod tests {
             "{}user_2/feature",
             crate::host::git_http::PREVIEW_REF_PREFIX
         );
-        publish_refname(&h.state, &h.app, &preview, None, Some(&main))
+        h.state
+            .wal
+            .publish_locked(
+                &h.app.slug,
+                &[ryuz_git::RefUpdate::set(&preview, None::<String>, &main)],
+            )
             .await
-            .expect("publish preview ref");
+            .expect("seed preview ref");
         let files = vec![text_file("feature.txt", "wip\n")];
 
         // `fromSha` naming the preview ref is refused before any object write.
