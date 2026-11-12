@@ -1549,6 +1549,26 @@ async fn branch_deploy_resolves_that_branchs_tip() {
             .await;
     assert!(forbidden.is_err(), "deploying a branch needs push");
 
+    // Branch protection is the admin's policy, so a push member cannot deploy
+    // a branch around it; an admin keeps the override.
+    crate::db::prs::set_branch_rules(&h.state.pool, &app.id, true, 0)
+        .await
+        .expect("branch rules");
+    let protected =
+        crate::service::deploys::prepare_branch_deploy(&h.state, &app.id, "feature", Some("push"))
+            .await;
+    assert!(
+        protected.is_err(),
+        "a push member must open a pull request under branch protection"
+    );
+    let admin =
+        crate::service::deploys::prepare_branch_deploy(&h.state, &app.id, "feature", Some("admin"))
+            .await;
+    assert!(
+        admin.is_ok(),
+        "an admin may deploy a branch under protection"
+    );
+
     h.finish().await;
 }
 

@@ -283,6 +283,18 @@ pub async fn prepare_branch_deploy(
     // carries the same push gate.
     super::environments::require_push(role)?;
     let app = app_or_404(state, id).await?;
+    // Branch protection is the admin's word on how code reaches production:
+    // with a PR rule on, a push member must open a pull request instead of
+    // deploying a branch around it (the same stance as a `main` push and the
+    // web-commit path). Admins keep the override.
+    let rules = crate::db::prs::branch_rules(&state.pool, &app.id)
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+    if (rules.require_pr != 0 || rules.required_approvals > 0) && role != Some("admin") {
+        return Err(ApiError::forbidden(
+            "branch protection is on: open a pull request, or ask an admin to deploy a branch",
+        ));
+    }
     let branch = branch_ref(reference)?;
     let bare = crate::host::forge::read_mirror(state, &app.slug)
         .await
