@@ -58,6 +58,20 @@ export type OnlineProbe =
       url: string;
     };
 
+/**
+ * The files whose text carries an image pin: the Dockerfile's FROM lines,
+ * compose's rustfs sidecar, CI's rustfs service and the tag platforms.mdx
+ * documents. `.github/workflows/check.yml` resolves image tag digests only
+ * for a PR that changes one of these, so docker/check-versions.test.ts
+ * asserts its paths filter lists every entry here.
+ */
+export const imagePinFiles = [
+  ".github/workflows/ci.yml",
+  "apps/website/docs/self-hosting/platforms.mdx",
+  "docker/Dockerfile",
+  "docker/compose.yaml",
+] as const;
+
 interface DownloadSpec {
   algo: "sha256" | "sha512";
   archVars: Record<string, string>;

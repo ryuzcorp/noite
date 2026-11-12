@@ -72,7 +72,11 @@ jobs:
       # immutable (an official image re-pushes the same tag for a base-OS
       # update), so their digests are resolved only for a PR that changes a
       # pin; `.github/workflows/pin-drift.yml` runs that leg weekly and files
-      # an issue instead of failing unrelated PRs.
+      # an issue instead of failing unrelated PRs. The merge queue and the
+      # release builds (`images.yml`, a push or tag with no PR file list)
+      # deliberately skip the image leg: the build consumes the digest the
+      # pin already carries, so a re-pushed tag cannot change what ships,
+      # and the weekly job is what notices drift.
       - name: image pin files changed
         id: pins
         if: github.event_name == 'pull_request'

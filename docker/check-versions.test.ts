@@ -6,6 +6,7 @@ import {
   checkIntegrityPins,
   githubAssetDigest,
   hubTagUrl,
+  imagePinFiles,
   npmIntegrityHex,
   onlineProbes,
   parseOnlineFlags,
@@ -475,6 +476,47 @@ describe("online flags", () => {
     expect(all.filter((probe) => probe.kind === "image")).toHaveLength(
       report.images.length
     );
+  });
+
+  // check.yml resolves image tag digests only for a PR that changes one of
+  // these files, so its paths filter must keep listing every file the guard
+  // reads for an image pin: a new source outside the filter would silently
+  // demote that pin to the weekly drift run.
+  test("check.yml's image filter covers every file that carries an image pin", () => {
+    const lines = readRepoFile(".github/workflows/check.yml").split("\n");
+
+    const filters = lines.findIndex((line) =>
+      /^\s*filters: \|\s*$/u.test(line)
+    );
+
+    const image = lines.findIndex(
+      (line, index) => index > filters && /^\s+image:\s*$/u.test(line)
+    );
+
+    if (filters === -1 || image === -1) {
+      throw new Error("check.yml has no image paths filter");
+    }
+
+    const baseIndent = (/^\s*/u.exec(lines[image])?.[0] ?? "").length;
+    const globs: string[] = [];
+
+    for (const line of lines.slice(image + 1)) {
+      if (!line.trim()) {
+        continue;
+      }
+
+      if ((/^\s*/u.exec(line)?.[0] ?? "").length <= baseIndent) {
+        break;
+      }
+
+      const glob = /^\s*-\s+(?<glob>.+?)\s*$/u.exec(line)?.groups?.glob;
+
+      if (glob !== undefined) {
+        globs.push(glob.replaceAll(/^['"]|['"]$/gu, ""));
+      }
+    }
+
+    expect(globs).toEqual(expect.arrayContaining([...imagePinFiles]));
   });
 });
 

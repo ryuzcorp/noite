@@ -55,6 +55,9 @@ jobs:
     uses: ./.github/workflows/check.yml
     # check.yml verifies the celld pin's provenance attestation and declares
     # `pull-requests: read` for its PR pin-paths filter (never used on a push).
+    # A push/tag has no PR file list, so the image tag digests are not
+    # resolved here: the image build pulls the pinned digests, and drift on a
+    # re-pushed tag is the weekly `pin-drift.yml` report, not a release gate.
     permissions:
       attestations: read
       contents: read
