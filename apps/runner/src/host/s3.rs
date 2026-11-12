@@ -1092,10 +1092,12 @@ const WIPE_BATCH_KEYS: usize = 250;
 
 /// The pacing state of **every** background wipe in this process: the previous
 /// batch's start. One token, held across the batch request itself, so concurrent
-/// wipes (N deletes, the resume pass, a rename's target wipe) cannot multiply
-/// the store's load: one `DeleteObjects` of a background wipe is in flight at a
-/// time, with [`WIPE_BATCH_GAP`] between starts. A request-path wipe never
-/// takes it.
+/// background wipes (N deletes and the resume pass) cannot multiply the store's
+/// load: one `DeleteObjects` of a background wipe is in flight at a time, with
+/// [`WIPE_BATCH_GAP`] between starts. The create/rename authoritative wipe and
+/// request-path wipes never take it: they run for a slug their caller already
+/// holds the guard for, and must not queue behind another tenant's background
+/// wipe (that wait is the create-blocking bug this PR fixes).
 struct WipePace;
 
 impl WipePace {
