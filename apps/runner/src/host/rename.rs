@@ -6,13 +6,13 @@
 //! reconcile loop respawns the fleet and rewrites Caddy from the DB on
 //! its next tick, so no explicit restart/rewrite is needed here.
 //!
-//! Locking (ordering: CREATE_LOCK → AppLock → slug lock, see
-//! [`ryuz_git::GitSync`]): the service layer holds
-//! `CREATE_LOCK` across slug-changing renames (serializing the slug-taken
-//! check → move → row update against creates and other renames); this module
-//! claims the `AppLock` (bailing on an in-flight deploy, 409 at the API
-//! layer) and then holds both slugs' locks across the whole move so
-//! no push can write under the old prefix mid-move.
+//! Locking (ordering: AppLock → slug lock, see
+//! [`ryuz_git::GitSync`]): this module claims the `AppLock` (bailing on an
+//! in-flight deploy, 409 at the API layer) and then holds both slugs' locks
+//! across the whole move so no push can write under the old prefix mid-move.
+//! Those same guards are what serialize a rename against a create for the
+//! target slug: the slug-taken check is repeated after both guards are held
+//! (R-03), so the loser of a race bails before moving a single object.
 use std::time::Duration;
 
 use anyhow::Context;
@@ -163,6 +163,16 @@ pub async fn rename_app(
     // after. Taken after the AppLock (ordering: AppLock → push_guard), in
     // lexical order so opposite renames cannot invert.
     let (_old_push, _new_push) = git_sync.lock_pair(&app.slug, new_slug).await;
+    // R-03: the service layer's check ran before these guards. A create for
+    // this slug (or another rename onto it) may have landed in between, and
+    // moving our prefixes onto a live slug would overwrite that app's git
+    // history. Re-check under the guards — this is the authoritative one — and
+    // bail before touching anything.
+    if let Some(other) = db::get_app_by_slug(pool, new_slug).await? {
+        if other.id != app_id {
+            anyhow::bail!("slug already taken");
+        }
+    }
     let renamed = rename_slugged(cfg, pool, procs, logs, &app, new_name, new_slug).await?;
     // The old generation ends here: its S3 prefix moved to the new slug, so
     // its seq marker must go too — otherwise a future slug reuse would skip

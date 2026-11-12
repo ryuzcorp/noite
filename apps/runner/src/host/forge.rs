@@ -2358,6 +2358,7 @@ mod tests {
             h.state.wal.sync(),
             &h.app.slug,
             crate::host::supervisor::StopGrace::NORMAL,
+            None,
         )
         .await
         .expect("purge");

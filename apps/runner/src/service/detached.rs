@@ -31,6 +31,21 @@ pub(crate) async fn run<T: Send + 'static>(
     }
 }
 
+/// Start `work` as a background task and do not wait for it. Unlike [`run`],
+/// the caller gets no result: this is for chores that must happen after the
+/// answer (`purge:<slug>`), where the answer is already on its way. The task
+/// is detached from the caller by construction, so a dropped client cancels
+/// nothing; tests still observe its end through [`finished`].
+pub(crate) fn spawn(task: String, work: impl Future<Output = ()> + Send + 'static) {
+    let name = task.clone();
+    tokio::spawn(async move {
+        work.await;
+        tracing::debug!(task = %name, "background work finished");
+        #[cfg(test)]
+        finished(&name).notify_one();
+    });
+}
+
 /// Fired once when the detached work named `task` has finished, every
 /// effect included. `notify_one` keeps a permit, so a test may start
 /// waiting after the work already ended.

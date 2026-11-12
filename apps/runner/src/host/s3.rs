@@ -1072,22 +1072,100 @@ pub async fn s3_rm_dir_except(
     s3_delete_keys(cfg, bucket, &victims).await
 }
 
-/// Recursive delete of one prefix (app purge, deleted-ref cleanup). Empty
-/// prefixes are a no-op, so retries after a partial delete stay quiet.
+/// The smallest gap between two batches of a **background** wipe. A
+/// `DeleteObjects` is the heaviest request this process sends; back-to-back
+/// batches kept a bundled RustFS busy enough on a 2 GB host that a tenant
+/// deploy's own S3 client (celld's `object_store`) timed out sending requests
+/// (owner report, 2026-11-12). Pacing a background wipe is cheap; a starved
+/// deploy is not.
+const WIPE_BATCH_GAP: Duration = Duration::from_millis(50);
+
+/// How many keys one background-wipe `DeleteObjects` carries. Smaller than the
+/// store's 1000-key page on purpose: a 1000-key delete blocks a small store for
+/// seconds, and every other S3 caller (a deploy, a create's credential mint)
+/// queues behind it.
+const WIPE_BATCH_KEYS: usize = 250;
+
+/// The pacing state of one background wipe: the previous batch's start, so the
+/// gap holds within the wipe without ever making another caller wait.
+#[derive(Default)]
+struct WipePace {
+    last: Option<tokio::time::Instant>,
+}
+
+impl WipePace {
+    /// Wait out the gap since the previous batch.
+    async fn wait(&mut self) {
+        if let Some(at) = self.last {
+            let elapsed = at.elapsed();
+            if elapsed < WIPE_BATCH_GAP {
+                tokio::time::sleep(WIPE_BATCH_GAP - elapsed).await;
+            }
+        }
+        self.last = Some(tokio::time::Instant::now());
+    }
+}
+
+/// Recursive delete of one prefix (deleted-ref cleanup, environment teardown).
+/// Empty prefixes are a no-op, so retries after a partial delete stay quiet.
+/// A request-path wipe is not paced: the caller already bounds it, and it must
+/// never queue behind a background purge.
 pub async fn s3_rm_prefix(cfg: &Config, bucket: &str, prefix: &str) -> anyhow::Result<()> {
-    // Delete page by page, never listing the whole prefix first: a purge cut
-    // by the caller's bound (or a huge telemetry/D1 history) must make
-    // progress, and a retry must not re-walk everything before deleting.
+    rm_prefix_loop(cfg, bucket, prefix, &|| false, None).await?;
+    Ok(())
+}
+
+/// [`s3_rm_prefix`] for a **background** purge: paced (see
+/// [`WIPE_BATCH_GAP`]), batches capped at [`WIPE_BATCH_KEYS`], and stoppable
+/// between batches — answers `false` when `stop` asked the wipe to end before
+/// the prefix was empty. A caller that stops keeps whatever is left and must
+/// wipe from scratch later (deletes are idempotent, so a partial wipe is a safe
+/// starting point).
+///
+/// Page by page, never listing the whole prefix first, so a wipe cut by a
+/// caller's bound (or a huge telemetry/D1 history) makes progress and a retry
+/// never re-walks everything before deleting.
+pub async fn s3_rm_prefix_paced(
+    cfg: &Config,
+    bucket: &str,
+    prefix: &str,
+    stop: &(dyn Fn() -> bool + Send + Sync),
+) -> anyhow::Result<bool> {
+    rm_prefix_loop(cfg, bucket, prefix, stop, Some(WipePace::default())).await
+}
+
+async fn rm_prefix_loop(
+    cfg: &Config,
+    bucket: &str,
+    prefix: &str,
+    stop: &(dyn Fn() -> bool + Send + Sync),
+    mut pace: Option<WipePace>,
+) -> anyhow::Result<bool> {
     loop {
-        let (objects, _, _) = with_s3_retry("list", prefix, || {
+        if stop() {
+            return Ok(false);
+        }
+        let page = with_s3_retry("list", prefix, || {
             list_page(cfg, bucket, prefix, None, None)
         })
         .await?;
-        if objects.is_empty() {
-            return Ok(());
+        if page.0.is_empty() {
+            return Ok(true);
         }
-        let keys: Vec<String> = objects.into_iter().map(|o| o.key).collect();
-        s3_delete_keys(cfg, bucket, &keys).await?;
+        let keys: Vec<String> = page.0.into_iter().map(|o| o.key).collect();
+        let batch = match &pace {
+            Some(_) => WIPE_BATCH_KEYS,
+            None => 1000,
+        };
+        for chunk in keys.chunks(batch) {
+            if stop() {
+                return Ok(false);
+            }
+            if let Some(pace) = pace.as_mut() {
+                pace.wait().await;
+            }
+            s3_delete_keys(cfg, bucket, chunk).await?;
+        }
     }
 }
 

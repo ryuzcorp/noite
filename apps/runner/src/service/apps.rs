@@ -6,25 +6,20 @@ use std::time::Duration;
 
 use crate::api_error::ApiError;
 use crate::db;
-use crate::host::{deploy, git_http, import, purge, rename, sleep, supervisor};
+use crate::host::{deploy, git_http, import, logs, purge, rename, sleep, supervisor};
 use crate::lifecycle::slug_ok;
 use crate::models::{App, AppSource, AppStatus, DesiredState, WriteGuard};
 use crate::AppState;
 
-/// Serializes the create critical section (NOITE-APPS-001). The per-account
-/// quota is a count-then-insert, and the purge of a slug's leftovers destroys
-/// data, so two creates that interleave there can slip past the limit — or wipe
-/// the mirrors of a slug another create just landed. Creating an app is
-/// human-paced (and the push-to-create path), so one process-wide lock is the
-/// honest fix: the whole check → purge → quota → insert sequence runs alone.
-///
-/// Lock ordering with the other guards (deadlock rule, see
-/// [`ryuz_git::GitSync`]): `CREATE_LOCK` is outermost, then
-/// the per-app `AppLock`, then the per-slug lock. Create holds
-/// `CREATE_LOCK` + its slug's lock; a slug-changing rename holds all
-/// three; delete holds `AppLock` + its slug's lock.
-static CREATE_LOCK: LazyLock<tokio::sync::Mutex<()>> =
-    LazyLock::new(|| tokio::sync::Mutex::new(()));
+/// Serializes the per-account quota decision with the row insert (NOITE-APPS-001):
+/// the quota is a count-then-insert, so two creates for one account could both
+/// slip under the limit. It is deliberately the *only* thing this lock covers,
+/// and it is taken after the slug lock — nothing acquires a slug guard while
+/// holding it, so a create for slug A can never wait on a create or delete for
+/// slug B. Slug exclusivity needs no global lock: create, rename and delete all
+/// hold that slug's `push_guard`. Lock order: `AppLock` → slug guard →
+/// `QUOTA_LOCK`.
+static QUOTA_LOCK: LazyLock<tokio::sync::Mutex<()>> = LazyLock::new(|| tokio::sync::Mutex::new(()));
 
 /// Fill the derived fields of a row on its way out: [`App::fleet_hold`] (the
 /// supervisor's crash or OOM backoff, process state) and [`App::auto_deploy`]
@@ -133,38 +128,55 @@ async fn create_inner(
         }
         Some(AppSource::Blank) | None => None,
     };
-    // NOITE-APPS-001: from here on the function reads and destroys state, so it
-    // runs under one lock — the slug re-check, the purge, the quota count and
-    // the insert cannot interleave with another create.
-    let _create = CREATE_LOCK.lock().await;
+    // A background purge of this slug (the app that held it was just deleted)
+    // asks to end before we queue on the slug lock: the wipe yields at its next
+    // batch, so a re-create never waits out a heavy wipe. We run the wipe
+    // ourselves below, under the lock, so nothing is skipped.
+    purge::stop(slug);
     // R-12: the purge destroys the same `git/<slug>/` + `fleets/<slug>/`
-    // prefixes pushes write under the slug lock, so the guard stays
-    // held across purge → init → insert (ordering: CREATE_LOCK → slug lock).
-    // A push to a half-created slug either lands fully before the purge or
-    // waits for the row.
+    // prefixes pushes write under the slug lock, so the guard is held across
+    // purge → init → insert (lock order: slug guard → QUOTA_LOCK). A push to a
+    // half-created slug either lands fully before the purge or waits for the
+    // row. The guard is also what serializes two creates for one slug — and it
+    // is per slug, so a slow create or delete of another app is never in the
+    // way (a process-wide create lock used to stall every create behind one
+    // slow purge: owner report, 2026-11-12).
     let _push = state.wal.lock(slug).await;
     match db::get_app_by_slug(&state.pool, slug).await {
         Ok(Some(_)) => return Err(ApiError::conflict("slug already taken")),
         Ok(None) => {}
-        Err(e) => return Err(ApiError::internal(e.to_string())),
+        Err(e) => {
+            return Err(ApiError::internal(format!(
+                "create {slug}: could not check the slug: {e}"
+            )))
+        }
     }
     // Always wipe leftover S3/local data for this slug before the new row lands
-    // — safe now: no row exists for it (checked just above, under these locks).
+    // — safe now: no row exists for it (checked just above, under this guard).
     // Callers of `purge_slug` hold the slug's push guard (see its docs); the
     // `_push` guard above is that holder for this path.
-    if let Err(e) = purge::purge_slug(
+    match purge::purge_slug(
         &state.config,
         &state.procs,
         &state.logs,
         state.wal.sync(),
         slug,
         supervisor::StopGrace::NORMAL,
+        None,
     )
     .await
     {
-        return Err(ApiError::internal(format!(
-            "failed to clear slug data: {e:#}"
-        )));
+        Ok(purge::Purged::Done) => {}
+        Ok(purge::Purged::Stopped) => {
+            return Err(ApiError::internal(format!(
+                "create {slug}: the leftover wipe was stopped before it finished; retry the create"
+            )))
+        }
+        Err(e) => {
+            return Err(ApiError::internal(format!(
+                "create {slug}: could not clear the deleted app's data: {e:#}"
+            )))
+        }
     }
     let subdomain = format!("{slug}.{}", state.config.base_domain);
     let owner = user_id
@@ -180,14 +192,18 @@ async fn create_inner(
                 )));
             }
             Ok(_) => {}
-            Err(e) => return Err(ApiError::internal(e.to_string())),
+            Err(e) => {
+                return Err(ApiError::internal(format!(
+                    "create {slug}: could not count the account's apps: {e}"
+                )))
+            }
         }
     }
     // A0: both bare mirrors exist, HEAD at `main`, before the app row does — a
     // failure here leaves no half-created app behind.
     if let Err(e) = git_http::init_repos(state, slug).await {
         return Err(ApiError::internal(format!(
-            "failed to initialize the git repositories: {e:#}"
+            "create {slug}: could not initialize the git repositories: {e:#}"
         )));
     }
     // No credential row: only a scoped provider (Phase 4) mints one.
@@ -205,22 +221,44 @@ async fn create_inner(
             "fleet port range {}-{} exhausted; raise NOITE_FLEET_PORTS",
             state.config.fleet_port_min, state.config.fleet_port_max
         )),
-        other => ApiError::internal(other.to_string()),
+        other => ApiError::internal(format!("create {slug}: no fleet ports: {other}")),
     })?;
-    let app = db::create_app(
-        &state.pool,
-        &state.config,
-        db::NewApp {
-            internal: ports.internal,
-            listen: ports.listen,
-            name,
-            slug,
-            subdomain: &subdomain,
-            user_id: owner,
-        },
-    )
-    .await
-    .map_err(|e| ApiError::internal(e.to_string()))?;
+    let app = {
+        // The quota count and the insert are one decision: the early check
+        // above fails fast, this one makes the limit exact when two creates for
+        // one account land together.
+        let _quota = QUOTA_LOCK.lock().await;
+        if owner != "local" {
+            match db::count_apps_for_user(&state.pool, owner).await {
+                Ok(count) if count >= i64::from(state.config.max_apps_per_user) => {
+                    return Err(ApiError::conflict(format!(
+                        "app limit reached ({} per account)",
+                        state.config.max_apps_per_user
+                    )));
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    return Err(ApiError::internal(format!(
+                        "create {slug}: could not count the account's apps: {e}"
+                    )))
+                }
+            }
+        }
+        db::create_app(
+            &state.pool,
+            &state.config,
+            db::NewApp {
+                internal: ports.internal,
+                listen: ports.listen,
+                name,
+                slug,
+                subdomain: &subdomain,
+                user_id: owner,
+            },
+        )
+        .await
+        .map_err(|e| ApiError::internal(format!("create {slug}: could not store the app: {e}")))?
+    };
     drop(ports);
     let Some(git) = git_source else {
         return Ok(with_hold(state, app).await);
@@ -349,18 +387,11 @@ async fn rename_inner(
     name: Option<&str>,
     slug: Option<&str>,
 ) -> Result<App, ApiError> {
-    // R-03: the slug-taken check is per-slug but the rename lock is per app
-    // id, so two apps renaming onto one slug could both pass and both move
-    // prefixes before the second fails at the row write. A slug-changing
-    // rename therefore holds CREATE_LOCK across check → move → row update
-    // (ordering: CREATE_LOCK → AppLock → push_guard), serializing it against
-    // creates and every other slug rename. Name-only renames move nothing
-    // and skip it.
-    let _create = if slug.is_some() {
-        Some(CREATE_LOCK.lock().await)
-    } else {
-        None
-    };
+    // R-03: two apps renaming onto one slug must not both move prefixes. The
+    // slug's `push_guard` is what serializes them now (`rename_app` takes both
+    // slugs' guards and re-checks the target under them), so no process-wide
+    // lock is involved: a rename of app A never delays a create or another
+    // rename of app B. This check is only the cheap, early 409.
     if let Some(s) = &slug {
         if !slug_ok(&state.config, s) {
             return Err(ApiError::bad("invalid slug"));
@@ -406,26 +437,25 @@ async fn rename_inner(
     }
 }
 
-/// What a delete call reports: finished, or still purging in the
-/// background (a slow store or a deploy in flight).
+/// What a delete call reports: finished, or still running in the background
+/// (a deploy in flight holds the app; the row, slug and data wipe are done).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Deletion {
     Done,
     InProgress,
 }
 
-/// How long a delete call waits for the purge before answering
+/// How long a delete call waits for the row to be gone before answering
 /// [`Deletion::InProgress`]: under the control plane's 5 s bound on every
-/// runner call (`apps/noite/src/lib/runner.ts`), so a purge that takes
-/// longer (thousands of telemetry objects on a slow store, a deploy holding
-/// the claim for minutes) never surfaces as a timeout.
+/// runner call (`apps/noite/src/lib/runner.ts`), so a delete that has to wait
+/// out an in-flight deploy never surfaces as a timeout.
 const DELETE_ANSWER_WITHIN: Duration = Duration::from_secs(3);
 
 /// How long the best-effort cleanup after the row delete may take. The app
-/// row (and the slug's push guard) are already released when it starts, so a
-/// hung provider or Caddy call can only delay this task, never a create or
-/// rename onto the slug; the bound also stops a permanently stuck provider
-/// from leaking the detached task and its in-memory delete marker.
+/// row, the slug's push guard and the data wipe are all already released when
+/// it starts, so a hung provider call can only delay this task; the bound also
+/// stops a permanently stuck provider from leaking the detached task and its
+/// in-memory delete marker.
 const DELETE_CLEANUP_WITHIN: Duration = Duration::from_secs(30);
 
 /// Where one app's delete is (RDEP-6). There is no DB column for it on
@@ -435,15 +465,19 @@ const DELETE_CLEANUP_WITHIN: Duration = Duration::from_secs(30);
 ///
 /// ```mermaid
 /// stateDiagram-v2
-///   [*] --> Purging: DELETE claims the app (hidden from list/get)
-///   Purging --> Cleanup: the row is gone and the slug is free
-///   Cleanup --> [*]: routes, credentials and tokens done (bounded)
-///   Purging --> [*]: purge failed; the row stays stopped and listed again
+///   [*] --> Stopping: DELETE claims the app (hidden from list/get)
+///   Stopping --> Cleanup: the fleets are stopped, the row is gone and the slug is free
+///   Cleanup --> [*]: routes, credential revoke and tokens done (bounded)
+///   Stopping --> [*]: stopping failed; the row stays stopped and listed again
 /// ```
+///
+/// The data wipe (local dirs + S3 prefixes) is deliberately *not* a phase: it
+/// runs as a background chore after the slug is free, and the caller's answer
+/// never waits for it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DeletePhase {
-    /// Claimed: the fleet is stopping, the slug's data is being wiped.
-    Purging,
+    /// Claimed: the fleet is stopping and the row is about to go.
+    Stopping,
     /// The row is deleted and the slug released; only best-effort cleanup
     /// (routes, scoped credentials, operator tokens) is still running.
     Cleanup,
@@ -465,14 +499,14 @@ impl Deletions {
     }
 
     /// Claim `id` for a delete. `false` = one is already running (the caller
-    /// reports [`Deletion::InProgress`] instead of starting a second purge).
+    /// reports [`Deletion::InProgress`] instead of starting a second one).
     fn begin(&self, id: &str) -> bool {
         self.guard()
-            .insert(id.to_string(), DeletePhase::Purging)
+            .insert(id.to_string(), DeletePhase::Stopping)
             .is_none()
     }
 
-    /// Move a claimed app on. Only ever Purging → Cleanup, and only while the
+    /// Move a claimed app on. Only ever Stopping → Cleanup, and only while the
     /// app is still claimed.
     fn advance(&self, id: &str, next: DeletePhase) {
         if let Some(phase) = self.guard().get_mut(id) {
@@ -553,7 +587,7 @@ pub async fn delete(state: &AppState, id: &str) -> Result<Deletion, ApiError> {
             // failed delete shows. The app stays stopped; deleting it again
             // retries.
             tracing::warn!(app_id = %id, error = %e, "app delete failed");
-            let note = format!("delete failed: {e}; delete the app again to retry");
+            let note = format!("{e}; delete the app again to retry");
             if let Err(db_error) = db::write_app_status(
                 &state.pool,
                 &id,
@@ -577,77 +611,137 @@ pub async fn delete(state: &AppState, id: &str) -> Result<Deletion, ApiError> {
 
 async fn delete_inner(state: &AppState, id: &str) -> Result<(), ApiError> {
     let app = app_or_404(state, id).await?;
-    // Same lock as deploy: wait out an in-flight build, then purge exclusively.
-    // The row is deleted while the claim is still held (R-01): a waiter that
-    // acquires after us must find no row and bail instead of building into
-    // the just-purged prefix. Ordering here is AppLock → slug lock (see
-    // [`ryuz_git::GitSync`]); `purge_slug` requires its
-    // callers to hold the slug's lock. The guard releases on every
-    // return below — and on cancel or panic — so a dropped delete can never
-    // wedge later deletes behind a stale "deploy in flight".
+    // Same lock as deploy: wait out an in-flight build before stopping
+    // anything. The row is deleted while the claim is still held (R-01): a
+    // waiter that acquires after us must find no row and bail instead of
+    // building into the just-purged prefix. Ordering here is AppLock → slug
+    // lock (see [`ryuz_git::GitSync`]); `purge_slug` requires its callers to
+    // hold the slug's lock. The guard releases on every return below — and on
+    // cancel or panic — so a dropped delete can never wedge later deletes
+    // behind a stale "deploy in flight".
     let Some(claim) =
         deploy::claim_wait_owned(&state.deploying, &app.id, Duration::from_secs(120)).await
     else {
-        return Err(ApiError::conflict("deploy in flight; retry delete shortly"));
+        return Err(ApiError::conflict(
+            "delete failed: a deploy is still in flight; retry the delete shortly",
+        ));
     };
     // The delete claim (taken by `delete` before this task starts) is what
     // closes import admission: a retry that passed its own check cannot
     // register a new attempt now, and anything registered is swept below.
     let _direct_claim = DELETIONS.begin(id).then(|| DeletionGuard(id.to_string()));
     // A background import is part of this delete: stop it and wait for it to
-    // end before the purge. A clone that finishes late would publish
+    // end before the wipe. A clone that finishes late would publish
     // `refs/heads/main` under the slug this delete is about to free, and the
     // next app to take that slug would inherit the imported tree.
     if import::cancel_and_wait(&app.id).await {
         tracing::info!(app_id = %app.id, "import stopped for delete");
     }
-    // R-02: a concurrent push writes under the slug lock across git +
-    // S3 + manifest; the purge must not run inside one of those writes.
+    // R-02: a concurrent push writes under the slug lock across git + S3 +
+    // manifest; the wipe must not run inside one of those writes.
     let push = state.wal.lock(&app.slug).await;
-    // Mark it stopped before the fleet goes down: the purge takes seconds
-    // (S3 prefixes), and an app still marked running is respawned in that
-    // window by the reconcile loop or by a wake. A failed purge leaves the
-    // app stopped, which a retried delete finishes.
+    // Mark it stopped before the fleet goes down: an app still marked running
+    // is respawned in that window by the reconcile loop or by a wake. A failed
+    // delete leaves the app stopped, which a retried delete finishes.
     if let Err(e) = db::patch_app_desired(&state.pool, &app.id, DesiredState::Stopped).await {
-        return Err(ApiError::internal(e.to_string()));
-    }
-    let purge_result = purge::purge_slug(
-        &state.config,
-        &state.procs,
-        &state.logs,
-        state.wal.sync(),
-        &app.slug,
-        supervisor::StopGrace::FOR_DELETE,
-    )
-    .await;
-    if let Err(e) = purge_result {
         return Err(ApiError::internal(format!(
-            "failed to purge app data: {e:#}"
+            "delete {}: could not stop the app: {e}",
+            app.slug
         )));
     }
+    // Stop what serves the slug now. This is the cheap part of the teardown;
+    // the expensive part (local dirs + three S3 prefixes) runs as a background
+    // chore below, after the slug is free.
+    supervisor::stop_fleet(&state.procs, &app.slug, supervisor::StopGrace::FOR_DELETE).await;
+    supervisor::stop_environment_fleets(&state.procs, &app.slug, supervisor::StopGrace::FOR_DELETE)
+        .await;
+    logs::clear(&state.logs, &app.slug).await;
+    // Row first. Every edge path resolves a host from the row (`app_for_host`,
+    // `app_for_slug`), so from this moment the slug answers "no app" — the
+    // reported "paused page for a deleted app" was the row lingering, stopped,
+    // for the whole wipe. The slug is free here too, so a re-create does not
+    // wait for the wipe.
     let delete_result = db::delete_app(&state.pool, id).await;
-    delete_result.map_err(|e| ApiError::internal(e.to_string()))?;
+    delete_result.map_err(|e| {
+        ApiError::internal(format!(
+            "delete {}: could not remove the app row: {e}",
+            app.slug
+        ))
+    })?;
     // A reconcile tick (or a wake) that listed the app before the stop above
     // can still have started the fleet again; with the row gone nothing else
     // would stop it. Stop it while the push guard is still ours: releasing
     // the slug first would let a new app with the same slug spawn, and this
     // late stop would kill *its* fleet.
     supervisor::stop_fleet(&state.procs, &app.slug, supervisor::StopGrace::FOR_DELETE).await;
+    // Register the background wipe *before* the slug is released, so a create
+    // that wins the guard next can ask it to stop (`purge::stop`) instead of
+    // racing it. See the row re-check in the task: a create that already held
+    // the guard when we registered would otherwise be wiped.
+    let registered = purge::begin(&app.slug);
     // The row is gone and no fleet can start under this slug any more:
     // release the slug's push guard and the app's deploy claim *now*, before
-    // the best-effort cleanup below. Create and rename onto this slug wait on
-    // the guard (and the control plane aborts their runner call after 5 s); a
-    // hung provider or Caddy call must never keep the slug unusable — that
-    // was the "deleted app, slug still taken" bug.
+    // the edge push, the wipe and the best-effort cleanup below. Create and
+    // rename onto this slug wait on the guard (and the control plane aborts
+    // their runner call after 5 s); a hung store or Caddy call must never keep
+    // the slug unusable — that was the "deleted app, slug still taken" bug.
     drop(push);
     drop(claim);
-    // The row is gone and the slug is free: only the best-effort cleanup is
-    // left, which is the state a caller's 202 keeps the app in.
+    // The row is gone and the slug is free: only best-effort work is left,
+    // which is the state a caller's 202 keeps the app in.
     DELETIONS.advance(id, DeletePhase::Cleanup);
+    // The edge stops routing the slug on this push, not on the next reconcile
+    // tick. Best-effort: the row is already gone, so an unanswered push only
+    // leaves a stale route (Caddy's upstream probe) until the tick retries.
+    if let Err(e) = crate::host::edge_table::push_routes(&state.pool, &state.config).await {
+        tracing::warn!(app_id = %id, error = %format!("{e:#}"), "edge push after app delete");
+    }
+    // The wipe itself: local dirs and `git/`, `fleets/`, `envs/` prefixes. It
+    // holds the slug's guard while it runs (the create that wants the slug
+    // back is what asks it to stop), and it re-checks the row first: if the
+    // slug was already re-created, that create's own wipe was the
+    // authoritative one and this one must not touch the new app's objects.
+    {
+        let state = state.clone();
+        let slug = app.slug.clone();
+        super::detached::spawn(format!("purge:{slug}"), async move {
+            let guard = state.wal.lock(&slug).await;
+            match db::get_app_by_slug(&state.pool, &slug).await {
+                Ok(Some(_)) => {
+                    tracing::debug!(slug, "purge skipped: the slug was re-created");
+                }
+                Ok(None) => {
+                    let out = purge::purge_slug(
+                        &state.config,
+                        &state.procs,
+                        &state.logs,
+                        state.wal.sync(),
+                        &slug,
+                        supervisor::StopGrace::FOR_DELETE,
+                        Some(registered.stop()),
+                    )
+                    .await;
+                    match out {
+                        Ok(purge::Purged::Done) => {}
+                        Ok(purge::Purged::Stopped) => {
+                            tracing::info!(slug, "purge stopped: the slug is being re-created");
+                        }
+                        Err(e) => {
+                            // The row is gone, so nothing retries this: say what
+                            // was left behind, loudly, at the operator's level.
+                            tracing::warn!(slug, error = %format!("{e:#}"), "background purge failed; the slug's data may be partly left");
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(slug, error = %e, "purge skipped: could not check whether the slug was re-created");
+                }
+            }
+            drop(guard);
+            drop(registered);
+        });
+    }
     let cleanup = async {
-        if let Err(e) = crate::host::edge_table::push_routes(&state.pool, &state.config).await {
-            tracing::warn!(app_id = %id, error = %format!("{e:#}"), "edge push after app delete");
-        }
         // Revoke the app's keys and its environments' (SPEC, Scoped
         // credentials). R-10: a revoke failure must not vanish — warn loudly
         // so the orphaned credential row is visible instead of silently kept.
@@ -1046,7 +1140,7 @@ mod tests {
         let id = "sm-delete-claim-test";
         assert!(DELETIONS.begin(id), "the first delete claims the app");
         assert!(!DELETIONS.begin(id), "a second delete reports the first");
-        assert_eq!(DELETIONS.phase(id), Some(DeletePhase::Purging));
+        assert_eq!(DELETIONS.phase(id), Some(DeletePhase::Stopping));
         DELETIONS.advance(id, DeletePhase::Cleanup);
         assert_eq!(DELETIONS.phase(id), Some(DeletePhase::Cleanup));
         assert!(deleting(id));
@@ -1335,6 +1429,122 @@ mod tests {
         drop(dir);
     }
 
+    /// A create must never wait on another slug's guard. Before 2026-11-12
+    /// a process-wide create lock was taken *before* the slug guard, so one
+    /// create parked behind a delete's wipe (or a push) stalled every other
+    /// create — the owner's "creating an app under a different name failed
+    /// for five minutes" right after a delete. `create_inner` is driven
+    /// inline (no detached task) so the ordering below is the test's, not the
+    /// scheduler's.
+    #[tokio::test]
+    async fn create_of_one_slug_never_waits_on_another_slugs_guard() {
+        let (state, dir) = test_state(10).await;
+        // Stand in for the wipe of a just-deleted app (or a push in flight):
+        // `busy-slug`'s guard is held for as long as this test wants.
+        let busy = state.wal.lock("busy-slug").await;
+        let mut blocked = Box::pin(create_inner(&state, "Busy", "busy-slug", Some("u1"), None));
+        let mut other = Box::pin(create_inner(
+            &state,
+            "Other",
+            "other-slug",
+            Some("u2"),
+            None,
+        ));
+        // Biased: the blocked create is polled first, so it is parked on the
+        // guard before the unrelated one is polled at all.
+        let created = tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::select! {
+                biased;
+                _ = &mut blocked => panic!("the parked create finished instead of waiting"),
+                out = &mut other => out,
+            }
+        })
+        .await
+        .expect("a create for another slug waited on busy-slug's guard")
+        .expect("the unrelated create lands");
+        assert_eq!(created.slug, "other-slug");
+        assert!(
+            db::get_app_by_slug(&state.pool, "other-slug")
+                .await
+                .expect("lookup")
+                .is_some(),
+            "the unrelated app's row is stored"
+        );
+        // The blocked one is still waiting, not failed.
+        drop(busy);
+        let parked = tokio::time::timeout(Duration::from_secs(10), blocked)
+            .await
+            .expect("the create that waited on the guard never landed")
+            .expect("the parked create lands once the guard frees");
+        assert_eq!(parked.slug, "busy-slug");
+        drop(dir);
+    }
+
+    /// The row is the edge's only source of truth, so a delete drops it before
+    /// the wipe: the slug is free and answers "no app" while the wipe is still
+    /// parked in the object store. Before 2026-11-12 the row (stopped) and the
+    /// slug both outlived the whole wipe — a deleted app answered the "paused"
+    /// page for minutes, and re-creating it was a 409 for the same window.
+    #[tokio::test]
+    async fn delete_frees_the_slug_before_the_wipe_finishes() {
+        let gated = spawn_gated_s3_stub().await;
+        let (state, dir) = test_state_with_s3(10, gated.endpoint.clone()).await;
+        let app = create(&state, "SlowWipe", "slow-wipe", Some("u1"), None)
+            .await
+            .expect("create");
+        gated.armed.store(true, std::sync::atomic::Ordering::SeqCst);
+        let purged = crate::service::detached::finished(&format!("purge:{}", app.slug));
+
+        let answered = delete(&state, &app.id).await.expect("delete answers");
+        assert_eq!(answered, Deletion::Done);
+        // The wipe is parked on its first S3 request, so nothing below can be
+        // explained by the wipe having finished.
+        tokio::time::timeout(Duration::from_secs(5), gated.entered.notified())
+            .await
+            .expect("the delete never started a background wipe");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), purged.notified())
+                .await
+                .is_err(),
+            "the wipe finished before the gate released it"
+        );
+        assert!(
+            db::get_app(&state.pool, &app.id)
+                .await
+                .expect("lookup")
+                .is_none(),
+            "the row outlived the delete answer"
+        );
+        assert!(
+            db::get_app_by_slug(&state.pool, "slow-wipe")
+                .await
+                .expect("lookup")
+                .is_none(),
+            "the slug is still taken while the wipe runs"
+        );
+        assert!(matches!(
+            get_by_slug(&state, "slow-wipe").await,
+            Err(ApiError::NotFound(_))
+        ));
+        // And the edge's own authoritative lookup (what `edge_fallback` uses)
+        // finds nothing, which is what makes the deleted app answer "not
+        // found" instead of the paused page.
+        assert!(crate::db::get_app_by_slug(&state.pool, "slow-wipe")
+            .await
+            .expect("lookup")
+            .is_none());
+
+        gated.release.notify_one();
+        tokio::time::timeout(Duration::from_secs(30), purged.notified())
+            .await
+            .expect("the background wipe never finished");
+        assert!(
+            !purge::stop("slow-wipe"),
+            "a finished wipe left a live stop handle behind"
+        );
+        drop(dir);
+    }
+
     /// S3 stub that parks the purge mid-flight: once armed, the first
     /// request is read, `entered` fires, and the response waits for
     /// `release`. Everything before arming — and every request after the
@@ -1464,25 +1674,28 @@ mod tests {
         gated.armed.store(true, std::sync::atomic::Ordering::SeqCst);
         let id = app.id.clone();
         let done = crate::service::detached::finished(&format!("app:{id}"));
+        let purged = crate::service::detached::finished(&format!("purge:{}", app.slug));
 
-        // Drive the delete until the purge reaches S3, then drop the caller —
-        // the control plane timing out is just the handler future going away.
+        // Drive the delete until its background wipe is parked inside S3, then
+        // drop the caller — the control plane timing out is just the handler
+        // future going away. (The delete answers as soon as the row is gone;
+        // the gate catches it before or after, both are the same contract.)
         let mut slot = Some(Box::pin(delete(&state, &id)));
-        let finished = tokio::select! {
+        let _ = tokio::select! {
             result = async { slot.as_mut().expect("delete future").await } => Some(result),
             () = gated.entered.notified() => None,
         };
-        if let Some(result) = finished {
-            panic!("delete finished before reaching the gate: {result:?}");
-        }
         let _ = slot.take();
         gated.release.notify_one();
 
-        // The detached work still runs to its end — every effect, the key's
-        // revoke included, which lands after the row is gone. Waiting on the
-        // row alone raced that revoke (CI 39751293992). A delete cancelled
-        // with its caller never signals, and the bound turns that into a
-        // failure instead of a hang.
+        // The background wipe still runs to its end, and the detached cleanup
+        // still revokes the key — which lands after the row is gone. Waiting on
+        // the row alone raced that revoke (CI 39751293992). A wipe or cleanup
+        // cancelled with its caller never signals, and the bound turns that
+        // into a failure instead of a hang.
+        tokio::time::timeout(Duration::from_secs(30), purged.notified())
+            .await
+            .expect("the data wipe stopped when its caller went away");
         tokio::time::timeout(Duration::from_secs(30), done.notified())
             .await
             .expect("delete cancelled with its caller: the detached work never finished");
