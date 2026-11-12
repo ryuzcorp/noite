@@ -388,6 +388,11 @@ export const rollbackTarget = (
   liveSha: string | null
 ): string => candidates.find((sha) => sha !== "" && sha !== liveSha) ?? "";
 
+/** A failed action is retryable: its own error is already painted, so the
+ * next click starts a fresh run instead of requiring a page reload. */
+const canStart = (action: DropdownAction): boolean =>
+  action._tag === "Idle" || action._tag === "Failed";
+
 /** The branch picker's transitions, split out so the dropdown's own switch
  * stays the rollback/redeploy table: `null` means the message is not the
  * picker's. */
@@ -401,7 +406,7 @@ const branchStep = (
     }
 
     case "BranchDeployRequested": {
-      if (model.action._tag !== "Idle" || !message.branch) {
+      if (!canStart(model.action) || !message.branch) {
         return { model };
       }
 
@@ -492,7 +497,7 @@ export const updateDropdown = (
     }
 
     case "RedeployRequested": {
-      if (model.action._tag !== "Idle" || !message.sha) {
+      if (!canStart(model.action) || !message.sha) {
         return { model };
       }
 
@@ -516,7 +521,7 @@ export const updateDropdown = (
       // The target must still be one this machine loaded: a sha the view
       // computed after a refetch is not a target it accepted.
       if (
-        model.action._tag !== "Idle" ||
+        !canStart(model.action) ||
         model.lookup._tag !== "Found" ||
         !model.lookup.candidates.includes(message.sha)
       ) {

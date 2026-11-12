@@ -18,9 +18,9 @@ import {
   feedValue,
   liveFeed,
 } from "../feeds";
-import { forgeRefs } from "../forge/data";
+import { forgeKeys, forgeRefs } from "../forge/data";
 import { islandProps } from "../island";
-import { resourceValue, resourceError } from "../resource";
+import { invalidate, resourceError, resourceValue } from "../resource";
 import { appDetail, deployLog, environments } from "../resources";
 import type { AppRole } from "../roles";
 import type { RunnerDeploy, RunnerEnvironment } from "../runner";
@@ -97,7 +97,12 @@ const DeployAction = ({
   dispatch: (message: DropdownMessage) => void;
   lastDeploySha: string | null;
 }) => {
-  const refs = resourceValue(forgeRefs(appId).state()) ?? null;
+  const resource = forgeRefs(appId);
+  const refs = resourceValue(resource.state()) ?? null;
+  const refsError = resourceError(resource.state());
+
+  const branchListError = refsError === undefined ? null : String(refsError);
+
   const productionBranch = refs?.defaultBranch ?? "main";
   const selected = branch ?? productionBranch;
   const listed = (refs?.branches ?? []).map((one) => one.name);
@@ -157,6 +162,18 @@ const DeployAction = ({
           ))}
         </select>
       </label>
+      {branchListError === null ? null : (
+        <div class="flex items-center gap-2">
+          <p class="text-error m-0 min-w-0 flex-1 text-xs">{branchListError}</p>
+          <button
+            type="button"
+            class="btn btn-sm btn-ghost shrink-0"
+            onclick={() => invalidate(forgeKeys.refs(appId))}
+          >
+            Retry
+          </button>
+        </div>
+      )}
       <button
         type="button"
         class="btn btn-sm btn-neutral w-full"
@@ -183,8 +200,10 @@ const DeployAction = ({
         {label}
       </button>
       <p class="m-0 text-xs opacity-70">
-        Deploys {selected}&apos;s current tip once; production keeps deploying
-        from {productionBranch} on its next push. Progress shows in Deployments.
+        {isProduction
+          ? `Re-runs the release production serves, with the latest env vars and flags. Pushing ${productionBranch} still deploys it.`
+          : `Deploys ${selected}'s current tip once; production keeps deploying from ${productionBranch} on its next push.`}{" "}
+        Progress shows in Deployments.
       </p>
     </div>
   );

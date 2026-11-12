@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use axum::{
     extract::{Path, Query, State},
+    http::StatusCode,
     response::{IntoResponse, Response},
     Json,
 };
@@ -74,7 +75,12 @@ pub async fn deploy_branch(
         q.role.as_deref().or(body.role.as_deref()),
     )
     .await
-    .map(|(deploy_id, sha)| Json(json!({ "ok": true, "sha": sha, "deployId": deploy_id })))
+    .map(|(deploy_id, sha)| {
+        (
+            StatusCode::ACCEPTED,
+            Json(json!({ "ok": true, "sha": sha, "deployId": deploy_id })),
+        )
+    })
 }
 
 /// `?environmentId=` — one preview environment's history; absent is

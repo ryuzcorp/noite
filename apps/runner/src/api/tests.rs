@@ -1507,8 +1507,8 @@ async fn branch_deploy_resolves_that_branchs_tip() {
             "push",
             "-q",
             bare.to_str().expect("mirror path"),
-            "HEAD:refs/heads/main",
-            "HEAD:refs/heads/feature",
+            "main:refs/heads/main",
+            "feature:refs/heads/feature",
         ],
     )
     .await;

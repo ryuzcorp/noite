@@ -187,6 +187,22 @@ describe("updateDropdown", () => {
     expect(result.model.action._tag).toBe("Idle");
   });
 
+  test("a failed branch deploy can be retried without a reload", () => {
+    const failed = updateDropdown(
+      dropdown({
+        action: DropdownActionTypes.Failed({
+          error: "nope",
+          kind: "branch",
+        }),
+        branch: "feature",
+      }),
+      DropdownMsg.BranchDeployRequested({ branch: "feature" })
+    );
+
+    expect(failed.cmd).toBeDefined();
+    expect(failed.model.action._tag).toBe("Deploying");
+  });
+
   test("a failed branch deploy keeps its kind so only that error paints", () => {
     const result = updateDropdown(
       dropdown({ action: DropdownActionTypes.Deploying() }),
