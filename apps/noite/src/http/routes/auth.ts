@@ -1,5 +1,6 @@
 import { authFromEnv, MissingAuthSecretError } from "../../lib/auth";
 import { ensureDb } from "../../lib/db";
+import { errorLogText } from "../../lib/errors";
 import { withTrustedClientAddress } from "../../lib/rate-limit";
 import {
   INVITES_PER_USER,
@@ -37,6 +38,12 @@ export const handleAuth: RouteHandler = async (request, env) => {
       return new Response(error.message, { status: 500 });
     }
 
-    throw error;
+    // better-auth rethrows a non-API failure (`onAPIError.throw`) so the
+    // router's own raw `console.error` never runs: log the cause chain here
+    // and answer a generic 500. Normal API errors never reach this branch —
+    // better-call still turns them into their response.
+    console.error("[auth]", errorLogText(error));
+
+    return new Response(null, { status: 500 });
   }
 };

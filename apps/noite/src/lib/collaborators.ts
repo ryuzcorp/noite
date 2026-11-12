@@ -341,11 +341,14 @@ export const listAppsForCollaborator = async (
       // The page and its SSE stream can heal the same app at once, and the
       // create's own grant can land in this window: `writeGrant`'s insert is
       // conflict-safe, so the loser no longer throws and the row is the same
-      // either way.
+      // either way. A write that did not stick (`missing`) leaves the app
+      // invisible, so it is not listed as granted.
       // oxlint-disable-next-line eslint/no-await-in-loop -- the write follows this app's read
-      await grantCollaborator(app.id, userId, "admin");
+      const write = await grantCollaborator(app.id, userId, "admin");
 
-      granted.add(app.id);
+      if (write === "applied") {
+        granted.add(app.id);
+      }
     }
   }
 

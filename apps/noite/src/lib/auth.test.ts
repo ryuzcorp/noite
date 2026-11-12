@@ -1,5 +1,6 @@
 import { beforeAll, beforeEach, describe, expect, spyOn, test } from "bun:test";
 
+import { handleAuth } from "../http/routes/auth";
 import { createTestD1 } from "../testing/d1";
 import type { TestD1 } from "../testing/d1";
 import { createAuth } from "./auth";
@@ -141,6 +142,96 @@ describe("dev-only shortcuts key on the localhost family", () => {
       expect(printed).toBe(true);
     } finally {
       log.mockRestore();
+    }
+  });
+});
+
+type D1Binding = Parameters<typeof setD1Binding>[0];
+
+type Prepared = ReturnType<D1Binding["prepare"]>;
+
+/** A D1 binding whose every statement rejects: how a driver failure reaches
+ * better-auth, which drizzle wraps with the statement and its parameters. */
+const failingD1 = (failure: Error): D1Binding => {
+  // SAFETY: every member mirrors the wrapped statement's surface; each one
+  // rejects with the driver failure the test wants better-auth to see.
+  // oxlint-disable-next-line anti-slop/no-chained-type-assertions -- test double for a platform binding (same pattern as testing/d1.ts).
+  const statement = {
+    all: () => Promise.reject(failure),
+    bind: () => statement,
+    first: () => Promise.reject(failure),
+    raw: () => Promise.reject(failure),
+    run: () => Promise.reject(failure),
+  } as unknown as Prepared;
+
+  // SAFETY: every member is the real binding's own; only prepare, batch and
+  // the session wrapper are replaced so every statement fails.
+  // oxlint-disable-next-line anti-slop/no-chained-type-assertions -- test double for a platform binding (same pattern as testing/d1.ts).
+  const wrapped = {
+    ...db.d1,
+    batch: () => Promise.reject(failure),
+    prepare: () => statement,
+    withSession: () => wrapped,
+  } as unknown as D1Binding;
+
+  return wrapped;
+};
+
+describe("a failing auth database write never logs its SQL or parameters", () => {
+  test("the endpoint's failure is logged through the cause chain only", async () => {
+    const failure = new Error("D1_ERROR: unavailable");
+    setD1Binding(failingD1(failure));
+    const logged: string[] = [];
+
+    const error = spyOn(console, "error").mockImplementation((...args) => {
+      logged.push(args.map(String).join(" "));
+    });
+
+    let status = 0;
+
+    try {
+      // better-auth rethrows a non-API failure (`onAPIError.throw`) so
+      // better-call's raw `# SERVER_ERROR` log never runs; `handleAuth` logs
+      // the cause chain and answers a generic 500.
+      const response = await handleAuth(
+        new Request(
+          `${ENV.BETTER_AUTH_URL}/api/auth/email-otp/send-verification-otp`,
+          {
+            body: JSON.stringify({ email: "a@example.com", type: "sign-in" }),
+            headers: {
+              "content-type": "application/json",
+              origin: ENV.BETTER_AUTH_URL,
+            },
+            method: "POST",
+          }
+        ),
+        // SAFETY: the test env carries the auth keys this path reads.
+        // oxlint-disable-next-line anti-slop/no-chained-type-assertions -- test env stands in for the platform binding.
+        ENV as unknown as KitEnv
+      );
+
+      if (!response) {
+        throw new Error("handleAuth answered no response");
+      }
+
+      ({ status } = response);
+    } finally {
+      error.mockRestore();
+      setD1Binding(db.d1);
+    }
+
+    expect(status).toBe(500);
+
+    const text = logged.join("\n");
+
+    expect(text).toContain("[auth]");
+    expect(text).toContain("query failed");
+    expect(text).toContain("D1_ERROR: unavailable");
+
+    // The statement, its table and every bound value stay out of the log: the
+    // verification row binds the one-time code.
+    for (const leak of ["Failed query", "params:", "insert into"]) {
+      expect(text).not.toContain(leak);
     }
   });
 });

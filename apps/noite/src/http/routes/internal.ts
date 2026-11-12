@@ -126,7 +126,15 @@ export const handleRecovery: RouteHandler = async (request, env) => {
       );
     }
 
-    throw error;
+    // The one-time code is a bound parameter of the write: a wrapped query
+    // failure must not reach Void's console.error, and the caller gets a
+    // generic answer.
+    console.error("[recovery] code creation failed", errorLogText(error));
+
+    return Response.json(
+      { error: "recovery unavailable", ok: false },
+      { status: 500 }
+    );
   }
 };
 
@@ -219,6 +227,88 @@ const gitAuthCreate = async (
   }
 };
 
+/** The account behind a git credential, or the response the caller gets.
+ * The lookup is a database read: its wrapped failure is the statement and the
+ * bound key material, so it reaches neither the client nor the log. */
+const gitAuthPrincipal = async (
+  request: Request,
+  env: KitEnv,
+  key: string
+): Promise<{ principal: KeyPrincipal } | { response: Response }> => {
+  let auth: Awaited<ReturnType<typeof authenticateKey>>;
+
+  try {
+    auth = await authenticateKey(request, env, key, { apps: ["manage"] });
+  } catch (error) {
+    console.error("[git-auth] key lookup failed", errorLogText(error));
+
+    return {
+      response: Response.json(
+        { error: "forbidden", ok: false },
+        { status: 500 }
+      ),
+    };
+  }
+
+  if (auth._tag === "Misconfigured") {
+    return { response: new Response(auth.message, { status: 500 }) };
+  }
+
+  if (auth._tag !== "Authed") {
+    return {
+      response: Response.json(
+        {
+          error: auth._tag === "Expired" ? "API key expired" : "invalid key",
+          ok: false,
+        },
+        { status: 401 }
+      ),
+    };
+  }
+
+  return { principal: auth.principal };
+};
+
+/** The key's role on the named app, or the response the caller gets. Every
+ * refusal answers the same 403: the app set, the role ceiling and "not a
+ * collaborator" must not be told apart (or a key could probe which apps
+ * exist). A failed read is logged through its cause chain and answers a flat
+ * 500. */
+const gitAppAccess = async (
+  principal: KeyPrincipal,
+  slug: string,
+  need: "admin" | "push" | "view"
+): Promise<
+  | { response: Response }
+  | { verdict: Awaited<ReturnType<typeof keyAppVerdict>> & { _tag: "Granted" } }
+> => {
+  let verdict: Awaited<ReturnType<typeof keyAppVerdict>>;
+
+  try {
+    verdict = await keyAppVerdict(principal, { slug }, need);
+  } catch (error) {
+    console.error("[git-auth] key verdict failed", errorLogText(error));
+
+    return {
+      response: Response.json(
+        { error: "forbidden", ok: false },
+        { status: 500 }
+      ),
+    };
+  }
+
+  if (verdict._tag !== "Granted") {
+    return {
+      response: Response.json(
+        { error: "forbidden", ok: false },
+        { status: 403 }
+      ),
+    };
+  }
+
+  return { verdict };
+};
+
 /** Runner → UI: verify profile API key + collaborator role for a slug, or
  * create the app when the push names a slug nobody owns yet (A5). */
 export const handleGitAuth: RouteHandler = async (request, env) => {
@@ -266,28 +356,14 @@ export const handleGitAuth: RouteHandler = async (request, env) => {
 
   // One authentication for every key surface (lib/server/key-auth.server):
   // the scope, the owner's ban and the key's expiry are decided once, here,
-  // for git exactly as for `/mcp` and ingest. Git smart-HTTP is the main
-  // machine credential, so a ban must stop it now, not on the next session
-  // refresh.
-  const auth = await authenticateKey(request, env, key, {
-    apps: ["manage"],
-  });
+  // for git exactly as for `/mcp` and ingest.
+  const authenticated = await gitAuthPrincipal(request, env, key);
 
-  if (auth._tag === "Misconfigured") {
-    return new Response(auth.message, { status: 500 });
+  if ("response" in authenticated) {
+    return authenticated.response;
   }
 
-  if (auth._tag !== "Authed") {
-    return Response.json(
-      {
-        error: auth._tag === "Expired" ? "API key expired" : "invalid key",
-        ok: false,
-      },
-      { status: 401 }
-    );
-  }
-
-  const { principal } = auth;
+  const { principal } = authenticated;
 
   if (wanted === "create") {
     // A key limited to apps cannot grow its own set: the app the push would
@@ -331,14 +407,13 @@ export const handleGitAuth: RouteHandler = async (request, env) => {
     );
   }
 
-  const verdict = await keyAppVerdict(principal, { slug }, need);
+  const access = await gitAppAccess(principal, slug, need);
 
-  if (verdict._tag !== "Granted") {
-    // Every refusal answers the same 403: the app set, the role ceiling and
-    // "not a collaborator" must not be told apart (or a key could probe which
-    // apps exist).
-    return Response.json({ error: "forbidden", ok: false }, { status: 403 });
+  if ("response" in access) {
+    return access.response;
   }
+
+  const { verdict } = access;
 
   return Response.json({
     appId: verdict.app.id,
@@ -365,7 +440,7 @@ export const handleTelemetryFacts: RouteHandler = async (request, env) => {
       { headers: { "cache-control": "no-store" } }
     );
   } catch (error) {
-    console.error("[telemetry-facts]", error);
+    console.error("[telemetry-facts]", errorLogText(error));
 
     return Response.json({ error: "user count unavailable" }, { status: 500 });
   }

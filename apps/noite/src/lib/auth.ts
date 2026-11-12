@@ -16,7 +16,7 @@ import * as Schema from "effect/Schema";
 
 import type { InstanceAuthority } from "./authority";
 import { getAuthDb, resolveEnv } from "./db";
-import { errorMessage } from "./errors";
+import { errorLogText, errorMessage } from "./errors";
 import { isLocalhostDomain } from "./local-host";
 import { fail } from "./server/api";
 import { revokeApiKeysForUser } from "./server/api-keys.server";
@@ -254,6 +254,18 @@ export const createAuth = (env: KitEnv, baseURL: string) =>
     },
     baseURL,
     database: getAuthDb(),
+    // better-auth's default onError logs the raw failure, and a database write
+    // failure is drizzle's statement plus every bound parameter — a fresh
+    // session token among them. `onError` replaces that path entirely (the
+    // default only runs when neither `onError` nor `throw` is set); the cause
+    // chain still reaches the log.
+    onAPIError: {
+      // oxlint-disable-next-line anti-slop/no-unknown-parameters -- better-auth hands the raw thrown value; the logger narrows it.
+      onError: (error: unknown) => {
+        console.error("[auth]", errorLogText(error));
+      },
+      throw: true,
+    },
     // A ban revokes the account's machine credentials in the same flow as
     // the session deletion: the admin plugin's `banUser` (and a direct
     // `POST /api/auth/admin/ban-user`) both write `banned: true` through
@@ -274,7 +286,10 @@ export const createAuth = (env: KitEnv, baseURL: string) =>
             try {
               await revokeApiKeysForUser(user.id);
             } catch (error) {
-              console.error("[auth] ban key revocation failed", error);
+              console.error(
+                "[auth] ban key revocation failed",
+                errorLogText(error)
+              );
             }
           },
         },
@@ -329,7 +344,7 @@ export const createAuth = (env: KitEnv, baseURL: string) =>
         try {
           await revokeApiKeysForUser(userId);
         } catch (error) {
-          console.error("[auth] unban key sweep failed", error);
+          console.error("[auth] unban key sweep failed", errorLogText(error));
         }
       }),
       before: createAuthMiddleware(async (ctx) => {
