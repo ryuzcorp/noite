@@ -203,6 +203,12 @@ sensitive:
   - "docker/uninstall.sh"
   - "docker/backup.sh"
   - "docker/restore.sh"
+  # The image-integrity guard: the digest/checksum rules and their tests. A
+  # weakened rule lets an unpinned or unverified artifact ship silently, so it
+  # needs a review like the Dockerfile it guards.
+  - "docker/check-pins.ts"
+  - "docker/check-versions.ts"
+  - "docker/check-versions.test.ts"
 
   # The gates themselves: workflows, this list, and the reviewer config.
   # Weakening review or CI silently weakens every path above.
