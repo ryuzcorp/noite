@@ -59,7 +59,10 @@ export const apiErrors = (body: unknown): FieldErrors | null => {
   return Object.keys(fields).length > 0 ? fields : null;
 };
 
-const errorBody = (body: unknown): string | null => {
+/** The `{error}` field of a refusal body (the control's and the runner's
+ * envelope), or null when the body carries none. Exported for the routes that
+ * forward the runner body verbatim but not as a Void action. */
+export const errorBody = (body: unknown): string | null => {
   if (body === null || typeof body !== "object" || Array.isArray(body)) {
     return null;
   }
@@ -72,16 +75,45 @@ const errorBody = (body: unknown): string | null => {
 };
 
 /* oxlint-enable anti-slop/no-unknown-parameters, anti-slop/no-runtime-typeof */
+
+/** Client-side bound on one action round trip. The server answers a stuck
+ * action itself (15 s, `middleware/01-timeout.ts`); this only covers a
+ * connection that never reaches it — a dead network, a stalled proxy — so
+ * the failure reads as a timeout instead of hanging the form forever. */
+export const API_TIMEOUT_MS = 20_000;
+
+/** The transport failure as text: a timeout says what to wait for, anything
+ * else is the browser's own network error (never a bare "fetch failed"). */
+// oxlint-disable-next-line anti-slop/no-unknown-parameters -- a rejected fetch value is unknown by construction; this maps it onto text.
+export const transportMessage = (error: unknown, timeoutMs: number): string => {
+  if (
+    error instanceof Error &&
+    (error.name === "TimeoutError" || error.name === "AbortError")
+  ) {
+    return `the server didn't answer within ${Math.round(timeoutMs / 1000)} s`;
+  }
+
+  return `network error: ${error instanceof Error ? error.message : String(error)}`;
+};
+
 /** POST `input` as JSON to a JSON-action endpoint and read the value back.
  * Rejects with `ApiError` whose `message` is the user-facing text. */
 // oxlint-disable-next-line anti-slop/no-unknown-parameters -- the JSON-action client boundary: the input shape is the endpoint's contract, serialized here.
 export const api = async <T>(path: string, input: unknown): Promise<T> => {
-  const response = await fetch(path, {
-    body: JSON.stringify(input ?? {}),
-    credentials: "same-origin",
-    headers: { "content-type": "application/json" },
-    method: "POST",
-  });
+  let response: Response;
+
+  try {
+    response = await fetch(path, {
+      body: JSON.stringify(input ?? {}),
+      credentials: "same-origin",
+      headers: { "content-type": "application/json" },
+      method: "POST",
+      signal: AbortSignal.timeout(API_TIMEOUT_MS),
+    });
+  } catch (error) {
+    // Status 0: the request never got an answer, so there is no HTTP status.
+    throw new ApiError(0, transportMessage(error, API_TIMEOUT_MS), null);
+  }
 
   if (response.ok) {
     // SAFETY: the endpoint answers the action's value as JSON; the caller names its type.

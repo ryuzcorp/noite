@@ -35,7 +35,7 @@ import { Data } from "effect";
 import * as Effect from "effect/Effect";
 
 import { api } from "../api";
-import { errorMessage } from "../errors";
+import { operationMessage } from "../errors";
 import type { AppStatus } from "../runner-types/AppStatus";
 import type { DesiredState } from "../runner-types/DesiredState";
 import { appLifecycle, appStatusFacts } from "./lifecycle";
@@ -101,7 +101,8 @@ const saveDesired = (
   seq: number
 ): Cmd<HeaderMessage> =>
   Effect.tryPromise({
-    catch: (error) => new Error(errorMessage(error)),
+    catch: (error) =>
+      new Error(operationMessage("Changing the app's state failed", error)),
     try: () =>
       api<{ ok: true }>("/api/apps/setDesired", {
         desiredState: next,
@@ -116,7 +117,8 @@ const saveDesired = (
 
 const retryImport = (appId: string, seq: number): Cmd<HeaderMessage> =>
   Effect.tryPromise({
-    catch: (error) => new Error(errorMessage(error)),
+    catch: (error) =>
+      new Error(operationMessage("Retrying the import failed", error)),
     try: () => api<{ ok: true }>("/api/apps/retryImport", appId),
   }).pipe(
     Effect.match({

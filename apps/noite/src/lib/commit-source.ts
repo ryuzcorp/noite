@@ -4,6 +4,7 @@
  * and the transport reads it before any auth — a browser commit can be a
  * folder of uploads (see `apps/runner/src/host/web_commit.rs`). */
 
+import { errorBody, transportMessage } from "./api";
 import type { SourceCommitFile, SourceCommitMove } from "./runner";
 
 /** Largest source body the route reads. Must match `MAX_COMMIT_BODY_BYTES` in
@@ -29,23 +30,50 @@ export interface SourceCommitInput {
   moves?: readonly SourceCommitMove[];
 }
 
+/** Client-side bound on one upload round trip: a commit body is up to
+ * `MAX_SOURCE_BODY_BYTES`, so it gets longer than the small JSON actions
+ * (`API_TIMEOUT_MS`) while still failing instead of hanging. */
+export const SOURCE_UPLOAD_TIMEOUT_MS = 120_000;
+
+/** Why the route refused: the runner's own `{error}` when the route forwarded
+ * one, else the plain-text refusal it wrote itself, else the status. */
+const refusalText = async (res: Response): Promise<string> => {
+  const text = await res.text().catch(() => res.statusText);
+
+  try {
+    const forwarded = errorBody(JSON.parse(text));
+
+    if (forwarded) {
+      return forwarded;
+    }
+  } catch {
+    // A plain-text refusal ("forbidden", "invalid JSON"): use it as written.
+  }
+
+  return text.trim() === "" ? `Request failed (${res.status})` : text.trim();
+};
+
 /** POST one web-commit body to `/api/apps/{id}/source/commit` and read the
  * runner's answer back. */
 const postSourceBody = async <T>(input: SourceCommitInput): Promise<T> => {
   const { appId, ...body } = input;
+  let res: Response;
 
-  const res = await fetch(
-    `/api/apps/${encodeURIComponent(appId)}/source/commit`,
-    {
+  try {
+    res = await fetch(`/api/apps/${encodeURIComponent(appId)}/source/commit`, {
       body: JSON.stringify(body),
       headers: { "content-type": "application/json" },
       method: "POST",
-    }
-  );
+      signal: AbortSignal.timeout(SOURCE_UPLOAD_TIMEOUT_MS),
+    });
+  } catch (error) {
+    throw new Error(transportMessage(error, SOURCE_UPLOAD_TIMEOUT_MS), {
+      cause: error,
+    });
+  }
 
   if (!res.ok) {
-    const text = await res.text().catch(() => res.statusText);
-    throw new Error(`commit failed: ${res.status} ${text}`);
+    throw new Error(await refusalText(res));
   }
 
   // SAFETY: the route re-serves the runner's own JSON verbatim (`{ sha }`).

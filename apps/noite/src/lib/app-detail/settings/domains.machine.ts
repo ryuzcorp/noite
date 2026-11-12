@@ -28,7 +28,7 @@ import { Data } from "effect";
 import * as Effect from "effect/Effect";
 
 import { api } from "../../api";
-import { errorMessage } from "../../errors";
+import { errorMessage, operationMessage } from "../../errors";
 import type { RunnerDomain } from "../../runner";
 import type { Step } from "../step";
 
@@ -106,7 +106,10 @@ const addDomain = (
   }).pipe(
     Effect.match({
       onFailure: (error) =>
-        DomainsMsg.Failed({ error: error.message, op: "add" }),
+        DomainsMsg.Failed({
+          error: operationMessage("Adding the hostname failed", error),
+          op: "add",
+        }),
       onSuccess: (rows) => {
         const claimed = rows.find(
           (row) => row.hostname === normalizeHostname(hostname)
@@ -137,7 +140,10 @@ const verifyDomain = (
   }).pipe(
     Effect.match({
       onFailure: (error) =>
-        DomainsMsg.Failed({ error: error.message, op: "verify" }),
+        DomainsMsg.Failed({
+          error: operationMessage("Verifying the hostname failed", error),
+          op: "verify",
+        }),
       onSuccess: () => DomainsMsg.Verified(),
     })
   );
@@ -159,7 +165,10 @@ const removeDomain = (
   }).pipe(
     Effect.match({
       onFailure: (error) =>
-        DomainsMsg.Failed({ error: error.message, op: "remove" }),
+        DomainsMsg.Failed({
+          error: operationMessage("Removing the hostname failed", error),
+          op: "remove",
+        }),
       onSuccess: () => DomainsMsg.Removed(),
     })
   );

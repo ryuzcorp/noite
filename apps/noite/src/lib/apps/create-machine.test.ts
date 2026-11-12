@@ -2,13 +2,15 @@ import { describe, expect, spyOn, test } from "bun:test";
 
 import type { UpdateResult } from "@ilha/model";
 import { runCommands } from "@ilha/model/test";
-import { Effect } from "effect";
+import { Effect, Fiber } from "effect";
+import { TestClock } from "effect/testing";
 
 import type { CreateModel, Message } from "./create-machine";
 import {
   createSourceOf,
   initialModel,
   Msg,
+  SLUG_CHECK_DEBOUNCE_MS,
   statusOf,
   update,
 } from "./create-machine";
@@ -30,18 +32,23 @@ const model = (patch: Partial<CreateModel> = {}): CreateModel => ({
   ...patch,
 });
 
-/** Run one update's command against a stubbed `fetch`, collecting what the
- * network saw and where the page was sent. */
-const run = async (result: UpdateResult<CreateModel, Message>) => {
+/** Run one update's command, collecting what the network saw. The default
+ * answer fits both the create and the commit; a failure test supplies its own
+ * responder (a 422, a rejected fetch). */
+const run = async (
+  result: UpdateResult<CreateModel, Message>,
+  answer: (path: string) => Promise<Response> = () =>
+    Promise.resolve(Response.json({ id: "app-1", sha: "abc1234" }))
+) => {
   const calls: string[] = [];
 
-  // The create and the commit answer the same shape here; the two commands only
-  // need a body the callers can read.
   const respond: typeof fetch = Object.assign(
     (input: URL | RequestInfo) => {
-      calls.push(String(input));
+      const path = String(input);
 
-      return Promise.resolve(Response.json({ id: "app-1", sha: "abc1234" }));
+      calls.push(path);
+
+      return answer(path);
     },
     { preconnect: () => {} }
   );
@@ -55,6 +62,56 @@ const run = async (result: UpdateResult<CreateModel, Message>) => {
   } finally {
     spy.mockRestore();
   }
+};
+
+/** The slug check settles after a debounce; drive the test clock instead of
+ * sleeping, so the answer is observed without wall-clock time. */
+const runSlugCheck = async (
+  result: UpdateResult<CreateModel, Message>,
+  answer: (path: string) => Promise<Response>
+) => {
+  const calls: string[] = [];
+
+  const respond: typeof fetch = Object.assign(
+    (input: URL | RequestInfo) => {
+      calls.push(String(input));
+
+      return answer(String(input));
+    },
+    { preconnect: () => {} }
+  );
+
+  const spy = spyOn(globalThis, "fetch").mockImplementation(respond);
+
+  try {
+    const messages = await Effect.runPromise(
+      Effect.provide(
+        Effect.gen(function* slugCheckWithClock() {
+          const fiber = yield* Effect.forkChild(runCommands(result));
+
+          yield* TestClock.adjust(SLUG_CHECK_DEBOUNCE_MS);
+
+          return yield* Fiber.join(fiber);
+        }),
+        TestClock.layer()
+      )
+    );
+
+    return { calls, messages };
+  } finally {
+    spy.mockRestore();
+  }
+};
+
+/** The single message a command answered, failing loudly on any other count. */
+const only = <M>(messages: readonly M[]): M => {
+  const [message] = messages;
+
+  if (message === undefined || messages.length !== 1) {
+    throw new Error(`expected one message, got ${messages.length}`);
+  }
+
+  return message;
 };
 
 describe("the create page's state machine", () => {
@@ -278,6 +335,75 @@ describe("the create page's state machine", () => {
 
     expect(reading.model.drop).toEqual({ t: "Reading" });
     expect(statusOf(reading.model).error).toBeNull();
+  });
+
+  test("a refused create shows the server's message, never Effect's default", async () => {
+    const next = update(model(), Msg.Submitted({ navigate: () => {} }));
+
+    // The control answers a refused create as a 422 `{errors:{form}}` carrying
+    // the runner's own text.
+    const { messages } = await run(next, () =>
+      Promise.resolve(
+        Response.json(
+          {
+            errors: {
+              form: "object store timed out while minting credentials",
+            },
+          },
+          { status: 422 }
+        )
+      )
+    );
+
+    expect(messages).toEqual([
+      Msg.CreateFailed({
+        error:
+          "Creating the app failed: object store timed out while minting credentials",
+      }),
+    ]);
+    expect(statusOf(update(next.model, only(messages)).model).error).toBe(
+      "Creating the app failed: object store timed out while minting credentials"
+    );
+  });
+
+  test("a create lost to the network names the network failure", async () => {
+    const next = update(model(), Msg.Submitted({ navigate: () => {} }));
+
+    const { messages } = await run(next, () =>
+      Promise.reject(new TypeError("Failed to fetch"))
+    );
+
+    expect(messages).toEqual([
+      Msg.CreateFailed({
+        error: "Creating the app failed: network error: Failed to fetch",
+      }),
+    ]);
+  });
+
+  test("a failed slug check reports why under the field", async () => {
+    const typed = update(
+      model({ slug: "" }),
+      Msg.SlugChanged({ value: "shop" })
+    );
+
+    const { messages } = await runSlugCheck(typed, () =>
+      Promise.reject(new TypeError("Failed to fetch"))
+    );
+
+    expect(messages).toEqual([
+      Msg.SlugCheckFailed({
+        message: "Checking the slug failed: network error: Failed to fetch",
+        slug: "shop",
+      }),
+    ]);
+
+    const settled = update(typed.model, only(messages));
+
+    expect(statusOf(settled.model).slugError).toBe(
+      "Checking the slug failed: network error: Failed to fetch"
+    );
+    // Advisory: the create path still gets to validate the slug.
+    expect(statusOf(settled.model).error).toBeNull();
   });
 
   test("a failed upload keeps the app reachable and the error on the button", () => {
