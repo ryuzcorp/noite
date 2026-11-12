@@ -13,6 +13,8 @@
 import { errorMessage } from "../errors";
 import type { SearchParam } from "../search-param";
 import { confirmDialog } from "../ui/confirm";
+import { initialFile } from "./initial-file";
+import type { InitialFile } from "./initial-file";
 import {
   clearNaming,
   finishNaming,
@@ -60,14 +62,6 @@ const STATUS: Record<ChangeKind, TreeGitStatus> = {
   moved: "renamed",
 };
 
-/** The commit's own config files, the sensible thing to open when a browse
- * names no file. */
-const CONFIG_FILES = [
-  "cloudflare.config.ts",
-  "wrangler.jsonc",
-  "wrangler.toml",
-] as const;
-
 /** What the tree wiring needs from the browser and the editor pane. */
 export interface TreeHost {
   aborted: () => boolean;
@@ -97,8 +91,9 @@ export interface TreeHost {
 
 /** The tree wiring's surface for the browser. */
 export interface TreeWiring {
-  /** Build the rows: answers the file to open first, if any. */
-  build: () => string | undefined;
+  /** Build the rows: answers the browse's initial file (see `./initial-file`)
+   * for the browser to open. */
+  build: () => InitialFile;
   cleanUp: () => void;
   /** Repaint the markers from the session (a keystroke changes none of the
    * rows, only their status). */
@@ -183,18 +178,6 @@ export const createTreeWiring = (host: TreeHost): TreeWiring => {
     tree?.setGitStatus(entries);
   };
 
-  /** The file to open when a browse names none: the deep link, else the
-   * Worker config, else nothing. */
-  const firstFile = (): string | undefined => {
-    const wanted = host.file();
-
-    if (wanted !== "" && held.has(wanted)) {
-      return wanted;
-    }
-
-    return CONFIG_FILES.find((name) => held.has(name));
-  };
-
   const closeMenu = (): void => {
     menu?.close();
     menu = null;
@@ -213,10 +196,11 @@ export const createTreeWiring = (host: TreeHost): TreeWiring => {
    * or an add, the listing is the truth. Rebuilding rather than patching keeps
    * pierre's store and the session from drifting apart — the two used to be
    * separate copies of the tree. */
-  const build = (): string | undefined => {
+  const build = (): InitialFile => {
     const rows = [...host.rows()].toSorted(byPath);
     held = new Set(rows);
-    const initial = firstFile();
+    const chosen = initialFile(rows, host.file());
+    const initial = chosen._tag === "Opened" ? chosen.path : undefined;
     tree?.cleanUp();
     closeMenu();
     const { FileTree, preparePresortedFileTreeInput } = host.trees;
@@ -284,7 +268,7 @@ export const createTreeWiring = (host: TreeHost): TreeWiring => {
     host.treeEl.textContent = "";
     tree.render({ fileTreeContainer: host.treeEl });
 
-    return initial;
+    return chosen;
   };
 
   /** Rename a row pierre already moved: a folder carries everything under it,

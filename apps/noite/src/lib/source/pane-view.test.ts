@@ -105,6 +105,21 @@ describe("the pane machine's transition table", () => {
     expect(panePath(decision.machine.view)).toBe("a.ts");
   });
 
+  test("Emptied is the no-files state, not a note over a file", () => {
+    const empty = stepPane(opened(), PaneEvents.Emptied());
+
+    expect(empty.machine.view).toEqual({ _tag: "NoFiles" });
+    expect(panePath(empty.machine.view)).toBeNull();
+    expect(paintedOf(empty.machine.view)).toBeNull();
+
+    const requested = stepPane(
+      empty.machine,
+      PaneEvents.Requested({ path: "a.ts" })
+    );
+
+    expect(panePath(requested.machine.view)).toBe("a.ts");
+  });
+
   test("Closed drops the paint and refuses a second close", () => {
     const closed = stepPane(opened(), PaneEvents.Closed());
 
