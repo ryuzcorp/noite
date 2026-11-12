@@ -1,0 +1,4 @@
+### Fixed
+
+- A D1 database with more than five tables lists its tables again. The row counts were one `SELECT … UNION ALL …` statement, and celld applies workerd's SQLite budget (`SQLITE_LIMIT_COMPOUND_SELECT = 5`) to every cell, so a sixth table failed the whole listing with a raw `D1_EXEC_ERROR` ("the SQL ends in an incomplete statement"). The counts now run as one `--batch` of per-table `SELECT COUNT(*)` statements. A database whose cell has never been opened, or that has no tables, shows the empty table view instead of an error.
+- A failed D1 read shows a concise message ("Couldn't list the D1 tables: …") with a **Retry** button instead of the runner's argv: the bucket path, the generated SQL and celld's stderr now stay in the runner log, and the tenant sees only celld's own error line.

@@ -28,6 +28,8 @@ jobs:
     permissions:
       attestations: read
       contents: read
+      # The image-pin paths-filter lists a pull request's files through the API.
+      pull-requests: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
@@ -63,14 +65,33 @@ jobs:
         run: |
           pinned=$(sed -n 's/^ARG CELLD_DIGEST=//p' docker/Dockerfile)
           gh attestation verify "oci://ghcr.io/ryuzcorp/celld@$pinned" --repo ryuzcorp/celld
-      # Every other image and tarball pin, against the publisher: the tag's
-      # index digest, Node's signed SHASUMS256.txt, npm's dist.integrity and
-      # the GitHub release asset digest. A bump that changes a version but not
-      # its checksum fails here instead of at some later build.
+      # Every other image and tarball pin, against the publisher: Node's
+      # signed SHASUMS256.txt, npm's dist.integrity and the GitHub release
+      # asset digest are immutable for a version, so a bump that changes a
+      # version but not its checksum always fails here. Image tags are not
+      # immutable (an official image re-pushes the same tag for a base-OS
+      # update), so their digests are resolved only for a PR that changes a
+      # pin; `.github/workflows/pin-drift.yml` runs that leg weekly and files
+      # an issue instead of failing unrelated PRs. The merge queue and the
+      # release builds (`images.yml`, a push or tag with no PR file list)
+      # deliberately skip the image leg: the build consumes the digest the
+      # pin already carries, so a re-pushed tag cannot change what ships,
+      # and the weekly job is what notices drift.
+      - name: image pin files changed
+        id: pins
+        if: github.event_name == 'pull_request'
+        uses: dorny/paths-filter@0e4a8c6effa4802afeda77dc8d303f8176d7dfad # v3
+        with:
+          filters: |
+            image:
+              - 'docker/Dockerfile'
+              - 'docker/compose.yaml'
+              - '.github/workflows/ci.yml'
+              - 'apps/website/docs/self-hosting/platforms.mdx'
       - name: image and tarball pins are published
         env:
           GH_TOKEN: ${{ github.token }}
-        run: bun docker/check-versions.ts --online
+        run: bun docker/check-versions.ts --online ${{ steps.pins.outputs.image == 'true' && '--online-images' || '' }}
       # Script unit tests: docker/ (including the test-hygiene checker,
       # docker/check-tests.test.ts) and the CI scripts (bun skips dot
       # directories unless they're named explicitly).

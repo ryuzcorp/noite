@@ -100,11 +100,60 @@ test(
         page.getByRole("heading", { level: 2, name: "Domains" })
       ).toBeInViewport();
 
+      // The sticky strip marks the section in view: the pick at once, then
+      // scrolling the stack moves the marker with the headings (scroll-spy),
+      // not only with clicks.
+      await expect(
+        sectionNav(page).getByRole("button", { name: "Domains" })
+      ).toHaveAttribute("aria-current", "location");
+      await page
+        .locator("#settings-identity")
+        .evaluate((heading) => heading.scrollIntoView({ block: "start" }));
+      await expect(
+        sectionNav(page).getByRole("button", { name: "Identity" })
+      ).toHaveAttribute("aria-current", "location");
+      await expect(
+        sectionNav(page).getByRole("button", { name: "Domains" })
+      ).not.toHaveAttribute("aria-current", "location");
+
+      // The strip is one keyboard row: End/Home move focus along it.
+      await sectionNav(page).getByRole("button", { name: "Identity" }).focus();
+      await page.keyboard.press("End");
+      await expect(
+        sectionNav(page).getByRole("button", { name: "Danger zone" })
+      ).toBeFocused();
+      await page.keyboard.press("Home");
+      await expect(
+        sectionNav(page).getByRole("button", { name: "Identity" })
+      ).toBeFocused();
+
+      // A narrow screen keeps the strip on one row and scrolls it sideways.
+      await page.setViewportSize({ width: 420, height: 800 });
+      await expect
+        .poll(() =>
+          sectionNav(page).evaluate((nav) => {
+            const scroller = nav.querySelector(".tabs")?.parentElement;
+
+            return (
+              scroller !== undefined &&
+              scroller !== null &&
+              scroller.scrollWidth > scroller.clientWidth
+            );
+          })
+        )
+        .toBe(true);
+      await page.setViewportSize({ width: 1280, height: 720 });
+
       // A shared link scrolls to its heading without switching anything.
       await page.goto(`/apps/${appId}/settings?section=danger`);
       await expect(
         page.getByRole("heading", { level: 2, name: "Danger zone" })
       ).toBeInViewport();
+      // …and the strip stayed on screen above the sections.
+      await expect(sectionNav(page)).toBeInViewport({ ratio: 1 });
+      await expect(
+        sectionNav(page).getByRole("button", { name: "Danger zone" })
+      ).toHaveAttribute("aria-current", "location");
       await expect(
         page.getByRole("heading", { level: 2, name: "Identity" })
       ).not.toBeInViewport();

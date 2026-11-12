@@ -15,6 +15,7 @@ use crate::host::generated_config;
 use crate::host::logs::LogState;
 use crate::host::package_manager;
 use crate::host::s3;
+use crate::host::source;
 use crate::host::supervisor::{self, ProcMap};
 use crate::host::tips::TipBundle;
 use crate::host::void_cohost;
@@ -2470,20 +2471,7 @@ async fn materialize_bundle(
     .await?;
     let _ = tokio::fs::remove_dir_all(&src_dir).await;
     tokio::fs::create_dir_all(&src_dir).await?;
-    exec::run_cmd(
-        "git",
-        &[
-            &format!("--git-dir={}", bare.display()),
-            &format!("--work-tree={}", src_dir.display()),
-            "checkout",
-            "-f",
-            git_ref,
-        ],
-        Some(work),
-        &[],
-        Duration::from_secs(30),
-    )
-    .await?;
+    source::checkout_into(&bare, git_ref, &src_dir).await?;
     Ok(src_dir)
 }
 

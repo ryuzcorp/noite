@@ -23,7 +23,7 @@ Browsing a tag or a raw commit sha (both work in `?ref=`) is read-only. Any bran
 
 ## Files and diffs
 
-The tree lists the ref's committed files with sizes; clicking one opens it in the editor. Binary files are detected and not rendered, blobs are capped at 256 KB, and a diff is capped at 1 MB. On a branch you can edit, the tree marks every file you have added, changed, moved or deleted but not pushed yet. The editor's own header shows the open file's change the same way — the same letter (A, M, R, D) beside its name — from the same unpushed changes, so it follows a discard or an undo.
+The tree lists the ref's committed files with sizes; clicking one opens it in the editor. When the URL names no file, Code mode opens the ref's front door — `package.json`, then `README.md`, then the first file in tree order — and writes that choice to `?file=` in place, so Back still leaves the page. Only a ref with no files at all is shown as empty. The open file's name stays pinned at the top of the editor while its text scrolls, truncating on narrow panes. Binary files are detected and not rendered, blobs are capped at 256 KB, and a diff is capped at 1 MB. On a branch you can edit, the tree marks every file you have added, changed, moved or deleted but not pushed yet. The editor's own header shows the open file's change the same way — the same letter (A, M, R, D) beside its name — from the same unpushed changes, so it follows a discard or an undo.
 
 Only committed files are rows: there is no local `.gitignore` filter and no dimmed rows, because nothing untracked exists in the page. Files a clone would not show (`node_modules`, `dist`, …) are simply not part of the ref.
 

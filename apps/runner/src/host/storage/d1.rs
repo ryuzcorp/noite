@@ -603,18 +603,17 @@ pub fn build_delete_keys(
         .to_string())
 }
 
-/// One exec for every table's row count:
-/// `SELECT 'name' AS t, COUNT(*) AS n FROM "name" UNION ALL …`.
-pub fn build_table_counts(tables: &[String]) -> String {
-    let mut parts: Vec<String> = Vec::new();
-    for name in tables {
-        parts.push(format!(
-            "SELECT {} AS t, COUNT(*) AS n FROM {}",
-            string_literal(name),
-            quote_ident(name)
-        ));
-    }
-    parts.join(" UNION ALL ")
+/// One count statement per table, run as one `--batch` exec.
+///
+/// Never `SELECT … UNION ALL …`: celld applies workerd's SQLite budgets to
+/// every cell, and `SQLITE_LIMIT_COMPOUND_SELECT` is 5 there, so a database
+/// with a sixth table failed the whole listing ("too many terms in compound
+/// SELECT", which the unterminated SQL then reported as "incomplete").
+pub fn build_table_counts(tables: &[String]) -> Vec<String> {
+    tables
+        .iter()
+        .map(|name| format!("SELECT COUNT(*) AS n FROM {}", quote_ident(name)))
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -646,23 +645,13 @@ impl<'a> D1<'a> {
     /// validated SQL only — never raw browser input.
     async fn exec(&self, sql: &str, json: bool) -> anyhow::Result<String> {
         let bucket = self.app.fleet_bucket.clone();
-        let scope_key = crate::host::credentials::Scope::app(self.app).key();
-        let env_owned = s3::celld_cli_env(self.cfg, &scope_key);
-        let env: Vec<(&str, &str)> = env_owned.iter().map(|(k, v)| (*k, v.as_str())).collect();
         let mut args = vec!["d1", "execute", self.database_id.as_str(), "--command", sql];
         if json {
             args.push("--json");
         }
         args.extend(["--bucket", bucket.as_str()]);
-        exec::run_cmd(
-            &self.cfg.celld_bin,
-            &args,
-            Some(&self.proj),
-            &env,
-            Duration::from_secs(30),
-        )
-        .await
-        .with_context(|| format!("celld d1 {}", self.database_id))
+        let out = self.celld(&args, None).await?;
+        Ok(String::from_utf8_lossy(&out).into_owned())
     }
 
     /// Several independent statements in one `celld d1 execute --batch --json`
@@ -674,9 +663,6 @@ impl<'a> D1<'a> {
         stmts: &[String],
     ) -> anyhow::Result<Vec<Vec<serde_json::Map<String, Value>>>> {
         let bucket = self.app.fleet_bucket.clone();
-        let scope_key = crate::host::credentials::Scope::app(self.app).key();
-        let env_owned = s3::celld_cli_env(self.cfg, &scope_key);
-        let env: Vec<(&str, &str)> = env_owned.iter().map(|(k, v)| (*k, v.as_str())).collect();
         let args = [
             "d1",
             "execute",
@@ -686,18 +672,87 @@ impl<'a> D1<'a> {
             "--bucket",
             bucket.as_str(),
         ];
-        let out = exec::run_cmd_stdin(
-            &self.cfg.celld_bin,
-            &args,
-            build_batch_input(stmts).as_bytes(),
-            Some(&self.proj),
-            &env,
-            Duration::from_secs(30),
-        )
-        .await
-        .with_context(|| format!("celld d1 {}", self.database_id))?;
+        let out = self
+            .celld(&args, Some(build_batch_input(stmts).as_bytes()))
+            .await?;
         parse_batch_output(&String::from_utf8_lossy(&out), stmts.len())
     }
+
+    /// Run one `celld d1` subprocess, turning a refused exit into celld's own
+    /// message. The argv names the bucket and the generated SQL, and stderr
+    /// can carry paths: both go to the runner log only, never to the client.
+    async fn celld(&self, args: &[&str], stdin: Option<&[u8]>) -> anyhow::Result<Vec<u8>> {
+        let scope_key = crate::host::credentials::Scope::app(self.app).key();
+        let env_owned = s3::celld_cli_env(self.cfg, &scope_key);
+        let env: Vec<(&str, &str)> = env_owned.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        let timeout = Duration::from_secs(30);
+        let output = match stdin {
+            Some(input) => {
+                exec::run_cmd_output_stdin(
+                    &self.cfg.celld_bin,
+                    args,
+                    Some(input),
+                    Some(&self.proj),
+                    &env,
+                    timeout,
+                )
+                .await
+            }
+            None => {
+                exec::run_cmd_output(&self.cfg.celld_bin, args, Some(&self.proj), &env, timeout)
+                    .await
+            }
+        }
+        .with_context(|| format!("spawn celld for {}", self.database_id))?;
+        if output.status.success() {
+            return Ok(output.stdout);
+        }
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        tracing::warn!(
+            database = %self.database_id,
+            argv = ?args,
+            exit = ?output.status.code(),
+            stderr = %stderr.trim(),
+            stdout = %String::from_utf8_lossy(&output.stdout).trim(),
+            "celld d1 failed"
+        );
+        bail!(
+            "{}",
+            scrub_bucket(celld_failure(&stderr), &self.app.fleet_bucket)
+        )
+    }
+}
+
+/// The tenant-facing text of a failed celld run: its first error line without
+/// the `Error:` prefix. The rest of the chain (the argv, the bucket and the
+/// generated SQL) stays in the runner log.
+fn celld_failure(stderr: &str) -> String {
+    let line = stderr
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or_default();
+    let message = line.strip_prefix("Error: ").unwrap_or(line).trim();
+    if message.is_empty() {
+        "celld exited without a message".to_string()
+    } else {
+        message.to_string()
+    }
+}
+
+/// A celld error line with the app's bucket path removed: a store refusal can
+/// name it, and the install's object layout is not the tenant's to read.
+fn scrub_bucket(message: String, fleet_bucket: &str) -> String {
+    if fleet_bucket.is_empty() {
+        return message;
+    }
+    message.replace(fleet_bucket, "<app bucket>")
+}
+
+/// Whether celld refused because the D1 cell has never been opened. The cell
+/// is created empty on first use, so this is "no tables yet", not a failure.
+fn unopened_database(error: &anyhow::Error) -> bool {
+    format!("{error:#}").contains("no db for ")
 }
 
 /// Materialize the deployed source into a persistent project dir so celld's
@@ -969,17 +1024,23 @@ async fn load_schema(d1: &D1<'_>, table: &str) -> anyhow::Result<D1TableSchemaRa
 // Public operations
 // ---------------------------------------------------------------------------
 
-/// Tables plus row counts, in one `SELECT … UNION ALL …` exec.
+/// Tables plus row counts, one count statement per table in one batch.
 pub async fn d1_tables(cfg: &Config, app: &App, database_id: &str) -> anyhow::Result<D1Tables> {
     let d1 = D1::connect(cfg, app, database_id).await?;
-    let names = table_names(&d1).await?;
+    // A declared database whose cell has never been opened has no tables
+    // yet, and celld says so as `no db for <scope>`. That is the same empty
+    // view as a created-but-empty database, not a failed listing.
+    let names = match table_names(&d1).await {
+        Ok(names) => names,
+        Err(error) if unopened_database(&error) => Vec::new(),
+        Err(error) => return Err(error),
+    };
     let mut counts: BTreeMap<String, i64> = BTreeMap::new();
     if !names.is_empty() {
-        let out = d1.exec(&build_table_counts(&names), true).await?;
-        for row in parse_json_rows(&out) {
-            if let (Some(name), Some(n)) = (json_str(&row, "t"), json_i64(&row, "n")) {
-                counts.insert(name.to_string(), n);
-            }
+        let sets = d1.exec_batch(&build_table_counts(&names)).await?;
+        for (name, rows) in names.iter().zip(&sets) {
+            let count = rows.first().and_then(|row| json_i64(row, "n")).unwrap_or(0);
+            counts.insert(name.clone(), count);
         }
     }
     let tables = names
@@ -1396,13 +1457,50 @@ mod tests {
     }
 
     #[test]
-    fn table_counts_union_all() {
-        let sql = build_table_counts(&["a".to_string(), "b'b".to_string()]);
+    fn table_counts_are_one_statement_per_table() {
+        let counts = build_table_counts(&[
+            "account".to_string(),
+            "verification".to_string(),
+            "session".to_string(),
+            "user".to_string(),
+            "jwks".to_string(),
+            "b'b".to_string(),
+        ]);
+        // One statement per table: celld's workerd SQLite budget allows only
+        // five `UNION ALL` terms, so a compound count broke every database
+        // with more than five tables.
+        assert_eq!(counts.len(), 6);
+        assert_eq!(counts[0], "SELECT COUNT(*) AS n FROM \"account\"");
+        assert_eq!(counts[5], "SELECT COUNT(*) AS n FROM \"b'b\"");
+        for sql in &counts {
+            assert!(!sql.contains("UNION"), "{sql}");
+            // The `--batch` path prepares each element as exactly one statement.
+            assert!(!sql.contains(';'), "{sql}");
+        }
+    }
+
+    #[test]
+    fn celld_failures_hide_the_bucket_path() {
+        let message = "read s3://noite/fleets/x/data.sqlite: access denied".to_string();
         assert_eq!(
-            sql,
-            "SELECT 'a' AS t, COUNT(*) AS n FROM \"a\" UNION ALL \
-             SELECT 'b''b' AS t, COUNT(*) AS n FROM \"b'b\""
+            scrub_bucket(message, "s3://noite/fleets/x"),
+            "read <app bucket>/data.sqlite: access denied"
         );
+        assert_eq!(
+            scrub_bucket("plain".to_string(), ""),
+            "plain",
+            "an empty bucket leaves the message alone"
+        );
+    }
+
+    #[test]
+    fn celld_failure_keeps_only_the_first_error_line() {
+        let stderr = "Error: D1_EXEC_ERROR: too many terms in compound SELECT\nsecond line\n";
+        assert_eq!(
+            celld_failure(stderr),
+            "D1_EXEC_ERROR: too many terms in compound SELECT"
+        );
+        assert_eq!(celld_failure("\n\n"), "celld exited without a message");
     }
 
     #[test]

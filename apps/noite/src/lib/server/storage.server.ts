@@ -20,6 +20,8 @@ import {
   runnerR2Delete,
   runnerR2Get,
   runnerR2List,
+  runnerFailureMessage,
+  runnerFailureOf,
   runnerStorage,
 } from "../runner";
 import type {
@@ -207,7 +209,10 @@ export const d1Tables = apiAction(
         tables: listed.tables.map((table) => ({ ...table, caps })),
       };
     } catch (error) {
-      failUnknown(error);
+      // The runner's own message (celld's line) is the useful part; its RPC
+      // envelope names the internal method and code, which the tenant cannot
+      // act on.
+      fail(runnerFailureMessage(runnerFailureOf(error)));
     }
   }
 );

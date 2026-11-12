@@ -41,6 +41,9 @@ import { TEXT_MAX_BYTES } from "./uploads";
 const BINARY_PLACEHOLDER = "(binary file — preview not available)";
 const OVERSIZE_PLACEHOLDER = "(file exceeds 256 KB — preview not available)";
 
+/** What the pane says for a checkout that holds no files at all. */
+const NO_FILES_NOTE = "This repository has no files yet";
+
 /** The letter the header paints the open file's change as, matching the tree's
  * own lane so the two panes never disagree. */
 const CHANGE_LETTER: Record<ChangeKind, string> = {
@@ -84,8 +87,9 @@ export interface EditorPane {
   open: (path: string) => Promise<boolean>;
   /** Re-read the open file (a commit moved its base, or the page reset). */
   reload: () => Promise<boolean>;
-  /** Paint a standing note in the pane ("Select a file to view"). */
-  note: (message: string) => void;
+  /** The checkout opened with no files: paint the one note this pane has for
+   * it (a state of the pane machine, see `./pane-view`). */
+  empty: () => void;
   /** Repaint the header chip from the session's changes. */
   syncStatus: () => void;
 }
@@ -135,7 +139,11 @@ export const createEditorPane = (host: EditorHost): EditorPane => {
       host.onEdit(shown.path, editor.getText());
       paintStatus(shown.path);
     },
+    // The header rides above the file and stays there while the pane scrolls:
+    // the browser's own scroll container is the code host (see `browser.tsx`),
+    // and pierre marks the header sticky (its `data-sticky` rule).
     overflow: "scroll",
+    stickyHeader: true,
     theme: THEME,
   });
 
@@ -222,10 +230,18 @@ export const createEditorPane = (host: EditorHost): EditorPane => {
     return decision;
   };
 
-  const note = (message: string): void => {
+  /** One standing note in the pane, with no file under it. */
+  const paintNote = (message: string): void => {
     clearBody();
     codeEl.textContent = message;
     statusChip.hidden = true;
+  };
+
+  const empty = (): void => {
+    disposeEdit?.();
+    disposeEdit = undefined;
+    advance(PaneEvents.Emptied());
+    paintNote(NO_FILES_NOTE);
   };
 
   const read = async (ticket: ReadTicket): Promise<boolean> => {
@@ -241,7 +257,7 @@ export const createEditorPane = (host: EditorHost): EditorPane => {
             ticket,
           })
         );
-        note(errorMessage(error));
+        paintNote(errorMessage(error));
       }
 
       return false;
@@ -307,7 +323,7 @@ export const createEditorPane = (host: EditorHost): EditorPane => {
       machine = { seq: machine.seq + 1, view: PaneViews.Closed() };
       statusChip.hidden = true;
     },
-    note,
+    empty,
     open,
     reload: async () => {
       const path = panePath(machine.view);
