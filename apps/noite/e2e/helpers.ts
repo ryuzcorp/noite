@@ -426,13 +426,13 @@ export const readInviteCode = async (page: Page): Promise<string> => {
       );
     }
 
-    // SAFETY: admin.server's adminCreateInvites answers the minted rows; only
-    // the first code is read.
+    // SAFETY: admin.server's adminCreateInvites answers the minted codes
+    // (`mintInvites` returns them as strings); only the first one is read.
     const created = (await mintedResponse.json()) as {
-      codes?: { code?: string }[];
+      codes?: string[];
     };
 
-    const mintedCode = created.codes?.[0]?.code ?? "";
+    const mintedCode = created.codes?.[0] ?? "";
 
     if (mintedCode === "") {
       throw new Error("adminCreateInvites answered no code");
