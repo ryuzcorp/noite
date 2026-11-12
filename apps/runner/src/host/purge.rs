@@ -507,6 +507,13 @@ pub async fn purge_slug(
                 .with_context(|| format!("remove {}", path.display()))?;
         }
     }
+    // `move_dir` parks a recreated source as `.<slug>.recreated-<ts>` next to
+    // its target when a rename is retried while the reconcile loop has already
+    // recreated the old state dir. Those trees are this slug's own salvage, so
+    // the wipe is the last place that can remove them; the exact prefix
+    // (`.<slug>.recreated-`) keeps a neighbouring slug untouched (`ab` vs
+    // `abc`).
+    remove_recreated_siblings(cfg, slug).await?;
     let local_ms = ms(local);
 
     // git/  — tip bundles + refs (source of truth for redeploy)
@@ -553,6 +560,48 @@ pub async fn purge_slug(
         "purged local + S3 app data"
     );
     Ok(Purged::Done)
+}
+
+/// Remove the `.<slug>.recreated-<ts>` salvage dirs `move_dir` leaves under
+/// the per-app trees. Matching is by exact prefix, leading dot included, so a
+/// slug that is a prefix of another (`ab` vs `abc`) never loses its data. The
+/// bare-repo trees name their entries `<slug>.git`, so their salvage dirs are
+/// `.<slug>.git.recreated-…`; `envs/` holds the per-environment durability and
+/// is swept the same way as the rest of the app's local data.
+async fn remove_recreated_siblings(cfg: &Config, slug: &str) -> anyhow::Result<()> {
+    let root = exec::work_root(cfg);
+    let plain = format!(".{slug}.recreated-");
+    let git = format!(".{slug}.git.recreated-");
+    for (tree, prefix) in [
+        ("repos", git.as_str()),
+        ("git-http", git.as_str()),
+        ("projects", plain.as_str()),
+        ("fleets", plain.as_str()),
+        ("builds", plain.as_str()),
+        ("cache", plain.as_str()),
+        ("envs", plain.as_str()),
+    ] {
+        let parent = root.join(tree);
+        let Ok(mut entries) = tokio::fs::read_dir(&parent).await else {
+            continue;
+        };
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else {
+                continue;
+            };
+            if !name.starts_with(prefix) {
+                continue;
+            }
+            let path = entry.path();
+            if entry.file_type().await.is_ok_and(|kind| kind.is_dir()) {
+                tokio::fs::remove_dir_all(&path)
+                    .await
+                    .with_context(|| format!("remove recreated rename dir {}", path.display()))?;
+            }
+        }
+    }
+    Ok(())
 }
 
 async fn clear_s3_prefix(
@@ -730,6 +779,160 @@ mod tests {
         .expect("purge");
         assert_eq!(ended, Purged::Stopped);
         let _ = std::fs::remove_dir_all(&cfg.work_dir);
+    }
+
+    /// A wipe removes the `.<slug>.recreated-<ts>` salvage dirs a rename's
+    /// `move_dir` leaves behind, and only for that exact slug: a neighbouring
+    /// slug that starts with the same text (`ab` vs `abc`) keeps its data.
+    #[tokio::test]
+    async fn a_purge_removes_only_this_slugs_recreated_dirs() {
+        let scratch = crate::testutil::TempDir::new("noite-purge-recreated");
+        let mut cfg = crate::config::config_for_tests();
+        cfg.work_dir = scratch.path().join("work").to_string_lossy().into_owned();
+        cfg.s3_endpoint = crate::testutil::spawn_s3_stub().await;
+        let root = crate::host::exec::work_root(&cfg);
+        // `repos/` and `git-http/` name their entries `<slug>.git`, so their
+        // salvage dirs carry the `.git` infix; the rest are plain.
+        for (tree, own, salvage, other, other_salvage) in [
+            (
+                "repos",
+                "ab.git",
+                ".ab.git.recreated-100",
+                "abc.git",
+                ".abc.git.recreated-100",
+            ),
+            (
+                "git-http",
+                "ab.git",
+                ".ab.git.recreated-100",
+                "abc.git",
+                ".abc.git.recreated-100",
+            ),
+            (
+                "projects",
+                "ab",
+                ".ab.recreated-100",
+                "abc",
+                ".abc.recreated-100",
+            ),
+            (
+                "fleets",
+                "ab",
+                ".ab.recreated-100",
+                "abc",
+                ".abc.recreated-100",
+            ),
+            (
+                "builds",
+                "ab",
+                ".ab.recreated-100",
+                "abc",
+                ".abc.recreated-100",
+            ),
+            (
+                "cache",
+                "ab",
+                ".ab.recreated-100",
+                "abc",
+                ".abc.recreated-100",
+            ),
+            (
+                "envs",
+                "ab",
+                ".ab.recreated-100",
+                "abc",
+                ".abc.recreated-100",
+            ),
+        ] {
+            for name in [own, salvage, other_salvage, other] {
+                let path = root.join(tree).join(name);
+                std::fs::create_dir_all(&path).expect("fixture dir");
+                std::fs::write(path.join("keep.json"), "{}").expect("fixture file");
+            }
+        }
+        let git_sync = ryuz_git::GitSync::default();
+        let _push = git_sync.lock("ab").await;
+        let ended = purge_slug(
+            &cfg,
+            &crate::host::supervisor::new_procs(),
+            &crate::host::logs::new_state(),
+            &git_sync,
+            "ab",
+            crate::host::supervisor::StopGrace::NORMAL,
+            None,
+            false,
+        )
+        .await
+        .expect("purge");
+        assert_eq!(ended, Purged::Done);
+        for (tree, own, salvage, other, other_salvage) in [
+            (
+                "repos",
+                "ab.git",
+                ".ab.git.recreated-100",
+                "abc.git",
+                ".abc.git.recreated-100",
+            ),
+            (
+                "git-http",
+                "ab.git",
+                ".ab.git.recreated-100",
+                "abc.git",
+                ".abc.git.recreated-100",
+            ),
+            (
+                "projects",
+                "ab",
+                ".ab.recreated-100",
+                "abc",
+                ".abc.recreated-100",
+            ),
+            (
+                "fleets",
+                "ab",
+                ".ab.recreated-100",
+                "abc",
+                ".abc.recreated-100",
+            ),
+            (
+                "builds",
+                "ab",
+                ".ab.recreated-100",
+                "abc",
+                ".abc.recreated-100",
+            ),
+            (
+                "cache",
+                "ab",
+                ".ab.recreated-100",
+                "abc",
+                ".abc.recreated-100",
+            ),
+            (
+                "envs",
+                "ab",
+                ".ab.recreated-100",
+                "abc",
+                ".abc.recreated-100",
+            ),
+        ] {
+            assert!(
+                !root.join(tree).join(salvage).exists(),
+                "{tree}: the slug's salvage dir is removed"
+            );
+            assert!(
+                !root.join(tree).join(own).exists(),
+                "{tree}: the slug's own dir is wiped"
+            );
+            assert!(
+                root.join(tree).join(other_salvage).exists(),
+                "{tree}: a longer slug's salvage dir is untouched"
+            );
+            assert!(
+                root.join(tree).join(other).exists(),
+                "{tree}: a longer slug's dir is untouched"
+            );
+        }
     }
 
     /// The delete path stops the app's fleets before it hands the wipe to the

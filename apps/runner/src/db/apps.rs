@@ -503,6 +503,39 @@ pub async fn rename_app_name(pool: &SqlitePool, id: &str, name: &str) -> sqlx::R
     Ok(())
 }
 
+/// Update only the slug-derived columns. A slug move that was not asked to
+/// change the name must never write it: a name-only rename can commit while
+/// the move runs (it needs no deploy claim), and carrying the name read before
+/// the move back over that write would undo it (review finding, 2026-11-12).
+pub async fn rename_app_slug(
+    pool: &SqlitePool,
+    id: &str,
+    slug: &str,
+    subdomain: &str,
+    git_prefix: &str,
+    fleet_bucket: &str,
+) -> sqlx::Result<()> {
+    // Same mint fence as `rename_app`: a key minted for the old prefix must
+    // not land after this write.
+    let _fence = super::mutate_fence().await;
+    let done = sqlx::query(
+        r#"UPDATE app SET slug = ?, subdomain = ?, git_prefix = ?,
+           fleet_bucket = ?, updated_at = ? WHERE id = ?"#,
+    )
+    .bind(slug)
+    .bind(subdomain)
+    .bind(git_prefix)
+    .bind(fleet_bucket)
+    .bind(now_iso())
+    .bind(id)
+    .execute(pool)
+    .await?;
+    if done.rows_affected() == 0 {
+        return Err(sqlx::Error::RowNotFound);
+    }
+    Ok(())
+}
+
 /// Rewrite app subdomains whose base is a local domain other than the
 /// configured one. The slug is identity and the subdomain is derived
 /// (`{slug}.{base}`), so a dev install that moved from `localhost` to
@@ -1106,6 +1139,36 @@ mod tests {
         let app = get_app(&pool, "a1").await.expect("read").expect("row");
         assert_eq!(app.name, "Renamed");
         assert_eq!(app.slug, "new", "a name write must not revert the slug");
+        assert_eq!(app.subdomain, "new.localhost");
+        assert_eq!(app.git_prefix, "git/new/");
+        assert_eq!(app.fleet_bucket, "s3://noite/fleets/new");
+    }
+
+    /// The mirror image: a slug move that was not asked to rename the app must
+    /// not write the name, or a name-only rename that committed after the move
+    /// read the row would be undone by the move's row write (review finding,
+    /// 2026-11-12).
+    #[tokio::test]
+    async fn a_slug_only_write_leaves_a_newer_name_alone() {
+        let pool = connect("sqlite::memory:").await.expect("memory db");
+        insert_app(&pool, "a1", "old", "old.localhost").await;
+        // The name write commits while the slug move is under way.
+        rename_app_name(&pool, "a1", "Renamed")
+            .await
+            .expect("name write");
+        rename_app_slug(
+            &pool,
+            "a1",
+            "new",
+            "new.localhost",
+            "git/new/",
+            "s3://noite/fleets/new",
+        )
+        .await
+        .expect("slug write");
+        let app = get_app(&pool, "a1").await.expect("read").expect("row");
+        assert_eq!(app.name, "Renamed", "a slug write must not revert the name");
+        assert_eq!(app.slug, "new");
         assert_eq!(app.subdomain, "new.localhost");
         assert_eq!(app.git_prefix, "git/new/");
         assert_eq!(app.fleet_bucket, "s3://noite/fleets/new");

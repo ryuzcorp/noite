@@ -194,12 +194,36 @@ async fn create_inner(
     }
     // An unfinished rename reserves this slug: its target prefix may hold the
     // only copy of the app's moved objects, so wiping it here would destroy
-    // them. Refuse instead; the rename resumes on its own (the loop's slow
-    // tick) or on the client's retry.
+    // them. Refuse with a distinct conflict that names the way out — the
+    // owner's own app can retry that rename or cancel it, another account's
+    // marker is simply not theirs to resolve.
     if crate::host::rename::target_reserved(&state.config, slug).await {
-        return Err(ApiError::conflict(format!(
-            "create {slug}: the slug is still being renamed; retry shortly"
-        )));
+        let label = match crate::host::rename::reserved_target(&state.config, slug).await {
+            Some(marker) => {
+                let owner = user_id
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .unwrap_or("local");
+                let own_app = owner != "local"
+                    && db::get_app(&state.pool, &marker.app_id)
+                        .await
+                        .ok()
+                        .flatten()
+                        .is_some_and(|app| app.user_id == owner);
+                if own_app {
+                    format!(
+                        "this app has an unfinished rename to {slug}; retry it or rename back to {} to cancel",
+                        marker.from
+                    )
+                } else {
+                    "the slug is reserved by an unfinished rename of another app".to_string()
+                }
+            }
+            // The file reserves the slug even when it cannot be read; the
+            // resume pass removes a truly malformed marker.
+            None => "the slug is reserved by an unfinished rename of another app".to_string(),
+        };
+        return Err(ApiError::conflict(label));
     }
     // Always wipe leftover S3/local data for this slug before the new row lands
     // — safe now: no row exists for it (checked just above, under this guard).
@@ -495,9 +519,12 @@ async fn rename_inner(
             let msg = format!("{e:#}");
             if msg.contains("deploy in flight") {
                 Err(ApiError::conflict(msg))
-            } else if msg.contains("another rename of this app is pending") {
-                // An unfinished move to a different target still owns what it
-                // may have moved there; retry once it resolves.
+            } else if msg.contains("reserved by an unfinished rename")
+                || msg.contains("has an unfinished rename")
+                || msg.contains("the pending rename")
+            {
+                // A reserved target (or this app's own unfinished move) is a
+                // conflict the client resolves by retrying or cancelling.
                 Err(ApiError::conflict(msg))
             } else if msg.contains("invalid slug") || msg.contains("app not found") {
                 Err(ApiError::bad(msg))
@@ -1757,12 +1784,20 @@ mod tests {
         .await
         .expect("failed attempt marker");
 
-        let refused = create(&state, "B", "ab-target", Some("u1"), None)
+        let refused = create(&state, "B", "ab-target", Some("u2"), None)
             .await
             .expect_err("a reserved target is not available");
         assert!(
-            matches!(&refused, ApiError::Conflict(message) if message.contains("being renamed")),
-            "the create is a retryable conflict, got {refused:?}"
+            matches!(&refused, ApiError::Conflict(message) if message.contains("reserved by an unfinished rename of another app")),
+            "the create is a distinct conflict, got {refused:?}"
+        );
+        // The owner's own create names the app and the way out.
+        let own = create(&state, "B", "ab-target", Some("u1"), None)
+            .await
+            .expect_err("the owner's create still cannot take the reserved slug");
+        assert!(
+            matches!(&own, ApiError::Conflict(message) if message.contains("has an unfinished rename to ab-target") && message.contains("rename back to ab-old to cancel")),
+            "the owner gets the actionable conflict, got {own:?}"
         );
 
         // The rename's own retry is allowed and resolves the reservation.
@@ -1835,6 +1870,398 @@ mod tests {
         drop(dir);
     }
 
+    /// The automatic resume is bounded: the twelfth failed pass records the
+    /// class and a stuck app event, and later passes leave the marker (and the
+    /// reservation it carries) alone until the owner retries or cancels.
+    #[tokio::test]
+    async fn a_stuck_rename_stops_auto_resuming_and_records_an_event() {
+        let (state, dir) = test_state(10).await;
+        let app = db::create_app(
+            &state.pool,
+            &state.config,
+            db::NewApp {
+                name: "Stuck",
+                slug: "st-old",
+                user_id: "u1",
+                subdomain: "st-old.localhost",
+                listen: 30640,
+                internal: 30641,
+            },
+        )
+        .await
+        .expect("app row");
+        // Someone took the target after the failed attempt: every resume pass
+        // fails the same way without moving anything.
+        db::create_app(
+            &state.pool,
+            &state.config,
+            db::NewApp {
+                name: "Taker",
+                slug: "st-new",
+                user_id: "u2",
+                subdomain: "st-new.localhost",
+                listen: 30642,
+                internal: 30643,
+            },
+        )
+        .await
+        .expect("competing row");
+        crate::host::rename::write_rename_marker_with_attempts_for_test(
+            &state.config,
+            &app.id,
+            "st-old",
+            "st-new",
+            11,
+            "slug already taken",
+        )
+        .await
+        .expect("stuck marker");
+
+        let resumed = crate::host::rename::resume_pending_renames(
+            &state.config,
+            &state.pool,
+            &state.procs,
+            &state.logs,
+            &state.deploying,
+            state.wal.sync(),
+        )
+        .await;
+        assert_eq!(resumed, 0, "the pass failed, so nothing was resumed");
+
+        let marker = crate::host::rename::pending_renames(&state.config)
+            .await
+            .into_iter()
+            .find(|marker| marker.to == "st-new")
+            .expect("the marker survives its failed pass");
+        assert_eq!(marker.attempts, 12, "the twelfth failure is recorded");
+        assert_eq!(marker.last_failure.as_deref(), Some("slug already taken"));
+        assert!(marker.last_attempt_at.is_some());
+
+        let events = db::list_app_events(&state.pool, &app.id, Some("rename"), 10)
+            .await
+            .expect("events");
+        assert_eq!(events.len(), 1, "one stuck event, at the bound");
+        assert_eq!(events[0].event, "rename stuck");
+        assert_eq!(
+            events[0].description,
+            "rename to st-new is stuck: slug already taken; retry the rename or rename back to st-old to cancel"
+        );
+
+        // At the bound the pass is skipped entirely: no new attempt, no event.
+        crate::host::rename::resume_pending_renames(
+            &state.config,
+            &state.pool,
+            &state.procs,
+            &state.logs,
+            &state.deploying,
+            state.wal.sync(),
+        )
+        .await;
+        let marker = crate::host::rename::pending_renames(&state.config)
+            .await
+            .into_iter()
+            .find(|marker| marker.to == "st-new")
+            .expect("the stuck marker is still there");
+        assert_eq!(marker.attempts, 12, "a stuck marker is not retried");
+        assert!(crate::host::rename::target_reserved(&state.config, "st-new").await);
+        assert_eq!(
+            db::list_app_events(&state.pool, &app.id, Some("rename"), 10)
+                .await
+                .expect("events")
+                .len(),
+            1
+        );
+        drop(dir);
+    }
+
+    /// A manual retry of the pending target is the owner's fresh decision: it
+    /// resets the failed-pass count (and so the automatic bound) even when the
+    /// retry itself cannot finish.
+    #[tokio::test]
+    async fn a_manual_retry_resets_the_failed_pass_count() {
+        // A store that refuses the move, so the manual retry fails after the
+        // reset instead of committing the rename.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind dead s3");
+        let dead = listener.local_addr().expect("addr");
+        drop(listener);
+        let (state, dir) = test_state_with_s3(10, format!("http://{dead}")).await;
+        let app = db::create_app(
+            &state.pool,
+            &state.config,
+            db::NewApp {
+                name: "Retry",
+                slug: "mr-old",
+                user_id: "u1",
+                subdomain: "mr-old.localhost",
+                listen: 30644,
+                internal: 30645,
+            },
+        )
+        .await
+        .expect("app row");
+        crate::host::rename::write_rename_marker_with_attempts_for_test(
+            &state.config,
+            &app.id,
+            "mr-old",
+            "mr-new",
+            12,
+            "storage move failed",
+        )
+        .await
+        .expect("stuck marker");
+
+        let failed = rename(&state, &app.id, None, Some("mr-new"))
+            .await
+            .expect_err("the dead store fails the move");
+        assert!(
+            matches!(&failed, ApiError::Internal(message) if message.contains("could not move the app")),
+            "the retry did attempt the move, got {failed:?}"
+        );
+        let marker = crate::host::rename::pending_renames(&state.config)
+            .await
+            .into_iter()
+            .find(|marker| marker.to == "mr-new")
+            .expect("marker");
+        assert_eq!(marker.attempts, 0, "a manual retry resets the bound");
+        assert!(marker.last_failure.is_none());
+        let row = db::get_app(&state.pool, &app.id)
+            .await
+            .expect("read")
+            .expect("row");
+        assert_eq!(row.slug, "mr-old", "the failed retry moved no row");
+        drop(dir);
+    }
+
+    /// Renaming back to the marker's source cancels the unfinished move: the
+    /// data the attempt moved to the target comes home, the marker goes, and
+    /// the target is free for another app. The app keeps its slug.
+    #[tokio::test]
+    async fn a_rename_back_to_the_source_cancels_the_pending_move() {
+        let (state, dir) = test_state(10).await;
+        let app = db::create_app(
+            &state.pool,
+            &state.config,
+            db::NewApp {
+                name: "Cancelled",
+                slug: "cx-old",
+                user_id: "u1",
+                subdomain: "cx-old.localhost",
+                listen: 30648,
+                internal: 30649,
+            },
+        )
+        .await
+        .expect("app row");
+        crate::host::rename::write_rename_marker_with_attempts_for_test(
+            &state.config,
+            &app.id,
+            "cx-old",
+            "cx-new",
+            12,
+            "storage move failed",
+        )
+        .await
+        .expect("stuck marker");
+        // The failed attempt got as far as moving the app's fleet state.
+        let root = crate::host::exec::work_root(&state.config);
+        let moved = root.join("fleets").join("cx-new");
+        std::fs::create_dir_all(&moved).expect("moved target dir");
+        std::fs::write(moved.join("object.bin"), "moved").expect("moved object");
+
+        let cancelled = rename(&state, &app.id, None, Some("cx-old"))
+            .await
+            .expect("a rename back to the source cancels");
+        assert_eq!(cancelled.slug, "cx-old", "the app keeps its slug");
+        assert!(
+            !crate::host::rename::target_reserved(&state.config, "cx-new").await,
+            "the marker is dropped"
+        );
+        assert!(
+            root.join("fleets")
+                .join("cx-old")
+                .join("object.bin")
+                .exists(),
+            "the moved data is back under the app's slug"
+        );
+        assert!(!moved.exists(), "the target no longer holds the moved data");
+
+        create(&state, "Sz", "cx-new", Some("u2"), None)
+            .await
+            .expect("the cancelled target is free for another app");
+        drop(dir);
+    }
+
+    /// A cancel interrupted mid-flight leaves a `cancelling` marker; the resume
+    /// pass must finish that cancel (move the data back, free the target) and
+    /// never complete the forward rename.
+    #[tokio::test]
+    async fn an_interrupted_cancel_resumes_as_a_cancel() {
+        let (state, dir) = test_state(10).await;
+        let app = db::create_app(
+            &state.pool,
+            &state.config,
+            db::NewApp {
+                name: "Interrupted",
+                slug: "ic-old",
+                user_id: "u1",
+                subdomain: "ic-old.localhost",
+                listen: 30654,
+                internal: 30655,
+            },
+        )
+        .await
+        .expect("app row");
+        crate::host::rename::write_cancelling_marker_for_test(
+            &state.config,
+            &app.id,
+            "ic-old",
+            "ic-new",
+        )
+        .await
+        .expect("cancelling marker");
+        let root = crate::host::exec::work_root(&state.config);
+        let moved = root.join("fleets").join("ic-new");
+        std::fs::create_dir_all(&moved).expect("moved target dir");
+        std::fs::write(moved.join("object.bin"), "moved").expect("moved object");
+
+        let resumed = crate::host::rename::resume_pending_renames(
+            &state.config,
+            &state.pool,
+            &state.procs,
+            &state.logs,
+            &state.deploying,
+            state.wal.sync(),
+        )
+        .await;
+
+        assert_eq!(resumed, 1, "the cancel was finished, not skipped");
+        let row = db::get_app(&state.pool, &app.id)
+            .await
+            .expect("read")
+            .expect("row");
+        assert_eq!(row.slug, "ic-old", "a cancel never moves forward");
+        assert!(
+            root.join("fleets")
+                .join("ic-old")
+                .join("object.bin")
+                .exists(),
+            "the moved data is back under the app's slug"
+        );
+        assert!(!moved.exists());
+        assert!(
+            !crate::host::rename::target_reserved(&state.config, "ic-new").await,
+            "the cancelled target is free"
+        );
+        drop(dir);
+    }
+
+    /// A rename off a slug takes the app's `move_dir` salvage trees along: the
+    /// next create of the old slug wipes only that slug's names, never the
+    /// app's parked data under the new one.
+    #[tokio::test]
+    async fn a_rename_carries_the_salvage_dirs_to_the_new_slug() {
+        let (state, dir) = test_state(10).await;
+        let app = create(&state, "Salvage", "sv-old", Some("u1"), None)
+            .await
+            .expect("create");
+        let root = crate::host::exec::work_root(&state.config);
+        let parked = root.join("fleets").join(".sv-old.recreated-100");
+        std::fs::create_dir_all(&parked).expect("salvage dir");
+        std::fs::write(parked.join("keep.json"), "{}").expect("salvage file");
+
+        rename(&state, &app.id, None, Some("sv-new"))
+            .await
+            .expect("rename");
+        assert!(!parked.exists(), "the old slug's salvage name is gone");
+        let moved = root.join("fleets").join(".sv-new.recreated-100");
+        assert!(
+            moved.join("keep.json").exists(),
+            "the salvage travelled with the app"
+        );
+
+        // A third app re-creates the old slug; its wipe must not reach the
+        // renamed app's salvage under the new slug.
+        create(&state, "Next", "sv-old", Some("u2"), None)
+            .await
+            .expect("re-create the old slug");
+        assert!(
+            moved.join("keep.json").exists(),
+            "the new tenant's purge leaves the renamed app's salvage alone"
+        );
+        drop(dir);
+    }
+
+    /// The marker is not an ownership proof: a cancel must refuse a target a
+    /// row owns again (a re-create or a stale marker) instead of stopping that
+    /// tenant's fleet and moving its data into the cancelling app.
+    #[tokio::test]
+    async fn a_cancel_never_moves_a_target_that_a_row_owns_again() {
+        let (state, dir) = test_state(10).await;
+        let app = db::create_app(
+            &state.pool,
+            &state.config,
+            db::NewApp {
+                name: "Canceller",
+                slug: "co-old",
+                user_id: "u1",
+                subdomain: "co-old.localhost",
+                listen: 30650,
+                internal: 30651,
+            },
+        )
+        .await
+        .expect("app row");
+        crate::host::rename::write_rename_marker_with_attempts_for_test(
+            &state.config,
+            &app.id,
+            "co-old",
+            "co-new",
+            3,
+            "storage move failed",
+        )
+        .await
+        .expect("pending marker");
+        // Another app now owns the target (a row inserted before the marker
+        // could be resolved, as an upgrade or a direct insert can leave it).
+        db::create_app(
+            &state.pool,
+            &state.config,
+            db::NewApp {
+                name: "Owner",
+                slug: "co-new",
+                user_id: "u2",
+                subdomain: "co-new.localhost",
+                listen: 30652,
+                internal: 30653,
+            },
+        )
+        .await
+        .expect("owner row");
+        let root = crate::host::exec::work_root(&state.config);
+        let theirs = root.join("fleets").join("co-new");
+        std::fs::create_dir_all(&theirs).expect("owner dir");
+        std::fs::write(theirs.join("their.bin"), "theirs").expect("owner file");
+
+        let refused = rename(&state, &app.id, None, Some("co-old"))
+            .await
+            .expect_err("the target has an owner now");
+        assert!(
+            matches!(&refused, ApiError::Conflict(message) if message.contains("slug already taken")),
+            "the cancel refuses a re-owned target, got {refused:?}"
+        );
+        assert!(
+            theirs.join("their.bin").exists(),
+            "the owner's data is untouched"
+        );
+        assert!(
+            crate::host::rename::target_reserved(&state.config, "co-new").await,
+            "the marker is left for the resume pass to resolve"
+        );
+        drop(dir);
+    }
+
     /// A pending rename to one target blocks a rename to another: the earlier
     /// attempt may already have moved objects there, and committing a
     /// different target would clear its marker and leave them owned by
@@ -1870,8 +2297,8 @@ mod tests {
             .await
             .expect_err("a different target is blocked by the pending move");
         assert!(
-            matches!(&refused, ApiError::Conflict(message) if message.contains("pending")),
-            "the refusal is a retryable conflict, got {refused:?}"
+            matches!(&refused, ApiError::Conflict(message) if message.contains("unfinished rename to rn-new")),
+            "the refusal names the pending move, got {refused:?}"
         );
         let row = db::get_app(&state.pool, &app.id)
             .await
@@ -1945,8 +2372,8 @@ mod tests {
             .await
             .expect_err("the target stays reserved until it is wiped");
         assert!(
-            matches!(&refused, ApiError::Conflict(message) if message.contains("being renamed")),
-            "the create is a retryable conflict, got {refused:?}"
+            matches!(&refused, ApiError::Conflict(message) if message.contains("reserved by an unfinished rename of another app")),
+            "the create names the reservation, got {refused:?}"
         );
 
         let resumed = crate::host::rename::resume_pending_renames(
