@@ -480,6 +480,22 @@ pub async fn rename_app(
     Ok(())
 }
 
+/// Update only the display name. A rename that changes no slug must never
+/// write the whole row from a row read earlier: a concurrent slug rename that
+/// landed in between would be reverted to the stale slug/prefix.
+pub async fn rename_app_name(pool: &SqlitePool, id: &str, name: &str) -> sqlx::Result<()> {
+    let done = sqlx::query("UPDATE app SET name = ?, updated_at = ? WHERE id = ?")
+        .bind(name)
+        .bind(now_iso())
+        .bind(id)
+        .execute(pool)
+        .await?;
+    if done.rows_affected() == 0 {
+        return Err(sqlx::Error::RowNotFound);
+    }
+    Ok(())
+}
+
 /// Rewrite app subdomains whose base is a local domain other than the
 /// configured one. The slug is identity and the subdomain is derived
 /// (`{slug}.{base}`), so a dev install that moved from `localhost` to
@@ -995,5 +1011,34 @@ mod tests {
             .await
             .expect_err("missing table");
         assert!(!rival_won(&missing), "other failures are not rival wins");
+    }
+
+    /// A name-only write must not carry a stale slug/prefix back: a concurrent
+    /// slug rename that commits after the caller read the row has to survive.
+    #[tokio::test]
+    async fn a_name_only_update_leaves_the_slug_and_prefix_alone() {
+        let pool = connect("sqlite::memory:").await.expect("memory db");
+        insert_app(&pool, "a1", "old", "old.localhost").await;
+        // Another rename commits after the caller read the row.
+        rename_app(
+            &pool,
+            "a1",
+            "old",
+            "new",
+            "new.localhost",
+            "git/new/",
+            "s3://noite/fleets/new",
+        )
+        .await
+        .expect("slug rename");
+        rename_app_name(&pool, "a1", "Renamed")
+            .await
+            .expect("name write");
+        let app = get_app(&pool, "a1").await.expect("read").expect("row");
+        assert_eq!(app.name, "Renamed");
+        assert_eq!(app.slug, "new", "a name write must not revert the slug");
+        assert_eq!(app.subdomain, "new.localhost");
+        assert_eq!(app.git_prefix, "git/new/");
+        assert_eq!(app.fleet_bucket, "s3://noite/fleets/new");
     }
 }

@@ -183,11 +183,19 @@ pub(crate) async fn write_rename_marker_for_test(
     write_rename_marker(cfg, app_id, from, to).await
 }
 
-/// Drop a finished (or no-longer-relevant) marker. A leftover marker is safe —
-/// it names an app/slug pair, and only that pair's own rename resumes on it —
-/// so a failure here is not worth failing the rename for.
+/// Drop a finished (or no-longer-relevant) marker. A failure here is not
+/// worth failing the rename for: the caller always has a much worse outcome
+/// to report if it matters.
 async fn clear_rename_marker(cfg: &Config, target: &str) {
     let _ = tokio::fs::remove_file(rename_marker(cfg, target)).await;
+}
+
+/// Forget the failed-rename marker for `target`. Called on every ownership
+/// change of the target slug (create, delete, a resumed purge): the attempt it
+/// recorded no longer owns anything under that slug, and a later retry must
+/// wipe the target instead of adopting the new owner's leftovers.
+pub(crate) async fn forget_target_marker(cfg: &Config, target: &str) {
+    clear_rename_marker(cfg, target).await;
 }
 
 // Nine params thread the rename through every subsystem (db, fleets, git,
@@ -210,16 +218,10 @@ pub async fn rename_app(
     let new_name = name.unwrap_or(&app.name);
     let new_slug = slug.unwrap_or(&app.slug);
     if new_slug == app.slug {
-        db::rename_app(
-            pool,
-            app_id,
-            new_name,
-            &app.slug,
-            &app.subdomain,
-            &app.git_prefix,
-            &app.fleet_bucket,
-        )
-        .await?;
+        // Name only: write just the name. Writing the whole row from this
+        // read would carry a stale slug/prefix back over a concurrent slug
+        // rename that committed in between (review finding, 2026-11-12).
+        db::rename_app_name(pool, app_id, new_name).await?;
         return db::get_app(pool, app_id)
             .await?
             .ok_or_else(|| anyhow::anyhow!("app not found"));
@@ -241,6 +243,12 @@ pub async fn rename_app(
     let app = db::get_app(pool, app_id)
         .await?
         .ok_or_else(|| anyhow::anyhow!("app not found"))?;
+    // Derive the target from the *fresh* row: a request that named no slug is
+    // a name-only rename even if a concurrent rename moved the row while this
+    // one waited on the claim. Using the pre-claim slug here would move the
+    // app back to it (review finding, 2026-11-12).
+    let new_name = name.unwrap_or(&app.name);
+    let new_slug = slug.unwrap_or(&app.slug);
     // The caller's requested slug is now the app's slug: a name-only write,
     // no move (the same branch the read above takes when nothing changed).
     if new_slug == app.slug {
@@ -264,7 +272,6 @@ pub async fn rename_app(
             .await?
             .ok_or_else(|| anyhow::anyhow!("app not found"));
     }
-    let new_name = name.unwrap_or(&app.name);
     // A background wipe of a just-deleted app on the target slug is a chore
     // with no owner: ask it to yield before we queue on its guard, exactly like
     // create does. Whatever it leaves behind is wiped below, under the guard.

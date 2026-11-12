@@ -192,6 +192,10 @@ async fn create_inner(
             return Err(ApiError::internal(format!("create {slug}: {step}")));
         }
     }
+    // This create takes the slug from here on: drop any failed-rename marker
+    // for it *before* the wipe, so even a failed/aborted purge cannot leave a
+    // stale marker that lets a later retry adopt what the wipe was removing.
+    crate::host::rename::forget_target_marker(&state.config, slug).await;
     // Always wipe leftover S3/local data for this slug before the new row lands
     // — safe now: no row exists for it (checked just above, under this guard).
     // Callers of `purge_slug` hold the slug's push guard (see its docs); the
@@ -768,6 +772,11 @@ async fn delete_inner(state: &AppState, id: &str) -> Result<(), ApiError> {
     // wait for the wipe. `delete_app` writes the purge tombstone and marks the
     // app's scoped keys `revoking` in the same transaction, so nothing below
     // can be lost (and no old key outlives the freed slug) if this task dies.
+    // The slug is about to lose its owner: a failed-rename marker that named
+    // it belongs to an attempt that has no claim here. Forget it *before* the
+    // row goes, so a crash right after the delete cannot leave a stale marker
+    // over the freed slug (a later retry would skip the wipe).
+    crate::host::rename::forget_target_marker(&state.config, &app.slug).await;
     let delete_result = db::delete_app(&state.pool, id).await;
     delete_result.map_err(|e| {
         let step = step_failure("could not remove the app row", &e.to_string());
@@ -777,7 +786,9 @@ async fn delete_inner(state: &AppState, id: &str) -> Result<(), ApiError> {
     // can still have started the fleet again; with the row gone nothing else
     // would stop it. Stop it while the push guard is still ours: releasing
     // the slug first would let a new app with the same slug spawn, and this
-    // late stop would kill *its* fleet.
+    // late stop would kill *its* fleet. A fleet killed here counts for the
+    // wipe's settle wait too.
+    let had_fleet = had_fleet || supervisor::any_fleet(&state.procs, &app.slug).await;
     supervisor::stop_fleet(&state.procs, &app.slug, supervisor::StopGrace::FOR_DELETE).await;
     // Register the background wipe *before* the slug is released, so a create
     // that wins the guard next can ask it to stop (`purge::stop`) instead of
@@ -1664,6 +1675,61 @@ mod tests {
         );
         // (The stub does not model the copy/delete round-trip; the surviving
         // target object above is the observable the retry must preserve.)
+        drop(dir);
+    }
+
+    /// The marker of a failed rename must not survive a change of owner of the
+    /// target slug. A stale marker would let a later retry skip the leftover
+    /// wipe and adopt the new owner's objects, and it would also skip clearing
+    /// the new owner's purge tombstone.
+    #[tokio::test]
+    async fn a_stale_rename_marker_does_not_survive_a_new_owner_of_the_target() {
+        let (state, dir) = test_state(10).await;
+        let a = db::create_app(
+            &state.pool,
+            &state.config,
+            db::NewApp {
+                name: "A",
+                slug: "ab-old",
+                user_id: "u1",
+                subdomain: "ab-old.localhost",
+                listen: 30630,
+                internal: 30631,
+            },
+        )
+        .await
+        .expect("app A");
+        // A's first attempt at ab-old → ab-target failed and left its marker.
+        crate::host::rename::write_rename_marker_for_test(
+            &state.config,
+            &a.id,
+            "ab-old",
+            "ab-target",
+        )
+        .await
+        .expect("failed attempt marker");
+        // B then took the target through the real create path, which wipes the
+        // target and must invalidate A's marker, and was deleted, leaving an
+        // empty prefix and its tombstone.
+        let b = create(&state, "B", "ab-target", Some("u1"), None)
+            .await
+            .expect("create B");
+        db::delete_app(&state.pool, &b.id)
+            .await
+            .expect("delete B row");
+
+        let renamed = rename(&state, &a.id, None, Some("ab-target"))
+            .await
+            .expect("retry A's rename");
+
+        assert_eq!(renamed.slug, "ab-target");
+        assert!(
+            db::pending_purges(&state.pool)
+                .await
+                .expect("tombstones")
+                .is_empty(),
+            "the retry's authoritative wipe satisfies B's tombstone; a stale marker would skip it"
+        );
         drop(dir);
     }
 

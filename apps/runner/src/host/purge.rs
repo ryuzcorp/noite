@@ -230,13 +230,19 @@ pub async fn resume_pending(
             Err(e) => Err(e.into()),
         };
         match satisfied {
-            Ok(true) => match crate::db::clear_app_purges(pool, &slug).await {
-                Ok(_) => report.cleared += 1,
-                Err(e) => {
-                    tracing::warn!(slug, error = %e, "pending purge wiped the slug but could not clear its tombstone");
-                    report.failed += 1;
+            Ok(true) => {
+                match crate::db::clear_app_purges(pool, &slug).await {
+                    Ok(_) => report.cleared += 1,
+                    Err(e) => {
+                        tracing::warn!(slug, error = %e, "pending purge wiped the slug but could not clear its tombstone");
+                        report.failed += 1;
+                    }
                 }
-            },
+                // The resume pass wiped the target (or a new owner did): a
+                // failed-rename marker for it no longer describes anything a
+                // retry may resume onto.
+                crate::host::rename::forget_target_marker(cfg, &slug).await;
+            }
             Ok(false) => {}
             Err(e) => {
                 tracing::warn!(slug, error = %format!("{e:#}"), "pending purge failed; retrying on a later pass");
