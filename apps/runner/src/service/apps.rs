@@ -2093,6 +2093,106 @@ mod tests {
         drop(dir);
     }
 
+    /// A cancel interrupted mid-flight leaves a `cancelling` marker; the resume
+    /// pass must finish that cancel (move the data back, free the target) and
+    /// never complete the forward rename.
+    #[tokio::test]
+    async fn an_interrupted_cancel_resumes_as_a_cancel() {
+        let (state, dir) = test_state(10).await;
+        let app = db::create_app(
+            &state.pool,
+            &state.config,
+            db::NewApp {
+                name: "Interrupted",
+                slug: "ic-old",
+                user_id: "u1",
+                subdomain: "ic-old.localhost",
+                listen: 30654,
+                internal: 30655,
+            },
+        )
+        .await
+        .expect("app row");
+        crate::host::rename::write_cancelling_marker_for_test(
+            &state.config,
+            &app.id,
+            "ic-old",
+            "ic-new",
+        )
+        .await
+        .expect("cancelling marker");
+        let root = crate::host::exec::work_root(&state.config);
+        let moved = root.join("fleets").join("ic-new");
+        std::fs::create_dir_all(&moved).expect("moved target dir");
+        std::fs::write(moved.join("object.bin"), "moved").expect("moved object");
+
+        let resumed = crate::host::rename::resume_pending_renames(
+            &state.config,
+            &state.pool,
+            &state.procs,
+            &state.logs,
+            &state.deploying,
+            state.wal.sync(),
+        )
+        .await;
+
+        assert_eq!(resumed, 1, "the cancel was finished, not skipped");
+        let row = db::get_app(&state.pool, &app.id)
+            .await
+            .expect("read")
+            .expect("row");
+        assert_eq!(row.slug, "ic-old", "a cancel never moves forward");
+        assert!(
+            root.join("fleets")
+                .join("ic-old")
+                .join("object.bin")
+                .exists(),
+            "the moved data is back under the app's slug"
+        );
+        assert!(!moved.exists());
+        assert!(
+            !crate::host::rename::target_reserved(&state.config, "ic-new").await,
+            "the cancelled target is free"
+        );
+        drop(dir);
+    }
+
+    /// A rename off a slug takes the app's `move_dir` salvage trees along: the
+    /// next create of the old slug wipes only that slug's names, never the
+    /// app's parked data under the new one.
+    #[tokio::test]
+    async fn a_rename_carries_the_salvage_dirs_to_the_new_slug() {
+        let (state, dir) = test_state(10).await;
+        let app = create(&state, "Salvage", "sv-old", Some("u1"), None)
+            .await
+            .expect("create");
+        let root = crate::host::exec::work_root(&state.config);
+        let parked = root.join("fleets").join(".sv-old.recreated-100");
+        std::fs::create_dir_all(&parked).expect("salvage dir");
+        std::fs::write(parked.join("keep.json"), "{}").expect("salvage file");
+
+        rename(&state, &app.id, None, Some("sv-new"))
+            .await
+            .expect("rename");
+        assert!(!parked.exists(), "the old slug's salvage name is gone");
+        let moved = root.join("fleets").join(".sv-new.recreated-100");
+        assert!(
+            moved.join("keep.json").exists(),
+            "the salvage travelled with the app"
+        );
+
+        // A third app re-creates the old slug; its wipe must not reach the
+        // renamed app's salvage under the new slug.
+        create(&state, "Next", "sv-old", Some("u2"), None)
+            .await
+            .expect("re-create the old slug");
+        assert!(
+            moved.join("keep.json").exists(),
+            "the new tenant's purge leaves the renamed app's salvage alone"
+        );
+        drop(dir);
+    }
+
     /// The marker is not an ownership proof: a cancel must refuse a target a
     /// row owns again (a re-create or a stale marker) instead of stopping that
     /// tenant's fleet and moving its data into the cancelling app.

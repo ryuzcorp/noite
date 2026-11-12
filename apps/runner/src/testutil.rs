@@ -133,6 +133,187 @@ pub async fn spawn_s3_stub_recording() -> (String, std::sync::Arc<std::sync::Mut
     (format!("http://{addr}"), seen)
 }
 
+/// A tiny stateful S3 stand-in for tests that must observe real objects:
+/// LIST returns every stored key under the requested prefix, GET returns the
+/// body (`404 NoSuchKey` when missing), PUT stores the body, DELETE removes the
+/// key and HEAD answers `200`/`404`. Only the operations rename/purge use are
+/// covered; the map is keyed by object key and shared with the test.
+pub async fn spawn_stateful_s3_stub() -> (
+    String,
+    std::sync::Arc<std::sync::Mutex<std::collections::BTreeMap<String, String>>>,
+) {
+    use std::collections::BTreeMap;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    fn percent_decode(value: &str) -> String {
+        let bytes = value.as_bytes();
+        let mut out = Vec::with_capacity(bytes.len());
+        let mut index = 0;
+        while index < bytes.len() {
+            match bytes[index] {
+                b'%' if index + 2 < bytes.len() => {
+                    let hex = std::str::from_utf8(&bytes[index + 1..index + 3]).ok();
+                    if let Some(byte) = hex.and_then(|hex| u8::from_str_radix(hex, 16).ok()) {
+                        out.push(byte);
+                        index += 3;
+                        continue;
+                    }
+                    out.push(bytes[index]);
+                    index += 1;
+                }
+                byte => {
+                    out.push(byte);
+                    index += 1;
+                }
+            }
+        }
+        String::from_utf8_lossy(&out).into_owned()
+    }
+
+    fn query_param(query: &str, name: &str) -> Option<String> {
+        query.split('&').find_map(|pair| {
+            let (key, value) = pair.split_once('=')?;
+            (key == name).then(|| percent_decode(value))
+        })
+    }
+
+    async fn read_request(sock: &mut tokio::net::TcpStream) -> Vec<u8> {
+        let mut buf = Vec::new();
+        let mut chunk = [0_u8; 4096];
+        loop {
+            let read = sock.read(&mut chunk).await.unwrap_or(0);
+            if read == 0 {
+                return buf;
+            }
+            buf.extend_from_slice(&chunk[..read]);
+            let Some(head) = buf.windows(4).position(|window| window == b"\r\n\r\n") else {
+                continue;
+            };
+            let header_end = head + 4;
+            let headers = String::from_utf8_lossy(&buf[..header_end]).to_lowercase();
+            let length = headers
+                .lines()
+                .find_map(|line| line.strip_prefix("content-length:"))
+                .and_then(|value| value.trim().parse::<usize>().ok())
+                .unwrap_or(0);
+            if buf.len() >= header_end + length {
+                return buf;
+            }
+        }
+    }
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind stateful s3 stub");
+    let addr = listener.local_addr().expect("stub addr");
+    let objects: std::sync::Arc<std::sync::Mutex<BTreeMap<String, String>>> =
+        std::sync::Arc::default();
+    let store = objects.clone();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut sock, _)) = listener.accept().await else {
+                break;
+            };
+            let store = store.clone();
+            tokio::spawn(async move {
+                let request = read_request(&mut sock).await;
+                let text = String::from_utf8_lossy(&request);
+                let mut lines = text.split("\r\n");
+                let Some(first) = lines.next() else {
+                    return;
+                };
+                let mut parts = first.split_whitespace();
+                let method = parts.next().unwrap_or_default();
+                let target = parts.next().unwrap_or_default();
+                let (path, query) = target.split_once('?').unwrap_or((target, ""));
+                let path = path.trim_start_matches('/');
+                let (_, key) = path.split_once('/').unwrap_or((path, ""));
+                let body_start = text
+                    .find("\r\n\r\n")
+                    .map(|pos| pos + 4)
+                    .unwrap_or(request.len());
+                let body = text.get(body_start..).unwrap_or("").to_string();
+                let is_list = query_param(query, "list-type").as_deref() == Some("2");
+                let (status, body) = if is_list {
+                    let prefix = query_param(query, "prefix").unwrap_or_default();
+                    let mut contents = String::new();
+                    let mut count = 0_usize;
+                    let map = store.lock().unwrap_or_else(|p| p.into_inner());
+                    for (key, value) in map.iter().filter(|(key, _)| key.starts_with(&prefix)) {
+                        count += 1;
+                        contents.push_str(&format!(
+                            "<Contents><Key>{key}</Key>\
+                             <LastModified>2026-01-01T00:00:00.000Z</LastModified>\
+                             <ETag>\"etag\"</ETag><Size>{}</Size>\
+                             <StorageClass>STANDARD</StorageClass></Contents>",
+                            value.len()
+                        ));
+                    }
+                    (
+                        "200 OK",
+                        format!(
+                            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+                             <ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
+                             <Name>noite</Name><Prefix>{prefix}</Prefix>\
+                             <KeyCount>{count}</KeyCount><MaxKeys>1000</MaxKeys>\
+                             <IsTruncated>false</IsTruncated>{contents}</ListBucketResult>"
+                        ),
+                    )
+                } else {
+                    match method {
+                        "PUT" => {
+                            store
+                                .lock()
+                                .unwrap_or_else(|p| p.into_inner())
+                                .insert(key.to_string(), body);
+                            ("200 OK", String::new())
+                        }
+                        "GET" => {
+                            let value = store
+                                .lock()
+                                .unwrap_or_else(|p| p.into_inner())
+                                .get(key)
+                                .cloned();
+                            match value {
+                                Some(value) => ("200 OK", value),
+                                None => (
+                                    "404 Not Found",
+                                    "<?xml version=\"1.0\"?><Error><Code>NoSuchKey</Code>\
+                                     <Message>missing</Message></Error>"
+                                        .to_string(),
+                                ),
+                            }
+                        }
+                        "HEAD" => {
+                            let exists = store
+                                .lock()
+                                .unwrap_or_else(|p| p.into_inner())
+                                .contains_key(key);
+                            if exists {
+                                ("200 OK", String::new())
+                            } else {
+                                ("404 Not Found", String::new())
+                            }
+                        }
+                        "DELETE" => {
+                            store.lock().unwrap_or_else(|p| p.into_inner()).remove(key);
+                            ("204 No Content", String::new())
+                        }
+                        _ => ("400 Bad Request", String::new()),
+                    }
+                };
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/xml\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = sock.write_all(response.as_bytes()).await;
+            });
+        }
+    });
+    (format!("http://{addr}"), objects)
+}
+
 /// [`spawn_s3_stub_recording`] where a read whose target mentions `fragment`
 /// answers `200` with garbage instead of `404` (a corrupt durable manifest),
 /// so one app's boot-time reader fails without the stub changing for others.

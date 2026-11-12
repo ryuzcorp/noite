@@ -141,6 +141,109 @@ async fn move_s3_prefix(cfg: &Config, from: &str, to: &str) -> anyhow::Result<()
     Ok(())
 }
 
+/// Reverse move for a cancel: the app kept serving under its source slug while
+/// the forward attempt was pending, so the source prefix can hold objects newer
+/// than the copies this attempt moved to the target. The destination wins: an
+/// existing destination key is kept and only the target copy is deleted. This
+/// mirrors `move_dir`'s local parking, which never overwrites an existing
+/// destination tree either.
+async fn move_s3_prefix_keep_destination(cfg: &Config, from: &str, to: &str) -> anyhow::Result<()> {
+    let bucket = from
+        .strip_prefix("s3://")
+        .and_then(|s| s.split('/').next())
+        .unwrap_or(&cfg.s3_bucket)
+        .to_string();
+    let from_key = from
+        .strip_prefix(&format!("s3://{bucket}/"))
+        .unwrap_or(from)
+        .to_string();
+    let to_key = to
+        .strip_prefix(&format!("s3://{bucket}/"))
+        .unwrap_or(to)
+        .to_string();
+    let json = s3::s3_list_prefix(cfg, &bucket, &from_key).await?;
+    let keys = parse_listing_keys(&json, from, to)?;
+    if keys.is_empty() {
+        return Ok(());
+    }
+    // One listing of the destination prefix is cheaper and less racy than a
+    // HEAD per moved key: every key already there is newer by definition.
+    let existing_json = s3::s3_list_prefix(cfg, &bucket, &to_key).await?;
+    let existing: std::collections::HashSet<String> = parse_listing_keys(&existing_json, to, from)?
+        .into_iter()
+        .collect();
+    use futures::StreamExt;
+    let moves = futures::stream::iter(keys.into_iter().map(|key| {
+        let rel = key.strip_prefix(&from_key).unwrap_or(&key).to_string();
+        let bucket = bucket.clone();
+        let to_key = format!("{to_key}{rel}");
+        let keep_existing = existing.contains(&to_key);
+        async move {
+            if !keep_existing {
+                s3::s3_copy_key(cfg, &bucket, &key, &to_key).await?;
+            }
+            s3::s3_delete_key(cfg, &key).await
+        }
+    }))
+    .buffer_unordered(8)
+    .collect::<Vec<anyhow::Result<()>>>();
+    for r in moves.await {
+        r.with_context(|| format!("move S3 prefix {from} → {to}"))?;
+    }
+    Ok(())
+}
+
+/// Move this app's `move_dir` salvage trees from one slug's name to the
+/// other's. The salvage belongs to the app, not to the slug: a rename that
+/// commits off `from` must take `.from.recreated-*` with it, or the next create
+/// of that slug would sweep the app's parked data as the new tenant's own. The
+/// same holds for a cancel leaving the target's name. Failures are the
+/// caller's to log: the rename/cancel itself has already committed.
+async fn relocate_salvage(cfg: &Config, from: &str, to: &str) -> anyhow::Result<()> {
+    if from == to {
+        return Ok(());
+    }
+    let root = exec::work_root(cfg);
+    let plain_from = format!(".{from}.recreated-");
+    let plain_to = format!(".{to}.recreated-");
+    let git_from = format!(".{from}.git.recreated-");
+    let git_to = format!(".{to}.git.recreated-");
+    for (tree, from_prefix, to_prefix) in [
+        ("repos", git_from.as_str(), git_to.as_str()),
+        ("git-http", git_from.as_str(), git_to.as_str()),
+        ("projects", plain_from.as_str(), plain_to.as_str()),
+        ("fleets", plain_from.as_str(), plain_to.as_str()),
+        ("builds", plain_from.as_str(), plain_to.as_str()),
+        ("cache", plain_from.as_str(), plain_to.as_str()),
+        ("envs", plain_from.as_str(), plain_to.as_str()),
+    ] {
+        let parent = root.join(tree);
+        let Ok(mut entries) = tokio::fs::read_dir(&parent).await else {
+            continue;
+        };
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else {
+                continue;
+            };
+            let Some(suffix) = name.strip_prefix(from_prefix) else {
+                continue;
+            };
+            let dest = parent.join(format!("{to_prefix}{suffix}"));
+            tokio::fs::rename(entry.path(), &dest)
+                .await
+                .with_context(|| {
+                    format!(
+                        "relocate rename salvage {} → {}",
+                        entry.path().display(),
+                        dest.display()
+                    )
+                })?;
+        }
+    }
+    Ok(())
+}
+
 /// Where the durable rename marker for `target` lives. The content names the
 /// app and the slug it was moving from: a retry that finds its own marker
 /// knows the target prefix may already hold *this app's* moved objects, so it
@@ -165,6 +268,9 @@ pub(crate) struct PendingRename {
     pub last_failure: Option<String>,
     /// When the last attempt failed (ISO 8601).
     pub last_attempt_at: Option<String>,
+    /// The owner asked to cancel: the pass must move the data back and never
+    /// complete the forward rename, even after a crash mid-cancel.
+    pub cancelling: bool,
 }
 
 /// Automatic resume passes a marker gets before it stops being retried
@@ -203,6 +309,9 @@ async fn read_marker(path: &std::path::Path) -> Option<PendingRename> {
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_string);
+    let cancelling = lines
+        .next()
+        .is_some_and(|value| matches!(value.trim(), "1" | "true"));
     Some(PendingRename {
         app_id,
         from,
@@ -210,6 +319,7 @@ async fn read_marker(path: &std::path::Path) -> Option<PendingRename> {
         attempts,
         last_failure,
         last_attempt_at,
+        cancelling,
     })
 }
 
@@ -217,7 +327,7 @@ async fn read_marker(path: &std::path::Path) -> Option<PendingRename> {
 /// per line, and an error message must never turn into a second field.
 fn marker_text(marker: &PendingRename) -> String {
     format!(
-        "{}\n{}\n{}\n{}\n{}\n",
+        "{}\n{}\n{}\n{}\n{}\n{}\n",
         marker.app_id,
         marker.from,
         marker.attempts,
@@ -226,7 +336,8 @@ fn marker_text(marker: &PendingRename) -> String {
             .as_deref()
             .unwrap_or("")
             .replace('\n', " "),
-        marker.last_attempt_at.as_deref().unwrap_or("")
+        marker.last_attempt_at.as_deref().unwrap_or(""),
+        if marker.cancelling { "1" } else { "" }
     )
 }
 
@@ -247,8 +358,9 @@ async fn marker_belongs_to(path: &std::path::Path, app_id: &str) -> bool {
     )
 }
 
-/// Every unfinished rename on disk, oldest first. Malformed markers are
-/// removed: they reserve nothing and would block a slug forever.
+/// Every unfinished rename on disk, oldest first. Malformed markers — and
+/// markers naming a slug that is not grammar-valid — are removed: they reserve
+/// nothing, and no pass may turn one into a path or an S3 prefix.
 pub(crate) async fn pending_renames(cfg: &Config) -> Vec<PendingRename> {
     let dir = exec::work_root(cfg).join("rename");
     let Ok(mut entries) = tokio::fs::read_dir(&dir).await else {
@@ -263,6 +375,22 @@ pub(crate) async fn pending_renames(cfg: &Config) -> Vec<PendingRename> {
             continue;
         }
         match read_marker(&path).await {
+            // Every slug in a marker becomes a path segment or an S3 prefix in
+            // the resume/cancel passes. The slugs that write a marker are
+            // validated upstream, but a marker is disk state: reject anything
+            // that is not a slug before it can name a path.
+            Some(marker)
+                if !crate::lifecycle::slug_ok(cfg, &marker.from)
+                    || !crate::lifecycle::slug_ok(cfg, &marker.to) =>
+            {
+                tracing::warn!(
+                    path = %path.display(),
+                    from = %marker.from,
+                    to = %marker.to,
+                    "rename marker names an invalid slug; removing it"
+                );
+                let _ = tokio::fs::remove_file(&path).await;
+            }
             Some(marker) => out.push(marker),
             None => {
                 let _ = tokio::fs::remove_file(&path).await;
@@ -338,6 +466,7 @@ async fn write_rename_marker(
             attempts: 0,
             last_failure: None,
             last_attempt_at: None,
+            cancelling: false,
         },
     )
     .await
@@ -404,15 +533,15 @@ async fn write_marker(cfg: &Config, marker: &PendingRename) -> anyhow::Result<()
 /// the snapshot the pass scanned: a cancel, a commit or another pass may have
 /// replaced or dropped it while this one ran, and writing the snapshot back
 /// would resurrect a reservation (or a rename the owner just cancelled). The
-/// target's guard is what makes the check and the write atomic. A failed write
-/// is only warned about: the marker protects the moved data, while the count
-/// only bounds automatic retries.
+/// target's guard is what makes the check and the write atomic. A write that
+/// fails is reported as not recorded: the bound and the stuck event must never
+/// advance on a count the marker does not hold.
 async fn record_resume_failure(
     cfg: &Config,
     git_sync: &ryuz_git::GitSync,
     marker: &PendingRename,
     class: &str,
-) -> Option<PendingRename> {
+) -> FailureRecord {
     let _guard = git_sync.lock(&marker.to).await;
     let current = read_marker(&rename_marker(cfg, &marker.to)).await;
     if current.as_ref() != Some(marker) {
@@ -420,7 +549,7 @@ async fn record_resume_failure(
             target = %marker.to,
             "rename marker changed while its resume pass ran; the failure is not recorded"
         );
-        return None;
+        return FailureRecord::NotRecorded;
     }
     let mut next = marker.clone();
     next.attempts = next.attempts.saturating_add(1);
@@ -430,10 +559,18 @@ async fn record_resume_failure(
         tracing::warn!(
             target = %next.to,
             error = %format!("{e:#}"),
-            "could not record a failed rename resume pass"
+            "could not record a failed rename resume pass; the bound does not advance"
         );
+        return FailureRecord::NotRecorded;
     }
-    Some(next)
+    FailureRecord::Recorded(next)
+}
+
+/// Whether a failed resume pass made it onto the marker. Only a recorded
+/// failure may move the automatic bound or raise a stuck event.
+enum FailureRecord {
+    Recorded(PendingRename),
+    NotRecorded,
 }
 
 /// Reset a marker's failed-pass count: a manual retry (or cancel) is a fresh
@@ -455,11 +592,12 @@ async fn reset_resume_attempts(cfg: &Config, marker: &PendingRename) {
     }
 }
 
-/// A short class for the marker and the stuck app event. Never carries a
-/// store URL: the error chain of a transport failure can hold a presigned one.
+/// A fixed class for the marker and the stuck app event. It is a closed set:
+/// the error chain can carry store prefixes and presigned URLs (a listing
+/// error names the prefix it walked), so no part of it is ever embedded.
 fn failure_class(err: &anyhow::Error) -> String {
-    let message = format!("{err:#}");
-    let class = if message.contains("deploy in flight") {
+    let message = format!("{err:#}").to_lowercase();
+    if message.contains("deploy in flight") {
         "deploy in flight"
     } else if message.contains("slug already taken") {
         "slug already taken"
@@ -470,22 +608,23 @@ fn failure_class(err: &anyhow::Error) -> String {
         "target reserved"
     } else if message.contains("stopped") {
         "target wipe stopped"
-    } else if message.contains("S3") || message.contains("s3://") {
+    } else if message.contains("s3://")
+        || message.contains("s3 ")
+        || message.contains("s3_")
+        || message.contains("storage")
+    {
         "storage move failed"
     } else if message.contains("rename marker") || message.contains("fsync") {
         "rename marker write failed"
+    } else if message.contains("rename ")
+        || message.contains("remove ")
+        || message.contains("move ")
+    {
+        "local move failed"
     } else {
-        let root = err.root_cause().to_string();
-        let line = root.lines().next().unwrap_or("move failed").trim();
-        // A transport error can carry a presigned store URL; this string is
-        // persisted in the marker and shown to the tenant. Never let a URL
-        // through, whatever context it arrives under.
-        if line.contains("://") {
-            return "move failed".to_string();
-        }
-        return line.chars().take(80).collect();
-    };
-    class.to_string()
+        "move failed"
+    }
+    .to_string()
 }
 
 /// One app event for a rename whose automatic passes ran out. Best effort: a
@@ -550,6 +689,31 @@ pub(crate) async fn write_rename_marker_with_attempts_for_test(
             attempts,
             last_failure: Some(last_failure.to_string()),
             last_attempt_at: Some(crate::models::now_iso()),
+            cancelling: false,
+        },
+    )
+    .await
+}
+
+/// Test hook: seed a marker already recorded as cancelling, so the resume
+/// pass can be driven as the crash of an interrupted cancel leaves it.
+#[cfg(test)]
+pub(crate) async fn write_cancelling_marker_for_test(
+    cfg: &Config,
+    app_id: &str,
+    from: &str,
+    to: &str,
+) -> anyhow::Result<()> {
+    write_marker(
+        cfg,
+        &PendingRename {
+            app_id: app_id.to_string(),
+            from: from.to_string(),
+            to: to.to_string(),
+            attempts: 0,
+            last_failure: None,
+            last_attempt_at: None,
+            cancelling: true,
         },
     )
     .await
@@ -560,6 +724,17 @@ pub(crate) async fn write_rename_marker_with_attempts_for_test(
 /// to report if it matters.
 async fn clear_rename_marker(cfg: &Config, target: &str) {
     let _ = tokio::fs::remove_file(rename_marker(cfg, target)).await;
+}
+
+/// Remove a marker and report whether it is really gone. Used where a caller
+/// must not report success while the reservation still exists (the cancel:
+/// its marker is the only record that the reverse move is authoritative).
+async fn remove_rename_marker(cfg: &Config, target: &str) -> std::io::Result<()> {
+    match tokio::fs::remove_file(rename_marker(cfg, target)).await {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
 }
 
 /// Forget the failed-rename marker for `target`. Called on every ownership
@@ -849,6 +1024,17 @@ async fn rename_app_inner(
         }
     }
     let renamed = rename_slugged(cfg, pool, procs, logs, &app, name, new_slug).await?;
+    // The app's salvage trees belong to it, not to the slug it is leaving: take
+    // them along so the next create of the old slug cannot sweep them.
+    if let Err(e) = relocate_salvage(cfg, &app.slug, new_slug).await {
+        tracing::warn!(
+            app_id = %app.id,
+            from = %app.slug,
+            to = %new_slug,
+            error = %format!("{e:#}"),
+            "renamed app but could not relocate its salvage dirs"
+        );
+    }
     // The row is committed to the target: the move is no longer resumable (a
     // retry takes the name-only branch), so the marker has done its job.
     // Markers left by other apps on the old slug are *not* touched here: a
@@ -902,6 +1088,20 @@ async fn cancel_pending_rename(
     if !marker_names_rename(&rename_marker(cfg, &pending.to), &app.id, &app.slug).await {
         anyhow::bail!("the pending rename changed; retry shortly");
     }
+    // Record the intent before touching data, under both guards: a crash mid-
+    // cancel leaves a marker the resume pass must finish as a cancel. Without
+    // it, that pass would complete the forward rename instead. A failure here
+    // aborts before anything moves.
+    let Some(current) = read_marker(&rename_marker(cfg, &pending.to)).await else {
+        anyhow::bail!("the pending rename changed; retry shortly");
+    };
+    let cancelling = PendingRename {
+        cancelling: true,
+        ..current.clone()
+    };
+    write_marker(cfg, &cancelling)
+        .await
+        .with_context(|| format!("record the cancel of rename target {}", pending.to))?;
     // The marker is not an ownership proof: under the guards, re-check the
     // target exactly like the forward move. A marker that outlived a re-create
     // must never let this cancel stop that tenant's fleet, move its dirs or
@@ -954,21 +1154,24 @@ async fn cancel_pending_rename(
     for (from, to) in &pairs {
         move_dir(from, to).await?;
     }
-    // Reverse of the forward move, with the same idempotent prefix move: a
-    // retry after a partial cancel keeps whatever already returned.
-    move_s3_prefix(
+    // Reverse of the forward move. The app kept serving under its slug while
+    // the attempt was pending, so an object that exists at the destination is
+    // newer than the target's copy: keep it and only delete the target copy
+    // (destination-wins, mirroring `move_dir`'s local parking). A retry after
+    // a partial cancel keeps whatever already returned.
+    move_s3_prefix_keep_destination(
         cfg,
         &format!("s3://{}/git/{}/", cfg.s3_bucket, pending.to),
         &format!("s3://{}/git/{}/", cfg.s3_bucket, app.slug),
     )
     .await?;
-    move_s3_prefix(
+    move_s3_prefix_keep_destination(
         cfg,
         &format!("s3://{}/fleets/{}/", cfg.s3_bucket, pending.to),
         &format!("s3://{}/fleets/{}/", cfg.s3_bucket, app.slug),
     )
     .await?;
-    move_s3_prefix(
+    move_s3_prefix_keep_destination(
         cfg,
         &format!("s3://{}/{}", cfg.s3_bucket, cfg.envs_prefix(&pending.to)),
         &format!("s3://{}/{}", cfg.s3_bucket, cfg.envs_prefix(&app.slug)),
@@ -977,7 +1180,7 @@ async fn cancel_pending_rename(
     // The forward move pointed every environment row (and its in-memory log
     // ring) at the target prefix; put them back on the app's slug, or preview
     // deploys keep writing into a prefix this call frees.
-    let envs = db::list_all_environments(pool).await.unwrap_or_default();
+    let envs = db::list_all_environments(pool).await?;
     for env in envs.iter().filter(|env| env.app_id == app.id) {
         db::set_environment_bucket(pool, &env.id, &cfg.envs_uri(&app.slug, &env.label)).await?;
         let from = supervisor::env_fleet_key(&pending.to, &env.label);
@@ -991,9 +1194,23 @@ async fn cancel_pending_rename(
     if !ring.is_empty() {
         logs.lock().await.insert(app.slug.clone(), ring);
     }
+    // The app's salvage trees parked under the target's name come home with
+    // it; otherwise a create of the freed target would sweep them as its own.
+    if let Err(e) = relocate_salvage(cfg, &pending.to, &app.slug).await {
+        tracing::warn!(
+            app_id = %app.id,
+            target = %pending.to,
+            error = %format!("{e:#}"),
+            "cancel moved the app back but could not relocate its salvage dirs"
+        );
+    }
     // The target is ours no longer: the marker is what reserved it, and the
-    // app row (still on its slug) is untouched.
-    clear_rename_marker(cfg, &pending.to).await;
+    // app row (still on its slug) is untouched. The unlink is part of the
+    // cancel's contract: reporting success while the reservation survives
+    // would let the next pass complete a rename the owner cancelled.
+    remove_rename_marker(cfg, &pending.to)
+        .await
+        .with_context(|| format!("drop the cancelled rename marker for {}", pending.to))?;
     git_sync.forget(&pending.to).await;
     if let Some(name) = name {
         db::rename_app_name(pool, &app.id, name).await?;
@@ -1146,6 +1363,37 @@ pub async fn resume_pending_renames(
             }
             continue;
         }
+        // A recorded cancel must be finished, never turned back into the
+        // forward move: a crash mid-cancel or a failed marker unlink leaves
+        // exactly this marker. The cancel is idempotent, so a later pass
+        // continues where the crash stopped.
+        if marker.cancelling {
+            if let Some(app) = app.as_ref() {
+                match cancel_pending_rename(
+                    cfg, pool, procs, logs, deploying, git_sync, app, None, &marker,
+                )
+                .await
+                {
+                    Ok(_) => {
+                        resumed += 1;
+                        tracing::info!(
+                            app_id = %marker.app_id,
+                            slug = %marker.from,
+                            target = %marker.to,
+                            "finished a cancelled rename"
+                        );
+                    }
+                    Err(e) => tracing::warn!(
+                        app_id = %marker.app_id,
+                        from = %marker.from,
+                        to = %marker.to,
+                        error = %format!("{e:#}"),
+                        "a cancelled rename is still pending; retrying on a later pass"
+                    ),
+                }
+            }
+            continue;
+        }
         // The automatic passes ran out (about an hour at the loop's slow
         // tick). Keep the reservation — its target may hold the only copy of
         // the moved data — but stop retrying until the owner retries the
@@ -1185,11 +1433,13 @@ pub async fn resume_pending_renames(
             }
             Err(e) => {
                 let class = failure_class(&e);
-                let Some(next) = record_resume_failure(cfg, git_sync, &marker, &class).await else {
-                    // The marker this pass scanned is gone or was replaced
-                    // (a cancel, a commit, another pass): the failure belongs
-                    // to an attempt that no longer exists, so nothing is
-                    // written and no stuck event is raised.
+                let FailureRecord::Recorded(next) =
+                    record_resume_failure(cfg, git_sync, &marker, &class).await
+                else {
+                    // The marker this pass scanned is gone or was replaced (a
+                    // cancel, a commit, another pass), or the write failed:
+                    // the failure belongs to an attempt whose count the marker
+                    // does not hold, so the bound and the stuck event stay put.
                     continue;
                 };
                 if next.attempts >= MAX_RESUME_ATTEMPTS {
@@ -1299,7 +1549,7 @@ async fn rename_slugged(
     if !ring.is_empty() {
         logs.lock().await.insert(new_slug.to_string(), ring);
     }
-    let envs = db::list_all_environments(pool).await.unwrap_or_default();
+    let envs = db::list_all_environments(pool).await?;
     for env in envs.iter().filter(|e| e.app_id == app.id) {
         let from = supervisor::env_fleet_key(&app.slug, &env.label);
         let to = supervisor::env_fleet_key(new_slug, &env.label);
@@ -1407,9 +1657,10 @@ mod tests {
         super::forget_target_marker(&cfg, "slug").await;
         let git_sync = ryuz_git::GitSync::default();
         assert!(
-            record_resume_failure(&cfg, &git_sync, &stale, "storage move failed")
-                .await
-                .is_none(),
+            matches!(
+                record_resume_failure(&cfg, &git_sync, &stale, "storage move failed").await,
+                super::FailureRecord::NotRecorded
+            ),
             "a resolved marker is not rewritten"
         );
         assert!(
@@ -1417,6 +1668,77 @@ mod tests {
             "the cancel/commit stays resolved"
         );
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A cancel moves the target's objects back over an app that kept serving
+    /// under its slug: the destination's newer object must win, and only the
+    /// target copy is deleted (a blind overwrite would roll back a live
+    /// `own.json`/LTX write).
+    #[tokio::test]
+    async fn a_cancel_keeps_a_newer_destination_object() {
+        let (endpoint, objects) = crate::testutil::spawn_stateful_s3_stub().await;
+        let mut cfg = crate::config::config_for_tests();
+        cfg.s3_endpoint = endpoint;
+        {
+            let mut store = objects.lock().unwrap_or_else(|p| p.into_inner());
+            store.insert("fleets/new/own.json".into(), "older-target".into());
+            store.insert("fleets/old/own.json".into(), "newer-source".into());
+            store.insert("fleets/new/ltx.bin".into(), "only-target".into());
+        }
+        super::move_s3_prefix_keep_destination(
+            &cfg,
+            "s3://noite/fleets/new/",
+            "s3://noite/fleets/old/",
+        )
+        .await
+        .expect("reverse move");
+        let store = objects.lock().unwrap_or_else(|p| p.into_inner());
+        assert_eq!(
+            store.get("fleets/old/own.json").map(String::as_str),
+            Some("newer-source"),
+            "the app's newer object is not overwritten"
+        );
+        assert_eq!(
+            store.get("fleets/old/ltx.bin").map(String::as_str),
+            Some("only-target"),
+            "a key only the target holds still moves back"
+        );
+        assert!(!store.contains_key("fleets/new/own.json"));
+        assert!(!store.contains_key("fleets/new/ltx.bin"));
+    }
+
+    /// Marker slugs are path and prefix segments in the resume/cancel passes.
+    /// A marker naming an invalid slug is removed, exactly like a malformed
+    /// one, instead of ever reaching a path.
+    #[tokio::test]
+    async fn a_marker_with_an_invalid_slug_is_dropped() {
+        let base =
+            std::env::temp_dir().join(format!("noite-rename-bad-slug-{}", crate::models::new_id()));
+        let mut cfg = crate::config::config_for_tests();
+        cfg.work_dir = base.join("work").to_string_lossy().into_owned();
+        let dir = crate::host::exec::work_root(&cfg).join("rename");
+        std::fs::create_dir_all(&dir).expect("rename dir");
+        std::fs::write(dir.join("evil.json"), "app-id\n../etc\n").expect("bad marker");
+        assert!(pending_renames(&cfg).await.is_empty());
+        assert!(
+            !dir.join("evil.json").exists(),
+            "the invalid marker is gone"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The classes persisted in markers and shown to the tenant are a fixed
+    /// set: a storage listing error names its prefix, and that must not leak.
+    #[test]
+    fn failure_classes_are_a_fixed_set() {
+        let listing = anyhow::anyhow!("s3 list git/secret-slug/ denied by the store");
+        assert_eq!(super::failure_class(&listing), "storage move failed");
+        let local = anyhow::anyhow!("rename /data/runner/fleets/x -> /data/runner/fleets/y");
+        assert_eq!(super::failure_class(&local), "local move failed");
+        assert_eq!(
+            super::failure_class(&anyhow::anyhow!("something odd")),
+            "move failed"
+        );
     }
 
     /// R-06: an empty `Contents` is the only "nothing to move" shape. Garbage
@@ -1515,6 +1837,7 @@ mod tests {
                 attempts: 0,
                 last_failure: None,
                 last_attempt_at: None,
+                cancelling: false,
             }]
         );
         let temps: Vec<_> = std::fs::read_dir(&dir)
