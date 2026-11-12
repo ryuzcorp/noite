@@ -182,6 +182,8 @@ export interface EditModule {
 export interface FileOptions {
   theme?: unknown;
   overflow?: string;
+  /** Keep the file-name header at the top of the pane while its text scrolls. */
+  stickyHeader?: boolean;
   unsafeCSS?: string;
   /** Fired after every render of the container (mount, update and unmount): the
    * pane hangs the header's change chip on it, so it survives a re-render. */

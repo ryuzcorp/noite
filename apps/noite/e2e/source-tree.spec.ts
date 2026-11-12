@@ -1,5 +1,5 @@
 import { expect, test } from "@playwright/test";
-import type { Page } from "@playwright/test";
+import type { Locator, Page } from "@playwright/test";
 
 import { createAppWithKey, deleteApp, pushAppDir } from "./helpers";
 
@@ -175,4 +175,84 @@ test("an uploaded file is a binary row the commit carries", async ({
 
   await expect(changesBadge(page)).toBeHidden({ timeout: 60_000 });
   await expect(page.getByRole("treeitem", { name: "blob.bin" })).toBeVisible();
+});
+
+// How far the code pane's own scroll container has scrolled: walk from the
+// file header (in pierre's shadow root) to the nearest scrolling ancestor.
+const paneScrollTop = (header: Locator): Promise<number> =>
+  header.evaluate((el) => {
+    let node: Node | null = el;
+
+    while (node !== null) {
+      if (node instanceof HTMLElement) {
+        const overflow = getComputedStyle(node).overflowY;
+
+        if (
+          (overflow === "auto" || overflow === "scroll") &&
+          node.scrollHeight > node.clientHeight + 8
+        ) {
+          return node.scrollTop;
+        }
+      }
+
+      const parent: Node | null = node.parentNode;
+      node = parent instanceof ShadowRoot ? parent.host : parent;
+    }
+
+    return 0;
+  });
+
+// No `?file=` means the repository's front door, not "no files": package.json
+// opens and the URL follows in place (Back leaves the app, never the browse's
+// own default). The file-name header then stays at the top of the pane while
+// a long file scrolls under it.
+test("a browse opens package.json by default, and the file header stays put", async ({
+  page,
+  request,
+}) => {
+  const slug = "source-tree-default";
+  createdApps.push(slug);
+
+  const { apiKey, appId } = await createAppWithKey(page, request, {
+    name: "Source Tree Default",
+    slug,
+  });
+
+  pushAppDir(apiKey, new URL("../test", import.meta.url), slug);
+
+  await page.goto(`/apps/${appId}/source?ref=main`);
+  const header = page.locator("[data-diffs-header]").first();
+  await expect(header).toContainText("package.json", { timeout: 60_000 });
+  await expect
+    .poll(() => new URL(page.url()).searchParams.get("file"))
+    .toBe("package.json");
+
+  await page.goBack();
+  await expect
+    .poll(() => new URL(page.url()).pathname)
+    .not.toContain("/source");
+
+  await page.goto(`/apps/${appId}/source?ref=main&file=bun.lock`);
+  const longHeader = page.locator("[data-diffs-header]").first();
+  await expect(longHeader).toContainText("bun.lock", { timeout: 60_000 });
+
+  const box = await longHeader.boundingBox();
+
+  if (box === null) {
+    throw new TypeError("the file header has no box");
+  }
+
+  await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
+  await page.mouse.wheel(0, 1200);
+  await expect.poll(() => paneScrollTop(longHeader)).toBeGreaterThan(0);
+
+  const after = await longHeader.boundingBox();
+
+  if (after === null) {
+    throw new TypeError(
+      "the file header left the page while the file scrolled"
+    );
+  }
+
+  expect(Math.abs(after.y - box.y)).toBeLessThanOrEqual(2);
 });

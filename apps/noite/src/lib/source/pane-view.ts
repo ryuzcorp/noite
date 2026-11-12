@@ -3,15 +3,23 @@
 //!
 //! ```mermaid
 //! stateDiagram-v2
-//!   [*] --> Empty
-//!   Empty --> Reading: Requested{path}
+//!   [*] --> Closed
+//!   Closed --> Reading: Requested{path}
 //!   Reading --> Ready: Resolved{token, painted}
 //!   Reading --> Failed: Failed{token, path}
 //!   Reading --> Reading: Requested{other path}   (the last paint stays)
 //!   Ready --> Reading: Requested{path}           (the last paint stays)
 //!   Failed --> Reading: Requested{path}
-//!   Ready --> Empty: Closed
-//!   Failed --> Empty: Closed
+//!   Closed --> NoFiles: Emptied
+//!   NoFiles --> Reading: Requested{path}
+//!   NoFiles --> NoFiles: Emptied
+//!   Reading --> NoFiles: Emptied                 (a checkout with no files)
+//!   Ready --> NoFiles: Emptied
+//!   Failed --> NoFiles: Emptied
+//!   Reading --> Closed: Closed
+//!   Ready --> Closed: Closed
+//!   Failed --> Closed: Closed
+//!   NoFiles --> Closed: Closed
 //! ```
 //!
 //! A `Resolved` or `Failed` is refused unless its token is the one the current
@@ -36,6 +44,8 @@ export interface PanePainted {
 export type PaneView = Data.TaggedEnum<{
   Closed: Record<never, never>;
   Failed: { message: string; path: string };
+  /** The checkout holds no files at all: the pane says so instead of a file. */
+  NoFiles: Record<never, never>;
   Reading: { path: string; token: number };
   Ready: { painted: PanePainted };
 }>;
@@ -79,6 +89,8 @@ export const panePath = (state: PaneView): string | null => {
 /** What the browser reports to the machine. */
 export type PaneEvent = Data.TaggedEnum<{
   Closed: Record<never, never>;
+  /** The checkout opened with no files: a state, never a note over a file. */
+  Emptied: Record<never, never>;
   Failed: { message: string; ticket: ReadTicket };
   Requested: { path: string };
   Resolved: { painted: PanePainted; ticket: ReadTicket };
@@ -155,7 +167,15 @@ export const stepPane = (
     };
   }
 
-  if (machine.view._tag === "Closed") {
+  if (event._tag === "Emptied") {
+    return {
+      machine: { seq: machine.seq, view: PaneViews.NoFiles() },
+      read: null,
+      refused: false,
+    };
+  }
+
+  if (machine.view._tag === "Closed" || machine.view._tag === "NoFiles") {
     return refuse(machine);
   }
 

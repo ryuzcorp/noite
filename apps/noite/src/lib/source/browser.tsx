@@ -282,7 +282,7 @@ export const SourceBrowser = ({
   };
 
   /** Install a ref's checkout: the session is the new tree, the panes show it,
-   * and the deep link's file (or the Worker config) opens. */
+   * and the deep link's file (or the repository's front door) opens. */
   const install = async (checkout: ReadyCheckout): Promise<void> => {
     const decision = stepRef(view(), RefEvents.Opened({ checkout }));
 
@@ -295,16 +295,23 @@ export const SourceBrowser = ({
     box.revision += 1;
     recompute();
     box.editor?.drop();
-    const initial = box.tree?.build();
+    // Exactly one of the two outcomes the browse has: the file the checkout
+    // opens (the URL's, or the repository's front door) or a checkout with no
+    // files at all. The pane machine paints the second, not this function.
+    const chosen = box.tree?.build();
     syncState();
 
-    if (initial !== undefined) {
-      await box.editor?.open(initial);
+    if (chosen === undefined) {
+      return;
+    }
+
+    if (chosen._tag === "Empty") {
+      box.editor?.empty();
 
       return;
     }
 
-    box.editor?.note("This repository has no files yet");
+    await box.editor?.open(chosen.path);
   };
 
   /** Start one ref's read. A stale answer is dropped by the ref machine (it
