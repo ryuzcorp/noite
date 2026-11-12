@@ -21,6 +21,19 @@ use crate::host::tips::{TipNotify, TipReceiver};
 use crate::lifecycle::{sha_same, DEPLOY_IN_FLIGHT_MS, DEPLOY_STUCK_MS};
 use crate::models::{App, AppStatus, DesiredState};
 
+/// Claim a slow-tick background pass: due once per `every` while no earlier
+/// pass of that same chore is still in flight. A pass that is still running
+/// leaves the timer untouched, so the next tick retries instead of skipping
+/// an interval. Each chore owns its own timer and flag, so one slow pass
+/// never delays another.
+fn claim_slow_tick(last: &mut Instant, running: &AtomicBool, every: Duration) -> bool {
+    if last.elapsed() < every || running.swap(true, Ordering::SeqCst) {
+        return false;
+    }
+    *last = Instant::now();
+    true
+}
+
 #[allow(clippy::too_many_arguments)] // shared deps threaded by reference; matches deploy_app's existing allow
 pub async fn run_forever(
     pool: SqlitePool,
@@ -78,12 +91,18 @@ pub async fn run_forever(
     // common case; this catches a store that was down at boot. One pass at a
     // time, off the tick, and paced like every background wipe.
     let mut last_purge_resume = Instant::now();
+    // CI cache volumes no live app owns: the boot pass covers the common
+    // case, this is the durable retry. Its own timer and in-flight gate —
+    // a wipe resume that takes seconds must neither delay the sweep nor be
+    // delayed by it.
+    let mut last_ci_sweep = Instant::now();
     // Unfinished renames (their durable markers) are resumed here too: a crash
     // mid-move must not wait for a client retry, and until it resolves the
     // target slug stays reserved. None resumes on the first tick.
     let mut last_rename_resume: Option<Instant> = None;
     let rename_resuming = Arc::new(AtomicBool::new(false));
     let purge_resuming = Arc::new(AtomicBool::new(false));
+    let ci_sweeping = Arc::new(AtomicBool::new(false));
     loop {
         tick.tick().await;
         if shutdown.load(Ordering::Relaxed) {
@@ -190,10 +209,11 @@ pub async fn run_forever(
         // Durable app-purge tombstones (`app_purge`): a delete whose wipe never
         // finished is resumed here every five minutes — off the tick, because
         // a wipe of a real data set takes seconds and holds its slug's guard.
-        if last_purge_resume.elapsed() >= Duration::from_secs(5 * 60)
-            && !purge_resuming.swap(true, Ordering::SeqCst)
-        {
-            last_purge_resume = Instant::now();
+        if claim_slow_tick(
+            &mut last_purge_resume,
+            &purge_resuming,
+            Duration::from_secs(5 * 60),
+        ) {
             let (pool2, cfg2, procs2, logs2, sync2, flag) = (
                 pool.clone(),
                 cfg.clone(),
@@ -214,10 +234,20 @@ pub async fn run_forever(
                         "resumed pending app purges"
                     );
                 }
-                // CI cache volumes no live app owns (a legacy slug-keyed
-                // name, a wipe that died, a rename): the delete's own removal
-                // is the fast path, this is the durable one. Never under a
-                // slug guard.
+                flag.store(false, Ordering::SeqCst);
+            });
+        }
+        // CI cache volumes no live app owns (a legacy slug-keyed name, a
+        // wipe that died, a rename): the delete's own removal is the fast
+        // path, this is the durable one. Its own pass: never under a slug
+        // guard, and it neither waits for nor delays the purge resume above.
+        if claim_slow_tick(
+            &mut last_ci_sweep,
+            &ci_sweeping,
+            Duration::from_secs(5 * 60),
+        ) {
+            let (cfg2, pool2, flag) = (cfg.clone(), pool.clone(), ci_sweeping.clone());
+            tokio::spawn(async move {
                 let removed = crate::host::purge::reconcile_ci_caches(&cfg2, &pool2).await;
                 if removed > 0 {
                     tracing::info!(removed, "removed orphaned CI cache volumes");
@@ -744,6 +774,41 @@ fn spawn_tip_deploy(
 mod tests {
     use super::*;
     use crate::models::DeployStatus;
+
+    /// The CI-cache sweep and the purge resume are separate slow-tick passes.
+    /// They used to share one in-flight flag inside the purge task, so a wipe
+    /// resume that held its slug guard for seconds kept the CI sweep from
+    /// running for a whole interval (and a long sweep delayed the resume).
+    /// One gate being busy must leave the other's claim untouched.
+    #[test]
+    fn a_busy_slow_tick_does_not_block_an_independent_pass() {
+        let every = Duration::from_secs(300);
+        // A purge resume from two intervals ago is still running: its claim
+        // must be refused and its timer left alone so the next tick retries.
+        let purge = AtomicBool::new(true);
+        let mut purge_last = Instant::now() - 2 * every;
+        // The CI sweep's own gate is free and due in the same tick.
+        let ci = AtomicBool::new(false);
+        let mut ci_last = Instant::now() - every;
+
+        assert!(
+            !claim_slow_tick(&mut purge_last, &purge, every),
+            "a pass that is still running must not claim a second time"
+        );
+        assert!(
+            claim_slow_tick(&mut ci_last, &ci, every),
+            "the CI sweep must run while the purge resume is busy"
+        );
+        assert!(ci.load(Ordering::SeqCst), "the claim arms its own gate");
+        assert!(
+            purge_last.elapsed() >= 2 * every,
+            "a refused claim must not consume the pass's interval"
+        );
+        assert!(
+            !claim_slow_tick(&mut ci_last, &ci, every),
+            "one claim per interval"
+        );
+    }
 
     /// A tick's `apps` snapshot can be older than the delete that landed in
     /// the middle of it: `still_wanted` re-reads the row (and the delete
