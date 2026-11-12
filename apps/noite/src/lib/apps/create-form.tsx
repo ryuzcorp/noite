@@ -196,25 +196,27 @@ const ImportOptions = ({
 );
 
 /** Under the Slug field: why it can't be used (with a free variant to take),
- * where it came from while it's being checked, and the URL and git remote it
- * gets once it's free. */
+ * why the check itself failed, where it came from while it's being checked,
+ * and the URL and git remote it gets once it's free. */
 const SlugStatus = ({
   checking,
+  failure,
   hint,
   onUse,
   verdict,
 }: {
   checking: boolean;
+  failure: string | null;
   hint: string;
   onUse: (suggestion: string) => void;
   verdict: SlugCheck | null;
-}) => (
-  <div
-    id="create-slug-status"
-    class="flex flex-col gap-1 text-xs"
-    aria-live="polite"
-  >
-    {verdict?.error ? (
+}) => {
+  let firstLine: View;
+
+  if (failure) {
+    firstLine = <span class="text-error">{failure}</span>;
+  } else if (verdict?.error) {
+    firstLine = (
       <span class="text-error inline-flex flex-wrap items-center gap-2">
         {verdict.error}
         {verdict.suggestion ? (
@@ -229,29 +231,39 @@ const SlugStatus = ({
           </button>
         ) : null}
       </span>
-    ) : (
-      <span class="text-base-content/60">{hint}</span>
-    )}
-    {checking ? (
-      <span class="text-base-content/60">Checking availability…</span>
-    ) : null}
-    {verdict && !verdict.error ? (
-      <dl class="bg-base-200 dark:bg-base-300 rounded-box m-0 grid grid-cols-[auto_minmax(0,1fr)] gap-x-3 gap-y-1 px-3 py-2">
-        <dt class="text-success inline-flex items-center gap-1">
-          <Check class="h-3.5 w-3.5" />
-          URL
-        </dt>
-        <dd class="m-0 truncate font-mono">{appUrl(verdict.host)}</dd>
-        {verdict.gitRemote ? (
-          <>
-            <dt class="text-base-content/60 pl-[1.125rem]">Git</dt>
-            <dd class="m-0 truncate font-mono">{verdict.gitRemote}</dd>
-          </>
-        ) : null}
-      </dl>
-    ) : null}
-  </div>
-);
+    );
+  } else {
+    firstLine = <span class="text-base-content/60">{hint}</span>;
+  }
+
+  return (
+    <div
+      id="create-slug-status"
+      class="flex flex-col gap-1 text-xs"
+      aria-live="polite"
+    >
+      {firstLine}
+      {checking ? (
+        <span class="text-base-content/60">Checking availability…</span>
+      ) : null}
+      {verdict && !verdict.error ? (
+        <dl class="bg-base-200 dark:bg-base-300 rounded-box m-0 grid grid-cols-[auto_minmax(0,1fr)] gap-x-3 gap-y-1 px-3 py-2">
+          <dt class="text-success inline-flex items-center gap-1">
+            <Check class="h-3.5 w-3.5" />
+            URL
+          </dt>
+          <dd class="m-0 truncate font-mono">{appUrl(verdict.host)}</dd>
+          {verdict.gitRemote ? (
+            <>
+              <dt class="text-base-content/60 pl-[1.125rem]">Git</dt>
+              <dd class="m-0 truncate font-mono">{verdict.gitRemote}</dd>
+            </>
+          ) : null}
+        </dl>
+      ) : null}
+    </div>
+  );
+};
 
 /** The Start from row once a folder was dropped: what will be committed, and
  * the way back to the three modes. */
@@ -628,7 +640,9 @@ const CreateForm = (model: CreateModel, dispatch: Dispatch<Message>): View => {
               maxlength={48}
               autocomplete="off"
               spellcheck={false}
-              aria-invalid={status.verdict?.error ? "true" : "false"}
+              aria-invalid={
+                status.verdict?.error || status.slugError ? "true" : "false"
+              }
               aria-describedby="create-slug-status"
               value={model.slug}
               oninput={(e) => {
@@ -638,6 +652,7 @@ const CreateForm = (model: CreateModel, dispatch: Dispatch<Message>): View => {
             />
             <SlugStatus
               checking={status.checking}
+              failure={status.slugError}
               hint={
                 currentSlug !== "" && !SLUG_RE.test(currentSlug)
                   ? SLUG_HINT

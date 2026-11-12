@@ -54,7 +54,7 @@ import { Data } from "effect";
 import * as Effect from "effect/Effect";
 
 import { api, ApiError } from "../api";
-import { errorMessage } from "../errors";
+import { errorMessage, operationMessage } from "../errors";
 import { deployStatusFacts, isProductionRow } from "./lifecycle";
 import type { Step } from "./step";
 
@@ -125,7 +125,9 @@ const stopDeploy = (appId: string, deployId: string): Cmd<RowMessage> =>
     (error) =>
       isConflict(error)
         ? RowMsg.StopConflict()
-        : RowMsg.StopFailed({ error: error.message })
+        : RowMsg.StopFailed({
+            error: operationMessage("Stopping the deploy failed", error),
+          })
   );
 
 const rollbackDeploy = (
@@ -142,7 +144,10 @@ const rollbackDeploy = (
       });
     },
     () => RowMsg.RollbackSucceeded(),
-    (error) => RowMsg.RollbackFailed({ error: error.message })
+    (error) =>
+      RowMsg.RollbackFailed({
+        error: operationMessage("Rolling back the deploy failed", error),
+      })
   );
 
 /** Whether the row's log pane opens without a click. */
@@ -298,7 +303,10 @@ const loadTargets = (appId: string): Cmd<DropdownMessage> =>
       >("/api/apps/listDeploys", { appId }),
   }).pipe(
     Effect.match({
-      onFailure: (error) => DropdownMsg.TargetsFailed({ error: error.message }),
+      onFailure: (error) =>
+        DropdownMsg.TargetsFailed({
+          error: operationMessage("Loading the release targets failed", error),
+        }),
       onSuccess: (rows) =>
         // Every successful production release, newest first. The live sha is
         // picked against at render, not here: a lookup opened while the app
@@ -323,15 +331,15 @@ const loadTargets = (appId: string): Cmd<DropdownMessage> =>
 const rollbackCall = (
   appId: string,
   sha: string,
-  failed: (error: string) => DropdownMessage
+  failed: (error: Error) => DropdownMessage
 ): Cmd<DropdownMessage> =>
   attempt<DropdownMessage>(
     async () => {
       await api<{ ok: true }>("/api/apps/rollback", { appId, sha });
     },
     () => DropdownMsg.Succeeded(),
-    (error) =>
-      isConflict(error) ? DropdownMsg.Succeeded() : failed(errorMessage(error))
+    // A 409 means the row is already closed: not this action's failure.
+    (error) => (isConflict(error) ? DropdownMsg.Succeeded() : failed(error))
   );
 
 /** The rollback target the loaded history offers against `liveSha`: the
@@ -400,7 +408,9 @@ export const updateDropdown = (
         cmd: keyed(
           `redeploy:${model.appId}`,
           rollbackCall(model.appId, message.sha, (error) =>
-            DropdownMsg.RedeployFailed({ error })
+            DropdownMsg.RedeployFailed({
+              error: operationMessage("Redeploying failed", error),
+            })
           )
         ),
         model: {
@@ -425,7 +435,9 @@ export const updateDropdown = (
         cmd: keyed(
           `rollback-target:${model.appId}`,
           rollbackCall(model.appId, message.sha, (error) =>
-            DropdownMsg.RollbackFailed({ error })
+            DropdownMsg.RollbackFailed({
+              error: operationMessage("Rolling back failed", error),
+            })
           )
         ),
         model: {

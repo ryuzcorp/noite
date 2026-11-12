@@ -32,7 +32,8 @@
 //!   state slugCheck {
 //!     idle --> checking: the slug changed and is well formed
 //!     checking --> done: SlugChecked (for this slug)
-//!     checking --> idle: SlugCheckFailed
+//!     checking --> failed: SlugCheckFailed (the message shows under the field)
+//!     failed --> checking: the slug changed
 //!     done --> checking: the slug changed
 //!   }
 //! ```
@@ -47,7 +48,7 @@ import { Data, Effect, Result } from "effect";
 import { api } from "../api";
 import type { SlugCheck } from "../api-types";
 import { commitSource } from "../commit-source";
-import { errorMessage } from "../errors";
+import { errorMessage, operationMessage } from "../errors";
 import type { UploadRead } from "../source/uploads";
 import type { CreateSourceInput } from "./create-source";
 import { parseGitHubRepo } from "./create-source";
@@ -87,7 +88,8 @@ export const normalizeSlug = (raw: string): string => raw.trim().toLowerCase();
 
 /** The Slug row's live verdict. Every non-idle state names the slug it is
  * about, so an answer that arrives after the field moved on is dropped instead
- * of being painted under a slug it does not describe. */
+ * of being painted under a slug it does not describe. `failed` reports why the
+ * check could not answer; it stays advisory (create re-validates the slug). */
 export type SlugCheckState =
   | { readonly status: "idle" }
   | { readonly for: string; readonly status: "checking" }
@@ -95,6 +97,11 @@ export type SlugCheckState =
       readonly for: string;
       readonly result: SlugCheck;
       readonly status: "done";
+    }
+  | {
+      readonly for: string;
+      readonly message: string;
+      readonly status: "failed";
     };
 
 /** What the app is created from: nothing yet, or one dropped project folder
@@ -162,7 +169,7 @@ export type Message = Data.TaggedEnum<{
   PathChanged: { value: string };
   RefChanged: { value: string };
   SlugChecked: { result: SlugCheck; slug: string };
-  SlugCheckFailed: { slug: string };
+  SlugCheckFailed: { message: string; slug: string };
   SlugChanged: { value: string };
   SlugRejected: { result: SlugCheck; slug: string };
   SlugSuggestionTaken: { slug: string };
@@ -296,6 +303,7 @@ export interface CreateStatus {
   readonly checking: boolean;
   readonly error: string | null;
   readonly retrying: boolean;
+  readonly slugError: string | null;
   readonly stranded: string | null;
   readonly verdict: SlugCheck | null;
 }
@@ -319,6 +327,8 @@ export const statusOf = (model: CreateModel): CreateStatus => {
     checking: check.status === "checking" && check.for === slug,
     error: model.submit.t === "Failed" ? model.submit.error : null,
     retrying: created !== undefined,
+    slugError:
+      check.status === "failed" && check.for === slug ? check.message : null,
     stranded: created ?? null,
     verdict:
       check.status === "done" && check.for === slug ? check.result : null,
@@ -361,7 +371,11 @@ const checkSlug = (slug: string): Cmd =>
     );
 
     return Result.match(asked, {
-      onFailure: () => Msg.SlugCheckFailed({ slug }),
+      onFailure: (error) =>
+        Msg.SlugCheckFailed({
+          message: operationMessage("Checking the slug failed", error),
+          slug,
+        }),
       onSuccess: (result) => Msg.SlugChecked({ result, slug }),
     });
   });
@@ -422,7 +436,9 @@ const createApp = (input: {
       return Msg.SlugRejected({ result: recheck.success, slug: input.slug });
     }
 
-    return Msg.CreateFailed({ error: errorMessage(created.failure) });
+    return Msg.CreateFailed({
+      error: operationMessage("Creating the app failed", created.failure),
+    });
   });
 
 /** The dropped folder's first commit. Its failure is not the end of the app —
@@ -462,7 +478,9 @@ const readFolder = (name: string, reads: Promise<readonly UploadRead[]>): Cmd =>
 
     if (Result.isFailure(settled)) {
       return Msg.FolderRead({
-        result: { error: errorMessage(settled.failure) },
+        result: {
+          error: operationMessage("Reading the folder failed", settled.failure),
+        },
       });
     }
 
@@ -813,9 +831,18 @@ const step = (model: CreateModel, message: Message): Step =>
         return { model };
       }
 
-      // The check is advisory: create re-validates, so a failed check leaves
-      // the row quiet rather than blocking the form.
-      return { model: { ...model, slugCheck: IDLE_SLUG_CHECK } };
+      // The check is advisory: create re-validates, so a failed check reports
+      // why under the field rather than blocking the form.
+      return {
+        model: {
+          ...model,
+          slugCheck: {
+            for: failed.slug,
+            message: failed.message,
+            status: "failed",
+          },
+        },
+      };
     },
     SlugChecked: (checked): Step => {
       // An answer for a slug the field no longer holds is not a verdict.

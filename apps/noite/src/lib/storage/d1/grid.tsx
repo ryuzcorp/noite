@@ -15,7 +15,7 @@ import * as Effect from "effect/Effect";
 import type { View } from "ilha";
 
 import { api } from "../../api";
-import { errorMessage } from "../../errors";
+import { errorMessage, operationMessage } from "../../errors";
 import { islandProps } from "../../island";
 import { d1Rows, invalidateD1 } from "../../resources";
 import type { D1Cell, D1Rows, D1RowsQuery, D1TableSchema } from "../../runner";
@@ -211,7 +211,7 @@ const deleteRows = ({
   table,
 }: Extract<Message, { _tag: "DeleteRequested" }>) =>
   Effect.tryPromise({
-    catch: (error) => errorMessage(error),
+    catch: (error) => operationMessage("Deleting the rows failed", error),
     try: () =>
       api<{ deleted: number; ok: boolean }>("/api/storage/d1DeleteRows", {
         appId,

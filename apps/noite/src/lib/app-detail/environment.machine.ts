@@ -70,7 +70,7 @@ import { Data } from "effect";
 import * as Effect from "effect/Effect";
 
 import { api } from "../api";
-import { errorMessage } from "../errors";
+import { errorMessage, operationMessage } from "../errors";
 import { invalidate } from "../resource";
 import { keys } from "../resources";
 import type { RunnerEnvironment } from "../runner";
@@ -386,7 +386,10 @@ const writeVar = (
       await reload();
     },
     () => VarsMsg.Saved(),
-    (error) => VarsMsg.SaveFailed({ error: error.message })
+    (error) =>
+      VarsMsg.SaveFailed({
+        error: operationMessage("Saving the variable failed", error),
+      })
   );
 
 const deleteVar = (
@@ -405,7 +408,11 @@ const deleteVar = (
       await reload();
     },
     () => VarsMsg.Deleted(),
-    (error) => VarsMsg.DeleteFailed({ error: error.message, name })
+    (error) =>
+      VarsMsg.DeleteFailed({
+        error: operationMessage("Deleting the variable failed", error),
+        name,
+      })
   );
 
 /** The one transition function for the override editor. */
@@ -610,7 +617,10 @@ const createEnvironment = (
       }),
   }).pipe(
     Effect.match({
-      onFailure: (error) => CreateMsg.Failed({ error: error.message }),
+      onFailure: (error) =>
+        CreateMsg.Failed({
+          error: operationMessage("Creating the environment failed", error),
+        }),
       onSuccess: (env) => {
         // The dialog closes only after the runner answered: on `null` the
         // caller gets no environment to deep-link, and the machine says so
