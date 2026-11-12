@@ -232,7 +232,7 @@ const DropdownApp = defineApp({
       // Stop/Start or Retry import control when the app's status lands, and a
       // positional morph would otherwise replace this subtree — closing an open
       // menu and dropping its state. The key makes ilha move it instead.
-      <div key="deploy" class="dropdown dropdown-end">
+      <div key="deploy" class="dropdown dropdown-end z-50">
         <div
           tabindex={0}
           role="button"
@@ -246,7 +246,7 @@ const DropdownApp = defineApp({
         </div>
         <div
           tabindex={0}
-          class="dropdown-content card bg-base-100 dark:bg-base-200 border-base-300 z-10 w-80 border shadow-md"
+          class="dropdown-content card bg-base-100 dark:bg-base-200 border-base-300 z-50 w-80 border shadow-xl"
         >
           <div class="card-body gap-4">
             <h3 class="card-title m-0 text-base">Deploy</h3>
