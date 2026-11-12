@@ -6,8 +6,10 @@ import {
   checkIntegrityPins,
   githubAssetDigest,
   hubTagUrl,
+  imagePinFiles,
   npmIntegrityHex,
   onlineProbes,
+  parseOnlineFlags,
   parseShasums,
   verifyFetchedPin,
   verifyImageDigest,
@@ -105,7 +107,7 @@ describe("checkIntegrityPins", () => {
 
     expect(report.failures).toEqual([]);
 
-    const probe = onlineProbes(report, bumped).find(
+    const probe = onlineProbes(report, bumped, { images: true }).find(
       (entry) =>
         entry.kind === "shasums" && entry.name === "node SHASUMS256.txt"
     );
@@ -377,7 +379,11 @@ describe("onlineProbes", () => {
 
   test("the repository's pins probe every publisher source", () => {
     const files = repoFiles();
-    const probes = onlineProbes(checkIntegrityPins(files), files);
+
+    const probes = onlineProbes(checkIntegrityPins(files), files, {
+      images: true,
+    });
+
     const kinds = probes.map((probe) => probe.kind);
 
     expect(kinds).toContain("image");
@@ -417,7 +423,10 @@ describe("onlineProbes", () => {
 
   test("jup, npm and pnpm are checked against their registry integrity", () => {
     const files = repoFiles();
-    const probes = onlineProbes(checkIntegrityPins(files), files);
+
+    const probes = onlineProbes(checkIntegrityPins(files), files, {
+      images: true,
+    });
 
     const names = probes
       .filter((probe) => probe.kind === "npm-integrity")
@@ -426,6 +435,88 @@ describe("onlineProbes", () => {
     expect(names).toEqual(
       expect.arrayContaining(["jup", "npm", "pnpm", "@esbuild/linux-x64"])
     );
+  });
+});
+
+describe("online flags", () => {
+  test("--online-images implies --online; plain --online is the immutable set", () => {
+    expect(parseOnlineFlags([])).toEqual({ images: false, online: false });
+    expect(parseOnlineFlags(["--online"])).toEqual({
+      images: false,
+      online: true,
+    });
+    expect(parseOnlineFlags(["--online-images"])).toEqual({
+      images: true,
+      online: true,
+    });
+    expect(parseOnlineFlags(["--online", "--online-images"])).toEqual({
+      images: true,
+      online: true,
+    });
+  });
+
+  test("image probes are selected only with --online-images", () => {
+    const files = repoFiles();
+    const report = checkIntegrityPins(files);
+
+    const tarballs = onlineProbes(report, files, { images: false });
+    const all = onlineProbes(report, files, { images: true });
+
+    // Floating tags must not fail a PR that changed no pin: without the
+    // flag, no image tag is resolved.
+    expect(tarballs.map((probe) => probe.kind)).not.toContain("image");
+    expect(tarballs).toHaveLength(all.length - report.images.length);
+
+    // The immutable publisher pins (SHASUMS, npm integrity, release assets)
+    // run either way.
+    expect(tarballs.map((probe) => probe.kind)).toEqual(
+      expect.arrayContaining(["shasums", "npm-integrity", "github-asset"])
+    );
+
+    expect(all.filter((probe) => probe.kind === "image")).toHaveLength(
+      report.images.length
+    );
+  });
+
+  // check.yml resolves image tag digests only for a PR that changes one of
+  // these files, so its paths filter must keep listing every file the guard
+  // reads for an image pin: a new source outside the filter would silently
+  // demote that pin to the weekly drift run.
+  test("check.yml's image filter covers every file that carries an image pin", () => {
+    const lines = readRepoFile(".github/workflows/check.yml").split("\n");
+
+    const filters = lines.findIndex((line) =>
+      /^\s*filters: \|\s*$/u.test(line)
+    );
+
+    const image = lines.findIndex(
+      (line, index) => index > filters && /^\s+image:\s*$/u.test(line)
+    );
+
+    if (filters === -1 || image === -1) {
+      throw new Error("check.yml has no image paths filter");
+    }
+
+    const baseIndent = (/^\s*/u.exec(lines[image])?.[0] ?? "").length;
+    const globs: string[] = [];
+
+    for (const line of lines.slice(image + 1)) {
+      if (!line.trim()) {
+        continue;
+      }
+
+      if ((/^\s*/u.exec(line)?.[0] ?? "").length <= baseIndent) {
+        break;
+      }
+
+      const glob = /^\s*-\s+(?<glob>.+?)\s*$/u.exec(line)?.groups?.glob;
+
+      if (glob !== undefined) {
+        globs.push(glob.replaceAll(/^['"]|['"]$/gu, ""));
+      }
+    }
+
+    expect(globs).toEqual(expect.arrayContaining([...imagePinFiles]));
   });
 });
 
