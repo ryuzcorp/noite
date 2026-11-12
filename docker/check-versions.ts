@@ -14,8 +14,18 @@
  *   default, so the generator (which writes the Caddyfile `log` block from
  *   config) and the tailer read one file even when the ENV line is dropped.
  */
+import { spawnSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import path from "node:path";
+
+import {
+  checkIntegrityPins,
+  githubAssetDigest,
+  npmIntegrityHex,
+  onlineProbes,
+  parseShasums,
+} from "./check-pins";
+import type { OnlineProbe } from "./check-pins";
 
 const root = new URL("../", import.meta.url).pathname;
 
@@ -319,55 +329,37 @@ if (rustRefs.length === 1) {
   );
 }
 
-// The bundled store: compose.yaml must serve the version platforms.mdx
-// documents, or installs and docs disagree about what runs.
+// The bundled store and the image's supply chain: every external FROM is
+// digest-pinned, every downloaded tarball is verified against the publisher's
+// checksum, and compose.yaml's rustfs is tag@digest and matches what
+// platforms.mdx documents and what CI's runner tests pull.
 const composeYaml = read("docker/compose.yaml");
-
-const rustfsCompose = /rustfs\/rustfs:(?<version>[^\s"']+)/u.exec(composeYaml)
-  ?.groups?.version;
-
 const platformsDoc = read("apps/website/docs/self-hosting/platforms.mdx");
+const sidecars = read("docker/install-sidecars.sh");
+const ciWorkflow = read(".github/workflows/ci.yml");
 
-const rustfsDoc = /rustfs\/rustfs:(?<version>[0-9.]+)/u.exec(platformsDoc)
-  ?.groups?.version;
+const pinFiles = {
+  ci: ciWorkflow,
+  compose: composeYaml,
+  dockerfile,
+  docs: platformsDoc,
+  sidecars,
+};
 
-if (!rustfsCompose || !rustfsDoc) {
-  fail(
-    "rustfs: could not read the image tag from compose.yaml or platforms.mdx"
-  );
-} else if (rustfsCompose === rustfsDoc) {
-  console.log(`rustfs: ${rustfsCompose}`);
-} else {
-  fail(
-    `rustfs: compose.yaml serves ${rustfsCompose} but platforms.mdx documents ${rustfsDoc}`
-  );
+const pins = checkIntegrityPins(pinFiles);
+
+for (const failure of pins.failures) {
+  fail(failure);
 }
 
-// Sidecars (esbuild, duckdb): install-sidecars.sh is the single source of
-// truth — each default must appear exactly once and be well-formed, and the
-// Dockerfile must not carry its own version (it only invokes the script).
-const sidecars = read("docker/install-sidecars.sh");
+for (const image of pins.images) {
+  console.log(`image: ${image.name} @ ${image.digest.slice(0, 12)}…`);
+}
 
-for (const name of ["ESBUILD_VERSION", "DUCKDB_VERSION"] as const) {
-  const defaults = [
-    ...sidecars.matchAll(
-      new RegExp(`^${name}="\\$\\{${name}:-(?<v>[^}]+)\\}"`, "gmu")
-    ),
-  ].map((m) => m.groups?.v ?? "");
-
-  if (defaults.length !== 1 || !/^\d+\.\d+\.\d+$/u.test(defaults[0] ?? "")) {
-    fail(
-      `${name}: install-sidecars.sh must default it exactly once to x.y.z (found: ${defaults.join(", ")})`
-    );
-  } else {
-    console.log(`${name}: ${defaults[0]}`);
-  }
-
-  if (new RegExp(`\\b${name}=`, "u").test(dockerfile)) {
-    fail(
-      `${name}: docker/Dockerfile must not pin its own version (single source is install-sidecars.sh)`
-    );
-  }
+for (const download of pins.downloads) {
+  console.log(
+    `download: ${download.name} ${download.version} (${download.algo}, ${Object.keys(download.digests).join("/")})`
+  );
 }
 
 // `@noitenow/cli` ships its version to npm: the release commit bumps
@@ -466,6 +458,132 @@ if (drifted.length === 0) {
   fail(
     `ui lock: apps/noite/bun.lock drifts from bun.lock (regenerate it with the workspace versions): ${drifted.join(", ")}`
   );
+}
+
+// `--online`: compare every pin with what the publisher serves today. CI runs
+// this leg; the offline checks above stay the local gate (no network, no
+// docker). A version bumped without its digest fails here: SHASUMS256.txt,
+// npm's `dist.integrity`, the release asset digest and the tag's index digest
+// are the sources the pins claim to come from.
+const verifyImagePin = (
+  probe: Extract<OnlineProbe, { kind: "image" }>
+): string | undefined => {
+  const result = spawnSync(
+    "docker",
+    [
+      "buildx",
+      "imagetools",
+      "inspect",
+      probe.url,
+      "--format",
+      "{{json .Manifest.Digest}}",
+    ],
+    { encoding: "utf-8" }
+  );
+
+  const digest = (result.stdout ?? "").trim().replaceAll('"', "");
+
+  if (result.status !== 0) {
+    return `online: could not inspect ${probe.url}: ${(result.stderr ?? "").trim() || "docker failed"}`;
+  }
+
+  return digest === `sha256:${probe.digest}`
+    ? undefined
+    : `online: ${probe.url} now resolves to ${digest || "nothing"}, but the pin is sha256:${probe.digest}`;
+};
+
+const verifyFetchedPin = (
+  probe: Exclude<OnlineProbe, { kind: "image" }>,
+  text: string
+): string | undefined => {
+  if (probe.kind === "shasums") {
+    const entries = parseShasums(text);
+
+    for (const [file, expected] of Object.entries(probe.entries)) {
+      if (entries[file] !== expected) {
+        return `online: ${probe.url} lists ${file} as ${entries[file] ?? "nothing"}, but the pin is ${expected}`;
+      }
+    }
+
+    return undefined;
+  }
+
+  if (probe.kind === "npm-integrity") {
+    // SAFETY: registry.npmjs.org's per-version document; only
+    // `dist.integrity` is read, and a missing field is reported below.
+    const versionDoc = JSON.parse(text) as { dist?: { integrity?: string } };
+    const integrity = versionDoc.dist?.integrity;
+
+    return npmIntegrityHex(integrity ?? "") === probe.digest
+      ? undefined
+      : `online: ${probe.url} publishes ${integrity ?? "no integrity"}, but the pin is ${probe.digest}`;
+  }
+
+  const hex = githubAssetDigest(text, probe.asset);
+
+  return hex === probe.digest
+    ? undefined
+    : `online: ${probe.url} publishes ${probe.asset} as ${hex ?? "no digest"}, but the pin is ${probe.digest}`;
+};
+
+if (process.argv.includes("--online")) {
+  const cache = new Map<string, Promise<{ error?: string; text?: string }>>();
+
+  const fetchText = (
+    url: string
+  ): Promise<{ error?: string; text?: string }> => {
+    const hit = cache.get(url);
+
+    if (hit !== undefined) {
+      return hit;
+    }
+
+    const headers = new Headers({ "user-agent": "noite-check-versions" });
+    const token = process.env.GH_TOKEN;
+
+    if (token && url.startsWith("https://api.github.com/")) {
+      headers.set("authorization", `Bearer ${token}`);
+    }
+
+    const pending = (async () => {
+      const response = await fetch(url, { headers });
+
+      return response.ok
+        ? { text: await response.text() }
+        : { error: String(response.status) };
+    })();
+
+    cache.set(url, pending);
+
+    return pending;
+  };
+
+  const verify = async (probe: OnlineProbe): Promise<string | undefined> => {
+    if (probe.kind === "image") {
+      return verifyImagePin(probe);
+    }
+
+    const fetched = await fetchText(probe.url);
+
+    if (fetched.error !== undefined) {
+      return `online: ${probe.url} answered ${fetched.error}`;
+    }
+
+    return verifyFetchedPin(probe, fetched.text ?? "");
+  };
+
+  const probes = onlineProbes(pins, pinFiles);
+  const results = await Promise.all(probes.map((probe) => verify(probe)));
+
+  const mismatches = results.flatMap((failure) =>
+    failure === undefined ? [] : [failure]
+  );
+
+  for (const mismatch of mismatches) {
+    fail(mismatch);
+  }
+
+  console.log(`online: ${probes.length} publisher pins checked`);
 }
 
 if (failed) {
