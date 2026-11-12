@@ -13,6 +13,8 @@
 - A credential mint is fenced against the app delete: the delete removes the row while holding the same mint lock, and `ensure` refuses to mint for a row that is gone, so an in-flight fleet spawn can no longer leave a live key (invisible to the `revoking`-only sweep) for a deleted app. Operator-token and scoped-key boot reconciliation now also treats a missing _environment_ row as an orphan, and the loop retries an incomplete orphan-row pass every ten minutes instead of giving up after five attempts.
 - Create and delete failures name the step that failed and a failure class (timed out, denied, unavailable, not empty, …) plus a short `ref` that matches the runner log line, instead of a bare 500, a generic message, or the raw chain with the bucket, prefixes, work-dir paths and store stderr.
 
+- The delete's row transaction takes the database write lock up front (`BEGIN IMMEDIATE`). It reads the slug before it deletes the row, and a deferred transaction that another commit overtakes in that gap is refused immediately (`database is locked`) without the busy timeout retrying it — a delete always runs beside the previous delete's background wipe, so a delete could fail with an internal error and leave the app in place. Now the concurrent writer waits.
+
 ### Changed
 
 - `DELETE /v1/apps/{id}` answers as soon as the row is gone (3 s bound): `204` when the cleanup also finished, `202` while the credential revoke or the background wipe still runs. The app disappears from `apps.list`/`apps.get` immediately, as before.

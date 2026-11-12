@@ -547,8 +547,21 @@ pub async fn rebind_local_subdomains(pool: &SqlitePool, base_domain: &str) -> sq
 ///   valid key to the old owner after a new app took the same prefix
 ///   (review finding, 2026-11-12). Only the row state changes here; the
 ///   store-side revoke is the background sweep's job and retries.
+///
+/// `BEGIN IMMEDIATE`, not a deferred begin: this is the one transaction in
+/// `db/` that reads before it writes (the slug `SELECT` above), and a
+/// deferred transaction that reads first then writes is refused the moment
+/// another connection commits in between — `SQLITE_BUSY_SNAPSHOT`, reported
+/// as `database is locked` and *not* retried by `busy_timeout`, because the
+/// connection's read snapshot is already stale. A delete always runs next to
+/// the previous delete's background wipe (`clear_app_purges`), so that
+/// interleaving is routine rather than rare: it flaked
+/// `api::tests::apps_delete_agrees` in CI. Taking the write lock up front
+/// makes a concurrent writer wait (through the connection's `busy_timeout`)
+/// instead of making this transaction fail, and the row is read after the
+/// lock, so the snapshot it sees is the one it deletes.
 pub async fn delete_app(pool: &SqlitePool, id: &str) -> sqlx::Result<()> {
-    let mut tx = pool.begin().await?;
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
     let slug: Option<String> = sqlx::query_scalar("SELECT slug FROM main.app WHERE id = ?")
         .bind(id)
         .fetch_optional(&mut *tx)
@@ -1040,5 +1053,71 @@ mod tests {
         assert_eq!(app.subdomain, "new.localhost");
         assert_eq!(app.git_prefix, "git/new/");
         assert_eq!(app.fleet_bucket, "s3://noite/fleets/new");
+    }
+
+    /// A delete never runs alone: the previous delete's background wipe
+    /// (`clear_app_purges`), the credential sweep and the reconcile loop all
+    /// commit on the same database while it runs. `delete_app` reads the slug
+    /// before it writes, so a deferred begin would let one of those commits
+    /// land between the read and the `DELETE` — `SQLITE_BUSY_SNAPSHOT`,
+    /// reported as `database is locked` and never retried by the busy
+    /// timeout — and the app would stay undeleted with an internal error. The
+    /// transaction takes the write lock up front (`BEGIN IMMEDIATE`), so the
+    /// concurrent writer waits instead. This failed with the deferred begin.
+    #[tokio::test]
+    async fn a_concurrent_writer_never_fails_the_delete() {
+        let dir = std::env::temp_dir().join(format!("noite-delete-app-{}", new_id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let url = format!("sqlite:{}?mode=rwc", dir.join("noite.sqlite").display());
+        let pool = connect(&url).await.expect("connect");
+
+        // Stands in for the wipe's tombstone clear: a writer that commits
+        // between this transaction's read and its write.
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let writer = tokio::spawn({
+            let pool = pool.clone();
+            let stop = stop.clone();
+            async move {
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    sqlx::query(
+                        "INSERT OR REPLACE INTO main.app_purge (app_id, slug, created_at) \
+                         VALUES ('noise', 'noise', datetime('now'))",
+                    )
+                    .execute(&pool)
+                    .await
+                    .expect("concurrent writer");
+                    tokio::time::sleep(std::time::Duration::from_micros(20)).await;
+                }
+            }
+        });
+
+        let mut failed = Vec::new();
+        for i in 0..40 {
+            let id = format!("app-{i}");
+            let slug = format!("slug-{i}");
+            insert_app(&pool, &id, &slug, &format!("{slug}.localhost")).await;
+            if let Err(e) = delete_app(&pool, &id).await {
+                failed.push(format!("{id}: {e}"));
+            } else {
+                assert!(
+                    get_app(&pool, &id).await.expect("lookup").is_none(),
+                    "{id} was deleted"
+                );
+                let tombstone: i64 =
+                    sqlx::query_scalar("SELECT count(*) FROM main.app_purge WHERE app_id = ?")
+                        .bind(&id)
+                        .fetch_one(&pool)
+                        .await
+                        .expect("tombstone");
+                assert_eq!(tombstone, 1, "{id} keeps its purge tombstone");
+            }
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        writer.await.expect("writer task");
+        assert!(
+            failed.is_empty(),
+            "a concurrent writer failed the delete: {failed:?}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
