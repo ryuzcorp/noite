@@ -237,16 +237,13 @@ async fn delete_inner(
     require(role, "admin")?;
     let app = app_or_404(state, id).await?;
     let env = env_or_404(state, &app.id, env_id).await?;
-    env_teardown::teardown(
-        &state.config,
-        &state.pool,
-        &state.procs,
-        &state.logs,
-        (&env).into(),
-        false,
-    )
-    .await
-    .map_err(|e| ApiError::internal(format!("{e:#}")))?;
+    // Same id-keyed wipe as the ref-driven path: it re-reads the row under the
+    // app's push guard (so a queued ref teardown and this delete cannot wipe
+    // the environment twice, and a recycle of the slug is never touched) and
+    // is a no-op if that task already removed the row.
+    env_teardown::teardown_env_by_id(state, &env.app_id, &env.id)
+        .await
+        .map_err(|e| ApiError::internal(format!("{e:#}")))?;
     if let Err(e) = crate::host::edge_table::push_routes(&state.pool, &state.config).await {
         tracing::warn!(error = %format!("{e:#}"), "caddy rewrite after environment delete");
     }

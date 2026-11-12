@@ -524,6 +524,19 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
+    // A runner that died mid-wipe — or a shutdown between the ref move's
+    // manifest flip and the queued teardown — leaves a branch environment
+    // whose ref is gone; the reconcile loop would otherwise respawn its fleet
+    // for a deleted branch. Non-fatal: a failed read or wipe logs and leaves
+    // the row for the next boot.
+    let swept = host::env_teardown::sweep_orphan_branch_environments(&state).await;
+    if swept > 0 {
+        tracing::info!(swept, "removed branch environments whose ref is gone");
+        if let Err(e) = host::edge_table::push_routes(&state.pool, &state.config).await {
+            tracing::warn!(error = %format!("{e:#}"), "edge push after the orphan environment sweep");
+        }
+    }
+
     let cfg_loop = (*config).clone();
     let shutdown_loop = shutdown.clone();
     tokio::spawn(host::loop_::run_forever(
