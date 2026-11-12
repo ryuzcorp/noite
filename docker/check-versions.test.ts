@@ -5,6 +5,7 @@ import path from "node:path";
 import {
   checkIntegrityPins,
   githubAssetDigest,
+  hubTagUrl,
   npmIntegrityHex,
   onlineProbes,
   parseShasums,
@@ -279,6 +280,20 @@ describe("checkIntegrityPins", () => {
     );
   });
 
+  test("the Caddy builder is a pinned image, so the online leg resolves it", () => {
+    const files = repoFiles();
+    const report = checkIntegrityPins(files);
+
+    const caddyVersion = /ARG CADDY_VERSION=(?<version>\S+)/u.exec(
+      files.dockerfile
+    )?.groups?.version;
+
+    const caddy = report.images.find((image) => image.name.includes("caddy:"));
+
+    expect(caddy?.name).toBe(`docker.io/library/caddy:${caddyVersion}-builder`);
+    expect(caddy?.digest).toMatch(/^[0-9a-f]{64}$/u);
+  });
+
   test("a newly added archive download without a checksum line fails", () => {
     const files = repoFiles();
 
@@ -296,6 +311,18 @@ describe("checkIntegrityPins", () => {
 });
 
 describe("onlineProbes", () => {
+  test("docker.io tags resolve through the Hub API, other registries do not", () => {
+    expect(hubTagUrl("docker.io/library/node:24.22.3-slim")).toBe(
+      "https://hub.docker.com/v2/repositories/library/node/tags/24.22.3-slim"
+    );
+    expect(hubTagUrl("docker.io/oven/bun:1.4-slim")).toBe(
+      "https://hub.docker.com/v2/repositories/oven/bun/tags/1.4-slim"
+    );
+    expect(
+      hubTagUrl("ghcr.io/ryuzcorp/celld:0.6.3-ryuzcorp.8")
+    ).toBeUndefined();
+  });
+
   test("the repository's pins probe every publisher source", () => {
     const files = repoFiles();
     const probes = onlineProbes(checkIntegrityPins(files), files);
@@ -368,6 +395,12 @@ describe("publisher parsers", () => {
     expect(parseShasums(manifest)).toEqual({
       "node-v24.22.3-linux-arm64.tar.xz": arm64,
       "node-v24.22.3-linux-x64.tar.xz": x64,
+    });
+
+    // rustup publishes its checksum as `<hex> *./rustup-init` (the online
+    // probe expects exactly that file name): a format change must fail here.
+    expect(parseShasums(`${arm64} *./rustup-init`)).toEqual({
+      "./rustup-init": arm64,
     });
   });
 

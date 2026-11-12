@@ -27,6 +27,7 @@ import path from "node:path";
 
 import {
   checkIntegrityPins,
+  hubTagUrl,
   onlineProbes,
   verifyFetchedPin,
   verifyImageDigest,
@@ -88,16 +89,22 @@ const compareVersions = (a: string, b: string): number => {
 for (const [name, pattern] of [
   // celld comes from the ryuzcorp/celld fork (SPEC, celld): a
   // `<version>-ryuzcorp.<level>` tag, so any other form pins zero times.
-  ["celld", /ARG CELLD_VERSION=(?<version>\d+\.\d+\.\d+-ryuzcorp\.\d+)/gu],
-  ["celld digest", /ARG CELLD_DIGEST=(?<version>sha256:[0-9a-f]{64})/gu],
-  ["caddy", /ARG CADDY_VERSION=(?<version>\d+\.\d+\.\d+)/gu],
-  ["node", /ARG NODE_VERSION=(?<version>\d+\.\d+\.\d+)/gu],
-  ["jup", /ARG JUP_VERSION=(?<version>\d+\.\d+\.\d+)/gu],
-  ["jup digest", /ARG JUP_SHA512=(?<version>[0-9a-f]{128})/gu],
-  ["npm", /ARG NPM_VERSION=(?<version>\d+\.\d+\.\d+)/gu],
-  ["npm digest", /ARG NPM_SHA512=(?<version>[0-9a-f]{128})/gu],
-  ["pnpm", /ARG PNPM_VERSION=(?<version>\d+\.\d+\.\d+)/gu],
-  ["pnpm digest", /ARG PNPM_SHA512=(?<version>[0-9a-f]{128})/gu],
+  [
+    "celld",
+    /ARG CELLD_VERSION=(?<version>\d+\.\d+\.\d+-ryuzcorp\.\d+)(?=\s|$)/gu,
+  ],
+  [
+    "celld digest",
+    /ARG CELLD_DIGEST=(?<version>sha256:[0-9a-f]{64})(?=\s|$)/gu,
+  ],
+  ["caddy", /ARG CADDY_VERSION=(?<version>\d+\.\d+\.\d+)(?=\s|$)/gu],
+  ["node", /ARG NODE_VERSION=(?<version>\d+\.\d+\.\d+)(?=\s|$)/gu],
+  ["jup", /ARG JUP_VERSION=(?<version>\d+\.\d+\.\d+)(?=\s|$)/gu],
+  ["jup digest", /ARG JUP_SHA512=(?<version>[0-9a-f]{128})(?=\s|$)/gu],
+  ["npm", /ARG NPM_VERSION=(?<version>\d+\.\d+\.\d+)(?=\s|$)/gu],
+  ["npm digest", /ARG NPM_SHA512=(?<version>[0-9a-f]{128})(?=\s|$)/gu],
+  ["pnpm", /ARG PNPM_VERSION=(?<version>\d+\.\d+\.\d+)(?=\s|$)/gu],
+  ["pnpm digest", /ARG PNPM_SHA512=(?<version>[0-9a-f]{128})(?=\s|$)/gu],
   ["docker", /ARG DOCKER_VERSION=(?<version>\S+)/gu],
 ] as const) {
   const versions = [...dockerfile.matchAll(pattern)].map(
@@ -181,9 +188,11 @@ for (const [name, dockerPattern, runnerPattern] of [
 // exactly the image's CADDY_VERSION, or Go's minimum version selection
 // would silently raise the Caddy that ships.
 const caddyPin =
-  [...dockerfile.matchAll(/ARG CADDY_VERSION=(?<version>\d+\.\d+\.\d+)/gu)].map(
-    (m) => m.groups?.version ?? ""
-  )[0] ?? "";
+  [
+    ...dockerfile.matchAll(
+      /ARG CADDY_VERSION=(?<version>\d+\.\d+\.\d+)(?=\s|$)/gu
+    ),
+  ].map((m) => m.groups?.version ?? "")[0] ?? "";
 
 const edgeMod = read("edge/go.mod");
 
@@ -466,12 +475,8 @@ if (drifted.length === 0) {
   );
 }
 
-// `--online`: compare every pin with what the publisher serves today. CI runs
-// this leg; the offline checks above stay the local gate (no network, no
-// docker). A version bumped without its digest fails here: SHASUMS256.txt,
-// npm's `dist.integrity`, the release asset digest and the tag's index digest
-// are the sources the pins claim to come from.
-const verifyImagePin = (
+/** Non-Hub registries: resolve the tag's index digest through buildx. */
+const verifyImageViaDocker = (
   probe: Extract<OnlineProbe, { kind: "image" }>
 ): string | undefined => {
   const result = spawnSync(
@@ -496,6 +501,11 @@ const verifyImagePin = (
   return verifyImageDigest(probe, digest);
 };
 
+// `--online`: compare every pin with what the publisher serves today. CI runs
+// this leg; the offline checks above stay the local gate (no network, no
+// docker). A version bumped without its digest fails here: SHASUMS256.txt,
+// npm's `dist.integrity`, the release asset digest and the tag's index digest
+// are the sources the pins claim to come from.
 if (process.argv.includes("--online")) {
   const cache = new Map<string, Promise<{ error?: string; text?: string }>>();
 
@@ -536,7 +546,23 @@ if (process.argv.includes("--online")) {
 
   const verify = async (probe: OnlineProbe): Promise<string | undefined> => {
     if (probe.kind === "image") {
-      return verifyImagePin(probe);
+      const hubUrl = hubTagUrl(probe.url);
+
+      if (hubUrl === undefined) {
+        return verifyImageViaDocker(probe);
+      }
+
+      const fetched = await fetchText(hubUrl);
+
+      if (fetched.error !== undefined) {
+        return `online: could not resolve ${probe.url}: ${fetched.error}`;
+      }
+
+      // SAFETY: Docker Hub's tag document; only `digest` is read, and a
+      // missing field is reported as a mismatch below.
+      const tagDoc = JSON.parse(fetched.text ?? "") as { digest?: string };
+
+      return verifyImageDigest(probe, tagDoc.digest ?? "");
     }
 
     const fetched = await fetchText(probe.url);

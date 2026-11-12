@@ -593,6 +593,24 @@ export const verifyFetchedPin = (
     : `online: ${probe.url} publishes ${probe.asset} as ${hex ?? "no digest"}, but the pin is ${probe.digest}`;
 };
 
+/**
+ * Docker Hub's tag document carries the tag's current index digest and has a
+ * far higher anonymous limit than the registry manifest API (which 429s
+ * shared CI addresses). Returns undefined for any other registry, whose tag
+ * is resolved through `docker buildx imagetools` instead.
+ */
+export const hubTagUrl = (ref: string): string | undefined => {
+  const match = /^docker\.io\/(?<repository>[^:\s]+):(?<tag>[^:\s]+)$/u.exec(
+    ref
+  );
+
+  if (!match?.groups?.repository || !match.groups.tag) {
+    return undefined;
+  }
+
+  return `https://hub.docker.com/v2/repositories/${match.groups.repository}/tags/${match.groups.tag}`;
+};
+
 /** The index digest a tag resolves to compared with the digest it pins. */
 export const verifyImageDigest = (
   probe: Extract<OnlineProbe, { kind: "image" }>,
