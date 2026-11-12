@@ -453,10 +453,10 @@ pub async fn rename_app(
                 // A tombstone left behind would let the purge resume pass wipe
                 // the target *after* this rename moved objects into it: fail
                 // before moving anything instead.
-                crate::host::purge::settle_slug(cfg, pool, new_slug)
+                crate::db::clear_app_purges(pool, new_slug)
                     .await
                     .with_context(|| {
-                        format!("settle the target slug's purge tombstone for {new_slug}")
+                        format!("clear the target slug's purge tombstone for {new_slug}")
                     })?;
                 // Written *after* the wipe (so it never vouches for a prefix
                 // the wipe did not finish) and *before* the first move.

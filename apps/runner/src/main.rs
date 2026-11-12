@@ -564,6 +564,18 @@ async fn main() -> anyhow::Result<()> {
             }
         });
     }
+    // CI cache volumes no live app owns: a legacy slug-keyed name, a deleted
+    // app whose wipe died, a rename. Detached and non-fatal, like the sweeps
+    // below; the slow loop tick runs it again.
+    {
+        let state = state.clone();
+        service::detached::spawn("ci-cache:sweep".to_string(), async move {
+            let removed = host::purge::reconcile_ci_caches(&state.config, &state.pool).await;
+            if removed > 0 {
+                tracing::info!(removed, "removed orphaned CI cache volumes");
+            }
+        });
+    }
     // Credential rows whose app row is gone (a delete that died before the
     // atomic mark, or a database from an older build) are marked/dropped
     // before anything can be minted on a re-created slug's prefix. Local-only

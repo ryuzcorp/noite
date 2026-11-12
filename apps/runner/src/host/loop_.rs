@@ -214,6 +214,14 @@ pub async fn run_forever(
                         "resumed pending app purges"
                     );
                 }
+                // CI cache volumes no live app owns (a legacy slug-keyed
+                // name, a wipe that died, a rename): the delete's own removal
+                // is the fast path, this is the durable one. Never under a
+                // slug guard.
+                let removed = crate::host::purge::reconcile_ci_caches(&cfg2, &pool2).await;
+                if removed > 0 {
+                    tracing::info!(removed, "removed orphaned CI cache volumes");
+                }
                 flag.store(false, Ordering::SeqCst);
             });
         }

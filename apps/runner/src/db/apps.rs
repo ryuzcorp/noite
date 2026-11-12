@@ -617,17 +617,12 @@ pub async fn pending_purges(pool: &SqlitePool) -> sqlx::Result<Vec<String>> {
         .await
 }
 
-/// The app ids whose tombstone is still owed for `slug`. A freed slug can
-/// carry several (deleted, re-created, deleted again), and each one reserves
-/// a build uid and a CI cache volume that the wipe must remove before the
-/// tombstones go.
-pub async fn pending_purge_apps(pool: &SqlitePool, slug: &str) -> sqlx::Result<Vec<String>> {
-    sqlx::query_scalar(
-        "SELECT app_id FROM main.app_purge WHERE slug = ? ORDER BY created_at, app_id",
-    )
-    .bind(slug)
-    .fetch_all(pool)
-    .await
+/// Every existing app id: the CI cache sweep keeps the volumes these own and
+/// removes the rest.
+pub async fn app_ids(pool: &SqlitePool) -> sqlx::Result<Vec<String>> {
+    sqlx::query_scalar("SELECT id FROM main.app")
+        .fetch_all(pool)
+        .await
 }
 
 /// Drop every tombstone for `slug`: a wipe of its prefixes finished while no

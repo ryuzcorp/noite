@@ -222,8 +222,8 @@ async fn create_inner(
             // this guard): every pending-purge tombstone for it is satisfied.
             // A failure only leaves them for the resume pass, which re-checks
             // the row and wipes an empty prefix — never fail the create for it.
-            if let Err(e) = purge::settle_slug(&state.config, &state.pool, slug).await {
-                tracing::warn!(slug, error = %format!("{e:#}"), "could not settle the slug's purge tombstones");
+            if let Err(e) = db::clear_app_purges(&state.pool, slug).await {
+                tracing::warn!(slug, error = %e, "could not clear the slug's purge tombstones");
             }
         }
         Ok(purge::Purged::Stopped) => {
@@ -856,6 +856,17 @@ async fn delete_inner(state: &AppState, id: &str) -> Result<(), ApiError> {
     // the slug unusable — that was the "deleted app, slug still taken" bug.
     drop(push);
     drop(claim);
+    // The CI cache volume goes with the slug's data, but its removal never
+    // gates the answer or the tombstone: it runs detached (no slug guard
+    // held), and `purge::reconcile_ci_caches` retries whatever fails here.
+    {
+        let (cfg, app_id) = (state.config.clone(), app.id.clone());
+        tokio::spawn(async move {
+            if let Err(e) = purge::remove_ci_cache_volume(&cfg, &app_id).await {
+                tracing::warn!(app_id = %app_id, error = %format!("{e:#}"), "could not remove the app's CI cache volume; the reconcile sweep retries");
+            }
+        });
+    }
     // The row is gone and the slug is free: only best-effort work is left,
     // which is the state a caller's 202 keeps the app in.
     DELETIONS.advance(id, DeletePhase::Cleanup);
@@ -917,8 +928,8 @@ async fn delete_inner(state: &AppState, id: &str) -> Result<(), ApiError> {
                 }
             };
             if satisfied {
-                if let Err(e) = purge::settle_slug(&state.config, &state.pool, &slug).await {
-                    tracing::warn!(slug, error = %format!("{e:#}"), "could not settle the slug's purge tombstones");
+                if let Err(e) = db::clear_app_purges(&state.pool, &slug).await {
+                    tracing::warn!(slug, error = %e, "could not clear the slug's purge tombstones");
                 }
             }
             drop(guard);

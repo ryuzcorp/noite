@@ -36,15 +36,13 @@ const CI_CONFIG_NAME: &str = "noite.ci.yaml";
 /// tenant's package caches readable by another, and never removed by the
 /// delete's wipe (merge-group e2e finding, 2026-11-12).
 pub fn ci_cache_volume(app_id: &str) -> String {
-    format!("noite-ci-cache-{app_id}")
+    format!("{}{app_id}", ci_cache_volume_prefix())
 }
 
-/// The slug-keyed volume older builds created (`noite-ci-cache-<slug>`).
-/// Nothing mounts it any more — [`ci_cache_volume`] replaced it — but it is
-/// still on disk for every app deleted before that change, so the wipe
-/// removes it by name.
-pub fn legacy_ci_cache_volume(slug: &str) -> String {
-    format!("noite-ci-cache-{slug}")
+/// Every CI cache volume's name starts with this: the reconcile sweep lists
+/// by it and treats the rest of the name as an app id.
+pub fn ci_cache_volume_prefix() -> &'static str {
+    "noite-ci-cache-"
 }
 
 /// Per-app exclusive lock shared by deploy and purge/delete so S3 fleets/git
@@ -2737,10 +2735,11 @@ pub async fn deploy_tip(
 #[cfg(test)]
 mod tests {
     use super::{
-        activate_after_staged_migrate, ci_cache_volume, contained_deploy_root, failure_summary,
-        go_arch, has_build_script, legacy_ci_cache_volume, log_migrate_warnings, migrate_void_app,
-        migrate_void_app_staged, parse_wrangler_build, probe_staged_generation, quoted, route_live,
-        wipe_worktree, without_runner_keys, DeployTarget, MigrateInputs, Progress,
+        activate_after_staged_migrate, ci_cache_volume, ci_cache_volume_prefix,
+        contained_deploy_root, failure_summary, go_arch, has_build_script, log_migrate_warnings,
+        migrate_void_app, migrate_void_app_staged, parse_wrangler_build, probe_staged_generation,
+        quoted, route_live, wipe_worktree, without_runner_keys, DeployTarget, MigrateInputs,
+        Progress,
     };
     use crate::models::DeployStatus;
     use serde_json::json;
@@ -2753,7 +2752,7 @@ mod tests {
     fn the_ci_cache_volume_is_keyed_by_app_id() {
         assert_eq!(ci_cache_volume("6f1e-4a"), "noite-ci-cache-6f1e-4a");
         assert_ne!(ci_cache_volume("6f1e-4a"), ci_cache_volume("6f1e-4b"));
-        assert_eq!(legacy_ci_cache_volume("shop"), "noite-ci-cache-shop");
+        assert!(ci_cache_volume("6f1e-4a").starts_with(ci_cache_volume_prefix()));
     }
 
     /// A client that waits for the deploy row (the CLI, the UI, the e2e)
