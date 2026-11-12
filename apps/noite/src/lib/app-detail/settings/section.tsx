@@ -30,7 +30,7 @@ export const SettingsSection = ({
     <div class="flex flex-wrap items-center justify-between gap-2">
       <h2
         id={settingsSectionAnchor(section)}
-        class={`m-0 scroll-mt-4 text-lg font-semibold${
+        class={`m-0 scroll-mt-16 text-lg font-semibold${
           section === "danger" ? " text-error" : ""
         }`}
       >
