@@ -211,6 +211,28 @@ pub async fn environment_route(
         .await
 }
 
+/// Every row's fleet ports, regardless of kind. A retired row's pair may
+/// still be bound by an orphaned fleet, so the allocator
+/// ([`super::alloc::next_ports_in`]) must keep reserving it even though model
+/// reads skip the row.
+pub async fn list_environment_ports(
+    pool: &SqlitePool,
+) -> sqlx::Result<Vec<(Option<i64>, Option<i64>)>> {
+    sqlx::query_as("SELECT listen_port, internal_port FROM environment")
+        .fetch_all(pool)
+        .await
+}
+
+/// Every label under one app, regardless of kind: the unique `(app_id, label)`
+/// index does not filter, so a label a retired row still holds must be
+/// suffixed instead of colliding on insert.
+pub async fn list_environment_labels(pool: &SqlitePool, app_id: &str) -> sqlx::Result<Vec<String>> {
+    sqlx::query_scalar("SELECT label FROM environment WHERE app_id = ?")
+        .bind(app_id)
+        .fetch_all(pool)
+        .await
+}
+
 /// Remove one environment row without reading it back. The boot teardown of
 /// retired rows needs this: `EnvironmentKind` can no longer decode a
 /// `workspace` row, so the row is never loaded as a model.

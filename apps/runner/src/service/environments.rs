@@ -108,14 +108,12 @@ async fn check_caps(state: &AppState, app_id: &str) -> Result<(), ApiError> {
 
 /// The labels already taken in one app (the unique `(app_id, label)` index's
 /// input, read before the insert so a collision gets a suffix instead of an
-/// error).
+/// error). Raw, kind-independent: a retired row still holds its label in the
+/// index even though model reads skip it.
 async fn taken_labels(state: &AppState, app_id: &str) -> Result<Vec<String>, ApiError> {
-    Ok(db::list_environments(&state.pool, app_id)
+    db::list_environment_labels(&state.pool, app_id)
         .await
-        .map_err(|e| ApiError::internal(e.to_string()))?
-        .into_iter()
-        .map(|e| e.label)
-        .collect())
+        .map_err(|e| ApiError::internal(e.to_string()))
 }
 
 /// Create an environment from a branch and deploy its head. `main` is the app

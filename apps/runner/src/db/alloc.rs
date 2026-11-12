@@ -172,12 +172,18 @@ pub async fn next_ports_in(
     max: u16,
 ) -> Result<(i64, i64), AllocError> {
     let apps = list_all_apps(pool).await?;
-    let envs = super::environments::list_all_environments(pool).await?;
+    // Raw, kind-independent: a retired row's pair may still be bound by an
+    // orphaned fleet even though model reads skip the row.
+    let env_ports = super::environments::list_environment_ports(pool).await?;
     let mut used = std::collections::HashSet::new();
     for p in apps
         .iter()
         .flat_map(|a| [a.listen_port, a.internal_port])
-        .chain(envs.iter().flat_map(|e| [e.listen_port, e.internal_port]))
+        .chain(
+            env_ports
+                .iter()
+                .flat_map(|(listen, internal)| [*listen, *internal]),
+        )
         .flatten()
     {
         // Only the allocator writes ports, so stored values are in range;
@@ -423,5 +429,32 @@ mod tests {
         ));
         pool.close().await;
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A retired `kind='workspace'` row is skipped by model reads, but its
+    /// pair may still be bound by an orphaned fleet: the allocator keeps
+    /// reserving it.
+    #[tokio::test]
+    async fn retired_environment_rows_still_reserve_their_ports() {
+        let pool = connect("sqlite::memory:").await.expect("boot");
+        insert_app(&pool, "a", "a").await;
+        sqlx::query(
+            "INSERT INTO environment (id, app_id, label, kind, git_ref, created_by, \
+             fleet_bucket, listen_port, internal_port, desired_state, created_at, updated_at) \
+             VALUES ('legacy', 'a', 'wip', 'workspace', 'refs/previews/u/wip', '', \
+             's3://noite/envs/a/wip', 20000, 20001, 'running', \
+             '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .expect("legacy row");
+        assert_eq!(
+            next_ports_in(&pool, 20000, 20003)
+                .await
+                .expect("next free pair"),
+            (20002, 20003),
+            "a retired row's ports are still bound"
+        );
+        pool.close().await;
     }
 }
