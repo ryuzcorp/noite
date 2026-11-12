@@ -158,22 +158,63 @@ pub async fn on_refs_deleted(state: &crate::AppState, app: &App, deleted: &[Stri
         #[cfg(test)]
         let task = teardown_task(&env.id);
         tokio::spawn(async move {
-            if let Err(e) = teardown(
-                &state.config,
-                &state.pool,
-                &state.procs,
-                &state.logs,
-                (&env).into(),
-                false,
-            )
-            .await
-            {
-                tracing::warn!(env_id = %env.id, error = %format!("{e:#}"), "environment teardown failed");
+            // Everything the wipe touches is keyed by identifiers a later app
+            // generation can reuse: `(slug, label)`, the fleet key and
+            // `envs/<slug>/<label>/`. A purge cascades the row away and frees
+            // the slug, so a successor could be serving that prefix while this
+            // task runs. `guarded_teardown_row` re-takes the push guard and
+            // re-reads the row by its immutable id: a gone row means a purge
+            // (or another teardown) owns the prefix now, and the row's current
+            // slug — never the queued snapshot — is what a rename left behind.
+            if let Some((_push_guard, row)) = guarded_teardown_row(&state, &env).await {
+                if let Err(e) = teardown(
+                    &state.config,
+                    &state.pool,
+                    &state.procs,
+                    &state.logs,
+                    (&row).into(),
+                    false,
+                )
+                .await
+                {
+                    tracing::warn!(env_id = %env.id, error = %format!("{e:#}"), "environment teardown failed");
+                }
             }
             #[cfg(test)]
             crate::service::detached::finished(&task).notify_one();
         });
     }
+}
+
+/// The environment row a queued teardown may wipe, re-read under its app's
+/// push guard, which the caller keeps for the wipe. `None` when the row is
+/// already gone (a purge cascaded it away, or another teardown finished it),
+/// when the store read fails, or when the app kept being renamed between the
+/// queue and the guard.
+///
+/// A rename's `lock_pair` takes the old and new slug guards together, and this
+/// holds exactly one at a time, so following a rename cannot deadlock with it.
+async fn guarded_teardown_row(
+    state: &crate::AppState,
+    env: &Environment,
+) -> Option<(tokio::sync::OwnedMutexGuard<()>, Environment)> {
+    let mut slug = env.app_slug.clone();
+    // A rename storm is not a reason to wipe the wrong app: give up (the row
+    // stays, an explicit `environments.delete` still works) after a few moves.
+    for _ in 0..3 {
+        let guard = state.wal.lock(&slug).await;
+        match db::get_environment(&state.pool, &env.id).await {
+            Ok(Some(row)) if row.app_slug == slug => return Some((guard, row)),
+            Ok(Some(row)) => slug = row.app_slug,
+            Ok(None) => return None,
+            Err(e) => {
+                tracing::warn!(env_id = %env.id, error = %e, "environment teardown: could not re-read the row");
+                return None;
+            }
+        }
+    }
+    tracing::warn!(env_id = %env.id, "environment teardown: the app kept being renamed");
+    None
 }
 
 /// The test-only name of one queued teardown's completion signal.
@@ -446,19 +487,16 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// The wipe must not hold the ref move: `prs.merge`'s `deleteBranch`
-    /// publish awaited it, so a preview environment's graceful fleet stop
-    /// (up to 15 s) pushed the merge past the control plane's 5 s runner
-    /// bound and the abort dropped the half-done wipe.
-    #[tokio::test]
-    async fn ref_teardown_runs_off_the_ref_move() {
-        let dir = std::env::temp_dir().join(format!("noite-env-queue-{}", new_id()));
-        std::fs::create_dir_all(&dir).expect("temp dir");
+    /// A state whose app is `tear`, with `s3_endpoint` as its object store.
+    async fn ref_teardown_state(
+        dir: &std::path::Path,
+        s3_endpoint: &str,
+    ) -> (crate::AppState, App) {
         let url = format!("sqlite:{}?mode=rwc", dir.join("noite.sqlite").display());
         let pool = db::connect(&url).await.expect("boot");
         let mut cfg = crate::config::config_for_tests();
         cfg.work_dir = dir.join("work").to_string_lossy().into_owned();
-        cfg.s3_endpoint = crate::testutil::spawn_s3_stub().await;
+        cfg.s3_endpoint = s3_endpoint.into();
         let state = crate::AppState {
             pool: pool.clone(),
             config: std::sync::Arc::new(cfg.clone()),
@@ -497,22 +535,44 @@ mod tests {
         )
         .await
         .expect("app");
-        let env = db::create_environment(
-            &pool,
+        (state, app)
+    }
+
+    async fn ref_teardown_env(
+        state: &crate::AppState,
+        app: &App,
+        label: &str,
+        git_ref: &str,
+        listen: i64,
+    ) -> Environment {
+        db::create_environment(
+            &state.pool,
             &state.config,
             db::NewEnvironment {
                 app_id: &app.id,
                 slug: "tear",
-                label: "gone",
+                label,
                 kind: EnvironmentKind::Branch,
-                git_ref: "refs/heads/gone",
+                git_ref,
                 created_by: "user_1",
-                listen: 30110,
-                internal: 30111,
+                listen,
+                internal: listen + 1,
             },
         )
         .await
-        .expect("env");
+        .expect("env")
+    }
+
+    /// The wipe must not hold the ref move: `prs.merge`'s `deleteBranch`
+    /// publish awaited it, so a preview environment's graceful fleet stop
+    /// (up to 15 s) pushed the merge past the control plane's 5 s runner
+    /// bound and the abort dropped the half-done wipe.
+    #[tokio::test]
+    async fn ref_teardown_runs_off_the_ref_move() {
+        let dir = std::env::temp_dir().join(format!("noite-env-queue-{}", new_id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let (state, app) = ref_teardown_state(&dir, &crate::testutil::spawn_s3_stub().await).await;
+        let env = ref_teardown_env(&state, &app, "gone", "refs/heads/gone", 30110).await;
 
         let done = teardown_finished(&env);
         on_refs_deleted(&state, &app, std::slice::from_ref(&env.git_ref)).await;
@@ -528,6 +588,70 @@ mod tests {
         );
         done.notified().await;
         assert!(db::get_environment(&state.pool, &env.id)
+            .await
+            .unwrap()
+            .is_none());
+        state.pool.clone().close().await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A queued wipe must never follow a reusable `(slug, label)` into a
+    /// successor app: the ref move's push guard is released when it returns,
+    /// so a purge can free the slug and a successor mint the same label before
+    /// the task runs. The task re-takes that guard and re-reads its row by the
+    /// immutable id first, so a gone row means the prefix is not its.
+    #[tokio::test]
+    async fn queued_teardown_never_wipes_a_successor_app() {
+        let dir = std::env::temp_dir().join(format!("noite-env-successor-{}", new_id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let (state, old_app) =
+            ref_teardown_state(&dir, &crate::testutil::spawn_s3_stub().await).await;
+        let old_env = ref_teardown_env(&state, &old_app, "gone", "refs/heads/gone", 30110).await;
+
+        // Hold the guard the ref move held, so the queued task cannot start
+        // until the purge and the successor are in place.
+        let guard = state.wal.lock("tear").await;
+        let done = teardown_finished(&old_env);
+        on_refs_deleted(&state, &old_app, std::slice::from_ref(&old_env.git_ref)).await;
+
+        // The purge cascades the old row away and frees the slug; a successor
+        // takes it and mints the same branch label.
+        db::delete_app(&state.pool, &old_app.id)
+            .await
+            .expect("purge app");
+        let successor = db::create_app(
+            &state.pool,
+            &state.config,
+            db::NewApp {
+                name: "tear again",
+                slug: "tear",
+                user_id: "local",
+                subdomain: "tear.localhost",
+                listen: 30100,
+                internal: 30101,
+            },
+        )
+        .await
+        .expect("successor app");
+        let successor_env =
+            ref_teardown_env(&state, &successor, "gone", "refs/heads/gone", 30110).await;
+        let successor_dir = supervisor::env_state_dir(&state.config, "tear", "gone");
+        std::fs::create_dir_all(&successor_dir).expect("successor state dir");
+        std::fs::write(successor_dir.join("deploy.json"), "{}").expect("successor state");
+
+        drop(guard);
+        done.notified().await;
+
+        // The task found its row gone and left the successor's prefix alone.
+        assert!(
+            successor_dir.exists(),
+            "the successor's state dir must survive the queued wipe"
+        );
+        assert!(db::get_environment(&state.pool, &successor_env.id)
+            .await
+            .unwrap()
+            .is_some());
+        assert!(db::get_environment(&state.pool, &old_env.id)
             .await
             .unwrap()
             .is_none());
