@@ -374,22 +374,89 @@ export const readInviteCode = async (page: Page): Promise<string> => {
     has: page.getByRole("heading", { name: "Invitations" }),
   });
 
+  // The card paints this tab's last snapshot (sessionStorage) until the fresh
+  // list lands, and that snapshot can name codes a parallel worker has spent
+  // since. So "does this account still have a code" is answered by the
+  // myInviteCodes call itself, never by what the card has painted.
+  const listed = page.waitForResponse(
+    (response) =>
+      response.url().includes("/api/account/myInviteCodes") &&
+      response.request().method() === "POST"
+  );
+
   await page.goto("/account");
   await expect(invitesCard).toBeVisible();
 
-  if ((await invitesCard.locator("code").count()) === 0) {
+  const listedResponse = await listed;
+
+  if (!listedResponse.ok()) {
+    throw new Error(`myInviteCodes failed with ${listedResponse.status()}`);
+  }
+
+  // SAFETY: account.server's myInviteCodes answers the account's unused codes;
+  // the first one is handed out.
+  const available = (await listedResponse.json()) as { code: string }[];
+
+  let known = available[0]?.code ?? "";
+
+  if (known === "") {
     await page.goto("/apps/_control?t=invites");
+    await expect(page.locator("#invite-count")).toBeVisible();
     await page.locator("#invite-count").fill("1");
+
+    // The mint is a POST the pool reloads after. Navigating to /account
+    // before it answers aborted it on the wire — the trace shows
+    // adminCreateInvites at status -1 and an empty `/account` list right
+    // after (runs 43133528648 and 43180768531) — so the click needs the
+    // response as its completion signal: `#admin-invite-search` is on screen
+    // before the click, which proved nothing.
+    const minted = page.waitForResponse(
+      (response) =>
+        response.url().includes("/api/admin/adminCreateInvites") &&
+        response.request().method() === "POST"
+    );
+
     await page.getByRole("button", { exact: true, name: "Generate" }).click();
-    await expect(page.locator("#admin-invite-search")).toBeVisible();
+
+    const mintedResponse = await minted;
+
+    if (!mintedResponse.ok()) {
+      throw new Error(
+        `adminCreateInvites failed with ${mintedResponse.status()}`
+      );
+    }
+
+    // SAFETY: admin.server's adminCreateInvites answers the minted rows; only
+    // the first code is read.
+    const created = (await mintedResponse.json()) as {
+      codes?: { code?: string }[];
+    };
+
+    const mintedCode = created.codes?.[0]?.code ?? "";
+
+    if (mintedCode === "") {
+      throw new Error("adminCreateInvites answered no code");
+    }
+
+    // Then the row: the panel refetches the pool after the mint, so the new
+    // code being on screen is the proof the write landed and the panel saw
+    // it.
+    await expect(
+      page.locator("code", { hasText: mintedCode }).first()
+    ).toBeVisible();
+
+    known = mintedCode;
     await page.goto("/account");
   }
 
-  const raw = await invitesCard
-    .locator("code")
-    .first()
-    .textContent({ timeout: 15_000 });
+  // The card is the contract: it must show the code the server says is
+  // available. It cannot paint that one by stale accident — the snapshot from
+  // the previous load predates either read.
+  const shown = invitesCard.locator("code", { hasText: known }).first();
 
+  await expect(shown).toBeVisible();
+
+  const raw = await shown.textContent();
   const code = raw?.trim() ?? "";
 
   if (code === "") {
