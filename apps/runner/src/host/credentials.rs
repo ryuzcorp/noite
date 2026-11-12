@@ -713,6 +713,11 @@ impl OrphanRows {
 /// Local-only (no store call) and non-fatal: boot logs a failure and leaves the
 /// rows for the next boot; the loop's first tick runs [`sweep`].
 pub async fn reconcile_orphans(pool: &sqlx::SqlitePool) -> anyhow::Result<OrphanRows> {
+    // Same fence as `sweep`/`ensure`: a mint that commits a row while this
+    // reads must be serialized with the read-and-mark, so the pass can never
+    // mark a key that a concurrent ensure just minted for a live app (and the
+    // token cache eviction is only consistent with its row under this lock).
+    let _guard = MUTATE.lock().await;
     let mut report = OrphanRows::default();
     for row in db::orphan_scoped_credentials(pool).await? {
         if row.state == db::ScopedCredentialState::Live {
