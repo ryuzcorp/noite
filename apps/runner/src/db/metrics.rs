@@ -95,7 +95,10 @@ pub async fn list_app_metrics(
 ) -> sqlx::Result<Vec<AppMetric>> {
     sqlx::query_as::<_, AppMetric>(
         r#"SELECT app_id, bucket_hour AS bucket_ts, requests, errors, p50_ms, p95_ms,
-                  mem_max_bytes AS memory_max_bytes, mem_avg_bytes AS memory_avg_bytes, cpu_ms
+                  mem_max_bytes AS memory_max_bytes,
+                  CASE WHEN mem_samples > 0 THEN mem_sum_bytes / mem_samples ELSE 0 END
+                    AS memory_avg_bytes,
+                  cpu_ms
            FROM metrics.app_hour WHERE app_id = ? AND environment_id = ? AND bucket_hour >= ?
            ORDER BY bucket_hour ASC"#,
     )

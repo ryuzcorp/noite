@@ -800,7 +800,18 @@ pub async fn sleep_environment(
         let owner_config = owner.as_ref().and_then(|a| a.deployed_config.as_deref());
         match auto_sleep_after_s(own, owner_config, cfg.sleep_after_s) {
             Some(after_s) => {
-                if !should_sleep_s(Utc::now(), &environment_activity(pool, &env).await, after_s) {
+                // Same rule as `sleep_app`: a burst skip inside the window
+                // means the feed may be missing this environment's requests,
+                // so the decision made by the sweep cannot be acted on here.
+                let now = Utc::now();
+                if skip_inside_window(access_log_skip_at(pool).await, now, after_s) {
+                    tracing::debug!(
+                        fleet = %format!("{}.{}", env.app_slug, env.label),
+                        "sleep refused: the access log dropped a burst inside the sleep window"
+                    );
+                    return Ok(false);
+                }
+                if !should_sleep_s(now, &environment_activity(pool, &env).await, after_s) {
                     return Ok(false);
                 }
             }
@@ -2073,6 +2084,84 @@ mod env_activity_tests {
             still_quiet[0], None,
             "production traffic must not count for the environment"
         );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A burst skip inside the window blocks an environment's idle park too:
+    /// `sleep_environment` re-checks it under its own lock (not only in the
+    /// sweep), so a skip that lands between the sweep's decision and the park
+    /// still wins, exactly like `sleep_app`.
+    #[tokio::test]
+    async fn a_burst_skip_blocks_environment_parking() {
+        let dir =
+            std::env::temp_dir().join(format!("noite-sleep-envskip-{}", crate::models::new_id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let pool = crate::db::connect(&format!(
+            "sqlite:{}?mode=rwc",
+            dir.join("noite.sqlite").display()
+        ))
+        .await
+        .expect("temp db");
+        let app = seed_app(&pool).await;
+        let env = seed_env(&pool, &app, "skipped", "refs/heads/skipped").await;
+        crate::db::write_environment_status(
+            &pool,
+            &env.id,
+            AppStatus::Running,
+            None,
+            crate::models::WriteGuard::Table,
+        )
+        .await
+        .expect("running");
+        // The creation clock is the only activity; make it older than the
+        // window so only the skip can refuse the park.
+        sqlx::query("UPDATE environment SET created_at = ? WHERE id = ?")
+            .bind((Utc::now() - chrono::Duration::hours(3)).to_rfc3339())
+            .bind(&env.id)
+            .execute(&pool)
+            .await
+            .expect("backdate");
+        let mut cfg = crate::config::config_for_tests();
+        cfg.sleep_after_s = 3600;
+        let procs = supervisor::new_procs();
+        crate::db::set_setting(
+            &pool,
+            crate::db::ACCESS_LOG_SKIP_AT,
+            &Utc::now().to_rfc3339(),
+        )
+        .await
+        .expect("skip stamp");
+        assert!(
+            !sleep_environment(&pool, &cfg, &procs, &env.id, false)
+                .await
+                .expect("refused park"),
+            "a skip inside the window refuses the park under the lock"
+        );
+        let fresh = crate::db::get_environment(&pool, &env.id)
+            .await
+            .expect("get")
+            .expect("row");
+        assert!(fresh.asleep_since.is_none(), "still awake");
+        // Once the skip is older than the window it changes nothing.
+        crate::db::set_setting(
+            &pool,
+            crate::db::ACCESS_LOG_SKIP_AT,
+            &(Utc::now() - chrono::Duration::hours(2)).to_rfc3339(),
+        )
+        .await
+        .expect("old skip stamp");
+        assert!(
+            sleep_environment(&pool, &cfg, &procs, &env.id, false)
+                .await
+                .expect("park"),
+            "an old skip no longer blocks"
+        );
+        let parked = crate::db::get_environment(&pool, &env.id)
+            .await
+            .expect("get")
+            .expect("row");
+        assert!(parked.asleep_since.is_some(), "the environment parks");
+        assert_eq!(parked.status, AppStatus::Sleeping);
         let _ = std::fs::remove_dir_all(dir);
     }
 }

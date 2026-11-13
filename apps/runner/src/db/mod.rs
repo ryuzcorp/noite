@@ -293,7 +293,8 @@ mod tests {
                     p50_ms: 5,
                     p95_ms: 20,
                     mem_max_bytes: 4096,
-                    mem_avg_bytes: 2048,
+                    mem_sum_bytes: 6144,
+                    mem_samples: 3,
                     last_request_us: 1_790_000_000_000_000,
                     cpu_ms: 12,
                 },
@@ -333,6 +334,11 @@ mod tests {
             .expect("metrics readable");
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].requests, 7);
+        assert_eq!(
+            (rows[0].memory_max_bytes, rows[0].memory_avg_bytes),
+            (4096, 2048),
+            "the mean is derived from the stored (sum, count) pair"
+        );
         let last = last_request_us(&pool, "a", "")
             .await
             .expect("last request readable");
