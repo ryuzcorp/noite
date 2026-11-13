@@ -1,10 +1,14 @@
 # CodeRabbit review config. Schema:
 # https://coderabbit.ai/integrations/schema.v2.json
-# Validated locally with python jsonschema (see the ci-gate PR report).
+# Validated locally against that schema with python jsonschema (see the PR report).
 reviews:
   auto_review:
-    # Drafts are for shaping; review when marked ready.
+    # Drafts are for shaping; review once, when the PR is marked ready.
     drafts: false
+    # One review per PR: a push does not re-review automatically (each push
+    # would otherwise spend a review and delay the round). Ask for another pass
+    # deliberately, after a substantial change, with `@coderabbitai review`.
+    auto_incremental_review: false
   path_filters:
     # Lockfiles carry no reviewable logic; regenerated output neither.
     # Everything not excluded here is still reviewed.
