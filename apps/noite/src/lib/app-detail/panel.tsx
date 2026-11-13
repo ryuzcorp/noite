@@ -76,27 +76,33 @@ const IdentityLine = ({
         </span>
       ) : null}
     </span>
-    <span class="opacity-30" aria-hidden="true">
-      ·
-    </span>
-    <a
-      class="link link-hover min-w-0 truncate opacity-80"
-      href={appUrl(app.subdomain)}
-      target="_blank"
-      rel="noopener noreferrer"
-    >
-      {appHost(app.subdomain)}
-    </a>
-    <span class="opacity-30" aria-hidden="true">
-      ·
-    </span>
-    {app.lastDeploySha ? (
-      <span class="font-mono opacity-70" title={app.lastDeploySha}>
-        {app.lastDeploySha.slice(0, SHA_CHARS)}
+    {/* Each item carries its own separator, so a wrap on a phone never
+     * strands a "·" at the end of the line or an orphan sha on its own. */}
+    <span class="inline-flex min-w-0 items-center gap-2">
+      <span class="opacity-30" aria-hidden="true">
+        ·
       </span>
-    ) : (
-      <span class="opacity-70">Not deployed</span>
-    )}
+      <a
+        class="link link-hover min-w-0 truncate opacity-80"
+        href={appUrl(app.subdomain)}
+        target="_blank"
+        rel="noopener noreferrer"
+      >
+        {appHost(app.subdomain)}
+      </a>
+    </span>
+    <span class="inline-flex min-w-0 items-center gap-2">
+      <span class="opacity-30" aria-hidden="true">
+        ·
+      </span>
+      {app.lastDeploySha ? (
+        <span class="font-mono opacity-70" title={app.lastDeploySha}>
+          {app.lastDeploySha.slice(0, SHA_CHARS)}
+        </span>
+      ) : (
+        <span class="opacity-70">Not deployed</span>
+      )}
+    </span>
   </p>
 );
 
