@@ -32,8 +32,11 @@
 //!   (`telemetry::object_key`), so an object in directory `H` only holds
 //!   events stamped at or before the flush instant; a flush that straddles
 //!   the boundary lands in `H + 1` with events still stamped in `H`. An event
-//!   hour is therefore final once the *following* directory has been read,
-//!   and at most two hours' groups are live at any moment. (A span flushed
+//!   hour is therefore final once the *following* directory has been read.
+//!   An empty directory hour (a quiet fleet) defers that finalisation, so the
+//!   next non-empty directory can absorb spans stamped in the skipped hour and
+//!   the one before it: at most three hours' groups can be live at any moment.
+//!   (A span flushed
 //!   more than an hour after it started — a request held open across the
 //!   boundary, e.g. a long SSE stream — would be folded into a second row for
 //!   its hour instead of the old query's single one. The error tables sum
@@ -87,7 +90,7 @@ const TOP_ERROR_GROUPS: usize = 200;
 /// (a 24 h chunk used to hold ~8.6M `String`s ≈ 1 GB on a 2 GB box). With
 /// `[u8; 16]` ids a set costs ~20 bytes per entry (16 payload + hashbrown's
 /// load factor), so this ceiling is ~20 MB per saturated group, and at most
-/// two hours are live while a chunk is read — a small fraction of the 2 GB
+/// three hours are live while a chunk is read — a small fraction of the 2 GB
 /// the runner shares with its fleets. It takes >278 spans/s of one identical
 /// error to saturate it, i.e. only the pathological case the old query would
 /// have made the runner OOM on.
@@ -171,8 +174,10 @@ struct LogLine {
 
 /// One object's decode result: a corrupt, foreign or unsupported-codec object
 /// is skipped with a warning (its key and the reason, never a signed URL) so
-/// it cannot fail the fleet's chunk — and hold its watermark — forever. A
-/// missing object is handled by the caller as an idle file.
+/// it cannot fail the fleet's chunk — and hold its watermark — forever. Only
+/// the decoder's own error on a complete body reaches this; a missing object
+/// is handled by the caller as an idle file, and a `spawn_blocking` join
+/// failure (a decoder panic) fails the chunk before the call.
 fn decoded_or_skipped<T>(key: &str, kind: &str, decoded: anyhow::Result<T>) -> Option<T> {
     match decoded {
         Ok(value) => Some(value),
@@ -215,14 +220,13 @@ async fn read_logs(
             // Parquet decode is CPU work: keep it off the async runtime, like
             // the compaction fold. Each object decodes into its own bounded
             // heap, so a corrupt object leaves nothing half-merged behind.
-            let decoded = match tokio::task::spawn_blocking(move || {
-                decode_log_object(body, from_us, until_us)
-            })
-            .await
-            {
-                Ok(decoded) => decoded,
-                Err(e) => Err(anyhow::anyhow!("telemetry log decode task: {e}")),
-            };
+            // A join error is a decoder panic — a bug, not a corrupt object —
+            // so it fails the fleet's chunk (the watermark is held and the
+            // chunk retried) instead of silently dropping the object.
+            let decoded =
+                tokio::task::spawn_blocking(move || decode_log_object(body, from_us, until_us))
+                    .await
+                    .map_err(|e| anyhow::anyhow!("telemetry log decode task: {e}"))?;
             let Some(local) = decoded_or_skipped(&key, "logs", decoded) else {
                 continue;
             };
@@ -656,15 +660,13 @@ async fn read_errors(
             };
             let fleet = slug.to_string();
             // Each object decodes into its own map, so a corrupt object leaves
-            // nothing half-merged behind.
-            let decoded = match tokio::task::spawn_blocking(move || {
+            // nothing half-merged behind. A join error is a decoder panic and
+            // fails the chunk (see the log loop above).
+            let decoded = tokio::task::spawn_blocking(move || {
                 decode_trace_object(body, from_us, until_us, &fleet)
             })
             .await
-            {
-                Ok(decoded) => decoded,
-                Err(e) => Err(anyhow::anyhow!("telemetry trace decode task: {e}")),
-            };
+            .map_err(|e| anyhow::anyhow!("telemetry trace decode task: {e}"))?;
             let Some(local) = decoded_or_skipped(&key, "traces", decoded) else {
                 continue;
             };

@@ -1,5 +1,14 @@
 //! Durable compaction (spec T3.5) of completed hours, and the watermark that
 //! keeps it from running twice.
+//!
+//! A fold never publishes an object the reader refuses: the inputs and the
+//! real output are checked against the reader's cap, and a refused hour is
+//! kept raw (sources untouched, never failed). Known residual: a *refused
+//! refold* — an existing compacted file plus more than ~96 MiB of late
+//! flushes — is left raw with the late sources still shadowed by the
+//! canonical rule, because publishing an oversized file would hide the whole
+//! hour instead. It needs a firehose hour plus a lost compaction pass, and
+//! the sources are never deleted.
 
 use std::collections::HashMap;
 use std::fs::File;
@@ -207,6 +216,53 @@ pub(super) struct CompactionReport {
     pub(super) kept_raw: usize,
 }
 
+/// The local files of one fold. `Drop` removes whatever is still on disk on
+/// every path — a failed fetch, a failed fold, a panicking decode task, a
+/// failed upload — because each attempt uses fresh UUID paths, so leaked
+/// spools or a partial output would accumulate on the work volume.
+struct FoldWork {
+    work: PathBuf,
+    id: uuid::Uuid,
+    spools: Vec<PathBuf>,
+    out: PathBuf,
+}
+
+impl FoldWork {
+    fn new(work: &Path) -> Self {
+        let id = uuid::Uuid::new_v4();
+        Self {
+            work: work.to_path_buf(),
+            id,
+            spools: Vec::new(),
+            out: work.join(format!("{id}-fold.parquet")),
+        }
+    }
+
+    /// Reserve one spool path, owned by the guard from this instant (a failed
+    /// write still has its partial file removed on drop).
+    fn spool(&mut self, index: usize) -> PathBuf {
+        let path = self.work.join(format!("{}-{index}.parquet", self.id));
+        self.spools.push(path.clone());
+        path
+    }
+
+    /// Remove the spools once the fold has read them; the output stays owned
+    /// until the function returns.
+    fn clear_spools(&mut self) {
+        for path in self.spools.drain(..) {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+impl Drop for FoldWork {
+    fn drop(&mut self) {
+        for path in self.spools.iter().chain(std::iter::once(&self.out)) {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
 /// Fold the union of `inputs` into `target`, proved with a HEAD before the
 /// caller deletes anything. The old implementation was a DuckDB
 /// `COPY (SELECT * FROM read_parquet([…], union_by_name=true) …)`; this is the
@@ -223,6 +279,14 @@ pub(super) struct CompactionReport {
 /// listing nor another compact pass sees it mid-write; the final
 /// `rm_dir_except` (keep `compacted.parquet`) removes it with the folded
 /// sources.
+///
+/// A refused refold is the one residual: the existing `compacted.parquet` plus
+/// more than ~96 MiB of late flushes would exceed [`MAX_REFOLD_INPUT_BYTES`],
+/// so the hour is kept raw and the canonical rule (a directory with
+/// `compacted.parquet` is read from that file alone) still shadows those late
+/// sources. Reaching it needs a firehose hour plus a lost compaction pass, and
+/// the alternative — publishing an object over the reader's cap — is worse;
+/// the sources are never deleted, so a later fix can recover them.
 async fn copy_union(
     cfg: &Config,
     dir: &str,
@@ -242,12 +306,9 @@ async fn copy_union(
     };
     let work = crate::host::exec::work_root(cfg).join("telemetry-compact");
     tokio::fs::create_dir_all(&work).await?;
-    let id = uuid::Uuid::new_v4();
-    let (sources, input_bytes) = match spool_inputs(cfg, inputs, &work, id, input_budget).await? {
-        Spool::Ready {
-            paths,
-            bytes: input_bytes,
-        } => (paths, input_bytes),
+    let mut guard = FoldWork::new(&work);
+    let input_bytes = match spool_inputs(cfg, inputs, &mut guard, input_budget).await? {
+        Spool::Ready { bytes } => bytes,
         Spool::TooLarge(bytes) => {
             tracing::warn!(
                 dir = %dir,
@@ -259,30 +320,23 @@ async fn copy_union(
             return Ok(FoldOutcome::KeptRaw);
         }
     };
-    let out = work.join(format!("{id}-fold.parquet"));
     let folded = {
-        let sources = sources.clone();
-        let out = out.clone();
+        let sources = guard.spools.clone();
+        let out = guard.out.clone();
         tokio::task::spawn_blocking(move || fold_files(&sources, &out))
             .await
             .map_err(|e| anyhow::anyhow!("compaction fold task: {e}"))?
     };
-    for path in &sources {
-        let _ = tokio::fs::remove_file(path).await;
-    }
+    guard.clear_spools();
     folded?;
     // The reader refuses an object over `MAX_OBJECT_BYTES`; never publish one.
     // The check is on the real file, not the input sum: the union's nullable
     // levels and row-group layout can move the size either way.
-    let output_bytes = match tokio::fs::metadata(&out).await {
-        Ok(meta) => meta.len(),
-        Err(e) => {
-            let _ = tokio::fs::remove_file(&out).await;
-            return Err(anyhow::anyhow!("folded object {}: {e}", out.display()));
-        }
-    };
+    let output_bytes = tokio::fs::metadata(&guard.out)
+        .await
+        .map_err(|e| anyhow::anyhow!("folded object {}: {e}", guard.out.display()))?
+        .len();
     if let Some(refusal) = fold_refusal(input_bytes, Some(output_bytes), input_budget) {
-        let _ = tokio::fs::remove_file(&out).await;
         tracing::warn!(
             dir = %dir,
             bytes = output_bytes,
@@ -291,9 +345,7 @@ async fn copy_union(
         );
         return Ok(FoldOutcome::KeptRaw);
     }
-    let uploaded = s3::s3_cp_upload(cfg, &out, &dest).await;
-    let _ = tokio::fs::remove_file(&out).await;
-    uploaded?;
+    s3::s3_cp_upload(cfg, &guard.out, &dest).await?;
     if !s3::s3_object_exists(cfg, &cfg.s3_bucket, &dest).await {
         anyhow::bail!("compacted object missing after copy: {dest}");
     }
@@ -312,44 +364,33 @@ async fn copy_union(
 
 /// The local copies one fold reads.
 enum Spool {
-    Ready {
-        paths: Vec<PathBuf>,
-        bytes: u64,
-    },
-    /// The inputs are past [`MAX_FOLD_INPUT_BYTES`] (or one is past the
-    /// reader's cap): folding cannot produce a readable object. Every spooled
-    /// copy is already removed.
+    /// The inputs were spooled into the guard's paths.
+    Ready { bytes: u64 },
+    /// The inputs are past the fold budget (or one is past the reader's cap):
+    /// folding cannot produce a readable object. The guard drops the spools.
     TooLarge(u64),
 }
 
 /// Download every input to a local file so each object is fetched once and the
-/// output schema is known before the first row is written. A partial spool is
-/// cleaned up on error; a missing object fails the fold (the hour is retried,
-/// never marked compacted with data skipped). An oversized input is not an
-/// error: the hour is kept raw so its sources stay readable.
+/// output schema is known before the first row is written. The guard owns the
+/// spool paths from the moment they are reserved, so an error, a refusal or a
+/// missing object never leaves a partial spool behind. A missing object fails
+/// the fold (the hour is retried, never marked compacted with data skipped);
+/// an oversized input is not an error — the hour is kept raw so its sources
+/// stay readable.
 async fn spool_inputs(
     cfg: &Config,
     inputs: &[String],
-    work: &Path,
-    id: uuid::Uuid,
+    guard: &mut FoldWork,
     input_budget: u64,
 ) -> anyhow::Result<Spool> {
-    let mut paths = Vec::with_capacity(inputs.len());
     let mut bytes = 0_u64;
     for (index, key) in inputs.iter().enumerate() {
-        let path = work.join(format!("{id}-{index}.parquet"));
+        let path = guard.spool(index);
         let body = match parquet_io::fetch(cfg, key).await? {
             Fetched::Body(body) => body,
-            Fetched::Missing => {
-                for done in &paths {
-                    let _ = tokio::fs::remove_file(done).await;
-                }
-                anyhow::bail!("compaction input vanished: {key}");
-            }
+            Fetched::Missing => anyhow::bail!("compaction input vanished: {key}"),
             Fetched::TooLarge(size) => {
-                for done in &paths {
-                    let _ = tokio::fs::remove_file(done).await;
-                }
                 tracing::warn!(
                     file = %key,
                     bytes = size,
@@ -360,21 +401,14 @@ async fn spool_inputs(
             }
         };
         bytes += body.len() as u64;
-        if let Err(e) = tokio::fs::write(&path, &body).await {
-            for done in paths.iter().chain(std::iter::once(&path)) {
-                let _ = tokio::fs::remove_file(done).await;
-            }
-            return Err(e).map_err(|e| anyhow::anyhow!("spool {key}: {e}"));
-        }
-        paths.push(path);
+        tokio::fs::write(&path, &body)
+            .await
+            .map_err(|e| anyhow::anyhow!("spool {key}: {e}"))?;
         if fold_refusal(bytes, None, input_budget).is_some() {
-            for done in &paths {
-                let _ = tokio::fs::remove_file(done).await;
-            }
             return Ok(Spool::TooLarge(bytes));
         }
     }
-    Ok(Spool::Ready { paths, bytes })
+    Ok(Spool::Ready { bytes })
 }
 
 /// One output column: its name and the physical kind every input agrees on.
@@ -423,7 +457,10 @@ fn merge_schema(fields: &mut Vec<OutField>, root: &Type) -> anyhow::Result<()> {
             PhysicalType::INT32 => match field.get_basic_info().converted_type() {
                 ConvertedType::UINT_8 => (ColumnKind::Int32, Some(ConvertedType::UINT_8)),
                 ConvertedType::UINT_16 => (ColumnKind::Int32, Some(ConvertedType::UINT_16)),
-                ConvertedType::UINT_32 => (ColumnKind::Int32, Some(ConvertedType::UINT_32)),
+                // A UINT_32 value does not fit INT32 (`cell_from` widens it
+                // to i64), so the column folds as INT64 and the annotation —
+                // an INT32 logical type — is dropped.
+                ConvertedType::UINT_32 => (ColumnKind::Int64, None),
                 _ => (ColumnKind::Int32, None),
             },
             PhysicalType::INT64 => match field.get_basic_info().converted_type() {
@@ -1408,5 +1445,79 @@ mod tests {
         state.folded(&newer);
         assert!(uncompacted_hours(&state, &current, &cfg).is_empty());
         assert_eq!(state.done.as_deref(), Some(newer.as_str()));
+    }
+
+    /// A UINT_32 column (a foreign or future writer; celld writes only
+    /// UTINYINT/USMALLINT) must fold: its values do not fit INT32, so the
+    /// column widens to INT64 and the INT32 logical annotation is dropped.
+    /// Before this the schema said INT32 while `cell_from` produced a `Long`,
+    /// and every such fold failed with "expected int32, got Long".
+    #[test]
+    fn a_uint32_column_folds_as_int64() {
+        let guard = crate::testutil::TempDir::new("noite-fold-uint32");
+        let input = guard.path().join("in.parquet");
+        let out = guard.path().join("out.parquet");
+        write_input(
+            &input,
+            &[OutField {
+                name: "requests".to_string(),
+                kind: ColumnKind::Int32,
+                logical: Some(ConvertedType::UINT_32),
+            }],
+            vec![vec![Cell::Int(4_000_000_000_u32 as i32)]],
+        );
+        fold_files(std::slice::from_ref(&input), &out).expect("a UINT_32 column must fold");
+        let reader =
+            SerializedFileReader::new(File::open(&out).expect("open folded")).expect("parsed");
+        let field = reader
+            .metadata()
+            .file_metadata()
+            .schema_descr()
+            .root_schema()
+            .get_fields()
+            .iter()
+            .find(|field| field.name() == "requests")
+            .expect("column");
+        assert_eq!(field.get_physical_type(), PhysicalType::INT64);
+        assert_eq!(field.get_basic_info().converted_type(), ConvertedType::NONE);
+        let rows: Vec<_> = reader
+            .get_row_iter(None)
+            .expect("rows")
+            .collect::<Result<_, _>>()
+            .expect("decoded rows");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].get_column_iter().next().map(|(_, value)| value),
+            Some(&Field::Long(4_000_000_000))
+        );
+    }
+
+    /// Every path through a fold removes its local files: the guard owns the
+    /// spools from the moment they are reserved and the output for the whole
+    /// call, so a failed fold, a panicking task or a failed upload cannot leak
+    /// UUID-named files onto the work volume.
+    #[test]
+    fn a_failed_fold_leaves_no_local_files_behind() {
+        let dir = crate::testutil::TempDir::new("noite-fold-cleanup");
+        let work = dir.path().join("telemetry-compact");
+        std::fs::create_dir_all(&work).expect("work dir");
+        let bad = dir.path().join("bad.parquet");
+        std::fs::write(&bad, b"not parquet").expect("bad source");
+        let mut guard = FoldWork::new(&work);
+        // A fetched spool and a partial output a failed fold left behind.
+        let spool = guard.spool(0);
+        std::fs::write(&spool, b"spool").expect("spool");
+        std::fs::write(&guard.out, b"partial").expect("partial output");
+        assert!(fold_files(std::slice::from_ref(&bad), &guard.out).is_err());
+        drop(guard);
+        assert_eq!(
+            std::fs::read_dir(&work).expect("read work").count(),
+            0,
+            "the spool and the partial output are gone"
+        );
+        // The guard owns only the fold's files: an unrelated file survives.
+        std::fs::write(work.join("unrelated"), b"keep").expect("unrelated");
+        drop(FoldWork::new(&work));
+        assert!(work.join("unrelated").exists());
     }
 }
