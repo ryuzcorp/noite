@@ -119,12 +119,8 @@ Counted approvals are the latest review per reviewer that is `approved`, not dis
 
 | Method | Route | Notes |
 | --- | --- | --- |
-| `GET` | `/v1/apps/{id}/metrics?hours=24` | Minute buckets (30-day prune) |
-| `GET` | `/v1/apps/{id}/metrics/version` | Schema/watermark version |
-| `GET` | `/v1/apps/{id}/devices` | Device breakdown (tailed from Caddy access log) |
-| `GET` | `/v1/apps/{id}/paths` | Path breakdown |
-| `GET` | `/v1/apps/{id}/refs` | Referrer breakdown |
-| `GET` | `/v1/apps/{id}/spans?hours=1` | Recent slow or failed spans |
+| `GET` | `/v1/apps/{id}/metrics?hours=24` | Hourly counters (requests, 5xx errors, p50/p95 latency in ms, memory peak/mean in bytes, CPU ms) |
+| `GET` | `/v1/apps/{id}/metrics/version` | Change counter for the dashboard's poll gate |
 | `GET` | `/v1/apps/{id}/logs` | App logs: 24 h of ingested lines plus the live stdout tail |
 | `GET` | `/v1/apps/{id}/logs/stream` | SSE log stream |
 | `GET` | `/v1/apps/{id}/errors/stream?status=open` | SSE stream of grouped errors in one status (`errors.list` shape) |

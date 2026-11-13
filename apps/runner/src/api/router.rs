@@ -74,8 +74,8 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/apps/{id}/git-remote", post(api::git_remote))
         .route("/v1/apps/{id}/tree", get(api::source_tree))
         .route("/v1/apps/{id}/blob/{*path}", get(api::source_blob))
-        // Forge mirror for the git.* RPCs. They sit under `/git/` because
-        // `/v1/apps/{id}/refs` is the traffic-referrer endpoint.
+        // Forge mirror for the git.* RPCs, under `/git/` so a branch ref and
+        // a Git object are never confused with an app route.
         .route("/v1/apps/{id}/git/refs", get(api::git_refs))
         .route("/v1/apps/{id}/git/log", get(api::git_log))
         .route("/v1/apps/{id}/git/commits/{sha}", get(api::git_commit))
@@ -86,15 +86,11 @@ pub fn router(state: AppState) -> Router {
             delete(api::git_branch_delete),
         )
         .route("/v1/apps/{id}/metrics", get(api::app_metrics))
-        .route("/v1/apps/{id}/devices", get(api::app_devices))
-        .route("/v1/apps/{id}/paths", get(api::app_paths))
-        .route("/v1/apps/{id}/refs", get(api::app_refs))
         .route(
             "/v1/apps/{id}/metrics/version",
             get(api::app_metrics_version),
         )
         .route("/v1/apps/{id}/errors/stream", get(api::list_errors_stream))
-        .route("/v1/apps/{id}/spans", get(api::app_spans))
         .route(
             "/v1/apps/{id}/events",
             get(api::list_events).post(api::log_event),

@@ -1162,11 +1162,11 @@ export const decodeLogs = (raw: string): string[] => {
   return next as string[];
 };
 
-/** Usage frame. Literal field types (not the runner interfaces) so the
- * frame stays a `WatchValue` for `watch(feed.latest, …)` — interfaces
- * carry no implicit index signature and fail the constraint. Shapes
- * mirror `RunnerMetric` / `RunnerSpan` / `RunnerDevice` / `RunnerPath` /
- * `RunnerRef` in `lib/runner.ts` field-for-field. */
+/** Usage frame: the app's hourly counters, oldest first. Literal field types
+ * (not the runner interface) so the frame stays a `WatchValue` for
+ * `watch(feed.latest, …)` — interfaces carry no implicit index signature and
+ * fail the constraint. Mirrors `RunnerMetric` in `lib/runner.ts`
+ * field-for-field. */
 // oxlint-disable-next-line typescript/consistent-type-definitions -- must stay a type alias: watch(feed.latest) requires a WatchValue, and interfaces carry no implicit index signature (tsc-verified).
 export type MetricsFrame = {
   metrics: {
@@ -1174,72 +1174,27 @@ export type MetricsFrame = {
     bucketTs: string;
     requests: number;
     errors: number;
-    latencyMs: number;
+    p50Ms: number;
+    p95Ms: number;
+    memoryMaxBytes: number;
+    memoryAvgBytes: number;
     cpuMs: number;
-  }[];
-  spans: {
-    name: string;
-    kind: number;
-    n: number;
-    ms: number;
-    err: number;
-    qwaitMs: number;
-  }[];
-  devices?: {
-    appId: string;
-    bucketTs: string;
-    browser: string;
-    os: string;
-    requests: number;
-  }[];
-  paths?: { appId: string; bucketTs: string; path: string; requests: number }[];
-  refs?: {
-    appId: string;
-    bucketTs: string;
-    source: string;
-    requests: number;
   }[];
 };
 
-/** Usage frame: `metrics` + `spans` required; `devices`/`paths`/`refs`
- * validated when present (the control route always sends them). */
+/** Usage frame: the hourly `metrics` array, validated as an array. */
 export const decodeMetrics = (raw: string): MetricsFrame => {
-  // SAFETY: frame shape is validated field-by-field below.
-  const frame = parseFrame(raw) as {
-    devices?: unknown;
-    metrics?: unknown;
-    paths?: unknown;
-    refs?: unknown;
-    spans?: unknown;
-  };
+  // SAFETY: the one required field is checked below; rows are only rendered
+  // as text and numeric attributes.
+  const frame = parseFrame(raw) as { metrics?: unknown };
 
-  if (!Array.isArray(frame.metrics) || !Array.isArray(frame.spans)) {
+  if (!Array.isArray(frame.metrics)) {
     throw badFrame("metrics");
   }
 
-  // SAFETY: both arrays passed Array.isArray above; rows mirror the list
-  // endpoint shapes and flow only into usage rendering.
-  const out: MetricsFrame = {
-    metrics: frame.metrics as MetricsFrame["metrics"],
-    spans: frame.spans as MetricsFrame["spans"],
-  };
-
-  if (Array.isArray(frame.devices)) {
-    // SAFETY: passed Array.isArray above; entries flow into usage rendering.
-    out.devices = frame.devices as NonNullable<MetricsFrame["devices"]>;
-  }
-
-  if (Array.isArray(frame.paths)) {
-    // SAFETY: passed Array.isArray above; entries flow into usage rendering.
-    out.paths = frame.paths as NonNullable<MetricsFrame["paths"]>;
-  }
-
-  if (Array.isArray(frame.refs)) {
-    // SAFETY: passed Array.isArray above; entries flow into usage rendering.
-    out.refs = frame.refs as NonNullable<MetricsFrame["refs"]>;
-  }
-
-  return out;
+  // SAFETY: passed Array.isArray above; rows mirror the `/metrics` endpoint
+  // and flow only into usage rendering.
+  return { metrics: frame.metrics as MetricsFrame["metrics"] };
 };
 
 /** Runner events-stream snapshot (same rows as the list endpoints). */

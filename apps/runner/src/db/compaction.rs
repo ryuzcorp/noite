@@ -54,21 +54,26 @@ pub async fn prune_compactions(pool: &SqlitePool, older_than_hour: &str) -> sqlx
     Ok(res.rows_affected())
 }
 
-/// Per-app-and-environment metrics version (spec T3.6): bumped by the ingest
-/// tick whenever it persists new rows, so each dashboard tab (production or
-/// one environment) can poll its own version and skip unchanged windows.
-pub async fn bump_metric_version(
-    pool: &SqlitePool,
+/// Per-app-and-environment metrics version (spec T3.6): bumped whenever rows
+/// the dashboard serves are written — the ingest tick's chunks and the hourly
+/// counters alike — so each dashboard tab (production or one environment) can
+/// poll its own version and skip unchanged windows. Takes any executor, so a
+/// caller inside a transaction bumps atomically with the row it wrote.
+pub async fn bump_metric_version<'e, E>(
+    exec: E,
     app_id: &str,
     environment_id: &str,
-) -> sqlx::Result<()> {
+) -> sqlx::Result<()>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
+{
     sqlx::query(
         "INSERT INTO metrics.metric_version (app_id, environment_id, version) VALUES (?, ?, 1) \
          ON CONFLICT (app_id, environment_id) DO UPDATE SET version = version + 1",
     )
     .bind(app_id)
     .bind(environment_id)
-    .execute(pool)
+    .execute(exec)
     .await?;
     Ok(())
 }

@@ -223,6 +223,25 @@ async fn a_failed_write_never_double_counts_the_retried_line() {
     assert_eq!(db.histogram(k).await.iter().map(|(_, n)| n).sum::<i64>(), 1);
 }
 
+/// Every counter write moves the app's metrics version: the dashboard's
+/// change gate polls it and skips the window read otherwise, so a request that
+/// only touched `app_hour` must not be invisible.
+#[tokio::test]
+async fn a_counter_write_moves_the_dashboard_version() {
+    let db = TestDb::new().await;
+    let k = db.key("2026-11-13T07:00:00Z");
+    let version = || async {
+        db::get_metric_version(&db.pool, "a", "")
+            .await
+            .expect("version")
+    };
+    assert_eq!(version().await, 0);
+    db.request(k, 10, Some(5)).await;
+    assert_eq!(version().await, 1);
+    record_memory(&db.pool, k, 1024).await.expect("sample");
+    assert_eq!(version().await, 2);
+}
+
 /// Pruning drops the hour rows and the histogram rows that fed them, and
 /// nothing inside the window.
 #[tokio::test]

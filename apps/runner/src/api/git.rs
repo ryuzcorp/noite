@@ -1,7 +1,7 @@
 //! Git remote info + forge operations (thin adapters over `service::git`).
 //!
-//! The forge routes live under `/git/` because `/v1/apps/{id}/refs` is
-//! already the traffic-referrer endpoint.
+//! The forge routes live under `/git/` so a branch ref and a Git object are
+//! never confused with an app route.
 use axum::{
     extract::{Path, Query, State},
     response::IntoResponse,

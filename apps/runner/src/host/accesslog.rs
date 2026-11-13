@@ -703,21 +703,14 @@ mod tests {
         )
         .await
         .expect("retry succeeds");
-        let devices = crate::db::list_app_devices(&pool, "app-id", "", "1970-01-01T00:00:00Z")
+        // Both lines count exactly once in the fleet's hourly counters: 2
+        // requests, never 3. That row is the surviving product surface — it is
+        // written in the same transaction as the line's analytics.
+        let rows = crate::db::list_app_metrics(&pool, "app-id", "", "1970-01-01T00:00:00Z")
             .await
             .expect("read");
-        // Both lines count exactly once: 2 total requests, never 3.
-        let total: i64 = devices.iter().map(|d| d.requests).sum();
-        assert_eq!(total, 2, "no line is counted twice");
-        let paths = crate::db::list_app_paths(&pool, "app-id", "", "1970-01-01T00:00:00Z")
-            .await
-            .expect("read");
-        let ok_hits: i64 = paths
-            .iter()
-            .filter(|p| p.path == "/ok")
-            .map(|p| p.requests)
-            .sum();
-        assert_eq!(ok_hits, 1);
+        assert_eq!(rows.len(), 1, "the fixtures' stamps share one hour");
+        assert_eq!(rows[0].requests, 2, "no line is counted twice");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -901,13 +894,12 @@ mod tests {
         let mut tx = pool.begin().await.expect("tx");
         assert!(crate::db::record_access_hit(&mut tx, &hit).await.is_err());
         drop(tx);
-        let devices = crate::db::list_app_devices(&pool, "a", "", "2026-09-30T00:00:00Z")
-            .await
-            .expect("read");
-        assert!(
-            devices.is_empty(),
-            "a failed line must not leave a partial count"
-        );
+        let devices: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM metrics.app_device_stat WHERE app_id = 'a'")
+                .fetch_one(&pool)
+                .await
+                .expect("read");
+        assert_eq!(devices, 0, "a failed line must not leave a partial count");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

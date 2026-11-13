@@ -133,11 +133,11 @@ pub fn auto_sleep_after_s(
 
 /// Newest activity timestamps for an app, as `should_sleep` expects them.
 async fn activity(pool: &SqlitePool, app: &App) -> Vec<Option<DateTime<Utc>>> {
-    let last_request = db::last_request_bucket(pool, &app.id, "")
+    let last_request = db::last_request_us(pool, &app.id, "")
         .await
         .ok()
         .flatten()
-        .and_then(|b| parse_time(&b));
+        .and_then(DateTime::from_timestamp_micros);
     let last_deploy = db::latest_deploy_status(pool, &app.id)
         .await
         .ok()
@@ -244,16 +244,16 @@ pub async fn sweep(pool: &SqlitePool, cfg: &Config, procs: &ProcMap) -> usize {
     parked
 }
 
-/// Idle signal for an environment: its own last request bucket keyed by
+/// Idle signal for an environment: its own last request stamp keyed by
 /// environment (like apps), with its own deploy, wake and creation clocks as
 /// the floor. An environment nobody requested still parks on its deploy
 /// clock; a busy one no longer parks just because its deploy is old.
 async fn environment_activity(pool: &SqlitePool, env: &Environment) -> Vec<Option<DateTime<Utc>>> {
-    let last_request = db::last_request_bucket(pool, &env.app_id, &env.id)
+    let last_request = db::last_request_us(pool, &env.app_id, &env.id)
         .await
         .ok()
         .flatten()
-        .and_then(|b| parse_time(&b));
+        .and_then(DateTime::from_timestamp_micros);
     vec![
         last_request,
         env.last_deployed_at.as_deref().and_then(parse_time),
@@ -1794,6 +1794,7 @@ mod tests {
 #[cfg(test)]
 mod env_activity_tests {
     use super::*;
+    use crate::host::metrics::hourly;
 
     async fn seed_app(pool: &SqlitePool) -> App {
         let cfg = crate::config::config_for_tests();
@@ -1860,16 +1861,32 @@ mod env_activity_tests {
             quiet.iter().any(|t| t.is_some()),
             "the creation clock is the floor"
         );
-        // Traffic on the environment moves its clock.
-        let bucket = Utc::now().format("%Y-%m-%dT%H:%M:00Z").to_string();
-        db::replace_app_metric_usage(&pool, &app_id, &env.id, &bucket, 3, 0, 10)
-            .await
-            .expect("env traffic");
+        // Traffic on the environment moves its clock, to the exact request
+        // stamp: the hourly counters keep microseconds, so a busy hour cannot
+        // look up to an hour older than it is.
+        let stamp = Utc::now();
+        let stamp_us = stamp.timestamp_micros();
+        let hour = stamp.format("%Y-%m-%dT%H:00:00Z").to_string();
+        let mut tx = pool.begin().await.expect("tx");
+        hourly::record_request(
+            &mut tx,
+            hourly::Key {
+                app_id: &app_id,
+                environment_id: &env.id,
+                bucket_hour: &hour,
+            },
+            stamp_us,
+            Some(10),
+            false,
+        )
+        .await
+        .expect("env traffic");
+        tx.commit().await.expect("commit");
         let active = environment_activity(&pool, &env).await;
         assert_eq!(
-            active[0].map(|t| t.format("%Y-%m-%dT%H:%M:00Z").to_string()),
-            Some(bucket.clone()),
-            "the environment's own bucket is its newest activity"
+            active[0].map(|t| t.format("%Y-%m-%dT%H:%M:%S").to_string()),
+            Some(stamp.format("%Y-%m-%dT%H:%M:%S").to_string()),
+            "the environment's own request stamp is its newest activity"
         );
         assert!(
             !should_sleep_s(Utc::now(), &active, 3600),
@@ -1878,9 +1895,21 @@ mod env_activity_tests {
         // Production traffic on the same app does not move it: a sibling
         // environment stays quiet.
         let sibling = seed_env(&pool, &app, "other", "refs/heads/other").await;
-        db::replace_app_metric_usage(&pool, &app_id, "", &bucket, 9, 0, 10)
-            .await
-            .expect("prod traffic");
+        let mut tx = pool.begin().await.expect("tx");
+        hourly::record_request(
+            &mut tx,
+            hourly::Key {
+                app_id: &app_id,
+                environment_id: "",
+                bucket_hour: &hour,
+            },
+            stamp_us,
+            Some(10),
+            false,
+        )
+        .await
+        .expect("prod traffic");
+        tx.commit().await.expect("commit");
         let still_quiet = environment_activity(&pool, &sibling).await;
         assert_eq!(
             still_quiet[0], None,

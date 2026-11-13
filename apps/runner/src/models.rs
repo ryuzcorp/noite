@@ -870,62 +870,24 @@ pub struct AppLimit {
     pub sleep_after_s: Option<i64>,
 }
 
+/// One hourly counter row served to the dashboard (`metrics.app_hour`). The
+/// percentiles are the edges' own (p50/p95 over that hour's served requests,
+/// from the log-scale histogram) and the memory is the fleet cgroup's peak and
+/// mean over the hour — no sums the reader has to divide.
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export)]
 pub struct AppMetric {
     pub app_id: String,
+    /// The hour this row counts (`…T07:00:00Z`).
     pub bucket_ts: String,
     pub requests: i64,
     pub errors: i64,
-    pub latency_ms: i64,
+    pub p50_ms: i64,
+    pub p95_ms: i64,
+    pub memory_max_bytes: i64,
+    pub memory_avg_bytes: i64,
     pub cpu_ms: i64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, FromRow, TS)]
-#[serde(rename_all = "camelCase")]
-#[ts(export)]
-pub struct AppDeviceStat {
-    pub app_id: String,
-    pub bucket_ts: String,
-    pub browser: String,
-    pub os: String,
-    pub requests: i64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, FromRow, TS)]
-#[serde(rename_all = "camelCase")]
-#[ts(export)]
-pub struct AppPathStat {
-    pub app_id: String,
-    pub bucket_ts: String,
-    pub path: String,
-    pub requests: i64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, FromRow, TS)]
-#[serde(rename_all = "camelCase")]
-#[ts(export)]
-pub struct AppRefStat {
-    pub app_id: String,
-    pub bucket_ts: String,
-    pub source: String,
-    pub requests: i64,
-}
-
-/// Aggregated span row served to the dashboard (spec T3.2). Same JSON shape
-/// as the old DuckDB-backed `SpanStat` (`qwaitMs`), now read from the
-/// ingested `app_span_stat` ring instead of scanning Parquet per viewer.
-#[derive(Debug, Clone, Serialize, Deserialize, FromRow, TS)]
-#[serde(rename_all = "camelCase")]
-#[ts(export)]
-pub struct AppSpanStat {
-    pub name: String,
-    pub kind: i64,
-    pub n: i64,
-    pub ms: i64,
-    pub err: i64,
-    pub qwait_ms: i64,
 }
 
 /// Triage state of a grouped error (ROTH-6). `open` is the only state in
