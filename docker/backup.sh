@@ -26,7 +26,6 @@ detect_engine
 
 PORT="${HTTP_PORT:-9080}"
 TOKEN="${RUNNER_TOKEN:-dev-runner-token}"
-API_URL="${NOITE_API_URL:-http://127.0.0.1:${PORT}/v1}"
 # Behind the edge the runner is reached by Host, not by port (raw-port lanes
 # set NOITE_API_URL and skip this).
 API_HOST_HEADER="${NOITE_API_HOST_HEADER:-api.${BASE_DOMAIN:-noite.localhost}}"
@@ -38,7 +37,35 @@ STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 DEST="${1:-backups/${STAMP}}"
 VOLUMES="noite-data rustfs-data"
 
-CE="$COMPOSE -p $PROJECT -f docker/compose.yaml"
+# This project's compose, always with -p: compose.yaml's `name:` is only a
+# default and must never decide which stack gets stopped.
+ce() {
+  $COMPOSE -p "$PROJECT" -f docker/compose.yaml "$@"
+}
+
+# The published HTTP port of this project's edge (the `noite` service publishes
+# container port 80), so a backup of `PROJECT=x` snapshots x's runner and not
+# whichever stack happens to sit on the default port.
+project_http_port() {
+  cid="$("$CLI" ps --format '{{.Names}} {{.ID}}' 2>/dev/null |
+    awk -v p="$PROJECT" '$1 ~ "^"p"[-_]noite[-_]" {print $2; exit}')"
+  [ -n "$cid" ] || return 0
+  "$CLI" port "$cid" 80/tcp 2>/dev/null | head -n 1 | sed 's/.*://'
+}
+
+API_URL="${NOITE_API_URL:-}"
+if [ -z "$API_URL" ]; then
+  api_port="$(project_http_port || true)"
+  if [ -z "$api_port" ] && [ "$PROJECT" = noite ]; then
+    api_port="$PORT"
+  fi
+  if [ -z "$api_port" ]; then
+    echo "error: project ${PROJECT} has no running noite container (and NOITE_API_URL is unset), so there is no runner to snapshot" >&2
+    echo "  start it with 'make up PROJECT=${PROJECT}', or pass NOITE_API_URL=http://127.0.0.1:<port>/v1" >&2
+    exit 1
+  fi
+  API_URL="http://127.0.0.1:${api_port}/v1"
+fi
 
 # Any image with `tar` will do; prefer the Noite image already on this host.
 pick_tar_image tar "run 'make up' first, or set NOITE_BACKUP_IMAGE=<image with tar>."
@@ -59,7 +86,8 @@ fi
 echo
 
 echo "==> stop the stack for a consistent copy (downtime = the tar)"
-$CE stop
+echo "    project ${PROJECT}, api ${API_URL}"
+ce stop
 
 echo "==> tar volumes into ${DEST}"
 for vol in $VOLUMES; do
@@ -82,6 +110,7 @@ done
   echo "noite backup"
   echo "created: ${STAMP}"
   echo "project: ${PROJECT}"
+  echo "api: ${API_URL}"
   echo "image: ${NOITE_IMAGE:-noite:local}"
   echo "volumes: ${VOLUMES}"
   echo "git: $(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
@@ -91,7 +120,7 @@ done
 echo "==> start the stack again"
 # podman-compose occasionally wedges after the containers are already up; a
 # backup that succeeded must not report failure because of that.
-timeout 300 $CE up -d || echo "note: restart did not return cleanly — check 'make up' and 'make doctor'"
+timeout 300 ce up -d || echo "note: restart did not return cleanly — check 'make up' and 'make doctor'"
 echo
 echo "backup complete: ${DEST}"
 echo "  restore it with: make restore FROM=${DEST}"

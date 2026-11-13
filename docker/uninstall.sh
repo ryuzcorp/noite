@@ -20,6 +20,8 @@
 #   NOITE_KEEP_DATA  1 = remove the containers only; volumes, images and .env
 #                    stay, and re-running install brings the same install back
 #   NOITE_CONFIRM    1 = do not ask (required without a terminal)
+#   PROJECT          compose project of the stack (default: the resolved
+#                    COMPOSE_PROJECT_NAME, else noite)
 #
 # A bucket of your own (S3_ENDPOINT in .env) is never touched: a reinstall
 # pointed at it restores the old state from its snapshot.
@@ -35,7 +37,7 @@ NOITE_CONFIRM="${NOITE_CONFIRM:-0}"
 # compose.yaml's `name:` default is `${COMPOSE_PROJECT_NAME:-noite}`; Compose
 # labels everything it creates with the resolved project, so the stack is
 # found even when compose.yaml is gone.
-PROJECT="${COMPOSE_PROJECT_NAME:-noite}"
+PROJECT="${PROJECT:-${COMPOSE_PROJECT_NAME:-noite}}"
 PROJECT_LABEL="com.docker.compose.project=$PROJECT"
 IMAGE_REPOS=("ghcr.io/ryuzcorp/noite" "rustfs/rustfs" "docker.io/rustfs/rustfs" "noite:local" "noite-dev:local")
 
@@ -96,6 +98,7 @@ survey() {
   if [[ -d "$NOITE_DIR" ]]; then
     info "install directory  $NOITE_DIR${DOMAIN:+ (BASE_DOMAIN=$DOMAIN)}"
   fi
+  info "project            $PROJECT"
   info "containers         $n_containers"
   if [[ "$NOITE_KEEP_DATA" != "1" ]]; then
     info "volumes            $n_volumes $(volumes | tr '\n' ' ')"

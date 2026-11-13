@@ -3,21 +3,32 @@
 # the Dockerfile's `dev` target with the sources bind-mounted.
 
 # The compose CLI for this host: docker when present, else podman.
-COMPOSE_BIN ?= $(shell command -v docker >/dev/null 2>&1 && echo 'docker compose' || echo 'podman compose')
-# `-p $(PROJECT)` is load-bearing, not decoration: a compose file's top-level
+COMPOSE_CMD ?= $(shell command -v docker >/dev/null 2>&1 && echo 'docker compose' || echo 'podman compose')
+# `PROJECT` names the compose project of every target that touches one:
+# `-p $(PROJECT)` is load-bearing, not decoration — a compose file's top-level
 # `name:` beats COMPOSE_PROJECT_NAME, so without the flag `make dev PROJECT=x`
-# still lands in the `noite` project and recreates the default stack. Every
-# compose invocation in this file goes through $(COMPOSE) (or $(COMPOSE_BIN)
-# for the e2e lanes' own projects) so no call site can drift back.
+# still lands in the `noite` project and recreates the default stack.
 PROJECT ?= noite
+
+-include .env
+export
+
+# `PROJECT` becomes an engine argv (`-p`), so it is validated once, from the
+# environment (`$$PROJECT` is never spliced into shell text): a stray value
+# fails here instead of turning into a compose flag.
+_PROJECT_OK := $(shell printf '%s' "$$PROJECT" | grep -qE '^[a-z0-9][a-z0-9_-]*$$' && echo ok)
+ifeq ($(_PROJECT_OK),)
+$(error PROJECT="$(PROJECT)" is not a compose project name (lowercase a-z, 0-9, '-' and '_', starting with a letter or digit))
+endif
 
 # Both docker compose and podman-compose resolve host paths in these files
 # relative to the first -f file's directory (docker/), so no
 # --project-directory flag (which podman-compose rejects outright).
-COMPOSE ?= $(COMPOSE_BIN) -p $(PROJECT) -f docker/compose.yaml
-
--include .env
-export
+#
+# Deliberately `override … :=` and not `?=`: neither an environment value nor
+# `make … COMPOSE=…` on the command line may drop `-p $(PROJECT)` and land back
+# in the default project. `COMPOSE_CMD` is the knob for another engine.
+override COMPOSE := $(COMPOSE_CMD) -p $(PROJECT) -f docker/compose.yaml
 
 # NOTE: keep conditionals in quoted form and avoid `$(if …)` — the repo linter
 # runs shellcheck in bash mode on Makefiles, where `$(if …)` parses as an if-
@@ -99,12 +110,14 @@ help:
 # changed (docker compose does), so a rebuild would otherwise keep the old
 # bytes running.
 up:
+	@echo "project $(PROJECT)"
 	$(COMPOSE_BUILD) up -d --build --force-recreate
 	@echo "open http://$(DEV_BASE):$${HTTP_PORT:-9080}"
 
 # Release deploy (any host): pull the image (the `alpha` channel unless
 # NOITE_IMAGE overrides it), never build.
 up-prod:
+	@echo "project $(PROJECT)"
 	$(COMPOSE) up -d --pull always --force-recreate
 
 e2e:
@@ -117,12 +130,14 @@ e2e-down:
 	sh docker/e2e-local.sh down
 
 dev:
+	@echo "project $(PROJECT)"
 	$(COMPOSE_DEV) up -d --build --force-recreate
 	@echo "dev — runner: cargo watch · control: vite dev (first boot compiles: minutes)"
 	@echo "open http://$(DEV_BASE):$${HTTP_PORT:-9080}  (make logs)"
 
 dev-host:
 	@if [ -z "$(HOST_IP)" ]; then echo "error: could not detect LAN IP; retry as \`make dev-host HOST_IP=192.168.x.x\`"; exit 1; fi
+	@echo "project $(PROJECT)"
 	CONTROL_EXTRA_HOSTS="$${CONTROL_EXTRA_HOSTS:+$$CONTROL_EXTRA_HOSTS,}$(DEV_HOST_EXTRA)" $(COMPOSE_DEV) up -d --build --force-recreate
 	@echo "dev-host — control UI on LAN at http://$(HOST_IP):$${HTTP_PORT:-9080}"
 
@@ -146,6 +161,7 @@ usage:
 
 # Never destroy data on a plain stop.
 down:
+	@echo "project $(PROJECT)"
 	-$(COMPOSE) down --remove-orphans
 
 # Explicit nuke: every volume of this project and the e2e lane, plus local
@@ -154,9 +170,10 @@ down:
 # best-effort, so remove what it leaves behind by project label and name.
 # pi-lens-ignore: shellcheck-14-1091
 nuke:
+	@echo "project $(PROJECT)"
 	-$(COMPOSE_DEV) down -v --remove-orphans
 	-$(COMPOSE) down -v --remove-orphans
-	-$(COMPOSE_BIN) -p noite-e2e -f docker/compose.yaml -f docker/compose.e2e.yaml down -v --remove-orphans
-	-@for s in 1 2 3 4 5 6 7 8; do $(COMPOSE_BIN) -p noite-e2e-$$s -f docker/compose.yaml -f docker/compose.e2e.yaml down -v --remove-orphans; done
-	@CLI=$(ENGINE) sh -c '. ./docker/lib.sh && remove_project $(PROJECT) noite-e2e noite-e2e-1 noite-e2e-2 noite-e2e-3 noite-e2e-4 noite-e2e-5 noite-e2e-6 noite-e2e-7 noite-e2e-8'
+	-$(COMPOSE_CMD) -p noite-e2e -f docker/compose.yaml -f docker/compose.e2e.yaml down -v --remove-orphans
+	-@for s in 1 2 3 4 5 6 7 8; do $(COMPOSE_CMD) -p noite-e2e-$$s -f docker/compose.yaml -f docker/compose.e2e.yaml down -v --remove-orphans; done
+	@CLI=$(ENGINE) sh -c '. ./docker/lib.sh && remove_project "$$@"' nuke $(PROJECT) noite-e2e noite-e2e-1 noite-e2e-2 noite-e2e-3 noite-e2e-4 noite-e2e-5 noite-e2e-6 noite-e2e-7 noite-e2e-8
 	rm -rf apps/noite/.wrangler apps/noite/.void

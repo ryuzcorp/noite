@@ -31,9 +31,13 @@ if [ ! -f "${FROM_DIR}/MANIFEST" ]; then
 fi
 
 # Same project the Makefile drives (`make restore PROJECT=x`); a direct run
-# follows COMPOSE_PROJECT_NAME, else the default install.
+# follows COMPOSE_PROJECT_NAME, else the default install. Always `-p`: the
+# target volumes below are named `<project>_<volume>`, so the stack that is
+# stopped must be the one the volumes belong to.
 PROJECT="${PROJECT:-${COMPOSE_PROJECT_NAME:-noite}}"
-CE="$COMPOSE -p $PROJECT -f docker/compose.yaml"
+ce() {
+  $COMPOSE -p "$PROJECT" -f docker/compose.yaml "$@"
+}
 
 pick_tar_image untar "set NOITE_BACKUP_IMAGE=<image with tar>."
 
@@ -41,7 +45,8 @@ echo "==> restoring ${FROM}"
 cat "${FROM_DIR}/MANIFEST"
 echo
 echo "==> stop the stack"
-$CE down --remove-orphans
+echo "    project ${PROJECT}"
+ce down --remove-orphans
 
 for tar in "${FROM_DIR}"/*.tar; do
   [ -f "$tar" ] || continue
@@ -57,6 +62,6 @@ for tar in "${FROM_DIR}"/*.tar; do
 done
 
 echo "==> start the stack"
-timeout 300 $CE up -d || echo "note: restart did not return cleanly — check 'make up' and 'make doctor'"
+timeout 300 ce up -d || echo "note: restart did not return cleanly — check 'make up' and 'make doctor'"
 echo
 echo "restored. Verify with 'make doctor', then check an app in the UI."
