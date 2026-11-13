@@ -108,6 +108,15 @@ export const openSession = (tree: RunnerTree): EditSession => ({
   moves: new Map(),
 });
 
+/** Whether the session knows `path` at all: a committed file, a live buffer,
+ * or the destination of a move. A row outside this set has nothing to read —
+ * pierre's inline-add placeholder (`untitled`) is one, and so is a row a
+ * rebuild delivered a stale selection for. */
+export const holdsPath = (session: EditSession, path: string): boolean =>
+  session.base.has(path) ||
+  session.buffers.has(path) ||
+  session.moves.has(path);
+
 /** The destination a committed path was moved to, if any. */
 const moveTarget = (session: EditSession, path: string): string | undefined => {
   for (const [to, from] of session.moves) {
