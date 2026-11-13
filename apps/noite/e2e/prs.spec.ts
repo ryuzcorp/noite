@@ -382,6 +382,39 @@ test("a conflicting pull request reports conflicts and refuses to merge", async 
   expect(await branchNames(request, appId)).toContain("clash");
 });
 
+test("the new pull request page prints the compare line, not a crash", async ({
+  page,
+  request,
+}) => {
+  const slug = "prs-compare-line";
+  createdApps.push(slug);
+
+  const { apiKey, appId } = await createAppWithKey(page, request, {
+    name: "PRs Compare",
+    slug,
+  });
+
+  pushAppDir(apiKey, new URL("../test", import.meta.url), slug);
+
+  const repo = cloneRepo(apiKey, slug);
+  repo.run(["checkout", "-b", "ahead"]);
+  commitFiles(repo, { "ahead.txt": "ahead\n" }, "ahead: add file");
+  repo.run(["push", "-u", "origin", "ahead"]);
+
+  await page.goto(`/apps/${appId}/pulls/new?head=ahead`);
+
+  // The compare summary. The compare resource used to be created only once the
+  // picks were a real pair, which shifted every later atom in the form's render
+  // by one: the compare inherited the pull-request list's atom and this page
+  // painted "Cannot read properties of undefined (reading 'length')" instead.
+  await expect(
+    page.getByText(/1 commit ahead · 1 file changed/u)
+  ).toBeVisible();
+  await expect(
+    page.getByText("reading 'length'", { exact: false })
+  ).toHaveCount(0);
+});
+
 test("an author cannot approve their own pull request", async ({
   page,
   request,

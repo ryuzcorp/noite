@@ -1,5 +1,6 @@
 import { Link, useRouter } from "@ilha/void";
-import { atom } from "ilha";
+import * as Atom from "effect/reactivity/Atom";
+import { atom, watch } from "ilha";
 import type { AtomHandle } from "ilha";
 
 import { api } from "../api";
@@ -118,6 +119,49 @@ const ReasonList = ({ reasons }: { reasons: readonly string[] }) => (
   </div>
 );
 
+/** The compare of the picked pair, and the one line it prints. It owns the
+ * resource for two reasons ilha forces: an atom is keyed by its allocation
+ * order inside the enclosing fiber's render, and a tracked resource reuses its
+ * atom for the lifetime of that render. Allocated in the form (only once the
+ * picks are a real pair) it landed in the atom the pull-request list had
+ * filled in the previous render — the summary then read `files` off that
+ * payload and the page crashed; allocated there once, it kept the first pair's
+ * answer forever. In its own fiber, keyed by the pair, every pair gets its own
+ * resource, and the form's own allocation sequence never changes. The status
+ * travels up for `validateNewPr`. */
+const CompareLine = ({
+  appId,
+  base,
+  head,
+  onStatus,
+}: {
+  appId: string;
+  base: string;
+  head: string;
+  onStatus: (status: CompareStatus) => void;
+}) => {
+  const res = forgeCompare(appId, base, head);
+  const state = res.state();
+  const status = compareStatusOf(state);
+  // Two projections, because neither alone sees every settle: the value
+  // keeps its reference through a cold Loading → Failed and a warm
+  // Reloading → Failed (the form would stay "Comparing…"), and the tag stays
+  // `Ready` when a reload lands a new payload.
+  const tag = atom(Atom.readable((get) => get(res.state.atom)._tag));
+
+  const report = (): undefined => {
+    onStatus(compareStatusOf(res.state()) ?? { kind: "loading" });
+  };
+
+  watch(tag, report);
+  watch(res.value, report);
+  watch.once(report);
+
+  return status?.kind === "ready" && state._tag === "Ready" ? (
+    <CompareSummary compare={state.value} />
+  ) : null;
+};
+
 /** The base ← head pickers, with a hint until the branch list arrives. */
 const BranchPickers = ({
   appId,
@@ -233,11 +277,17 @@ export const NewPrForm = ({
     baseValue.trim() !== headValue.trim();
 
   // Cheap: the compare runs only once both picks are real, distinct branches.
-  const compareState = picksDiffer
-    ? forgeCompare(appId, baseValue.trim(), headValue.trim()).state()
-    : null;
+  // Reported by `CompareLine` (see its docs for why it owns the resource); a
+  // new pair clears it before the next pair's compare runs.
+  const compareStatus = atom<CompareStatus | null>(null);
 
-  const compare = compareStatusOf(compareState);
+  watch(base, () => {
+    compareStatus.set(null);
+  });
+  watch(head, () => {
+    compareStatus.set(null);
+  });
+  const compare = compareStatus();
 
   const openPulls =
     resourceValue(prList(appId, "open").state())?.pullRequests ?? [];
@@ -299,8 +349,16 @@ export const NewPrForm = ({
         }}
       />
 
-      {compare?.kind === "ready" && compareState?._tag === "Ready" ? (
-        <CompareSummary compare={compareState.value} />
+      {picksDiffer ? (
+        <CompareLine
+          key={`${baseValue.trim()}:${headValue.trim()}`}
+          appId={appId}
+          base={baseValue.trim()}
+          head={headValue.trim()}
+          onStatus={(next) => {
+            compareStatus.set(next);
+          }}
+        />
       ) : null}
 
       <fieldset class="fieldset">
