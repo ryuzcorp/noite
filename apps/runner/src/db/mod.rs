@@ -87,13 +87,14 @@ pub use instance_setting::{
     UPDATE_CHECK_ENABLED, UPDATE_CHECK_LAST_AT, UPDATE_CHECK_RESULT,
 };
 pub use metrics::{
-    add_app_metric_cpu, clear_telemetry_replay_if, delete_environment_telemetry,
-    delete_metric_watermarks_for, get_metric_watermarks, get_telemetry_replay, last_request_bucket,
-    list_app_devices, list_app_logs, list_app_metrics, list_app_paths, list_app_refs,
-    list_span_stats, prune_app_devices, prune_app_logs, prune_app_metrics, prune_app_paths,
-    prune_app_refs, prune_span_stats, record_access_hit, replace_app_logs,
-    replace_app_metric_usage, replace_span_stat, set_metric_watermarks, set_telemetry_replay,
-    AccessHit, AccessTrace,
+    add_app_metric_cpu, app_hour_lat, clear_telemetry_replay_if, delete_environment_telemetry,
+    delete_metric_watermarks_for, get_app_hour, get_metric_watermarks, get_telemetry_replay,
+    last_request_bucket, list_app_devices, list_app_logs, list_app_metrics, list_app_paths,
+    list_app_refs, list_span_stats, prune_app_devices, prune_app_hours, prune_app_logs,
+    prune_app_metrics, prune_app_paths, prune_app_refs, prune_span_stats, record_access_hit,
+    replace_app_hour, replace_app_hour_lat, replace_app_logs, replace_app_metric_usage,
+    replace_span_stat, set_metric_watermarks, set_telemetry_replay, AccessHit, AccessTrace,
+    AppHourValues,
 };
 pub use void_cohost::{delete_environment_hashes, get_cohost_hash, set_cohost_hash};
 
@@ -284,8 +285,9 @@ mod tests {
             set_metric_watermarks(&pool, &[("test".to_string(), 42)])
                 .await
                 .expect("watermark");
+            let mut tx = pool.begin().await.expect("tx");
             record_access_hit(
-                &pool,
+                &mut tx,
                 &AccessHit {
                     app_id: "a",
                     environment_id: "",
@@ -299,6 +301,7 @@ mod tests {
             )
             .await
             .expect("path");
+            tx.commit().await.expect("commit");
             pool.close().await;
         }
         let pool = connect(&url).await.expect("second boot");

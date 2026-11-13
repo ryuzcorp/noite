@@ -817,9 +817,16 @@ async fn a_late_access_line_backfills_the_stored_occurrence() {
     std::fs::write(&log, format!("{}\n", access_log_line("t-late"))).expect("log line");
     let mut cfg = crate::config::config_for_tests();
     cfg.caddy_access_log = log.to_string_lossy().into_owned();
-    crate::host::accesslog::tick(&pool, &cfg, &slug_id(), &slug_env(), &mut state.requests)
-        .await
-        .expect("tail the late line");
+    crate::host::accesslog::tick(
+        &pool,
+        &cfg,
+        &slug_id(),
+        &slug_env(),
+        &HashMap::new(),
+        &mut state.requests,
+    )
+    .await
+    .expect("tail the late line");
     assert_eq!(
         stored_request(&pool).await,
         (
@@ -892,9 +899,16 @@ async fn the_backfill_never_touches_sdk_or_foreign_occurrences() {
     std::fs::write(&log, format!("{}\n", access_log_line("t-shared"))).expect("log line");
     let mut cfg = crate::config::config_for_tests();
     cfg.caddy_access_log = log.to_string_lossy().into_owned();
-    crate::host::accesslog::tick(&pool, &cfg, &slug_id(), &slug_env(), &mut state.requests)
-        .await
-        .expect("tail the late line");
+    crate::host::accesslog::tick(
+        &pool,
+        &cfg,
+        &slug_id(),
+        &slug_env(),
+        &HashMap::new(),
+        &mut state.requests,
+    )
+    .await
+    .expect("tail the late line");
     let rows: Vec<(String, String, String, String)> = sqlx::query_as(
         "SELECT app_id, source, method, path FROM metrics.app_error_event ORDER BY app_id, source",
     )
@@ -938,9 +952,16 @@ async fn a_tailed_line_joins_at_ingest() {
     std::fs::write(&log, format!("{}\n", access_log_line("t-early"))).expect("log line");
     let mut cfg = crate::config::config_for_tests();
     cfg.caddy_access_log = log.to_string_lossy().into_owned();
-    crate::host::accesslog::tick(&pool, &cfg, &slug_id(), &slug_env(), &mut state.requests)
-        .await
-        .expect("tail the line");
+    crate::host::accesslog::tick(
+        &pool,
+        &cfg,
+        &slug_id(),
+        &slug_env(),
+        &HashMap::new(),
+        &mut state.requests,
+    )
+    .await
+    .expect("tail the line");
     commit_chunk(
         &pool,
         &mut state,

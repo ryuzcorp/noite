@@ -14,6 +14,12 @@
 //! once and yields minute buckets, hourly span stats and new log lines at
 //! once. Every dashboard then serves from SQLite — no DuckDB on any request
 //! path.
+//!
+//! Alongside that ingest, `hourly` keeps the DuckDB-free replacement:
+//! `metrics.app_hour`, one row per fleet per hour with requests, errors,
+//! p50/p95 latency, memory and CPU. Requests/errors/latency come from the
+//! edge access log (the one request sample that is not Parquet), memory from
+//! each fleet's cgroup leaf, CPU from the `/proc` sampler.
 
 use std::collections::{HashMap, HashSet};
 
@@ -23,6 +29,7 @@ use crate::host::errors;
 
 mod compact;
 mod cpu;
+pub mod hourly;
 mod ingest;
 mod plan;
 mod tick;

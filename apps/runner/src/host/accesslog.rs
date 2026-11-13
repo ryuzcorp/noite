@@ -5,6 +5,11 @@
 //! attributes tenant hosts to apps, classifies the User-Agent into a
 //! (browser, os) pair, and accumulates hour buckets in SQLite.
 //!
+//! The same line is the request feed for the hourly counters
+//! (`metrics/hourly.rs`): its status class, latency and timestamp fold into the
+//! fleet's open hour inside the line's own transaction, so a line is counted
+//! exactly once or not at all.
+//!
 //! Privacy: only the classified pair is stored — raw user-agents and
 //! client IPs never leave this module (neither is parsed). The error index
 //! (trace id → method, query-less path, status, device pair) holds the same
@@ -24,6 +29,7 @@ use crate::config::Config;
 use crate::db;
 use crate::host::edge::{parse_edge_slug, parse_env_host};
 use crate::host::errors::{RequestCtx, RequestIndex};
+use crate::host::metrics::hourly;
 
 /// Log lines are tiny; past this the file is truncated after consuming.
 const TRUNCATE_BYTES: u64 = 2 * 1024 * 1024;
@@ -218,6 +224,16 @@ struct Line {
     os: &'static str,
     path: String,
     source: String,
+    /// The request's own start, in epoch microseconds (the log's `ts`): the
+    /// hourly counters key their bucket on it and keep the newest one for the
+    /// sleep sweeper.
+    ts_us: i64,
+    /// Edge latency in milliseconds, when the line carries `duration`.
+    /// Caddy always does; a line without it still counts as a request, just
+    /// without a latency sample.
+    duration_ms: Option<i64>,
+    /// The edge's status class: 5xx is the error count the counters carry.
+    error: bool,
     /// The `traceID` fleet sites log (`TENANT_TRACE` in the static edge
     /// config, `traceparent` on tenant/custom/env requests) with the request
     /// it names, for the error ingest (host/errors.rs). Non-fleet log lines
@@ -231,13 +247,16 @@ struct Line {
 /// `parse_edge_slug` already refuses these to keep them out of the tenant
 /// space; the access-log tail uses this to attribute the control plane's own
 /// traffic (its polling and SSE) to the reserved control key instead.
-fn is_control_host(host: &str, control_hosts: &[String]) -> bool {
-    let bare = host
-        .split_once(':')
+fn bare_host(host: &str) -> String {
+    host.split_once(':')
         .map(|(h, _)| h)
         .unwrap_or(host)
         .trim()
-        .to_lowercase();
+        .to_lowercase()
+}
+
+fn is_control_host(host: &str, control_hosts: &[String]) -> bool {
+    let bare = bare_host(host);
     if bare.is_empty() {
         return false;
     }
@@ -251,6 +270,7 @@ fn parse_line(
     cfg: &Config,
     slug_id: &HashMap<String, String>,
     slug_env: &HashMap<String, String>,
+    domain_id: &HashMap<String, String>,
 ) -> Option<Line> {
     let v: serde_json::Value = serde_json::from_str(line).ok()?;
     let host = v
@@ -276,7 +296,10 @@ fn parse_line(
                 None if is_control_host(host, &cfg.control_hosts()) => {
                     (crate::host::control::SLUG.to_string(), String::new())
                 }
-                None => return None,
+                // A verified custom domain is the app's own traffic, served by the
+                // same edge: without this the counters (and the idle clock that reads
+                // them) would see nothing for an app on its own hostname.
+                None => (domain_id.get(&bare_host(host))?.clone(), String::new()),
             },
         };
     let ua = first_header(&v, "User-Agent");
@@ -289,7 +312,18 @@ fn parse_line(
         return None;
     }
     let source = ref_source(first_header(&v, "Referer"));
-    let ts = v.pointer("/ts").and_then(|x| x.as_f64()).unwrap_or(0.0) as i64;
+    let ts = v.pointer("/ts").and_then(|x| x.as_f64()).unwrap_or(0.0);
+    let ts_us = (ts * 1_000_000.0) as i64;
+    let status = v
+        .pointer("/status")
+        .and_then(serde_json::Value::as_i64)
+        .unwrap_or(0);
+    // Caddy logs `duration` in seconds (float). Keep it in whole milliseconds:
+    // the histogram behind the percentiles is millisecond-scale.
+    let duration_ms = v
+        .pointer("/duration")
+        .and_then(serde_json::Value::as_f64)
+        .map(|secs| (secs * 1_000.0).round().max(0.0) as i64);
     let (browser, os) = device_classify(ua);
     let trace = v
         .pointer("/traceID")
@@ -303,10 +337,6 @@ fn parse_line(
                 .chars()
                 .take(16)
                 .collect();
-            let status = v
-                .pointer("/status")
-                .and_then(serde_json::Value::as_i64)
-                .unwrap_or(0);
             (
                 t.to_string(),
                 RequestCtx {
@@ -321,7 +351,10 @@ fn parse_line(
     Some(Line {
         app_id,
         environment_id,
-        bucket: hour_bucket(ts),
+        bucket: hour_bucket(ts as i64),
+        ts_us,
+        duration_ms,
+        error: status >= 500,
         browser,
         os,
         path: path.to_string(),
@@ -415,7 +448,52 @@ struct Tail<'a> {
     cfg: &'a Config,
     slug_id: &'a HashMap<String, String>,
     slug_env: &'a HashMap<String, String>,
+    /// Verified custom `hostname → app_id`: the edge serves those hosts too, so
+    /// their requests belong to the owning app.
+    domain_id: &'a HashMap<String, String>,
     requests: &'a mut RequestIndex,
+}
+
+/// Commit one access-log line: its device/path/referrer counters, the trace
+/// backfill, and the fleet's hourly counters in one transaction. A failed
+/// statement or commit applies nothing, so the retried line is not counted
+/// twice.
+async fn apply_line(tail: &mut Tail<'_>, l: &Line) -> anyhow::Result<()> {
+    let trace = l.trace.as_ref().map(|(trace_id, ctx)| db::AccessTrace {
+        trace_id,
+        method: &ctx.method,
+        path: &ctx.path,
+        http_status: ctx.status,
+        browser: ctx.browser,
+        os: ctx.os,
+        backfill: tail.requests.is_pending(trace_id),
+    });
+    let hit = db::AccessHit {
+        app_id: &l.app_id,
+        environment_id: &l.environment_id,
+        bucket: &l.bucket,
+        browser: l.browser,
+        os: l.os,
+        path: &l.path,
+        source: &l.source,
+        trace,
+    };
+    let mut tx = tail.pool.begin().await?;
+    db::record_access_hit(&mut tx, &hit).await?;
+    hourly::record_request(
+        &mut tx,
+        hourly::Key {
+            app_id: &l.app_id,
+            environment_id: &l.environment_id,
+            bucket_hour: &l.bucket,
+        },
+        l.ts_us,
+        l.duration_ms,
+        l.error,
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(())
 }
 
 async fn consume_lines(
@@ -437,30 +515,10 @@ async fn consume_lines(
         let advance_by = nl as u64 + 1;
         if let Ok(text) = std::str::from_utf8(line) {
             if !text.is_empty() {
-                if let Some(l) = parse_line(text, tail.cfg, tail.slug_id, tail.slug_env) {
-                    let trace = l.trace.as_ref().map(|(trace_id, ctx)| db::AccessTrace {
-                        trace_id,
-                        method: &ctx.method,
-                        path: &ctx.path,
-                        http_status: ctx.status,
-                        browser: ctx.browser,
-                        os: ctx.os,
-                        backfill: tail.requests.is_pending(trace_id),
-                    });
-                    db::record_access_hit(
-                        tail.pool,
-                        &db::AccessHit {
-                            app_id: &l.app_id,
-                            environment_id: &l.environment_id,
-                            bucket: &l.bucket,
-                            browser: l.browser,
-                            os: l.os,
-                            path: &l.path,
-                            source: &l.source,
-                            trace,
-                        },
-                    )
-                    .await?;
+                if let Some(l) =
+                    parse_line(text, tail.cfg, tail.slug_id, tail.slug_env, tail.domain_id)
+                {
+                    apply_line(tail, &l).await?;
                     if let Some((trace_id, ctx)) = l.trace {
                         tail.requests.clear_pending(&trace_id);
                         tail.requests.insert(trace_id, ctx);
@@ -475,10 +533,11 @@ async fn consume_lines(
     Ok(cursor)
 }
 
-/// Consume new access-log lines into device stats. A missing log (Caddy not
-/// yet reloaded) is a silent skip. Environment hosts attribute to the
-/// environment's own (app, environment) rows; the trace → request index is
-/// shared (trace ids are unique per request).
+/// Consume new access-log lines into device stats and the fleet's hourly
+/// counters. A missing log (Caddy not yet reloaded) is a silent skip.
+/// Environment hosts attribute to the environment's own (app, environment)
+/// rows; the trace → request index is shared (trace ids are unique per
+/// request).
 ///
 /// The offset advances (and is persisted) only after a line's rows commit, so
 /// a mid-loop DB error re-reads exactly the lines that were not applied — never
@@ -489,6 +548,7 @@ pub async fn tick(
     cfg: &Config,
     slug_id: &HashMap<String, String>,
     slug_env: &HashMap<String, String>,
+    domain_id: &HashMap<String, String>,
     requests: &mut RequestIndex,
 ) -> anyhow::Result<()> {
     use std::os::unix::fs::MetadataExt;
@@ -515,6 +575,7 @@ pub async fn tick(
         cfg,
         slug_id,
         slug_env,
+        domain_id,
         requests,
     };
     consume_lines(&mut tail, &bytes, meta.ino(), cursor, &offset_file).await?;
@@ -571,7 +632,15 @@ mod tests {
         .execute(&pool)
         .await
         .expect("trigger");
-        let result = super::tick(&pool, &cfg, &slug_id, &HashMap::new(), &mut requests).await;
+        let result = super::tick(
+            &pool,
+            &cfg,
+            &slug_id,
+            &HashMap::new(),
+            &HashMap::new(),
+            &mut requests,
+        )
+        .await;
         assert!(result.is_err(), "the second line fails");
         let offset = std::fs::read_to_string(dir.join("access-log.offset")).expect("offset");
         assert_eq!(
@@ -583,9 +652,16 @@ mod tests {
             .execute(&pool)
             .await
             .expect("drop trigger");
-        super::tick(&pool, &cfg, &slug_id, &HashMap::new(), &mut requests)
-            .await
-            .expect("retry succeeds");
+        super::tick(
+            &pool,
+            &cfg,
+            &slug_id,
+            &HashMap::new(),
+            &HashMap::new(),
+            &mut requests,
+        )
+        .await
+        .expect("retry succeeds");
         let devices = crate::db::list_app_devices(&pool, "app-id", "", "1970-01-01T00:00:00Z")
             .await
             .expect("read");
@@ -657,7 +733,9 @@ mod tests {
             source: "Direct",
             trace: None,
         };
-        assert!(crate::db::record_access_hit(&pool, &hit).await.is_err());
+        let mut tx = pool.begin().await.expect("tx");
+        assert!(crate::db::record_access_hit(&mut tx, &hit).await.is_err());
+        drop(tx);
         let devices = crate::db::list_app_devices(&pool, "a", "", "2026-09-30T00:00:00Z")
             .await
             .expect("read");
@@ -687,6 +765,49 @@ mod env_tests {
         .to_string()
     }
 
+    /// A verified custom domain is the app's own traffic: the edge serves it,
+    /// so its requests must count (and keep the idle clock honest). An
+    /// unverified or unknown host still lands nowhere.
+    #[test]
+    fn custom_domains_attribute_to_their_app() {
+        let cfg = crate::config::config_for_tests();
+        let slug_id = HashMap::from([("blog".to_string(), "app1".to_string())]);
+        let domains = HashMap::from([
+            ("example.com".to_string(), "app1".to_string()),
+            ("www.example.com".to_string(), "app1".to_string()),
+        ]);
+        let custom = parse_line(
+            &line("example.com"),
+            &cfg,
+            &slug_id,
+            &HashMap::new(),
+            &domains,
+        )
+        .expect("custom host parses");
+        assert_eq!(custom.app_id, "app1");
+        assert_eq!(custom.environment_id, "");
+        let ported = parse_line(
+            &line("WWW.Example.COM:443"),
+            &cfg,
+            &slug_id,
+            &HashMap::new(),
+            &domains,
+        )
+        .expect("case and port do not matter");
+        assert_eq!(ported.app_id, "app1");
+        assert!(
+            parse_line(
+                &line("pending.example.org"),
+                &cfg,
+                &slug_id,
+                &HashMap::new(),
+                &domains
+            )
+            .is_none(),
+            "an unverified host is dropped, never guessed"
+        );
+    }
+
     /// An environment host attributes to the environment's own (app,
     /// environment) rows; a tenant host stays production; an unknown
     /// label is dropped, never mis-keyed onto the app.
@@ -698,17 +819,36 @@ mod env_tests {
             ("blog.feature".to_string(), "app1".to_string()),
         ]);
         let slug_env = HashMap::from([("blog.feature".to_string(), "env-1".to_string())]);
-        let env = parse_line(&line("feature.blog.localhost"), &cfg, &slug_id, &slug_env)
-            .expect("env host parses");
+        let env = parse_line(
+            &line("feature.blog.localhost"),
+            &cfg,
+            &slug_id,
+            &slug_env,
+            &HashMap::new(),
+        )
+        .expect("env host parses");
         assert_eq!(env.app_id, "app1");
         assert_eq!(env.environment_id, "env-1");
         assert_eq!(env.path, "/about");
-        let prod = parse_line(&line("blog.localhost"), &cfg, &slug_id, &slug_env)
-            .expect("tenant host parses");
+        let prod = parse_line(
+            &line("blog.localhost"),
+            &cfg,
+            &slug_id,
+            &slug_env,
+            &HashMap::new(),
+        )
+        .expect("tenant host parses");
         assert_eq!(prod.app_id, "app1");
         assert_eq!(prod.environment_id, "");
         assert!(
-            parse_line(&line("ghost.blog.localhost"), &cfg, &slug_id, &slug_env).is_none(),
+            parse_line(
+                &line("ghost.blog.localhost"),
+                &cfg,
+                &slug_id,
+                &slug_env,
+                &HashMap::new()
+            )
+            .is_none(),
             "an unknown label is dropped, never production"
         );
         assert!(
@@ -716,6 +856,7 @@ mod env_tests {
                 &line("feature.blog.localhost"),
                 &cfg,
                 &slug_id,
+                &HashMap::new(),
                 &HashMap::new()
             )
             .is_none(),

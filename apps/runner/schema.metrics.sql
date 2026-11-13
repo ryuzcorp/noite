@@ -9,6 +9,38 @@ CREATE TABLE IF NOT EXISTS metrics.app_metric (
   PRIMARY KEY (app_id, environment_id, bucket_ts)
 );
 CREATE INDEX IF NOT EXISTS metrics.idx_app_metric_app_bucket ON app_metric(app_id, environment_id, bucket_ts);
+-- Hourly per-fleet counters (the DuckDB replacement): one row per
+-- (app, environment, hour), rewritten from the tick's open hour instead of
+-- accumulated, so a retried access-log line can never double count. The
+-- percentiles are derived from `app_hour_lat` when the row is written, so a
+-- dashboard read is one indexed scan of this table.
+CREATE TABLE IF NOT EXISTS metrics.app_hour (
+  app_id TEXT NOT NULL,
+  environment_id TEXT NOT NULL DEFAULT '',
+  bucket_hour TEXT NOT NULL,
+  requests INTEGER NOT NULL DEFAULT 0,
+  errors INTEGER NOT NULL DEFAULT 0,
+  p50_ms INTEGER NOT NULL DEFAULT 0,
+  p95_ms INTEGER NOT NULL DEFAULT 0,
+  mem_max_bytes INTEGER NOT NULL DEFAULT 0,
+  mem_avg_bytes INTEGER NOT NULL DEFAULT 0,
+  last_request_us INTEGER NOT NULL DEFAULT 0,
+  cpu_ms INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (app_id, environment_id, bucket_hour)
+);
+-- Fixed log-scale latency histogram behind the two percentiles: bucket 0 is
+-- `< 1 ms`, bucket k is `[2^(k-1), 2^k)` ms, and the top bucket absorbs the
+-- rest. One row per bucket actually hit bounds an hour to `LAT_BUCKETS` rows
+-- and keeps the percentiles exact at the resolution the dashboard needs,
+-- instead of keeping samples.
+CREATE TABLE IF NOT EXISTS metrics.app_hour_lat (
+  app_id TEXT NOT NULL,
+  environment_id TEXT NOT NULL DEFAULT '',
+  bucket_hour TEXT NOT NULL,
+  bucket INTEGER NOT NULL,
+  n INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (app_id, environment_id, bucket_hour, bucket)
+);
 CREATE TABLE IF NOT EXISTS metrics.app_device_stat (
   app_id TEXT NOT NULL,
   environment_id TEXT NOT NULL DEFAULT '',
