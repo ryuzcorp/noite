@@ -1,6 +1,7 @@
-//! The `/account` admin settings machine, shared by the release-check card and
-//! the telemetry card. They were two copies of the same code and had already
-//! drifted once (update has a background `checking`, telemetry does not).
+//! The instance-settings machine behind the control page's Settings tab,
+//! shared by the release-check card and the telemetry card. They were two
+//! copies of the same code and had already drifted once (update has a
+//! background `checking`, telemetry does not).
 //!
 //! States:
 //!

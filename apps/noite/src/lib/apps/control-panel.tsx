@@ -1,5 +1,6 @@
 import { AdminAppsPanel } from "../admin/apps";
 import { AdminInvitesPanel } from "../admin/invites";
+import { AdminSettingsPanel } from "../admin/settings";
 import { AdminUsersPanel } from "../admin/users";
 import { fleetState, telemetryAvailable } from "../app-detail/control-fleet";
 import type { FleetState } from "../app-detail/control-fleet";
@@ -26,9 +27,11 @@ import { adminStatus, session } from "../resources";
 //! telemetry into the same ingest as every app (reserved key `_control`, no
 //! `app` row — see runner `host/control.rs`), so the Overview, Metrics, Errors
 //! and Logs surfaces reuse the tenant panels unchanged. Instance
-//! administration (Users, Apps, Invites) shares the page. Overview lists the
-//! control D1, which opens on its own `/storage/_control/...` page like any
-//! app's storage.
+//! administration shares the page: Users, Apps and Invites are the CRUD tabs,
+//! and Settings holds the instance-wide switches (anonymous telemetry,
+//! release check) that used to live in `/account`'s retired Admin tab.
+//! Overview lists the control D1, which opens on its own
+//! `/storage/_control/...` page like any app's storage.
 //!
 //! Visibility mirrors the server gate: a real instance admin, never an
 //! impersonated session — and the runner streams behind these panels re-check
@@ -53,6 +56,7 @@ const TABS = [
   { id: "users", label: "Users" },
   { id: "apps", label: "Apps" },
   { id: "invites", label: "Invites" },
+  { id: "settings", label: "Settings" },
 ] as const;
 
 type TabId = (typeof TABS)[number]["id"];
@@ -68,6 +72,7 @@ const NEEDS_FLEET: Record<TabId, boolean> = {
   logs: true,
   metrics: true,
   overview: false,
+  settings: false,
   users: false,
 };
 
@@ -105,23 +110,27 @@ const ControlMetricsTab = () => {
   );
 };
 
-/** Shaped like a tenant app's header: avatar, name, then one line of facts. */
+/** Shaped like a tenant app's header: avatar, name, then one line of facts.
+ * The facts are flex chunks separated by the row's gap, never by literal `·`
+ * text: a dot between two spans belongs to neither, so at 390 px it wraps
+ * onto the next line as a leading (or, at the end of the previous line,
+ * dangling) separator. Each fact may wrap inside itself instead. */
 const Header = ({ controlFleet }: { controlFleet: boolean }) => (
   <header class="flex min-w-0 items-center gap-3">
     <Avatar class="shrink-0" label={CONTROL_APP_NAME} size="lg" />
     <div class="min-w-0">
       <h1 class="m-0 truncate text-xl font-semibold">{CONTROL_APP_NAME}</h1>
-      <p class="m-0 flex flex-wrap items-center gap-x-2 text-sm">
+      <p class="m-0 flex flex-wrap items-center gap-x-3 gap-y-1 text-sm">
         <span class="badge badge-sm">{CONTROL_APP_SUBTITLE}</span>
-        <span class="opacity-70">
+        <span class="whitespace-nowrap opacity-70">
           build <span class="font-mono">{CONTROL_BUILD}</span>
         </span>
         {/* The control plane's numbers include this dashboard's own traffic:
             every page load polls and its logs/errors streams stay open. Only
             shown where the telemetry tabs exist. */}
         {controlFleet ? (
-          <span class="opacity-70">
-            · telemetry includes this dashboard's own polling and streams
+          <span class="min-w-0 opacity-70">
+            telemetry includes this dashboard's own polling and streams
           </span>
         ) : null}
       </p>
@@ -230,6 +239,7 @@ const ControlAppDetailBody = ({ fleet }: { fleet: FleetState }) => {
       {active === "users" ? <AdminUsersPanel /> : null}
       {active === "apps" ? <AdminAppsPanel /> : null}
       {active === "invites" ? <AdminInvitesPanel /> : null}
+      {active === "settings" ? <AdminSettingsPanel /> : null}
     </DetailShell>
   );
 };

@@ -131,7 +131,7 @@ export const authorityFromWire = (wire: AuthorityWire): InstanceAuthority => {
 };
 
 /** The client's single read of `/api/admin/adminOverview`: one predicate for
- * the side bar, the control page and the Admin tab. A missing overview (still
+ * the side bar and the control page. A missing overview (still
  * loading) is not an admin. */
 export const overviewAuthority = (
   overview: { readonly authority: AuthorityWire } | undefined

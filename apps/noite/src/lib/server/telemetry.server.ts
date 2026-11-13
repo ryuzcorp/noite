@@ -18,9 +18,9 @@ export const countControlUsers = (): Promise<number> =>
     return Number(row?.n ?? 0);
   });
 
-/** The telemetry opt-out state behind the `/account` admin section. A real
- * instance admin only, never an impersonated session: the runner takes any
- * bearer call, so the gate has to live here. */
+/** The telemetry opt-out state behind the control page's Settings tab. A
+ * real instance admin only, never an impersonated session: the runner takes
+ * any bearer call, so the gate has to live here. */
 export const getTelemetry = apiActionNoInput(async ({ env, request }) => {
   await requireControlAdmin(request, env);
 

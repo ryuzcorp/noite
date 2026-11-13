@@ -104,7 +104,7 @@ The full walkthrough is in the [Quickstart](https://noite.now/quickstart/).
 
 Installs follow a release channel: `ghcr.io/ryuzcorp/noite:alpha` by default. `stable` follows final releases only, and a version tag (`0.1.0-alpha.5`) pins one release. For real installs, bring your own S3-compatible bucket (R2, S3, Tigris, GCS or Azure Blob); the bundled RustFS store is for getting started ([Storage](https://noite.now/self-hosting/storage/)).
 
-Installs send one anonymous heartbeat a day — release, platform and counts, never domains, names, emails or IPs. It is opt-out: the Admin section on `/account` or `NOITE_TELEMETRY=0` turns it off ([Telemetry](https://noite.now/self-hosting/telemetry/)).
+Installs send one anonymous heartbeat a day — release, platform and counts, never domains, names, emails or IPs. It is opt-out: the control page's Settings tab (`/apps/_control?t=settings`) or `NOITE_TELEMETRY=0` turns it off ([Telemetry](https://noite.now/self-hosting/telemetry/)).
 
 ## How it works
 

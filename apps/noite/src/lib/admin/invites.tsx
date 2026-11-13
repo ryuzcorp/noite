@@ -1,4 +1,5 @@
-//! Admin tab: the invite pool — search it, mint codes, revoke what is open.
+//! Invites tab of the control page (`/apps/_control?t=invites`): the invite
+//! pool — search it, mint codes, revoke what is open.
 
 import { atom } from "ilha";
 import type { View } from "ilha";

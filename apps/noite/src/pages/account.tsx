@@ -1,27 +1,18 @@
-import { isInstanceAdmin, TelemetryCard } from "$lib/account/admin-telemetry";
-import { UpdateCard } from "$lib/account/admin-update";
 import { AccountPanel } from "$lib/account/panel";
-import { DetailShell, DetailTabs } from "$lib/app-detail/shell";
-import { CONTROL_APP_ID, CONTROL_APP_NAME } from "$lib/control-app";
+import { isInstanceAdmin } from "$lib/admin/access";
+import { DetailShell } from "$lib/app-detail/shell";
+import { CONTROL_APP_ID } from "$lib/control-app";
 import { session } from "$lib/resources";
 import { searchParam } from "$lib/search-param";
 import { Avatar } from "$lib/ui/avatar";
-import { Link } from "@ilha/void";
+import { useRouter } from "@ilha/void";
+import { watch } from "ilha";
 
 import { resourceValue } from "../lib/resource";
 
-const TABS = [
-  { id: "account", label: "Account" },
-  { id: "admin", label: "Admin" },
-] as const;
-
-type TabId = (typeof TABS)[number]["id"];
-
-/** Parse `?t=`: unknown tabs fall back to account. */
-const toTabId = (raw: string): TabId =>
-  TABS.find((tab) => tab.id === raw)?.id ?? "account";
-
-/** Shaped like an app's header: avatar, name, then one line of facts. */
+/** Shaped like an app's header: avatar, name, then one line of facts. The
+ * role badge stays here (who you are); every admin *control* now lives on the
+ * control page. */
 const Header = ({ admin }: { admin: boolean }) => {
   const user = resourceValue(session().state())?.user;
   const name = user?.name || user?.email || "Account";
@@ -40,51 +31,33 @@ const Header = ({ admin }: { admin: boolean }) => {
   );
 };
 
-/** Where the rest of instance administration lives. */
-const AdminHomeCard = () => (
-  <section class="border-base-300 bg-base-100 dark:bg-base-200 rounded-box flex flex-col gap-2 border p-4 shadow-md">
-    <h2 class="m-0 text-lg font-semibold">Users, apps and invites</h2>
-    <p class="m-0 text-sm opacity-80">
-      Managed on the{" "}
-      <Link class="link" href={`/apps/${CONTROL_APP_ID}?t=users`}>
-        {CONTROL_APP_NAME} admin page
-      </Link>
-      .
-    </p>
-  </section>
-);
-
+/** `/account` is personal settings only: profile, passkeys, API keys, invite
+ * codes and agent connect. Instance administration — users, apps, invites and
+ * the instance switches (telemetry, release check) — is one place, the
+ * control app's detail page (`/apps/_control`).
+ *
+ * The Admin tab that used to live here is gone; `?t=admin` was in docs, in the
+ * update-notice e2e and in bookmarks, so it redirects to the control page's
+ * Settings tab (the switches it used to hold) instead of landing on a tab
+ * that no longer exists. A non-admin who follows such a link gets that page's
+ * usual answer (the overview gate refuses it). */
 export default function Account() {
-  const tab = searchParam<TabId>("t", { default: "account", parse: toTabId });
+  const router = useRouter();
+  const tab = searchParam("t", { default: "" });
+
+  watch.once(() => {
+    if (typeof window === "undefined" || tab() !== "admin") {
+      return;
+    }
+
+    void router.visit(`/apps/${CONTROL_APP_ID}?t=settings`);
+  });
+
   const admin = isInstanceAdmin();
-  // The Admin tab exists for a real instance admin only; a stale `?t=admin`
-  // for anyone else lands on Account.
-  const active: TabId = admin ? tab() : "account";
 
   return (
-    <DetailShell
-      panel={null}
-      header={
-        <>
-          <Header admin={admin} />
-          <DetailTabs
-            active={active}
-            tabs={admin ? TABS : TABS.filter((item) => item.id !== "admin")}
-            onSelect={(next) => {
-              tab.set(toTabId(next));
-            }}
-          />
-        </>
-      }
-    >
-      {active === "account" ? <AccountPanel /> : null}
-      {active === "admin" ? (
-        <>
-          <TelemetryCard />
-          <UpdateCard />
-          <AdminHomeCard />
-        </>
-      ) : null}
+    <DetailShell panel={null} header={<Header admin={admin} />}>
+      <AccountPanel />
     </DetailShell>
   );
 }

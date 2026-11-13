@@ -1,6 +1,7 @@
-//! The one renderer for an admin on/off setting card (telemetry, release
-//! check). It reads the shared state machine (`settings.machine.ts`) and
-//! emits events; the card around it owns its own API call and extra rows.
+//! The one renderer for an instance-wide on/off setting card (telemetry,
+//! release check) on the control page's Settings tab. It reads the shared
+//! state machine (`settings.machine.ts`) and emits events; the card around it
+//! owns its own API call and extra rows.
 //!
 //! The locked notice always names the *stored* preference, so an operator can
 //! tell "stored on, ignored" from "stored off" — the two cards used to hide
