@@ -72,34 +72,92 @@ const onDropdownPointerDown = (event: PointerEvent) => {
   closeOpenDetails(event.target instanceof Node ? event.target : undefined);
 };
 
-// Esc closes any dropdown: open `<details>` ones, and focus-based ones by
-// dropping focus out of them. A dialog's own Esc handling is unaffected.
-const onDropdownKeyDown = (event: KeyboardEvent) => {
+/** The phone drawer's checkbox: daisyUI's one source of truth for whether
+ * the drawer is open. At `lg` and up the drawer is always open (`drawer-open`
+ * wins) and the state is left alone. */
+const drawerToggle = (): HTMLInputElement | null =>
+  document.querySelector<HTMLInputElement>("#nav-drawer");
+
+/** The top bar's toggle, which opens the drawer and gets focus back when Esc
+ * closes it. */
+const DRAWER_TOGGLE = "[data-drawer-toggle]";
+
+/** Close the phone drawer if it is open; answers whether it was. */
+const closeDrawer = (): boolean => {
+  const toggle = drawerToggle();
+
+  if (toggle?.checked !== true) {
+    return false;
+  }
+
+  toggle.checked = false;
+
+  return true;
+};
+
+// Esc closes the popovers first (an open `<details>` one, or the focus-based
+// account menu by dropping focus out of it) and the phone drawer second, so
+// one press never closes two layers at once. Only the press that closes the
+// drawer hands focus back to the toggle: the drawer's items are gone with it,
+// and a keyboard user must not be left on a hidden element. A dialog's own
+// Esc handling is unaffected.
+const onShellKeyDown = (event: KeyboardEvent) => {
   if (event.key !== "Escape") {
     return;
   }
 
-  closeOpenDetails();
+  const openDetails = document.querySelector("details.dropdown[open]");
   const active = document.activeElement;
+  const focused = active instanceof HTMLElement ? active : null;
+  const inMenu = focused !== null && focused.closest(".dropdown") !== null;
 
-  if (active instanceof HTMLElement && active.closest(".dropdown")) {
-    active.blur();
+  if (openDetails || inMenu) {
+    closeOpenDetails();
+
+    if (inMenu) {
+      focused.blur();
+    }
+
+    return;
+  }
+
+  if (closeDrawer()) {
+    document.querySelector<HTMLElement>(DRAWER_TOGGLE)?.focus();
   }
 };
 
-const useDropdownWiring = (): void => {
+// A tap on any destination inside the drawer closes it, so the next page is
+// never hidden behind an open overlay. The account row is the one item that
+// does not navigate — it opens the profile menu, which closes on its own
+// items' clicks (they are links and buttons too).
+const onDrawerItemClick = (event: MouseEvent) => {
+  const { target } = event;
+
+  if (
+    target instanceof Element &&
+    target.closest(".drawer-side a[href], .drawer-side button") !== null
+  ) {
+    closeDrawer();
+  }
+};
+
+/** The shell's document-level wiring: dropdowns and the phone drawer. The
+ * layout stays mounted across navigations, so this runs once. */
+const useShellWiring = (): void => {
   watch.once(({ onCleanup }) => {
     if (typeof document === "undefined") {
       return;
     }
 
     document.addEventListener("click", onDropdownClick);
+    document.addEventListener("click", onDrawerItemClick);
     document.addEventListener("pointerdown", onDropdownPointerDown);
-    document.addEventListener("keydown", onDropdownKeyDown);
+    document.addEventListener("keydown", onShellKeyDown);
     onCleanup(() => {
       document.removeEventListener("click", onDropdownClick);
+      document.removeEventListener("click", onDrawerItemClick);
       document.removeEventListener("pointerdown", onDropdownPointerDown);
-      document.removeEventListener("keydown", onDropdownKeyDown);
+      document.removeEventListener("keydown", onShellKeyDown);
     });
   });
 };
@@ -121,7 +179,7 @@ export default function DashboardLayout({ children }: { children?: View }) {
   // The cell every `searchParam` read subscribes to (see $lib/search-param).
   // It must run on every render, before the /login early return.
   provideQueryCell();
-  useDropdownWiring();
+  useShellWiring();
 
   // The chrome's own state, like the cell above: the sidebar is part of the
   // shell, so it is created before the /login early return — nothing binds
@@ -210,7 +268,10 @@ export default function DashboardLayout({ children }: { children?: View }) {
               />
             </Link>
             <ul class="menu w-full flex-1">
-              <li>
+              {/* The phone drawer's top bar sits right above this list, so
+                  the first item needs its own breathing room there; at `lg`
+                  the menu-title already spaces it. */}
+              <li class="mt-2 lg:mt-0">
                 <a
                   {...link("/apps")}
                   data-tour="apps"
@@ -220,9 +281,12 @@ export default function DashboardLayout({ children }: { children?: View }) {
                   <ListIcon class="h-5 w-5 shrink-0" />
                   Apps
                 </a>
-                {onAppsPages ? (
-                  <SidebarApps activeId={activeAppId} activeView={activeView} />
-                ) : null}
+                {/* Always mounted: the app list is the shell's navigation, not
+                    a submenu of /apps. It reads the same live feed as the
+                    /apps page (one SSE topic, one connection — see
+                    $lib/feeds), and `sidebarPlace` highlights the open app's
+                    page from the URL. */}
+                <SidebarApps activeId={activeAppId} activeView={activeView} />
               </li>
             </ul>
             <div class="border-base-300 border-t p-2">
@@ -284,13 +348,25 @@ export default function DashboardLayout({ children }: { children?: View }) {
           {/* Phones: a real top bar instead of a floating button, so the
               menu toggle never sits on top of page content. */}
           <div class="bg-base-200/90 dark:bg-base-100/90 border-base-300 sticky top-0 z-40 flex items-center gap-2 border-b px-2 py-2 backdrop-blur lg:hidden">
-            <label
-              for="nav-drawer"
+            {/* A real button, not a `label for` the checkbox: the phone drawer
+                is a disclosure a keyboard user must be able to open, and Esc
+                hands focus back to this control by name (see onShellKeyDown). */}
+            <button
+              type="button"
               class="btn btn-sm btn-ghost btn-square"
               aria-label="Open menu"
+              aria-controls="nav-drawer"
+              data-drawer-toggle
+              onclick={() => {
+                const toggle = drawerToggle();
+
+                if (toggle !== null) {
+                  toggle.checked = true;
+                }
+              }}
             >
               <MenuIcon class="h-5 w-5" />
-            </label>
+            </button>
             <Link href="/apps" class="inline-flex" aria-label="Noite dashboard">
               <img src="/logo.svg" alt="" class="h-5 w-auto dark:hidden" />
               <img

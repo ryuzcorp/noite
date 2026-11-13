@@ -1,8 +1,9 @@
-/** The sidebar's app list: the children of the Apps item while the user is
- * on the apps pages, with the open app's own App, Code and Pulls items under
- * it. Live over the same stream as the /apps list, so a new, renamed or
- * deleted app shows up without a reload. Its own component, so a stream
- * frame re-renders only this list, never the page beside it. */
+/** The sidebar's app list: the children of the Apps item, with the open app's
+ * own App, Code and Pulls items under it. Always mounted — it is the shell's
+ * navigation on every page, not a submenu of /apps — and live over the same
+ * stream as the /apps list, so a new, renamed or deleted app shows up without
+ * a reload. Its own component, so a stream frame re-renders only this list,
+ * never the page beside it. */
 import { useLink } from "@ilha/void";
 import type { View } from "ilha";
 
