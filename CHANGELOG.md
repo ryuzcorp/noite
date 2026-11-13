@@ -10,6 +10,32 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 <!-- New entries go in changelog.d/<topic>.md; the release PR assembles them with `bun docker/changelog-release.ts`. -->
 
+## [0.1.0-alpha.35] - 2026-11-13
+
+### Operator action required
+
+- None.
+
+### Added
+
+- The app overview's **Deploy** menu has a branch picker: pick any branch and deploy its current tip to production once, without merging or changing the production branch. The default selection is the production branch, which behaves exactly like **Redeploy**. Deploy history labels the run `Deploy <branch>@<sha>`, and the next push to the production branch deploys as usual.
+- `POST /v1/apps/<id>/deploy {ref}` (RPC `deploys.deploy`) deploys one branch's tip to production; push role required, admin-only while the app's branch protection is on. The deploy row records the new `branch` intent with the branch ref in `actor`.
+
+### Changed
+
+- The Deployments tab renders each environment as a layer card: the environment's name, status, URL and actions sit in a header strip on a slightly different surface than the deploy rows in the card body (production included), so an environment's history reads as one card instead of a header next to a separate list.
+- `docker/check-versions.ts` splits its online leg: `--online` compares the immutable publisher pins (Node's signed `SHASUMS256.txt`, npm's `dist.integrity`, the GitHub release-asset digests, rustup's checksum) and gates every pull request; `--online-images` adds the image tag index digests. Official images re-push the same tag for a base-OS update, so `check.yml` resolves image digests only for a PR that changes a pin (`docker/Dockerfile`, `docker/compose.yaml`, CI's `rustfs` service or `platforms.mdx`), and the new weekly `pin-drift.yml` run does the full check and keeps one `Image pin drift` issue open while a pin no longer matches its publisher.
+- The Settings page's section links are a daisyUI tab strip that sticks to the top while the sections scroll. It marks the section currently in view (scrolling updates the marker, not only clicks), stays on one row and scrolls sideways on narrow screens, and moves focus with Left/Right/Home/End.
+- The open file's name header stays pinned at the top of the code pane while a long file scrolls under it, in both themes and on narrow panes (long names truncate).
+
+### Fixed
+
+- A D1 database with more than five tables lists its tables again. The row counts were one `SELECT … UNION ALL …` statement, and celld applies workerd's SQLite budget (`SQLITE_LIMIT_COMPOUND_SELECT = 5`) to every cell, so a sixth table failed the whole listing with a raw `D1_EXEC_ERROR` ("the SQL ends in an incomplete statement"). The counts now run as one `--batch` of per-table `SELECT COUNT(*)` statements. A database whose cell has never been opened, or that has no tables, shows the empty table view instead of an error.
+- A failed D1 read shows a concise message ("Couldn't list the D1 tables: …") with a **Retry** button instead of the runner's argv: the bucket path, the generated SQL and celld's stderr now stay in the runner log, and the tenant sees only celld's own error line.
+- A stopped or killed deploy no longer wedges the app's git mirror: the checkout of a build worktree used the bare mirror's own index, so a leftover `index.lock` failed every later deploy of that app ("Unable to create '…/index.lock': File exists"). Every checkout now owns its index file, so a concurrent read (d1's project dir, a source preview, a preview environment) or a stop mid-checkout cannot break the next deploy — and a checkout no longer moves the mirror's `HEAD`.
+- `docker.io/library/rust:1-bookworm` is re-pinned to the digest the tag carries after upstream's base-OS rebuild. A moved tag no longer fails the `check` job on unrelated pull requests; it is reported by the weekly drift run instead.
+- Code mode no longer says a repository has no files when it only has no `?file=`: a browse now opens `package.json`, then `README.md`, then the first file in tree order, and only a ref with no files at all shows the empty note. The chosen file is written to `?file=` in place (`replaceState`), so Back still leaves the page.
+
 ## [0.1.0-alpha.34] - 2026-11-12
 
 ### Operator action required
