@@ -213,6 +213,11 @@ sensitive:
   # The gates themselves: workflows, this list, and the reviewer config.
   # Weakening review or CI silently weakens every path above.
   - ".github/workflows/**"
+  # The rule that decides whether `security-reviewed` survives a push: a
+  # changed comparison that always answers "same" would carry a review across
+  # an unreviewed diff, and its test encodes the same rule.
+  - ".github/scripts/pr-own-change.ts"
+  - ".github/scripts/pr-own-change.test.ts"
   # The workflow drift guard: it encodes the timeout rule every workflow must
   # keep, so deleting the describe block must need a review like the workflows.
   - "docker/pr-ready.test.ts"
