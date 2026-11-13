@@ -240,9 +240,15 @@ export default function DashboardLayout({ children }: { children?: View }) {
       >
         <input id="nav-drawer" type="checkbox" class="drawer-toggle" />
         {/* `lg:w-60` is the phone drawer's own width, kept at `lg` so the
-            column is 240px before the split binds (and measured from it). */}
+            column is 240px before the split binds (and measured from it).
+            Below `lg` it must sit above the page's own stacked chrome (the
+            sticky top bar at `z-40`, a page's sticky tab row at `z-10`):
+            daisyUI's drawer is `z-10` too and comes first in the DOM, so
+            without this those bars painted over the open drawer. At `lg` the
+            drawer is a plain grid column, and the split's handle must stay
+            reachable, so the raise is phone-only. */}
         <div
-          class="drawer-side lg:w-60"
+          class="drawer-side max-lg:z-50 lg:w-60"
           data-slot="resizable-panel"
           data-default-size={sidebarSplit?.[0]}
           data-morph-preserve={MORPH_PRESERVE}
