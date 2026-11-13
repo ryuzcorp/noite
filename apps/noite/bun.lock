@@ -11,7 +11,7 @@
         "@fontsource-variable/geist": "^5.3.0",
         "@fontsource-variable/geist-mono": "^5.3.0",
         "@ilha/model": "^0.1.1",
-        "@ilha/void": "^0.1.6",
+        "@ilha/void": "^0.1.7",
         "@pierre/diffs": "1.6.4",
         "@pierre/trees": "1.0.0",
         "better-auth": "^1.7.22",
@@ -167,7 +167,7 @@
 
     "@ilha/model": ["@ilha/model@0.1.1", "", { "peerDependencies": { "effect": "^4.1.0", "ilha": ">=0.16.3" } }, "sha512-NrRfRXujZBAzxhtzjY9V8DxFllkkR5n6GFeeOeAX5s8K10rvxgS/NErTddoroxa4ALG+Gs7AYYogpaz3SfQH4g=="],
 
-    "@ilha/void": ["@ilha/void@0.1.6", "", { "peerDependencies": { "ilha": ">=0.16.2", "vite": "^8.0.0", "void": "^1.1.12" } }, "sha512-RHeNwb772EwoFSr99/GO0wImw72uVUDKR8dpba4aaLre15MxuYmsVh1mmRFUZeUgfNS6UNMW0IF4jPZdjmiKeg=="],
+    "@ilha/void": ["@ilha/void@0.1.7", "", { "peerDependencies": { "ilha": ">=0.16.3", "vite": "^8.0.0", "void": "^1.1.12" } }, "sha512-4D6Pfy5UIT1eL7vneJVRL7OUZ+6olz46TiHYnR1k7Ss0RQm47yTPf3hkPh1wXrLSsG2aGOGYSuoQzckq1ur6Ng=="],
 
     "@img/colour": ["@img/colour@1.1.0", "", {}, "sha512-Td76q7j57o/tLVdgS746cYARfSyxk8iEfRxewL9h4OMzYhbW4TAcppl0mT4eyqXddh6L/jwoM75mo7ixa/pCeQ=="],
 
