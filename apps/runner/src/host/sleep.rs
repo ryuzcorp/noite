@@ -133,11 +133,11 @@ pub fn auto_sleep_after_s(
 
 /// Newest activity timestamps for an app, as `should_sleep` expects them.
 async fn activity(pool: &SqlitePool, app: &App) -> Vec<Option<DateTime<Utc>>> {
-    let last_request = db::last_request_bucket(pool, &app.id, "")
+    let last_request = db::last_request_us(pool, &app.id, "")
         .await
         .ok()
         .flatten()
-        .and_then(|b| parse_time(&b));
+        .and_then(DateTime::from_timestamp_micros);
     let last_deploy = db::latest_deploy_status(pool, &app.id)
         .await
         .ok()
@@ -149,6 +149,25 @@ async fn activity(pool: &SqlitePool, app: &App) -> Vec<Option<DateTime<Utc>>> {
         app.woke_at.as_deref().and_then(parse_time),
         parse_time(&app.created_at),
     ]
+}
+
+/// The instant the access-log tail last had to drop a burst instead of
+/// consuming it, if it ever did (`host::accesslog`).
+async fn access_log_skip_at(pool: &SqlitePool) -> Option<DateTime<Utc>> {
+    db::get_setting(pool, db::ACCESS_LOG_SKIP_AT)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|value| parse_time(&value))
+}
+
+/// Whether a burst skip makes an idle decision untrustworthy: the tail lost
+/// those lines, so a request they held should still keep the app awake when
+/// the skip is inside the app's sleep window. An older skip cannot change the
+/// decision — should the dropped requests be the newest activity, they are
+/// already older than the window. Pure so it is testable.
+fn skip_inside_window(skip_at: Option<DateTime<Utc>>, now: DateTime<Utc>, after_s: u64) -> bool {
+    skip_at.is_some_and(|skip| now - skip < chrono::Duration::seconds(after_s as i64))
 }
 
 /// Whether the app may be parked at all right now (independent of idleness).
@@ -201,6 +220,7 @@ pub async fn sweep(pool: &SqlitePool, cfg: &Config, procs: &ProcMap) -> usize {
         return 0;
     };
     let now = Utc::now();
+    let skip_at = access_log_skip_at(pool).await;
     let mut parked = 0;
     for app in apps.iter().filter(|a| sleep_candidate(a)) {
         let own = own_of(&app.id);
@@ -209,6 +229,13 @@ pub async fn sweep(pool: &SqlitePool, cfg: &Config, procs: &ProcMap) -> usize {
         else {
             continue;
         };
+        if skip_inside_window(skip_at, now, after_s) {
+            tracing::debug!(
+                slug = %app.slug,
+                "sleep refused: the access log dropped a burst inside the sleep window"
+            );
+            continue;
+        }
         if !should_sleep_s(now, &activity(pool, app).await, after_s) {
             continue;
         }
@@ -230,6 +257,13 @@ pub async fn sweep(pool: &SqlitePool, cfg: &Config, procs: &ProcMap) -> usize {
         let Some(after_s) = auto_sleep_after_s(own, owner_config, cfg.sleep_after_s) else {
             continue;
         };
+        if skip_inside_window(skip_at, now, after_s) {
+            tracing::debug!(
+                fleet = %format!("{}.{}", env.app_slug, env.label),
+                "sleep refused: the access log dropped a burst inside the sleep window"
+            );
+            continue;
+        }
         if !should_sleep_s(now, &environment_activity(pool, env).await, after_s) {
             continue;
         }
@@ -244,16 +278,16 @@ pub async fn sweep(pool: &SqlitePool, cfg: &Config, procs: &ProcMap) -> usize {
     parked
 }
 
-/// Idle signal for an environment: its own last request bucket keyed by
+/// Idle signal for an environment: its own last request stamp keyed by
 /// environment (like apps), with its own deploy, wake and creation clocks as
 /// the floor. An environment nobody requested still parks on its deploy
 /// clock; a busy one no longer parks just because its deploy is old.
 async fn environment_activity(pool: &SqlitePool, env: &Environment) -> Vec<Option<DateTime<Utc>>> {
-    let last_request = db::last_request_bucket(pool, &env.app_id, &env.id)
+    let last_request = db::last_request_us(pool, &env.app_id, &env.id)
         .await
         .ok()
         .flatten()
-        .and_then(|b| parse_time(&b));
+        .and_then(DateTime::from_timestamp_micros);
     vec![
         last_request,
         env.last_deployed_at.as_deref().and_then(parse_time),
@@ -301,7 +335,17 @@ pub async fn sleep_app(
         }
     };
     if let Some(after_s) = after_s {
-        if !should_sleep_s(Utc::now(), &activity(pool, &app).await, after_s) {
+        let now = Utc::now();
+        // A burst skip inside the window means the feed may be missing this
+        // app's requests; idle-based parking must not act on that.
+        if skip_inside_window(access_log_skip_at(pool).await, now, after_s) {
+            tracing::debug!(
+                slug = %app.slug,
+                "sleep refused: the access log dropped a burst inside the sleep window"
+            );
+            return Ok(false);
+        }
+        if !should_sleep_s(now, &activity(pool, &app).await, after_s) {
             return Ok(false);
         }
     }
@@ -756,7 +800,18 @@ pub async fn sleep_environment(
         let owner_config = owner.as_ref().and_then(|a| a.deployed_config.as_deref());
         match auto_sleep_after_s(own, owner_config, cfg.sleep_after_s) {
             Some(after_s) => {
-                if !should_sleep_s(Utc::now(), &environment_activity(pool, &env).await, after_s) {
+                // Same rule as `sleep_app`: a burst skip inside the window
+                // means the feed may be missing this environment's requests,
+                // so the decision made by the sweep cannot be acted on here.
+                let now = Utc::now();
+                if skip_inside_window(access_log_skip_at(pool).await, now, after_s) {
+                    tracing::debug!(
+                        fleet = %format!("{}.{}", env.app_slug, env.label),
+                        "sleep refused: the access log dropped a burst inside the sleep window"
+                    );
+                    return Ok(false);
+                }
+                if !should_sleep_s(now, &environment_activity(pool, &env).await, after_s) {
                     return Ok(false);
                 }
             }
@@ -1040,6 +1095,94 @@ mod tests {
             !should_sleep_s(now, &[None, None], 24 * 3600),
             "no timestamps: never guess idle"
         );
+    }
+
+    /// A burst skip inside an app's sleep window means the access-log feed
+    /// may be missing that app's requests, so an idle decision must not be
+    /// acted on; once the skip is older than the window it changes nothing.
+    #[test]
+    fn a_burst_skip_only_blocks_the_window_it_falls_in() {
+        let now = at(48).unwrap();
+        assert!(
+            skip_inside_window(at(47), now, 2 * 3600),
+            "a skip an hour ago is inside a two-hour window"
+        );
+        assert!(
+            skip_inside_window(at(48), now, 3600),
+            "a skip right now is inside the window"
+        );
+        assert!(
+            !skip_inside_window(at(46), now, 3600),
+            "a skip older than the window cannot hide newer activity"
+        );
+        assert!(
+            !skip_inside_window(at(46), now, 2 * 3600),
+            "and the boundary is the window's own end"
+        );
+        assert!(!skip_inside_window(at(48), now, 0), "0 disables sleeping");
+        assert!(!skip_inside_window(None, now, 3600), "no skip, no block");
+    }
+
+    /// The sweep and the `force = false` recheck both refuse idle-based
+    /// parking while a burst skip is inside the window; a forced park ignores
+    /// the skip, and the sweep resumes once the window has passed.
+    #[tokio::test]
+    async fn a_burst_skip_blocks_idle_parking_until_the_window_passes() {
+        let mut cfg = crate::config::config_for_tests();
+        cfg.sleep_after_s = 3600;
+        let pool = crate::db::connect("sqlite::memory:")
+            .await
+            .expect("memory db");
+        let skipped = seed_idle_app(&pool, &cfg, "skipped").await;
+        let older = seed_idle_app(&pool, &cfg, "older-skip").await;
+        let procs = supervisor::new_procs();
+        crate::db::set_setting(
+            &pool,
+            crate::db::ACCESS_LOG_SKIP_AT,
+            &Utc::now().to_rfc3339(),
+        )
+        .await
+        .expect("skip stamp");
+
+        assert_eq!(
+            sweep(&pool, &cfg, &procs).await,
+            0,
+            "a skip inside the window refuses the idle park"
+        );
+        let fresh = crate::db::get_app(&pool, &skipped.id)
+            .await
+            .expect("get")
+            .expect("row");
+        assert!(fresh.asleep_since.is_none(), "still awake");
+        assert_eq!(fresh.status, AppStatus::Running);
+
+        // An explicit park is not an idle decision: the operator's call stands.
+        assert!(
+            sleep_app(&pool, &cfg, &procs, &skipped.id, true)
+                .await
+                .expect("forced park"),
+            "a forced park ignores the skip"
+        );
+
+        // The skip is now older than the window: parking resumes.
+        crate::db::set_setting(
+            &pool,
+            crate::db::ACCESS_LOG_SKIP_AT,
+            &(Utc::now() - chrono::Duration::hours(2)).to_rfc3339(),
+        )
+        .await
+        .expect("old skip stamp");
+        assert_eq!(
+            sweep(&pool, &cfg, &procs).await,
+            1,
+            "a skip older than the window no longer blocks"
+        );
+        let parked = crate::db::get_app(&pool, &older.id)
+            .await
+            .expect("get")
+            .expect("row");
+        assert!(parked.asleep_since.is_some(), "the idle app parks");
+        assert_eq!(parked.status, AppStatus::Sleeping);
     }
 
     /// Minimal celld health gate: 200 on `/.well-known/celld/health`.
@@ -1682,6 +1825,32 @@ mod tests {
             .expect("row")
     }
 
+    /// An app the sweep may park: running, deployed, and created long enough
+    /// ago that only the timestamps decide idleness.
+    async fn seed_idle_app(pool: &SqlitePool, cfg: &Config, slug: &str) -> App {
+        let app = seed_confirm_app(pool, cfg, slug).await;
+        crate::db::write_app_status(
+            pool,
+            &app.id,
+            AppStatus::Running,
+            None,
+            None,
+            crate::models::WriteGuard::Table,
+        )
+        .await
+        .expect("running");
+        sqlx::query("UPDATE app SET created_at = ? WHERE id = ?")
+            .bind((Utc::now() - chrono::Duration::hours(3)).to_rfc3339())
+            .bind(&app.id)
+            .execute(pool)
+            .await
+            .expect("backdate the create");
+        crate::db::get_app(pool, &app.id)
+            .await
+            .expect("get")
+            .expect("row")
+    }
+
     /// A health gate that accepts the probe and answers only once the test
     /// says so: the barrier the park/confirm race needs.
     async fn held_health() -> (i64, tokio::sync::oneshot::Sender<()>) {
@@ -1794,6 +1963,7 @@ mod tests {
 #[cfg(test)]
 mod env_activity_tests {
     use super::*;
+    use crate::host::metrics::hourly;
 
     async fn seed_app(pool: &SqlitePool) -> App {
         let cfg = crate::config::config_for_tests();
@@ -1860,16 +2030,32 @@ mod env_activity_tests {
             quiet.iter().any(|t| t.is_some()),
             "the creation clock is the floor"
         );
-        // Traffic on the environment moves its clock.
-        let bucket = Utc::now().format("%Y-%m-%dT%H:%M:00Z").to_string();
-        db::replace_app_metric_usage(&pool, &app_id, &env.id, &bucket, 3, 0, 10)
-            .await
-            .expect("env traffic");
+        // Traffic on the environment moves its clock, to the exact request
+        // stamp: the hourly counters keep microseconds, so a busy hour cannot
+        // look up to an hour older than it is.
+        let stamp = Utc::now();
+        let stamp_us = stamp.timestamp_micros();
+        let hour = stamp.format("%Y-%m-%dT%H:00:00Z").to_string();
+        let mut tx = pool.begin().await.expect("tx");
+        hourly::record_request(
+            &mut tx,
+            hourly::Key {
+                app_id: &app_id,
+                environment_id: &env.id,
+                bucket_hour: &hour,
+            },
+            stamp_us,
+            Some(10),
+            false,
+        )
+        .await
+        .expect("env traffic");
+        tx.commit().await.expect("commit");
         let active = environment_activity(&pool, &env).await;
         assert_eq!(
-            active[0].map(|t| t.format("%Y-%m-%dT%H:%M:00Z").to_string()),
-            Some(bucket.clone()),
-            "the environment's own bucket is its newest activity"
+            active[0].map(|t| t.format("%Y-%m-%dT%H:%M:%S").to_string()),
+            Some(stamp.format("%Y-%m-%dT%H:%M:%S").to_string()),
+            "the environment's own request stamp is its newest activity"
         );
         assert!(
             !should_sleep_s(Utc::now(), &active, 3600),
@@ -1878,14 +2064,104 @@ mod env_activity_tests {
         // Production traffic on the same app does not move it: a sibling
         // environment stays quiet.
         let sibling = seed_env(&pool, &app, "other", "refs/heads/other").await;
-        db::replace_app_metric_usage(&pool, &app_id, "", &bucket, 9, 0, 10)
-            .await
-            .expect("prod traffic");
+        let mut tx = pool.begin().await.expect("tx");
+        hourly::record_request(
+            &mut tx,
+            hourly::Key {
+                app_id: &app_id,
+                environment_id: "",
+                bucket_hour: &hour,
+            },
+            stamp_us,
+            Some(10),
+            false,
+        )
+        .await
+        .expect("prod traffic");
+        tx.commit().await.expect("commit");
         let still_quiet = environment_activity(&pool, &sibling).await;
         assert_eq!(
             still_quiet[0], None,
             "production traffic must not count for the environment"
         );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A burst skip inside the window blocks an environment's idle park too:
+    /// `sleep_environment` re-checks it under its own lock (not only in the
+    /// sweep), so a skip that lands between the sweep's decision and the park
+    /// still wins, exactly like `sleep_app`.
+    #[tokio::test]
+    async fn a_burst_skip_blocks_environment_parking() {
+        let dir =
+            std::env::temp_dir().join(format!("noite-sleep-envskip-{}", crate::models::new_id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let pool = crate::db::connect(&format!(
+            "sqlite:{}?mode=rwc",
+            dir.join("noite.sqlite").display()
+        ))
+        .await
+        .expect("temp db");
+        let app = seed_app(&pool).await;
+        let env = seed_env(&pool, &app, "skipped", "refs/heads/skipped").await;
+        crate::db::write_environment_status(
+            &pool,
+            &env.id,
+            AppStatus::Running,
+            None,
+            crate::models::WriteGuard::Table,
+        )
+        .await
+        .expect("running");
+        // The creation clock is the only activity; make it older than the
+        // window so only the skip can refuse the park.
+        sqlx::query("UPDATE environment SET created_at = ? WHERE id = ?")
+            .bind((Utc::now() - chrono::Duration::hours(3)).to_rfc3339())
+            .bind(&env.id)
+            .execute(&pool)
+            .await
+            .expect("backdate");
+        let mut cfg = crate::config::config_for_tests();
+        cfg.sleep_after_s = 3600;
+        let procs = supervisor::new_procs();
+        crate::db::set_setting(
+            &pool,
+            crate::db::ACCESS_LOG_SKIP_AT,
+            &Utc::now().to_rfc3339(),
+        )
+        .await
+        .expect("skip stamp");
+        assert!(
+            !sleep_environment(&pool, &cfg, &procs, &env.id, false)
+                .await
+                .expect("refused park"),
+            "a skip inside the window refuses the park under the lock"
+        );
+        let fresh = crate::db::get_environment(&pool, &env.id)
+            .await
+            .expect("get")
+            .expect("row");
+        assert!(fresh.asleep_since.is_none(), "still awake");
+        // Once the skip is older than the window it changes nothing.
+        crate::db::set_setting(
+            &pool,
+            crate::db::ACCESS_LOG_SKIP_AT,
+            &(Utc::now() - chrono::Duration::hours(2)).to_rfc3339(),
+        )
+        .await
+        .expect("old skip stamp");
+        assert!(
+            sleep_environment(&pool, &cfg, &procs, &env.id, false)
+                .await
+                .expect("park"),
+            "an old skip no longer blocks"
+        );
+        let parked = crate::db::get_environment(&pool, &env.id)
+            .await
+            .expect("get")
+            .expect("row");
+        assert!(parked.asleep_since.is_some(), "the environment parks");
+        assert_eq!(parked.status, AppStatus::Sleeping);
         let _ = std::fs::remove_dir_all(dir);
     }
 }

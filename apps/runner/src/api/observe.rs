@@ -1,4 +1,4 @@
-//! Observability: metrics, spans, logs (thin adapters over
+//! Observability: hourly metrics and logs (thin adapters over
 //! `service::observe`) + the notify-driven live log tail.
 use std::time::Duration;
 
@@ -37,45 +37,6 @@ pub async fn app_metrics(
         .map(Json)
 }
 
-pub async fn app_devices(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-    Query(q): Query<MetricsQuery>,
-) -> impl IntoResponse {
-    service::observe::devices(&state, &id, q.hours, q.environment_id.as_deref())
-        .await
-        .map(Json)
-}
-
-pub async fn app_paths(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-    Query(q): Query<MetricsQuery>,
-) -> impl IntoResponse {
-    service::observe::paths(&state, &id, q.hours, q.environment_id.as_deref())
-        .await
-        .map(Json)
-}
-
-pub async fn app_refs(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-    Query(q): Query<MetricsQuery>,
-) -> impl IntoResponse {
-    service::observe::refs(&state, &id, q.hours, q.environment_id.as_deref())
-        .await
-        .map(Json)
-}
-
-pub async fn app_spans(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-    Query(q): Query<MetricsQuery>,
-) -> impl IntoResponse {
-    service::observe::spans(&state, &id, q.hours, q.environment_id.as_deref())
-        .await
-        .map(Json)
-}
 /// Per-app metrics version (spec T3.6): dashboard polls fetch this first and
 /// skip their window queries when it hasn't moved.
 pub async fn app_metrics_version(

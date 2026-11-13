@@ -1355,16 +1355,6 @@ async fn dispatch_call(
                 service::observe::metrics(state, &p.id, p.hours, p.environment_id.as_deref()).await,
             )
         }
-        "spans.get" => {
-            let p: HoursParams = match parse(params, &id) {
-                Ok(p) => p,
-                Err(e) => return e,
-            };
-            complete(
-                id,
-                service::observe::spans(state, &p.id, p.hours, p.environment_id.as_deref()).await,
-            )
-        }
         "logs.get" => {
             #[derive(Deserialize)]
             #[serde(rename_all = "camelCase")]

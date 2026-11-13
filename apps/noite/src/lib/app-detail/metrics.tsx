@@ -1,6 +1,6 @@
-//! Usage charts: request/CPU bars over a chosen window (24h / 7d / 1m) + spans table.
+//! Usage charts: request / error / latency / memory / CPU bars over a chosen
+//! window (24h / 7d / 1m), from the runner's hourly counters.
 import { Link } from "@ilha/void";
-import { atom } from "ilha";
 
 import { api } from "../api";
 import { formatDateTime, formatHour } from "../dates";
@@ -15,17 +15,11 @@ import {
   metricsUrl,
 } from "../feeds";
 import type { MetricsFrame } from "../feeds";
-import type {
-  RunnerDevice,
-  RunnerMetric,
-  RunnerPath,
-  RunnerRef,
-  RunnerSpan,
-} from "../runner";
+import type { RunnerMetric } from "../runner";
 import { Info } from "../ui/icons";
 
 /** Windows the range picker offers, matching the control route's
- * METRICS_WINDOWS_HOURS (all series share one window). */
+ * METRICS_WINDOWS_HOURS (one window for every series). */
 export const METRICS_RANGES = [
   { hours: 24, label: "last 24h", short: "24h" },
   { hours: 168, label: "last 7d", short: "7d" },
@@ -70,13 +64,37 @@ const hourEnds = (keys: string[], hours: number): [string, string] => [
 
 const sum = (xs: number[]) => xs.reduce((a, b) => a + b, 0);
 
-// Per-hour average from parallel totals/counts (zero where no traffic).
-const perReqAvg = (totals: number[], counts: number[]) =>
-  totals.map((t, i) => {
-    const n = counts[i] ?? 0;
+/** How two values of the same series in one bucket combine. Requests, errors
+ * and CPU add up; the percentiles and the memory peak are the bucket's own
+ * value, so a second row (never produced today) must not be summed. */
+const COMBINE: Record<"peak" | "sum", (a: number, b: number) => number> = {
+  peak: Math.max,
+  sum: (a, b) => a + b,
+};
 
-    return n > 0 ? t / n : 0;
-  });
+/** Mean over the buckets that carry traffic (percentiles and memory are
+ * meaningless for an idle hour). */
+const busyMean = (values: number[], counts: number[]): number => {
+  const busy = values.filter((_, i) => (counts[i] ?? 0) > 0);
+
+  return busy.length > 0 ? sum(busy) / busy.length : 0;
+};
+
+const formatBytes = (bytes: number): string => {
+  if (bytes >= 1024 ** 3) {
+    return `${(bytes / 1024 ** 3).toFixed(1)} GB`;
+  }
+
+  if (bytes >= 1024 ** 2) {
+    return `${Math.round(bytes / 1024 ** 2)} MB`;
+  }
+
+  if (bytes >= 1024) {
+    return `${Math.round(bytes / 1024)} KB`;
+  }
+
+  return `${bytes} B`;
+};
 
 const BarChart = ({
   hours,
@@ -171,38 +189,53 @@ const StatTiles = ({
   cpus,
   errs,
   hours,
-  lats,
+  memAvgs,
+  memPeaks,
+  p50s,
+  p95s,
   reqs,
 }: {
   cpus: number[];
   errs: number[];
   hours: number;
-  lats: number[];
+  memAvgs: number[];
+  memPeaks: number[];
+  p50s: number[];
+  p95s: number[];
   reqs: number[];
 }) => {
   const period = windowLabel(hours);
   const totalReq = sum(reqs);
   const totalErr = sum(errs);
-  const totalLat = sum(lats);
   const totalCpu = sum(cpus);
 
   const errRate =
     totalReq > 0 ? `${((100 * totalErr) / totalReq).toFixed(1)}%` : "—";
 
-  const avgLat = totalReq > 0 ? `${Math.round(totalLat / totalReq)} ms` : "—";
-
   const cpu =
     totalCpu >= 1000 ? `${(totalCpu / 1000).toFixed(1)} s` : `${totalCpu} ms`;
+
+  const p50 = busyMean(p50s, reqs);
+  const p95 = busyMean(p95s, reqs);
+  const peak = Math.max(0, ...memPeaks);
 
   const tiles: [string, string, string][] = [
     ["Requests", totalReq.toLocaleString(), period],
     ["Error rate", errRate, `${totalErr.toLocaleString()} errors`],
-    ["Avg latency", avgLat, "per request"],
+    ["p50 latency", p50 > 0 ? `${Math.round(p50)} ms` : "—", "typical hour"],
+    ["p95 latency", p95 > 0 ? `${Math.round(p95)} ms` : "—", "tail, per hour"],
+    [
+      "Memory peak",
+      peak > 0 ? formatBytes(peak) : "—",
+      peak > 0
+        ? `${formatBytes(busyMean(memAvgs, reqs))} per hour`
+        : "no cgroup reading",
+    ],
     ["CPU time", cpu, period],
   ];
 
   return (
-    <div class="grid grid-cols-2 gap-4 lg:grid-cols-4">
+    <div class="grid grid-cols-2 gap-4 lg:grid-cols-3">
       {tiles.map(([label, value, sub]) => (
         <section
           key={label}
@@ -219,133 +252,35 @@ const StatTiles = ({
   );
 };
 
-/** Per-browser OS mix for the Browsers table sub-lines: top 3 OSes by
- * share of that browser's own traffic (`macOS 60% · Windows 40%`). */
-const browserOsSubs = (devices: RunnerDevice[]) => {
-  const perBrowser: Record<string, Record<string, number>> = {};
-
-  for (const d of devices) {
-    const os = d.os === "" ? "Unknown" : d.os;
-    let byOs = perBrowser[d.browser];
-
-    if (!byOs) {
-      byOs = {};
-      perBrowser[d.browser] = byOs;
-    }
-
-    byOs[os] = (byOs[os] ?? 0) + d.requests;
-  }
-
-  const subs: Record<string, string> = {};
-
-  for (const [browser, oses] of Object.entries(perBrowser)) {
-    const total = sum(Object.values(oses));
-    subs[browser] = Object.entries(oses)
-      .toSorted((a, b) => b[1] - a[1])
-      .slice(0, 3)
-      .map(
-        ([os, n]) => `${os} ${total > 0 ? ((100 * n) / total).toFixed(0) : 0}%`
-      )
-      .join(" · ");
-  }
-
-  return subs;
-};
-
-const BreakdownSection = ({
-  empty,
-  entries,
-  head,
-  subs,
-  title,
-}: {
-  empty: string;
-  entries: [string, number][];
-  head: string;
-  subs?: Record<string, string>;
-  title: string;
-}) => {
-  const total = sum(entries.map(([, n]) => n));
-  const grouped: Record<string, number> = {};
-
-  for (const [label, n] of entries) {
-    grouped[label] = (grouped[label] ?? 0) + n;
-  }
-
-  const ranked = Object.entries(grouped).toSorted((a, b) => b[1] - a[1]);
-  // Analytics tables stay scannable: top 5 rows, overflow as a count.
-  const shown = ranked.slice(0, 5);
-  const extra = ranked.length - shown.length;
-
-  return (
-    <section class="card bg-base-100 dark:bg-base-200 border-base-300 w-full border shadow-md">
-      <div class="card-body gap-4">
-        <h3 class="m-0 text-lg font-semibold">{title}</h3>
-        <div class="flex flex-col gap-2">
-          {ranked.length > 0 ? (
-            <div class="overflow-x-auto">
-              <table class="table-sm table">
-                <thead>
-                  <tr>
-                    <th>{head}</th>
-                    <th class="text-right">requests</th>
-                    <th class="text-right">share</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {shown.map(([label, n]) => (
-                    <tr key={label}>
-                      <td class="font-mono text-xs">
-                        {label}
-                        {subs?.[label] ? (
-                          <div class="opacity-60">{subs[label]}</div>
-                        ) : null}
-                      </td>
-                      <td class="text-right">{n.toLocaleString()}</td>
-                      <td class="text-right">
-                        {total > 0 ? `${((100 * n) / total).toFixed(1)}%` : "—"}
-                      </td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-              {extra > 0 ? (
-                <p class="m-0 text-xs opacity-60">+{extra} more</p>
-              ) : null}
-            </div>
-          ) : (
-            <p class="m-0 text-sm opacity-70">{empty}</p>
-          )}
-        </div>
-      </div>
-    </section>
-  );
-};
-
 const MetricsDetailCards = ({
   cpus,
-  devices,
   errs,
   hours,
-  lats,
-  paths,
-  refs,
+  memAvgs,
+  memPeaks,
+  p50s,
+  p95s,
   reqs,
-  spans,
-  spansError,
 }: {
   cpus: number[];
-  devices: RunnerDevice[];
   errs: number[];
   hours: number;
-  lats: number[];
-  paths: RunnerPath[];
-  refs: RunnerRef[];
+  memAvgs: number[];
+  memPeaks: number[];
+  p50s: number[];
+  p95s: number[];
   reqs: number[];
-  spans: RunnerSpan[];
-  spansError: string;
 }) => {
   const keys = hourKeys(hours);
+
+  const charts: [string, number[]][] = [
+    ["Requests", reqs],
+    ["Errors", errs],
+    ["p50 latency (ms)", p50s],
+    ["p95 latency (ms)", p95s],
+    ["Memory peak (bytes)", memPeaks],
+    ["CPU (ms)", cpus],
+  ];
 
   return (
     <>
@@ -353,148 +288,29 @@ const MetricsDetailCards = ({
         cpus={cpus}
         errs={errs}
         hours={hours}
-        lats={lats}
+        memAvgs={memAvgs}
+        memPeaks={memPeaks}
+        p50s={p50s}
+        p95s={p95s}
         reqs={reqs}
       />
       <div class="grid grid-cols-1 gap-4 md:grid-cols-2">
-        <section class="card bg-base-100 dark:bg-base-200 border-base-300 w-full border shadow-md">
-          <div class="card-body gap-4">
-            <h3 class="m-0 text-lg font-semibold">Requests</h3>
-            <BarRow
-              hours={hours}
-              keys={keys}
-              values={reqs}
-              max={Math.max(1, ...reqs)}
-            />
-          </div>
-        </section>
-        <section class="card bg-base-100 dark:bg-base-200 border-base-300 w-full border shadow-md">
-          <div class="card-body gap-4">
-            <h3 class="m-0 text-lg font-semibold">Errors</h3>
-            <BarRow
-              hours={hours}
-              keys={keys}
-              values={errs}
-              max={Math.max(1, ...errs)}
-            />
-          </div>
-        </section>
-        <section class="card bg-base-100 dark:bg-base-200 border-base-300 w-full border shadow-md">
-          <div class="card-body gap-4">
-            <h3 class="m-0 text-lg font-semibold">Latency</h3>
-            <BarRow
-              hours={hours}
-              keys={keys}
-              values={perReqAvg(lats, reqs)}
-              max={Math.max(1, ...perReqAvg(lats, reqs))}
-            />
-          </div>
-        </section>
-        <section class="card bg-base-100 dark:bg-base-200 border-base-300 w-full border shadow-md">
-          <div class="card-body gap-4">
-            <h3 class="m-0 text-lg font-semibold">CPU</h3>
-            <BarRow
-              hours={hours}
-              keys={keys}
-              values={cpus}
-              max={Math.max(1, ...cpus)}
-            />
-          </div>
-        </section>
-      </div>
-      <section class="card bg-base-100 dark:bg-base-200 border-base-300 w-full border shadow-md">
-        <div class="card-body gap-4">
-          <h3 class="m-0 text-lg font-semibold">Spans</h3>
-          <div class="flex flex-col gap-2">
-            {spansError ? (
-              <p class="text-warning m-0 text-xs">
-                Spans unavailable: {spansError}
-              </p>
-            ) : null}
-            {spans.length > 0 ? (
-              <div class="overflow-x-auto">
-                <table class="table-sm table">
-                  <thead>
-                    <tr>
-                      <th>Span</th>
-                      <th class="text-right">n</th>
-                      <th class="text-right">ms</th>
-                      <th class="text-right">err</th>
-                      <th class="text-right">err %</th>
-                      <th class="text-right">queue ms</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {spans
-                      .toSorted((a, b) => b.ms - a.ms)
-                      .map((s) => (
-                        <tr key={s.name}>
-                          <td class="font-mono text-xs">{s.name}</td>
-                          <td class="text-right">{s.n.toLocaleString()}</td>
-                          <td class="text-right">{s.ms.toLocaleString()}</td>
-                          <td class="text-right">
-                            {s.err > 0 ? (
-                              <span class="text-error">{s.err}</span>
-                            ) : (
-                              "0"
-                            )}
-                          </td>
-                          <td class="text-right">
-                            {s.n > 0
-                              ? `${((100 * s.err) / s.n).toFixed(1)}%`
-                              : "—"}
-                          </td>
-                          <td class="text-right">
-                            {s.qwaitMs.toLocaleString()}
-                          </td>
-                        </tr>
-                      ))}
-                  </tbody>
-                </table>
-              </div>
-            ) : null}
-            {spans.length === 0 && !spansError ? (
-              <p class="m-0 text-sm opacity-70">
-                No spans in the {windowLabel(hours)} — spans come from the
-                fleet's traces.
-              </p>
-            ) : null}
-          </div>
-        </div>
-      </section>
-      <h3 class="m-0 text-lg font-semibold">Analytics</h3>
-      <div class="grid grid-cols-1 gap-4 md:grid-cols-2">
-        <BreakdownSection
-          empty="No browser data yet — visit the app URL, then reload."
-          entries={devices.map((d): [string, number] => [
-            d.browser,
-            d.requests,
-          ])}
-          head="Browser"
-          subs={browserOsSubs(devices)}
-          title="Browsers"
-        />
-        <BreakdownSection
-          empty="No OS data yet — visit the app URL, then reload."
-          entries={devices.map((d): [string, number] => [
-            d.os === "" ? "Unknown" : d.os,
-            d.requests,
-          ])}
-          head="OS"
-          title="Operating systems"
-        />
-        <BreakdownSection
-          empty="No visited paths yet — browse the app, then reload."
-          entries={paths.map((p): [string, number] => [p.path, p.requests])}
-          head="Path"
-          title="Paths"
-        />
-        <BreakdownSection
-          empty="No referrer data yet — share a link to the app, then reload."
-          entries={refs.map((r): [string, number] => [r.source, r.requests])}
-          head="Source"
-          title="Referrers"
-        />
+        {charts.map(([title, values]) => (
+          <section
+            key={title}
+            class="card bg-base-100 dark:bg-base-200 border-base-300 w-full border shadow-md"
+          >
+            <div class="card-body gap-4">
+              <h3 class="m-0 text-lg font-semibold">{title}</h3>
+              <BarRow
+                hours={hours}
+                keys={keys}
+                max={Math.max(1, ...values)}
+                values={values}
+              />
+            </div>
+          </section>
+        ))}
       </div>
     </>
   );
@@ -502,32 +318,28 @@ const MetricsDetailCards = ({
 
 const MetricsDetailView = ({
   cpus,
-  devices,
   errs,
   hasRows,
   hours,
-  lats,
   loadError,
   loaded,
-  paths,
-  refs,
+  memAvgs,
+  memPeaks,
+  p50s,
+  p95s,
   reqs,
-  spans,
-  spansError,
 }: {
   cpus: number[];
-  devices: RunnerDevice[];
   errs: number[];
   hasRows: boolean;
   hours: number;
-  lats: number[];
   loadError: string;
   loaded: boolean;
-  paths: RunnerPath[];
-  refs: RunnerRef[];
+  memAvgs: number[];
+  memPeaks: number[];
+  p50s: number[];
+  p95s: number[];
   reqs: number[];
-  spans: RunnerSpan[];
-  spansError: string;
 }) => (
   <>
     {loadError ? <p class="text-error m-0 text-sm">{loadError}</p> : null}
@@ -553,32 +365,33 @@ const MetricsDetailView = ({
     {loaded && hasRows && !loadError ? (
       <MetricsDetailCards
         cpus={cpus}
-        devices={devices}
         errs={errs}
         hours={hours}
-        lats={lats}
-        paths={paths}
-        refs={refs}
+        memAvgs={memAvgs}
+        memPeaks={memPeaks}
+        p50s={p50s}
+        p95s={p95s}
         reqs={reqs}
-        spans={spans}
-        spansError={spansError}
       />
     ) : null}
   </>
 );
 
-/** Per-bucket totals over `keys` (oldest first): one pass over the rows, not
+/** Per-bucket series over `keys` (oldest first): one pass over the rows, not
  * one filter per bucket — a 1-month window has 720 buckets. */
-const totalsByBucket = (
+const byBucket = (
   rows: MetricsFrame["metrics"],
   keys: string[],
-  pick: (row: RunnerMetric) => number
+  pick: (row: RunnerMetric) => number,
+  combine: (a: number, b: number) => number
 ): number[] => {
   const totals = new Map<string, number>();
 
   for (const row of rows) {
     const key = row.bucketTs.slice(0, 13);
-    totals.set(key, (totals.get(key) ?? 0) + pick(row));
+    const seen = totals.get(key);
+
+    totals.set(key, seen === undefined ? pick(row) : combine(seen, pick(row)));
   }
 
   return keys.map((key) => totals.get(key) ?? 0);
@@ -652,22 +465,7 @@ export const MetricsCard = ({
 
   // Read the frame (or its stored snapshot) directly: no copy into atoms,
   // so a revisit paints the last numbers in the very first render.
-  const rows = (): MetricsFrame["metrics"] =>
-    feedValue(feed.state())?.metrics ?? [];
-
-  const spans = (): MetricsFrame["spans"] =>
-    feedValue(feed.state())?.spans ?? [];
-
-  const devices = (): NonNullable<MetricsFrame["devices"]> =>
-    feedValue(feed.state())?.devices ?? [];
-
-  const paths = (): NonNullable<MetricsFrame["paths"]> =>
-    feedValue(feed.state())?.paths ?? [];
-
-  const refs = (): NonNullable<MetricsFrame["refs"]> =>
-    feedValue(feed.state())?.refs ?? [];
-
-  const spansError = atom("");
+  const frame: MetricsFrame["metrics"] = feedValue(feed.state())?.metrics ?? [];
 
   const loaded = (): boolean => feedLoaded(feed.state());
 
@@ -676,44 +474,36 @@ export const MetricsCard = ({
       ? "Usage stream disconnected — retrying…"
       : (feedProblem(feed.state()) ?? "");
 
-  const pickers = {
-    cpuMs: (r: RunnerMetric) => r.cpuMs,
-    errors: (r: RunnerMetric) => r.errors,
-    latency: (r: RunnerMetric) => r.latencyMs,
-    requests: (r: RunnerMetric) => r.requests,
-  };
-
   const keys = hourKeys(hours);
 
-  const totalByHour = (kind: keyof typeof pickers) =>
-    totalsByBucket(rows(), keys, pickers[kind]);
+  const reqs = byBucket(frame, keys, (r) => r.requests, COMBINE.sum);
+  const errs = byBucket(frame, keys, (r) => r.errors, COMBINE.sum);
+  const p50s = byBucket(frame, keys, (r) => r.p50Ms, COMBINE.peak);
+  const p95s = byBucket(frame, keys, (r) => r.p95Ms, COMBINE.peak);
+  const memPeaks = byBucket(frame, keys, (r) => r.memoryMaxBytes, COMBINE.peak);
+  const memAvgs = byBucket(frame, keys, (r) => r.memoryAvgBytes, COMBINE.peak);
+  const cpus = byBucket(frame, keys, (r) => r.cpuMs, COMBINE.sum);
 
-  const reqs = totalByHour("requests");
-  const cpus = totalByHour("cpuMs");
-  const errs = totalByHour("errors");
-  const lats = totalByHour("latency");
   const totalReq = sum(reqs);
-  const totalErr = rows().reduce((a, r) => a + r.errors, 0);
+  const totalErr = sum(errs);
   const totalCpu = sum(cpus);
-  const totalLat = rows().reduce((a, r) => a + r.latencyMs, 0);
+  const peakMem = Math.max(0, ...memPeaks);
 
   return (
     <>
       {detail ? (
         <MetricsDetailView
           cpus={cpus}
-          devices={devices()}
           errs={errs}
-          hasRows={rows().length > 0}
+          hasRows={frame.length > 0}
           hours={hours}
-          lats={lats}
           loadError={loadError()}
           loaded={loaded()}
-          paths={paths()}
-          refs={refs()}
+          memAvgs={memAvgs}
+          memPeaks={memPeaks}
+          p50s={p50s}
+          p95s={p95s}
           reqs={reqs}
-          spans={spans()}
-          spansError={spansError()}
         />
       ) : (
         <section class="card bg-base-100 dark:bg-base-200 border-base-300 w-full border shadow-md">
@@ -723,7 +513,7 @@ export const MetricsCard = ({
                 Metrics · {windowLabel(hours)}
                 <span
                   class="tooltip tooltip-bottom sm:tooltip-right inline-flex opacity-60"
-                  data-tip={`What celld OTel recorded · ${windowLabel(hours)}: request/cell-fetch/startup spans, execution ms, failed spans, and queued time. Errors come from the trace \`ok\` flag.`}
+                  data-tip={`What the edge logged · ${windowLabel(hours)}: served requests, 5xx errors, p50/p95 latency, peak and mean memory, and CPU per hour.`}
                 >
                   <Info />
                 </span>
@@ -737,7 +527,7 @@ export const MetricsCard = ({
             {loadError() ? (
               <p class="text-error m-0 text-sm">{loadError()}</p>
             ) : null}
-            {!loaded() && rows().length === 0 && !loadError() ? (
+            {!loaded() && frame.length === 0 && !loadError() ? (
               <div
                 role="status"
                 aria-label="Loading usage"
@@ -747,7 +537,7 @@ export const MetricsCard = ({
                 <div class="skeleton h-16 w-full" />
               </div>
             ) : null}
-            {loaded() && rows().length === 0 && !loadError() ? (
+            {loaded() && frame.length === 0 && !loadError() ? (
               <p class="m-0 text-sm opacity-70">
                 No traffic recorded yet — hit the app URL to see requests and
                 CPU.
@@ -757,14 +547,14 @@ export const MetricsCard = ({
                 <BarRow
                   hours={hours}
                   keys={keys}
-                  label="Requests (fetch spans)"
+                  label={`Requests per hour`}
                   values={reqs}
                   max={Math.max(1, ...reqs)}
                 />
                 <p class="m-0 text-sm opacity-80">
-                  {totalReq} requests · {totalErr} errors ·{" "}
-                  {totalCpu.toLocaleString()} ms CPU ·{" "}
-                  {(totalLat / 1000).toFixed(1)} s latency
+                  {totalReq} requests · {totalErr} errors · p95{" "}
+                  {Math.round(busyMean(p95s, reqs))} ms · peak{" "}
+                  {formatBytes(peakMem)} · {totalCpu.toLocaleString()} ms CPU
                 </p>
               </>
             )}

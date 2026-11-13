@@ -171,6 +171,9 @@ async fn store(
         )
         .await?;
     }
+    // The dashboard's change gate (spec T3.6) has to move with these rows, not
+    // only with the Parquet ingest: every counter write is a visible change.
+    db::bump_metric_version(&mut *conn, key.app_id, key.environment_id).await?;
     Ok(())
 }
 

@@ -182,8 +182,9 @@ export const handleAppsStream: RouteHandler = async (request, env) => {
   );
 };
 
-/** Usage-stats poll cadence: the runner rolls minute buckets, so 30s
- * catches every change without hammering it. */
+/** Usage-stats poll cadence: the runner rolls hour buckets and rewrites the
+ * open one on every request line, so 30s catches every change without
+ * hammering it. */
 export const METRICS_STREAM_POLL_MS = 30_000;
 
 /** The hub's first-frame budget for this route: two poll cycles, so a
@@ -229,8 +230,8 @@ export const streamMetrics = async (
     try {
       // Cheap change check (spec T3.6): the runner bumps the per-app
       // version on every ingest with new rows. When it hasn't moved,
-      // the whole 5-call poll is skipped — but the cycle still ends in
-      // the sleep below (a bare `continue` here would spin the loop).
+      // the metrics read is skipped — but the cycle still ends in the
+      // sleep below (a bare `continue` here would spin the loop).
       // oxlint-disable-next-line eslint/no-await-in-loop -- one sequential cycle per loop by design
       const v = await pollMetricsVersion(base, auth, envQuery, signal);
 
@@ -275,11 +276,11 @@ export const streamMetrics = async (
   }
 };
 
-/** Usage stats over SSE (like the apps stream): the runner only exposes
- * unary metrics/spans endpoints, so this polls them here and pushes one
- * frame only when the request total moves — minute buckets mean the rest
- * is noise. `eventStream`'s keep-alive comments hold celld's ~60 s
- * idle-stream expiry; EventSource auto-reconnect covers the rest.
+/** Usage stats over SSE (like the apps stream): the runner exposes one
+ * unary `/metrics` read over the hourly counters, so this polls it here
+ * (behind the version gate) and pushes a frame only when the request total
+ * moves. `eventStream`'s keep-alive comments hold celld's ~60 s idle-stream
+ * expiry; EventSource auto-reconnect covers the rest.
  * Session + view-role gated. */
 export const handleMetricsStream: RouteHandler = async (
   request,
@@ -327,10 +328,9 @@ export const handleMetricsStream: RouteHandler = async (
   const base = `${rc.runner}/v1/apps/${encodeURIComponent(appId)}`;
   const auth = { authorization: `Bearer ${rc.token}` };
 
-  // One window for every series in the frame, so tiles, charts, spans and
-  // analytics always describe the same period; `?environmentId=` scopes the
-  // whole frame (and the version gate below) to one preview environment,
-  // absent/"" is production.
+  // One window for the whole frame, so tiles and charts always describe the
+  // same period; `?environmentId=` scopes the frame (and the version gate
+  // below) to one preview environment, absent/"" is production.
   const envQuery =
     environmentId === ""
       ? ""

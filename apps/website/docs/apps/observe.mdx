@@ -1,6 +1,6 @@
 ---
 title: Observe
-description: Logs, metrics with spans, errors, product-analytics events, and idle sleep for one app.
+description: Logs, hourly metrics, errors, product-analytics events, and idle sleep for one app.
 ---
 
 :::note
@@ -11,11 +11,11 @@ The **Metrics** and **Errors** tabs scope to one environment with a picker: **Pr
 
 The Deployments tab shows the app's runtime logs, live over SSE, and follows the tail while pinned; scroll up to hold still. It holds the last 24 hours of logs ingested from celld's telemetry (up to 500 lines, about 40 s behind live traffic) followed by the fleet's live stdout/stderr, which lives in memory and resets when the runner restarts. Each deploy's build log is on its own row in the same tab. A deploy row inside a [preview environment](/apps/environments)'s group shows that environment's own fleet instead: its ingested telemetry plus its live stdout/stderr, never production's lines.
 
-## Metrics and spans
+## Metrics
 
-The **Metrics** tab covers the last 24 hours, 7 days or 30 days (the range picker; `?r=` keeps it across reloads): charts for requests, errors, latency and CPU, plus stat tiles. Requests count `celld.fetch` spans; errors, latency, and queue wait come from the same spans; CPU is sampled from the celld process tree. The Overview tab shows the same numbers in a smaller card. The environment picker scopes every chart and breakdown to one environment; without it the tab is production only.
+The **Metrics** tab covers the last 24 hours, 7 days or 30 days (the range picker; `?r=` keeps it across reloads): stat tiles for requests, error rate, p50/p95 latency, peak memory and CPU, then one chart per hour for requests, errors, p50 and p95 latency, peak memory and CPU. The Overview tab shows the same numbers in a smaller card. The environment picker scopes every chart to one environment; without it the tab is production only.
 
-Below the charts, the spans table lists recent slow or failed requests, and the analytics tables break traffic down by browser and OS, path and referrer.
+The numbers are the edge's own record of the hour, not an estimate from traces: every request a fleet's own proxy answers is one access-log line, which gives the hour's request count, its 5xx errors (error rate), and its latency percentiles (p50 and p95, from a fixed log-scale histogram of every served line's `duration`). The edge's own answers — the `:80` redirect, a gate refusal, a rate limit, the starting page — are not requests and do not count. Memory is the fleet cgroup's charge, sampled every few seconds, so an hour carries its peak and its exact mean; CPU is the celld process tree's own time. Retention follows `RUNNER_TELEMETRY_RETENTION_DAYS`.
 
 Ingestion is idempotent and resumable: each pass rewrites the hours it reads, so a failed pass is retried instead of skipped, and after the runner has been down the gap is ingested hour by hour on restart (bounded by telemetry retention). An operator can replay a window by hand with [`noite-runner telemetry reingest`](/self-hosting/storage#replaying-a-window).
 
@@ -57,7 +57,7 @@ Each successful deploy stores its source maps under `maps/<deploy-sha>/` in its 
 `@sentry/cloudflare` inside the Worker is _untested_ until an AsyncLocalStorage spike on celld confirms it.
 ::::
 
-## Events, insights, devices, paths, refs
+## Events and insights
 
 The **Events** tab is tenant-facing product analytics, separate from metrics. The app emits events into named channels; the UI offers channel filter, text search, paging, per-event tags and user properties, and insight widgets over the feed.
 
@@ -65,7 +65,7 @@ Before the first event lands, the tab shows an ingest snippet for that app. Iden
 
 ## The control plane's own app
 
-`_control` is a reserved pseudo app in your app list — the Noite control plane itself, labelled "admin". It has no runner `app` row, no fleet to deploy and no source to browse, so its detail carries the control plane's telemetry tabs (Overview with metrics, an errors summary and the control D1, **Metrics**, **Errors**, **Logs**) next to the instance administration tabs (**Users**, **Apps**, **Invites**). The control D1 opens on its own `/storage` page, like any app's storage. This page is the single admin home. The numbers come from the control node's own celld telemetry, ingested exactly like a tenant's (Parquet under `control/telemetry/`), so they include this dashboard's own polling and event streams — real load, not noise to subtract.
+`_control` is a reserved pseudo app in your app list — the Noite control plane itself, labelled "admin". It has no runner `app` row, no fleet to deploy and no source to browse, so its detail carries the control plane's telemetry tabs (Overview with metrics, an errors summary and the control D1, **Metrics**, **Errors**, **Logs**) next to the instance administration tabs (**Users**, **Apps**, **Invites**). The control D1 opens on its own `/storage` page, like any app's storage. This page is the single admin home. The metrics are the edge's record of the control node's own traffic — including this dashboard's polling and event streams, real load rather than noise to subtract — and the errors and logs come from its celld telemetry, ingested exactly like a tenant's (Parquet under `control/telemetry/`).
 
 It is visible to a **real instance admin only**, never an impersonated session, and both the page and every stream behind it re-check that rule server-side.
 

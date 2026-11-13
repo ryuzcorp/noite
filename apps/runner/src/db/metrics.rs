@@ -8,24 +8,24 @@
 
 use sqlx::{Sqlite, SqliteConnection, SqlitePool};
 
-use crate::models::{
-    new_id, now_iso, AppDeviceStat, AppMetric, AppPathStat, AppRefStat, AppSpanStat,
-};
+use crate::models::{new_id, now_iso, AppMetric};
 
-/// Newest minute bucket with at least one request (celld `celld.fetch`
-/// spans), or None when the app never served within retention.
-pub async fn last_request_bucket(
+/// Newest request of one fleet as epoch microseconds (the hourly counters keep
+/// the exact stamp, not just the bucket), or None when it never served within
+/// retention. The scale-to-zero sweep reads this: hour granularity would have
+/// loosened idle detection by up to an hour.
+pub async fn last_request_us(
     pool: &SqlitePool,
     app_id: &str,
     environment_id: &str,
-) -> sqlx::Result<Option<String>> {
-    sqlx::query_scalar::<_, String>(
-        r#"SELECT bucket_ts FROM metrics.app_metric
-           WHERE app_id = ? AND environment_id = ? AND requests > 0 ORDER BY bucket_ts DESC LIMIT 1"#,
+) -> sqlx::Result<Option<i64>> {
+    sqlx::query_scalar::<_, Option<i64>>(
+        r#"SELECT MAX(last_request_us) FROM metrics.app_hour
+           WHERE app_id = ? AND environment_id = ? AND requests > 0"#,
     )
     .bind(app_id)
     .bind(environment_id)
-    .fetch_optional(pool)
+    .fetch_one(pool)
     .await
 }
 
@@ -85,20 +85,26 @@ pub async fn add_app_metric_cpu(
     Ok(())
 }
 
+/// One fleet's hourly counters at or after `since_hour`, oldest first: one
+/// indexed scan serves the whole dashboard window.
 pub async fn list_app_metrics(
     pool: &SqlitePool,
     app_id: &str,
     environment_id: &str,
-    since_ts: &str,
+    since_hour: &str,
 ) -> sqlx::Result<Vec<AppMetric>> {
     sqlx::query_as::<_, AppMetric>(
-        r#"SELECT app_id, bucket_ts, requests, errors, latency_ms, cpu_ms
-           FROM metrics.app_metric WHERE app_id = ? AND environment_id = ? AND bucket_ts >= ?
-           ORDER BY bucket_ts ASC"#,
+        r#"SELECT app_id, bucket_hour AS bucket_ts, requests, errors, p50_ms, p95_ms,
+                  mem_max_bytes AS memory_max_bytes,
+                  CASE WHEN mem_samples > 0 THEN mem_sum_bytes / mem_samples ELSE 0 END
+                    AS memory_avg_bytes,
+                  cpu_ms
+           FROM metrics.app_hour WHERE app_id = ? AND environment_id = ? AND bucket_hour >= ?
+           ORDER BY bucket_hour ASC"#,
     )
     .bind(app_id)
     .bind(environment_id)
-    .bind(since_ts)
+    .bind(since_hour)
     .fetch_all(pool)
     .await
 }
@@ -445,24 +451,6 @@ pub async fn record_access_hit(
     Ok(())
 }
 
-pub async fn list_app_devices(
-    pool: &SqlitePool,
-    app_id: &str,
-    environment_id: &str,
-    since_ts: &str,
-) -> sqlx::Result<Vec<AppDeviceStat>> {
-    sqlx::query_as::<_, AppDeviceStat>(
-        r#"SELECT app_id, bucket_ts, browser, os, requests
-           FROM metrics.app_device_stat WHERE app_id = ? AND environment_id = ? AND bucket_ts >= ?
-           ORDER BY bucket_ts ASC"#,
-    )
-    .bind(app_id)
-    .bind(environment_id)
-    .bind(since_ts)
-    .fetch_all(pool)
-    .await
-}
-
 pub async fn prune_app_devices(pool: &SqlitePool, older_than_ts: &str) -> sqlx::Result<u64> {
     let res = sqlx::query("DELETE FROM metrics.app_device_stat WHERE bucket_ts < ?")
         .bind(older_than_ts)
@@ -471,48 +459,12 @@ pub async fn prune_app_devices(pool: &SqlitePool, older_than_ts: &str) -> sqlx::
     Ok(res.rows_affected())
 }
 
-pub async fn list_app_paths(
-    pool: &SqlitePool,
-    app_id: &str,
-    environment_id: &str,
-    since_ts: &str,
-) -> sqlx::Result<Vec<AppPathStat>> {
-    sqlx::query_as::<_, AppPathStat>(
-        r#"SELECT app_id, bucket_ts, path, requests
-           FROM metrics.app_path_stat WHERE app_id = ? AND environment_id = ? AND bucket_ts >= ?
-           ORDER BY bucket_ts ASC"#,
-    )
-    .bind(app_id)
-    .bind(environment_id)
-    .bind(since_ts)
-    .fetch_all(pool)
-    .await
-}
-
 pub async fn prune_app_paths(pool: &SqlitePool, older_than_ts: &str) -> sqlx::Result<u64> {
     let res = sqlx::query("DELETE FROM metrics.app_path_stat WHERE bucket_ts < ?")
         .bind(older_than_ts)
         .execute(pool)
         .await?;
     Ok(res.rows_affected())
-}
-
-pub async fn list_app_refs(
-    pool: &SqlitePool,
-    app_id: &str,
-    environment_id: &str,
-    since_ts: &str,
-) -> sqlx::Result<Vec<AppRefStat>> {
-    sqlx::query_as::<_, AppRefStat>(
-        r#"SELECT app_id, bucket_ts, source, requests
-           FROM metrics.app_ref_stat WHERE app_id = ? AND environment_id = ? AND bucket_ts >= ?
-           ORDER BY bucket_ts ASC"#,
-    )
-    .bind(app_id)
-    .bind(environment_id)
-    .bind(since_ts)
-    .fetch_all(pool)
-    .await
 }
 
 pub async fn prune_app_refs(pool: &SqlitePool, older_than_ts: &str) -> sqlx::Result<u64> {
@@ -566,26 +518,6 @@ pub async fn replace_span_stat(
 
 /// Top spans over `[since_hour, now]`, summed across hour buckets
 /// (spec T3.2). A 24 h (or 7 d) window is one indexed SQLite scan.
-pub async fn list_span_stats(
-    pool: &SqlitePool,
-    app_id: &str,
-    environment_id: &str,
-    since_hour: &str,
-) -> sqlx::Result<Vec<AppSpanStat>> {
-    sqlx::query_as::<_, AppSpanStat>(
-        r#"SELECT name, kind,
-             SUM(n) AS n, SUM(ms) AS ms, SUM(err) AS err, SUM(qwait_ms) AS qwait_ms
-           FROM metrics.app_span_stat
-           WHERE app_id = ? AND environment_id = ? AND bucket_hour >= ?
-           GROUP BY name, kind ORDER BY ms DESC LIMIT 8"#,
-    )
-    .bind(app_id)
-    .bind(environment_id)
-    .bind(since_hour)
-    .fetch_all(pool)
-    .await
-}
-
 pub async fn prune_span_stats(pool: &SqlitePool, older_than_hour: &str) -> sqlx::Result<u64> {
     let res = sqlx::query("DELETE FROM metrics.app_span_stat WHERE bucket_hour < ?")
         .bind(older_than_hour)

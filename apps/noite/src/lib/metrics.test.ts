@@ -12,15 +12,28 @@ afterEach(() => {
 const metricsRequest = (query: string) =>
   new Request(`http://localhost/api/apps/a/metrics/stream${query}`);
 
+const HOUR_ROW = {
+  appId: "a",
+  bucketTs: "2026-11-13T07:00:00Z",
+  cpuMs: 4,
+  errors: 1,
+  memoryAvgBytes: 1024,
+  memoryMaxBytes: 4096,
+  p50Ms: 5,
+  p95Ms: 40,
+  requests: 0,
+};
+
 const stubRunner = (requests: number): void => {
   // SAFETY: the poll only needs the (url, init) call shape.
   // oxlint-disable-next-line anti-slop/no-chained-type-assertions -- test double for the global fetch.
-  globalThis.fetch = ((url: string) =>
-    Promise.resolve(
-      url.includes("/metrics?")
-        ? Response.json([{ path: "/", requests }])
-        : Response.json([])
-    )) as unknown as typeof fetch;
+  globalThis.fetch = ((url: string) => {
+    if (!url.includes("/metrics?")) {
+      return Promise.reject(new Error(`unexpected runner call: ${url}`));
+    }
+
+    return Promise.resolve(Response.json([{ ...HOUR_ROW, requests }]));
+  }) as unknown as typeof fetch;
 };
 
 describe("METRICS_WINDOWS_HOURS", () => {
@@ -51,7 +64,7 @@ describe("pollMetricsFrame", () => {
 
     expect(polled?.total).toBe(3);
     expect(JSON.parse(polled?.frame ?? "{}").metrics).toEqual([
-      { path: "/", requests: 3 },
+      { ...HOUR_ROW, requests: 3 },
     ]);
   });
 

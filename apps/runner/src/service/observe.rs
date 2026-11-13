@@ -1,5 +1,5 @@
-//! Observability: metrics, spans, devices, paths, refs, logs (the unary reads
-//! plus the merged log view the log SSE stream tails).
+//! Observability: hourly metrics and logs (the unary reads plus the merged log
+//! view the log SSE stream tails).
 //!
 //! Every read takes an optional environment: absent or empty means
 //! production only — never "everything", now that environments carry their
@@ -129,54 +129,8 @@ pub async fn metrics(
     environment: Option<&str>,
 ) -> Result<serde_json::Value, ApiError> {
     let scope = telemetry_scope(&state.pool, id, environment).await?;
-    let since = hours_since(hours, "%Y-%m-%dT%H:%M:00Z");
+    let since = hours_since(hours, "%Y-%m-%dT%H:00:00Z");
     json_rows(db::list_app_metrics(&state.pool, &scope.app_id, &scope.environment_id, &since).await)
-}
-
-pub async fn devices(
-    state: &AppState,
-    id: &str,
-    hours: Option<i64>,
-    environment: Option<&str>,
-) -> Result<serde_json::Value, ApiError> {
-    let scope = telemetry_scope(&state.pool, id, environment).await?;
-    let since = hours_since(hours, "%Y-%m-%dT%H:00:00Z");
-    json_rows(db::list_app_devices(&state.pool, &scope.app_id, &scope.environment_id, &since).await)
-}
-
-pub async fn paths(
-    state: &AppState,
-    id: &str,
-    hours: Option<i64>,
-    environment: Option<&str>,
-) -> Result<serde_json::Value, ApiError> {
-    let scope = telemetry_scope(&state.pool, id, environment).await?;
-    let since = hours_since(hours, "%Y-%m-%dT%H:00:00Z");
-    json_rows(db::list_app_paths(&state.pool, &scope.app_id, &scope.environment_id, &since).await)
-}
-
-pub async fn refs(
-    state: &AppState,
-    id: &str,
-    hours: Option<i64>,
-    environment: Option<&str>,
-) -> Result<serde_json::Value, ApiError> {
-    let scope = telemetry_scope(&state.pool, id, environment).await?;
-    let since = hours_since(hours, "%Y-%m-%dT%H:00:00Z");
-    json_rows(db::list_app_refs(&state.pool, &scope.app_id, &scope.environment_id, &since).await)
-}
-
-/// Ingested hourly span stats (spec T3.2): the 24 h default is one indexed
-/// SQLite scan, like every other series (up to 720 h).
-pub async fn spans(
-    state: &AppState,
-    id: &str,
-    hours: Option<i64>,
-    environment: Option<&str>,
-) -> Result<serde_json::Value, ApiError> {
-    let scope = telemetry_scope(&state.pool, id, environment).await?;
-    let since = hours_since(hours, "%Y-%m-%dT%H:00:00Z");
-    json_rows(db::list_span_stats(&state.pool, &scope.app_id, &scope.environment_id, &since).await)
 }
 
 /// Per-app-and-environment metrics version (spec T3.6): dashboard polls fetch

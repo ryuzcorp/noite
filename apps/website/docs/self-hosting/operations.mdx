@@ -164,7 +164,7 @@ Image rules follow the platform's container rules, with two sandbox additions. A
   docker compose exec noite sh -c 'curl -fsS -H "Authorization: Bearer $RUNNER_TOKEN" \
     http://127.0.0.1:8080/v1/apps'                       # id + slug per app
   docker compose exec noite sh -c 'curl -fsS -H "Authorization: Bearer $RUNNER_TOKEN" \
-    "http://127.0.0.1:8080/v1/apps/<id>/metrics?hours=720"'   # minute buckets, 30 days
+    "http://127.0.0.1:8080/v1/apps/<id>/metrics?hours=720"'   # hourly counters, 30 days
   ```
 
   A missing hour shows as a gap in that list (or in the app's **Metrics** tab); compare it with the hour directories under `s3://<bucket>/fleets/<slug>/telemetry/` to see whether the source data still exists. Nothing older than `RUNNER_TELEMETRY_RETENTION_DAYS` is recoverable: celld has already pruned it from the bucket.

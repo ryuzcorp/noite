@@ -66,7 +66,9 @@ An app idle past its threshold stops costing anything; the next request brings i
 
 **Sweep.** Every `RUNNER_SLEEP_SWEEP_S` seconds — unset, a quarter of the threshold, clamped `300`–`3600` — the runner parks apps that are deployed, desired `running`, awake, and request-free for their window.
 
-**Activity** is the newest of: the last minute bucket with requests in `app_metric` (real `celld.fetch` spans), the app's last wake (`woke_at`), its last deploy. A fresh deploy or manual start gets a full window.
+**Activity** is the newest of: the last hour bucket with a fleet-served request in `app_hour` (edge answers — the `:80` redirect, a gate refusal, a rate-limit `429`, the starting page — never count), the app's last wake (`woke_at`), its last deploy. A fresh deploy or manual start gets a full window.
+
+**A lossy log feed never parks.** The access log is the activity feed, and its tail drops a whole backlog it cannot catch up on (over 8 MiB unread in one tick). Each such skip is recorded; while it falls inside an app's sleep window, the sweep refuses to park that app on idleness — the dropped lines may have been its requests. Explicit sleeps (API, operator) and memory-pressure parking are never blocked, and a skip older than the window no longer matters.
 
 **Asleep is not stopped.** `desired_state` stays `running`; sleep is its own column `asleep_since`, and status reads `sleeping`. A stopped app never sleeps or wakes; stopping an asleep app clears the flag. Going to sleep: mark asleep → rewrite Caddy sites to wake-on-demand → stop the fleet with normal SIGTERM drain.
 

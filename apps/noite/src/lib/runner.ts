@@ -52,8 +52,6 @@ import type { SentryEventItem } from "./sentry-envelope";
 
 export type { App as RunnerApp } from "./runner-types/App";
 
-export type { AppDeviceStat as RunnerDevice } from "./runner-types/AppDeviceStat";
-
 export type { AppDomain as RunnerDomain } from "./runner-types/AppDomain";
 
 export type { AppEnv as RunnerEnv } from "./runner-types/AppEnv";
@@ -63,12 +61,6 @@ export type { AppEvent as RunnerEvent } from "./runner-types/AppEvent";
 export type { AppInsight as RunnerInsight } from "./runner-types/AppInsight";
 
 export type { AppMetric as RunnerMetric } from "./runner-types/AppMetric";
-
-export type { AppPathStat as RunnerPath } from "./runner-types/AppPathStat";
-
-export type { AppRefStat as RunnerRef } from "./runner-types/AppRefStat";
-
-export type { AppSpanStat as RunnerSpan } from "./runner-types/AppSpanStat";
 
 export type { AppUserProps as RunnerUserProps } from "./runner-types/AppUserProps";
 
@@ -338,7 +330,7 @@ interface JsonRpcEnvelope<T> {
  * message, never hang into the platform request deadline. Healthy calls
  * measure ~70ms through the public edge (a Railway worker cell cannot resolve
  * `*.railway.internal`, so that hop is the internet), so 5s leaves room for
- * the slow queries (metrics/spans read Parquet) while still failing well
+ * the slow queries (logs and errors read SQLite rings) while still failing well
  * before a browser gives up — a 10s bound surfaced as a mystery hang. */
 const RUNNER_TIMEOUT_MS = 5000;
 

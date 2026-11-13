@@ -83,18 +83,17 @@ pub use events::{
 };
 pub use ingest_keys::{app_for_project, get_or_create_ingest_key, rotate_ingest_key};
 pub use instance_setting::{
-    ensure_identity, get_setting, set_setting, TELEMETRY_ENABLED, TELEMETRY_LAST_SENT_AT,
-    UPDATE_CHECK_ENABLED, UPDATE_CHECK_LAST_AT, UPDATE_CHECK_RESULT,
+    ensure_identity, get_setting, set_setting, ACCESS_LOG_SKIP_AT, TELEMETRY_ENABLED,
+    TELEMETRY_LAST_SENT_AT, UPDATE_CHECK_ENABLED, UPDATE_CHECK_LAST_AT, UPDATE_CHECK_RESULT,
 };
 pub use metrics::{
     add_app_metric_cpu, app_hour_lat, clear_telemetry_replay_if, delete_environment_telemetry,
     delete_metric_watermarks_for, get_app_hour, get_metric_watermarks, get_telemetry_replay,
-    last_request_bucket, list_app_devices, list_app_logs, list_app_metrics, list_app_paths,
-    list_app_refs, list_span_stats, prune_app_devices, prune_app_hours, prune_app_logs,
-    prune_app_metrics, prune_app_paths, prune_app_refs, prune_span_stats, record_access_hit,
-    replace_app_hour, replace_app_hour_lat, replace_app_logs, replace_app_metric_usage,
-    replace_span_stat, set_metric_watermarks, set_telemetry_replay, AccessHit, AccessTrace,
-    AppHourValues,
+    last_request_us, list_app_logs, list_app_metrics, prune_app_devices, prune_app_hours,
+    prune_app_logs, prune_app_metrics, prune_app_paths, prune_app_refs, prune_span_stats,
+    record_access_hit, replace_app_hour, replace_app_hour_lat, replace_app_logs,
+    replace_app_metric_usage, replace_span_stat, set_metric_watermarks, set_telemetry_replay,
+    AccessHit, AccessTrace, AppHourValues,
 };
 pub use void_cohost::{delete_environment_hashes, get_cohost_hash, set_cohost_hash};
 
@@ -282,6 +281,27 @@ mod tests {
             add_app_metric_cpu(&pool, "a", "", "2026-09-30T12:36:00Z", 1)
                 .await
                 .expect("cpu");
+            let mut hour_tx = pool.begin().await.expect("tx");
+            replace_app_hour(
+                &mut hour_tx,
+                "a",
+                "",
+                "2026-09-30T12:00:00Z",
+                &AppHourValues {
+                    requests: 7,
+                    errors: 1,
+                    p50_ms: 5,
+                    p95_ms: 20,
+                    mem_max_bytes: 4096,
+                    mem_sum_bytes: 6144,
+                    mem_samples: 3,
+                    last_request_us: 1_790_000_000_000_000,
+                    cpu_ms: 12,
+                },
+            )
+            .await
+            .expect("hour");
+            hour_tx.commit().await.expect("commit");
             set_metric_watermarks(&pool, &[("test".to_string(), 42)])
                 .await
                 .expect("watermark");
@@ -313,10 +333,16 @@ mod tests {
             .await
             .expect("metrics readable");
         assert_eq!(rows.len(), 1);
-        let paths = list_app_paths(&pool, "a", "", "2026-09-30T00:00:00Z")
+        assert_eq!(rows[0].requests, 7);
+        assert_eq!(
+            (rows[0].memory_max_bytes, rows[0].memory_avg_bytes),
+            (4096, 2048),
+            "the mean is derived from the stored (sum, count) pair"
+        );
+        let last = last_request_us(&pool, "a", "")
             .await
-            .expect("paths readable");
-        assert_eq!(paths.len(), 1);
+            .expect("last request readable");
+        assert_eq!(last, Some(1_790_000_000_000_000));
         pool.close().await;
         let _ = std::fs::remove_dir_all(&dir);
     }
