@@ -66,43 +66,37 @@ const IdentityLine = ({
   app: AppDetailInfo["app"];
   view: LifecycleView;
 }) => (
-  <p class="m-0 flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 text-sm">
-    <span class="inline-flex items-center gap-1.5">
+  <p class="m-0 flex min-w-0 flex-wrap items-center gap-x-3 gap-y-1 text-sm">
+    <span class="inline-flex items-center gap-1.5 whitespace-nowrap">
       <span class={`status ${view.tone}`} aria-hidden="true" />
       {view.label}
       {view.retryAt ? (
         <span class="opacity-70" title={view.retryAt}>
-          · {formatAgo(view.retryAt)}
+          {formatAgo(view.retryAt)}
         </span>
       ) : null}
     </span>
-    {/* Each item carries its own separator, so a wrap on a phone never
-     * strands a "·" at the end of the line or an orphan sha on its own. */}
-    <span class="inline-flex min-w-0 items-center gap-2">
-      <span class="opacity-30" aria-hidden="true">
-        ·
-      </span>
-      <a
-        class="link link-hover min-w-0 truncate opacity-80"
-        href={appUrl(app.subdomain)}
-        target="_blank"
-        rel="noopener noreferrer"
+    <a
+      class="link link-hover min-w-0 truncate opacity-80"
+      href={appUrl(app.subdomain)}
+      target="_blank"
+      rel="noopener noreferrer"
+    >
+      {appHost(app.subdomain)}
+    </a>
+    {/* The facts are flex chunks separated by the row's gap, never by a
+     * literal `·` (see the control header): a dot between two spans belongs
+     * to neither and starts the wrapped line. Short facts stay whole. */}
+    {app.lastDeploySha ? (
+      <span
+        class="font-mono whitespace-nowrap opacity-70"
+        title={app.lastDeploySha}
       >
-        {appHost(app.subdomain)}
-      </a>
-    </span>
-    <span class="inline-flex min-w-0 items-center gap-2">
-      <span class="opacity-30" aria-hidden="true">
-        ·
+        {app.lastDeploySha.slice(0, SHA_CHARS)}
       </span>
-      {app.lastDeploySha ? (
-        <span class="font-mono opacity-70" title={app.lastDeploySha}>
-          {app.lastDeploySha.slice(0, SHA_CHARS)}
-        </span>
-      ) : (
-        <span class="opacity-70">Not deployed</span>
-      )}
-    </span>
+    ) : (
+      <span class="whitespace-nowrap opacity-70">Not deployed</span>
+    )}
   </p>
 );
 

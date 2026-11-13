@@ -97,24 +97,61 @@ export const DetailTabs = ({
       return;
     }
 
-    const selected = (): Element | null =>
-      el.querySelector('[role="tab"][aria-selected="true"]');
+    const selected = (): HTMLElement | null =>
+      el.querySelector<HTMLElement>('[role="tab"][aria-selected="true"]');
+
+    // Scroll the strip itself by the tab's overflow, keeping `INSET` of
+    // gutter on both edges. `scrollIntoView({ inline: "nearest" })` stopped
+    // at the strip's edge and left the active tab's last letters clipped.
+    const INSET = 8;
 
     const reveal = (): void => {
-      selected()?.scrollIntoView({ block: "nearest", inline: "nearest" });
+      const tabEl = selected();
+
+      if (tabEl === null) {
+        return;
+      }
+
+      const box = tabEl.getBoundingClientRect();
+      const view = el.getBoundingClientRect();
+
+      if (box.right > view.right - INSET) {
+        el.scrollLeft += box.right - view.right + INSET;
+      } else if (box.left < view.left + INSET) {
+        el.scrollLeft -= view.left + INSET - box.left;
+      }
     };
 
-    reveal();
+    // Measure on the next frame, once the patch that moved `aria-selected`
+    // has been laid out.
+    const follow = (): void => {
+      requestAnimationFrame(reveal);
+    };
 
-    const observer = new MutationObserver(reveal);
+    follow();
+
+    const observer = new MutationObserver(follow);
     observer.observe(el, {
       attributeFilter: ["aria-selected"],
       attributes: true,
       subtree: true,
     });
-    signal.addEventListener("abort", () => observer.disconnect(), {
-      once: true,
-    });
+
+    // A viewport change or a web-font swap resizes the strip or its tablist
+    // without a selection change, and a tab that fit before can end up
+    // clipped: re-measure on either.
+    const resizes = new ResizeObserver(follow);
+    resizes.observe(el);
+    resizes.observe(el.firstElementChild ?? el);
+
+    signal.addEventListener(
+      "abort",
+      () => {
+        observer.disconnect();
+        resizes.disconnect();
+      },
+      { once: true }
+    );
   });
 
   return (
@@ -123,7 +160,7 @@ export const DetailTabs = ({
         ref={(el) => {
           collectRef(row, el);
         }}
-        class="min-w-0 flex-1 overflow-x-auto"
+        class="no-scrollbar min-w-0 flex-1 overflow-x-auto"
       >
         <div
           role="tablist"
