@@ -121,14 +121,18 @@ pub struct AppHourValues {
     pub p50_ms: i64,
     pub p95_ms: i64,
     pub mem_max_bytes: i64,
-    pub mem_avg_bytes: i64,
+    /// The hour's cgroup samples as an exact (sum, count) pair. The mean is
+    /// derived where it is read (`sum / count`): a stored average cannot be
+    /// restored exactly, and every write here is a restore-then-rewrite.
+    pub mem_sum_bytes: i64,
+    pub mem_samples: i64,
     pub last_request_us: i64,
     pub cpu_ms: i64,
 }
 
 /// Column list of one `app_hour` row, in `AppHourValues` order.
 const APP_HOUR_COLS: &str = "requests, errors, p50_ms, p95_ms, mem_max_bytes, \
-     mem_avg_bytes, last_request_us, cpu_ms";
+     mem_sum_bytes, mem_samples, last_request_us, cpu_ms";
 
 /// REPLACE one hour of counters. The replacement is the whole row from the
 /// caller's accumulator, so writing the same state twice is exact.
@@ -141,11 +145,12 @@ pub async fn replace_app_hour(
 ) -> sqlx::Result<()> {
     sqlx::query(sqlx::AssertSqlSafe(format!(
         "INSERT INTO metrics.app_hour (app_id, environment_id, bucket_hour, {APP_HOUR_COLS}) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
          ON CONFLICT (app_id, environment_id, bucket_hour) DO UPDATE SET \
            requests = excluded.requests, errors = excluded.errors, \
            p50_ms = excluded.p50_ms, p95_ms = excluded.p95_ms, \
-           mem_max_bytes = excluded.mem_max_bytes, mem_avg_bytes = excluded.mem_avg_bytes, \
+           mem_max_bytes = excluded.mem_max_bytes, \
+           mem_sum_bytes = excluded.mem_sum_bytes, mem_samples = excluded.mem_samples, \
            last_request_us = excluded.last_request_us, cpu_ms = excluded.cpu_ms"
     )))
     .bind(app_id)
@@ -156,7 +161,8 @@ pub async fn replace_app_hour(
     .bind(v.p50_ms)
     .bind(v.p95_ms)
     .bind(v.mem_max_bytes)
-    .bind(v.mem_avg_bytes)
+    .bind(v.mem_sum_bytes)
+    .bind(v.mem_samples)
     .bind(v.last_request_us)
     .bind(v.cpu_ms)
     .execute(&mut *conn)

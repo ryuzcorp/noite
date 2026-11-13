@@ -277,12 +277,15 @@ fn is_control_host(host: &str, control_hosts: &[String]) -> bool {
 /// `reverse_proxy` chose, `noite_edge_upstream` is the fleet upstream the
 /// route table picked, and `noite_edge_error` marks a `handle_errors` page.
 /// A fleet answered only when a proxy ran, on exactly the route's upstream,
-/// and the edge did not render its own error page. The tenant's own 4xx/5xx
-/// still counts: its fleet produced the response. A redirect, a gate refusal
-/// (the hop's API upstream), an edge 429 (no proxy ran) and the starting page
-/// do not — otherwise one unauthenticated request per sleep window could keep
-/// any idle app awake and inflate its counters.
-fn served_by_fleet(v: &serde_json::Value) -> bool {
+/// that upstream is not the runner's own API (the `fallback`/`env-parked`
+/// route proxies to the runner there, and the table publishes the same
+/// address as the route's upstream), and the edge did not render its own
+/// error page. The tenant's own 4xx/5xx still counts: its fleet produced the
+/// response. A redirect, a gate refusal (the hop's API upstream), an edge 429
+/// (no proxy ran), a fallback answer and the starting page do not — otherwise
+/// one unauthenticated request per sleep window could keep any idle app awake
+/// and inflate its counters.
+fn served_by_fleet(v: &serde_json::Value, cfg: &Config) -> bool {
     let field = |name: &str| {
         v.pointer(&format!("/{name}"))
             .and_then(|x| x.as_str())
@@ -292,6 +295,7 @@ fn served_by_fleet(v: &serde_json::Value) -> bool {
     !upstream.is_empty()
         && upstream == field("noite_edge_upstream")
         && field("noite_edge_error").is_empty()
+        && upstream != cfg.caddy_api_upstream
 }
 
 fn parse_line(
@@ -354,7 +358,7 @@ fn parse_line(
         .and_then(serde_json::Value::as_f64)
         .map(|secs| (secs * 1_000.0).round().max(0.0) as i64);
     let (browser, os) = device_classify(ua);
-    let served = served_by_fleet(&v);
+    let served = served_by_fleet(&v, cfg);
     let trace = v
         .pointer("/traceID")
         .and_then(|x| x.as_str())
@@ -753,9 +757,10 @@ mod tests {
 
     /// Fix: only a line the fleet's own `reverse_proxy` answered moves the
     /// hourly counters. The edge's own answers — the `:80` redirect, a
-    /// `forward_auth` gate refusal, a rate-limit 429, the starting page — used
-    /// to count too, so one unauthenticated request per sleep window kept any
-    /// app awake and inflated its metrics. The tenant's own 4xx still counts.
+    /// `forward_auth` gate refusal, a rate-limit 429, the runner's
+    /// `fallback`/`env-parked` endpoint, the starting page — used to count
+    /// too, so one unauthenticated request per sleep window kept any app awake
+    /// and inflated its metrics. The tenant's own 4xx still counts.
     #[tokio::test]
     async fn edge_answered_lines_never_move_the_counters() {
         let dir = std::env::temp_dir().join(format!(
@@ -766,6 +771,8 @@ mod tests {
         let log = dir.join("access.log");
         let fleet = "127.0.0.1:9001";
         let api = "127.0.0.1:9000";
+        let mut cfg = crate::config::config_for_tests();
+        cfg.caddy_api_upstream = api.into();
         let ts = 1_767_225_600.0;
         let lines = [
             // The :80 site answers a 308 itself; no proxy ran.
@@ -778,6 +785,10 @@ mod tests {
             // A fleet that is down still leaves its upstream in the
             // placeholder; `handle_errors` marks the page it rendered.
             served_line("blog.localhost", 503, ts, Some(fleet), Some(fleet), true),
+            // The `fallback`/`env-parked` route proxies to the runner's own
+            // endpoint, and the table publishes the same address as the
+            // route's upstream: both fields agree, yet no fleet answered.
+            served_line("blog.localhost", 200, ts + 5.0, Some(api), Some(api), false),
             // Served: 200 and the tenant's own 401 both count.
             served_line(
                 "blog.localhost",
@@ -797,7 +808,6 @@ mod tests {
             ),
         ];
         std::fs::write(&log, lines.concat()).expect("write log");
-        let mut cfg = crate::config::config_for_tests();
         cfg.caddy_access_log = log.display().to_string();
         let pool = crate::db::connect(&format!(
             "sqlite:{}?mode=rwc",

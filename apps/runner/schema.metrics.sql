@@ -13,7 +13,9 @@ CREATE INDEX IF NOT EXISTS metrics.idx_app_metric_app_bucket ON app_metric(app_i
 -- (app, environment, hour), rewritten from the tick's open hour instead of
 -- accumulated, so a retried access-log line can never double count. The
 -- percentiles are derived from `app_hour_lat` when the row is written, so a
--- dashboard read is one indexed scan of this table.
+-- dashboard read is one indexed scan of this table. Memory keeps the peak and
+-- the exact (sum, count) pair — the mean is derived where it is read, so a
+-- rewrite never has to re-weight a stored average.
 CREATE TABLE IF NOT EXISTS metrics.app_hour (
   app_id TEXT NOT NULL,
   environment_id TEXT NOT NULL DEFAULT '',
@@ -23,7 +25,8 @@ CREATE TABLE IF NOT EXISTS metrics.app_hour (
   p50_ms INTEGER NOT NULL DEFAULT 0,
   p95_ms INTEGER NOT NULL DEFAULT 0,
   mem_max_bytes INTEGER NOT NULL DEFAULT 0,
-  mem_avg_bytes INTEGER NOT NULL DEFAULT 0,
+  mem_sum_bytes INTEGER NOT NULL DEFAULT 0,
+  mem_samples INTEGER NOT NULL DEFAULT 0,
   last_request_us INTEGER NOT NULL DEFAULT 0,
   cpu_ms INTEGER NOT NULL DEFAULT 0,
   PRIMARY KEY (app_id, environment_id, bucket_hour)

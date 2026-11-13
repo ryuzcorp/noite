@@ -42,8 +42,10 @@ pub(crate) const UPSTREAM_LOG_APPEND: &str =
 /// The fleet upstream the route table picked for this request. Compared with
 /// [`UPSTREAM_LOG_APPEND`] it tells a fleet-served line from an edge answer:
 /// only a served request has both equal (a gate refusal leaves the API
-/// upstream, an edge 429 leaves none). The fleet's own 4xx counts — the
-/// tenant answered it.
+/// upstream, an edge 429 leaves none), and the parser also refuses the
+/// runner's own API upstream — the `fallback`/`env-parked` route proxies
+/// there with the table publishing that same address. The fleet's own 4xx
+/// counts — the tenant answered it.
 pub(crate) const EDGE_UPSTREAM_LOG_APPEND: &str =
     "log_append noite_edge_upstream {http.vars.edge_upstream}";
 

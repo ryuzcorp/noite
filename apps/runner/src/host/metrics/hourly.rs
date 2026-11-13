@@ -70,15 +70,15 @@ pub struct Key<'a> {
 }
 
 /// One fleet's open hour, as loaded from `app_hour` and its histogram. Memory
-/// is kept as a sum over samples and a count (the average is derived on write);
-/// the peak is a running maximum.
+/// is kept as an exact (sum, count) pair — the mean is derived where it is read
+/// — and the peak as a running maximum.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct HourRow {
     requests: i64,
     errors: i64,
     last_request_us: i64,
     cpu_ms: i64,
-    mem_total: i64,
+    mem_sum: i64,
     mem_samples: i64,
     mem_max: i64,
     hist: [i64; LAT_BUCKETS],
@@ -87,9 +87,8 @@ struct HourRow {
 impl HourRow {
     /// Restore an hour from its stored row and histogram.
     ///
-    /// The row keeps the memory *mean*, not its sample count, so the mean is
-    /// carried back as one sample: a restart mid-hour keeps the pre-restart
-    /// average in the average (slightly weighted) instead of dropping it.
+    /// The memory pair is restored exactly, so a rewrite that folds one more
+    /// sample keeps the hour's true mean; nothing is re-weighted.
     fn restored(stored: Option<db::AppHourValues>, hist: Vec<(i64, i64)>) -> Self {
         let mut row = Self::default();
         if let Some(stored) = stored {
@@ -98,10 +97,8 @@ impl HourRow {
             row.last_request_us = stored.last_request_us;
             row.cpu_ms = stored.cpu_ms;
             row.mem_max = stored.mem_max_bytes;
-            if stored.mem_avg_bytes > 0 {
-                row.mem_total = stored.mem_avg_bytes;
-                row.mem_samples = 1;
-            }
+            row.mem_sum = stored.mem_sum_bytes;
+            row.mem_samples = stored.mem_samples;
         }
         for (bucket, n) in hist {
             if let Some(slot) = usize::try_from(bucket)
@@ -135,17 +132,10 @@ impl HourRow {
             p50_ms: percentile(&self.hist, 0.50),
             p95_ms: percentile(&self.hist, 0.95),
             mem_max_bytes: self.mem_max,
-            mem_avg_bytes: self.mem_avg(),
+            mem_sum_bytes: self.mem_sum,
+            mem_samples: self.mem_samples,
             last_request_us: self.last_request_us,
             cpu_ms: self.cpu_ms,
-        }
-    }
-
-    fn mem_avg(&self) -> i64 {
-        if self.mem_samples > 0 {
-            self.mem_total / self.mem_samples
-        } else {
-            0
         }
     }
 }
@@ -204,7 +194,7 @@ pub async fn record_request(
 pub async fn record_memory(pool: &SqlitePool, key: Key<'_>, bytes: u64) -> sqlx::Result<()> {
     let bytes = i64::try_from(bytes).unwrap_or(i64::MAX);
     write(pool, key, |row| {
-        row.mem_total += bytes;
+        row.mem_sum += bytes;
         row.mem_samples += 1;
         row.mem_max = row.mem_max.max(bytes);
         None

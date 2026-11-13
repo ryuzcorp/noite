@@ -143,20 +143,29 @@ async fn every_fleet_key_keeps_its_own_row() {
 }
 
 /// Memory and CPU keep the peak and the mean over every sample, without moving
-/// the request counts.
+/// the request counts. The mean is exact — 100/300/500 is 300, and folding one
+/// more sample into the restored row cannot re-weight the stored ones.
 #[tokio::test]
 async fn memory_and_cpu_fold_into_the_same_row() {
     let db = TestDb::new().await;
     let k = db.key("2026-11-13T07:00:00Z");
     db.request(k, 10, Some(5)).await;
-    for bytes in [100, 300, 200] {
+    for bytes in [100, 300, 500] {
         record_memory(&db.pool, k, bytes).await.expect("sample");
     }
+    let row = db.stored(k).await.expect("row");
+    assert_eq!(row.mem_max_bytes, 500);
+    assert_eq!((row.mem_sum_bytes, row.mem_samples), (900, 3));
+    assert_eq!(row.mem_sum_bytes / row.mem_samples, 300, "exact mean");
+    // A fourth sample restores the pair and continues from it: the mean moves
+    // to 325, never to the (300 + 400) / 2 a re-weighted restore would give.
+    record_memory(&db.pool, k, 400).await.expect("sample");
     record_cpu(&db.pool, k, 40).await.expect("cpu");
     record_cpu(&db.pool, k, 2).await.expect("cpu");
     let row = db.stored(k).await.expect("row");
-    assert_eq!(row.mem_max_bytes, 300);
-    assert_eq!(row.mem_avg_bytes, 200);
+    assert_eq!((row.mem_sum_bytes, row.mem_samples), (1300, 4));
+    assert_eq!(row.mem_sum_bytes / row.mem_samples, 325);
+    assert_eq!(row.mem_max_bytes, 500);
     assert_eq!((row.requests, row.cpu_ms), (1, 42));
 }
 
