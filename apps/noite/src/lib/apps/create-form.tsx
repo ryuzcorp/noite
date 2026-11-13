@@ -683,10 +683,12 @@ const CreateForm = (model: CreateModel, dispatch: Dispatch<Message>): View => {
           </footer>
         </fieldset>
       </form>
-      <p class="text-base-content/60 m-0 flex items-center justify-center gap-1.5 text-center text-xs">
-        <Folder class="h-3.5 w-3.5 shrink-0" />
-        Drag a project folder anywhere on this page to create an app from it.
-        Dependencies, build output and <code>.env</code> files are left out.
+      <p class="text-base-content/60 m-0 flex items-start justify-center gap-1.5 text-center text-xs">
+        <Folder class="mt-0.5 h-3.5 w-3.5 shrink-0" />
+        <span>
+          Drag a project folder anywhere on this page to create an app from it.
+          Dependencies, build output and <code>.env</code> files are left out.
+        </span>
       </p>
       {model.drop.t === "Dragging" || model.drop.t === "Reading" ? (
         <DropOverlay reading={model.drop.t === "Reading"} />

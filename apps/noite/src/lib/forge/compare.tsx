@@ -2,7 +2,7 @@
  * verdict. This is the entry point for "Open pull request" (the PullRequests
  * slice adds that button; nothing renders for it yet). */
 import { SectionSkeleton } from "../ui/skeletons";
-import { RefSelect } from "./branches";
+import { RefField } from "./branches";
 import { forgeCompare } from "./data";
 import { DiffView } from "./diff";
 import { loadState } from "./load";
@@ -20,21 +20,23 @@ export const CompareBar = ({
   head: string;
   onPick: (base: string, head: string) => void;
 }) => (
-  <div class="flex flex-wrap items-center gap-2">
-    <RefSelect
+  <div class="flex flex-wrap items-end gap-x-3 gap-y-2">
+    <RefField
       appId={appId}
-      label="Base ref"
+      caption="Base"
       value={base}
       onChange={(next) => {
         onPick(next, head);
       }}
     />
-    <span aria-hidden="true" class="opacity-50">
+    {/* Between the two, and only while they sit on one row (see the new-PR
+     * form's pickers). */}
+    <span aria-hidden="true" class="hidden pb-2 opacity-50 sm:inline">
       ←
     </span>
-    <RefSelect
+    <RefField
       appId={appId}
-      label="Head ref"
+      caption="Head"
       value={head}
       onChange={(next) => {
         onPick(base, next);

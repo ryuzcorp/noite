@@ -82,6 +82,9 @@ export interface SourceBrowserProps {
   onDraftsReady: (actions: DraftActions) => void;
   /** Every change of the session, for the page's badge and panel. */
   onState: (state: SourceBrowserState) => void;
+  /** A file was opened (a tree pick, an added file): below `lg` the page lets
+   * its file tree slide-over go. */
+  onFileOpen?: () => void;
   /** The page's tree column: the browser mounts the tree into it. */
   treeHost: LiveRef<HTMLElement>;
 }
@@ -135,6 +138,7 @@ export const SourceBrowser = ({
   file,
   gitRef,
   onDraftsReady,
+  onFileOpen,
   onState,
   setRef,
   treeHost,
@@ -531,7 +535,15 @@ export const SourceBrowser = ({
         notify: (message) => {
           notice.set(message);
         },
-        openFile: async (path) => (await box.editor?.open(path)) ?? false,
+        openFile: async (path) => {
+          const opened = (await box.editor?.open(path)) ?? false;
+
+          if (opened) {
+            onFileOpen?.();
+          }
+
+          return opened;
+        },
         removePath: (path) => {
           apply(remove(box.session, path));
         },

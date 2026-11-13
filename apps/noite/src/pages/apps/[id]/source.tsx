@@ -20,6 +20,7 @@ import type {
   SourceBrowserState,
 } from "$lib/source/drafts";
 import { refAccess } from "$lib/source/push-target";
+import { Folder, X } from "$lib/ui/icons";
 import { createPaneGroup, MORPH_PRESERVE } from "$lib/ui/resizable";
 import { ResizeHandle } from "$lib/ui/resize-handle";
 import { SidePanel } from "$lib/ui/side-panel";
@@ -271,6 +272,12 @@ const SourceBody = ({ appId }: { appId: string }) => {
   // calls it.
   const committer = atom.lazy(newCommitter)();
 
+  // The phone layout's file tree. Below `lg` the tree would keep its 288px
+  // column and leave the editor a ~100px sliver, so it becomes a slide-over the
+  // bar opens (the same pattern as the side panel) and the editor takes the
+  // whole width. Selecting a file closes it again (`onFileOpen` below).
+  const treeOpen = atom(false);
+
   // The state every group below is seeded with: which tab `?panel=` names
   // ("" = closed).
   const openPanel = panel();
@@ -423,6 +430,18 @@ const SourceBody = ({ appId }: { appId: string }) => {
     // bottom line is not 3rem past the viewport.
     <div class="flex h-[calc(100dvh-3rem)] w-full flex-col overflow-hidden lg:h-dvh">
       <div class="border-base-300 flex flex-wrap items-center gap-2 border-b px-4 py-2">
+        <button
+          type="button"
+          class="btn btn-sm btn-ghost gap-1.5 lg:hidden"
+          aria-controls="source-tree"
+          aria-expanded={treeOpen() ? "true" : "false"}
+          onclick={() => {
+            treeOpen.set(!treeOpen());
+          }}
+        >
+          <Folder class="h-4 w-4" />
+          Files
+        </button>
         <BranchPicker appId={appId} value={browsing} onChange={writeRef} />
         <div class="ml-auto flex flex-wrap items-center justify-end gap-2">
           <PanelToggles
@@ -447,13 +466,30 @@ const SourceBody = ({ appId }: { appId: string }) => {
         class="relative flex min-h-0 min-w-0 flex-1 overflow-hidden"
       >
         {/* The file tree, at the width the page has always given it (`w-72`)
-            until the split says otherwise. */}
+            until the split says otherwise. Below `lg` it covers the panes
+            instead (the page's box is `relative`), opened from the bar's
+            Files button and closed by picking a file. */}
         <div
           data-slot="resizable-panel"
+          id="source-tree"
           data-default-size={treeSplit?.[0]}
           data-morph-preserve={MORPH_PRESERVE}
-          class="bg-base-200/50 border-base-300 flex w-72 shrink-0 grow-0 flex-col border-r"
+          class={`bg-base-200/50 border-base-300 flex w-72 shrink-0 grow-0 flex-col border-r max-lg:absolute max-lg:inset-0 max-lg:z-30 max-lg:w-full ${treeOpen() ? "" : "max-lg:hidden"}`}
         >
+          <div class="border-base-300 flex min-h-9 items-center gap-2 border-b py-1 pr-1.5 pl-3 lg:hidden">
+            <h2 class="m-0 text-sm font-semibold">Files</h2>
+            <button
+              type="button"
+              class="btn btn-ghost btn-xs btn-square ml-auto opacity-70 hover:opacity-100"
+              aria-label="Close file tree"
+              title="Close file tree"
+              onclick={() => {
+                treeOpen.set(false);
+              }}
+            >
+              <X class="h-3.5 w-3.5" />
+            </button>
+          </div>
           <div
             ref={(host) => {
               collectRef(treeHost, host);
@@ -490,6 +526,9 @@ const SourceBody = ({ appId }: { appId: string }) => {
                 gitRef={ref}
                 onDraftsReady={(actions) => {
                   committer.actions = actions;
+                }}
+                onFileOpen={() => {
+                  treeOpen.set(false);
                 }}
                 onState={(state) => {
                   browser.set(state);

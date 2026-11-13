@@ -5,7 +5,7 @@ import type { AtomHandle } from "ilha";
 import { api } from "../api";
 import type { PrCreateInput } from "../api-types";
 import { errorMessage } from "../errors";
-import { RefSelect } from "../forge/branches";
+import { RefField } from "../forge/branches";
 import { forgeCompare, forgeRefs } from "../forge/data";
 import { resourceValue } from "../resource";
 /** New-pull-request form: base/head branch pickers (from `gitRefs`), title
@@ -13,6 +13,7 @@ import { resourceValue } from "../resource";
  * success. */
 import type { ResourceState } from "../resource";
 import type { GitCompare, PrDetail } from "../runner";
+import { Info } from "../ui/icons";
 import { createInputOf, reasonText, validateNewPr } from "./new-pr";
 import type { CompareStatus, NewPrInput } from "./new-pr";
 import { invalidatePr, prList } from "./resources";
@@ -100,13 +101,21 @@ const CompareSummary = ({ compare }: { compare: GitCompare }) => (
   </p>
 );
 
-/** The unmet preconditions listed above the Create button. */
+/** The unmet preconditions listed above the Create button: the reasons the
+ * primary action is off, in a box of their own — as bare grey lines they read
+ * as helper text and "Add a title" looked like prose. */
 const ReasonList = ({ reasons }: { reasons: readonly string[] }) => (
-  <ul class="text-base-content/70 m-0 flex list-none flex-col gap-1 p-0 text-sm">
-    {reasons.map((reason) => (
-      <li key={reason}>{reason}</li>
-    ))}
-  </ul>
+  <div class="border-base-300 bg-base-200/60 rounded-box flex flex-col gap-1.5 border p-3">
+    <p class="m-0 flex items-center gap-1.5 text-sm font-medium">
+      <Info class="h-4 w-4 shrink-0 opacity-70" />
+      Before this pull request can be created
+    </p>
+    <ul class="text-base-content/70 m-0 flex list-disc flex-col gap-1 pl-5 text-sm">
+      {reasons.map((reason) => (
+        <li key={reason}>{reason}</li>
+      ))}
+    </ul>
+  </div>
 );
 
 /** The base ← head pickers, with a hint until the branch list arrives. */
@@ -125,24 +134,26 @@ const BranchPickers = ({
   onBaseChange: (next: string) => void;
   onHeadChange: (next: string) => void;
 }) => (
-  <div class="flex flex-wrap items-center gap-2">
-    <RefSelect
+  <div class="flex flex-wrap items-end gap-x-3 gap-y-2">
+    <RefField
       appId={appId}
-      label="Base branch"
+      caption="Base"
       value={baseValue}
       onChange={onBaseChange}
     />
-    <span aria-hidden="true" class="opacity-50">
+    {/* Between the two, and only while they sit on one row: wrapped onto its
+     * own line the arrow would read as "main ←". */}
+    <span aria-hidden="true" class="hidden pb-2 opacity-50 sm:inline">
       ←
     </span>
-    <RefSelect
+    <RefField
       appId={appId}
-      label="Head branch"
+      caption="Head"
       value={headValue}
       onChange={onHeadChange}
     />
     {loading ? (
-      <span class="text-base-content/60 text-xs">Loading branches…</span>
+      <span class="text-base-content/60 pb-2 text-xs">Loading branches…</span>
     ) : null}
   </div>
 );
