@@ -2,13 +2,41 @@
 # tenant fleets) plus the bundled RustFS store. Dev runs the same service from
 # the Dockerfile's `dev` target with the sources bind-mounted.
 
-# Both docker compose and podman-compose resolve host paths in these files
-# relative to the first -f file's directory (docker/), so no
-# --project-directory flag (which podman-compose rejects outright).
-COMPOSE ?= $(shell command -v docker >/dev/null 2>&1 && echo 'docker compose' || echo 'podman compose') -f docker/compose.yaml
+# The compose CLI for this host: docker when present, else podman.
+COMPOSE_CMD ?= $(shell command -v docker >/dev/null 2>&1 && echo 'docker compose' || echo 'podman compose')
+# `PROJECT` names the compose project of every target that touches one:
+# `-p $(PROJECT)` is load-bearing, not decoration — a compose file's top-level
+# `name:` beats COMPOSE_PROJECT_NAME, so without the flag `make dev PROJECT=x`
+# still lands in the `noite` project and recreates the default stack.
+PROJECT ?= noite
 
 -include .env
 export
+
+# `PROJECT` becomes an engine argv (`-p`), so it is validated once, from the
+# environment (`$$PROJECT` is never spliced into shell text): a stray value
+# fails here instead of turning into a compose flag. The check is on the WHOLE
+# value — a newline would pass a per-line `grep` and then split a recipe into a
+# second shell command (`NR > 1` refuses that). (`case` cannot be used: make
+# counts the `)` in every `case` pattern and ends `$(shell …)` early.)
+_PROJECT_OK := $(shell printf '%s' "$$PROJECT" | awk 'NR > 1 { bad = 1 } /^[a-z0-9][a-z0-9_-]*$$/ { ok = 1 } END { print (ok && !bad) ? "ok" : "bad" }')
+ifneq ($(_PROJECT_OK),ok)
+$(error PROJECT="$(PROJECT)" is not a compose project name (lowercase a-z, 0-9, '-' and '_', starting with a letter or digit))
+endif
+
+# Both docker compose and podman-compose resolve host paths in these files
+# relative to the first -f file's directory (docker/), so no
+# --project-directory flag (which podman-compose rejects outright).
+#
+# COMPOSE itself is assembled below, once every overlay is known: it is
+# `override … :=` so neither an environment value nor `make … COMPOSE=…` can
+# drop `-p $(PROJECT)` and land back in the default project, and that also
+# means a plain `COMPOSE += …` would be ignored — extend COMPOSE_FILES.
+# Scope of the guarantee: `-p $(PROJECT)` only. COMPOSE_CMD and COMPOSE_FILES
+# stay overridable because they are spliced into every recipe and an operator
+# legitimately picks an engine there (self-supplied: an override can already
+# run any command through make).
+COMPOSE_FILES := -f docker/compose.yaml
 
 # NOTE: keep conditionals in quoted form and avoid `$(if …)` — the repo linter
 # runs shellcheck in bash mode on Makefiles, where `$(if …)` parses as an if-
@@ -25,8 +53,13 @@ export
 # wins, otherwise a localhost-family BASE_DOMAIN means single.
 _TENANCY := $(shell NOITE_TENANCY='$(NOITE_TENANCY)' BASE_DOMAIN='$(or $(BASE_DOMAIN),localhost)' sh -c '. docker/lib.sh && is_multi_tenancy && echo multi || echo single')
 ifeq ($(_TENANCY),multi)
-COMPOSE += -f docker/compose.multi.yaml
+COMPOSE_FILES += -f docker/compose.multi.yaml
 endif
+
+# Every compose invocation in this file, with the project first: a compose
+# file's `name:` is only a default and must never decide which stack a target
+# touches. `COMPOSE_CMD` is the knob for another engine.
+override COMPOSE := $(COMPOSE_CMD) -p $(PROJECT) $(COMPOSE_FILES)
 
 # The compose file bind-mounts the host engine socket (`DOCKER_SOCKET`,
 # default /var/run/docker.sock). Rootless Podman has none there, and unlike
@@ -48,7 +81,6 @@ endif
 COMPOSE_BUILD := $(COMPOSE) -f docker/compose.build.yaml
 COMPOSE_DEV := $(COMPOSE) -f docker/compose.dev.yaml
 ENGINE ?= $(shell command -v docker >/dev/null 2>&1 && echo docker || echo podman)
-PROJECT ?= noite
 # The host the dev stack answers on: `BASE_DOMAIN` from .env, else the shipped
 # dev default. Never bare `localhost` — the control UI and every app/preview
 # host must share one registrable domain to be same-site.
@@ -91,12 +123,14 @@ help:
 # changed (docker compose does), so a rebuild would otherwise keep the old
 # bytes running.
 up:
+	@echo "project $(PROJECT)"
 	$(COMPOSE_BUILD) up -d --build --force-recreate
 	@echo "open http://$(DEV_BASE):$${HTTP_PORT:-9080}"
 
 # Release deploy (any host): pull the image (the `alpha` channel unless
 # NOITE_IMAGE overrides it), never build.
 up-prod:
+	@echo "project $(PROJECT)"
 	$(COMPOSE) up -d --pull always --force-recreate
 
 e2e:
@@ -109,12 +143,14 @@ e2e-down:
 	sh docker/e2e-local.sh down
 
 dev:
+	@echo "project $(PROJECT)"
 	$(COMPOSE_DEV) up -d --build --force-recreate
 	@echo "dev — runner: cargo watch · control: vite dev (first boot compiles: minutes)"
 	@echo "open http://$(DEV_BASE):$${HTTP_PORT:-9080}  (make logs)"
 
 dev-host:
 	@if [ -z "$(HOST_IP)" ]; then echo "error: could not detect LAN IP; retry as \`make dev-host HOST_IP=192.168.x.x\`"; exit 1; fi
+	@echo "project $(PROJECT)"
 	CONTROL_EXTRA_HOSTS="$${CONTROL_EXTRA_HOSTS:+$$CONTROL_EXTRA_HOSTS,}$(DEV_HOST_EXTRA)" $(COMPOSE_DEV) up -d --build --force-recreate
 	@echo "dev-host — control UI on LAN at http://$(HOST_IP):$${HTTP_PORT:-9080}"
 
@@ -138,6 +174,7 @@ usage:
 
 # Never destroy data on a plain stop.
 down:
+	@echo "project $(PROJECT)"
 	-$(COMPOSE) down --remove-orphans
 
 # Explicit nuke: every volume of this project and the e2e lane, plus local
@@ -146,9 +183,10 @@ down:
 # best-effort, so remove what it leaves behind by project label and name.
 # pi-lens-ignore: shellcheck-14-1091
 nuke:
+	@echo "project $(PROJECT)"
 	-$(COMPOSE_DEV) down -v --remove-orphans
 	-$(COMPOSE) down -v --remove-orphans
-	-$(COMPOSE) -p noite-e2e -f docker/compose.e2e.yaml down -v --remove-orphans
-	-@for s in 1 2 3 4 5 6 7 8; do $(COMPOSE) -p noite-e2e-$$s -f docker/compose.e2e.yaml down -v --remove-orphans; done
-	@CLI=$(ENGINE) sh -c '. ./docker/lib.sh && remove_project $(PROJECT) noite-e2e noite-e2e-1 noite-e2e-2 noite-e2e-3 noite-e2e-4 noite-e2e-5 noite-e2e-6 noite-e2e-7 noite-e2e-8'
+	-$(COMPOSE_CMD) -p noite-e2e -f docker/compose.yaml -f docker/compose.e2e.yaml down -v --remove-orphans
+	-@for s in 1 2 3 4 5 6 7 8; do $(COMPOSE_CMD) -p noite-e2e-$$s -f docker/compose.yaml -f docker/compose.e2e.yaml down -v --remove-orphans; done
+	@CLI=$(ENGINE) sh -c '. ./docker/lib.sh && remove_project "$$@"' nuke $(PROJECT) noite-e2e noite-e2e-1 noite-e2e-2 noite-e2e-3 noite-e2e-4 noite-e2e-5 noite-e2e-6 noite-e2e-7 noite-e2e-8
 	rm -rf apps/noite/.wrangler apps/noite/.void

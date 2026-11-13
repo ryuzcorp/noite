@@ -152,6 +152,8 @@ make e2e      # image + doctor + Playwright; make e2e-isolation for multi-tenant
 make help     # everything else: backup, restore, down, nuke
 ```
 
+`make up PROJECT=other` runs the stack as the `other` compose project (its own containers, volumes and network) instead of `noite`; every compose target honours it. Ports still come from `.env`, so a second stack on the same host also needs `HTTP_PORT`/`HTTPS_PORT`/`RUSTFS_API_PORT`.
+
 | URL                                  |               |
 | ------------------------------------ | ------------- |
 | http://noite.localhost:9080          | control UI    |

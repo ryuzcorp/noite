@@ -20,6 +20,8 @@
 #   NOITE_KEEP_DATA  1 = remove the containers only; volumes, images and .env
 #                    stay, and re-running install brings the same install back
 #   NOITE_CONFIRM    1 = do not ask (required without a terminal)
+#   PROJECT          compose project of the stack (default: the resolved
+#                    COMPOSE_PROJECT_NAME, else noite)
 #
 # A bucket of your own (S3_ENDPOINT in .env) is never touched: a reinstall
 # pointed at it restores the old state from its snapshot.
@@ -32,9 +34,10 @@ set -euo pipefail
 NOITE_DIR="${NOITE_DIR:-/opt/noite}"
 NOITE_KEEP_DATA="${NOITE_KEEP_DATA:-0}"
 NOITE_CONFIRM="${NOITE_CONFIRM:-0}"
-# `name:` in compose.yaml; Compose labels everything it creates with it, so
-# the stack is found even when compose.yaml is gone.
-PROJECT="noite"
+# compose.yaml's `name:` default is `${COMPOSE_PROJECT_NAME:-noite}`; Compose
+# labels everything it creates with the resolved project, so the stack is
+# found even when compose.yaml is gone.
+PROJECT="${PROJECT:-${COMPOSE_PROJECT_NAME:-noite}}"
 PROJECT_LABEL="com.docker.compose.project=$PROJECT"
 IMAGE_REPOS=("ghcr.io/ryuzcorp/noite" "rustfs/rustfs" "docker.io/rustfs/rustfs" "noite:local" "noite-dev:local")
 
@@ -95,12 +98,21 @@ survey() {
   if [[ -d "$NOITE_DIR" ]]; then
     info "install directory  $NOITE_DIR${DOMAIN:+ (BASE_DOMAIN=$DOMAIN)}"
   fi
+  info "project            $PROJECT"
   info "containers         $n_containers"
   if [[ "$NOITE_KEEP_DATA" != "1" ]]; then
     info "volumes            $n_volumes $(volumes | tr '\n' ' ')"
   fi
-  if [[ ! -d "$NOITE_DIR" ]] && ((n_containers == 0 && n_volumes == 0)); then
-    info "nothing to remove"
+  if ((n_containers == 0 && n_volumes == 0)); then
+    # The install directory may still exist (it holds the secrets and the
+    # shared images), but this project has no stack: never walk on into
+    # confirm() — its prompt reads /opt/noite/.env and would look like the
+    # right target while the removal wipes an install that is still running.
+    if [[ -d "$NOITE_DIR" ]]; then
+      info "no stack for project $PROJECT (set PROJECT/COMPOSE_PROJECT_NAME)"
+    else
+      info "nothing to remove"
+    fi
     exit 0
   fi
 }

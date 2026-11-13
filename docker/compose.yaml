@@ -14,7 +14,12 @@
 # Bring your own S3 (R2, Tigris, S3 — celld-qualified stores): set
 # S3_ENDPOINT, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY and start without the
 # bundled store: `docker compose -f docker/compose.yaml up -d --scale rustfs=0`.
-name: noite
+# The default project name. A hard-coded `name:` is not overridable from the
+# environment (it beats COMPOSE_PROJECT_NAME), so `make dev PROJECT=x` would
+# still recreate the `noite` stack; parameterised, both `-p` (the Makefile) and
+# a plain `COMPOSE_PROJECT_NAME=… docker compose …` select the project, and an
+# unset name stays `noite`.
+name: ${COMPOSE_PROJECT_NAME:-noite}
 
 services:
   noite:

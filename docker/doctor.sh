@@ -12,6 +12,9 @@ set -eu
 cd "$(dirname "$0")/.."
 # shellcheck source=docker/lib.sh
 . "$(dirname "$0")/lib.sh"
+# `.env` must not override the caller's choice: `make doctor PROJECT=x`
+# exports x, and load_env would set PROJECT from the file over it.
+_PROJECT_ARG="${PROJECT:-}"
 load_env
 
 TOKEN="${RUNNER_TOKEN:-dev-runner-token}"
@@ -27,7 +30,9 @@ else
   EDGE="http://127.0.0.1:${HTTP_PORT:-9080}"
   API="$EDGE"
   API_HOST="api.${BASE_HOST}"
-  PROJECT=noite
+  # The project `make` drives (it exports PROJECT); a direct run checks the
+  # one .env names, else the default install.
+  PROJECT="${_PROJECT_ARG:-${PROJECT:-noite}}"
 fi
 
 detect_engine
