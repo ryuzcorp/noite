@@ -83,8 +83,8 @@ pub use events::{
 };
 pub use ingest_keys::{app_for_project, get_or_create_ingest_key, rotate_ingest_key};
 pub use instance_setting::{
-    ensure_identity, get_setting, set_setting, TELEMETRY_ENABLED, TELEMETRY_LAST_SENT_AT,
-    UPDATE_CHECK_ENABLED, UPDATE_CHECK_LAST_AT, UPDATE_CHECK_RESULT,
+    ensure_identity, get_setting, set_setting, ACCESS_LOG_SKIP_AT, TELEMETRY_ENABLED,
+    TELEMETRY_LAST_SENT_AT, UPDATE_CHECK_ENABLED, UPDATE_CHECK_LAST_AT, UPDATE_CHECK_RESULT,
 };
 pub use metrics::{
     add_app_metric_cpu, app_hour_lat, clear_telemetry_replay_if, delete_environment_telemetry,

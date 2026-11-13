@@ -606,7 +606,14 @@ pub async fn tick(
         return Ok(());
     }
     if len - cursor.pos() > MAX_CATCHUP_BYTES {
-        tracing::warn!(skipped = len - cursor.pos(), "access log burst skipped");
+        let skipped = len - cursor.pos();
+        tracing::warn!(skipped, "access log burst skipped");
+        // The counters, and the idle clock that reads them, get no lines for
+        // the skipped burst. Record when it happened *before* moving the
+        // cursor: the sleep sweep refuses idle-based parking while the skip
+        // falls inside the app's window, so a write that fails retries the
+        // whole skip instead of leaving a silent blind spot.
+        db::set_setting(pool, db::ACCESS_LOG_SKIP_AT, &crate::models::now_iso()).await?;
         cursor = OffsetState::skipped_to(meta.ino(), len);
         cursor.persist(&offset_file)?;
     }
@@ -651,8 +658,10 @@ mod tests {
         std::fs::create_dir_all(&dir).expect("temp dir");
         // First line: a desktop UA (commits). Second: a bot UA, which the
         // trigger below rejects before its transaction commits.
-        let first = "{\"request\":{\"host\":\"blog.localhost\",\"uri\":\"/ok\",\"method\":\"GET\",\"headers\":{\"User-Agent\":[\"Mozilla/5.0 (X11; Linux x86_64) Chrome/131.0.0.0 Safari/537.36\"]}},\"status\":200}\n";
-        let second = "{\"request\":{\"host\":\"blog.localhost\",\"uri\":\"/bot\",\"method\":\"GET\",\"headers\":{\"User-Agent\":[\"Googlebot/2.1\"]}},\"status\":200}\n";
+        // Both are fleet-served (the log fields the counters gate on), so the
+        // hourly row is what this test checks.
+        let first = "{\"request\":{\"host\":\"blog.localhost\",\"uri\":\"/ok\",\"method\":\"GET\",\"headers\":{\"User-Agent\":[\"Mozilla/5.0 (X11; Linux x86_64) Chrome/131.0.0.0 Safari/537.36\"]}},\"status\":200,\"noite_upstream\":\"127.0.0.1:9000\",\"noite_edge_upstream\":\"127.0.0.1:9000\"}\n";
+        let second = "{\"request\":{\"host\":\"blog.localhost\",\"uri\":\"/bot\",\"method\":\"GET\",\"headers\":{\"User-Agent\":[\"Googlebot/2.1\"]}},\"status\":200,\"noite_upstream\":\"127.0.0.1:9000\",\"noite_edge_upstream\":\"127.0.0.1:9000\"}\n";
         let log = dir.join("access.log");
         std::fs::write(&log, format!("{first}{second}")).expect("write log");
         let mut cfg = crate::config::config_for_tests();
@@ -834,6 +843,63 @@ mod tests {
             row.last_request_us,
             (ts + 20.0) as i64 * 1_000_000,
             "the idle clock only sees a fleet-served request"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A burst skip drops every buffered line, so it has to leave evidence:
+    /// the sleep sweep refuses idle-based parking while the skip is inside an
+    /// app's sleep window (the lines it lost may have been that app's
+    /// requests).
+    #[tokio::test]
+    async fn a_burst_skip_records_when_it_happened() {
+        let dir =
+            std::env::temp_dir().join(format!("noite-accesslog-skip-{}", crate::models::new_id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let log = dir.join("access.log");
+        let size = MAX_CATCHUP_BYTES as usize + 1;
+        std::fs::write(&log, vec![b'\n'; size]).expect("write an oversized log");
+        let mut cfg = crate::config::config_for_tests();
+        cfg.caddy_access_log = log.display().to_string();
+        let pool = crate::db::connect(&format!(
+            "sqlite:{}?mode=rwc",
+            dir.join("noite.sqlite").display()
+        ))
+        .await
+        .expect("file db");
+        let before = Utc::now();
+        let mut requests = RequestIndex::default();
+        super::tick(
+            &pool,
+            &cfg,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &mut requests,
+        )
+        .await
+        .expect("the skip is not an error");
+        let stamp = crate::db::get_setting(&pool, crate::db::ACCESS_LOG_SKIP_AT)
+            .await
+            .expect("read the setting")
+            .expect("the skip is recorded");
+        let at = DateTime::parse_from_rfc3339(&stamp)
+            .expect("RFC3339 stamp")
+            .with_timezone(&Utc);
+        assert!(
+            at + chrono::Duration::milliseconds(1) >= before,
+            "the skip is stamped when it happens: {stamp}"
+        );
+        let offset = std::fs::read_to_string(dir.join("access-log.offset")).expect("offset");
+        assert_eq!(
+            offset.split(':').nth(1).and_then(|o| o.parse::<u64>().ok()),
+            Some(0),
+            "the oversized file is truncated in place after the skip"
+        );
+        assert_eq!(
+            std::fs::metadata(&log).expect("log").len(),
+            0,
+            "and starts over empty"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

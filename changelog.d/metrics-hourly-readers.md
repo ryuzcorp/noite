@@ -5,6 +5,10 @@
 - **Breaking:** `GET /v1/apps/{id}/devices`, `/paths`, `/refs` and `/spans` (and the `spans.get` RPC) are removed, together with the Metrics tab's Spans table and the Analytics cards (browsers, operating systems, paths, referrers). Their tables are still written until the DuckDB stack is removed, but nothing reads them.
 - Scale-to-zero now reads the hourly counters' exact request stamp, so idle detection is no less precise than before (hour granularity alone would have loosened it by up to an hour).
 
+### Fixed
+
+- A burst skip in the access-log tail (over 8 MiB unread in one tick, when every buffered line is dropped) is now recorded as an instance setting and makes the idle sweep skip that app while the skip falls inside its sleep window. Before, one flooded feed could park actively-served apps on the next sweep; explicit sleeps and memory-pressure parking are unaffected.
+
 ### Operator action required
 
 - Anything scraping `/devices`, `/paths`, `/refs` or `/spans` must stop: those routes are gone. `/metrics` keeps its path but returns hour buckets and no longer carries `latencyMs` — read `p50Ms`/`p95Ms` for latency.

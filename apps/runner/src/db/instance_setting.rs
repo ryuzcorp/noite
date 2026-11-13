@@ -22,6 +22,11 @@ pub const TELEMETRY_LAST_SENT_AT: &str = "telemetry_last_sent_at";
 pub const UPDATE_CHECK_ENABLED: &str = "update_check_enabled";
 pub const UPDATE_CHECK_LAST_AT: &str = "update_check_last_at";
 pub const UPDATE_CHECK_RESULT: &str = "update_check_result";
+/// When the access-log tail last skipped a burst instead of consuming it
+/// (`host::accesslog`), as RFC3339. While that instant is inside an app's
+/// sleep window the skipped lines could have been its requests, so the sweep
+/// refuses to park it on idleness.
+pub const ACCESS_LOG_SKIP_AT: &str = "access_log_skip_at";
 
 /// One setting's value; `None` when the row has never been written.
 pub async fn get_setting(pool: &SqlitePool, key: &str) -> sqlx::Result<Option<String>> {

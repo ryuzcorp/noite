@@ -440,9 +440,10 @@ An app with no requests past its idle threshold stops costing anything, and the 
 - **Why 15 minutes on a small host.** A resident tenant fleet measures ~40–50 MB, so a dozen idle apps hold ~0.5 GiB of a 2 GiB box, while a cold wake measures ~1.33 s. Parking sooner is nearly free there; a 4 GiB host can hold its fleets, so its 6 h and 24 h tiers stay.
 - **Scheduled work never auto-sleeps.** An app whose last deployed config (`app.deployed_config`, the stored Wrangler JSON) carries a non-empty `triggers.crons` or `queues.consumers` skips the sweep unless its owner set an explicit `sleep_after_s` override — a sleeping scheduler would silently miss its triggers. Memory-pressure parking below still parks it (an OOM kill would miss the triggers too, and the next request wakes it).
 - **What counts as activity.** Activity is the newest of:
-  - the newest request stamp (`last_request_us`) in `metrics.app_hour`, i.e. the exact time of a real request;
+  - the newest request stamp (`last_request_us`) in `metrics.app_hour`, i.e. the exact time of a request a fleet's own `reverse_proxy` answered. The edge logs the proxy's upstream next to the route's fleet upstream, so an edge answer — the `:80` `308`, a `forward_auth` gate refusal, a rate-limit `429`, the `handle_errors` starting page — is not traffic and cannot keep an app awake;
   - the app's last wake (`app.woke_at`);
   - its last deploy. So a fresh deploy or a manual start gets a full window before it can sleep.
+- **A lossy log feed never parks.** The access-log tail drops a whole backlog it cannot catch up on (over 8 MiB unread in one tick, `MAX_CATCHUP_BYTES`) and records the skip instant in `instance_setting.access_log_skip_at`. While that instant falls inside an app's sleep window, the sweep (and the `force = false` recheck in `sleep_app`) refuses idle-based parking: the dropped lines may have been its requests. Explicit sleeps and memory-pressure parking (`force = true`) are unaffected, and a skip older than the window cannot hide newer activity.
 - **Asleep is not stopped.** `desired_state` stays `running` (the owner's intent). Sleep is its own column, `app.asleep_since`, and `status` reads `sleeping` for the UI. A stopped app never sleeps or wakes, and stopping an asleep app clears the flag.
 - **Going to sleep** (per-app transition lock), in this order:
   1. mark the app asleep;
