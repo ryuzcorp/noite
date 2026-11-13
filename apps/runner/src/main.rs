@@ -459,7 +459,6 @@ async fn main() -> anyhow::Result<()> {
     // A killed telemetry DuckDB leaves its spill behind, and stale bytes
     // count against RUNNER_DUCKDB_TEMP_MB; boot is the one moment no query
     // can be running, so clear the whole directory.
-    host::metrics::sweep_spill(&config, std::time::Duration::ZERO);
     let mut metrics = host::metrics::new_state();
     // Resume telemetry aggregation where the last snapshot left off.
     match db::get_metric_watermarks(&pool).await {

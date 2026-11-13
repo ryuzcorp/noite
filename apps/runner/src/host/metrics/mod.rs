@@ -1,19 +1,19 @@
 //! App observability.
 //!
-//! Requests + latency come from celld's OpenTelemetry (CELLD_OTEL=1, bucket
-//! sink): each fleet writes Parquet spans into its fleet bucket under
-//! `telemetry/traces/...`, and we aggregate them with the DuckDB CLI — the
-//! documented query path, no collector service.
+//! Errors and logs come from celld's OpenTelemetry (CELLD_OTEL=1, bucket
+//! sink): each fleet writes Parquet spans and console lines into its fleet
+//! bucket under `telemetry/{traces,logs}/...`, and the runner decodes them
+//! itself (`otel`) — no collector service and no DuckDB CLI.
 //!
 //! CPU time celld executes code: OTel has no metrics signal yet (spans carry
 //! durations), so CPU is sampled from `/proc/<celld-pid>/stat` (+ descendants)
 //! — visible because the runner spawns celld in its own PID namespace.
 //!
-//! One ingest pass per tick, all live fleets (spec T3.1): a single DuckDB
-//! invocation over the hour globs of every live fleet reads each Parquet file
-//! once and yields minute buckets, hourly span stats and new log lines at
-//! once. Every dashboard then serves from SQLite — no DuckDB on any request
-//! path.
+//! One ingest pass per tick, all live fleets (spec T3.1): the hour
+//! directories of every fleet in the chunk are listed through the S3 client
+//! and each object is decoded once, projected to the columns the Errors and
+//! Logs tabs need. Every dashboard then serves from SQLite — no Parquet read
+//! on any request path.
 //!
 //! Alongside that ingest, `hourly` keeps the DuckDB-free replacement:
 //! `metrics.app_hour`, one row per fleet per hour with requests, errors,
@@ -31,16 +31,13 @@ mod compact;
 mod cpu;
 pub mod hourly;
 mod ingest;
+mod otel;
+mod parquet_io;
 mod plan;
 mod tick;
 
 pub use cpu::otel_env;
 pub use tick::tick;
-
-/// Remove stale spill files left by a killed DuckDB run (boot: all of them).
-pub fn sweep_spill(cfg: &crate::config::Config, min_age: std::time::Duration) {
-    plan::sweep_spill(cfg, min_age);
-}
 
 pub struct MetricsState {
     last_cpu: HashMap<String, (u64, u64)>, // slug -> (utime, stime) in ticks
@@ -49,7 +46,7 @@ pub struct MetricsState {
     /// from `metric_compaction` at boot (spec T3.5). Progress is per hour, so
     /// a failed fold can never be skipped by a later success.
     compacted: HashMap<String, compact::CompactionState>,
-    /// Last ingest pass: the DuckDB ingest runs at most once per
+    /// Last ingest pass: the telemetry read runs at most once per
     /// `cfg.otel_flush_ms` (spec T3.4), not every reconcile tick.
     last_ingest: Option<std::time::Instant>,
     /// Trace id → edge request, from the access log; a span ingested before

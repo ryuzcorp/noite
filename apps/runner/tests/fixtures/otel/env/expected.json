@@ -1,0 +1,37 @@
+{
+  "slug": "otel-fixture.feature",
+  "from": 0,
+  "until": 9999999999999999,
+  "logs": [
+    {
+      "ts": 1794577849959984,
+      "body": "ERROR Error: logged otelfixmwf1b375\n    at fetch (worker.js:23:35)\n    at <anonymous>:7173:36\n    at __ctxRun (<anonymous>:4029:12)\n    at <anonymous>:7173:14",
+      "trace": "a6ab37a45d8e4f268725601b6d529526"
+    },
+    {
+      "ts": 1794577849965681,
+      "body": "ERROR Error: sync otelfixmwf1b375\n    at fetch (worker.js:18:35)\n    at <anonymous>:7173:36\n    at __ctxRun (<anonymous>:4029:12)\n    at <anonymous>:7173:14",
+      "trace": "243d694f89044f548bd2e846f49cafd8"
+    }
+  ],
+  "errors": [
+    {
+      "error": "Error: async otelfixmwf1b375 [at fetch (worker.js:21:76) <- at <anonymous>:7173:36 <- at __ctxRun (<anonymous>:4029:12)]",
+      "name": "celld.fetch",
+      "cell": "",
+      "trace": "60f884e1173f4768850275a5f624c266",
+      "count": 1,
+      "first": 1794577849962755,
+      "last": 1794577849962755
+    },
+    {
+      "error": "Error: sync otelfixmwf1b375 [at fetch (worker.js:19:11) <- at <anonymous>:7173:36 <- at __ctxRun (<anonymous>:4029:12)]",
+      "name": "celld.fetch",
+      "cell": "",
+      "trace": "243d694f89044f548bd2e846f49cafd8",
+      "count": 1,
+      "first": 1794577849965564,
+      "last": 1794577849965564
+    }
+  ]
+}
