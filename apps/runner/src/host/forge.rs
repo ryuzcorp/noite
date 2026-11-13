@@ -1,5 +1,5 @@
 //! Small git forge: the primitives the runner uses to move refs itself
-//! (browser commits, imports, merges) and the read RPCs behind the Source
+//! (browser commits, imports, merges) and the read routes behind the Source
 //! page (branches, history, compare).
 //!
 //! Everything here works on the push mirror (`RUNNER_WORK_DIR/git-http/
@@ -1199,7 +1199,7 @@ async fn git_status(bare: &Path, args: &[&str]) -> anyhow::Result<(bool, String)
 #[cfg(test)]
 mod tests {
     //! Integration tests against real bare repositories: every case seeds a
-    //! mirror in the work dir and drives the same functions the RPCs call.
+    //! mirror in the work dir and drives the same functions the routes call.
     //! S3 is an in-process stub (objects in memory, LIST, batch delete), so
     //! `publish_ref` runs its whole bundle+manifest path.
     use std::sync::Arc;
@@ -3302,84 +3302,73 @@ mod tests {
 
         h.finish().await;
     }
-
-    /// One JSON-RPC round trip against the real dispatcher (bearer-gated like
-    /// the UI's calls).
-    async fn rpc_json(
+    /// One REST call with an optional JSON body: the status and the raw body
+    /// text (error answers are plain text, success answers JSON).
+    async fn rest_call(
         router: &axum::Router,
         method: &str,
-        params: serde_json::Value,
-    ) -> serde_json::Value {
-        let body = json!({ "id": 1, "jsonrpc": "2.0", "method": method, "params": params });
-        let request = axum::http::Request::builder()
-            .method("POST")
-            .uri("/rpc")
-            .header("authorization", "Bearer test-token")
-            .header("content-type", "application/json")
-            .body(axum::body::Body::from(body.to_string()))
-            .expect("build rpc request");
-        let response = router.clone().oneshot(request).await.expect("rpc dispatch");
-        assert_eq!(response.status(), axum::http::StatusCode::OK, "{method}");
-        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .expect("rpc body");
-        serde_json::from_slice(&bytes).expect("rpc json")
-    }
-
-    /// A successful call's `result`.
-    async fn rpc(
-        router: &axum::Router,
-        method: &str,
-        params: serde_json::Value,
-    ) -> serde_json::Value {
-        let envelope = rpc_json(router, method, params).await;
-        assert!(
-            envelope.get("error").is_none(),
-            "{method} failed: {envelope}"
-        );
-        envelope
-            .get("result")
-            .cloned()
-            .unwrap_or(serde_json::Value::Null)
-    }
-
-    /// A failed call's `(code, message)`.
-    async fn rpc_error(
-        router: &axum::Router,
-        method: &str,
-        params: serde_json::Value,
-    ) -> (i64, String) {
-        let envelope = rpc_json(router, method, params).await;
-        let error = envelope
-            .get("error")
-            .unwrap_or_else(|| panic!("{method} unexpectedly succeeded: {envelope}"));
-        (
-            error["code"].as_i64().unwrap_or_default(),
-            error["message"].as_str().unwrap_or_default().to_string(),
-        )
-    }
-
-    /// One REST call, mirroring what the UI's REST fallback would do.
-    async fn rest(router: &axum::Router, path: &str) -> serde_json::Value {
-        let request = axum::http::Request::builder()
-            .method("GET")
+        path: &str,
+        body: Option<serde_json::Value>,
+    ) -> (axum::http::StatusCode, String) {
+        let mut builder = axum::http::Request::builder()
+            .method(method)
             .uri(path)
-            .header("authorization", "Bearer test-token")
-            .body(axum::body::Body::empty())
-            .expect("build rest request");
-        let response = router.clone().oneshot(request).await.expect("rest call");
-        assert_eq!(response.status(), axum::http::StatusCode::OK, "{path}");
+            .header("authorization", "Bearer test-token");
+        let payload = match body {
+            Some(value) => {
+                builder = builder.header("content-type", "application/json");
+                value.to_string()
+            }
+            None => String::new(),
+        };
+        let request = builder
+            .body(axum::body::Body::from(payload))
+            .expect("build request");
+        let response = router.clone().oneshot(request).await.expect("dispatch");
+        let status = response.status();
         let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
-            .expect("rest body");
-        serde_json::from_slice(&bytes).expect("rest json")
+            .expect("body");
+        (status, String::from_utf8_lossy(&bytes).into_owned())
     }
 
-    /// Every contract RPC runs through the real dispatcher against a real
-    /// bare repo, and the REST mirror answers the same shapes.
+    /// One successful call's JSON answer.
+    async fn rest_json(
+        router: &axum::Router,
+        method: &str,
+        path: &str,
+        body: Option<serde_json::Value>,
+    ) -> serde_json::Value {
+        let (status, text) = rest_call(router, method, path, body).await;
+        assert_eq!(
+            status,
+            axum::http::StatusCode::OK,
+            "{method} {path}: {text}"
+        );
+        serde_json::from_str(&text).expect("json body")
+    }
+
+    /// One successful GET.
+    async fn rest(router: &axum::Router, path: &str) -> serde_json::Value {
+        rest_json(router, "GET", path, None).await
+    }
+
+    /// A rejected call's status and the runner's message.
+    async fn rest_error(
+        router: &axum::Router,
+        method: &str,
+        path: &str,
+        body: Option<serde_json::Value>,
+    ) -> (u16, String) {
+        let (status, text) = rest_call(router, method, path, body).await;
+        (status.as_u16(), text)
+    }
+
+    /// The forge contract end to end against a real bare repo: every route
+    /// answers its shape, and the rejections keep their statuses.
     #[tokio::test]
-    async fn rpc_and_rest_serve_the_forge() {
-        let h = Harness::new("rpcs").await;
+    async fn the_forge_serves_its_contract() {
+        let h = Harness::new("forge").await;
         let app = h.app.clone();
         let bare = h.mirror().await;
         let work = Work::new(&h.dir.join("scratch")).await;
@@ -3399,9 +3388,9 @@ mod tests {
         }
 
         let router = crate::api::router::router(h.state.clone());
-        let id = json!(app.id);
+        let app_path = format!("/v1/apps/{}", app.id);
 
-        let refs_out = rpc(&router, "git.refs", json!({ "id": id })).await;
+        let refs_out = rest(&router, &format!("{app_path}/git/refs")).await;
         assert_eq!(refs_out["defaultBranch"], "main");
         assert_eq!(refs_out["branches"][0]["name"], "main");
         let feature_row = refs_out["branches"]
@@ -3413,108 +3402,101 @@ mod tests {
         assert_eq!(feature_row["ahead"], 1);
         assert_eq!(feature_row["behind"], 1);
 
-        let log_out = rpc(
-            &router,
-            "git.log",
-            json!({ "id": id, "ref": "feature", "limit": 1 }),
-        )
-        .await;
+        let log_out = rest(&router, &format!("{app_path}/git/log?ref=feature&limit=1")).await;
         assert_eq!(log_out["commits"][0]["sha"], json!(feature));
         assert_eq!(log_out["nextSkip"], 1, "feature has two commits");
-        let log_page2 = rpc(
+        let log_page2 = rest(
             &router,
-            "git.log",
-            json!({ "id": id, "ref": "feature", "limit": 1, "skip": 1 }),
+            &format!("{app_path}/git/log?ref=feature&limit=1&skip=1"),
         )
         .await;
         assert_eq!(log_page2["commits"][0]["sha"], json!(base));
         assert_eq!(log_page2["nextSkip"], serde_json::Value::Null);
 
-        let filtered = rpc(
-            &router,
-            "git.log",
-            json!({ "id": id, "path": "f.txt", "skip": 0 }),
-        )
-        .await;
+        let filtered = rest(&router, &format!("{app_path}/git/log?path=f.txt&skip=0")).await;
         assert_eq!(filtered["commits"].as_array().map(Vec::len), Some(2));
 
-        let commit_out = rpc(&router, "git.commit", json!({ "id": id, "sha": feature })).await;
+        let commit_out = rest(&router, &format!("{app_path}/git/commits/{feature}")).await;
         assert_eq!(commit_out["commit"]["sha"], json!(feature));
         assert_eq!(commit_out["files"][0]["status"], "modified");
 
-        let compared = rpc(
+        let compared = rest(
             &router,
-            "git.compare",
-            json!({ "id": id, "base": "main", "head": "feature" }),
+            &format!("{app_path}/git/compare?base=main&head=feature"),
         )
         .await;
         assert_eq!(compared["mergeable"], false);
         assert_eq!(compared["conflicts"], json!(["f.txt"]));
         assert_eq!(compared["ahead"], 1);
 
-        let created = rpc(
+        let created = rest_json(
             &router,
-            "git.branch_create",
-            json!({ "id": id, "name": "topic", "from": "main" }),
+            "POST",
+            &format!("{app_path}/git/branches"),
+            Some(json!({ "name": "topic", "from": "main" })),
         )
         .await;
         assert_eq!(created["name"], "topic");
         assert_eq!(created["sha"], json!(main));
         // Creating it again is a conflict (the compare-and-swap refuses it).
-        let (code, _) = rpc_error(
+        let (status, message) = rest_error(
             &router,
-            "git.branch_create",
-            json!({ "id": id, "name": "topic", "from": "main" }),
+            "POST",
+            &format!("{app_path}/git/branches"),
+            Some(json!({ "name": "topic", "from": "main" })),
         )
         .await;
-        assert_eq!(code, 409);
+        assert_eq!(status, 409, "{message}");
 
         // `ref` on the source reads: the topic branch is tree-identical to main.
-        let tree_out = rpc(&router, "source.tree", json!({ "id": id, "ref": "topic" })).await;
+        let tree_out = rest(&router, &format!("{app_path}/tree?ref=topic")).await;
         assert_eq!(tree_out["sha"], json!(main));
         assert_eq!(
             tree_out["files"].as_array().map(Vec::len),
             Some(1),
             "topic tree"
         );
-        let blob_out = rpc(
-            &router,
-            "source.blob",
-            json!({ "id": id, "path": "f.txt", "ref": "feature" }),
-        )
-        .await;
+        let blob_out = rest(&router, &format!("{app_path}/blob/f.txt?ref=feature")).await;
         assert_eq!(blob_out["text"], "feature\n");
 
         // Unknown refs, malformed refs and protected branches map onto the
-        // right JSON-RPC statuses.
-        let (code, message) =
-            rpc_error(&router, "source.tree", json!({ "id": id, "ref": "nope" })).await;
-        assert_eq!(code, 404, "{message}");
+        // right statuses.
+        let (status, message) =
+            rest_error(&router, "GET", &format!("{app_path}/tree?ref=nope"), None).await;
+        assert_eq!(status, 404, "{message}");
         assert!(message.contains("not found"), "{message}");
-        let (code, message) =
-            rpc_error(&router, "git.log", json!({ "id": id, "ref": "a..b" })).await;
-        assert_eq!(code, 400, "{message}");
+        let (status, message) = rest_error(
+            &router,
+            "GET",
+            &format!("{app_path}/git/log?ref=a..b"),
+            None,
+        )
+        .await;
+        assert_eq!(status, 400, "{message}");
         assert!(message.contains("invalid ref"), "{message}");
-        let (code, message) = rpc_error(
+        let (status, message) = rest_error(
             &router,
-            "git.branch_delete",
-            json!({ "id": id, "name": "main" }),
+            "DELETE",
+            &format!("{app_path}/git/branches/main"),
+            None,
         )
         .await;
-        assert_eq!(code, 400, "{message}");
+        assert_eq!(status, 400, "{message}");
         assert!(message.contains("default branch"), "{message}");
-        let (code, _) = rpc_error(
+        let (status, message) = rest_error(
             &router,
-            "git.branch_delete",
-            json!({ "id": id, "name": "ghost" }),
+            "DELETE",
+            &format!("{app_path}/git/branches/ghost"),
+            None,
         )
         .await;
-        assert_eq!(code, 404);
+        assert_eq!(status, 404, "{message}");
 
-        let deleted = rpc(
+        let deleted = rest_json(
             &router,
-            "git.branch_delete",
-            json!({ "id": id, "name": "topic" }),
+            "DELETE",
+            &format!("{app_path}/git/branches/topic"),
+            None,
         )
         .await;
         assert_eq!(deleted["ok"], true);
@@ -3523,37 +3505,24 @@ mod tests {
             .expect("list")
             .contains_key("refs/heads/topic"));
 
-        // REST mirrors answer the same shapes.
-        let rest_refs = rest(&router, &format!("/v1/apps/{}/git/refs", app.id)).await;
-        assert_eq!(rest_refs["defaultBranch"], "main");
-        assert_eq!(rest_refs["branches"][0]["name"], "main");
-        let rest_log = rest(
+        // `source.commit`: a branch commit and then a commit to main, both
+        // attributed to the session actor.
+        let committed = rest_json(
             &router,
-            &format!("/v1/apps/{}/git/log?ref=feature&limit=5", app.id),
-        )
-        .await;
-        assert_eq!(rest_log["commits"][0]["sha"], json!(feature));
-        let rest_tree = rest(&router, &format!("/v1/apps/{}/tree?ref=main", app.id)).await;
-        assert_eq!(rest_tree["sha"], json!(main));
-
-        // `source.commit` through the dispatcher: a branch commit and then a
-        // commit to main, both attributed to the session actor.
-        let committed = rpc(
-            &router,
-            "source.commit",
-            json!({
-                "id": id,
+            "POST",
+            &format!("{app_path}/source/commit"),
+            Some(json!({
                 "actor": { "userId": "user_test", "name": "Test User" },
                 "message": "from the api",
-                "branch": "from-rpc",
+                "branch": "from-the-api",
                 "fromSha": main,
                 "files": [{ "path": "new.txt", "content": "hi\n" }],
-            }),
+            })),
         )
         .await;
         let branch_sha = committed["sha"].as_str().expect("sha").to_string();
         let refs_now = list_refs(&bare).await.expect("list");
-        assert_eq!(refs_now.get("refs/heads/from-rpc"), Some(&branch_sha));
+        assert_eq!(refs_now.get("refs/heads/from-the-api"), Some(&branch_sha));
         assert_eq!(
             refs_now.get("refs/heads/main"),
             Some(&main),
@@ -3566,16 +3535,16 @@ mod tests {
             "user_test@users.noreply.localhost"
         );
 
-        let on_main = rpc(
+        let on_main = rest_json(
             &router,
-            "source.commit",
-            json!({
-                "id": id,
+            "POST",
+            &format!("{app_path}/source/commit"),
+            Some(json!({
                 "actor": { "userId": "user_test", "name": "Test User" },
                 "message": "onto main",
                 "files": [{ "path": "new.txt", "content": "there\n" }],
                 "deletes": ["f.txt"],
-            }),
+            })),
         )
         .await;
         let main_sha = on_main["sha"].as_str().expect("sha").to_string();
@@ -3596,15 +3565,15 @@ mod tests {
             use base64::Engine as _;
             base64::engine::general_purpose::STANDARD.encode(&png)
         };
-        let uploaded = rpc(
+        let uploaded = rest_json(
             &router,
-            "source.commit",
-            json!({
-                "id": id,
+            "POST",
+            &format!("{app_path}/source/commit"),
+            Some(json!({
                 "actor": { "userId": "user_test", "name": "Test User" },
                 "message": "upload",
                 "files": [{ "path": "logo.png", "content": encoded, "encoding": "base64" }],
-            }),
+            })),
         )
         .await;
         let upload_sha = uploaded["sha"].as_str().expect("sha").to_string();
@@ -3628,18 +3597,18 @@ mod tests {
         assert_eq!(bytes, png, "uploaded bytes round-trip exactly");
 
         // Invalid base64 is a 400 naming the file.
-        let (code, message) = rpc_error(
+        let (status, message) = rest_error(
             &router,
-            "source.commit",
-            json!({
-                "id": id,
+            "POST",
+            &format!("{app_path}/source/commit"),
+            Some(json!({
                 "actor": { "userId": "user_test", "name": "Test User" },
                 "message": "bad upload",
                 "files": [{ "path": "bad.bin", "content": "not base64!", "encoding": "base64" }],
-            }),
+            })),
         )
         .await;
-        assert_eq!(code, 400, "{message}");
+        assert_eq!(status, 400, "{message}");
         assert!(message.contains("bad.bin is not valid base64"), "{message}");
 
         // A body above axum's 2 MiB default reaches the commit route.
@@ -3673,7 +3642,7 @@ mod tests {
         let h = Harness::new("bodyauth").await;
         let router = crate::api::router::router(h.state.clone());
         let big = format!("{{\"pad\":\"{}\"}}", "x".repeat(2 * 1024 * 1024 + 16));
-        for path in ["/rpc", "/v1/apps/anything/source/commit"] {
+        for path in ["/v1/errors/ingest", "/v1/apps/anything/source/commit"] {
             let request = axum::http::Request::builder()
                 .method("POST")
                 .uri(path)

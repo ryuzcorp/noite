@@ -282,3 +282,20 @@ pub async fn app_r2_delete(
         .await
         .map(|deleted| Json(json!({ "ok": true, "deleted": deleted })))
 }
+
+/// Up to 100 keys in one atomic request (the browser's multi-select delete;
+/// the per-object `DELETE …?key=` above stays for one key).
+#[derive(Deserialize)]
+pub struct R2DeleteBody {
+    pub keys: Vec<String>,
+}
+
+pub async fn app_r2_delete_many(
+    State(state): State<AppState>,
+    Path((id, bucket)): Path<(String, String)>,
+    Json(body): Json<R2DeleteBody>,
+) -> impl IntoResponse {
+    service::storage::r2_delete_many(&state, &id, &bucket, &body.keys)
+        .await
+        .map(|deleted| Json(json!({ "ok": true, "deleted": deleted })))
+}

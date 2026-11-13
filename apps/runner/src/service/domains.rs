@@ -22,7 +22,7 @@
 //! only resolves verified claims.
 //!
 //! Hostname grammar, platform-host refusal and the collision mapping live
-//! here so the RPC surface cannot drift. There is no background polling
+//! here so the HTTP surface cannot drift. There is no background polling
 //! loop: verification is one DNS lookup per explicit Verify call.
 
 use crate::api_error::ApiError;

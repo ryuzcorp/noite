@@ -1,4 +1,4 @@
-//! Per-app limits (`limits.*` RPC; the settings panel's source): edge rate
+//! Per-app limits (the settings panel's source): edge rate
 //! limits and the fleet memory cap override.
 
 use serde::Serialize;

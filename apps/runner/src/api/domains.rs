@@ -5,7 +5,7 @@
 //! them and `host/edge.rs` mints certificates through them. A pending claim
 //! is invisible to routing, TLS and the fallback page. Hostname grammar,
 //! platform-host refusal, the collision mapping and the role gates live in
-//! the service layer so the RPC surface cannot drift.
+//! the service layer so the HTTP surface cannot drift.
 use axum::{
     extract::{Path, Query, State},
     response::IntoResponse,

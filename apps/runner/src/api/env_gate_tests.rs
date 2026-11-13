@@ -360,65 +360,33 @@ async fn wake_and_fallback_resolve_environment_hosts() {
 }
 
 #[tokio::test]
-async fn grant_agrees_on_both_transports_and_stays_on_its_app() {
+async fn grant_stays_on_its_app() {
     let harness = Harness::new().await;
     let app = harness.seed_app("test").await;
     let env = seed_environment(&harness, &app, "feat-x").await;
     let path = format!("/v1/apps/{}/environments/{}/grant", app.id, env.id);
 
-    let token = harness
-        .rpc(
-            "environments.grant",
-            json!({ "id": app.id, "envId": env.id, "userId": "user-1" }),
-        )
-        .await
-        .expect("grant rpc")["token"]
-        .as_str()
-        .expect("token")
-        .to_string();
-    assert_eq!(
-        env_gate::verify_grant(&harness.state.config, &token),
-        Some((env.id.clone(), "user-1".to_string()))
-    );
     let (status, body) = harness
         .rest("POST", &path, Some(json!({ "userId": "user-1" })))
         .await;
     assert_eq!(status, StatusCode::OK);
     let rest_token = body["token"].as_str().expect("token").to_string();
     assert_eq!(
-        env_gate::verify_grant(&harness.state.config, &rest_token).map(|(id, _)| id),
-        Some(env.id.clone())
+        env_gate::verify_grant(&harness.state.config, &rest_token),
+        Some((env.id.clone(), "user-1".to_string()))
     );
 
     // A user id is required, and an environment only grants through its own
     // app: another app's id is not a way in.
-    assert_eq!(
-        harness
-            .rpc(
-                "environments.grant",
-                json!({ "id": app.id, "envId": env.id, "userId": "" })
-            )
-            .await
-            .expect_err("empty user")
-            .0,
-        400
-    );
+    let (status, _) = harness
+        .rest("POST", &path, Some(json!({ "userId": "" })))
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "empty user");
     let other = harness.seed_app("other").await;
     let other_path = format!("/v1/apps/{}/environments/{}/grant", other.id, env.id);
     let (status, _) = harness
         .rest("POST", &other_path, Some(json!({ "userId": "user-1" })))
         .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
-    assert_eq!(
-        harness
-            .rpc(
-                "environments.grant",
-                json!({ "id": other.id, "envId": env.id, "userId": "user-1" })
-            )
-            .await
-            .expect_err("foreign app")
-            .0,
-        404
-    );
     harness.finish().await;
 }

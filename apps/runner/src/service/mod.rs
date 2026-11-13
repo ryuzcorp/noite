@@ -1,11 +1,9 @@
-//! Service layer: the one implementation behind both transports.
+//! Service layer: the one implementation behind the runner's HTTP surface.
 //!
 //! REST handlers (`crate::api::*`) decode path/query/body, call a service
-//! function and encode the result; the JSON-RPC dispatcher (`crate::api::rpc`)
-//! decodes params, calls the *same* function and maps `ApiError` onto a
-//! JSON-RPC error. Nothing here knows about axum extractors or JSON-RPC, and
-//! nothing in `crate::api` is imported from here — the two transports stay
-//! peers over this layer instead of one re-implementing the other.
+//! function and encode the result (`ApiError` becomes the HTTP status and a
+//! plain-text message). Nothing here knows about axum extractors, and nothing
+//! in `crate::api` is imported from here.
 
 pub mod apps;
 pub mod deploys;

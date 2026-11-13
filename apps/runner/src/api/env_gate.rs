@@ -1,5 +1,4 @@
-//! Environment access grant (`environments.grant`): the REST mirror of the RPC
-//! the control UI's `/api/env-auth` route calls before it redirects a browser
+//! Environment access grant: what the control UI's `/api/env-auth` route calls before it redirects a browser
 //! into a members-only environment (host/env_gate.rs).
 
 use axum::{

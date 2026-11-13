@@ -37,6 +37,9 @@ pub fn router(state: AppState) -> Router {
             get(api::get_update_status).put(api::set_update_status),
         )
         .route("/v1/apps", get(api::list_apps).post(api::create_app))
+        // A slug lookup, static before the `{id}` route below (matchit
+        // prefers the literal segment and the shapes differ anyway).
+        .route("/v1/apps/by-slug/{slug}", get(api::get_app_by_slug))
         .route(
             "/v1/apps/{id}",
             get(api::get_app)
@@ -74,7 +77,7 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/apps/{id}/git-remote", post(api::git_remote))
         .route("/v1/apps/{id}/tree", get(api::source_tree))
         .route("/v1/apps/{id}/blob/{*path}", get(api::source_blob))
-        // Forge mirror for the git.* RPCs, under `/git/` so a branch ref and
+        // Forge routes, under `/git/` so a branch ref and
         // a Git object are never confused with an app route.
         .route("/v1/apps/{id}/git/refs", get(api::git_refs))
         .route("/v1/apps/{id}/git/log", get(api::git_log))
@@ -90,7 +93,24 @@ pub fn router(state: AppState) -> Router {
             "/v1/apps/{id}/metrics/version",
             get(api::app_metrics_version),
         )
+        .route("/v1/apps/{id}/errors", get(api::list_errors))
+        .route("/v1/apps/{id}/errors/ingest-key", get(api::get_ingest_key))
+        .route(
+            "/v1/apps/{id}/errors/ingest-key/rotate",
+            post(api::rotate_ingest_key),
+        )
+        .route(
+            "/v1/apps/{id}/errors/{fingerprint}",
+            get(api::get_error).patch(api::set_error_status),
+        )
         .route("/v1/apps/{id}/errors/stream", get(api::list_errors_stream))
+        .route(
+            "/v1/apps/{id}/limits",
+            get(api::get_limits).put(api::set_limits),
+        )
+        // Envelope ingest is project-addressed (the key carries the app), so
+        // it is not under an app id.
+        .route("/v1/errors/ingest", post(api::ingest_errors))
         .route(
             "/v1/apps/{id}/events",
             get(api::list_events).post(api::log_event),
@@ -176,6 +196,10 @@ pub fn router(state: AppState) -> Router {
             get(api::app_r2_raw),
         )
         .route(
+            "/v1/apps/{id}/storage/r2/{bucket}/delete",
+            post(api::app_r2_delete_many),
+        )
+        .route(
             "/v1/apps/{id}/environments",
             get(api::list_environments).post(api::create_environment),
         )
@@ -201,7 +225,6 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/v1/apps/{id}/env", get(api::list_env).post(api::set_env))
         .route("/v1/apps/{id}/env/{name}", delete(api::delete_env))
-        .route("/rpc", post(api::handle_rpc))
         .route("/v1/git/{slug}/info/refs", get(host::git_http::info_refs))
         .route(
             "/v1/git/{slug}/git-upload-pack",

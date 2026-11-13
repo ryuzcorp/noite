@@ -27,7 +27,7 @@ pub struct RollbackBody {
     environment_id: Option<String>,
     /// The caller's role in the app (a preview target needs `push`, the way
     /// `environments.deploy` does). The query carries it too; the body is the
-    /// shape the RPC and tests use.
+    /// shape the UI and the tests use.
     #[serde(default)]
     role: Option<String>,
 }

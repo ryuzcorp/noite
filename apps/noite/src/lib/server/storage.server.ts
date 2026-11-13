@@ -209,9 +209,8 @@ export const d1Tables = apiAction(
         tables: listed.tables.map((table) => ({ ...table, caps })),
       };
     } catch (error) {
-      // The runner's own message (celld's line) is the useful part; its RPC
-      // envelope names the internal method and code, which the tenant cannot
-      // act on.
+      // The runner's own message (celld's line) is the useful part; a bare
+      // status line names an internal route, which the tenant cannot act on.
       fail(runnerFailureMessage(runnerFailureOf(error)));
     }
   }

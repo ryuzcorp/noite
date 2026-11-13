@@ -1,10 +1,9 @@
-//! The operator's stop, over both transports: a live run is signalled (its
-//! token trips and the pipeline records its own failure), a row whose run is
-//! gone — the runner restarted mid-build — is closed here, and a finished
-//! deploy cannot be "stopped" a second time.
+//! The operator's stop: a live run is signalled (its token trips and the
+//! pipeline records its own failure), a row whose run is gone — the runner
+//! restarted mid-build — is closed here, and a finished deploy cannot be
+//! "stopped" a second time.
 
 use axum::http::StatusCode;
-use serde_json::json;
 
 use super::tests::Harness;
 
@@ -107,15 +106,6 @@ async fn stopping_a_live_run_signals_it_and_leaves_the_row_to_the_pipeline() {
         .expect("read deploy")
         .expect("deploy row");
     assert_eq!(row.status, crate::models::DeployStatus::Deploying);
-
-    // The RPC transport answers the same operation identically.
-    let rpc = h
-        .rpc(
-            "deploys.cancel",
-            json!({ "id": app.id, "deploy_id": deploy_id }),
-        )
-        .await;
-    assert!(rpc.is_ok(), "{rpc:?}");
 
     crate::host::cancel::CANCELS.release(&deploy_id);
     h.finish().await;

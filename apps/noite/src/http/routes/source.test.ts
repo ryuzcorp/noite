@@ -97,7 +97,7 @@ interface ForwardedCall {
 const forwarded: ForwardedCall[] = [];
 
 /** Capture the runner commit forward while the app lookup the key gate makes
- * (`/rpc`) keeps answering from the runner double. */
+ * keeps answering from the runner double. */
 const captureForward = (answer: () => Response): (() => void) => {
   const original = globalThis.fetch;
 

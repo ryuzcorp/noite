@@ -1,6 +1,6 @@
 /**
- * Pull-request server actions (F4): the runner's `prs.*` / `branch_rules.*`
- * RPCs behind the same role gates their RPCs expect. Reads (`prsList`,
+ * Pull-request server actions (F4): the runner's pull-request and branch-rule
+ * routes behind the same role gates they expect. Reads (`prsList`,
  * `prsGet`, `branchRulesGet`, `prsUserNames`, `prsViewer`) are `view`;
  * `prsCreate`, `prsComment`, `prsReview`, `prsMerge`, `prsCommentEdit`,
  * `prsCommentDelete` and `prsUpdate` are `push` (the runner itself enforces

@@ -1,5 +1,5 @@
 //! Preview environments: the control UI's actions over the runner's
-//! `environments.*` RPCs (list/create/delete/update/deploy + variable
+//! environment routes (list/create/delete/update/deploy + variable
 //! overrides).
 //!
 //! The runner enforces the app role on every call, so each action resolves the

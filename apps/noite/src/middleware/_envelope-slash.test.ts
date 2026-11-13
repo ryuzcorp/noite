@@ -27,14 +27,11 @@ describe("envelope trailing-slash alias", () => {
     controlEnv.RUNNER_URL = ENV.RUNNER_URL;
     envelopeLimiter.reset();
 
-    // SAFETY: the handler only posts JSON-RPC bodies to the runner.
+    // SAFETY: the handler only posts the envelope's ingest body to the
+    // runner's one ingest route.
     globalThis.fetch = (() =>
       Promise.resolve(
-        Response.json({
-          id: 1,
-          jsonrpc: "2.0",
-          result: { fingerprints: ["fp-one"] },
-        })
+        Response.json({ fingerprints: ["fp-one"] })
       )) as unknown as typeof fetch;
 
     try {

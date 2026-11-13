@@ -9,7 +9,7 @@
 //!    `__noite_env` cookie → 302 to
 //!    `<control>/api/env-auth?env=&app=&return=<absolute env url>`.
 //! 2. The control UI checks its session and the app's `view` role, mints a
-//!    token with the `environments.grant` RPC and redirects the browser to
+//!    token with the environment grant and redirects the browser to
 //!    `<env host>/__noite/auth?token=&return=<path>`.
 //! 3. `/v1/edge/env-auth` verifies the token, sets the host-only
 //!    `__noite_env` cookie and 302s to the return path.
