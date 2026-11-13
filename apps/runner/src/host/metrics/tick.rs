@@ -1,7 +1,8 @@
 //! The reconcile tick's telemetry pass, one named step per concern:
 //! sample CPU (1), access log (2), ingest chunks (3), compaction (3b),
-//! persist versions + wake the log stream (4), prune (5) — same order, same
-//! error handling, same watermark semantics as the single-function original.
+//! hourly counters' sampler feeds (3c), persist versions + wake the log
+//! stream (4), prune (5) — same order, same error handling, same watermark
+//! semantics as the single-function original.
 //! The idempotency rule lives in `ingest::commit_chunk`: a failed pass never
 //! advances the watermark.
 
