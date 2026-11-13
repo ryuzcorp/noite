@@ -180,6 +180,124 @@ async fn apps_get() {
     h.finish().await;
 }
 
+/// The route table's static segments must win over the `{id}` and
+/// `{fingerprint}` parameters: a slug lookup is not an app id, the ingest-key
+/// reads are not error fingerprints, and the errors stream is not one either.
+/// A precedence regression (matchit treats a static sibling over a parameter)
+/// would turn each of these into a 404 of the wrong handler without touching
+/// any handler's code, so each is pinned here.
+#[tokio::test]
+async fn static_segments_win_over_the_parameter_routes() {
+    let h = Harness::new().await;
+    let app = h.seed_app("routed-app").await;
+
+    // `by-slug` is not an app id: the id route would answer 404 (and this
+    // test's own 404 check below would pass for the wrong reason).
+    let (status, by_slug) = h.rest("GET", "/v1/apps/by-slug/routed-app", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(by_slug["id"], json!(app.id));
+    assert_eq!(by_slug["slug"], "routed-app");
+
+    // `ingest-key` is not a fingerprint: the read route answers the app's
+    // ingest identity instead of "no such issue".
+    let (status, key) = h
+        .rest(
+            "GET",
+            &format!("/v1/apps/{}/errors/ingest-key?role=view", app.id),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(key["key"].is_string(), "{key}");
+
+    // `ingest-key/rotate` is two static segments, not `{fingerprint}/…`.
+    let (status, rotated) = h
+        .rest(
+            "POST",
+            &format!("/v1/apps/{}/errors/ingest-key/rotate?role=admin", app.id),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_ne!(rotated["key"], key["key"], "rotate mints a new key");
+
+    // `stream` is not a fingerprint: it answers an SSE stream, so only the
+    // head is read (the body never completes).
+    let request = Request::builder()
+        .method("GET")
+        .uri(format!("/v1/apps/{}/errors/stream?status=open", app.id))
+        .header("authorization", format!("Bearer {TOKEN}"))
+        .body(Body::empty())
+        .expect("build request");
+    let response = h
+        .router
+        .clone()
+        .oneshot(request)
+        .await
+        .expect("router call");
+    assert_eq!(response.status(), StatusCode::OK);
+    let content_type = response
+        .headers()
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+    assert!(
+        content_type.starts_with("text/event-stream"),
+        "{content_type}"
+    );
+
+    // The batch delete is a POST on its own segment: an empty selection is
+    // refused by that handler's service call, never routed to the
+    // single-object `DELETE …/object?key=` above it.
+    let (status, body) = h
+        .rest(
+            "POST",
+            &format!("/v1/apps/{}/storage/r2/assets/delete", app.id),
+            Some(json!({ "keys": [] })),
+        )
+        .await;
+    assert_ne!(status, StatusCode::NOT_FOUND, "{body}");
+    assert_ne!(status, StatusCode::METHOD_NOT_ALLOWED, "{body}");
+    assert!(
+        body.as_str()
+            .is_some_and(|text| text.contains("select 1 to 100 objects")),
+        "{body}"
+    );
+
+    h.finish().await;
+}
+
+/// Rotating the ingest key is admin-only, and the refusal is the runner's
+/// (the role is resolved by the control UI, re-checked here). The view role
+/// may read the key but never rotate it.
+#[tokio::test]
+async fn rotating_the_ingest_key_needs_admin() {
+    let h = Harness::new().await;
+    let app = h.seed_app("key-app").await;
+
+    for role in ["view", "push"] {
+        let (status, body) = h
+            .rest(
+                "POST",
+                &format!("/v1/apps/{}/errors/ingest-key/rotate?role={role}", app.id),
+                None,
+            )
+            .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{role}: {body}");
+    }
+
+    let (status, body) = h
+        .rest(
+            "POST",
+            &format!("/v1/apps/{}/errors/ingest-key/rotate", app.id),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "no role: {body}");
+
+    h.finish().await;
+}
+
 /// The app API carries the supervisor's crash/OOM hold, on the read and in
 /// the list: a crash-looping fleet answered `running` with nothing to
 /// say why, which is what the "crashed, retrying" badge reads. A fleet that is

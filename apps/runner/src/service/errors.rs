@@ -387,7 +387,10 @@ pub async fn ingest(state: &AppState, batch: SdkIngestBatch) -> Result<Vec<Strin
     let Some((app_id, live)) = row else {
         return Err(ApiError::not_found("unknown project or key"));
     };
-    if batch.key != live {
+    // Constant time: the key is the only secret this route compares, and a
+    // timing oracle on it would be the one way to learn a prefix. An unknown
+    // project and a wrong key stay the same answer either way.
+    if !constant_time_eq::constant_time_eq(batch.key.as_bytes(), live.as_bytes()) {
         return Err(ApiError::not_found("unknown project or key"));
     }
     if batch.events.is_empty() {
