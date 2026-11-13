@@ -2,10 +2,19 @@
 # tenant fleets) plus the bundled RustFS store. Dev runs the same service from
 # the Dockerfile's `dev` target with the sources bind-mounted.
 
+# The compose CLI for this host: docker when present, else podman.
+COMPOSE_BIN ?= $(shell command -v docker >/dev/null 2>&1 && echo 'docker compose' || echo 'podman compose')
+# `-p $(PROJECT)` is load-bearing, not decoration: a compose file's top-level
+# `name:` beats COMPOSE_PROJECT_NAME, so without the flag `make dev PROJECT=x`
+# still lands in the `noite` project and recreates the default stack. Every
+# compose invocation in this file goes through $(COMPOSE) (or $(COMPOSE_BIN)
+# for the e2e lanes' own projects) so no call site can drift back.
+PROJECT ?= noite
+
 # Both docker compose and podman-compose resolve host paths in these files
 # relative to the first -f file's directory (docker/), so no
 # --project-directory flag (which podman-compose rejects outright).
-COMPOSE ?= $(shell command -v docker >/dev/null 2>&1 && echo 'docker compose' || echo 'podman compose') -f docker/compose.yaml
+COMPOSE ?= $(COMPOSE_BIN) -p $(PROJECT) -f docker/compose.yaml
 
 -include .env
 export
@@ -48,7 +57,6 @@ endif
 COMPOSE_BUILD := $(COMPOSE) -f docker/compose.build.yaml
 COMPOSE_DEV := $(COMPOSE) -f docker/compose.dev.yaml
 ENGINE ?= $(shell command -v docker >/dev/null 2>&1 && echo docker || echo podman)
-PROJECT ?= noite
 # The host the dev stack answers on: `BASE_DOMAIN` from .env, else the shipped
 # dev default. Never bare `localhost` — the control UI and every app/preview
 # host must share one registrable domain to be same-site.
@@ -148,7 +156,7 @@ down:
 nuke:
 	-$(COMPOSE_DEV) down -v --remove-orphans
 	-$(COMPOSE) down -v --remove-orphans
-	-$(COMPOSE) -p noite-e2e -f docker/compose.e2e.yaml down -v --remove-orphans
-	-@for s in 1 2 3 4 5 6 7 8; do $(COMPOSE) -p noite-e2e-$$s -f docker/compose.e2e.yaml down -v --remove-orphans; done
+	-$(COMPOSE_BIN) -p noite-e2e -f docker/compose.yaml -f docker/compose.e2e.yaml down -v --remove-orphans
+	-@for s in 1 2 3 4 5 6 7 8; do $(COMPOSE_BIN) -p noite-e2e-$$s -f docker/compose.yaml -f docker/compose.e2e.yaml down -v --remove-orphans; done
 	@CLI=$(ENGINE) sh -c '. ./docker/lib.sh && remove_project $(PROJECT) noite-e2e noite-e2e-1 noite-e2e-2 noite-e2e-3 noite-e2e-4 noite-e2e-5 noite-e2e-6 noite-e2e-7 noite-e2e-8'
 	rm -rf apps/noite/.wrangler apps/noite/.void

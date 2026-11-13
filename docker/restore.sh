@@ -30,8 +30,10 @@ if [ ! -f "${FROM_DIR}/MANIFEST" ]; then
   exit 1
 fi
 
-PROJECT="${COMPOSE_PROJECT_NAME:-noite}"
-CE="$COMPOSE -f docker/compose.yaml"
+# Same project the Makefile drives (`make restore PROJECT=x`); a direct run
+# follows COMPOSE_PROJECT_NAME, else the default install.
+PROJECT="${PROJECT:-${COMPOSE_PROJECT_NAME:-noite}}"
+CE="$COMPOSE -p $PROJECT -f docker/compose.yaml"
 
 pick_tar_image untar "set NOITE_BACKUP_IMAGE=<image with tar>."
 

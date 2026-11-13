@@ -30,12 +30,15 @@ API_URL="${NOITE_API_URL:-http://127.0.0.1:${PORT}/v1}"
 # Behind the edge the runner is reached by Host, not by port (raw-port lanes
 # set NOITE_API_URL and skip this).
 API_HOST_HEADER="${NOITE_API_HOST_HEADER:-api.${BASE_DOMAIN:-noite.localhost}}"
-PROJECT="${COMPOSE_PROJECT_NAME:-noite}"
+# Same project the Makefile drives: `make backup PROJECT=x` sets PROJECT,
+# a direct run follows COMPOSE_PROJECT_NAME (compose.yaml's `name:` default
+# interpolates the same variable), else the default install.
+PROJECT="${PROJECT:-${COMPOSE_PROJECT_NAME:-noite}}"
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 DEST="${1:-backups/${STAMP}}"
 VOLUMES="noite-data rustfs-data"
 
-CE="$COMPOSE -f docker/compose.yaml"
+CE="$COMPOSE -p $PROJECT -f docker/compose.yaml"
 
 # Any image with `tar` will do; prefer the Noite image already on this host.
 pick_tar_image tar "run 'make up' first, or set NOITE_BACKUP_IMAGE=<image with tar>."

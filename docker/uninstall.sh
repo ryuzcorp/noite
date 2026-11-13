@@ -32,9 +32,10 @@ set -euo pipefail
 NOITE_DIR="${NOITE_DIR:-/opt/noite}"
 NOITE_KEEP_DATA="${NOITE_KEEP_DATA:-0}"
 NOITE_CONFIRM="${NOITE_CONFIRM:-0}"
-# `name:` in compose.yaml; Compose labels everything it creates with it, so
-# the stack is found even when compose.yaml is gone.
-PROJECT="noite"
+# compose.yaml's `name:` default is `${COMPOSE_PROJECT_NAME:-noite}`; Compose
+# labels everything it creates with the resolved project, so the stack is
+# found even when compose.yaml is gone.
+PROJECT="${COMPOSE_PROJECT_NAME:-noite}"
 PROJECT_LABEL="com.docker.compose.project=$PROJECT"
 IMAGE_REPOS=("ghcr.io/ryuzcorp/noite" "rustfs/rustfs" "docker.io/rustfs/rustfs" "noite:local" "noite-dev:local")
 

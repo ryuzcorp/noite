@@ -27,7 +27,9 @@ else
   EDGE="http://127.0.0.1:${HTTP_PORT:-9080}"
   API="$EDGE"
   API_HOST="api.${BASE_HOST}"
-  PROJECT=noite
+  # The project `make` drives (it exports PROJECT); a direct run checks the
+  # default install.
+  PROJECT="${PROJECT:-noite}"
 fi
 
 detect_engine
