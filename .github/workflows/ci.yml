@@ -133,7 +133,7 @@ jobs:
   # replicates — every past image-only breakage (trustedDependencies,
   # .assetsignore handling, SSR snapshot atoms) was green here. Both
   # platforms: the arm64 leg is what exercises the per-arch pins (the Node
-  # tarball, esbuild's and DuckDB's assets), which an amd64-only build cannot.
+  # tarball, esbuild's asset), which an amd64-only build cannot.
   # Only the amd64 image is loaded and handed to the e2e lanes as an artifact,
   # so no lane rebuilds it (every lane paid ~280 s for its own build before).
   image:

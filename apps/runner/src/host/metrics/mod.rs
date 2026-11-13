@@ -3,7 +3,7 @@
 //! Errors and logs come from celld's OpenTelemetry (CELLD_OTEL=1, bucket
 //! sink): each fleet writes Parquet spans and console lines into its fleet
 //! bucket under `telemetry/{traces,logs}/...`, and the runner decodes them
-//! itself (`otel`) — no collector service and no DuckDB CLI.
+//! itself (`otel`) — no collector service and no CLI subprocess.
 //!
 //! CPU time celld executes code: OTel has no metrics signal yet (spans carry
 //! durations), so CPU is sampled from `/proc/<celld-pid>/stat` (+ descendants)
@@ -15,7 +15,7 @@
 //! Logs tabs need. Every dashboard then serves from SQLite — no Parquet read
 //! on any request path.
 //!
-//! Alongside that ingest, `hourly` keeps the DuckDB-free replacement:
+//! Alongside that ingest, `hourly` keeps the hourly counters:
 //! `metrics.app_hour`, one row per fleet per hour with requests, errors,
 //! p50/p95 latency, memory and CPU. Requests/errors/latency come from the
 //! edge access log (the one request sample that is not Parquet), memory from

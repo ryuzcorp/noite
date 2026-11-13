@@ -1,6 +1,6 @@
 //! One ingest chunk: the replace-only writers and the per-fleet fault
 //! isolation around a shared read. The read itself — celld's Parquet decoded
-//! without DuckDB — lives in [`super::otel`].
+//! lives in [`super::otel`].
 
 use std::collections::{HashMap, HashSet};
 
@@ -14,7 +14,7 @@ use super::MetricsState;
 
 /// The two result sets one ingest chunk carries: the fleet's newest log lines
 /// and its failed-span groups. The minute counters and hourly span stats the
-/// old four-tag DuckDB query also produced are gone — nothing reads them since
+/// old four-tag query also produced are gone — nothing reads them since
 /// the hourly counters replaced the Metrics tab.
 #[derive(Clone)]
 pub(super) struct IngestRows {
@@ -117,7 +117,7 @@ async fn write_ingest_rows(
 /// watermark moves only when every write succeeded: a failure returns `Err`
 /// with the watermarks untouched, so the chunk is retried — exact, because the
 /// writers replace. Kept as one call so the "failed pass never advances the
-/// watermark" rule is testable without DuckDB.
+/// watermark" rule is testable without a Parquet read.
 pub(super) async fn commit_chunk(
     pool: &SqlitePool,
     state: &mut MetricsState,

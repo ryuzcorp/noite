@@ -1,7 +1,7 @@
-//! The DuckDB-free telemetry read: the two result sets the Errors and Logs
+//! The Parquet telemetry read: the two result sets the Errors and Logs
 //! tabs still need, decoded straight from celld's Parquet objects.
 //!
-//! The old ingest was one DuckDB query unioning four tagged sets. The minute
+//! The old ingest was one query unioning four tagged sets. The minute
 //! counters (tag 1) and hourly span stats (tag 2) are gone with their API —
 //! requests/errors/latency/CPU come from the access-log tail and the hourly
 //! counters ([`super::hourly`]) — so only two sets remain:
@@ -22,7 +22,7 @@
 //!
 //! # Bounded failed-span aggregation
 //!
-//! The old tag 4 aggregated the whole window inside DuckDB, with a
+//! The old tag 4 aggregated the whole window inside the query engine, with a
 //! `memory_limit` and a spill directory. The reader runs on the runner's own
 //! heap, so it keeps the same *result* with a bounded working set instead:
 //!
@@ -419,7 +419,7 @@ struct Group {
     name: String,
     /// The latest span of the group: `arg_max(name, start_unix_us)`.
     best_start: i64,
-    /// `arg_max(trace_id, start_unix_us)`: DuckDB's `arg_max` skips NULL
+    /// `arg_max(trace_id, start_unix_us)`: `arg_max` skips NULL
     /// arguments, so this is the trace id of the latest span that *had* one.
     trace_id: String,
     trace_start: Option<i64>,
@@ -502,7 +502,7 @@ impl Group {
             traces,
         } = other;
         let saturated = self.traces.absorb(traces, MAX_TRACES_PER_GROUP);
-        // `arg_max` ties are arbitrary in DuckDB; keeping the earlier object's
+        // `arg_max` ties are arbitrary in the old query; keeping the earlier object's
         // value on a tie keeps this merge deterministic.
         if best_start > self.best_start {
             self.best_start = best_start;
@@ -876,7 +876,7 @@ mod tests {
             unwrap.replace("rejected: Error: rejected: Error: rejected: X", ""),
             "X"
         );
-        // The loop does not eat a bare second `rejected:` — same as DuckDB.
+        // The loop does not eat a bare second `rejected:` — same as the old SQL.
         assert_eq!(unwrap.replace("rejected: rejected: X", ""), "rejected: X");
         assert_eq!(unwrap.replace("plain", ""), "plain");
     }
@@ -1294,15 +1294,15 @@ mod tests {
     }
 
     /// The permanent differential: real celld objects with the rows the old
-    /// DuckDB tag-3 and tag-4 query produced over exactly those files. Every
+    /// tag-3 and tag-4 query produced over exactly those files. Every
     /// case carries an `expected.json` generated from that query; a celld
     /// schema bump that breaks the decode fails here before it reaches a
     /// dashboard. `folded` is the compaction output this crate writes
     /// (`compact::fold_files`), so the new writer's union-by-name file is read
     /// back against the old query — the other compacted case was written by
-    /// DuckDB.
+    /// that query engine.
     #[test]
-    fn real_celld_fixtures_match_the_duckdb_rows() {
+    fn real_celld_fixtures_match_the_reference_rows() {
         for case in ["prod", "env", "compacted", "folded"] {
             let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join("tests/fixtures/otel")

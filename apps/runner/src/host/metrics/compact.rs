@@ -159,7 +159,7 @@ const FOLD_BATCH_ROWS: usize = 8192;
 /// the inputs well below the reader's [`parquet_io::MAX_OBJECT_BYTES`] means
 /// the published file stays readable. At the 30 s flush default an hour is
 /// ~120 objects of a few MB, so this bound is only reached by a firehose node —
-/// exactly the hour the old DuckDB compaction could fold into a file the new
+/// exactly the hour the old compaction could fold into a file the new
 /// reader would refuse.
 const MAX_FOLD_INPUT_BYTES: u64 = 160 * 1024 * 1024;
 
@@ -264,10 +264,9 @@ impl Drop for FoldWork {
 }
 
 /// Fold the union of `inputs` into `target`, proved with a HEAD before the
-/// caller deletes anything. The old implementation was a DuckDB
+/// caller deletes anything. The old implementation was a
 /// `COPY (SELECT * FROM read_parquet([…], union_by_name=true) …)`; this is the
-/// same operation on the Parquet writer, because the runner may not call
-/// DuckDB anymore.
+/// same operation on the Parquet writer, in-process.
 ///
 /// Every input column is preserved (union by name), so an hour that spans a
 /// celld upgrade keeps both shapes. Row order inside the file is not
@@ -425,7 +424,7 @@ struct OutField {
     kind: ColumnKind,
     /// The unsigned annotation every input agrees on (`UTINYINT`,
     /// `USMALLINT`, …). celld's `kind` and `http_status` carry one, and the
-    /// old DuckDB `COPY` preserved it, so a compacted file keeps the same
+    /// old `COPY` preserved it, so a compacted file keeps the same
     /// column types. Dropped when the inputs disagree or an `INT32` widens to
     /// `INT64`.
     logical: Option<ConvertedType>,
@@ -1149,7 +1148,7 @@ mod tests {
     /// The fold is a union by name: a column only one input carries is kept
     /// (null in the rows that lack it), a wider integer widens, and the row
     /// order of every input survives. This is the `union_by_name=true` the
-    /// old DuckDB `COPY` relied on.
+    /// old `COPY` relied on.
     #[test]
     fn fold_keeps_every_input_column_and_row() {
         let guard = crate::testutil::TempDir::new("noite-compact-fold");
@@ -1270,10 +1269,10 @@ mod tests {
     }
 
     /// Regenerate the `folded` differential fixture consumed by
-    /// `otel::tests::real_celld_fixtures_match_the_duckdb_rows`: the union of
-    /// the two committed real celld objects per signal, written by
-    /// `fold_files`. The expected rows beside it come from the old DuckDB
-    /// tag-3/tag-4 query over exactly this output (see the fixture's
+    /// `otel::tests::real_celld_fixtures_match_the_reference_rows`: the union
+    /// of the two committed real celld objects per signal, written by
+    /// `fold_files`. The expected rows beside it come from the old tag-3/tag-4
+    /// query over exactly this output (see the fixture's
     /// `expected.json`). Run:
     /// `cargo test --locked write_folded_fixture -- --ignored`.
     #[test]
@@ -1321,7 +1320,7 @@ mod tests {
             .expect("parsed folded");
         // The unsigned annotations survive: celld's `kind` stays UTINYINT and
         // `http_status` stays USMALLINT, so the compacted file's types match
-        // its inputs (as DuckDB's `COPY` did).
+        // its inputs (as the old `COPY` did).
         let schema = reader.metadata().file_metadata().schema_descr();
         let converted = |name: &str| {
             schema

@@ -70,7 +70,7 @@ pub async fn app_logs(
 
 /// Live log tail as server-sent events: one JSON array per message, sent
 /// only when the snapshot changed (plus keep-alive comments). Wakes on the
-/// ingest tick's "new logs" signal (spec T3.3) instead of polling DuckDB, and
+/// ingest tick's "new logs" signal (spec T3.3) instead of polling the ring, and
 /// ends when the client disconnects. `?environmentId=` serves that
 /// environment's own ring and its ingested OTel logs, never production's.
 ///

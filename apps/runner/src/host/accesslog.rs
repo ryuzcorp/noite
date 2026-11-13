@@ -1,21 +1,18 @@
-//! Device breakdown from the Caddy access log.
+//! Request feed from the Caddy access log.
 //!
 //! Caddy appends one JSON line per request to the file next to the Caddyfile
 //! (see caddy.rs `push_block`). Each reconcile tick consumes new lines,
-//! attributes tenant hosts to apps, classifies the User-Agent into a
-//! (browser, os) pair, and accumulates hour buckets in SQLite.
+//! attributes tenant hosts to apps, and folds them into the fleet's hourly
+//! counters (`metrics/hourly.rs`): the status class, latency and timestamp
+//! inside the line's own transaction, so a line is counted exactly once or
+//! not at all. Only lines a fleet's own `reverse_proxy` answered count
+//! ([`served_by_fleet`]) — a redirect, a gate refusal, an edge 429 or an
+//! error page the edge rendered itself is not a request.
 //!
-//! The same line is the request feed for the hourly counters
-//! (`metrics/hourly.rs`): the fleet's status class, latency and timestamp fold
-//! into its open hour inside the line's own transaction, so a line is counted
-//! exactly once or not at all. Only lines a fleet's own `reverse_proxy`
-//! answered count ([`served_by_fleet`]) — a redirect, a gate refusal, an edge
-//! 429 or an error page the edge rendered itself is not a request.
-//!
-//! Privacy: only the classified pair is stored — raw user-agents and
-//! client IPs never leave this module (neither is parsed). The error index
-//! (trace id → method, query-less path, status, device pair) holds the same
-//! fields, in memory only.
+//! The same line carries the trace → request join the error ingest backfills
+//! with: a classified (browser, os) pair, the query-less path, method and
+//! status. Privacy: raw user-agents and client IPs never leave this module
+//! (neither is parsed), and the join is in memory only.
 //!
 //! Offset tracking survives restarts via a sidecar file next to the log
 //! (`access-log.offset`, holding `ino:off`). Caddy opens the log O_APPEND,
@@ -151,81 +148,11 @@ fn split_path(uri: &str) -> &str {
     }
 }
 
-/// Social networks and search engines served by name; everything else keeps
-/// its bare host (paths and queries never stored — they can carry tokens).
-/// Empty referrer (typed URL, bookmark, in-app navigation) is Direct.
-fn ref_source(referrer: &str) -> String {
-    let lower = referrer.trim().to_lowercase();
-    if lower.is_empty() {
-        return "Direct".to_string();
-    }
-    let host = lower
-        .split_once("://")
-        .map(|(_, rest)| rest)
-        .unwrap_or(&lower);
-    let host = host.split('/').next().unwrap_or(host);
-    let host = host.split('@').next_back().unwrap_or(host);
-    let host = host.split_once(':').map(|(h, _)| h).unwrap_or(host);
-    const DOMAINS: &[(&str, &str)] = &[
-        ("facebook.com", "Facebook"),
-        ("fb.com", "Facebook"),
-        ("fb.watch", "Facebook"),
-        ("messenger.com", "Facebook"),
-        ("instagram.com", "Instagram"),
-        ("threads.com", "Threads"),
-        ("threads.net", "Threads"),
-        ("twitter.com", "X"),
-        ("x.com", "X"),
-        ("t.co", "X"),
-        ("tiktok.com", "TikTok"),
-        ("linkedin.com", "LinkedIn"),
-        ("youtube.com", "YouTube"),
-        ("youtu.be", "YouTube"),
-        ("reddit.com", "Reddit"),
-        ("pinterest.com", "Pinterest"),
-        ("snapchat.com", "Snapchat"),
-        ("whatsapp.com", "WhatsApp"),
-        ("wa.me", "WhatsApp"),
-        ("t.me", "Telegram"),
-        ("discord.com", "Discord"),
-        ("bsky.app", "Bluesky"),
-        ("bing.com", "Bing"),
-        ("duckduckgo.com", "DuckDuckGo"),
-        ("baidu.com", "Baidu"),
-        ("ecosia.org", "Ecosia"),
-        ("search.brave.com", "Brave"),
-    ];
-    // Single-segment keys match any dot-separated segment — this is how
-    // multi-TLD names (google.*, yahoo.*, yandex.*) work. Full-domain
-    // matching above stays exact-or-dot-suffix, so `x.com` never matches
-    // `x.company.com`.
-    const SEGMENTS: &[(&str, &str)] = &[
-        ("google", "Google"),
-        ("yahoo", "Yahoo"),
-        ("yandex", "Yandex"),
-    ];
-    for (key, label) in DOMAINS {
-        if host == *key || host.ends_with(&format!(".{key}")) {
-            return label.to_string();
-        }
-    }
-    for seg in host.split('.') {
-        if let Some((_, label)) = SEGMENTS.iter().find(|(k, _)| seg == *k) {
-            return label.to_string();
-        }
-    }
-    host.chars().take(64).collect()
-}
-
 /// One parsed tenant line.
 struct Line {
     app_id: String,
     environment_id: String,
     bucket: String,
-    browser: &'static str,
-    os: &'static str,
-    path: String,
-    source: String,
     /// The request's own start, in epoch microseconds (the log's `ts`): the
     /// hourly counters key their bucket on it and keep the newest one for the
     /// sleep sweeper.
@@ -344,7 +271,6 @@ fn parse_line(
     if path.len() > 256 {
         return None;
     }
-    let source = ref_source(first_header(&v, "Referer"));
     let ts = v.pointer("/ts").and_then(|x| x.as_f64()).unwrap_or(0.0);
     let ts_us = (ts * 1_000_000.0) as i64;
     let status = v
@@ -390,10 +316,6 @@ fn parse_line(
         duration_ms,
         error: status >= 500,
         served,
-        browser,
-        os,
-        path: path.to_string(),
-        source,
         trace,
     })
 }
@@ -489,36 +411,31 @@ struct Tail<'a> {
     requests: &'a mut RequestIndex,
 }
 
-/// Commit one access-log line: its device/path/referrer counters, the trace
-/// backfill, and the fleet's hourly counters in one transaction. A failed
-/// statement or commit applies nothing, so the retried line is not counted
-/// twice.
+/// Commit one access-log line: the trace backfill and the fleet's hourly
+/// counters in one transaction. A failed statement or commit applies nothing,
+/// so the retried line is not counted twice.
 async fn apply_line(tail: &mut Tail<'_>, l: &Line) -> anyhow::Result<()> {
-    let trace = l.trace.as_ref().map(|(trace_id, ctx)| db::AccessTrace {
-        trace_id,
-        method: &ctx.method,
-        path: &ctx.path,
-        http_status: ctx.status,
-        browser: ctx.browser,
-        os: ctx.os,
-        backfill: tail.requests.is_pending(trace_id),
-    });
-    let hit = db::AccessHit {
-        app_id: &l.app_id,
-        environment_id: &l.environment_id,
-        bucket: &l.bucket,
-        browser: l.browser,
-        os: l.os,
-        path: &l.path,
-        source: &l.source,
-        trace,
-    };
     let mut tx = tail.pool.begin().await?;
-    db::record_access_hit(&mut tx, &hit).await?;
+    if let Some((trace_id, ctx)) = &l.trace {
+        db::backfill_trace_request(
+            &mut tx,
+            &l.app_id,
+            &l.environment_id,
+            &db::AccessTrace {
+                trace_id,
+                method: &ctx.method,
+                path: &ctx.path,
+                http_status: ctx.status,
+                browser: ctx.browser,
+                os: ctx.os,
+                backfill: tail.requests.is_pending(trace_id),
+            },
+        )
+        .await?;
+    }
     // The hourly counters and the idle clock they feed are fleet activity:
     // an edge-answered line (redirect, gate refusal, 429, starting page)
-    // neither served the app nor proves anyone used it. The device/path
-    // counters above stay edge-wide, as they always were.
+    // neither served the app nor proves anyone used it.
     if l.served {
         hourly::record_request(
             &mut tx,
@@ -656,8 +573,8 @@ mod tests {
     async fn a_mid_loop_db_error_never_double_counts_earlier_lines() {
         let dir = std::env::temp_dir().join(format!("noite-accesslog-{}", crate::models::new_id()));
         std::fs::create_dir_all(&dir).expect("temp dir");
-        // First line: a desktop UA (commits). Second: a bot UA, which the
-        // trigger below rejects before its transaction commits.
+        // First line: commits. Second: its hourly write is what the trigger
+        // below rejects, before that line's transaction commits.
         // Both are fleet-served (the log fields the counters gate on), so the
         // hourly row is what this test checks.
         let first = "{\"request\":{\"host\":\"blog.localhost\",\"uri\":\"/ok\",\"method\":\"GET\",\"headers\":{\"User-Agent\":[\"Mozilla/5.0 (X11; Linux x86_64) Chrome/131.0.0.0 Safari/537.36\"]}},\"status\":200,\"noite_upstream\":\"127.0.0.1:9000\",\"noite_edge_upstream\":\"127.0.0.1:9000\"}\n";
@@ -676,8 +593,8 @@ mod tests {
         slug_id.insert("blog".to_string(), "app-id".to_string());
         let mut requests = RequestIndex::default();
         sqlx::query(
-            "CREATE TRIGGER metrics.boom BEFORE INSERT ON app_device_stat \
-             WHEN NEW.browser = 'Bot' BEGIN SELECT RAISE(ABORT, 'injected'); END",
+            "CREATE TRIGGER metrics.boom BEFORE INSERT ON app_hour \
+             WHEN NEW.requests = 2 BEGIN SELECT RAISE(ABORT, 'injected'); END",
         )
         .execute(&pool)
         .await
@@ -925,49 +842,6 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
-
-    /// P1 root cause: the three counters and the backfill share one
-    /// transaction, so a failure after the first insert commits nothing. The
-    /// old code issued three independent statements and could leave a device
-    /// hit counted for a line the tail re-reads.
-    #[tokio::test]
-    async fn an_access_hit_is_all_or_nothing() {
-        let dir = std::env::temp_dir().join(format!("noite-accesshit-{}", crate::models::new_id()));
-        std::fs::create_dir_all(&dir).expect("temp dir");
-        let pool = crate::db::connect(&format!(
-            "sqlite:{}?mode=rwc",
-            dir.join("noite.sqlite").display()
-        ))
-        .await
-        .expect("file db");
-        sqlx::query(
-            "CREATE TRIGGER metrics.boom BEFORE INSERT ON app_device_stat \
-             WHEN NEW.browser = 'Bot' BEGIN SELECT RAISE(ABORT, 'injected'); END",
-        )
-        .execute(&pool)
-        .await
-        .expect("trigger");
-        let hit = crate::db::AccessHit {
-            app_id: "a",
-            environment_id: "",
-            bucket: "2026-09-30T12:00:00Z",
-            browser: "Bot",
-            os: "",
-            path: "/",
-            source: "Direct",
-            trace: None,
-        };
-        let mut tx = pool.begin().await.expect("tx");
-        assert!(crate::db::record_access_hit(&mut tx, &hit).await.is_err());
-        drop(tx);
-        let devices: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM metrics.app_device_stat WHERE app_id = 'a'")
-                .fetch_one(&pool)
-                .await
-                .expect("read");
-        assert_eq!(devices, 0, "a failed line must not leave a partial count");
-        let _ = std::fs::remove_dir_all(&dir);
-    }
 }
 
 #[cfg(test)]
@@ -984,6 +858,7 @@ mod env_tests {
             },
             "status": 200,
             "ts": 1_767_225_600.0,
+            "traceID": "4bf92f3577b34da6a3ce929d0e0e4736",
         })
         .to_string()
     }
@@ -1052,7 +927,11 @@ mod env_tests {
         .expect("env host parses");
         assert_eq!(env.app_id, "app1");
         assert_eq!(env.environment_id, "env-1");
-        assert_eq!(env.path, "/about");
+        assert_eq!(
+            env.trace.as_ref().map(|(_, ctx)| ctx.path.as_str()),
+            Some("/about"),
+            "the error join keeps the query-less path"
+        );
         let prod = parse_line(
             &line("blog.localhost"),
             &cfg,

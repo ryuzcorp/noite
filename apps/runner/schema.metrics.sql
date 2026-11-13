@@ -1,15 +1,4 @@
-CREATE TABLE IF NOT EXISTS metrics.app_metric (
-  app_id TEXT NOT NULL,
-  environment_id TEXT NOT NULL DEFAULT '',
-  bucket_ts TEXT NOT NULL,
-  requests INTEGER NOT NULL DEFAULT 0,
-  errors INTEGER NOT NULL DEFAULT 0,
-  latency_ms INTEGER NOT NULL DEFAULT 0,
-  cpu_ms INTEGER NOT NULL DEFAULT 0,
-  PRIMARY KEY (app_id, environment_id, bucket_ts)
-);
-CREATE INDEX IF NOT EXISTS metrics.idx_app_metric_app_bucket ON app_metric(app_id, environment_id, bucket_ts);
--- Hourly per-fleet counters (the DuckDB replacement): one row per
+-- Hourly per-fleet counters: one row per
 -- (app, environment, hour), rewritten from the tick's open hour instead of
 -- accumulated, so a retried access-log line can never double count. The
 -- percentiles are derived from `app_hour_lat` when the row is written, so a
@@ -44,51 +33,10 @@ CREATE TABLE IF NOT EXISTS metrics.app_hour_lat (
   n INTEGER NOT NULL DEFAULT 0,
   PRIMARY KEY (app_id, environment_id, bucket_hour, bucket)
 );
-CREATE TABLE IF NOT EXISTS metrics.app_device_stat (
-  app_id TEXT NOT NULL,
-  environment_id TEXT NOT NULL DEFAULT '',
-  bucket_ts TEXT NOT NULL,
-  browser TEXT NOT NULL,
-  os TEXT NOT NULL,
-  requests INTEGER NOT NULL DEFAULT 0,
-  PRIMARY KEY (app_id, environment_id, bucket_ts, browser, os)
-);
-CREATE INDEX IF NOT EXISTS metrics.idx_app_device_stat_app_bucket ON app_device_stat(app_id, environment_id, bucket_ts);
-CREATE TABLE IF NOT EXISTS metrics.app_path_stat (
-  app_id TEXT NOT NULL,
-  environment_id TEXT NOT NULL DEFAULT '',
-  bucket_ts TEXT NOT NULL,
-  path TEXT NOT NULL,
-  requests INTEGER NOT NULL DEFAULT 0,
-  PRIMARY KEY (app_id, environment_id, bucket_ts, path)
-);
-CREATE INDEX IF NOT EXISTS metrics.idx_app_path_stat_app_bucket ON app_path_stat(app_id, environment_id, bucket_ts);
-CREATE TABLE IF NOT EXISTS metrics.app_ref_stat (
-  app_id TEXT NOT NULL,
-  environment_id TEXT NOT NULL DEFAULT '',
-  bucket_ts TEXT NOT NULL,
-  source TEXT NOT NULL,
-  requests INTEGER NOT NULL DEFAULT 0,
-  PRIMARY KEY (app_id, environment_id, bucket_ts, source)
-);
-CREATE INDEX IF NOT EXISTS metrics.idx_app_ref_stat_app_bucket ON app_ref_stat(app_id, environment_id, bucket_ts);
 CREATE TABLE IF NOT EXISTS metrics.metric_watermark (
   slug TEXT PRIMARY KEY NOT NULL,
   after_us INTEGER NOT NULL
 );
-CREATE TABLE IF NOT EXISTS metrics.app_span_stat (
-  app_id TEXT NOT NULL,
-  environment_id TEXT NOT NULL DEFAULT '',
-  bucket_hour TEXT NOT NULL,
-  name TEXT NOT NULL,
-  kind INTEGER NOT NULL DEFAULT 0,
-  n INTEGER NOT NULL DEFAULT 0,
-  ms INTEGER NOT NULL DEFAULT 0,
-  err INTEGER NOT NULL DEFAULT 0,
-  qwait_ms INTEGER NOT NULL DEFAULT 0,
-  PRIMARY KEY (app_id, environment_id, bucket_hour, name, kind)
-);
-CREATE INDEX IF NOT EXISTS metrics.idx_app_span_stat_app_hour ON app_span_stat(app_id, environment_id, bucket_hour);
 CREATE TABLE IF NOT EXISTS metrics.app_log (
   app_id TEXT NOT NULL,
   environment_id TEXT NOT NULL DEFAULT '',

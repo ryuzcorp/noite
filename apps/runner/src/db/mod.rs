@@ -87,12 +87,11 @@ pub use instance_setting::{
     TELEMETRY_LAST_SENT_AT, UPDATE_CHECK_ENABLED, UPDATE_CHECK_LAST_AT, UPDATE_CHECK_RESULT,
 };
 pub use metrics::{
-    add_app_metric_cpu, app_hour_lat, clear_telemetry_replay_if, delete_environment_telemetry,
+    app_hour_lat, backfill_trace_request, clear_telemetry_replay_if, delete_environment_telemetry,
     delete_metric_watermarks_for, get_app_hour, get_metric_watermarks, get_telemetry_replay,
-    last_request_us, list_app_logs, list_app_metrics, prune_app_devices, prune_app_hours,
-    prune_app_logs, prune_app_metrics, prune_app_paths, prune_app_refs, prune_span_stats,
-    record_access_hit, replace_app_hour, replace_app_hour_lat, replace_app_logs,
-    set_metric_watermarks, set_telemetry_replay, AccessHit, AccessTrace, AppHourValues,
+    last_request_us, list_app_logs, list_app_metrics, prune_app_hours, prune_app_logs,
+    replace_app_hour, replace_app_hour_lat, replace_app_logs, set_metric_watermarks,
+    set_telemetry_replay, AccessTrace, AppHourValues,
 };
 pub use void_cohost::{delete_environment_hashes, get_cohost_hash, set_cohost_hash};
 
@@ -179,6 +178,17 @@ pub fn metrics_db_path(database_url: &str) -> String {
     ":memory:".to_string()
 }
 
+/// Telemetry tables this build no longer writes or reads: the old minute
+/// buckets, the access-log analytics and the hourly span stats. Dropped,
+/// idempotently, whenever `metrics.sqlite` is attached — an upgraded install
+/// still carries them, and `schema.metrics.sql` only ever creates.
+pub(crate) const DEAD_METRICS_TABLES: &str = "\
+     DROP TABLE IF EXISTS metrics.app_metric; \
+     DROP TABLE IF EXISTS metrics.app_device_stat; \
+     DROP TABLE IF EXISTS metrics.app_path_stat; \
+     DROP TABLE IF EXISTS metrics.app_ref_stat; \
+     DROP TABLE IF EXISTS metrics.app_span_stat";
+
 /// Attach the sibling metrics database and apply the telemetry schema
 /// (`schema.metrics.sql`, embedded at compile time) on one connection.
 /// Idempotent and run on every connection, so any query can name `metrics.*`.
@@ -204,6 +214,13 @@ macro_rules! attach_metrics {
             sqlx::raw_sql(include_str!("../../schema.metrics.sql")),
         )
         .await?;
+        // Telemetry tables this build no longer writes or reads. An upgraded
+        // install still carries them (`schema.metrics.sql` only creates, it
+        // never drops), so reclaim their space here. Fully qualified on
+        // purpose: a bare `DROP TABLE` resolves against the main database
+        // first (`telemetry_survives_a_reconnect` covers that regression).
+        sqlx::Executor::execute(&mut *$conn, sqlx::raw_sql($crate::db::DEAD_METRICS_TABLES))
+            .await?;
     }};
 }
 pub(crate) use attach_metrics;
@@ -246,19 +263,19 @@ mod tests {
         std::fs::create_dir_all(&dir).expect("temp dir");
         let url = format!("sqlite:{}?mode=rwc", dir.join("noite.sqlite").display());
         let pool = connect(&url).await.expect("boot");
-        sqlx::query("DROP INDEX metrics.idx_app_metric_app_bucket")
+        sqlx::query("DROP INDEX metrics.idx_app_log_app_ts")
             .execute(&pool)
             .await
             .expect("simulate the crash window");
         pool.close().await;
         let pool = connect(&url).await.expect("reboot");
         let found: Option<String> = sqlx::query_scalar(
-            "SELECT name FROM metrics.sqlite_master WHERE type = 'index' AND name = 'idx_app_metric_app_bucket'",
+            "SELECT name FROM metrics.sqlite_master WHERE type = 'index' AND name = 'idx_app_log_app_ts'",
         )
         .fetch_optional(&pool)
         .await
         .expect("index lookup");
-        assert_eq!(found.as_deref(), Some("idx_app_metric_app_bucket"));
+        assert_eq!(found.as_deref(), Some("idx_app_log_app_ts"));
         pool.close().await;
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -274,9 +291,6 @@ mod tests {
         let url = format!("sqlite:{}?mode=rwc", dir.join("noite.sqlite").display());
         {
             let pool = connect(&url).await.expect("first boot");
-            add_app_metric_cpu(&pool, "a", "", "2026-09-30T12:36:00Z", 1)
-                .await
-                .expect("cpu");
             let mut hour_tx = pool.begin().await.expect("tx");
             replace_app_hour(
                 &mut hour_tx,
@@ -301,23 +315,6 @@ mod tests {
             set_metric_watermarks(&pool, &[("test".to_string(), 42)])
                 .await
                 .expect("watermark");
-            let mut tx = pool.begin().await.expect("tx");
-            record_access_hit(
-                &mut tx,
-                &AccessHit {
-                    app_id: "a",
-                    environment_id: "",
-                    bucket: "2026-09-30T12:00:00Z",
-                    browser: "Other",
-                    os: "",
-                    path: "/",
-                    source: "Direct",
-                    trace: None,
-                },
-            )
-            .await
-            .expect("path");
-            tx.commit().await.expect("commit");
             pool.close().await;
         }
         let pool = connect(&url).await.expect("second boot");
@@ -339,6 +336,71 @@ mod tests {
             .await
             .expect("last request readable");
         assert_eq!(last, Some(1_790_000_000_000_000));
+        pool.close().await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An install upgraded from the old telemetry pipeline still carries its
+    /// old metrics tables: attaching the database must drop them (the new
+    /// schema only creates) and leave the live counters alone.
+    #[tokio::test]
+    async fn an_upgrade_drops_the_dead_telemetry_tables() {
+        let dir = std::env::temp_dir().join(format!("noite-db-upgrade-{}", new_id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let url = format!("sqlite:{}?mode=rwc", dir.join("noite.sqlite").display());
+        {
+            // The old install's metrics.sqlite: the dead tables with a row.
+            let metrics_path = metrics_db_path(&url);
+            let old = sqlx::SqlitePool::connect(&format!("sqlite:{metrics_path}?mode=rwc"))
+                .await
+                .expect("old metrics db");
+            for table in [
+                "app_metric",
+                "app_device_stat",
+                "app_path_stat",
+                "app_ref_stat",
+                "app_span_stat",
+            ] {
+                sqlx::query(sqlx::AssertSqlSafe(format!(
+                    "CREATE TABLE {table} (app_id TEXT NOT NULL, environment_id TEXT NOT NULL DEFAULT '')"
+                )))
+                .execute(&old)
+                .await
+                .expect("old table");
+                sqlx::query(sqlx::AssertSqlSafe(format!(
+                    "INSERT INTO {table} (app_id) VALUES ('a')"
+                )))
+                .execute(&old)
+                .await
+                .expect("old row");
+            }
+            old.close().await;
+        }
+        let pool = connect(&url).await.expect("boot");
+        let tables: Vec<String> = sqlx::query_scalar(
+            "SELECT name FROM metrics.sqlite_master WHERE type = 'table' ORDER BY name",
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("table list");
+        for dead in [
+            "app_metric",
+            "app_device_stat",
+            "app_path_stat",
+            "app_ref_stat",
+            "app_span_stat",
+        ] {
+            assert!(
+                !tables.iter().any(|t| t == dead),
+                "{dead} must be dropped on attach: {tables:?}"
+            );
+        }
+        for kept in ["app_hour", "app_log", "metric_watermark", "app_error_issue"] {
+            assert!(
+                tables.iter().any(|t| t == kept),
+                "{kept} must survive the upgrade: {tables:?}"
+            );
+        }
         pool.close().await;
         let _ = std::fs::remove_dir_all(&dir);
     }

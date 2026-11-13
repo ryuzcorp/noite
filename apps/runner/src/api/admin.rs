@@ -57,7 +57,7 @@ pub async fn snapshot(State(state): State<AppState>) -> impl IntoResponse {
 }
 
 /// Process-wide cost counters (spec T0.1): subprocess spawns by program, S3
-/// operations by verb with bytes, DuckDB runs by purpose, snapshot uploads,
+/// operations by verb with bytes, snapshot uploads,
 /// live SSE loops, plus RSS and CPU time. `make usage` diffs this over a
 /// window for the before/after harness. Also carries `control_fleet`: whether
 /// this image supervises the control fleet at all (the dev image does not —

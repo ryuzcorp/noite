@@ -4,7 +4,6 @@ import path from "node:path";
 
 import {
   checkIntegrityPins,
-  githubAssetDigest,
   hubTagUrl,
   imagePinFiles,
   npmIntegrityHex,
@@ -130,14 +129,14 @@ describe("checkIntegrityPins", () => {
     const report = checkIntegrityPins({
       ...files,
       sidecars: files.sidecars.replace(
-        `echo "\${DUCKDB_SHA256}  /tmp/duckdb.tar.gz" | sha256sum -c -`,
+        `echo "\${ESBUILD_SHA512}  /tmp/esbuild.tgz" | sha512sum -c -`,
         'echo "unchecked"'
       ),
     });
 
     expect(report.failures).toContainEqual(
       expect.stringContaining(
-        `duckdb: the install must verify the download with \${DUCKDB_SHA256}`
+        `esbuild: the install must verify the download with \${ESBUILD_SHA512}`
       )
     );
   });
@@ -389,18 +388,6 @@ describe("onlineProbes", () => {
     expect(kinds).toContain("image");
     expect(kinds).toContain("shasums");
     expect(kinds).toContain("npm-integrity");
-    expect(kinds).toContain("github-asset");
-
-    // Both arch assets of each multi-arch download are probed.
-    const assets = probes
-      .filter((probe) => probe.kind === "github-asset")
-      .map((probe) => probe.asset)
-      .toSorted();
-
-    expect(assets).toEqual([
-      "duckdb-cli-linux-amd64.tar.gz",
-      "duckdb-cli-linux-arm64.tar.gz",
-    ]);
 
     // A shared base image is resolved once, not once per stage.
     const slim = probes.filter(
@@ -467,10 +454,9 @@ describe("online flags", () => {
     expect(tarballs.map((probe) => probe.kind)).not.toContain("image");
     expect(tarballs).toHaveLength(all.length - report.images.length);
 
-    // The immutable publisher pins (SHASUMS, npm integrity, release assets)
-    // run either way.
+    // The immutable publisher pins (SHASUMS, npm integrity) run either way.
     expect(tarballs.map((probe) => probe.kind)).toEqual(
-      expect.arrayContaining(["shasums", "npm-integrity", "github-asset"])
+      expect.arrayContaining(["shasums", "npm-integrity"])
     );
 
     expect(all.filter((probe) => probe.kind === "image")).toHaveLength(
@@ -558,24 +544,6 @@ describe("publisher parsers", () => {
     );
     expect(npmIntegrityHex("sha1-deadbeef")).toBeUndefined();
   });
-
-  test("githubAssetDigest reads the release asset's published digest", () => {
-    const release = JSON.stringify({
-      assets: [
-        { digest: null, name: "duckdb.zip" },
-        {
-          digest:
-            "sha256:c6507206baf7793c6013dbd82368469a45f20dc0e17a6f92f204602f652ed2bc",
-          name: "duckdb-cli-linux-amd64.tar.gz",
-        },
-      ],
-    });
-
-    expect(githubAssetDigest(release, "duckdb-cli-linux-amd64.tar.gz")).toBe(
-      "c6507206baf7793c6013dbd82368469a45f20dc0e17a6f92f204602f652ed2bc"
-    );
-    expect(githubAssetDigest(release, "missing.tar.gz")).toBeUndefined();
-  });
 });
 
 describe("online comparators", () => {
@@ -640,32 +608,5 @@ describe("online comparators", () => {
     expect(
       verifyFetchedPin(probe, JSON.stringify({ dist: { integrity: "sha1-x" } }))
     ).toContain("publishes sha1-x");
-  });
-
-  test("a GitHub release asset must carry the pinned digest", () => {
-    const probe = {
-      asset: "duckdb-cli-linux-amd64.tar.gz",
-      digest: "e".repeat(64),
-      kind: "github-asset" as const,
-      name: "duckdb amd64",
-      url: "https://api.github.com/repos/duckdb/duckdb/releases/tags/v2.0.0",
-    };
-
-    expect(
-      verifyFetchedPin(
-        probe,
-        JSON.stringify({
-          assets: [
-            {
-              digest: `sha256:${"e".repeat(64)}`,
-              name: "duckdb-cli-linux-amd64.tar.gz",
-            },
-          ],
-        })
-      )
-    ).toBeUndefined();
-    expect(verifyFetchedPin(probe, JSON.stringify({ assets: [] }))).toContain(
-      "as no digest"
-    );
   });
 });

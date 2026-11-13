@@ -250,7 +250,7 @@ pub fn tenant_fleet_env(input: &TenantFleetEnv<'_>) -> Vec<(String, String)> {
     // configured per fleet. Without a leaf the fleets share the container
     // cgroup, so a derived container-wide threshold is the one graceful
     // shed available: it leaves the last quarter of the box for the runner,
-    // Caddy, RustFS, DuckDB and builds instead of letting celld sit at its
+    // Caddy, RustFS and builds instead of letting celld sit at its
     // own 80% until the kernel OOM-killer acts.
     let shed_mb: Option<u64> = if cfg.fleet_max_rss_mb > 0 {
         Some(u64::from(cfg.fleet_max_rss_mb))

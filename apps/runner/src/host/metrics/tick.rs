@@ -84,7 +84,7 @@ pub async fn tick(
     let (mut touched, new_logs) =
         ingest_step(pool, cfg, state, &keys, &live_slugs, control_pid).await;
     compact_step(pool, cfg, state, &keys.ids).await;
-    persist_step(pool, &cpu, &mut touched, new_logs, log_tx).await?;
+    persist_step(pool, &mut touched, new_logs, log_tx).await?;
     hourly_step(pool, &keys, &cpu).await;
     prune_step(pool, cfg, state).await;
     Ok(())
@@ -475,25 +475,18 @@ async fn compact_step(
     }
 }
 
-/// Step 4 — persist sampled CPU (telemetry usage was replaced per chunk above),
-/// then dashboard versions (spec T3.6) and log wakeups (spec T3.3): polls
+/// Step 4 — dashboard versions (spec T3.6) and log wakeups (spec T3.3): polls
 /// skip unchanged windows, the log stream wakes instead of re-scanning.
 /// The watermarks advanced (and persisted) per committed chunk in
 /// `commit_chunk`, so a restart resumes there; a crash before a chunk's writes
-/// re-reads the chunk, which the replace writers make exact.
+/// re-reads the chunk, which the replace writers make exact. The hourly
+/// counters' CPU/memory writes bump their own version inside `hourly`.
 async fn persist_step(
     pool: &SqlitePool,
-    cpu: &HashMap<(String, String, String), i64>,
     touched: &mut HashSet<(String, String)>,
     new_logs: bool,
     log_tx: &tokio::sync::watch::Sender<u64>,
 ) -> anyhow::Result<()> {
-    for ((id, env, bucket), ms) in cpu {
-        if *ms > 0 {
-            db::add_app_metric_cpu(pool, id, env, bucket, *ms).await?;
-            touched.insert((id.clone(), env.clone()));
-        }
-    }
     for (id, env) in touched.iter() {
         if let Err(e) = db::bump_metric_version(pool, id, env).await {
             tracing::warn!(error = %e, "version bump");
@@ -515,40 +508,12 @@ async fn prune_step(pool: &SqlitePool, cfg: &Config, state: &mut MetricsState) {
     state
         .ingest_backoff
         .retain(|_, at| *at > std::time::Instant::now());
-    let cutoff = (Utc::now() - chrono::Duration::days(cfg.telemetry_retention_days))
-        .format("%Y-%m-%dT%H:%M:00Z")
-        .to_string();
-    if let Ok(n) = db::prune_app_metrics(pool, &cutoff).await {
-        if n > 0 {
-            tracing::info!(pruned = n, "pruned old app metrics");
-        }
-    }
-    if let Ok(n) = db::prune_app_devices(pool, &cutoff).await {
-        if n > 0 {
-            tracing::info!(pruned = n, "pruned old device stats");
-        }
-    }
-    if let Ok(n) = db::prune_app_paths(pool, &cutoff).await {
-        if n > 0 {
-            tracing::info!(pruned = n, "pruned old path stats");
-        }
-    }
-    if let Ok(n) = db::prune_app_refs(pool, &cutoff).await {
-        if n > 0 {
-            tracing::info!(pruned = n, "pruned old ref stats");
-        }
-    }
     let hour_cutoff = (Utc::now() - chrono::Duration::days(cfg.telemetry_retention_days))
         .format("%Y-%m-%dT%H:00:00Z")
         .to_string();
     if let Ok(n) = db::prune_app_hours(pool, &hour_cutoff).await {
         if n > 0 {
             tracing::info!(pruned = n, "pruned old hourly counters");
-        }
-    }
-    if let Ok(n) = db::prune_span_stats(pool, &hour_cutoff).await {
-        if n > 0 {
-            tracing::info!(pruned = n, "pruned old span stats");
         }
     }
     let cutoff_us = now_us() - cfg.telemetry_retention_days * 86_400_000_000;

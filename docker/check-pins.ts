@@ -7,7 +7,7 @@
  * with fixtures. docker/check-versions.ts reads the real files, calls
  * checkIntegrityPins, and with `--online` compares every pin with what the
  * publisher serves today (the tag's index digest, Node's signed
- * SHASUMS256.txt, npm's `dist.integrity`, GitHub's release-asset digest).
+ * SHASUMS256.txt, npm's `dist.integrity`).
  */
 
 export interface PinFiles {
@@ -49,14 +49,7 @@ export type OnlineProbe =
       name: string;
       url: string;
     }
-  | { digest: string; kind: "npm-integrity"; name: string; url: string }
-  | {
-      asset: string;
-      digest: string;
-      kind: "github-asset";
-      name: string;
-      url: string;
-    };
+  | { digest: string; kind: "npm-integrity"; name: string; url: string };
 
 /**
  * The files whose text carries an image pin: the Dockerfile's FROM lines,
@@ -115,15 +108,6 @@ const downloadSpecs: DownloadSpec[] = [
     sumRef: `\${ESBUILD_SHA512}`,
     url: `https://registry.npmjs.org/@esbuild/\${ESBUILD_PKG}/-/\${ESBUILD_PKG}-\${ESBUILD_VERSION}.tgz`,
     versionVar: "ESBUILD_VERSION",
-  },
-  {
-    algo: "sha256",
-    archVars: { amd64: "DUCKDB_SHA256_X64", arm64: "DUCKDB_SHA256_ARM64" },
-    file: "sidecars",
-    name: "duckdb",
-    sumRef: `\${DUCKDB_SHA256}`,
-    url: `https://github.com/duckdb/duckdb/releases/download/v\${DUCKDB_VERSION}/\${DUCKDB_PKG}.tar.gz`,
-    versionVar: "DUCKDB_VERSION",
   },
 ];
 
@@ -568,22 +552,6 @@ export const npmIntegrityHex = (integrity: string): string | undefined => {
   return Buffer.from(match.groups.base64, "base64").toString("hex");
 };
 
-/** The `digest` GitHub's release API publishes for one asset, as hex. */
-export const githubAssetDigest = (
-  json: string,
-  asset: string
-): string | undefined => {
-  // SAFETY: GitHub's release API response; only the `assets[].digest`/`name`
-  // pair is read, and a missing asset returns undefined below.
-  const parsed = JSON.parse(json) as {
-    assets?: { digest?: string; name?: string }[];
-  };
-
-  const found = parsed.assets?.find((entry) => entry.name === asset);
-
-  return found?.digest?.replace(/^sha256:/u, "");
-};
-
 /** A fetched publisher document compared with the digest the pin claims. */
 export const verifyFetchedPin = (
   probe: Exclude<OnlineProbe, { kind: "image" }>,
@@ -612,11 +580,16 @@ export const verifyFetchedPin = (
       : `online: ${probe.url} publishes ${integrity ?? "no integrity"}, but the pin is ${probe.digest}`;
   }
 
-  const hex = githubAssetDigest(text, probe.asset);
+  // SAFETY: Node's SHASUMS document; only the lines this probe names are read.
+  const entries = parseShasums(text);
 
-  return hex === probe.digest
-    ? undefined
-    : `online: ${probe.url} publishes ${probe.asset} as ${hex ?? "no digest"}, but the pin is ${probe.digest}`;
+  for (const [file, expected] of Object.entries(probe.entries)) {
+    if (entries[file] !== expected) {
+      return `online: ${probe.url} lists ${file} as ${entries[file] ?? "nothing"}, but the pin is ${expected}`;
+    }
+  }
+
+  return undefined;
 };
 
 /**
@@ -692,18 +665,6 @@ const onlineProbesForDownload = (download: PinnedDownload): OnlineProbe[] => {
         kind: "npm-integrity",
         name: `@esbuild/linux-${arch}`,
         url: `https://registry.npmjs.org/@esbuild/linux-${arch}/${download.version}`,
-      });
-    }
-  }
-
-  if (download.name === "duckdb") {
-    for (const arch of archs) {
-      probes.push({
-        asset: `duckdb-cli-linux-${arch}.tar.gz`,
-        digest: download.digests[arch] ?? "",
-        kind: "github-asset",
-        name: `duckdb ${arch}`,
-        url: `https://api.github.com/repos/duckdb/duckdb/releases/tags/v${download.version}`,
       });
     }
   }

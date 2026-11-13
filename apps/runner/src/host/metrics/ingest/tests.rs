@@ -474,7 +474,7 @@ async fn control_telemetry_is_keyed_on_the_reserved_slug_without_an_app_row() {
 #[tokio::test]
 async fn an_upgrade_resumes_at_the_stored_watermark_and_ingests_once() {
     let (pool, dir) = test_pool("upgrade").await;
-    // State the previous (DuckDB) install left behind.
+    // State the previous pipeline's install left behind.
     db::set_metric_watermarks(&pool, &[("blog".to_string(), H + HOUR_US)])
         .await
         .expect("seed the old watermark");

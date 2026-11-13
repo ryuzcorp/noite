@@ -17,7 +17,7 @@
  *   once — a split pin fails here instead of shipping mixed toolchains.
  * - The bundled store (rustfs) must match what platforms.mdx documents and
  *   CI's rustfs service, tag and digest.
- * - Sidecar versions and checksums (esbuild, duckdb) live exactly once in
+ * - The esbuild sidecar version and checksum live exactly once in
  *   docker/install-sidecars.sh; the Dockerfile only invokes the script.
  * - The access log path the image sets (CADDY_ACCESS_LOG) is the runner's own
  *   default, so the generator (which writes the Caddyfile `log` block from

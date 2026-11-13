@@ -1,6 +1,6 @@
-//! High-churn telemetry tables (spec T4.1): minute buckets, edge analytics,
-//! hourly span stats, the log ring, ingest watermarks, and replay requests.
-//! All rows live in the ATTACHed `metrics` database.
+//! High-churn telemetry tables (spec T4.1): hourly counters, the log ring,
+//! ingest watermarks, error rows and replay requests. All rows live in the
+//! ATTACHed `metrics` database.
 //!
 //! Every per-environment table keys on `(app_id, environment_id, …)` where
 //! `environment_id` is `''` for production (the brief's NULL/none is `''`:
@@ -29,29 +29,6 @@ pub async fn last_request_us(
     .await
 }
 
-/// Accumulate one minute-bucket of sampled CPU into the same row. CPU is a
-/// per-tick delta from `/proc`, so it adds; telemetry usage replaces.
-pub async fn add_app_metric_cpu(
-    pool: &SqlitePool,
-    app_id: &str,
-    environment_id: &str,
-    bucket_ts: &str,
-    cpu_ms: i64,
-) -> sqlx::Result<()> {
-    sqlx::query(
-        r#"INSERT INTO metrics.app_metric (app_id, environment_id, bucket_ts, requests, errors, latency_ms, cpu_ms)
-           VALUES (?, ?, ?, 0, 0, 0, ?)
-           ON CONFLICT (app_id, environment_id, bucket_ts) DO UPDATE SET cpu_ms = cpu_ms + excluded.cpu_ms"#,
-    )
-    .bind(app_id)
-    .bind(environment_id)
-    .bind(bucket_ts)
-    .bind(cpu_ms)
-    .execute(pool)
-    .await?;
-    Ok(())
-}
-
 /// One fleet's hourly counters at or after `since_hour`, oldest first: one
 /// indexed scan serves the whole dashboard window.
 pub async fn list_app_metrics(
@@ -74,14 +51,6 @@ pub async fn list_app_metrics(
     .bind(since_hour)
     .fetch_all(pool)
     .await
-}
-
-pub async fn prune_app_metrics(pool: &SqlitePool, older_than_ts: &str) -> sqlx::Result<u64> {
-    let res = sqlx::query("DELETE FROM metrics.app_metric WHERE bucket_ts < ?")
-        .bind(older_than_ts)
-        .execute(pool)
-        .await?;
-    Ok(res.rows_affected())
 }
 
 /// The counters one `app_hour` write carries. A whole-row replace (never an
@@ -325,20 +294,6 @@ pub async fn clear_telemetry_replay_if(
     Ok(res.rows_affected() == 1)
 }
 
-/// One parsed access-log line, all fields already classified. Written in one
-/// transaction with its optional trace backfill: a mid-line DB error applies
-/// nothing, so the tail can retry the line without double counting.
-pub struct AccessHit<'a> {
-    pub app_id: &'a str,
-    pub environment_id: &'a str,
-    pub bucket: &'a str,
-    pub browser: &'a str,
-    pub os: &'a str,
-    pub path: &'a str,
-    pub source: &'a str,
-    pub trace: Option<AccessTrace<'a>>,
-}
-
 /// The trace → request join carried by an access-log line. `backfill` is set
 /// when the error ingest stored an occurrence before the line landed.
 pub struct AccessTrace<'a> {
@@ -351,106 +306,35 @@ pub struct AccessTrace<'a> {
     pub backfill: bool,
 }
 
-/// Accumulate one access-log line into the device, path and referrer hour
-/// buckets, and backfill a pending error occurrence — inside the caller's
-/// transaction, which also carries the fleet's hourly counters and commits
-/// once. The tail persists its log offset only after that commit: a failure
-/// leaves the line unread instead of half-counted.
-pub async fn record_access_hit(
+/// Backfill a pending error occurrence with the request context its
+/// access-log line carried, inside the caller's transaction (which also
+/// carries the fleet's hourly counters and commits once). The tail persists
+/// its log offset only after that commit: a failure leaves the line unread
+/// instead of half-counted.
+pub async fn backfill_trace_request(
     tx: &mut sqlx::Transaction<'_, Sqlite>,
-    hit: &AccessHit<'_>,
+    app_id: &str,
+    environment_id: &str,
+    trace: &AccessTrace<'_>,
 ) -> sqlx::Result<()> {
-    sqlx::query(
-        r#"INSERT INTO metrics.app_device_stat (app_id, environment_id, bucket_ts, browser, os, requests)
-           VALUES (?, ?, ?, ?, ?, 1)
-           ON CONFLICT (app_id, environment_id, bucket_ts, browser, os) DO UPDATE SET
-             requests = requests + 1"#,
-    )
-    .bind(hit.app_id)
-    .bind(hit.environment_id)
-    .bind(hit.bucket)
-    .bind(hit.browser)
-    .bind(hit.os)
-    .execute(&mut **tx)
-    .await?;
-    sqlx::query(
-        r#"INSERT INTO metrics.app_path_stat (app_id, environment_id, bucket_ts, path, requests)
-           VALUES (?, ?, ?, ?, 1)
-           ON CONFLICT (app_id, environment_id, bucket_ts, path) DO UPDATE SET
-             requests = requests + 1"#,
-    )
-    .bind(hit.app_id)
-    .bind(hit.environment_id)
-    .bind(hit.bucket)
-    .bind(hit.path)
-    .execute(&mut **tx)
-    .await?;
-    sqlx::query(
-        r#"INSERT INTO metrics.app_ref_stat (app_id, environment_id, bucket_ts, source, requests)
-           VALUES (?, ?, ?, ?, 1)
-           ON CONFLICT (app_id, environment_id, bucket_ts, source) DO UPDATE SET
-             requests = requests + 1"#,
-    )
-    .bind(hit.app_id)
-    .bind(hit.environment_id)
-    .bind(hit.bucket)
-    .bind(hit.source)
-    .execute(&mut **tx)
-    .await?;
-    if let Some(trace) = &hit.trace {
-        if trace.backfill {
-            crate::db::errors::backfill_error_request(
-                tx,
-                hit.app_id,
-                hit.environment_id,
-                trace.trace_id,
-                &crate::db::ErrorRequest {
-                    method: trace.method,
-                    path: trace.path,
-                    http_status: trace.http_status,
-                    browser: trace.browser,
-                    os: trace.os,
-                },
-            )
-            .await?;
-        }
+    if !trace.backfill {
+        return Ok(());
     }
+    crate::db::errors::backfill_error_request(
+        tx,
+        app_id,
+        environment_id,
+        trace.trace_id,
+        &crate::db::ErrorRequest {
+            method: trace.method,
+            path: trace.path,
+            http_status: trace.http_status,
+            browser: trace.browser,
+            os: trace.os,
+        },
+    )
+    .await?;
     Ok(())
-}
-
-pub async fn prune_app_devices(pool: &SqlitePool, older_than_ts: &str) -> sqlx::Result<u64> {
-    let res = sqlx::query("DELETE FROM metrics.app_device_stat WHERE bucket_ts < ?")
-        .bind(older_than_ts)
-        .execute(pool)
-        .await?;
-    Ok(res.rows_affected())
-}
-
-pub async fn prune_app_paths(pool: &SqlitePool, older_than_ts: &str) -> sqlx::Result<u64> {
-    let res = sqlx::query("DELETE FROM metrics.app_path_stat WHERE bucket_ts < ?")
-        .bind(older_than_ts)
-        .execute(pool)
-        .await?;
-    Ok(res.rows_affected())
-}
-
-pub async fn prune_app_refs(pool: &SqlitePool, older_than_ts: &str) -> sqlx::Result<u64> {
-    let res = sqlx::query("DELETE FROM metrics.app_ref_stat WHERE bucket_ts < ?")
-        .bind(older_than_ts)
-        .execute(pool)
-        .await?;
-    Ok(res.rows_affected())
-}
-
-/// Drop span-stat rows past retention. Nothing writes the table since the
-/// hourly counters replaced the Metrics tab; the prune stays until the schema
-/// drops the table with DuckDB's telemetry path.
-pub async fn prune_span_stats(pool: &SqlitePool, older_than_hour: &str) -> sqlx::Result<u64> {
-    let res = sqlx::query("DELETE FROM metrics.app_span_stat WHERE bucket_hour < ?")
-        .bind(older_than_hour)
-        .execute(pool)
-        .await?;
-    Ok(res.rows_affected())
 }
 
 /// REPLACE the ingested OTel log rows of one `[from_us, to_us)` window in the
@@ -492,7 +376,7 @@ pub async fn replace_app_logs(
 }
 
 /// Ring contents in chronological order (oldest first), like the old
-/// DuckDB `recent_logs` return.
+/// `recent_logs` return.
 pub async fn list_app_logs(
     pool: &SqlitePool,
     app_id: &str,
@@ -547,9 +431,9 @@ pub async fn prune_app_logs(
     Ok(n)
 }
 
-/// Drop every telemetry row of one environment: metrics, analytics, spans,
-/// the log ring, error issues/events/hours, and its metrics version. Labels
-/// can be reused after a delete, so nothing may survive for a successor.
+/// Drop every telemetry row of one environment: the hourly counters, the log
+/// ring, error issues/events/hours, and its metrics version. Labels can be
+/// reused after a delete, so nothing may survive for a successor.
 pub async fn delete_environment_telemetry(
     pool: &SqlitePool,
     app_id: &str,
@@ -557,13 +441,8 @@ pub async fn delete_environment_telemetry(
 ) -> sqlx::Result<u64> {
     let mut n = 0;
     for table in [
-        "metrics.app_metric",
         "metrics.app_hour",
         "metrics.app_hour_lat",
-        "metrics.app_device_stat",
-        "metrics.app_path_stat",
-        "metrics.app_ref_stat",
-        "metrics.app_span_stat",
         "metrics.app_log",
         "metrics.app_error_issue",
         "metrics.app_error_event",
