@@ -27,11 +27,15 @@ Ground truth for working on Noite. Read this before touching code — the rules 
 
 ## Merging
 
-- Open PRs as drafts; mark ready only when the report is written. Merge only on green: `main` requires the `ci-ok` and `security-gate` checks, and merges through a squash merge queue.
-- The fast suite runs on PRs that touch runtime code (`@fast` on single, `@isolation` on multi). The `e2e` label upgrades the next run to the full `release` suite — labels never start CI by themselves, so push (an empty commit if the branch is otherwise done), close/reopen, or dispatch after labeling.
+- **One push per review round.** Each push restarts CI (~5 min) and, when it changes the PR's own diff, strips `security-reviewed`; so collect every finding first (CodeRabbit threads, security review, CI), fix them all, push once. CodeRabbit reviews a PR once, when it is marked ready — it does not re-review on later pushes; ask for a second pass only after a substantial change, with `@coderabbitai review`.
+- **Order:** CI green and every CodeRabbit thread answered or resolved → independent security review and `security-reviewed` (when the gate asks for it) → merge queue. Never start the security review against a red or still-moving PR.
+- **CodeRabbit is advisory.** Do not wait for it: the free tier regularly stops at "Review limit reached". If CI is green and the security review is in, merge; a valid finding that lands afterward is a roadmap candidate — unless it is release-blocking: a security, isolation or data-integrity defect is fixed before it ships (if the PR already merged, as a stop-the-line follow-up in the same loop).
+- Open PRs as drafts; mark ready only when the report is written — the ready toggle is the PR's one CodeRabbit review. Merge only on green: `main` requires the `ci-ok` and `security-gate` checks, and merges through a squash merge queue.
+- **~800 changed lines per PR**, excluding lockfiles, generated bindings (`apps/noite/src/lib/runner-types/`) and `changelog.d/` fragments. A bigger item is split: dependent layers go up as a GitHub stack (`gh stack init|add|submit|sync|rebase|merge`; every PR in a stack is still evaluated against `main`), independent items as parallel PRs.
+- Local e2e is for reproducing a failure, not for pre-flighting a PR: on a runtime-code change PR CI runs the fast suite on both lanes (`@fast` on single, `@isolation` on multi) in ~5 min, and the merge queue follows with the full `release` suite on both lanes before anything lands. The `e2e` label upgrades the next PR run to that `release` suite — labels never start CI by themselves, so push (an empty commit if the branch is otherwise done), close/reopen, or dispatch after labeling. Don't run the full lanes locally before opening a PR; bring the stack up only to reproduce a failure, narrowed (`E2E_SPECS="e2e/prs.spec.ts" make e2e`). The one local run CI cannot replace is a release-image smoke test (`TAG=<short-sha> make e2e`), which belongs to cutting a release.
 - If a push starts no `pull_request` run at all within two minutes, that is GitHub's (see the note in `ci.yml`; nothing in this repo filters or skips it): close/reopen the PR, or `gh workflow run ci.yml --ref <branch> -f suite=release`.
-- The merge queue runs `release` on both lanes against the merged result; `merge_group` runs never skip by paths and never cancel each other or a PR's run.
-- `.github/security-paths.yml` lists change-sensitive paths (auth, isolation, secrets, the image, the gates themselves). Touching one fails `security-gate` until a reviewer — never the change's author — reads the diff and adds the `security-reviewed` label. New commits strip it and fail again.
+- In the queue, `merge_group` runs never skip by paths and never cancel each other or a PR's run.
+- `.github/security-paths.yml` lists change-sensitive paths (auth, isolation, secrets, the image, the gates themselves). Touching one fails `security-gate` until a reviewer — never the change's author — reads the diff and adds the `security-reviewed` label. The label survives a pure rebase, i.e. a push that leaves the PR's own diff unchanged (a stack retarget included); any commit that changes that diff strips it and fails again.
 
 ## Map and architecture in one breath
 
@@ -65,7 +69,7 @@ SPEC.md is the design record; this file keeps only the operational rules and the
 
 Operational do-nots and gotchas not carried by SPEC:
 
-- **Run `make e2e-isolation`** after touching `host/exec.rs`, `deploy.rs`, `netisolation.rs`, `isolation.rs`, `db/alloc.rs` (uid allocation) or the Dockerfile.
+- **Isolation coverage comes from CI**, not a pre-PR local run: touching `host/exec.rs`, `deploy.rs`, `netisolation.rs`, `isolation.rs`, `db/alloc.rs` (uid allocation) or the Dockerfile puts the PR's multi lane on the `@isolation` specs (hostile, fleet-oom, domains, deploy), and the merge queue runs the full `release` suite on both lanes before anything lands. A local `make e2e-isolation` runs that whole suite, so keep it for reproducing a failure — narrowed, e.g. `E2E_SPECS=<spec> make e2e-isolation`.
 - **Testing jup by hand** inside this monorepo walks up to `apps/noite/package.json` (pinned to bun) and refuses other managers: set `JUP_ENABLE_STRICT=0`.
 - **Verify a new build shape** with `celld deploy <dir> --bucket s3://x --dry-run` in the image (it lists every refused key) before trusting it; `make e2e` covers Vite through `vite.spec.ts`.
 - **Instance telemetry:** never add or rename a field in the `instance_heartbeat` payload without updating [the telemetry docs page](apps/website/docs/self-hosting/telemetry.mdx) in the same change, and never let a test send a real event to PostHog — inject the sender and assert on the built payload.
