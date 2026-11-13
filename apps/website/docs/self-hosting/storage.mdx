@@ -84,6 +84,12 @@ The loss window on an ungraceful crash is about 22 s of API mutations, as long a
 
 Tenant fleets run `CELLD_OTEL=1` with celld's bucket sink: Parquet under `telemetry/traces/` and `telemetry/logs/` in the fleet bucket, no collector service. The flush interval comes from `RUNNER_OTEL_FLUSH_MS` (30 s by default) and retention from `RUNNER_TELEMETRY_RETENTION_DAYS` (30 days), which also bounds the runner's `app_metric` prune.
 
+### Hourly counters
+
+Next to the Parquet ingest, the runner keeps one DuckDB-free row per fleet per hour in `metrics.sqlite`: `app_hour` holds the request count, the 5xx error count, p50 and p95 latency, peak and mean memory, CPU time and the newest request stamp for `(app, environment, hour)`, and `app_hour_lat` holds the fixed log-scale latency histogram those percentiles are derived from (one row per bucket hit, so an hour is bounded by a couple of dozen rows instead of kept samples).
+
+Requests, errors and latency come from the Caddy access log — one JSON line per request, already tailed for the error index — so they need no Parquet read and no DuckDB run. Only lines a fleet's own `reverse_proxy` answered count: the edge logs the proxy's upstream next to the route's fleet upstream, so the `:80` redirect, a gate refusal, an edge rate-limit answer and the edge's starting page never look like traffic (and never keep an idle app awake). Memory is the fleet's cgroup charge sampled every reconcile tick (peak and mean over the hour, the `_control` fleet included), and CPU is the same `/proc` delta the minute buckets carry. The tail advances its offset only after a line's rows commit, and every write replaces the fleet's open hour from memory rather than incrementing it, so a retried line is counted exactly once; a restart mid-hour re-seeds from the stored row and continues from there. Retention is the same `RUNNER_TELEMETRY_RETENTION_DAYS` window.
+
 ### The control fleet's own telemetry
 
 The control UI is a celld fleet too, and it runs the same telemetry environment as a tenant (`RUNNER_OTEL_FLUSH_MS`, `RUNNER_TELEMETRY_RETENTION_DAYS`) with its own bucket prefix, so celld writes under `s3://<bucket>/control/telemetry/{traces,logs}/<node>/<yyyy>/<mm>/<dd>/<hh>/`. It is ingested, compacted, pruned and error-grouped exactly like a tenant fleet, keyed on the reserved `_control` slug, and served on the same runner routes (`/v1/apps/_control/metrics|spans|logs|errors`, the RPC equivalents and the UI's SSE streams).

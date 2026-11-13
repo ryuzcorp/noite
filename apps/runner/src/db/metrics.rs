@@ -6,7 +6,7 @@
 //! `environment_id` is `''` for production (the brief's NULL/none is `''`:
 //! SQLite allows duplicate NULLs in PKs, so NULL cannot be the none value).
 
-use sqlx::SqlitePool;
+use sqlx::{Sqlite, SqliteConnection, SqlitePool};
 
 use crate::models::{
     new_id, now_iso, AppDeviceStat, AppMetric, AppPathStat, AppRefStat, AppSpanStat,
@@ -109,6 +109,143 @@ pub async fn prune_app_metrics(pool: &SqlitePool, older_than_ts: &str) -> sqlx::
         .execute(pool)
         .await?;
     Ok(res.rows_affected())
+}
+
+/// The counters one `app_hour` write carries. A whole-row replace (never an
+/// increment): the caller owns the hour's state and writes it back every time
+/// it changes, so a retried line cannot double count.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, sqlx::FromRow)]
+pub struct AppHourValues {
+    pub requests: i64,
+    pub errors: i64,
+    pub p50_ms: i64,
+    pub p95_ms: i64,
+    pub mem_max_bytes: i64,
+    /// The hour's cgroup samples as an exact (sum, count) pair. The mean is
+    /// derived where it is read (`sum / count`): a stored average cannot be
+    /// restored exactly, and every write here is a restore-then-rewrite.
+    pub mem_sum_bytes: i64,
+    pub mem_samples: i64,
+    pub last_request_us: i64,
+    pub cpu_ms: i64,
+}
+
+/// Column list of one `app_hour` row, in `AppHourValues` order.
+const APP_HOUR_COLS: &str = "requests, errors, p50_ms, p95_ms, mem_max_bytes, \
+     mem_sum_bytes, mem_samples, last_request_us, cpu_ms";
+
+/// REPLACE one hour of counters. The replacement is the whole row from the
+/// caller's accumulator, so writing the same state twice is exact.
+pub async fn replace_app_hour(
+    conn: &mut SqliteConnection,
+    app_id: &str,
+    environment_id: &str,
+    bucket_hour: &str,
+    v: &AppHourValues,
+) -> sqlx::Result<()> {
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "INSERT INTO metrics.app_hour (app_id, environment_id, bucket_hour, {APP_HOUR_COLS}) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+         ON CONFLICT (app_id, environment_id, bucket_hour) DO UPDATE SET \
+           requests = excluded.requests, errors = excluded.errors, \
+           p50_ms = excluded.p50_ms, p95_ms = excluded.p95_ms, \
+           mem_max_bytes = excluded.mem_max_bytes, \
+           mem_sum_bytes = excluded.mem_sum_bytes, mem_samples = excluded.mem_samples, \
+           last_request_us = excluded.last_request_us, cpu_ms = excluded.cpu_ms"
+    )))
+    .bind(app_id)
+    .bind(environment_id)
+    .bind(bucket_hour)
+    .bind(v.requests)
+    .bind(v.errors)
+    .bind(v.p50_ms)
+    .bind(v.p95_ms)
+    .bind(v.mem_max_bytes)
+    .bind(v.mem_sum_bytes)
+    .bind(v.mem_samples)
+    .bind(v.last_request_us)
+    .bind(v.cpu_ms)
+    .execute(&mut *conn)
+    .await?;
+    Ok(())
+}
+
+/// REPLACE one latency histogram bucket's count (same replace rule as the row
+/// it feeds).
+pub async fn replace_app_hour_lat(
+    conn: &mut SqliteConnection,
+    app_id: &str,
+    environment_id: &str,
+    bucket_hour: &str,
+    bucket: i64,
+    n: i64,
+) -> sqlx::Result<()> {
+    sqlx::query(
+        r#"INSERT INTO metrics.app_hour_lat (app_id, environment_id, bucket_hour, bucket, n)
+           VALUES (?, ?, ?, ?, ?)
+           ON CONFLICT (app_id, environment_id, bucket_hour, bucket) DO UPDATE SET n = excluded.n"#,
+    )
+    .bind(app_id)
+    .bind(environment_id)
+    .bind(bucket_hour)
+    .bind(bucket)
+    .bind(n)
+    .execute(&mut *conn)
+    .await?;
+    Ok(())
+}
+
+/// The stored counters of one hour, for re-seeding an accumulator after a
+/// restart or an eviction.
+pub async fn get_app_hour(
+    conn: &mut SqliteConnection,
+    app_id: &str,
+    environment_id: &str,
+    bucket_hour: &str,
+) -> sqlx::Result<Option<AppHourValues>> {
+    sqlx::query_as::<_, AppHourValues>(sqlx::AssertSqlSafe(format!(
+        "SELECT {APP_HOUR_COLS} FROM metrics.app_hour \
+         WHERE app_id = ? AND environment_id = ? AND bucket_hour = ?"
+    )))
+    .bind(app_id)
+    .bind(environment_id)
+    .bind(bucket_hour)
+    .fetch_optional(&mut *conn)
+    .await
+}
+
+/// The stored histogram of one hour, as `(bucket, n)`.
+pub async fn app_hour_lat(
+    conn: &mut SqliteConnection,
+    app_id: &str,
+    environment_id: &str,
+    bucket_hour: &str,
+) -> sqlx::Result<Vec<(i64, i64)>> {
+    sqlx::query_as(
+        "SELECT bucket, n FROM metrics.app_hour_lat \
+         WHERE app_id = ? AND environment_id = ? AND bucket_hour = ?",
+    )
+    .bind(app_id)
+    .bind(environment_id)
+    .bind(bucket_hour)
+    .fetch_all(&mut *conn)
+    .await
+}
+
+/// Drop hourly counters past retention: the rows and every histogram bucket
+/// that fed them.
+pub async fn prune_app_hours(pool: &SqlitePool, older_than_hour: &str) -> sqlx::Result<u64> {
+    let mut n = sqlx::query("DELETE FROM metrics.app_hour WHERE bucket_hour < ?")
+        .bind(older_than_hour)
+        .execute(pool)
+        .await?
+        .rows_affected();
+    n += sqlx::query("DELETE FROM metrics.app_hour_lat WHERE bucket_hour < ?")
+        .bind(older_than_hour)
+        .execute(pool)
+        .await?
+        .rows_affected();
+    Ok(n)
 }
 
 /// Telemetry watermark persistence: slug -> the START of the last hour-chunk
@@ -242,11 +379,14 @@ pub struct AccessTrace<'a> {
 }
 
 /// Accumulate one access-log line into the device, path and referrer hour
-/// buckets, and backfill a pending error occurrence, atomically. The caller
-/// persists its log offset only after this returns: a failure leaves the
-/// line unread instead of half-counted.
-pub async fn record_access_hit(pool: &SqlitePool, hit: &AccessHit<'_>) -> sqlx::Result<()> {
-    let mut tx = pool.begin().await?;
+/// buckets, and backfill a pending error occurrence — inside the caller's
+/// transaction, which also carries the fleet's hourly counters and commits
+/// once. The tail persists its log offset only after that commit: a failure
+/// leaves the line unread instead of half-counted.
+pub async fn record_access_hit(
+    tx: &mut sqlx::Transaction<'_, Sqlite>,
+    hit: &AccessHit<'_>,
+) -> sqlx::Result<()> {
     sqlx::query(
         r#"INSERT INTO metrics.app_device_stat (app_id, environment_id, bucket_ts, browser, os, requests)
            VALUES (?, ?, ?, ?, ?, 1)
@@ -258,7 +398,7 @@ pub async fn record_access_hit(pool: &SqlitePool, hit: &AccessHit<'_>) -> sqlx::
     .bind(hit.bucket)
     .bind(hit.browser)
     .bind(hit.os)
-    .execute(&mut *tx)
+    .execute(&mut **tx)
     .await?;
     sqlx::query(
         r#"INSERT INTO metrics.app_path_stat (app_id, environment_id, bucket_ts, path, requests)
@@ -270,7 +410,7 @@ pub async fn record_access_hit(pool: &SqlitePool, hit: &AccessHit<'_>) -> sqlx::
     .bind(hit.environment_id)
     .bind(hit.bucket)
     .bind(hit.path)
-    .execute(&mut *tx)
+    .execute(&mut **tx)
     .await?;
     sqlx::query(
         r#"INSERT INTO metrics.app_ref_stat (app_id, environment_id, bucket_ts, source, requests)
@@ -282,12 +422,12 @@ pub async fn record_access_hit(pool: &SqlitePool, hit: &AccessHit<'_>) -> sqlx::
     .bind(hit.environment_id)
     .bind(hit.bucket)
     .bind(hit.source)
-    .execute(&mut *tx)
+    .execute(&mut **tx)
     .await?;
     if let Some(trace) = &hit.trace {
         if trace.backfill {
             crate::db::errors::backfill_error_request(
-                &mut tx,
+                tx,
                 hit.app_id,
                 hit.environment_id,
                 trace.trace_id,
@@ -302,7 +442,6 @@ pub async fn record_access_hit(pool: &SqlitePool, hit: &AccessHit<'_>) -> sqlx::
             .await?;
         }
     }
-    tx.commit().await?;
     Ok(())
 }
 
@@ -560,6 +699,8 @@ pub async fn delete_environment_telemetry(
     let mut n = 0;
     for table in [
         "metrics.app_metric",
+        "metrics.app_hour",
+        "metrics.app_hour_lat",
         "metrics.app_device_stat",
         "metrics.app_path_stat",
         "metrics.app_ref_stat",

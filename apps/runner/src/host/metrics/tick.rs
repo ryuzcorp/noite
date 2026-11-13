@@ -13,6 +13,7 @@ use sqlx::SqlitePool;
 use crate::config::Config;
 use crate::db;
 use crate::host::accesslog;
+use crate::host::cgroups;
 use crate::host::supervisor::{self, ProcMap};
 use crate::models::{App, AppStatus, Environment};
 
@@ -20,6 +21,7 @@ use super::compact::{
     compact_fleet, hour_dir, mark_compacted, mark_failed, prune_marks, uncompacted_hours,
 };
 use super::cpu::{otel_flush_ms, sample_cpu};
+use super::hourly::{self, hour_now, hour_of, Key};
 use super::ingest::{collect_chunk_results, commit_chunk, DuckdbPass, FleetKeys};
 use super::plan::{
     agg_lag_us, back_off_ingest, floor_hour_us, ingest_after, plan_chunks, MAX_CHUNKS_PER_PASS,
@@ -41,6 +43,7 @@ pub async fn tick(
     // advancing log offset, and could clear a pending replay unrewound.
     let envs = db::list_all_environments(pool).await?;
     let (slug_id, slug_env) = telemetry_fleets(&apps, &envs);
+    let domain_id = custom_domains(pool, &slug_id).await;
     // Each fleet's own deploy sha (an environment's errors symbolicate
     // against the environment's deploy), keyed by fleet key like the bounds.
     let mut fleet_sha: HashMap<String, String> = HashMap::new();
@@ -76,11 +79,12 @@ pub async fn tick(
     // The tail runs before the ingest so a line already on disk joins its
     // span in the same tick; a line that lands later backfills the stored
     // occurrence when the next tail sees it (host/errors.rs `RequestIndex`).
-    accesslog_step(pool, cfg, &keys.ids, &keys.envs, state).await;
+    accesslog_step(pool, cfg, &keys.ids, &keys.envs, &domain_id, state).await;
     let (mut touched, new_logs) =
         ingest_step(pool, cfg, state, &keys, &live_slugs, control_pid).await;
     compact_step(pool, cfg, state, &keys.ids).await;
     persist_step(pool, &cpu, &mut touched, new_logs, log_tx).await?;
+    hourly_step(pool, &keys, &cpu).await;
     prune_step(pool, cfg, state).await;
     Ok(())
 }
@@ -124,6 +128,31 @@ fn telemetry_fleets(
         slug_env.insert(key, env.id.clone());
     }
     (slug_id, slug_env)
+}
+
+/// Verified custom `hostname → app_id` for the fleets with telemetry. The edge
+/// serves a tenant's own domain as readily as its platform subdomain, so those
+/// requests must land on the same app rows: without this, an app on its custom
+/// domain would look idle (and the counters would report no traffic). Pending
+/// claims never resolve, like the edge's own route table. A failed read yields
+/// no custom attribution rather than failing the tick: platform hosts still
+/// count.
+async fn custom_domains(
+    pool: &SqlitePool,
+    slug_id: &HashMap<String, String>,
+) -> HashMap<String, String> {
+    let fleets: HashSet<&str> = slug_id.values().map(String::as_str).collect();
+    match db::list_app_domains(pool).await {
+        Ok(domains) => domains
+            .into_iter()
+            .filter(|domain| domain.is_verified() && fleets.contains(domain.app_id.as_str()))
+            .map(|domain| (domain.hostname.to_lowercase(), domain.app_id))
+            .collect(),
+        Err(e) => {
+            tracing::warn!(error = %e, "custom domain read");
+            HashMap::new()
+        }
+    }
 }
 
 /// Step 1 — CPU deltas since the last sample (100 ticks/sec → *10 = ms). CPU is
@@ -341,10 +370,49 @@ async fn accesslog_step(
     cfg: &Config,
     slug_id: &HashMap<String, String>,
     slug_env: &HashMap<String, String>,
+    domain_id: &HashMap<String, String>,
     state: &mut MetricsState,
 ) {
-    if let Err(e) = accesslog::tick(pool, cfg, slug_id, slug_env, &mut state.requests).await {
+    if let Err(e) =
+        accesslog::tick(pool, cfg, slug_id, slug_env, domain_id, &mut state.requests).await
+    {
         tracing::warn!(error = %e, "access_log");
+    }
+}
+
+/// Step 3c — the hourly counters' sampler feeds: the cgroup charge (peak and
+/// mean over the hour) and the CPU delta this pass already measured, folded
+/// into each fleet's open hour. Requests, errors and latency come from the
+/// access-log tail instead. Never fails the tick: a fleet without a cgroup leaf
+/// (or a stopped one) simply has no memory sample.
+async fn hourly_step(
+    pool: &SqlitePool,
+    keys: &FleetKeys,
+    cpu: &HashMap<(String, String, String), i64>,
+) {
+    for ((id, env, bucket), ms) in cpu {
+        let key = Key {
+            app_id: id,
+            environment_id: env,
+            bucket_hour: &hour_of(bucket),
+        };
+        if let Err(e) = hourly::record_cpu(pool, key, *ms).await {
+            tracing::warn!(error = %e, "hourly cpu");
+        }
+    }
+    let hour = hour_now();
+    for (fleet, id) in &keys.ids {
+        let Some(bytes) = cgroups::fleet_usage_bytes(fleet) else {
+            continue;
+        };
+        let key = Key {
+            app_id: id,
+            environment_id: keys.envs.get(fleet).map(String::as_str).unwrap_or_default(),
+            bucket_hour: &hour,
+        };
+        if let Err(e) = hourly::record_memory(pool, key, bytes).await {
+            tracing::warn!(error = %e, "hourly memory");
+        }
     }
 }
 
@@ -453,6 +521,11 @@ async fn prune_step(pool: &SqlitePool, cfg: &Config, state: &mut MetricsState) {
     let hour_cutoff = (Utc::now() - chrono::Duration::days(cfg.telemetry_retention_days))
         .format("%Y-%m-%dT%H:00:00Z")
         .to_string();
+    if let Ok(n) = db::prune_app_hours(pool, &hour_cutoff).await {
+        if n > 0 {
+            tracing::info!(pruned = n, "pruned old hourly counters");
+        }
+    }
     if let Ok(n) = db::prune_span_stats(pool, &hour_cutoff).await {
         if n > 0 {
             tracing::info!(pruned = n, "pruned old span stats");
