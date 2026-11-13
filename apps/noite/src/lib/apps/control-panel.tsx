@@ -110,23 +110,27 @@ const ControlMetricsTab = () => {
   );
 };
 
-/** Shaped like a tenant app's header: avatar, name, then one line of facts. */
+/** Shaped like a tenant app's header: avatar, name, then one line of facts.
+ * The facts are flex chunks separated by the row's gap, never by literal `·`
+ * text: a dot between two spans belongs to neither, so at 390 px it wraps
+ * onto the next line as a leading (or, at the end of the previous line,
+ * dangling) separator. Each fact may wrap inside itself instead. */
 const Header = ({ controlFleet }: { controlFleet: boolean }) => (
   <header class="flex min-w-0 items-center gap-3">
     <Avatar class="shrink-0" label={CONTROL_APP_NAME} size="lg" />
     <div class="min-w-0">
       <h1 class="m-0 truncate text-xl font-semibold">{CONTROL_APP_NAME}</h1>
-      <p class="m-0 flex flex-wrap items-center gap-x-2 text-sm">
+      <p class="m-0 flex flex-wrap items-center gap-x-3 gap-y-1 text-sm">
         <span class="badge badge-sm">{CONTROL_APP_SUBTITLE}</span>
-        <span class="opacity-70">
+        <span class="whitespace-nowrap opacity-70">
           build <span class="font-mono">{CONTROL_BUILD}</span>
         </span>
         {/* The control plane's numbers include this dashboard's own traffic:
             every page load polls and its logs/errors streams stay open. Only
             shown where the telemetry tabs exist. */}
         {controlFleet ? (
-          <span class="opacity-70">
-            · telemetry includes this dashboard's own polling and streams
+          <span class="min-w-0 opacity-70">
+            telemetry includes this dashboard's own polling and streams
           </span>
         ) : null}
       </p>
