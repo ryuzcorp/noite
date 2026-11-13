@@ -80,8 +80,17 @@ pub(super) fn hour_dir(us: i64) -> String {
 /// exists, so a failed copy can never lose spans. The root comes from
 /// [`telemetry_prefix`], so the control fleet's `control/telemetry/...` is
 /// compacted exactly like a tenant fleet's.
-pub(super) async fn compact_fleet(cfg: &Config, slug: &str, hour: &str) -> anyhow::Result<usize> {
-    let mut compacted = 0_usize;
+///
+/// An hour directory whose fold would exceed the reader's object cap is left
+/// untouched and reported as kept raw: the sources stay readable (each is
+/// below the cap), so the reader still shows the hour, and the caller must not
+/// mark it compacted.
+pub(super) async fn compact_fleet(
+    cfg: &Config,
+    slug: &str,
+    hour: &str,
+) -> anyhow::Result<CompactionReport> {
+    let mut report = CompactionReport::default();
     let prefix = telemetry_prefix(slug);
     for kind in ["traces", "logs"] {
         let root = format!("{prefix}/telemetry/{kind}/");
@@ -118,12 +127,16 @@ pub(super) async fn compact_fleet(cfg: &Config, slug: &str, hour: &str) -> anyho
             let Some(inputs) = compaction_inputs(&keys, &target) else {
                 continue;
             };
-            copy_union(cfg, &dir, &target, &inputs).await?;
-            s3::s3_rm_dir_except(cfg, &cfg.s3_bucket, &dir, "compacted.parquet").await?;
-            compacted += 1;
+            match copy_union(cfg, &dir, &target, &inputs).await? {
+                FoldOutcome::Folded => {
+                    s3::s3_rm_dir_except(cfg, &cfg.s3_bucket, &dir, "compacted.parquet").await?;
+                    report.folded += 1;
+                }
+                FoldOutcome::KeptRaw => report.kept_raw += 1,
+            }
         }
     }
-    Ok(compacted)
+    Ok(report)
 }
 
 /// Rows buffered before one row group is written. A batch this size is a few
@@ -131,6 +144,68 @@ pub(super) async fn compact_fleet(cfg: &Config, slug: &str, hour: &str) -> anyho
 /// in memory, and the compacted file still has few row groups for the ingest
 /// to read.
 const FOLD_BATCH_ROWS: usize = 8192;
+
+/// Largest input set one fresh fold accepts. The output is a re-compression of
+/// the same rows, so it lands within a few percent of the input bytes; keeping
+/// the inputs well below the reader's [`parquet_io::MAX_OBJECT_BYTES`] means
+/// the published file stays readable. At the 30 s flush default an hour is
+/// ~120 objects of a few MB, so this bound is only reached by a firehose node —
+/// exactly the hour the old DuckDB compaction could fold into a file the new
+/// reader would refuse.
+const MAX_FOLD_INPUT_BYTES: u64 = 160 * 1024 * 1024;
+
+/// Input budget for a refold, which also carries the hour's existing
+/// compacted file. That file was published below the reader's cap, and a late
+/// flush must still fold into it — otherwise the canonical rule (a directory
+/// with `compacted.parquet` is read from that file alone) would hide the late
+/// rows. The output check below still guarantees the promoted file is
+/// readable.
+const MAX_REFOLD_INPUT_BYTES: u64 = parquet_io::MAX_OBJECT_BYTES as u64;
+
+/// Why one hour directory cannot be folded into a file the reader accepts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FoldRefusal {
+    /// The inputs alone are past [`MAX_FOLD_INPUT_BYTES`].
+    InputsTooLarge(u64),
+    /// The folded file is past [`parquet_io::MAX_OBJECT_BYTES`].
+    OutputTooLarge(u64),
+}
+
+/// Whether a fold must be skipped. `output_bytes` is `None` before the fold
+/// runs (the input check), `Some` after it. A refusal means the sources stay
+/// in place and the hour is recorded as kept raw — never as failed, so it
+/// cannot wedge the hours behind it.
+fn fold_refusal(
+    input_bytes: u64,
+    output_bytes: Option<u64>,
+    input_budget: u64,
+) -> Option<FoldRefusal> {
+    if input_bytes > input_budget {
+        return Some(FoldRefusal::InputsTooLarge(input_bytes));
+    }
+    output_bytes
+        .filter(|bytes| *bytes > parquet_io::MAX_OBJECT_BYTES as u64)
+        .map(FoldRefusal::OutputTooLarge)
+}
+
+/// What one hour directory's fold did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FoldOutcome {
+    /// The compacted object was written and proved with a HEAD.
+    Folded,
+    /// The fold was skipped (see [`FoldRefusal`]); every source is untouched.
+    KeptRaw,
+}
+
+/// What one fleet hour's compaction pass did.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(super) struct CompactionReport {
+    /// Node directories folded into a compacted file.
+    pub(super) folded: usize,
+    /// Node directories left raw because folding them would produce an object
+    /// the reader refuses.
+    pub(super) kept_raw: usize,
+}
 
 /// Fold the union of `inputs` into `target`, proved with a HEAD before the
 /// caller deletes anything. The old implementation was a DuckDB
@@ -153,8 +228,13 @@ async fn copy_union(
     dir: &str,
     target: &str,
     inputs: &[String],
-) -> anyhow::Result<()> {
+) -> anyhow::Result<FoldOutcome> {
     let refold = inputs.iter().any(|k| k == target);
+    let input_budget = if refold {
+        MAX_REFOLD_INPUT_BYTES
+    } else {
+        MAX_FOLD_INPUT_BYTES
+    };
     let dest = if refold {
         format!("{dir}compacted.staging-{}", uuid::Uuid::new_v4())
     } else {
@@ -163,7 +243,22 @@ async fn copy_union(
     let work = crate::host::exec::work_root(cfg).join("telemetry-compact");
     tokio::fs::create_dir_all(&work).await?;
     let id = uuid::Uuid::new_v4();
-    let sources = spool_inputs(cfg, inputs, &work, id).await?;
+    let (sources, input_bytes) = match spool_inputs(cfg, inputs, &work, id, input_budget).await? {
+        Spool::Ready {
+            paths,
+            bytes: input_bytes,
+        } => (paths, input_bytes),
+        Spool::TooLarge(bytes) => {
+            tracing::warn!(
+                dir = %dir,
+                inputs = inputs.len(),
+                bytes,
+                cap = input_budget,
+                "telemetry hour left raw: its inputs exceed the fold budget"
+            );
+            return Ok(FoldOutcome::KeptRaw);
+        }
+    };
     let out = work.join(format!("{id}-fold.parquet"));
     let folded = {
         let sources = sources.clone();
@@ -176,6 +271,26 @@ async fn copy_union(
         let _ = tokio::fs::remove_file(path).await;
     }
     folded?;
+    // The reader refuses an object over `MAX_OBJECT_BYTES`; never publish one.
+    // The check is on the real file, not the input sum: the union's nullable
+    // levels and row-group layout can move the size either way.
+    let output_bytes = match tokio::fs::metadata(&out).await {
+        Ok(meta) => meta.len(),
+        Err(e) => {
+            let _ = tokio::fs::remove_file(&out).await;
+            return Err(anyhow::anyhow!("folded object {}: {e}", out.display()));
+        }
+    };
+    if let Some(refusal) = fold_refusal(input_bytes, Some(output_bytes), input_budget) {
+        let _ = tokio::fs::remove_file(&out).await;
+        tracing::warn!(
+            dir = %dir,
+            bytes = output_bytes,
+            refusal = ?refusal,
+            "telemetry hour left raw: the folded object would not be readable"
+        );
+        return Ok(FoldOutcome::KeptRaw);
+    }
     let uploaded = s3::s3_cp_upload(cfg, &out, &dest).await;
     let _ = tokio::fs::remove_file(&out).await;
     uploaded?;
@@ -192,20 +307,35 @@ async fn copy_union(
             anyhow::bail!("compacted object missing after promote: {target}");
         }
     }
-    Ok(())
+    Ok(FoldOutcome::Folded)
+}
+
+/// The local copies one fold reads.
+enum Spool {
+    Ready {
+        paths: Vec<PathBuf>,
+        bytes: u64,
+    },
+    /// The inputs are past [`MAX_FOLD_INPUT_BYTES`] (or one is past the
+    /// reader's cap): folding cannot produce a readable object. Every spooled
+    /// copy is already removed.
+    TooLarge(u64),
 }
 
 /// Download every input to a local file so each object is fetched once and the
 /// output schema is known before the first row is written. A partial spool is
 /// cleaned up on error; a missing object fails the fold (the hour is retried,
-/// never marked compacted with data skipped).
+/// never marked compacted with data skipped). An oversized input is not an
+/// error: the hour is kept raw so its sources stay readable.
 async fn spool_inputs(
     cfg: &Config,
     inputs: &[String],
     work: &Path,
     id: uuid::Uuid,
-) -> anyhow::Result<Vec<PathBuf>> {
+    input_budget: u64,
+) -> anyhow::Result<Spool> {
     let mut paths = Vec::with_capacity(inputs.len());
+    let mut bytes = 0_u64;
     for (index, key) in inputs.iter().enumerate() {
         let path = work.join(format!("{id}-{index}.parquet"));
         let body = match parquet_io::fetch(cfg, key).await? {
@@ -220,12 +350,16 @@ async fn spool_inputs(
                 for done in &paths {
                     let _ = tokio::fs::remove_file(done).await;
                 }
-                anyhow::bail!(
-                    "compaction input {key} is {size} bytes, over the {}-byte cap",
-                    parquet_io::MAX_OBJECT_BYTES
+                tracing::warn!(
+                    file = %key,
+                    bytes = size,
+                    cap = parquet_io::MAX_OBJECT_BYTES,
+                    "compaction input over the decode cap; the hour stays raw"
                 );
+                return Ok(Spool::TooLarge(size));
             }
         };
+        bytes += body.len() as u64;
         if let Err(e) = tokio::fs::write(&path, &body).await {
             for done in paths.iter().chain(std::iter::once(&path)) {
                 let _ = tokio::fs::remove_file(done).await;
@@ -233,8 +367,14 @@ async fn spool_inputs(
             return Err(e).map_err(|e| anyhow::anyhow!("spool {key}: {e}"));
         }
         paths.push(path);
+        if fold_refusal(bytes, None, input_budget).is_some() {
+            for done in &paths {
+                let _ = tokio::fs::remove_file(done).await;
+            }
+            return Ok(Spool::TooLarge(bytes));
+        }
     }
-    Ok(paths)
+    Ok(Spool::Ready { paths, bytes })
 }
 
 /// One output column: its name and the physical kind every input agrees on.
@@ -249,10 +389,16 @@ enum ColumnKind {
 struct OutField {
     name: String,
     kind: ColumnKind,
+    /// The unsigned annotation every input agrees on (`UTINYINT`,
+    /// `USMALLINT`, …). celld's `kind` and `http_status` carry one, and the
+    /// old DuckDB `COPY` preserved it, so a compacted file keeps the same
+    /// column types. Dropped when the inputs disagree or an `INT32` widens to
+    /// `INT64`.
+    logical: Option<ConvertedType>,
 }
 
 /// One cell of a folded row.
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 enum Cell {
     Null,
     Bool(bool),
@@ -272,11 +418,20 @@ fn merge_schema(fields: &mut Vec<OutField>, root: &Type) -> anyhow::Result<()> {
                 field.name()
             );
         }
-        let kind = match field.get_physical_type() {
-            PhysicalType::BOOLEAN => ColumnKind::Bool,
-            PhysicalType::INT32 => ColumnKind::Int32,
-            PhysicalType::INT64 => ColumnKind::Int64,
-            PhysicalType::BYTE_ARRAY => ColumnKind::Str,
+        let (kind, logical) = match field.get_physical_type() {
+            PhysicalType::BOOLEAN => (ColumnKind::Bool, None),
+            PhysicalType::INT32 => match field.get_basic_info().converted_type() {
+                ConvertedType::UINT_8 => (ColumnKind::Int32, Some(ConvertedType::UINT_8)),
+                ConvertedType::UINT_16 => (ColumnKind::Int32, Some(ConvertedType::UINT_16)),
+                ConvertedType::UINT_32 => (ColumnKind::Int32, Some(ConvertedType::UINT_32)),
+                _ => (ColumnKind::Int32, None),
+            },
+            PhysicalType::INT64 => match field.get_basic_info().converted_type() {
+                ConvertedType::UINT_64 => (ColumnKind::Int64, Some(ConvertedType::UINT_64)),
+                _ => (ColumnKind::Int64, None),
+            },
+            // The output always annotates text as UTF-8 (see `output_schema`).
+            PhysicalType::BYTE_ARRAY => (ColumnKind::Str, None),
             other => anyhow::bail!(
                 "telemetry column {} has unsupported physical type {other:?}",
                 field.name()
@@ -286,20 +441,28 @@ fn merge_schema(fields: &mut Vec<OutField>, root: &Type) -> anyhow::Result<()> {
             .iter_mut()
             .find(|existing| existing.name == field.name())
         {
-            Some(existing) => {
-                existing.kind = match (existing.kind, kind) {
-                    (a, b) if a == b => a,
-                    (ColumnKind::Int32, ColumnKind::Int64)
-                    | (ColumnKind::Int64, ColumnKind::Int32) => ColumnKind::Int64,
-                    _ => anyhow::bail!(
-                        "telemetry column {} has conflicting types across an hour",
-                        field.name()
-                    ),
-                };
-            }
+            Some(existing) => match (existing.kind, kind) {
+                (a, b) if a == b => {
+                    // Same width: keep the annotation only while every input
+                    // agrees on it. A mismatch widens to the plain signed
+                    // type, which every reader projects by name.
+                    if existing.logical != logical {
+                        existing.logical = None;
+                    }
+                }
+                (ColumnKind::Int32, ColumnKind::Int64) | (ColumnKind::Int64, ColumnKind::Int32) => {
+                    existing.kind = ColumnKind::Int64;
+                    existing.logical = None;
+                }
+                _ => anyhow::bail!(
+                    "telemetry column {} has conflicting types across an hour",
+                    field.name()
+                ),
+            },
             None => fields.push(OutField {
                 name: field.name().to_string(),
                 kind,
+                logical,
             }),
         }
     }
@@ -313,8 +476,20 @@ fn output_schema(fields: &[OutField]) -> anyhow::Result<Type> {
     for field in fields {
         let builder = match field.kind {
             ColumnKind::Bool => Type::primitive_type_builder(&field.name, PhysicalType::BOOLEAN),
-            ColumnKind::Int32 => Type::primitive_type_builder(&field.name, PhysicalType::INT32),
-            ColumnKind::Int64 => Type::primitive_type_builder(&field.name, PhysicalType::INT64),
+            ColumnKind::Int32 => {
+                let builder = Type::primitive_type_builder(&field.name, PhysicalType::INT32);
+                match field.logical {
+                    Some(logical) => builder.with_converted_type(logical),
+                    None => builder,
+                }
+            }
+            ColumnKind::Int64 => {
+                let builder = Type::primitive_type_builder(&field.name, PhysicalType::INT64);
+                match field.logical {
+                    Some(logical) => builder.with_converted_type(logical),
+                    None => builder,
+                }
+            }
             ColumnKind::Str => Type::primitive_type_builder(&field.name, PhysicalType::BYTE_ARRAY)
                 .with_converted_type(ConvertedType::UTF8),
         };
@@ -403,6 +578,18 @@ fn cell_from(field: &Field) -> anyhow::Result<Cell> {
         Field::Short(value) => Cell::Int(i32::from(*value)),
         Field::Byte(value) => Cell::Int(i32::from(*value)),
         Field::Long(value) => Cell::Long(*value),
+        // celld's `kind` and `http_status` are UTINYINT/USMALLINT: the
+        // record API surfaces them as unsigned fields, and every real trace
+        // object carries both. Without these arms an hour with one real
+        // trace file could never fold.
+        Field::UByte(value) => Cell::Int(i32::from(*value)),
+        Field::UShort(value) => Cell::Int(i32::from(*value)),
+        Field::UInt(value) => Cell::Long(i64::from(*value)),
+        Field::ULong(value) => {
+            Cell::Long(i64::try_from(*value).map_err(|_| {
+                anyhow::anyhow!("telemetry integer column does not fit i64: {value}")
+            })?)
+        }
         Field::Str(value) => Cell::Str(value.clone()),
         Field::Bytes(value) => Cell::Str(
             std::str::from_utf8(value.data())
@@ -523,14 +710,20 @@ fn write_column<W: Write + Send>(
 ///   [*] --> Pending
 ///   Pending --> Compacted: fold ok
 ///   Pending --> Failed: fold error
+///   Pending --> KeptRaw: fold would not be readable
 ///   Failed --> Pending: retry window elapsed
 ///   Failed --> Compacted: fold ok on retry
+///
+/// `KeptRaw` is terminal: the hour's inputs exceed the fold budget (or a
+/// single input exceeds the reader's cap), so a retry cannot succeed. Its
+/// sources stay in the bucket and the reader still reads them; the hour is
+/// skipped like a compacted one, so it can never wedge the hours behind it.
 #[derive(Debug, Clone, Default)]
 pub(super) struct CompactionState {
     hours: HashMap<String, HourState>,
-    /// The newest hour of the contiguous compacted run. Compaction schedules
-    /// from `done + 1` and stops at the first hour that is not ready, so a
-    /// failure can never be jumped over.
+    /// The newest hour of the contiguous finished run (compacted or kept
+    /// raw). Compaction schedules from `done + 1` and stops at the first hour
+    /// that is not ready, so a failure can never be jumped over.
     done: Option<String>,
 }
 
@@ -542,6 +735,9 @@ enum HourState {
     Failed {
         retry_at: std::time::Instant,
     },
+    /// The hour cannot be folded into an object the reader accepts; its
+    /// sources stay readable and it is never retried.
+    KeptRaw,
 }
 
 /// How long a failed hour waits before the next attempt. Same shape as the
@@ -570,7 +766,7 @@ impl CompactionState {
     fn is_due(&self, hour: &str, now: std::time::Instant) -> bool {
         match self.hours.get(hour) {
             None => true,
-            Some(HourState::Compacted) => false,
+            Some(HourState::Compacted | HourState::KeptRaw) => false,
             Some(HourState::Failed { retry_at }) => retry_at <= &now,
         }
     }
@@ -579,8 +775,22 @@ impl CompactionState {
     /// folded hour is exactly the next one, so a write can never skip an
     /// earlier hour.
     fn folded(&mut self, hour: &str) {
-        let earlier = self.hours.keys().any(|h| h.as_str() < hour);
         self.hours.insert(hour.to_string(), HourState::Compacted);
+        self.advance_from(hour);
+    }
+
+    /// Transition `Pending -> KeptRaw`. Terminal: the hour needs no further
+    /// work and must not hold up the hours behind it.
+    fn kept_raw(&mut self, hour: &str) {
+        self.hours.insert(hour.to_string(), HourState::KeptRaw);
+        self.advance_from(hour);
+    }
+
+    /// Move the contiguous `done` cursor over `hour` and over any following
+    /// hours that are already finished (compacted or kept raw), so a kept-raw
+    /// hour never re-opens the scheduling walk for the rest of the run.
+    fn advance_from(&mut self, hour: &str) {
+        let earlier = self.hours.keys().any(|h| h.as_str() < hour);
         let advances = match &self.done {
             Some(done) => Self::next_after(done).as_deref() == Some(hour),
             // A first fold only opens the cursor when nothing earlier is
@@ -589,6 +799,19 @@ impl CompactionState {
         };
         if advances {
             self.done = Some(hour.to_string());
+        }
+        while let Some(done) = self.done.clone() {
+            let Some(next) = Self::next_after(&done) else {
+                break;
+            };
+            if matches!(
+                self.hours.get(&next),
+                Some(HourState::Compacted | HourState::KeptRaw)
+            ) {
+                self.done = Some(next);
+            } else {
+                break;
+            }
         }
     }
 
@@ -615,8 +838,10 @@ impl CompactionState {
 /// Completed hours that still need a fold, oldest first. Scheduling starts
 /// after the contiguous `done` cursor (or the last 25 hours on a fresh fleet)
 /// and stops at the first non-ready hour: a failed hour blocks the hours
-/// behind it until its retry, so the cursor can never skip it. Bounded so one
-/// pass cannot name the whole retention; unparseable input compacts nothing.
+/// behind it until its retry, so the cursor can never skip it. A kept-raw
+/// hour is finished work, not a failure, so it never blocks the walk. Bounded
+/// so one pass cannot name the whole retention; unparseable input compacts
+/// nothing.
 pub(super) fn uncompacted_hours(
     state: &CompactionState,
     current: &str,
@@ -642,8 +867,12 @@ pub(super) fn uncompacted_hours(
     let mut hours = Vec::new();
     while start < current_dt && hours.len() < 48 {
         let hour = start.format("%Y/%m/%d/%H").to_string();
-        if state.hours.get(&hour) == Some(&HourState::Compacted) {
-            // Already folded (only possible below a restored cursor).
+        if matches!(
+            state.hours.get(&hour),
+            Some(HourState::Compacted | HourState::KeptRaw)
+        ) {
+            // Finished work (a compacted or kept-raw hour, the latter only
+            // possible below the cursor).
         } else if state.is_due(&hour, now) {
             hours.push(hour);
         } else {
@@ -666,6 +895,17 @@ pub(super) fn mark_failed(state: &mut MetricsState, slug: &str, hour: &str) {
         .entry(slug.to_string())
         .or_default()
         .failed(hour, std::time::Instant::now());
+}
+
+/// Transition `Pending -> KeptRaw` for one hour: the fold cannot produce a
+/// readable object, the sources stay in the bucket, and later hours must not
+/// wait behind it.
+pub(super) fn mark_kept_raw(state: &mut MetricsState, slug: &str, hour: &str) {
+    state
+        .compacted
+        .entry(slug.to_string())
+        .or_default()
+        .kept_raw(hour);
 }
 
 /// Drop in-memory marks that fell out of the retention window.
@@ -885,10 +1125,12 @@ mod tests {
                 OutField {
                     name: "name".to_string(),
                     kind: ColumnKind::Str,
+                    logical: None,
                 },
                 OutField {
                     name: "start".to_string(),
                     kind: ColumnKind::Int32,
+                    logical: None,
                 },
             ],
             vec![
@@ -902,14 +1144,17 @@ mod tests {
                 OutField {
                     name: "name".to_string(),
                     kind: ColumnKind::Str,
+                    logical: None,
                 },
                 OutField {
                     name: "start".to_string(),
                     kind: ColumnKind::Int64,
+                    logical: None,
                 },
                 OutField {
                     name: "cell".to_string(),
                     kind: ColumnKind::Str,
+                    logical: None,
                 },
             ],
             vec![
@@ -955,6 +1200,7 @@ mod tests {
         let mut fields = vec![OutField {
             name: "ok".to_string(),
             kind: ColumnKind::Bool,
+            logical: None,
         }];
         let schema = Type::group_type_builder("x")
             .with_fields(vec![Arc::new(
@@ -971,6 +1217,7 @@ mod tests {
         let mut fields = vec![OutField {
             name: "ok".to_string(),
             kind: ColumnKind::Int32,
+            logical: None,
         }];
         let wider = Type::group_type_builder("x")
             .with_fields(vec![Arc::new(
@@ -983,5 +1230,183 @@ mod tests {
             .expect("schema");
         merge_schema(&mut fields, &wider).expect("widen");
         assert_eq!(fields[0].name, "ok");
+    }
+
+    /// Regenerate the `folded` differential fixture consumed by
+    /// `otel::tests::real_celld_fixtures_match_the_duckdb_rows`: the union of
+    /// the two committed real celld objects per signal, written by
+    /// `fold_files`. The expected rows beside it come from the old DuckDB
+    /// tag-3/tag-4 query over exactly this output (see the fixture's
+    /// `expected.json`). Run:
+    /// `cargo test --locked write_folded_fixture -- --ignored`.
+    #[test]
+    #[ignore = "regenerates the committed folded differential fixture"]
+    fn write_folded_fixture() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/otel");
+        for (kind, inputs) in [
+            (
+                "logs",
+                vec![
+                    root.join("prod/logs/1794577873709403-6f71c41f.parquet"),
+                    root.join("env/logs/1794577876549734-73049318.parquet"),
+                ],
+            ),
+            (
+                "traces",
+                vec![
+                    root.join("prod/traces/1794577873683359-c06bd8cf.parquet"),
+                    root.join("env/traces/1794577876522388-4fc8076d.parquet"),
+                ],
+            ),
+        ] {
+            let dir = root.join("folded").join(kind);
+            std::fs::create_dir_all(&dir).expect("fixture dir");
+            fold_files(&inputs, &dir.join("compacted.parquet")).expect("fold fixture");
+        }
+    }
+
+    /// celld writes `kind` as UTINYINT and `http_status` as USMALLINT; the
+    /// record API hands those back as `UByte`/`UShort`, which a fold must
+    /// accept. Before these arms every real trace hour failed with
+    /// "unsupported telemetry cell type: UByte(1)" and was retried forever,
+    /// so no trace hour could ever be compacted.
+    #[test]
+    fn folding_real_celld_traces_accepts_the_unsigned_columns() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/otel");
+        let inputs = vec![
+            root.join("prod/traces/1794577873683359-c06bd8cf.parquet"),
+            root.join("env/traces/1794577876522388-4fc8076d.parquet"),
+        ];
+        let guard = crate::testutil::TempDir::new("noite-fold-unsigned");
+        let out = guard.path().join("folded.parquet");
+        fold_files(&inputs, &out).expect("fold two real celld trace objects");
+        let reader = SerializedFileReader::new(File::open(&out).expect("open folded"))
+            .expect("parsed folded");
+        // The unsigned annotations survive: celld's `kind` stays UTINYINT and
+        // `http_status` stays USMALLINT, so the compacted file's types match
+        // its inputs (as DuckDB's `COPY` did).
+        let schema = reader.metadata().file_metadata().schema_descr();
+        let converted = |name: &str| {
+            schema
+                .root_schema()
+                .get_fields()
+                .iter()
+                .find(|field| field.name() == name)
+                .map(|field| field.get_basic_info().converted_type())
+        };
+        assert_eq!(converted("kind"), Some(ConvertedType::UINT_8));
+        assert_eq!(converted("http_status"), Some(ConvertedType::UINT_16));
+        let rows: Vec<_> = reader
+            .get_row_iter(None)
+            .expect("rows")
+            .collect::<Result<_, _>>()
+            .expect("decoded rows");
+        assert_eq!(rows.len(), 9, "4 + 5 rows survive the union");
+        // And the record API hands the values back with those shapes.
+        assert!(rows.iter().all(|row| {
+            row.get_column_iter()
+                .any(|(name, field)| name == "kind" && matches!(field, Field::UByte(_)))
+        }));
+    }
+
+    /// Every unsigned width celld (or a foreign writer) can produce folds into
+    /// the signed cell the writer stores; a `ULong` past `i64::MAX` fails
+    /// instead of silently wrapping.
+    #[test]
+    fn cell_from_accepts_every_unsigned_width() {
+        assert_eq!(cell_from(&Field::UByte(255)).expect("u8"), Cell::Int(255));
+        assert_eq!(
+            cell_from(&Field::UShort(65_535)).expect("u16"),
+            Cell::Int(65_535)
+        );
+        assert_eq!(
+            cell_from(&Field::UInt(u32::MAX)).expect("u32"),
+            Cell::Long(i64::from(u32::MAX))
+        );
+        assert_eq!(
+            cell_from(&Field::ULong(i64::MAX as u64)).expect("u64"),
+            Cell::Long(i64::MAX)
+        );
+        assert!(cell_from(&Field::ULong(u64::MAX)).is_err());
+    }
+
+    /// A fold that cannot produce an object the reader accepts is refused
+    /// before anything is published: the inputs budget keeps the output under
+    /// the reader's cap, and the output check catches a fold that still grows
+    /// past it.
+    #[test]
+    fn a_fold_that_would_produce_an_unreadable_object_is_refused() {
+        assert_eq!(
+            fold_refusal(MAX_FOLD_INPUT_BYTES, None, MAX_FOLD_INPUT_BYTES),
+            None
+        );
+        assert_eq!(
+            fold_refusal(MAX_FOLD_INPUT_BYTES + 1, None, MAX_FOLD_INPUT_BYTES),
+            Some(FoldRefusal::InputsTooLarge(MAX_FOLD_INPUT_BYTES + 1))
+        );
+        // An output over the reader's cap is refused even when the inputs fit,
+        // so compaction can never publish an object the ingest skips.
+        assert_eq!(
+            fold_refusal(
+                1024,
+                Some(parquet_io::MAX_OBJECT_BYTES as u64 + 1),
+                MAX_FOLD_INPUT_BYTES
+            ),
+            Some(FoldRefusal::OutputTooLarge(
+                parquet_io::MAX_OBJECT_BYTES as u64 + 1
+            ))
+        );
+        assert_eq!(
+            fold_refusal(
+                1024,
+                Some(parquet_io::MAX_OBJECT_BYTES as u64),
+                MAX_FOLD_INPUT_BYTES
+            ),
+            None
+        );
+        // The fresh-fold budget leaves headroom under the reader cap, while a
+        // refold may use the whole cap for its inputs (the existing compacted
+        // file plus a late flush) and still has to pass the output check.
+        assert!(MAX_FOLD_INPUT_BYTES < parquet_io::MAX_OBJECT_BYTES as u64);
+        assert_eq!(MAX_REFOLD_INPUT_BYTES, parquet_io::MAX_OBJECT_BYTES as u64);
+        assert_eq!(
+            fold_refusal(MAX_REFOLD_INPUT_BYTES, None, MAX_REFOLD_INPUT_BYTES),
+            None
+        );
+        assert_eq!(
+            fold_refusal(MAX_REFOLD_INPUT_BYTES + 1, None, MAX_REFOLD_INPUT_BYTES),
+            Some(FoldRefusal::InputsTooLarge(MAX_REFOLD_INPUT_BYTES + 1))
+        );
+    }
+
+    /// A kept-raw hour is finished work: it is never scheduled again and it
+    /// never blocks the hours behind it (the old failed-hour rule would have
+    /// wedged that fleet's compaction until retention).
+    #[test]
+    fn a_kept_raw_hour_never_blocks_the_hours_after_it() {
+        let _env = crate::config::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let cfg = crate::config::Config::from_env().expect("config");
+        let now = chrono::Utc::now().naive_utc();
+        let hour = |dt: chrono::NaiveDateTime| dt.format("%Y/%m/%d/%H").to_string();
+        let current = hour(now);
+        let older = hour(now - chrono::Duration::hours(3));
+        let raw = hour(now - chrono::Duration::hours(2));
+        let newer = hour(now - chrono::Duration::hours(1));
+        let mut state = CompactionState::default();
+        state.folded(&older);
+        state.kept_raw(&raw);
+        // The raw hour is not named again, and the walk continues to the next
+        // hour instead of breaking on it.
+        assert_eq!(
+            uncompacted_hours(&state, &current, &cfg),
+            vec![newer.clone()]
+        );
+        // The cursor moved past it, so the run stays contiguous: folding the
+        // next hour does not leave a walk from the raw hour on every pass.
+        state.folded(&newer);
+        assert!(uncompacted_hours(&state, &current, &cfg).is_empty());
+        assert_eq!(state.done.as_deref(), Some(newer.as_str()));
     }
 }

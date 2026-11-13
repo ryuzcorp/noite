@@ -21,7 +21,9 @@ use crate::host::s3;
 /// node's 30 s of spans sits far below this, so a bigger object means a
 /// corrupt or foreign file, and buffering it whole would be the only way to
 /// read it. Skipping it with a warning keeps the tick bounded; the skip is
-/// logged, never silent.
+/// logged, never silent. Compaction never publishes a folded file above this
+/// cap ([`super::compact`] checks the real output size), so a compacted object
+/// is always readable.
 pub(super) const MAX_OBJECT_BYTES: usize = 256 * 1024 * 1024;
 
 /// One fetched object: a body, a key that vanished between the listing and
@@ -98,6 +100,13 @@ pub(super) fn long(field: &Field) -> Option<i64> {
         Field::Int(value) => Some(i64::from(*value)),
         Field::Short(value) => Some(i64::from(*value)),
         Field::Byte(value) => Some(i64::from(*value)),
+        // A column annotated `UTINYINT`/`USMALLINT` (celld's `kind`,
+        // `http_status`) comes back unsigned; a compacted file preserves the
+        // annotation, so the helper accepts both shapes.
+        Field::UByte(value) => Some(i64::from(*value)),
+        Field::UShort(value) => Some(i64::from(*value)),
+        Field::UInt(value) => Some(i64::from(*value)),
+        Field::ULong(value) => i64::try_from(*value).ok(),
         _ => None,
     }
 }

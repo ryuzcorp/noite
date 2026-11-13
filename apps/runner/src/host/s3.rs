@@ -552,6 +552,10 @@ async fn get_once(
     let resp = match http_client().get(url).timeout(timeout).send().await {
         Ok(resp) => resp,
         Err(e) => {
+            // `without_url`: reqwest's Display carries the full presigned URL
+            // (access-key id plus a live signature), and this text reaches the
+            // caller through the S3 error chain.
+            let e = e.without_url();
             return Err(S3Fail::Retryable(anyhow::anyhow!(
                 "s3 download {key} transport: {e:#}"
             )));
@@ -573,6 +577,8 @@ async fn get_once(
         let chunk = match chunk {
             Ok(chunk) => chunk,
             Err(e) => {
+                // Same presigned-URL leak as the send error above.
+                let e = e.without_url();
                 return Err(S3Fail::Retryable(anyhow::anyhow!(
                     "s3 download {key} body: {e:#}"
                 )));
@@ -1034,6 +1040,10 @@ async fn get_object_once(
     {
         Ok(resp) => resp,
         Err(e) => {
+            // `without_url`: reqwest's Display carries the full presigned URL
+            // (access-key id plus a live signature), and this text reaches the
+            // caller through the S3 error chain.
+            let e = e.without_url();
             return Err(S3Fail::Retryable(anyhow::anyhow!(
                 "s3 download {key} transport: {e:#}"
             )));
@@ -1058,6 +1068,8 @@ async fn get_object_once(
         let chunk = match chunk {
             Ok(chunk) => chunk,
             Err(e) => {
+                // Same presigned-URL leak as the send error above.
+                let e = e.without_url();
                 return Err(S3Fail::Retryable(anyhow::anyhow!(
                     "s3 download {key} body: {e:#}"
                 )));
