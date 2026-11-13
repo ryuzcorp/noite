@@ -83,7 +83,8 @@ export const RefSelect = ({
   value,
 }: {
   appId: string;
-  /** Accessible name (there is no visible label beside the select). */
+  /** Accessible name; the visible caption beside the select is `RefField`'s
+   * (the two match, so voice control and the screen reader agree). */
   label: string;
   onChange: (ref: string) => void;
   value: string;
@@ -122,6 +123,21 @@ export const RefSelect = ({
     </select>
   );
 };
+
+/** One branch picker with the caption a pilot needs: the select's accessible
+ * name alone left two identical-looking dropdowns ("main",
+ * "feature/checkout") with nothing saying which is base and which is head. The
+ * visible caption matches the accessible name, so voice control and the screen
+ * reader say the same word. */
+export const RefField = ({
+  caption,
+  ...props
+}: { caption: string } & Omit<Parameters<typeof RefSelect>[0], "label">) => (
+  <label class="flex min-w-0 flex-col gap-1">
+    <span class="text-base-content/60 text-xs">{caption}</span>
+    <RefSelect {...props} label={caption} />
+  </label>
+);
 
 /** One branch in the picker: selects it, with its distance from the default
  * branch, a compare link, the push-only create-environment action and the

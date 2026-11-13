@@ -17,14 +17,18 @@ export default function NewPrPage() {
 
   return (
     <PullsPage appId={appId} back>
-      <h1 class="m-0 text-xl font-semibold">New pull request</h1>
-      <NewPrForm
-        key={`${appId}:${base()}:${headRef()}`}
-        appId={appId}
-        baseDefault={base()}
-        headDefault={headRef()}
-        titleDefault={title()}
-      />
+      {/* A form, so it keeps the app's form width (`max-w-3xl`, as Settings
+          and the create page do) instead of stretching the whole pane. */}
+      <div class="flex w-full max-w-3xl flex-col gap-4">
+        <h1 class="m-0 text-xl font-semibold">New pull request</h1>
+        <NewPrForm
+          key={`${appId}:${base()}:${headRef()}`}
+          appId={appId}
+          baseDefault={base()}
+          headDefault={headRef()}
+          titleDefault={title()}
+        />
+      </div>
     </PullsPage>
   );
 }

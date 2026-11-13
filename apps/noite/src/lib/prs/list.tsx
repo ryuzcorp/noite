@@ -108,7 +108,10 @@ export const PrsList = ({
       {pulls.length > 0 ? (
         <ul class="list bg-base-100 dark:bg-base-200 border-base-300 rounded-box m-0 w-full border p-0 shadow-md">
           {pulls.map((pull) => (
-            <li key={pull.number} class="list-row items-center">
+            <li
+              key={pull.number}
+              class="list-row items-start max-sm:[grid-auto-flow:row] max-sm:[--list-grid-cols:auto_1fr]"
+            >
               <div>
                 <PrStateBadge state={pull.state} />
               </div>
@@ -120,12 +123,15 @@ export const PrsList = ({
                 >
                   {pull.title}
                 </Link>
-                <div class="text-base-content/70 flex flex-wrap items-center gap-x-1.5 text-xs">
+                {/* One readable sentence: each separator is glued to the item
+                 * after it, so a narrow row never ends a line on a bare "·". */}
+                <div class="text-base-content/70 flex flex-wrap items-center gap-x-2 gap-y-0.5 text-xs">
                   <span class="font-mono">#{pull.number}</span>
-                  <span aria-hidden="true">·</span>
-                  <span>{nameFor(names, pull.authorId, pull.authorLabel)}</span>
-                  <span aria-hidden="true">·</span>
+                  <span class="whitespace-nowrap">
+                    · {nameFor(names, pull.authorId, pull.authorLabel)}
+                  </span>
                   <span class="font-mono">
+                    ·{"\u00A0"}
                     <Link
                       class="link link-hover"
                       href={`/apps/${appId}/source?ref=${encodeURIComponent(pull.head)}`}
@@ -141,7 +147,7 @@ export const PrsList = ({
                     </Link>
                   </span>
                   <Link
-                    class="link link-hover"
+                    class="link link-hover whitespace-nowrap"
                     href={`/apps/${appId}/source/compare?base=${encodeURIComponent(
                       pull.base
                     )}&head=${encodeURIComponent(pull.head)}`}
@@ -150,7 +156,10 @@ export const PrsList = ({
                   </Link>
                 </div>
               </div>
-              <div class="text-base-content/70 flex shrink-0 items-center gap-3 text-xs">
+              {/* Below `sm` the row puts the age under the metadata instead of
+               * in a third column: the column squeezed the sentence into three
+               * lines and floated the age beside them. */}
+              <div class="text-base-content/70 flex shrink-0 items-center gap-3 text-xs max-sm:col-start-2 max-sm:row-start-2 max-sm:pt-1">
                 {pull.commentCount > 0 ? (
                   <span class="tabular-nums">
                     {pull.commentCount} comment
