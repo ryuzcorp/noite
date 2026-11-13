@@ -6,19 +6,11 @@ const H: i64 = 1_767_225_600_000_000; // 2026-01-01T00:00:00Z in micros
 const HOUR_US: i64 = 3_600_000_000;
 
 // -----------------------------------------------------------------------
-// Write-layer tests. DuckDB is not on the dev host, so these drive
-// `commit_chunk` directly with the rows `ingest_all` would return: the
-// aggregation itself is exercised by the e2e lanes, the idempotency and
+// Write-layer tests. S3 is not on the dev host, so these drive
+// `commit_chunk` directly with the rows `otel::ingest_all` would return: the
+// decode itself is covered by the committed fixtures, the idempotency and
 // watermark rules here.
 // -----------------------------------------------------------------------
-
-#[test]
-fn canonical_file_list_prefers_compacted_directories() {
-    let sql = canonical_file_list_sql("SELECT file FROM glob('s3://b/x/*.parquet')");
-    assert!(sql.contains("compacted.parquet"), "{sql}");
-    assert!(sql.contains("NOT IN"), "{sql}");
-    assert!(sql.contains("compacted_dirs"), "{sql}");
-}
 
 async fn test_pool(name: &str) -> (SqlitePool, crate::testutil::TempDir) {
     let guard = crate::testutil::TempDir::new(&format!("noite-metrics-{name}"));
@@ -49,32 +41,6 @@ fn log_row(ts_us: i64, body: &str, trace: &str) -> errors::LogRow {
 
 fn rows_hour1() -> IngestRows {
     IngestRows {
-        minutes: vec![
-            (
-                "blog".to_string(),
-                "2026-01-01T00:05:00Z".to_string(),
-                10,
-                5_000,
-                0,
-            ),
-            (
-                "blog".to_string(),
-                "2026-01-01T00:06:00Z".to_string(),
-                4,
-                2_000,
-                1,
-            ),
-        ],
-        spans: vec![(
-            "blog".to_string(),
-            "2026-01-01T00:00:00Z".to_string(),
-            "celld.fetch".to_string(),
-            0,
-            14,
-            7_000,
-            1,
-            300,
-        )],
         logs: vec![log_row(H + 5 * 60_000_000, "hello", "t1")],
         errors: Vec::new(),
     }
@@ -82,23 +48,6 @@ fn rows_hour1() -> IngestRows {
 
 fn rows_hour2() -> IngestRows {
     IngestRows {
-        minutes: vec![(
-            "blog".to_string(),
-            "2026-01-01T01:10:00Z".to_string(),
-            7,
-            3_000,
-            0,
-        )],
-        spans: vec![(
-            "blog".to_string(),
-            "2026-01-01T01:00:00Z".to_string(),
-            "celld.fetch".to_string(),
-            0,
-            7,
-            3_000,
-            0,
-            100,
-        )],
         logs: vec![log_row(H + HOUR_US + 10 * 60_000_000, "world", "t2")],
         errors: vec![errors::SpanErrorRow {
             slug: "blog".to_string(),
@@ -114,28 +63,11 @@ fn rows_hour2() -> IngestRows {
 }
 
 /// A chunk of the control fleet's own telemetry, keyed on the reserved
-/// slug exactly as the ingest emits it (`ingest_all` derives the slug from
-/// the `control/telemetry/...` path).
+/// slug exactly as the ingest emits it (the fleet key comes from the
+/// `control/telemetry/...` path).
 fn rows_control_hour() -> IngestRows {
     let control = crate::host::control::SLUG.to_string();
     IngestRows {
-        minutes: vec![(
-            control.clone(),
-            "2026-01-01T00:05:00Z".to_string(),
-            9,
-            4_500,
-            0,
-        )],
-        spans: vec![(
-            control.clone(),
-            "2026-01-01T00:00:00Z".to_string(),
-            "celld.fetch".to_string(),
-            0,
-            9,
-            4_500,
-            0,
-            200,
-        )],
         logs: vec![errors::LogRow {
             slug: control.clone(),
             ts_us: H + 5 * 60_000_000,
@@ -157,8 +89,6 @@ fn rows_control_hour() -> IngestRows {
 
 fn combined(a: IngestRows, b: IngestRows) -> IngestRows {
     IngestRows {
-        minutes: [a.minutes, b.minutes].concat(),
-        spans: [a.spans, b.spans].concat(),
         logs: [a.logs, b.logs].concat(),
         errors: [a.errors, b.errors].concat(),
     }
@@ -167,20 +97,6 @@ fn combined(a: IngestRows, b: IngestRows) -> IngestRows {
 /// Deterministic dump of every table the ingest writes.
 async fn dump(pool: &SqlitePool) -> Vec<String> {
     let mut out = Vec::new();
-    let metrics: Vec<(String, String, i64, i64, i64, i64)> = sqlx::query_as(
-            "SELECT app_id, bucket_ts, requests, errors, latency_ms, cpu_ms FROM metrics.app_metric ORDER BY bucket_ts",
-        )
-        .fetch_all(pool)
-        .await
-        .expect("app_metric");
-    out.extend(metrics.iter().map(|r| format!("metric {r:?}")));
-    let spans: Vec<SpanRow> = sqlx::query_as(
-            "SELECT app_id, bucket_hour, name, kind, n, ms, err, qwait_ms FROM metrics.app_span_stat ORDER BY bucket_hour, name, kind",
-        )
-        .fetch_all(pool)
-        .await
-        .expect("span");
-    out.extend(spans.iter().map(|r| format!("span {r:?}")));
     let logs: Vec<(String, i64, String)> =
         sqlx::query_as("SELECT app_id, ts_us, body FROM metrics.app_log ORDER BY ts_us, body")
             .fetch_all(pool)
@@ -212,32 +128,31 @@ async fn dump(pool: &SqlitePool) -> Vec<String> {
 }
 
 /// A chunk pass whose behaviour per call is scripted: a fleet in `fail`
-/// fails alone, `idle` returns the no-files error.
+/// fails alone, `empty` returns a chunk with no rows.
 struct FakePass {
     fail: HashSet<String>,
-    idle: bool,
+    empty: bool,
 }
 
 impl ChunkPass for FakePass {
     async fn pass(&self, bounds: &[(String, i64, i64)]) -> anyhow::Result<IngestRows> {
-        if self.idle {
-            anyhow::bail!("duckdb: No files found that match the pattern");
-        }
         if bounds
             .iter()
             .any(|(slug, _, _)| self.fail.contains(slug.as_str()))
         {
             anyhow::bail!("simulated telemetry ingest error");
         }
+        if self.empty {
+            return Ok(IngestRows::empty());
+        }
         let mut rows = IngestRows::empty();
         for (slug, _, _) in bounds {
-            rows.minutes.push((
-                slug.clone(),
-                "2026-01-01T00:05:00Z".to_string(),
-                1,
-                1_000,
-                0,
-            ));
+            rows.logs.push(errors::LogRow {
+                slug: slug.clone(),
+                ts_us: H,
+                body: "served".to_string(),
+                trace_id: String::new(),
+            });
         }
         Ok(rows)
     }
@@ -247,7 +162,7 @@ impl ChunkPass for FakePass {
 async fn a_healthy_shared_pass_is_one_result() {
     let pass = FakePass {
         fail: HashSet::new(),
-        idle: false,
+        empty: false,
     };
     let bounds = vec![
         ("a".to_string(), H, H + HOUR_US),
@@ -262,12 +177,12 @@ async fn a_healthy_shared_pass_is_one_result() {
 async fn an_empty_window_is_a_successful_chunk() {
     let pass = FakePass {
         fail: HashSet::new(),
-        idle: true,
+        empty: true,
     };
     let results = collect_chunk_results(&pass, &[("a".to_string(), H, H + HOUR_US)]).await;
     assert_eq!(results.len(), 1);
     assert!(
-        results[0].1.is_ok(),
+        results[0].1.as_ref().is_ok_and(|rows| rows.logs.is_empty()),
         "no files means nothing to read, not an error"
     );
 }
@@ -286,7 +201,7 @@ async fn a_broken_fleet_does_not_hold_the_healthy_one() {
     ];
     let pass = FakePass {
         fail: HashSet::from(["bad".to_string()]),
-        idle: false,
+        empty: false,
     };
     let results = collect_chunk_results(&pass, &bounds).await;
     // The shared pass failed, so it was retried per fleet: one result each.
@@ -332,19 +247,19 @@ async fn a_broken_fleet_does_not_hold_the_healthy_one() {
             .backing_off(std::time::Instant::now()),
         "the broken fleet backs off"
     );
-    let written: Vec<(String, i64)> =
-        sqlx::query_as("SELECT app_id, requests FROM metrics.app_metric ORDER BY app_id")
+    let written: Vec<(String, String)> =
+        sqlx::query_as("SELECT app_id, environment_id FROM metrics.app_log ORDER BY app_id")
             .fetch_all(&pool)
             .await
-            .expect("app_metric");
-    assert_eq!(written, vec![("app-good".to_string(), 1)]);
+            .expect("app_log");
+    assert_eq!(written, vec![("app-good".to_string(), String::new())]);
     drop(dir);
 }
 
 #[tokio::test]
 async fn reingesting_a_window_is_idempotent_and_a_partial_retry_converges() {
-    let full = rows_hour1();
-    let bounds = vec![("blog".to_string(), H, H + HOUR_US)];
+    let full = rows_hour2();
+    let bounds = vec![("blog".to_string(), H + HOUR_US, H + 2 * HOUR_US)];
     let sha = HashMap::new();
 
     // A: the chunk written once.
@@ -388,8 +303,8 @@ async fn reingesting_a_window_is_idempotent_and_a_partial_retry_converges() {
     let (pool_b, dir_b) = test_pool("idem-b").await;
     let mut state_b = new_state();
     let mut partial = full.clone();
-    partial.minutes.truncate(1);
     partial.logs.clear();
+    partial.errors.clear();
     commit_chunk(
         &pool_b,
         &mut state_b,
@@ -425,7 +340,7 @@ async fn reingesting_a_window_is_idempotent_and_a_partial_retry_converges() {
     );
 
     // The watermark moved to the chunk's end, not the cutoff.
-    assert_eq!(state_a.watermark.get("blog"), Some(&(H + HOUR_US)));
+    assert_eq!(state_a.watermark.get("blog"), Some(&(H + 2 * HOUR_US)));
     for dir in [dir_a, dir_b] {
         drop(dir);
     }
@@ -514,12 +429,6 @@ async fn control_telemetry_is_keyed_on_the_reserved_slug_without_an_app_row() {
     .expect("commit the control chunk");
     let once = dump(&pool).await;
     assert!(!once.is_empty(), "control telemetry must be written");
-    let metrics: Vec<(String, i64)> =
-        sqlx::query_as("SELECT app_id, requests FROM metrics.app_metric ORDER BY app_id")
-            .fetch_all(&pool)
-            .await
-            .expect("app_metric");
-    assert_eq!(metrics, vec![(crate::host::control::SLUG.to_string(), 9)]);
     let issues: Vec<(String, i64)> =
         sqlx::query_as("SELECT app_id, count FROM metrics.app_error_issue ORDER BY app_id")
             .fetch_all(&pool)
@@ -553,6 +462,59 @@ async fn control_telemetry_is_keyed_on_the_reserved_slug_without_an_app_row() {
     assert_eq!(
         state.watermark.get(crate::host::control::SLUG),
         Some(&(H + HOUR_US))
+    );
+    drop(dir);
+}
+
+/// The upgrade path: an install that already has a watermark (and hours
+/// compacted behind it) must resume at the stored mark, ingest the next
+/// chunk exactly once, and leave the same rows on a retry. The compacted
+/// hour itself is never re-read — its canonical file is selected, and the
+/// watermark already sits past it.
+#[tokio::test]
+async fn an_upgrade_resumes_at_the_stored_watermark_and_ingests_once() {
+    let (pool, dir) = test_pool("upgrade").await;
+    // State the previous (DuckDB) install left behind.
+    db::set_metric_watermarks(&pool, &[("blog".to_string(), H + HOUR_US)])
+        .await
+        .expect("seed the old watermark");
+    let mut state = new_state();
+    crate::host::metrics::set_watermarks(
+        &mut state,
+        db::get_metric_watermarks(&pool).await.expect("restore"),
+    );
+    assert_eq!(
+        state.watermark.get("blog"),
+        Some(&(H + HOUR_US)),
+        "boot must resume at the stored mark, never at the floor"
+    );
+    let keys = FleetKeys {
+        ids: slug_id(),
+        envs: slug_env(),
+        shas: HashMap::new(),
+    };
+    let bounds = vec![("blog".to_string(), H + HOUR_US, H + 2 * HOUR_US)];
+    commit_chunk(&pool, &mut state, &keys, &bounds, rows_hour2(), 0)
+        .await
+        .expect("first chunk after the upgrade");
+    let once = dump(&pool).await;
+    assert!(!once.is_empty(), "the new hour must be ingested");
+    // The new reader's retry/replay of that chunk is exact.
+    commit_chunk(&pool, &mut state, &keys, &bounds, rows_hour2(), 0)
+        .await
+        .expect("retry");
+    assert_eq!(dump(&pool).await, once, "a retry must not double count");
+    assert_eq!(state.watermark.get("blog"), Some(&(H + 2 * HOUR_US)));
+    // Nothing from the hour before the stored mark leaked in.
+    let logs: Vec<(String, i64)> =
+        sqlx::query_as("SELECT app_id, ts_us FROM metrics.app_log ORDER BY ts_us")
+            .fetch_all(&pool)
+            .await
+            .expect("app_log");
+    assert_eq!(
+        logs,
+        vec![("app1".to_string(), H + HOUR_US + 10 * 60_000_000)],
+        "only the new hour's line, nothing before the stored mark"
     );
     drop(dir);
 }
@@ -607,15 +569,9 @@ async fn environment_rows_stay_separate_from_production() {
         ("blog".to_string(), H, H + HOUR_US),
         ("blog.preview".to_string(), H + HOUR_US, H + 2 * HOUR_US),
     ];
-    // The environment's rows are the same shapes `ingest_all` emits, keyed
-    // on the `{slug}.{label}` fleet key the file path carries.
+    // The environment's rows are the shapes `ingest_all` emits, keyed on
+    // the `{slug}.{label}` fleet key the file path carries.
     let mut env_rows = rows_hour2();
-    for m in &mut env_rows.minutes {
-        m.0 = "blog.preview".to_string();
-    }
-    for s in &mut env_rows.spans {
-        s.0 = "blog.preview".to_string();
-    }
     for l in &mut env_rows.logs {
         l.slug = "blog.preview".to_string();
     }
@@ -636,58 +592,6 @@ async fn environment_rows_stay_separate_from_production() {
     )
     .await
     .expect("commit the shared chunk");
-    // Minute buckets carry their environment.
-    let metrics: Vec<(String, String, String, i64)> = sqlx::query_as(
-        "SELECT app_id, environment_id, bucket_ts, requests FROM metrics.app_metric ORDER BY bucket_ts",
-    )
-    .fetch_all(&pool)
-    .await
-    .expect("app_metric");
-    assert_eq!(
-        metrics,
-        vec![
-            (
-                "app1".to_string(),
-                "".to_string(),
-                "2026-01-01T00:05:00Z".to_string(),
-                10
-            ),
-            (
-                "app1".to_string(),
-                "".to_string(),
-                "2026-01-01T00:06:00Z".to_string(),
-                4
-            ),
-            (
-                "app1".to_string(),
-                "env-1".to_string(),
-                "2026-01-01T01:10:00Z".to_string(),
-                7
-            ),
-        ]
-    );
-    // Span stats likewise.
-    let spans: Vec<(String, String, String)> = sqlx::query_as(
-        "SELECT app_id, environment_id, bucket_hour FROM metrics.app_span_stat ORDER BY bucket_hour",
-    )
-    .fetch_all(&pool)
-    .await
-    .expect("span");
-    assert_eq!(
-        spans,
-        vec![
-            (
-                "app1".to_string(),
-                "".to_string(),
-                "2026-01-01T00:00:00Z".to_string()
-            ),
-            (
-                "app1".to_string(),
-                "env-1".to_string(),
-                "2026-01-01T01:00:00Z".to_string()
-            ),
-        ]
-    );
     // The log ring keeps both, keyed apart.
     let logs: Vec<(String, String, String)> =
         sqlx::query_as("SELECT app_id, environment_id, body FROM metrics.app_log ORDER BY ts_us")
@@ -738,8 +642,6 @@ async fn environment_rows_stay_separate_from_production() {
 
 fn error_rows(trace: &str) -> IngestRows {
     IngestRows {
-        minutes: Vec::new(),
-        spans: Vec::new(),
         logs: Vec::new(),
         errors: vec![errors::SpanErrorRow {
             slug: "blog".to_string(),

@@ -22,7 +22,7 @@ use super::compact::{
 };
 use super::cpu::{otel_flush_ms, sample_cpu};
 use super::hourly::{self, hour_now, hour_of, Key};
-use super::ingest::{collect_chunk_results, commit_chunk, DuckdbPass, FleetKeys};
+use super::ingest::{collect_chunk_results, commit_chunk, FleetKeys, ParquetPass};
 use super::plan::{
     agg_lag_us, back_off_ingest, floor_hour_us, ingest_after, plan_chunks, MAX_CHUNKS_PER_PASS,
 };
@@ -95,7 +95,7 @@ pub async fn tick(
 /// production and the control fleet).
 ///
 /// Only deployed fleets have telemetry and a running celld — never-deployed
-/// apps are excluded so we don't spawn duckdb (and sample CPU) for every
+/// apps are excluded so we don't sample CPU for every
 /// created-but-empty slug every cycle. The control fleet is a telemetry
 /// source with no `app` row, on purpose: nothing that iterates apps
 /// (reconcile, Caddy, sleep, purge, list_apps) may see the control plane, yet
@@ -304,7 +304,7 @@ async fn ingest_step(
         if bounds.is_empty() {
             break;
         }
-        let results = collect_chunk_results(&DuckdbPass(cfg), &bounds).await;
+        let results = collect_chunk_results(&ParquetPass(cfg), &bounds).await;
         for (chunk, result) in results {
             let rows = match result {
                 Ok(rows) => rows,

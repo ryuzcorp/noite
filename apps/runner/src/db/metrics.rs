@@ -29,39 +29,6 @@ pub async fn last_request_us(
     .await
 }
 
-/// REPLACE one minute-bucket's telemetry columns. The metrics tick recomputes
-/// a whole hour-chunk from its hour boundary every pass, so the values it
-/// carries include everything already stored: replacing (not accumulating)
-/// is what makes a re-read and a replay exact instead of double counting.
-/// `cpu_ms` is left alone — it is sampled, not replayed, and accumulates.
-pub async fn replace_app_metric_usage(
-    pool: &SqlitePool,
-    app_id: &str,
-    environment_id: &str,
-    bucket_ts: &str,
-    requests: i64,
-    errors: i64,
-    latency_ms: i64,
-) -> sqlx::Result<()> {
-    sqlx::query(
-        r#"INSERT INTO metrics.app_metric (app_id, environment_id, bucket_ts, requests, errors, latency_ms, cpu_ms)
-           VALUES (?, ?, ?, ?, ?, ?, 0)
-           ON CONFLICT (app_id, environment_id, bucket_ts) DO UPDATE SET
-             requests = excluded.requests,
-             errors = excluded.errors,
-             latency_ms = excluded.latency_ms"#,
-    )
-    .bind(app_id)
-    .bind(environment_id)
-    .bind(bucket_ts)
-    .bind(requests)
-    .bind(errors)
-    .bind(latency_ms)
-    .execute(pool)
-    .await?;
-    Ok(())
-}
-
 /// Accumulate one minute-bucket of sampled CPU into the same row. CPU is a
 /// per-tick delta from `/proc`, so it adds; telemetry usage replaces.
 pub async fn add_app_metric_cpu(
@@ -475,49 +442,9 @@ pub async fn prune_app_refs(pool: &SqlitePool, older_than_ts: &str) -> sqlx::Res
     Ok(res.rows_affected())
 }
 
-/// REPLACE one hour-bucket of span stats (spec T3.2), filled by the ingest
-/// tick. The tick recomputes the whole hour from its boundary, so the values
-/// already include what was stored — replace, never accumulate. Retention
-/// matches the other metric tables.
-#[allow(clippy::too_many_arguments)]
-pub async fn replace_span_stat(
-    pool: &SqlitePool,
-    app_id: &str,
-    environment_id: &str,
-    bucket_hour: &str,
-    name: &str,
-    kind: i64,
-    n: i64,
-    ms: i64,
-    err: i64,
-    qwait_ms: i64,
-) -> sqlx::Result<()> {
-    sqlx::query(
-        r#"INSERT INTO metrics.app_span_stat
-           (app_id, environment_id, bucket_hour, name, kind, n, ms, err, qwait_ms)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-           ON CONFLICT (app_id, environment_id, bucket_hour, name, kind) DO UPDATE SET
-             n = excluded.n,
-             ms = excluded.ms,
-             err = excluded.err,
-             qwait_ms = excluded.qwait_ms"#,
-    )
-    .bind(app_id)
-    .bind(environment_id)
-    .bind(bucket_hour)
-    .bind(name)
-    .bind(kind)
-    .bind(n)
-    .bind(ms)
-    .bind(err)
-    .bind(qwait_ms)
-    .execute(pool)
-    .await?;
-    Ok(())
-}
-
-/// Top spans over `[since_hour, now]`, summed across hour buckets
-/// (spec T3.2). A 24 h (or 7 d) window is one indexed SQLite scan.
+/// Drop span-stat rows past retention. Nothing writes the table since the
+/// hourly counters replaced the Metrics tab; the prune stays until the schema
+/// drops the table with DuckDB's telemetry path.
 pub async fn prune_span_stats(pool: &SqlitePool, older_than_hour: &str) -> sqlx::Result<u64> {
     let res = sqlx::query("DELETE FROM metrics.app_span_stat WHERE bucket_hour < ?")
         .bind(older_than_hour)

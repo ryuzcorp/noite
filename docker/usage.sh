@@ -72,7 +72,7 @@ def delta(section, key):
     b = (before.get(section) or {}).get(key, 0)
     a = (after.get(section) or {}).get(key, 0)
     return a - b
-for section in ("spawns", "s3_ops", "duckdb"):
+for section in ("spawns", "s3_ops"):
     keys = sorted(set((before.get(section) or {})) | set((after.get(section) or {})))
     if keys:
         print(f"[{section}] " + "  ".join(f"{k}=+{delta(section,k)}" for k in keys))

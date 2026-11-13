@@ -2,9 +2,8 @@
 //! before/after from the same harness, so all recurring work is counted here.
 //!
 //! What is tracked:
-//! - subprocess spawns by program (`aws`, `duckdb`, `git`, `celld`, `bun`),
+//! - subprocess spawns by program (`aws`, `git`, `celld`, `bun`),
 //! - S3 operations by verb, with bytes up and down,
-//! - DuckDB runs by purpose (`ingest`, `spans`, `logs`, `compact`, legacy),
 //! - snapshot uploads with bytes,
 //! - live SSE loops by kind (gauge, not cumulative),
 //! - scale-to-zero transitions (apps slept / woken / wake failures).
@@ -19,7 +18,6 @@ struct Counters {
     s3_ops: Mutex<HashMap<String, u64>>,
     s3_up: Mutex<HashMap<String, u64>>,
     s3_down: Mutex<HashMap<String, u64>>,
-    duckdb: Mutex<HashMap<String, u64>>,
     snapshots: Mutex<(u64, u64)>, // (uploads, bytes)
     sse: Mutex<HashMap<String, i64>>,
     /// Scale to zero: apps parked by the sweep / woken by a request.
@@ -31,7 +29,6 @@ static COUNTERS: LazyLock<Counters> = LazyLock::new(|| Counters {
     s3_ops: Mutex::new(HashMap::new()),
     s3_up: Mutex::new(HashMap::new()),
     s3_down: Mutex::new(HashMap::new()),
-    duckdb: Mutex::new(HashMap::new()),
     snapshots: Mutex::new((0, 0)),
     sse: Mutex::new(HashMap::new()),
     sleep: Mutex::new(HashMap::new()),
@@ -68,11 +65,6 @@ pub fn count_s3(verb: &str, bytes_up: u64, bytes_down: u64) {
     if bytes_down > 0 {
         bump(&c.s3_down, verb, bytes_down);
     }
-}
-
-/// One DuckDB run for `purpose` (`ingest`, `compact`, …).
-pub fn count_duckdb(purpose: &str) {
-    bump(&counters().duckdb, purpose, 1);
 }
 
 /// One state-snapshot upload of `bytes` (post-compression).
@@ -177,7 +169,6 @@ pub fn snapshot() -> serde_json::Value {
         "s3_ops": map_snapshot(&c.s3_ops),
         "s3_bytes_up": map_snapshot(&c.s3_up),
         "s3_bytes_down": map_snapshot(&c.s3_down),
-        "duckdb": map_snapshot(&c.duckdb),
         "snapshots": { "uploads": uploads, "bytes": bytes },
         "sleep": map_snapshot(&c.sleep),
         "sse": c.sse.lock().ok().map(|m| {
@@ -193,14 +184,13 @@ pub fn snapshot() -> serde_json::Value {
 
 #[cfg(test)]
 mod tests {
-    use super::{count_duckdb, count_s3, count_snapshot, snapshot, sse_enter, sse_exit};
+    use super::{count_s3, count_snapshot, snapshot, sse_enter, sse_exit};
 
     // The counters are process-wide and other tests (the API parity suite's
     // S3 stub) bump real verbs concurrently: count under keys nothing else uses.
     #[test]
     fn admin_stats_shape() {
         count_s3("stats-test-verb", 3, 5);
-        count_duckdb("stats-test-purpose");
         count_snapshot(10);
         sse_enter("stats-test-kind");
         sse_exit("stats-test-kind");
@@ -208,7 +198,6 @@ mod tests {
         assert_eq!(v["s3_ops"]["stats-test-verb"], 1);
         assert_eq!(v["s3_bytes_up"]["stats-test-verb"], 3);
         assert_eq!(v["s3_bytes_down"]["stats-test-verb"], 5);
-        assert_eq!(v["duckdb"]["stats-test-purpose"], 1);
         assert_eq!(v["sse"]["stats-test-kind"], 0);
         assert!(v["snapshots"]["uploads"].as_u64().is_some_and(|n| n >= 1));
         assert!(v["rss_bytes"].is_number());

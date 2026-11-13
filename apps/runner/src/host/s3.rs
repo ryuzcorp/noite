@@ -983,6 +983,97 @@ pub async fn s3_list_delimited(cfg: &Config, bucket: &str, prefix: &str) -> anyh
     Ok(listings_json(&objects, &prefixes))
 }
 
+/// One delimited listing as `(keys directly under prefix, child prefixes)`.
+/// The telemetry reader walks hour directories with it instead of expanding a
+/// glob, so an hour with no files costs one empty page, not a failed query.
+pub(crate) async fn s3_list_dir(
+    cfg: &Config,
+    bucket: &str,
+    prefix: &str,
+) -> anyhow::Result<(Vec<String>, Vec<String>)> {
+    let (objects, prefixes) = s3_list_raw(cfg, bucket, prefix, Some("/")).await?;
+    Ok((objects.into_iter().map(|o| o.key).collect(), prefixes))
+}
+
+/// Download one object's whole body into memory, refusing to buffer more than
+/// `max_bytes`. `Ok(None)` means the key vanished between the listing and the
+/// read (a concurrent compaction or celld's retention sweep): the caller
+/// treats that as an idle file, never as a failed pass.
+///
+/// Unlike [`s3_get_bytes`], this never touches the disk: a telemetry object is
+/// decoded from the buffer, so the body streams straight into it. The cap is
+/// enforced from `Content-Length` before the body is read and again while it
+/// streams, so a store that lies about the length cannot OOM the runner.
+pub(crate) async fn s3_get_object(
+    cfg: &Config,
+    key: &str,
+    max_bytes: usize,
+) -> anyhow::Result<Option<bytes::Bytes>> {
+    match with_s3_retry("download", key, || get_object_once(cfg, key, max_bytes)).await {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(error) if is_not_found(&error) => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+async fn get_object_once(
+    cfg: &Config,
+    key: &str,
+    max_bytes: usize,
+) -> Result<bytes::Bytes, S3Fail> {
+    use futures::StreamExt;
+    let (handle, creds) = s3_bucket(cfg, &cfg.s3_bucket).map_err(S3Fail::Final)?;
+    let url = handle
+        .get_object(Some(&creds), key)
+        .sign(Duration::from_secs(PRESIGN_SECS));
+    let resp = match http_client()
+        .get(url)
+        .timeout(Duration::from_secs(60))
+        .send()
+        .await
+    {
+        Ok(resp) => resp,
+        Err(e) => {
+            return Err(S3Fail::Retryable(anyhow::anyhow!(
+                "s3 download {key} transport: {e:#}"
+            )));
+        }
+    };
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = bounded_text_or_empty(resp, Duration::from_secs(30)).await;
+        return Err(classify_status("download", key, status, &body));
+    }
+    if resp
+        .content_length()
+        .is_some_and(|len| len > max_bytes as u64)
+    {
+        return Err(S3Fail::Final(anyhow::anyhow!(
+            "s3 download {key}: object is larger than the {max_bytes}-byte cap"
+        )));
+    }
+    let mut out = bytes::BytesMut::new();
+    let mut stream = resp.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = match chunk {
+            Ok(chunk) => chunk,
+            Err(e) => {
+                return Err(S3Fail::Retryable(anyhow::anyhow!(
+                    "s3 download {key} body: {e:#}"
+                )));
+            }
+        };
+        if out.len() + chunk.len() > max_bytes {
+            return Err(S3Fail::Final(anyhow::anyhow!(
+                "s3 download {key}: object is larger than the {max_bytes}-byte cap"
+            )));
+        }
+        out.extend_from_slice(&chunk);
+    }
+    super::stats::count_s3("download", 0, out.len() as u64);
+    Ok(out.freeze())
+}
+
 /// `HEAD` probe: true when the object exists.
 pub async fn s3_object_exists(cfg: &Config, bucket: &str, key: &str) -> bool {
     let Ok((handle, creds)) = s3_bucket(cfg, bucket) else {

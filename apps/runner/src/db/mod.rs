@@ -92,8 +92,7 @@ pub use metrics::{
     last_request_us, list_app_logs, list_app_metrics, prune_app_devices, prune_app_hours,
     prune_app_logs, prune_app_metrics, prune_app_paths, prune_app_refs, prune_span_stats,
     record_access_hit, replace_app_hour, replace_app_hour_lat, replace_app_logs,
-    replace_app_metric_usage, replace_span_stat, set_metric_watermarks, set_telemetry_replay,
-    AccessHit, AccessTrace, AppHourValues,
+    set_metric_watermarks, set_telemetry_replay, AccessHit, AccessTrace, AppHourValues,
 };
 pub use void_cohost::{delete_environment_hashes, get_cohost_hash, set_cohost_hash};
 
@@ -275,9 +274,6 @@ mod tests {
         let url = format!("sqlite:{}?mode=rwc", dir.join("noite.sqlite").display());
         {
             let pool = connect(&url).await.expect("first boot");
-            replace_app_metric_usage(&pool, "a", "", "2026-09-30T12:36:00Z", 5, 4, 10)
-                .await
-                .expect("metric");
             add_app_metric_cpu(&pool, "a", "", "2026-09-30T12:36:00Z", 1)
                 .await
                 .expect("cpu");

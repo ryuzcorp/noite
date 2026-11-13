@@ -1,126 +1,11 @@
-//! Ingest chunk planning, fleet globs and DuckDB query building: what window
-//! to read, which Parquet files name it, and how to run the query.
+//! Ingest chunk planning: what window to read, which hour directories name it,
+//! and how a failed fleet is backed off. The Parquet listing and decode live
+//! in [`super::otel`].
 
 use crate::config::Config;
-use crate::host::{exec, stats};
 
 use super::cpu::otel_flush_ms;
 use super::MetricsState;
-
-fn endpoint_host(endpoint: &str) -> String {
-    endpoint
-        .strip_prefix("http://")
-        .or(endpoint.strip_prefix("https://"))
-        .unwrap_or(endpoint)
-        .to_string()
-}
-
-/// Coerce a DuckDB JSON field to i64 — the -json writer emits BIGINT sums as
-/// STRINGS ("51644") and small integers as numbers (4). Handle both.
-pub(super) fn json_i64(v: &serde_json::Value, key: &str) -> i64 {
-    let path = format!("/{key}");
-    let Some(f) = v.pointer(path.as_str()) else {
-        return 0;
-    };
-    if let Some(n) = f.as_i64() {
-        return n;
-    }
-    f.as_str().and_then(|s| s.parse::<i64>().ok()).unwrap_or(0)
-}
-
-/// Runtime caps every telemetry query carries. DuckDB's own defaults are the
-/// machine: all cores and 80% of RAM, which on a small install puts a single
-/// ingest or compaction scan larger than every resident fleet together. The
-/// cap is explicit so the box OOMs nothing; a scan that outgrows it spills to
-/// `<work_dir>/duckdb-tmp` instead, bounded by `RUNNER_DUCKDB_TEMP_MB`.
-pub(super) fn duckdb_settings(cfg: &Config) -> String {
-    let mut out = format!(
-        "SET threads={}; SET memory_limit='{}MiB';",
-        cfg.duckdb_threads.max(1),
-        cfg.duckdb_memory_mb,
-    );
-    if cfg.duckdb_temp_mb > 0 {
-        // Paths and sizes ride in SQL strings: a quote in RUNNER_WORK_DIR
-        // must not end the literal.
-        let temp = format!("{}/duckdb-tmp", cfg.work_dir.trim_end_matches('/')).replace('\'', "''");
-        out.push_str(&format!(
-            " SET temp_directory='{temp}'; SET max_temp_directory_size='{}MiB';",
-            cfg.duckdb_temp_mb,
-        ));
-    }
-    out
-}
-
-/// Spill root for every telemetry DuckDB invocation.
-pub(super) fn spill_dir(cfg: &Config) -> std::path::PathBuf {
-    std::path::Path::new(&cfg.work_dir).join("duckdb-tmp")
-}
-
-/// Best-effort removal of spill entries older than `min_age`. DuckDB removes
-/// its own temp directory on a clean exit; a timeout kill leaves it behind,
-/// and stale bytes count against `max_temp_directory_size`, which would
-/// otherwise wedge every later pass. The age filter keeps a live query's
-/// files untouched; `min_age` of zero clears everything and is only safe
-/// before the first query (boot).
-pub(super) fn sweep_spill(cfg: &Config, min_age: std::time::Duration) {
-    let Ok(entries) = std::fs::read_dir(spill_dir(cfg)) else {
-        return;
-    };
-    let now = std::time::SystemTime::now();
-    for entry in entries.flatten() {
-        let path = entry.path();
-        // `symlink_metadata`: never follow a link a tenant or a crash could
-        // have planted, either to read the target's age or to delete through
-        // it. A link is removed as a link.
-        let Ok(meta) = std::fs::symlink_metadata(&path) else {
-            continue;
-        };
-        let stale = meta
-            .modified()
-            .ok()
-            .and_then(|modified| now.duration_since(modified).ok())
-            .is_some_and(|age| age >= min_age);
-        if !stale {
-            continue;
-        }
-        let _ = if meta.file_type().is_dir() {
-            std::fs::remove_dir_all(&path)
-        } else {
-            std::fs::remove_file(&path)
-        };
-    }
-}
-
-/// Seconds a spilled entry may sit before a failed pass sweeps it. Long
-/// enough that a query still spilling is never touched (directory mtimes
-/// only move on entry creation), short enough that a killed pass does not
-/// pin the spill cap until the next restart.
-pub(super) const SPILL_SWEEP_AGE: std::time::Duration = std::time::Duration::from_secs(3600);
-
-/// One single-quoted DuckDB SQL literal. A doubled quote is the only escape
-/// DuckDB needs, and store fields or bucket keys may contain one.
-pub(super) fn sql_lit(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "''"))
-}
-
-/// S3 connection options (PATH style, plain HTTP) as DuckDB SET statements —
-/// no CREATE SECRET, so the -json output carries no DDL glue lines. The docs
-/// prescribe exactly these two for an S3-compatible plain-HTTP endpoint.
-/// Every interpolated field is a quoted literal: the store secret must not
-/// end the statement, and an operator typo must fail one query, not the
-/// whole telemetry pass.
-pub(super) fn s3_setup(cfg: &Config, query: &str) -> String {
-    format!(
-        "SET s3_region={}; SET s3_endpoint={}; SET s3_url_style='path'; \
-         SET s3_access_key_id={}; SET s3_secret_access_key={}; SET s3_use_ssl=false; {} {}",
-        sql_lit(&cfg.aws_region),
-        sql_lit(&endpoint_host(&cfg.s3_endpoint)),
-        sql_lit(&cfg.aws_access_key_id),
-        sql_lit(&cfg.aws_secret_access_key),
-        duckdb_settings(cfg),
-        query,
-    )
-}
 
 /// Bucket prefix one telemetry source writes under. The key is a fleet key:
 /// a production slug maps to its celld `--bucket` (`fleets/<slug>`), an
@@ -156,8 +41,7 @@ pub(super) fn floor_hour_us(us: i64) -> i64 {
     us.div_euclid(3_600_000_000) * 3_600_000_000
 }
 /// Hours of complete history one catch-up chunk names. Small enough to keep a
-/// single DuckDB scan and its SQLite writes bounded; a 30-day backlog is ~30
-/// chunks.
+/// single read and its SQLite writes bounded; a 30-day backlog is ~30 chunks.
 const CATCHUP_CHUNK_HOURS: i64 = 24;
 
 /// Hour-chunks one ingest pass commits. Bounds how long an outage catch-up can
@@ -168,7 +52,7 @@ pub(super) const MAX_CHUNKS_PER_PASS: usize = 2;
 
 /// How long a fleet whose chunk failed waits before the runner retries it.
 /// Long enough that a persistently broken fleet does not fail the shared pass
-/// every tick, short enough that a transient S3/DuckDB error heals quickly.
+/// every tick, short enough that a transient S3 error heals quickly.
 const INGEST_RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_secs(120);
 
 /// The watermark a fleet's next chunk should start from, or `None` when the
@@ -212,7 +96,7 @@ pub(super) fn back_off_ingest(state: &mut MetricsState, slug: &str, from: i64) {
 /// most `max_chunks` of them. Complete hours are `CATCHUP_CHUNK_HOURS` wide;
 /// the hour the cutoff falls in is always last and may be partial (`until_us`
 /// == cutoff_us). The ingest REPLACES every window it reads, so the tiling
-/// only decides how much one DuckDB query touches — never what is counted.
+/// only decides how much one pass reads — never what is counted.
 pub(super) fn plan_chunks(
     after_us: i64,
     cutoff_us: i64,
@@ -233,113 +117,43 @@ pub(super) fn plan_chunks(
     out
 }
 
-/// Parquet globs for one fleet's telemetry over `[from_us, to_us]`. celld
-/// partitions the files by node and by hour
-/// (`telemetry/{kind}/<node>/<yyyy>/<mm>/<dd>/<hh>/<id>.parquet`), and DuckDB
-/// opens every file a glob names — so a tick names only the hours its window
-/// touches instead of the whole retention (a 10 s window names one or two
-/// hour directories). The node stays a wildcard so history written by an
-/// earlier node id still aggregates.
-pub(super) fn telemetry_globs(
-    cfg: &Config,
-    slug: &str,
-    kind: &str,
-    from_us: i64,
-    to_us: i64,
-) -> Vec<String> {
-    let prefix = telemetry_prefix(slug);
+/// The hour directories one fleet's window touches, as celld partitions them
+/// (`telemetry/{kind}/<node>/<yyyy>/<mm>/<dd>/<hh>/`). A tick names only the
+/// hours its window touches instead of the whole retention (a 30 s window
+/// names one or two hour directories); the node stays a wildcard so history
+/// written by an earlier node id still reads.
+///
+/// The walk and its clamps are the old glob expansion's, so a chunk covers
+/// exactly the files the old DuckDB glob named: start floored to the hour (a
+/// window that starts mid-hour must still read its trailing partial hour),
+/// clamped to the retention floor (celld has already deleted older objects),
+/// and bounded to `retention_days * 24 + 1` hours so a stale watermark after
+/// a long outage cannot name thousands of directories.
+pub(super) fn telemetry_hours(cfg: &Config, from_us: i64, to_us: i64) -> Vec<String> {
     let Some(mut hour) = chrono::DateTime::from_timestamp_micros(from_us.max(0)) else {
-        return vec![format!(
-            "s3://{}/{prefix}/telemetry/{kind}/*/*/*/*/*/*.parquet",
-            cfg.s3_bucket
-        )];
+        return Vec::new();
     };
     let Some(last) = chrono::DateTime::from_timestamp_micros(to_us.max(0)) else {
         return Vec::new();
     };
     let floor = chrono::Utc::now() - chrono::Duration::days(cfg.telemetry_retention_days);
     if hour < floor {
-        // Older than retention: celld has deleted those objects already.
         hour = floor;
     }
-    // Truncate to the hour: the walk below steps whole hours, so starting
-    // mid-hour would skip the trailing partial hour when a window crosses
-    // a boundary (and its files would never aggregate — the watermark still
-    // advances past them).
     let truncated = hour.timestamp().div_euclid(3600) * 3600;
     if let Some(t) = chrono::DateTime::from_timestamp_secs(truncated) {
         hour = t;
     }
-    let mut globs = Vec::new();
-    // Bound the expansion: callers pass narrow windows, but a stale
-    // watermark after a long outage must not name thousands of hours.
+    let mut hours = Vec::new();
     let max_hours = (cfg.telemetry_retention_days * 24 + 1) as usize;
-    while hour <= last && globs.len() < max_hours {
-        globs.push(format!(
-            "s3://{}/{prefix}/telemetry/{kind}/*/{}/{}/{}/{}/*.parquet",
-            cfg.s3_bucket,
-            hour.format("%Y"),
-            hour.format("%m"),
-            hour.format("%d"),
-            hour.format("%H"),
-        ));
+    while hour <= last && hours.len() < max_hours {
+        hours.push(hour.format("%Y/%m/%d/%H").to_string());
         let Some(next) = hour.checked_add_signed(chrono::Duration::hours(1)) else {
             break;
         };
         hour = next;
     }
-    globs
-}
-
-/// Remove the store keys from an error that may be logged: DuckDB echoes the
-/// failing statement, and the SQL carries `SET s3_secret_access_key`.
-pub(super) fn redact_store_keys(error: anyhow::Error, cfg: &Config) -> anyhow::Error {
-    let mut message = format!("{error:#}");
-    for secret in [&cfg.aws_access_key_id, &cfg.aws_secret_access_key] {
-        if secret.is_empty() {
-            continue;
-        }
-        // The error may echo the raw value or the SQL-escaped one.
-        let escaped = secret.replace('\'', "''");
-        for form in [secret.as_str(), escaped.as_str()] {
-            message = message.replace(form, "***");
-        }
-    }
-    anyhow::anyhow!("{message}")
-}
-
-pub(super) async fn duckdb_json(cfg: &Config, sql: &str, purpose: &str) -> anyhow::Result<String> {
-    stats::count_duckdb(purpose);
-    // SQL on stdin, never argv: it carries the store secret (the platform
-    // root keys), and `/proc/<pid>/cmdline` is world-readable while tenant
-    // build processes share the PID namespace. `-json` keeps the output
-    // shape identical to `-c`.
-    let result = exec::run_cmd_stdin(
-        "/usr/local/bin/duckdb",
-        &["-json"],
-        sql.as_bytes(),
-        None,
-        &[],
-        std::time::Duration::from_secs(30),
-    )
-    .await
-    .map(|out| String::from_utf8_lossy(&out).into_owned());
-    if result.is_err() {
-        // A timeout kills the CLI without its clean exit, leaving its spill
-        // behind; stale bytes count against the cap and would wedge the next
-        // passes (see `sweep_spill`).
-        sweep_spill(cfg, SPILL_SWEEP_AGE);
-    }
-    result.map_err(|error| redact_store_keys(error, cfg))
-}
-
-/// True when duckdb failed only because the window has no parquet (idle):
-/// a glob that matched nothing, or an expanded file list that came up empty.
-/// The tick distinguishes this from a real error: idle completes the chunk
-/// (there is nothing to read), a real error holds the watermark for a retry.
-pub(super) fn is_idle_telemetry_err(err: &anyhow::Error) -> bool {
-    let msg = err.to_string();
-    msg.contains("No files found") || msg.contains("needs at least one file")
+    hours
 }
 
 #[cfg(test)]
@@ -350,129 +164,6 @@ mod tests {
 
     const H: i64 = 1_767_225_600_000_000; // 2026-01-01T00:00:00Z in micros
     const HOUR_US: i64 = 3_600_000_000;
-
-    #[test]
-    fn duckdb_settings_cap_memory_threads_and_spill() {
-        let mut cfg = crate::config::config_for_tests();
-        cfg.work_dir = "/data/runner".into();
-        cfg.duckdb_memory_mb = 256;
-        cfg.duckdb_threads = 1;
-        cfg.duckdb_temp_mb = 1024;
-        let sql = s3_setup(&cfg, "SELECT 1");
-        assert!(sql.contains("SET threads=1;"), "{sql}");
-        assert!(sql.contains("SET memory_limit='256MiB';"), "{sql}");
-        assert!(
-            sql.contains("SET temp_directory='/data/runner/duckdb-tmp';"),
-            "{sql}"
-        );
-        assert!(
-            sql.contains("SET max_temp_directory_size='1024MiB';"),
-            "{sql}"
-        );
-        // The caps precede the query, so they apply to it.
-        assert!(sql.ends_with("SELECT 1"), "{sql}");
-    }
-
-    #[test]
-    fn duckdb_spill_can_be_left_to_duckdb() {
-        let mut cfg = crate::config::config_for_tests();
-        cfg.duckdb_temp_mb = 0;
-        let sql = duckdb_settings(&cfg);
-        assert!(!sql.contains("temp_directory"), "{sql}");
-        assert!(!sql.contains("max_temp_directory_size"), "{sql}");
-    }
-
-    #[test]
-    fn duckdb_paths_escape_sql_literals() {
-        let mut cfg = crate::config::config_for_tests();
-        cfg.work_dir = "/data/it's".into();
-        cfg.duckdb_temp_mb = 64;
-        let sql = duckdb_settings(&cfg);
-        assert!(
-            sql.contains("temp_directory='/data/it''s/duckdb-tmp'"),
-            "{sql}"
-        );
-    }
-
-    #[test]
-    fn duckdb_literals_escape_quotes() {
-        assert_eq!(sql_lit("plain"), "'plain'");
-        assert_eq!(sql_lit("it's"), "'it''s'");
-    }
-
-    #[test]
-    fn s3_setup_quotes_every_interpolated_field() {
-        let mut cfg = crate::config::config_for_tests();
-        cfg.aws_region = "us'east".into();
-        cfg.aws_access_key_id = "key'one".into();
-        cfg.aws_secret_access_key = "sec'ret".into();
-        let sql = s3_setup(&cfg, "SELECT 1");
-        assert!(sql.contains("SET s3_region='us''east';"), "{sql}");
-        assert!(sql.contains("SET s3_access_key_id='key''one';"), "{sql}");
-        assert!(
-            sql.contains("SET s3_secret_access_key='sec''ret';"),
-            "{sql}"
-        );
-        assert!(!sql.contains("sec'ret'"), "unescaped secret in {sql}");
-    }
-
-    #[test]
-    fn duckdb_errors_do_not_echo_store_keys() {
-        let mut cfg = crate::config::config_for_tests();
-        cfg.aws_access_key_id = "AKIAEXAMPLE".into();
-        cfg.aws_secret_access_key = "sekret'value".into();
-        let error = anyhow::anyhow!(
-            "duckdb: Catalog Error: SET s3_access_key_id='AKIAEXAMPLE'; SET s3_secret_access_key='sekret''value';"
-        );
-        let message = format!("{:#}", redact_store_keys(error, &cfg));
-        assert!(!message.contains("AKIAEXAMPLE"), "{message}");
-        assert!(!message.contains("sekret"), "{message}");
-        assert!(message.contains("***"), "{message}");
-    }
-
-    #[test]
-    fn spill_sweep_clears_stale_entries_and_tolerates_a_missing_dir() {
-        let dir = crate::testutil::TempDir::new("noite-spill-sweep");
-        let mut cfg = crate::config::config_for_tests();
-        cfg.work_dir = dir.path().to_string_lossy().into_owned();
-        let spill = spill_dir(&cfg);
-        std::fs::create_dir_all(spill.join("dead")).expect("spill subdir");
-        std::fs::write(spill.join("dead/query.tmp"), b"bytes").expect("spill file");
-        // A pass that cannot have left anything old keeps it.
-        sweep_spill(&cfg, std::time::Duration::from_secs(86_400));
-        assert!(spill.join("dead/query.tmp").exists());
-        // Boot sweeps everything.
-        sweep_spill(&cfg, std::time::Duration::ZERO);
-        assert!(!spill.join("dead/query.tmp").exists());
-        // A link inside the spill dir is removed as a link; its target (which
-        // may be outside the directory) survives.
-        let outside = dir.path().join("outside.txt");
-        std::fs::write(&outside, b"keep").expect("outside file");
-        #[cfg(unix)]
-        {
-            std::fs::create_dir_all(&spill).expect("spill root");
-            std::os::unix::fs::symlink(&outside, spill.join("planted")).expect("symlink");
-            sweep_spill(&cfg, std::time::Duration::ZERO);
-            assert!(!spill.join("planted").exists());
-            assert!(
-                outside.exists(),
-                "the sweep must never delete through a link"
-            );
-        }
-        // No directory at all is a no-op, never a panic.
-        std::fs::remove_dir_all(&spill).expect("remove spill");
-        sweep_spill(&cfg, std::time::Duration::ZERO);
-    }
-
-    #[test]
-    fn idle_err_detects_no_files() {
-        let e = anyhow::anyhow!("duckdb: No files found that match the pattern");
-        assert!(is_idle_telemetry_err(&e));
-        let e = anyhow::anyhow!("IO Error: read_parquet needs at least one file to read");
-        assert!(is_idle_telemetry_err(&e));
-        let e2 = anyhow::anyhow!("connection refused");
-        assert!(!is_idle_telemetry_err(&e2));
-    }
 
     #[test]
     fn chunks_tile_the_gap_in_bounded_hours() {
@@ -550,68 +241,59 @@ mod tests {
     }
 
     #[test]
-    fn telemetry_globs_name_each_sources_prefix() {
+    fn hour_walk_tiles_the_window_and_clamps_to_retention() {
         let _env = crate::config::ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let cfg = crate::config::Config::from_env().expect("config");
+        let mut cfg = crate::config::Config::from_env().expect("config");
+        cfg.telemetry_retention_days = 30;
         let now = now_us();
         let (from, to) = (now - HOUR_US, now);
-        let control = telemetry_globs(&cfg, crate::host::control::SLUG, "traces", from, to);
-        assert!(!control.is_empty());
-        let control_root = format!("s3://{}/control/telemetry/traces/", cfg.s3_bucket);
-        assert!(
-            control.iter().all(|g| g.starts_with(&control_root)),
-            "{control:?}"
+        let hours = telemetry_hours(&cfg, from, to);
+        // Two hour directories: the one we started in and the current one.
+        assert_eq!(hours.len(), 2, "{hours:?}");
+        assert_eq!(
+            hours[0],
+            chrono::DateTime::from_timestamp_micros(from)
+                .expect("hour")
+                .format("%Y/%m/%d/%H")
+                .to_string()
         );
-        let tenant = telemetry_globs(&cfg, "blog", "traces", from, to);
-        assert!(!tenant.is_empty());
-        let tenant_root = format!("s3://{}/fleets/blog/telemetry/traces/", cfg.s3_bucket);
-        assert!(
-            tenant.iter().all(|g| g.starts_with(&tenant_root)),
-            "{tenant:?}"
+        // A window that ends exactly on an hour boundary names that hour.
+        let boundary = floor_hour_us(now);
+        assert_eq!(telemetry_hours(&cfg, boundary - HOUR_US, boundary).len(), 2);
+        // A window wholly inside one hour names one directory.
+        assert_eq!(telemetry_hours(&cfg, boundary, boundary + 1).len(), 1);
+        // Starting mid-hour still reaches the trailing partial hour: the walk
+        // is hour-aligned, so a boundary-crossing window is never truncated.
+        let mid = boundary + 60_000_000;
+        assert_eq!(telemetry_hours(&cfg, mid, boundary + HOUR_US + 1).len(), 2);
+        // A stale watermark older than retention clamps to the floor instead
+        // of naming months of directories; the cap is retention*24+1.
+        let ancient = now - 400 * 86_400_000_000;
+        assert_eq!(
+            telemetry_hours(&cfg, ancient, now).len(),
+            (30 * 24 + 1) as usize
         );
-        // An environment fleet globs only its own prefix.
-        for kind in ["traces", "logs"] {
-            let globs = telemetry_globs(&cfg, "blog.preview", kind, from, to);
-            assert!(!globs.is_empty());
-            let root = format!("s3://{}/envs/blog/preview/telemetry/{kind}/", cfg.s3_bucket);
-            assert!(
-                globs.iter().all(|g| g.starts_with(&root)),
-                "{kind}: {globs:?}"
-            );
-        }
+        // A window wholly older than the floor names nothing: celld deleted
+        // those objects already, and the old glob expansion returned no file
+        // for the same reason.
+        let old = now - 31 * 86_400_000_000;
+        assert!(telemetry_hours(&cfg, old, old + HOUR_US).is_empty());
     }
 
     /// Preview environments write their telemetry under `envs/<slug>/<label>/`
-    /// (their own `--bucket`), globbed from the environment's own fleet key —
+    /// (their own `--bucket`), listed from the environment's own fleet key —
     /// so an environment's rows land on the environment, never on the app.
     #[test]
-    fn environment_telemetry_globs_its_own_prefix_only() {
-        let _env = crate::config::ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let cfg = crate::config::Config::from_env().expect("config");
-        let now = now_us();
-        let (from, to) = (now - HOUR_US, now);
-        for kind in ["traces", "logs"] {
-            let globs = telemetry_globs(&cfg, "blog", kind, from, to);
-            assert!(
-                globs
-                    .iter()
-                    .all(|g| !g.contains("/envs/") && !g.contains("envs/blog")),
-                "{kind}: {globs:?}"
-            );
-            let env_globs = telemetry_globs(&cfg, "blog.preview", kind, from, to);
-            assert!(
-                env_globs
-                    .iter()
-                    .all(|g| g.contains("/envs/blog/preview/") && !g.contains("/fleets/")),
-                "{kind}: {env_globs:?}"
-            );
-        }
+    fn telemetry_prefix_follows_the_source_bucket_for_every_kind() {
         assert_eq!(telemetry_prefix(crate::host::control::SLUG), "control");
         assert_eq!(telemetry_prefix("blog"), "fleets/blog");
         assert_eq!(telemetry_prefix("blog.preview"), "envs/blog/preview");
+        // The hour walk itself is prefix-agnostic; the reader joins the two
+        // (see `otel::chunk_files`) and a production fleet can never name an
+        // environment's directory because `telemetry_prefix` never yields one.
+        assert!(!telemetry_prefix("blog").contains("envs/"));
+        assert!(telemetry_prefix("blog.preview").contains("envs/blog/preview"));
     }
 }
