@@ -25,10 +25,11 @@ endif
 # relative to the first -f file's directory (docker/), so no
 # --project-directory flag (which podman-compose rejects outright).
 #
-# Deliberately `override … :=` and not `?=`: neither an environment value nor
-# `make … COMPOSE=…` on the command line may drop `-p $(PROJECT)` and land back
-# in the default project. `COMPOSE_CMD` is the knob for another engine.
-override COMPOSE := $(COMPOSE_CMD) -p $(PROJECT) -f docker/compose.yaml
+# COMPOSE itself is assembled below, once every overlay is known: it is
+# `override … :=` so neither an environment value nor `make … COMPOSE=…` can
+# drop `-p $(PROJECT)` and land back in the default project, and that also
+# means a plain `COMPOSE += …` would be ignored — extend COMPOSE_FILES.
+COMPOSE_FILES := -f docker/compose.yaml
 
 # NOTE: keep conditionals in quoted form and avoid `$(if …)` — the repo linter
 # runs shellcheck in bash mode on Makefiles, where `$(if …)` parses as an if-
@@ -45,8 +46,13 @@ override COMPOSE := $(COMPOSE_CMD) -p $(PROJECT) -f docker/compose.yaml
 # wins, otherwise a localhost-family BASE_DOMAIN means single.
 _TENANCY := $(shell NOITE_TENANCY='$(NOITE_TENANCY)' BASE_DOMAIN='$(or $(BASE_DOMAIN),localhost)' sh -c '. docker/lib.sh && is_multi_tenancy && echo multi || echo single')
 ifeq ($(_TENANCY),multi)
-COMPOSE += -f docker/compose.multi.yaml
+COMPOSE_FILES += -f docker/compose.multi.yaml
 endif
+
+# Every compose invocation in this file, with the project first: a compose
+# file's `name:` is only a default and must never decide which stack a target
+# touches. `COMPOSE_CMD` is the knob for another engine.
+override COMPOSE := $(COMPOSE_CMD) -p $(PROJECT) $(COMPOSE_FILES)
 
 # The compose file bind-mounts the host engine socket (`DOCKER_SOCKET`,
 # default /var/run/docker.sock). Rootless Podman has none there, and unlike
