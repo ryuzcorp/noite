@@ -6,9 +6,11 @@
 //! (browser, os) pair, and accumulates hour buckets in SQLite.
 //!
 //! The same line is the request feed for the hourly counters
-//! (`metrics/hourly.rs`): its status class, latency and timestamp fold into the
-//! fleet's open hour inside the line's own transaction, so a line is counted
-//! exactly once or not at all.
+//! (`metrics/hourly.rs`): the fleet's status class, latency and timestamp fold
+//! into its open hour inside the line's own transaction, so a line is counted
+//! exactly once or not at all. Only lines a fleet's own `reverse_proxy`
+//! answered count ([`served_by_fleet`]) — a redirect, a gate refusal, an edge
+//! 429 or an error page the edge rendered itself is not a request.
 //!
 //! Privacy: only the classified pair is stored — raw user-agents and
 //! client IPs never leave this module (neither is parsed). The error index
@@ -234,6 +236,9 @@ struct Line {
     duration_ms: Option<i64>,
     /// The edge's status class: 5xx is the error count the counters carry.
     error: bool,
+    /// Whether the fleet's own `reverse_proxy` answered. Only these lines
+    /// enter the hourly counters — see [`served_by_fleet`].
+    served: bool,
     /// The `traceID` fleet sites log (`TENANT_TRACE` in the static edge
     /// config, `traceparent` on tenant/custom/env requests) with the request
     /// it names, for the error ingest (host/errors.rs). Non-fleet log lines
@@ -263,6 +268,30 @@ fn is_control_host(host: &str, control_hosts: &[String]) -> bool {
     control_hosts
         .iter()
         .any(|candidate| candidate.trim().to_lowercase() == bare)
+}
+
+/// Whether the line's response came from the fleet's own `reverse_proxy`.
+///
+/// The static edge config appends three fields to every serving-site line
+/// (see `host::caddy`): `noite_upstream` is the upstream the last
+/// `reverse_proxy` chose, `noite_edge_upstream` is the fleet upstream the
+/// route table picked, and `noite_edge_error` marks a `handle_errors` page.
+/// A fleet answered only when a proxy ran, on exactly the route's upstream,
+/// and the edge did not render its own error page. The tenant's own 4xx/5xx
+/// still counts: its fleet produced the response. A redirect, a gate refusal
+/// (the hop's API upstream), an edge 429 (no proxy ran) and the starting page
+/// do not — otherwise one unauthenticated request per sleep window could keep
+/// any idle app awake and inflate its counters.
+fn served_by_fleet(v: &serde_json::Value) -> bool {
+    let field = |name: &str| {
+        v.pointer(&format!("/{name}"))
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+    };
+    let upstream = field("noite_upstream");
+    !upstream.is_empty()
+        && upstream == field("noite_edge_upstream")
+        && field("noite_edge_error").is_empty()
 }
 
 fn parse_line(
@@ -325,6 +354,7 @@ fn parse_line(
         .and_then(serde_json::Value::as_f64)
         .map(|secs| (secs * 1_000.0).round().max(0.0) as i64);
     let (browser, os) = device_classify(ua);
+    let served = served_by_fleet(&v);
     let trace = v
         .pointer("/traceID")
         .and_then(|x| x.as_str())
@@ -355,6 +385,7 @@ fn parse_line(
         ts_us,
         duration_ms,
         error: status >= 500,
+        served,
         browser,
         os,
         path: path.to_string(),
@@ -480,18 +511,24 @@ async fn apply_line(tail: &mut Tail<'_>, l: &Line) -> anyhow::Result<()> {
     };
     let mut tx = tail.pool.begin().await?;
     db::record_access_hit(&mut tx, &hit).await?;
-    hourly::record_request(
-        &mut tx,
-        hourly::Key {
-            app_id: &l.app_id,
-            environment_id: &l.environment_id,
-            bucket_hour: &l.bucket,
-        },
-        l.ts_us,
-        l.duration_ms,
-        l.error,
-    )
-    .await?;
+    // The hourly counters and the idle clock they feed are fleet activity:
+    // an edge-answered line (redirect, gate refusal, 429, starting page)
+    // neither served the app nor proves anyone used it. The device/path
+    // counters above stay edge-wide, as they always were.
+    if l.served {
+        hourly::record_request(
+            &mut tx,
+            hourly::Key {
+                app_id: &l.app_id,
+                environment_id: &l.environment_id,
+                bucket_hour: &l.bucket,
+            },
+            l.ts_us,
+            l.duration_ms,
+            l.error,
+        )
+        .await?;
+    }
     tx.commit().await?;
     Ok(())
 }
@@ -677,6 +714,124 @@ mod tests {
             .map(|p| p.requests)
             .sum();
         assert_eq!(ok_hits, 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The line's own log fields decide whether the fleet answered. The
+    /// static edge config logs the proxy's upstream, the route's fleet
+    /// upstream and a marker on `handle_errors` pages.
+    fn served_line(
+        host: &str,
+        status: u16,
+        ts: f64,
+        upstream: Option<&str>,
+        edge_upstream: Option<&str>,
+        edge_error: bool,
+    ) -> String {
+        let mut v = serde_json::json!({
+            "request": {
+                "host": host,
+                "uri": "/x?y=1",
+                "method": "GET",
+                "headers": {"User-Agent": ["curl/8.18.0"], "Referer": [""]},
+            },
+            "status": status,
+            "ts": ts,
+            "duration": 0.012,
+        });
+        if let Some(upstream) = upstream {
+            v["noite_upstream"] = upstream.into();
+        }
+        if let Some(edge) = edge_upstream {
+            v["noite_edge_upstream"] = edge.into();
+        }
+        if edge_error {
+            v["noite_edge_error"] = "1".into();
+        }
+        format!("{v}\n")
+    }
+
+    /// Fix: only a line the fleet's own `reverse_proxy` answered moves the
+    /// hourly counters. The edge's own answers — the `:80` redirect, a
+    /// `forward_auth` gate refusal, a rate-limit 429, the starting page — used
+    /// to count too, so one unauthenticated request per sleep window kept any
+    /// app awake and inflated its metrics. The tenant's own 4xx still counts.
+    #[tokio::test]
+    async fn edge_answered_lines_never_move_the_counters() {
+        let dir = std::env::temp_dir().join(format!(
+            "noite-accesslog-served-{}",
+            crate::models::new_id()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let log = dir.join("access.log");
+        let fleet = "127.0.0.1:9001";
+        let api = "127.0.0.1:9000";
+        let ts = 1_767_225_600.0;
+        let lines = [
+            // The :80 site answers a 308 itself; no proxy ran.
+            served_line("blog.localhost", 308, ts, None, None, false),
+            // forward_auth refused: the hop's own upstream is the runner API.
+            served_line("blog.localhost", 401, ts, Some(api), Some(fleet), false),
+            // An edge rate-limit answer: the route's upstream is known, the
+            // proxy never ran.
+            served_line("blog.localhost", 429, ts, None, Some(fleet), false),
+            // A fleet that is down still leaves its upstream in the
+            // placeholder; `handle_errors` marks the page it rendered.
+            served_line("blog.localhost", 503, ts, Some(fleet), Some(fleet), true),
+            // Served: 200 and the tenant's own 401 both count.
+            served_line(
+                "blog.localhost",
+                200,
+                ts + 10.0,
+                Some(fleet),
+                Some(fleet),
+                false,
+            ),
+            served_line(
+                "blog.localhost",
+                401,
+                ts + 20.0,
+                Some(fleet),
+                Some(fleet),
+                false,
+            ),
+        ];
+        std::fs::write(&log, lines.concat()).expect("write log");
+        let mut cfg = crate::config::config_for_tests();
+        cfg.caddy_access_log = log.display().to_string();
+        let pool = crate::db::connect(&format!(
+            "sqlite:{}?mode=rwc",
+            dir.join("noite.sqlite").display()
+        ))
+        .await
+        .expect("file db");
+        let slug_id = HashMap::from([("blog".to_string(), "app-id".to_string())]);
+        let mut requests = RequestIndex::default();
+        super::tick(
+            &pool,
+            &cfg,
+            &slug_id,
+            &HashMap::new(),
+            &HashMap::new(),
+            &mut requests,
+        )
+        .await
+        .expect("tick consumes the log");
+        let mut conn = pool.acquire().await.expect("connection");
+        let row = crate::db::get_app_hour(&mut conn, "app-id", "", &super::hour_bucket(ts as i64))
+            .await
+            .expect("read hour")
+            .expect("the served lines created the hour");
+        assert_eq!(row.requests, 2, "only the two fleet-served lines count");
+        assert_eq!(
+            row.errors, 0,
+            "the edge's starting page is not an app error"
+        );
+        assert_eq!(
+            row.last_request_us,
+            (ts + 20.0) as i64 * 1_000_000,
+            "the idle clock only sees a fleet-served request"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

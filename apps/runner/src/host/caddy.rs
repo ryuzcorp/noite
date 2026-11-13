@@ -26,6 +26,33 @@ pub(crate) const TRACE_MAP: &[&str] = &[
 pub(crate) const TRACE_HEADER: &str = "traceparent \"00-{noite_trace}-{noite_span}-01\"";
 pub(crate) const TRACE_LOG_APPEND: &str = "log_append traceID {noite_trace}";
 
+/// Which reverse_proxy — if any — answered this request, as the upstream it
+/// chose. Caddy fills `{http.reverse_proxy.upstream.hostport}` only once a
+/// reverse_proxy handler picked an upstream, so every line carries the last
+/// proxy that ran: the fleet's for a served request, the runner API's for a
+/// refused `forward_auth` hop, nothing for a redirect/429/404 the edge
+/// answered itself.
+///
+/// `header_up`/`request_header` markers are NOT usable for this: the access
+/// log records the request headers as received, before any handler mutates
+/// them (measured on 2.11.9), so a header the proxy adds never appears.
+pub(crate) const UPSTREAM_LOG_APPEND: &str =
+    "log_append noite_upstream {http.reverse_proxy.upstream.hostport}";
+
+/// The fleet upstream the route table picked for this request. Compared with
+/// [`UPSTREAM_LOG_APPEND`] it tells a fleet-served line from an edge answer:
+/// only a served request has both equal (a gate refusal leaves the API
+/// upstream, an edge 429 leaves none). The fleet's own 4xx counts — the
+/// tenant answered it.
+pub(crate) const EDGE_UPSTREAM_LOG_APPEND: &str =
+    "log_append noite_edge_upstream {http.vars.edge_upstream}";
+
+/// Set on every line `handle_errors` produced (the starting page and Caddy's
+/// default 502). The failed upstream still shows up as the reverse_proxy
+/// placeholder, so without this marker a fleet that is down would look
+/// served and a broken app would never idle.
+pub(crate) const EDGE_ERROR_LOG_APPEND: &str = "log_append noite_edge_error 1";
+
 /// Answer when a fleet stays unready past `lb_try_duration` (503) or refuses
 /// the connection while it restarts (502): a page that retries by itself,
 /// and `Retry-After` for API clients, instead of Caddy's empty error.
@@ -319,7 +346,11 @@ fn route_block(cfg: &Config) -> Vec<String> {
 /// responses (load shedding) pass through unchanged. Fleet/env routes get
 /// the starting page; control/api keep Caddy's default 502.
 fn errors_block() -> Vec<String> {
-    let mut out = vec!["handle_errors {".into(), "\thandle @fleetish_err {".into()];
+    let mut out = vec![
+        "handle_errors {".into(),
+        format!("\t{EDGE_ERROR_LOG_APPEND}"),
+        "\thandle @fleetish_err {".into(),
+    ];
     for line in STARTING_HEADERS {
         out.push(format!("\t\t{line}"));
     }
@@ -343,6 +374,8 @@ fn serving_site(addr: &str, tls: bool, cfg: &Config) -> Vec<String> {
     out.push("\t\tformat json".into());
     out.push("\t}".into());
     out.push(format!("\t{TRACE_LOG_APPEND}"));
+    out.push(format!("\t{UPSTREAM_LOG_APPEND}"));
+    out.push(format!("\t{EDGE_UPSTREAM_LOG_APPEND}"));
     out.push("\tencode zstd gzip".into());
     for line in TRACE_MAP {
         out.push(format!("\t{line}"));
@@ -595,6 +628,39 @@ mod tests {
         // The plain branch carries the same timeouts and pooling, no hold.
         assert!(out.contains("dial_timeout 5s"), "{out}");
         assert!(out.contains("flush_interval -1"), "{out}");
+    }
+
+    #[test]
+    fn access_log_records_who_answered() {
+        // The counters and the idle clock read only lines a fleet's own
+        // reverse_proxy answered. The log carries the proxy's upstream and the
+        // route's fleet upstream (equal only when the fleet answered), and
+        // `handle_errors` marks the pages the edge produced itself.
+        let cfg = prod_config();
+        let out = static_caddyfile(&cfg);
+        assert!(
+            out.contains("log_append noite_upstream {http.reverse_proxy.upstream.hostport}"),
+            "{out}"
+        );
+        assert!(
+            out.contains("log_append noite_edge_upstream {http.vars.edge_upstream}"),
+            "{out}"
+        );
+        assert!(out.contains("log_append noite_edge_error 1"), "{out}");
+        let errors = out.split("handle_errors {").nth(1).expect("errors block");
+        assert!(
+            errors.starts_with("\n\t\tlog_append noite_edge_error 1"),
+            "{errors}"
+        );
+        // The :80 redirect site answers with a 308 and never proxies: its
+        // lines must not carry a served upstream at all.
+        let redirect = out
+            .split(":80 {")
+            .nth(1)
+            .and_then(|rest| rest.split(":443 {").next())
+            .expect("redirect site");
+        assert!(!redirect.contains("noite_upstream"), "{redirect}");
+        assert!(!redirect.contains("noite_edge_upstream"), "{redirect}");
     }
 
     #[test]
