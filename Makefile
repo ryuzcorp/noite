@@ -15,9 +15,12 @@ export
 
 # `PROJECT` becomes an engine argv (`-p`), so it is validated once, from the
 # environment (`$$PROJECT` is never spliced into shell text): a stray value
-# fails here instead of turning into a compose flag.
-_PROJECT_OK := $(shell printf '%s' "$$PROJECT" | grep -qE '^[a-z0-9][a-z0-9_-]*$$' && echo ok)
-ifeq ($(_PROJECT_OK),)
+# fails here instead of turning into a compose flag. The check is on the WHOLE
+# value — a newline would pass a per-line `grep` and then split a recipe into a
+# second shell command (`NR > 1` refuses that). (`case` cannot be used: make
+# counts the `)` in every `case` pattern and ends `$(shell …)` early.)
+_PROJECT_OK := $(shell printf '%s' "$$PROJECT" | awk 'NR > 1 { bad = 1 } /^[a-z0-9][a-z0-9_-]*$$/ { ok = 1 } END { print (ok && !bad) ? "ok" : "bad" }')
+ifneq ($(_PROJECT_OK),ok)
 $(error PROJECT="$(PROJECT)" is not a compose project name (lowercase a-z, 0-9, '-' and '_', starting with a letter or digit))
 endif
 
@@ -29,6 +32,10 @@ endif
 # `override … :=` so neither an environment value nor `make … COMPOSE=…` can
 # drop `-p $(PROJECT)` and land back in the default project, and that also
 # means a plain `COMPOSE += …` would be ignored — extend COMPOSE_FILES.
+# Scope of the guarantee: `-p $(PROJECT)` only. COMPOSE_CMD and COMPOSE_FILES
+# stay overridable because they are spliced into every recipe and an operator
+# legitimately picks an engine there (self-supplied: an override can already
+# run any command through make).
 COMPOSE_FILES := -f docker/compose.yaml
 
 # NOTE: keep conditionals in quoted form and avoid `$(if …)` — the repo linter

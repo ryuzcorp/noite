@@ -103,8 +103,16 @@ survey() {
   if [[ "$NOITE_KEEP_DATA" != "1" ]]; then
     info "volumes            $n_volumes $(volumes | tr '\n' ' ')"
   fi
-  if [[ ! -d "$NOITE_DIR" ]] && ((n_containers == 0 && n_volumes == 0)); then
-    info "nothing to remove"
+  if ((n_containers == 0 && n_volumes == 0)); then
+    # The install directory may still exist (it holds the secrets and the
+    # shared images), but this project has no stack: never walk on into
+    # confirm() — its prompt reads /opt/noite/.env and would look like the
+    # right target while the removal wipes an install that is still running.
+    if [[ -d "$NOITE_DIR" ]]; then
+      info "no stack for project $PROJECT (set PROJECT/COMPOSE_PROJECT_NAME)"
+    else
+      info "nothing to remove"
+    fi
     exit 0
   fi
 }

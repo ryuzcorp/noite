@@ -21,6 +21,9 @@ set -eu
 cd "$(dirname "$0")/.."
 # shellcheck source=docker/lib.sh
 . "$(dirname "$0")/lib.sh"
+# `.env` must not override the caller's choice: `make backup PROJECT=x`
+# exports x, and load_env would set PROJECT from the file over it.
+_PROJECT_ARG="${PROJECT:-}"
 load_env
 detect_engine
 
@@ -30,9 +33,10 @@ TOKEN="${RUNNER_TOKEN:-dev-runner-token}"
 # set NOITE_API_URL and skip this).
 API_HOST_HEADER="${NOITE_API_HOST_HEADER:-api.${BASE_DOMAIN:-noite.localhost}}"
 # Same project the Makefile drives: `make backup PROJECT=x` sets PROJECT,
-# a direct run follows COMPOSE_PROJECT_NAME (compose.yaml's `name:` default
-# interpolates the same variable), else the default install.
-PROJECT="${PROJECT:-${COMPOSE_PROJECT_NAME:-noite}}"
+# a direct run follows `PROJECT`/`COMPOSE_PROJECT_NAME` from .env
+# (compose.yaml's `name:` default interpolates the same variable), else the
+# default install.
+PROJECT="${_PROJECT_ARG:-${PROJECT:-${COMPOSE_PROJECT_NAME:-noite}}}"
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 DEST="${1:-backups/${STAMP}}"
 VOLUMES="noite-data rustfs-data"
@@ -120,7 +124,10 @@ done
 echo "==> start the stack again"
 # podman-compose occasionally wedges after the containers are already up; a
 # backup that succeeded must not report failure because of that.
-timeout 300 ce up -d || echo "note: restart did not return cleanly — check 'make up' and 'make doctor'"
+# `timeout` can only exec a program, never the `ce` function (it would exit
+# 127 and leave the stack down), so the restart spells the command out.
+timeout 300 $COMPOSE -p "$PROJECT" -f docker/compose.yaml up -d ||
+  echo "note: restart did not return cleanly — check 'make up' and 'make doctor'"
 echo
 echo "backup complete: ${DEST}"
 echo "  restore it with: make restore FROM=${DEST}"

@@ -49,9 +49,13 @@ sha=$(curl -fsS --max-time 10 -H 'Accept: application/vnd.github.sha' \
   "https://api.github.com/repos/ryuzcorp/noite/commits/$ref") || sha="$ref"
 script=$(curl -fsSL "https://raw.githubusercontent.com/ryuzcorp/noite/$sha/docker/$name.sh")
 
-# NOITE_* settings pass through sudo, which would otherwise drop them.
+# NOITE_* settings pass through sudo, which would otherwise drop them. PROJECT
+# and COMPOSE_PROJECT_NAME select which compose project uninstall removes, so
+# they must survive the sudo hop too: dropping them would silently target the
+# default install.
 vars=()
 for v in "${!NOITE_@}"; do vars+=("$v=${!v}"); done
+for v in PROJECT COMPOSE_PROJECT_NAME; do [[ -n "${!v:-}" ]] && vars+=("$v=${!v}"); done
 vars+=("NOITE_REF=$sha")
 
 if [[ "$(id -u)" -ne 0 ]]; then
