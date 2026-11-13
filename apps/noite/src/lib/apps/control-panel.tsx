@@ -1,5 +1,6 @@
 import { AdminAppsPanel } from "../admin/apps";
 import { AdminInvitesPanel } from "../admin/invites";
+import { AdminSettingsPanel } from "../admin/settings";
 import { AdminUsersPanel } from "../admin/users";
 import { fleetState, telemetryAvailable } from "../app-detail/control-fleet";
 import type { FleetState } from "../app-detail/control-fleet";
@@ -26,9 +27,11 @@ import { adminStatus, session } from "../resources";
 //! telemetry into the same ingest as every app (reserved key `_control`, no
 //! `app` row — see runner `host/control.rs`), so the Overview, Metrics, Errors
 //! and Logs surfaces reuse the tenant panels unchanged. Instance
-//! administration (Users, Apps, Invites) shares the page. Overview lists the
-//! control D1, which opens on its own `/storage/_control/...` page like any
-//! app's storage.
+//! administration shares the page: Users, Apps and Invites are the CRUD tabs,
+//! and Settings holds the instance-wide switches (anonymous telemetry,
+//! release check) that used to live in `/account`'s retired Admin tab.
+//! Overview lists the control D1, which opens on its own
+//! `/storage/_control/...` page like any app's storage.
 //!
 //! Visibility mirrors the server gate: a real instance admin, never an
 //! impersonated session — and the runner streams behind these panels re-check
@@ -53,6 +56,7 @@ const TABS = [
   { id: "users", label: "Users" },
   { id: "apps", label: "Apps" },
   { id: "invites", label: "Invites" },
+  { id: "settings", label: "Settings" },
 ] as const;
 
 type TabId = (typeof TABS)[number]["id"];
@@ -68,6 +72,7 @@ const NEEDS_FLEET: Record<TabId, boolean> = {
   logs: true,
   metrics: true,
   overview: false,
+  settings: false,
   users: false,
 };
 
@@ -230,6 +235,7 @@ const ControlAppDetailBody = ({ fleet }: { fleet: FleetState }) => {
       {active === "users" ? <AdminUsersPanel /> : null}
       {active === "apps" ? <AdminAppsPanel /> : null}
       {active === "invites" ? <AdminInvitesPanel /> : null}
+      {active === "settings" ? <AdminSettingsPanel /> : null}
     </DetailShell>
   );
 };

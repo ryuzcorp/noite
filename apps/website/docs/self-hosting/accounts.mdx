@@ -33,7 +33,7 @@ It prints a code and where to enter it. The code is the same kind the email carr
 
 ## The admin home
 
-An instance admin sees the control plane itself in `/apps`: the **Noite** card ("admin"), which is not a user app but a link to a dedicated detail page. That page is the whole admin home — the control plane's telemetry tabs (Overview, Metrics, Errors, Logs) next to instance administration (Users, Apps, Invites), with the control database linked from Overview. Every tab re-checks the same rule server-side: a real instance admin, never an impersonated session.
+An instance admin sees the control plane itself in `/apps`: the **Noite** card ("admin"), which is not a user app but a link to a dedicated detail page. That page is the whole admin home — the control plane's telemetry tabs (Overview, Metrics, Errors, Logs) next to instance administration (Users, Apps, Invites) and the instance switches (**Settings**: anonymous telemetry, release check), with the control database linked from Overview. `/account` is personal settings only: profile, passkeys, API keys, the account's own invite codes and agent connect. Every tab re-checks the same rule server-side: a real instance admin, never an impersonated session.
 
 **Ban** in the Users tab revokes the account's sessions and deletes its API keys, so `git push`, event ingest and `/mcp` stop immediately. The ban is checked on every request as well, so a key that somehow survived the deletion is still refused. Unbanning does not restore a deleted key: the account mints a new one.
 

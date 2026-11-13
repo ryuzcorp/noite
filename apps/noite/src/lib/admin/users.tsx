@@ -1,4 +1,5 @@
-//! Admin tab: every account — search, page, ban, role, delete, impersonate.
+//! Users tab of the control page (`/apps/_control?t=users`): every account —
+//! search, page, ban, role, delete, impersonate.
 
 import { useRouter } from "@ilha/void";
 import { atom } from "ilha";

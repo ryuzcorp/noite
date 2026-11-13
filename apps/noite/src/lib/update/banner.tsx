@@ -1,6 +1,6 @@
 import { atom } from "ilha";
 
-import { isInstanceAdmin } from "../account/admin-telemetry";
+import { isInstanceAdmin } from "../admin/access";
 import { resourceValue } from "../resource";
 import { updateStatus } from "../resources";
 import { X } from "../ui/icons";

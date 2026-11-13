@@ -21,7 +21,8 @@ import {
   withInviteLock,
 } from "./helpers";
 
-// Instance admin page (`/apps/_control?t=users|apps|invites`): every effect is
+// Instance admin page (`/apps/_control?t=users|apps|invites|settings`): every
+// effect is
 // verified for real — through the worker's own admin API, the runner API, or
 // the affected account's own session — never just that the UI renders. One
 // second account serves the whole file (tests are serial); the deployed sample
@@ -91,6 +92,7 @@ const adminListInvites = async (
 
 type AdminActionInput =
   | { count: number }
+  | { enabled: boolean }
   | { page: number; query: string }
   | { role: string; userId: string };
 
@@ -274,6 +276,20 @@ test("the users tab finds the second account and refuses it admin surfaces", asy
 
   expect(denied.status).toBe(422);
   expect(denied.body.errors?.form).toContain("Admin only");
+
+  // The Settings tab (the instance switches moved off `/account`) is behind
+  // the same gate, and so is the action behind its cards.
+  await second.goto("/apps/_control?t=settings");
+  await expect(second.getByText("App not found.")).toBeVisible();
+
+  const deniedTelemetry = await adminPost(
+    second.request,
+    "/api/telemetry/setTelemetry",
+    { enabled: false }
+  );
+
+  expect(deniedTelemetry.status).toBe(422);
+  expect(deniedTelemetry.body.errors?.form).toContain("Instance admins only");
 });
 
 test("make admin hands the second account a working admin gate", async ({
@@ -303,6 +319,12 @@ test("make admin hands the second account a working admin gate", async ({
   await second.goto("/apps/_control?t=users");
   await second.reload();
   await expect(second.locator("#admin-user-search")).toBeVisible();
+
+  // The instance switches open for a real admin too.
+  await second.goto("/apps/_control?t=settings");
+  await expect(
+    second.getByRole("heading", { name: "Instance settings" })
+  ).toBeVisible();
 });
 
 test("the apps tab stops and starts another account's app", async ({

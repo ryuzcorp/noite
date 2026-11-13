@@ -209,8 +209,8 @@ export const adminOverview = apiActionNoInput(async ({ env, request }) => {
 
   // The probe answers with the real state (signed out, plain, impersonating
   // or banned) instead of one flat "not admin": the side bar, the control
-  // page and the Admin tab all read this field, and only the instance-admin
-  // state may see them.
+  // page and the update banner all read this field, and only the
+  // instance-admin state may see them.
   let authority: InstanceAuthority = Authority.Anonymous();
 
   try {

@@ -5,9 +5,9 @@ import { runnerUpdateGet, runnerUpdateSet } from "../runner";
 import { apiAction, apiActionNoInput } from "./api";
 import { requireControlAdmin } from "./session.server";
 
-/** The opt-out update-check state behind the `/account` admin section. A real
- * instance admin only, never an impersonated session: the runner takes any
- * bearer call, so the gate has to live here. */
+/** The opt-out update-check state behind the control page's Settings tab. A
+ * real instance admin only, never an impersonated session: the runner takes
+ * any bearer call, so the gate has to live here. */
 export const getUpdateStatus = apiActionNoInput(async ({ env, request }) => {
   await requireControlAdmin(request, env);
 
