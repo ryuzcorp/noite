@@ -83,6 +83,19 @@ const trackedRef = (gitRef: string): string => {
 /** A `FLAG_<NAME>` row is a feature flag: the toggle writes `1`/`0`. */
 const isFlag = (name: string) => name.startsWith("FLAG_");
 
+/** The branch a header deploys, as one muted chip everywhere — an
+ * environment's own ref and Production's default branch. The runner's
+ * `GitRefs.defaultBranch` is the source (never a literal `main`). */
+export const BranchChip = ({ branch }: { branch: string }) => (
+  <span
+    class="text-base-content/60 inline-flex min-w-0 items-center gap-1 text-xs"
+    title={`Deploys branch ${branch}`}
+  >
+    <GitBranch class="h-3 w-3 shrink-0" />
+    <span class="truncate">{branch}</span>
+  </span>
+);
+
 /** What a deploy group's header says after its name, identically for
  * Production and each environment: a status dot, the live commit and the
  * host it serves. `desiredState` makes a deliberate stop paint neutral even
@@ -428,10 +441,6 @@ const GroupApp = defineApp({
     const header = environmentHeaderState(env);
     const pending = groupBusy(model);
 
-    // Say what it tracks only when the label is not the branch (a branch name
-    // the label had to sanitize).
-    const tracks = branch === env.label ? null : branch;
-
     // Scroll a deep-linked group into view once, waiting out the first ref.
     const box = atom.lazy(newLiveRef<HTMLElement>)();
 
@@ -492,12 +501,7 @@ const GroupApp = defineApp({
                 {model.expanded ? <ChevronUp /> : <ChevronDown />}
               </button>
               <span class="text-lg font-semibold">{env.label}</span>
-              {tracks ? (
-                <span class="text-base-content/60 inline-flex items-center gap-1 text-xs">
-                  <GitBranch class="h-3 w-3" />
-                  {tracks}
-                </span>
-              ) : null}
+              {branch ? <BranchChip branch={branch} /> : null}
               <DeployGroupMeta
                 appId={props.appId}
                 desiredState={env.desiredState}

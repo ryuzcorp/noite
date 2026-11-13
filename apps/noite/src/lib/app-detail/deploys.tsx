@@ -50,6 +50,7 @@ import type {
   RowModel,
 } from "./deploy.machine";
 import {
+  BranchChip,
   CreateEnvironmentDialog,
   DeployGroupMeta,
   EnvironmentGroup,
@@ -402,11 +403,9 @@ const FinishedBuildLog = ({
   const log = resourceValue(res.state())?.log;
 
   return (
-    <div class="bg-base-200 rounded-lg p-3">
-      <pre class="max-h-64 overflow-auto rounded font-mono text-xs whitespace-pre-wrap">
-        {log ?? "(loading build log…)"}
-      </pre>
-    </div>
+    <pre class="max-h-64 overflow-auto font-mono text-xs whitespace-pre-wrap">
+      {log ?? "(loading build log…)"}
+    </pre>
   );
 };
 
@@ -426,20 +425,14 @@ const BuildLogPane = ({
   tab: "build" | "deploy";
 }) => {
   if (tab === "deploy") {
-    return (
-      <div class="bg-base-200 rounded-lg p-3">
-        <RuntimeLogs appId={appId} environmentId={environmentId} />
-      </div>
-    );
+    return <RuntimeLogs appId={appId} environmentId={environmentId} />;
   }
 
   if (d.log) {
     return (
-      <div class="bg-base-200 rounded-lg p-3">
-        <pre class="max-h-64 overflow-auto rounded font-mono text-xs whitespace-pre-wrap">
-          {d.log}
-        </pre>
-      </div>
+      <pre class="max-h-64 overflow-auto font-mono text-xs whitespace-pre-wrap">
+        {d.log}
+      </pre>
     );
   }
 
@@ -614,7 +607,7 @@ const RowApp = defineApp({
           </button>
         </li>
         {open ? (
-          <li class="flex flex-col gap-2 px-4 pb-4">
+          <li class="flex flex-col gap-2 px-4 py-3">
             <div role="tablist" class="tabs tabs-border w-fit">
               <button
                 type="button"
@@ -791,6 +784,13 @@ export const DeployList = ({
   const deep = searchParam("env", { default: "" });
   const canPush = capabilities(myRole).push;
 
+  // Production deploys the app repo's default branch (the runner's
+  // `Target::Production.git_ref()`); the refs resource is the one source for
+  // its name, and it is unknown until the repo answers.
+  const productionBranch = resourceValue(
+    forgeRefs(appId).state()
+  )?.defaultBranch;
+
   return (
     <div class="flex w-full flex-col gap-4">
       <div class="flex items-center justify-between gap-2">
@@ -811,6 +811,7 @@ export const DeployList = ({
       <div class="rounded-box border-base-300 bg-base-200 w-full overflow-hidden border shadow-md">
         <div class="bg-base-100 border-base-300 flex w-full flex-wrap items-center gap-x-3 gap-y-2 border-b px-4 py-3">
           <span class="text-lg font-semibold">Production</span>
+          {productionBranch ? <BranchChip branch={productionBranch} /> : null}
           {app ? (
             <DeployGroupMeta
               appId={appId}

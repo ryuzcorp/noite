@@ -111,7 +111,7 @@ describe("settingsSectionsFor", () => {
 });
 
 describe("settingsSectionLabel", () => {
-  test("headings read the way the page's contents nav lists them", () => {
+  test("headings read the way the page words them", () => {
     expect(settingsSectionLabel("domains")).toBe("Domains");
     expect(settingsSectionLabel("env")).toBe("Environment");
     expect(settingsSectionLabel("danger")).toBe("Danger zone");

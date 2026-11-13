@@ -509,10 +509,10 @@ export const MetricsCard = ({
         <section class="card bg-base-100 dark:bg-base-200 border-base-300 w-full border shadow-md">
           <div class="card-body gap-4">
             <div class="flex items-center justify-between gap-2">
-              <h3 class="m-0 flex items-center gap-2 text-lg font-semibold">
-                Metrics · {windowLabel(hours)}
+              <h3 class="m-0 flex min-w-0 items-center gap-2 text-lg font-semibold">
+                <span class="truncate">Metrics · {windowLabel(hours)}</span>
                 <span
-                  class="tooltip tooltip-bottom sm:tooltip-right inline-flex opacity-60"
+                  class="tooltip tooltip-bottom sm:tooltip-right inline-flex shrink-0 opacity-60"
                   data-tip={`What the edge logged · ${windowLabel(hours)}: served requests, 5xx errors, p50/p95 latency, peak and mean memory, and CPU per hour.`}
                 >
                   <Info />

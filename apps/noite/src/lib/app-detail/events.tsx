@@ -230,7 +230,7 @@ const SendEventsCard = ({
   return (
     <section class="card bg-base-100 dark:bg-base-200 border-base-300 w-full border shadow-md">
       <div class="card-body gap-2">
-        <h3 class="m-0 text-lg font-semibold">Send events</h3>
+        <h2 class="m-0 text-lg font-semibold">Send events</h2>
         <p class="m-0 text-sm opacity-70">
           Server-to-server ingest with an API key (Account → API keys). The key
           needs push access on this app plus the Events scope — an Events-only
@@ -420,7 +420,7 @@ const EventsFeed = ({
         <div class="card-body gap-4">
           <div class="flex flex-wrap items-center justify-between gap-2">
             <span class="flex items-center gap-2 tracking-wide">
-              <h3 class="m-0 text-lg font-semibold">Events</h3>
+              <h2 class="m-0 text-lg font-semibold">Events</h2>
               <span class="badge badge-sm">{snapshot().feed.length}</span>
             </span>
             <span class="flex items-center gap-2">
@@ -540,19 +540,14 @@ export const EventsPanel = ({ appId }: { appId: string }) => {
   };
 
   return (
-    <div class="flex flex-col gap-4">
-      <div class="flex items-center justify-between gap-2">
-        <h2 class="m-0 text-lg font-semibold">Events</h2>
-      </div>
-      <EventsFeed
-        key={channel()}
-        appId={appId}
-        channel={channel}
-        clearQuery={clearQuery}
-        pageIndex={pageIndex}
-        pageSize={pageSize}
-        query={q}
-      />
-    </div>
+    <EventsFeed
+      key={channel()}
+      appId={appId}
+      channel={channel}
+      clearQuery={clearQuery}
+      pageIndex={pageIndex}
+      pageSize={pageSize}
+      query={q}
+    />
   );
 };

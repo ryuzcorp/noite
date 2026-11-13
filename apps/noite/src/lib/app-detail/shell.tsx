@@ -1,8 +1,10 @@
 /** The detail layout shared by app pages, the Noite admin page and
  * `/account`: a header (identity, actions, tabs) that stays put above a
  * scrolling tab body, and an optional side panel, like Code mode. */
+import { atom, watch } from "ilha";
 import type { View } from "ilha";
 
+import { collectRef, newLiveRef, whenLive } from "../live-ref";
 import { splitColumns } from "../ui/side-panel";
 
 export const DetailShell = ({
@@ -81,9 +83,48 @@ export const DetailTabs = ({
     list?.querySelectorAll<HTMLElement>('[role="tab"]')[next]?.focus();
   };
 
+  // The row scrolls sideways on every width, so the selected tab has to be
+  // brought into view — whether the selection came from a URL (`?t=settings`)
+  // or a keyboard move, a strip still scrolled to Overview would hide it.
+  // `aria-selected` is what ilha patches on a switch, so the observer sees
+  // every change without the bar keeping per-render state.
+  const row = atom.lazy(newLiveRef<HTMLDivElement>)();
+
+  watch.once(async ({ signal }) => {
+    const el = await whenLive(row, signal);
+
+    if (el === null || signal.aborted) {
+      return;
+    }
+
+    const selected = (): Element | null =>
+      el.querySelector('[role="tab"][aria-selected="true"]');
+
+    const reveal = (): void => {
+      selected()?.scrollIntoView({ block: "nearest", inline: "nearest" });
+    };
+
+    reveal();
+
+    const observer = new MutationObserver(reveal);
+    observer.observe(el, {
+      attributeFilter: ["aria-selected"],
+      attributes: true,
+      subtree: true,
+    });
+    signal.addEventListener("abort", () => observer.disconnect(), {
+      once: true,
+    });
+  });
+
   return (
     <div class="border-base-300 flex items-center gap-2 border-b">
-      <div class="min-w-0 flex-1 overflow-x-auto">
+      <div
+        ref={(el) => {
+          collectRef(row, el);
+        }}
+        class="min-w-0 flex-1 overflow-x-auto"
+      >
         <div
           role="tablist"
           class="tabs tabs-border w-max flex-nowrap"

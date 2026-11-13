@@ -63,7 +63,7 @@ const SETTINGS_SECTION_META = {
   { readonly adminOnly: boolean; readonly label: string }
 >;
 
-/** A section's heading, and the text of its table-of-contents link. */
+/** A section's heading text. */
 export const settingsSectionLabel = (section: SettingsSection): string =>
   SETTINGS_SECTION_META[section].label;
 
