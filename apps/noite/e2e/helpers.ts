@@ -10,6 +10,7 @@ import type {
   APIRequestContext,
   Browser,
   BrowserContext,
+  Locator,
   Page,
 } from "@playwright/test";
 
@@ -155,6 +156,15 @@ export const runnerApi = async <T>(
   // SAFETY: the runner returns raw JSON objects matching the caller's shape (runnerFetch contract — never a { body } envelope).
   return (await res.json()) as T;
 };
+
+/** The authed shell's page column — everything beside the sidebar, which
+ * lists every app by name plus the open app's "App", "Code", "Pull requests"
+ * and "Settings" rows (`$lib/apps/sidebar`). A page locator left unscoped can
+ * therefore land on the sidebar instead: with an app named "Worker Errors"
+ * open, `getByRole("link", { name: "Errors" })` matched both that app and the
+ * environment card's link. Query page content inside this scope. */
+export const pageColumn = (page: Page): Locator =>
+  page.locator(".drawer-content");
 
 /** After the create form submits: it opens the new app's page
  * (`/apps/<id>`, plus `?t=deployments` for an import or template). */
