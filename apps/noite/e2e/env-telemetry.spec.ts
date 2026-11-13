@@ -18,6 +18,7 @@ import {
   createAppWithKey,
   deleteApp,
   execGit,
+  pageColumn,
   runnerApi,
   runnerCall,
   waitForDeploy,
@@ -297,9 +298,11 @@ test(
     // the "no Open link" check runs on the rendered card, not a loading page.
     const createEnv = page.getByRole("button", { name: "Create environment" });
 
+    const column = pageColumn(page);
+
     await expect(createEnv).toBeVisible();
     await expect(
-      page.getByRole("link", { name: "Open environment" })
+      column.getByRole("link", { exact: true, name: "Open environment" })
     ).toHaveCount(0);
     await createEnv.click();
 
@@ -311,7 +314,7 @@ test(
       .getByRole("button", { exact: true, name: "Create environment" })
       .click();
     await expect(
-      page.getByRole("link", { name: "Open environment" })
+      column.getByRole("link", { exact: true, name: "Open environment" })
     ).toBeVisible({ timeout: 30_000 });
 
     const environments = await rpc<RunnerEnvironment[]>(
@@ -465,7 +468,10 @@ test(
     // --- the PR page shows the head branch's environment card ---------------
     await page.goto(`/apps/${appId}/pulls/${prNumber}`);
 
-    const card = page.getByRole("link", { name: "Open environment" });
+    const card = column.getByRole("link", {
+      exact: true,
+      name: "Open environment",
+    });
 
     await expect(card).toBeVisible();
     await expect(card).toHaveAttribute("target", "_blank");
@@ -473,17 +479,15 @@ test(
       "href",
       new RegExp(`^https?://${LABEL}\\.${SLUG}\\.`, "u")
     );
-    await expect(page.getByText("running")).toBeVisible();
+    await expect(column.getByText("running")).toBeVisible();
     await expect(
-      page.getByRole("link", { name: "Deploy log" })
+      column.getByRole("link", { exact: true, name: "Deploy log" })
     ).toHaveAttribute("href", `/apps/${appId}?t=deployments&env=${envId}`);
-    await expect(page.getByRole("link", { name: "Metrics" })).toHaveAttribute(
-      "href",
-      `/apps/${appId}?t=metrics&env=${envId}`
-    );
-    await expect(page.getByRole("link", { name: "Errors" })).toHaveAttribute(
-      "href",
-      `/apps/${appId}?t=errors&env=${envId}`
-    );
+    await expect(
+      column.getByRole("link", { exact: true, name: "Metrics" })
+    ).toHaveAttribute("href", `/apps/${appId}?t=metrics&env=${envId}`);
+    await expect(
+      column.getByRole("link", { exact: true, name: "Errors" })
+    ).toHaveAttribute("href", `/apps/${appId}?t=errors&env=${envId}`);
   }
 );
