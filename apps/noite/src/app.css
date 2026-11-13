@@ -223,3 +223,13 @@ dialog.modal.modal-end .modal-box {
     transition: none;
   }
 }
+
+/* A horizontal strip that scrolls without a visible bar (the app page's tab
+ * row on a phone): a native bar adds height under the labels and flashes
+ * while the row is scrolled. Wheel, touch and keyboard scrolling still work. */
+.no-scrollbar {
+  scrollbar-width: none;
+}
+.no-scrollbar::-webkit-scrollbar {
+  display: none;
+}

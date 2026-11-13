@@ -489,17 +489,6 @@ const GroupApp = defineApp({
         <div class="rounded-box border-base-300 bg-base-200 w-full overflow-hidden border shadow-md">
           <div class="bg-base-100 border-base-300 flex w-full flex-col gap-2 border-b px-4 py-3">
             <div class="flex w-full flex-wrap items-center gap-x-3 gap-y-2">
-              <button
-                type="button"
-                class="btn btn-sm btn-ghost btn-square -ml-2 shrink-0"
-                aria-expanded={model.expanded}
-                aria-label={`${model.expanded ? "Hide" : "Show"} ${env.label} deploy history`}
-                onclick={() => {
-                  dispatch(GroupMsg.ExpandedToggled());
-                }}
-              >
-                {model.expanded ? <ChevronUp /> : <ChevronDown />}
-              </button>
               <span class="text-lg font-semibold">{env.label}</span>
               {branch ? <BranchChip branch={branch} /> : null}
               <DeployGroupMeta
@@ -553,9 +542,13 @@ const GroupApp = defineApp({
                     }}
                   >
                     <Refresh />
-                    {model.op._tag === "Deploying"
-                      ? "Redeploying…"
-                      : "Redeploy"}
+                    {/* Icon-only on a phone, so the actions and the expander
+                     * fit one row; the label stays the accessible name. */}
+                    <span class="max-sm:sr-only">
+                      {model.op._tag === "Deploying"
+                        ? "Redeploying…"
+                        : "Redeploy"}
+                    </span>
                   </button>
                 ) : null}
                 <button
@@ -567,7 +560,7 @@ const GroupApp = defineApp({
                   }}
                 >
                   <Key />
-                  Variables
+                  <span class="max-sm:sr-only">Variables</span>
                 </button>
                 {caps.admin ? (
                   <button
@@ -592,6 +585,17 @@ const GroupApp = defineApp({
                     <Trash />
                   </button>
                 ) : null}
+                <button
+                  type="button"
+                  class="btn btn-sm btn-ghost btn-square shrink-0"
+                  aria-expanded={model.expanded}
+                  aria-label={`${model.expanded ? "Hide" : "Show"} ${env.label} deploy history`}
+                  onclick={() => {
+                    dispatch(GroupMsg.ExpandedToggled());
+                  }}
+                >
+                  {model.expanded ? <ChevronUp /> : <ChevronDown />}
+                </button>
               </span>
             </div>
             {alertText ? (

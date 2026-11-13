@@ -474,13 +474,20 @@ const DeployRowSummary = ({ appId, d }: { appId: string; d: RunnerDeploy }) => {
           "—"
         )}
       </div>
-      <div class="text-base-content/70 text-xs">
-        {intent === null ? null : <span class="mr-2">{intent}</span>}
-        {d.actor === null || d.intent === "branch" ? null : (
-          <span class="mr-2">by {d.actor}</span>
+      {/* One gap-separated chunk per fact: the date and "took 3s" each stay
+       * whole on a phone, where the old inline line broke the clock in half
+       * ("Nov 13, 8:27" / "PM took 3s"). */}
+      <div class="text-base-content/70 flex flex-wrap items-center gap-x-2 gap-y-0.5 text-xs">
+        {intent === null ? null : (
+          <span class="whitespace-nowrap">{intent}</span>
         )}
-        {formatDateTime(d.createdAt)}
-        {took === null ? null : <span class="ml-2">took {took}</span>}
+        {d.actor === null || d.intent === "branch" ? null : (
+          <span class="whitespace-nowrap">by {d.actor}</span>
+        )}
+        <span class="whitespace-nowrap">{formatDateTime(d.createdAt)}</span>
+        {took === null ? null : (
+          <span class="whitespace-nowrap">took {took}</span>
+        )}
       </div>
       {d.error === null ? null : (
         <p class="text-error m-0 text-xs break-words">{d.error}</p>
@@ -607,8 +614,12 @@ const RowApp = defineApp({
           </button>
         </li>
         {open ? (
-          <li class="flex flex-col gap-2 px-4 py-3">
-            <div role="tablist" class="tabs tabs-border w-fit">
+          <li class="flex flex-col gap-2 px-4 pt-0 pb-3">
+            {/* The strip sits on the card's content edge: daisyUI's first
+             * tab carries `--tab-p` (1rem) of its own padding, so the strip
+             * is pulled back by exactly that and its label lines up with the
+             * log text and the header above. */}
+            <div role="tablist" class="tabs tabs-border -ml-4 w-fit">
               <button
                 type="button"
                 role="tab"
