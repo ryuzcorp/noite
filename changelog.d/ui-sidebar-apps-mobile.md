@@ -6,4 +6,4 @@
 
 - The phone sidebar closes when a destination in it is tapped — an app, the app's own items, or an item in the profile menu — instead of staying open over the page it navigated to. The profile row itself still opens its menu.
 - The phone sidebar has breathing room above the Apps item, and Esc closes it and returns focus to the toggle. The toggle is a real button now, so the drawer can be opened from the keyboard too.
-- The open phone drawer now paints above the page's own stacked chrome (the sticky mobile top bar, a page's sticky tab row), instead of those bars drawing over the app list.
+- Nothing on a page can paint over the open phone drawer any more: the page column is one stacking context below `lg`, so a page's own `z-*` chrome (the sticky top bar, a sticky tab row, the app header's Deploy dropdown at `z-50`) is covered by the drawer instead of drawing through it. On phones the overlay also dims the page harder (60% instead of 40%), so the app list reads as the front layer.

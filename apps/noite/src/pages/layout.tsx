@@ -240,15 +240,9 @@ export default function DashboardLayout({ children }: { children?: View }) {
       >
         <input id="nav-drawer" type="checkbox" class="drawer-toggle" />
         {/* `lg:w-60` is the phone drawer's own width, kept at `lg` so the
-            column is 240px before the split binds (and measured from it).
-            Below `lg` it must sit above the page's own stacked chrome (the
-            sticky top bar at `z-40`, a page's sticky tab row at `z-10`):
-            daisyUI's drawer is `z-10` too and comes first in the DOM, so
-            without this those bars painted over the open drawer. At `lg` the
-            drawer is a plain grid column, and the split's handle must stay
-            reachable, so the raise is phone-only. */}
+            column is 240px before the split binds (and measured from it). */}
         <div
-          class="drawer-side max-lg:z-50 lg:w-60"
+          class="drawer-side lg:w-60"
           data-slot="resizable-panel"
           data-default-size={sidebarSplit?.[0]}
           data-morph-preserve={MORPH_PRESERVE}
@@ -345,8 +339,18 @@ export default function DashboardLayout({ children }: { children?: View }) {
           </aside>
         </div>
         <ResizeHandle label="Resize sidebar" />
+        {/* The page column is one stacking context below `lg`, so nothing it
+            renders can paint over the open phone drawer: pages carry their
+            own `z-*` chrome (the sticky top bar at `z-40`, a sticky tab row at
+            `z-10`, and the app header's Deploy dropdown at `z-50`), and any
+            of those would otherwise win by DOM order against daisyUI's
+            `z-10` drawer. An `isolate` context keeps every one of them inside
+            the column, where the drawer simply covers it. At `lg` the sidebar
+            is a pane beside the column, nothing overlaps, and the split's
+            handle keeps its own stacking. Native `<dialog>` modals use
+            `showModal()` (the top layer), so they stay above all of this. */}
         <div
-          class="drawer-content bg-base-200 dark:bg-base-100 flex min-h-screen flex-1 flex-col"
+          class="drawer-content bg-base-200 dark:bg-base-100 flex min-h-screen flex-1 flex-col max-lg:isolate"
           data-slot="resizable-panel"
           data-default-size={sidebarSplit?.[1]}
           data-morph-preserve={MORPH_PRESERVE}

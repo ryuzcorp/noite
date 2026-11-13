@@ -120,6 +120,18 @@
   --trees-selected-focused-border-color-override: var(--color-primary);
 }
 
+/* The phone nav (daisyUI `.drawer`): its overlay dims the page at 40%, which
+ * still reads too close to the page behind it under the sidebar's dense app
+ * list. On a phone the drawer is the front layer, so the page dims harder.
+ * Phones only — at `lg` the sidebar is a pane beside the page, and the
+ * overlay never shows. daisyUI sets the colour in `:checked ~ .drawer-side`,
+ * hence the same selector shape here. */
+@media (width < 64rem) {
+  .drawer-toggle:checked ~ .drawer-side > .drawer-overlay {
+    background-color: oklch(0% 0 0 / 0.6);
+  }
+}
+
 /* D1 row drawer (dialog.modal-end): slide-in from the right on open, via
  * @starting-style. Native <dialog> closes instantly, so there is no exit
  * transition — the drawer unmounts with the close. `translate` (not
