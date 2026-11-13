@@ -197,6 +197,10 @@ describe("deployIntentLabel", () => {
 
   test("an environment deploy reads as the Redeploy action", () => {
     expect(deployIntentLabel("redeploy", "abc1234def0")).toBe("Redeploy");
+    expect(
+      deployIntentLabel("branch", "abc1234def05555", "refs/heads/feature")
+    ).toBe("Deploy feature@abc1234def05");
+    expect(deployIntentLabel("branch", null, null)).toBe("Deploy branch");
   });
 
   test("an unmodelled intent reads as a plain deploy, never another trigger", () => {

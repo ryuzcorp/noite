@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use axum::{
     extract::{Path, Query, State},
+    http::StatusCode,
     response::{IntoResponse, Response},
     Json,
 };
@@ -46,6 +47,40 @@ pub async fn rollback(
     )
     .await
     .map(|(deploy_id, sha)| Json(json!({ "ok": true, "sha": sha, "deployId": deploy_id })))
+}
+
+/// Deploy one branch's current tip to production, once: the production
+/// branch (and its automatic tip deploy) stays unchanged. 202 immediately;
+/// progress follows on the deploys stream.
+#[derive(serde::Deserialize)]
+pub struct DeployBranchBody {
+    /// A branch name (`main`) or its full ref (`refs/heads/main`).
+    #[serde(rename = "ref")]
+    reference: String,
+    /// The caller's role in the app; the deploy needs `push`.
+    #[serde(default)]
+    role: Option<String>,
+}
+
+pub async fn deploy_branch(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Query(q): Query<super::environments::RoleQuery>,
+    Json(body): Json<DeployBranchBody>,
+) -> impl IntoResponse {
+    service::deploys::deploy_branch(
+        &state,
+        &id,
+        &body.reference,
+        q.role.as_deref().or(body.role.as_deref()),
+    )
+    .await
+    .map(|(deploy_id, sha)| {
+        (
+            StatusCode::ACCEPTED,
+            Json(json!({ "ok": true, "sha": sha, "deployId": deploy_id })),
+        )
+    })
 }
 
 /// `?environmentId=` — one preview environment's history; absent is

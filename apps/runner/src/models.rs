@@ -436,7 +436,10 @@ pub struct Deploy {
     pub intent: DeployIntent,
     /// Who asked for the run, when the caller could say: a profile API key's
     /// attributable label ("Ada via key ci") for a redeploy it triggered.
-    /// `None` is the automatic push/tip pipeline, which has no request.
+    /// A [`DeployIntent::Branch`] row has no request behind it, so it records
+    /// the branch ref it deployed instead — the history reads
+    /// `Deploy <branch>@<sha>`. `None` is the automatic push/tip pipeline,
+    /// which has no request.
     pub actor: Option<String>,
     pub log: String,
     /// The one-line reason a terminal run closed with: the row's own
@@ -460,6 +463,7 @@ pub struct Deploy {
 ///   [*] --> Deploy: a push, a web commit or the tip sweep
 ///   [*] --> Rollback: an operator re-runs an old successful sha
 ///   [*] --> Redeploy: an environment deploy at its ref's head
+///   [*] --> Branch: an operator deploys another branch's tip to production
 /// ```
 ///
 /// The intent is set once, when the row is created, and never changes: it
@@ -479,6 +483,10 @@ pub enum DeployIntent {
     /// An environment deployed at its ref's current head
     /// (`environments.deploy`, the UI's Redeploy).
     Redeploy,
+    /// An operator deployed one branch's current tip to production once
+    /// (`POST /v1/apps/{id}/deploy`), leaving the production branch untouched.
+    /// The row's `actor` carries the branch ref.
+    Branch,
 }
 
 impl DeployIntent {
@@ -487,10 +495,12 @@ impl DeployIntent {
             Self::Deploy => "deploy",
             Self::Rollback => "rollback",
             Self::Redeploy => "redeploy",
+            Self::Branch => "branch",
         }
     }
 
-    /// Whether the row was started by an operator action (rollback, redeploy)
+    /// Whether the row was started by an operator action (rollback, redeploy,
+    /// branch deploy)
     /// rather than by a push or the automatic tip sweep. An explicit row is
     /// what resets the automatic-deploy budget.
     pub fn is_explicit(self) -> bool {

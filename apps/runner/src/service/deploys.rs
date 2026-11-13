@@ -107,7 +107,8 @@ pub struct PreparedRollback {
     app: crate::models::App,
     /// Production, or the preview environment the sha came from.
     target: deploy::DeployTarget,
-    key: String,
+    /// The tip bundle the run reads: the ref the successful deploy came from.
+    pub key: String,
     pool: sqlx::SqlitePool,
     cfg: std::sync::Arc<crate::config::Config>,
     procs: crate::host::supervisor::ProcMap,
@@ -169,7 +170,7 @@ pub async fn prepare_rollback(
         Some(env_id) => Some(super::environments::env_or_404(state, &app.id, env_id).await?),
         None => None,
     };
-    match db::get_success_deploy(
+    let success = match db::get_success_deploy(
         &state.pool,
         &app.id,
         &sha,
@@ -177,16 +178,34 @@ pub async fn prepare_rollback(
     )
     .await
     {
-        Ok(Some(_)) => {}
+        Ok(Some(row)) => row,
         Ok(None) => return Err(ApiError::not_found("no successful deploy at that sha")),
         Err(e) => return Err(ApiError::internal(e.to_string())),
-    }
-    // The bundle lives under the ref the deploy came from: `git/<slug>/<ref>/`
-    // for a preview (mirroring `after_receive`), the main tip for production.
-    let key = match &environment {
-        Some(env) => format!("git/{}/{}/{sha}.bundle", app.slug, env.git_ref),
-        None => format!("git/{}/refs/heads/main/{sha}.bundle", app.slug),
     };
+    // The bundle lives under the ref the deploy came from: `git/<slug>/<ref>/`
+    // for a preview (mirroring `after_receive`); for production the main tip —
+    // or the branch a one-off branch deploy recorded, so rolling back to its
+    // sha fetches the bundle that exists instead of assuming `refs/heads/main`.
+    let reference = match &environment {
+        Some(env) => env.git_ref.clone(),
+        None => {
+            // Any branch success at this sha names the ref, not only the newest
+            // row: after a rollback/redeploy of that sha the newest success is
+            // a `rollback` row, which would otherwise fall back to main.
+            let branch = if success.intent == crate::models::DeployIntent::Branch {
+                success.actor.clone()
+            } else {
+                db::get_success_branch_deploy(&state.pool, &app.id, &sha)
+                    .await
+                    .map_err(|e| ApiError::internal(e.to_string()))?
+                    .and_then(|row| row.actor)
+            };
+            recorded_branch_ref(branch.as_deref())
+                .unwrap_or("refs/heads/main")
+                .to_string()
+        }
+    };
+    let key = format!("git/{}/{}/{sha}.bundle", app.slug, reference);
     let target = match environment {
         Some(env) => deploy::DeployTarget::Environment(Box::new(env)),
         None => deploy::DeployTarget::Production,
@@ -221,6 +240,176 @@ pub async fn prepare_rollback(
         logs: state.logs.clone(),
         deploying: state.deploying.clone(),
     })
+}
+
+/// A validated branch deploy whose queued row already exists: a watcher sees
+/// it before the spawned task is even scheduled.
+pub struct PreparedBranchDeploy {
+    pub deploy_id: String,
+    pub sha: String,
+    /// The tip bundle the run reads: that branch's own ref, never production's.
+    pub key: String,
+    app: crate::models::App,
+    pool: sqlx::SqlitePool,
+    cfg: std::sync::Arc<crate::config::Config>,
+    procs: crate::host::supervisor::ProcMap,
+    logs: crate::host::logs::LogState,
+    deploying: deploy::Deploying,
+}
+
+impl PreparedBranchDeploy {
+    /// Build the branch's tip into production. Explicit: a branch tip equal to
+    /// the live sha still builds, the way Redeploy does.
+    pub async fn run(self) {
+        let Self {
+            deploy_id,
+            sha,
+            key,
+            app,
+            pool,
+            cfg,
+            procs,
+            logs,
+            deploying,
+        } = self;
+        deploy::deploy_app(
+            &pool,
+            &cfg,
+            &procs,
+            &logs,
+            &deploying,
+            app,
+            deploy::DeployTarget::Production,
+            &key,
+            Some(&sha),
+            deploy::DeployTrigger::Explicit,
+            Some(&deploy_id),
+        )
+        .await;
+    }
+}
+
+/// Resolve `reference` to one branch's current tip and pre-create its deploy
+/// row. The row records `DeployIntent::Branch` and the branch ref in `actor`,
+/// so the history reads `Deploy <branch>@<sha>`.
+pub async fn prepare_branch_deploy(
+    state: &AppState,
+    id: &str,
+    reference: &str,
+    role: Option<&str>,
+) -> Result<PreparedBranchDeploy, ApiError> {
+    // The UI's Deploy button is the same operator surface as Redeploy, so it
+    // carries the same push gate.
+    super::environments::require_push(role)?;
+    let app = app_or_404(state, id).await?;
+    // Branch protection is the admin's word on how code reaches production:
+    // with a PR rule on, a push member must open a pull request instead of
+    // deploying a branch around it (the same stance as a `main` push and the
+    // web-commit path). Admins keep the override.
+    let rules = crate::db::prs::branch_rules(&state.pool, &app.id)
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+    if (rules.require_pr != 0 || rules.required_approvals > 0) && role != Some("admin") {
+        return Err(ApiError::forbidden(
+            "branch protection is on: open a pull request, or ask an admin to deploy a branch",
+        ));
+    }
+    let branch = branch_ref(reference)?;
+    let bare = crate::host::forge::read_mirror(state, &app.slug)
+        .await
+        .map_err(ApiError::from_anyhow)?;
+    let sha = crate::host::forge::resolve_user_ref(&bare, &branch)
+        .await
+        .map_err(|e| {
+            let msg = format!("{e:#}");
+            if msg.contains("not found") {
+                ApiError::not_found(msg)
+            } else {
+                ApiError::bad(msg)
+            }
+        })?;
+    // The bundle `after_receive` wrote for that branch's tip, never the
+    // production one: the branch's commit is materialized from its own ref.
+    let key = format!("git/{}/{}/{sha}.bundle", app.slug, branch);
+    let deploy_id = db::queue_deploy(
+        &state.pool,
+        &app.id,
+        None,
+        crate::models::DeployIntent::Branch,
+        &sha,
+        Some(branch.as_str()),
+    )
+    .await
+    .map_err(|e| ApiError::internal(e.to_string()))?;
+    Ok(PreparedBranchDeploy {
+        deploy_id,
+        sha,
+        key,
+        app,
+        pool: state.pool.clone(),
+        cfg: state.config.clone(),
+        procs: state.procs.clone(),
+        logs: state.logs.clone(),
+        deploying: state.deploying.clone(),
+    })
+}
+
+/// Deploy one branch's current tip to production, once. The production
+/// branch itself (and the automatic tip pipeline) is not touched: a later
+/// push to it deploys exactly as before, which is the rollback rule in
+/// `host::loop_::sweep_needs_tip` (a git tip the history already built is
+/// never pulled back over a release).
+///
+/// `reference` is a branch name (`main`) or its full ref
+/// (`refs/heads/main`); it goes through the same caller-reference guard the
+/// source views use, so a reserved namespace can never be resolved here.
+/// Returns the new deploy id and the sha; progress follows on the deploys
+/// stream.
+pub async fn deploy_branch(
+    state: &AppState,
+    id: &str,
+    reference: &str,
+    role: Option<&str>,
+) -> Result<(String, String), ApiError> {
+    let prepared = prepare_branch_deploy(state, id, reference, role).await?;
+    let out = (prepared.deploy_id.clone(), prepared.sha.clone());
+    tokio::spawn(async move { prepared.run().await });
+    Ok(out)
+}
+
+/// A branch deploy's recorded ref, validated before it becomes an S3 key: a
+/// stored row must not be able to point the bundle read outside the app's own
+/// branch namespace. `None` falls back to the production ref.
+fn recorded_branch_ref(reference: Option<&str>) -> Option<&str> {
+    let reference = reference?;
+    let name = reference.strip_prefix("refs/heads/")?;
+    if !crate::host::forge::valid_branch_name(name)
+        || crate::host::forge::is_reserved_ref(reference)
+    {
+        return None;
+    }
+    Some(reference)
+}
+
+/// The full branch ref for a caller's reference: a branch name gains the
+/// `refs/heads/` prefix, an already-qualified branch ref is kept. Anything
+/// under another `refs/` namespace (tags, hidden previews) is refused here so
+/// the history label and the bundle key always name a branch. A name that
+/// looks like a sha (`deadbeef`, `20240101`) is still a branch name: the
+/// picker only sends branches, and resolution below has no sha fallback.
+fn branch_ref(reference: &str) -> Result<String, ApiError> {
+    let name = reference.trim();
+    if name.is_empty() {
+        return Err(ApiError::bad("branch is required"));
+    }
+    let refname = if name.starts_with("refs/heads/") {
+        name.to_string()
+    } else if name.starts_with("refs/") {
+        return Err(ApiError::bad("deploy ref must be a branch"));
+    } else {
+        format!("refs/heads/{name}")
+    };
+    Ok(refname)
 }
 
 /// Re-run the pipeline at an old successful tip bundle (immutable per-sha),

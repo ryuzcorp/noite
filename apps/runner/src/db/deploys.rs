@@ -260,6 +260,28 @@ pub async fn get_success_deploy(
         .await
 }
 
+/// The newest successful production deploy of `sha` recorded as a one-off
+/// branch deploy. Rollback and the tip sweep need the ref such a run came
+/// from even after a later `rollback`/`redeploy` success row became the newest
+/// row at that sha.
+pub async fn get_success_branch_deploy(
+    pool: &SqlitePool,
+    app_id: &str,
+    sha: &str,
+) -> sqlx::Result<Option<Deploy>> {
+    let sql = format!(
+        "SELECT {DEPLOY_COLS} FROM deploy          WHERE app_id = ? AND sha = ? AND status = ? AND intent = ? AND {TARGET_CLAUSE}          ORDER BY created_at DESC LIMIT 1"
+    );
+    sqlx::query_as::<_, Deploy>(sqlx::AssertSqlSafe(sql))
+        .bind(app_id)
+        .bind(sha)
+        .bind(DeployStatus::Success.as_str())
+        .bind(DeployIntent::Branch.as_str())
+        .bind(None::<&str>)
+        .fetch_optional(pool)
+        .await
+}
+
 /// What one [`upsert_deploy`] did: the row's id, whether the write landed,
 /// and — when it did not — the terminal status that closed the row first.
 pub struct DeployUpsert {

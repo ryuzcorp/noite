@@ -90,6 +90,7 @@ describe("updateRow", () => {
 const dropdown = (patch: Partial<DropdownModel> = {}): DropdownModel => ({
   action: DropdownActionTypes.Idle(),
   appId: "app_1",
+  branch: null,
   liveSha: "aaa",
   lookup: LookupTypes.Idle(),
   ...patch,
@@ -142,6 +143,76 @@ describe("updateDropdown", () => {
     expect(first.cmd).toBeDefined();
     expect(second.cmd).toBeUndefined();
     expect(second.model).toBe(first.model);
+  });
+
+  test("picking a branch keeps it, and Deploy runs that branch once", () => {
+    const picked = updateDropdown(
+      dropdown(),
+      DropdownMsg.BranchPicked({ branch: "feature" })
+    );
+
+    expect(picked.model.branch).toBe("feature");
+
+    const deploying = updateDropdown(
+      picked.model,
+      DropdownMsg.BranchDeployRequested({ branch: "feature" })
+    );
+
+    expect(deploying.cmd).toBeDefined();
+    expect(deploying.model.action._tag).toBe("Deploying");
+  });
+
+  test("a branch deploy while another action is in flight is refused", () => {
+    const deploying = dropdown({
+      action: DropdownActionTypes.Deploying(),
+      branch: "feature",
+    });
+
+    const second = updateDropdown(
+      deploying,
+      DropdownMsg.BranchDeployRequested({ branch: "feature" })
+    );
+
+    expect(second.cmd).toBeUndefined();
+    expect(second.model).toBe(deploying);
+  });
+
+  test("an empty branch never starts a deploy", () => {
+    const result = updateDropdown(
+      dropdown(),
+      DropdownMsg.BranchDeployRequested({ branch: "" })
+    );
+
+    expect(result.cmd).toBeUndefined();
+    expect(result.model.action._tag).toBe("Idle");
+  });
+
+  test("a failed branch deploy can be retried without a reload", () => {
+    const failed = updateDropdown(
+      dropdown({
+        action: DropdownActionTypes.Failed({
+          error: "nope",
+          kind: "branch",
+        }),
+        branch: "feature",
+      }),
+      DropdownMsg.BranchDeployRequested({ branch: "feature" })
+    );
+
+    expect(failed.cmd).toBeDefined();
+    expect(failed.model.action._tag).toBe("Deploying");
+  });
+
+  test("a failed branch deploy keeps its kind so only that error paints", () => {
+    const result = updateDropdown(
+      dropdown({ action: DropdownActionTypes.Deploying() }),
+      DropdownMsg.BranchDeployFailed({ error: "nope" })
+    );
+
+    expect(result.model.action).toMatchObject({
+      error: "nope",
+      kind: "branch",
+    });
   });
 
   test("a successful action reloads the targets so the new live sha is excluded", () => {

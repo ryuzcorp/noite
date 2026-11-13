@@ -40,7 +40,9 @@ pub use apps::{
     app_state_stream, create_app, delete_app, get_app, health, list_apps, patch_app, ready,
     rename_app, retry_import, sleep_app,
 };
-pub use deploys::{cancel_deploy, deploy_log, list_deploys, list_deploys_stream, rollback};
+pub use deploys::{
+    cancel_deploy, deploy_branch, deploy_log, list_deploys, list_deploys_stream, rollback,
+};
 pub use domains::{add_domain, list_domains, remove_domain, verify_domain};
 pub use env::{delete_env, list_env, set_env};
 pub use env_gate::grant_environment;

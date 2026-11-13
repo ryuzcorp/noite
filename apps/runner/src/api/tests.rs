@@ -1469,6 +1469,192 @@ async fn git(dir: &std::path::Path, args: &[&str]) -> String {
     .unwrap_or_else(|e| panic!("git {args:?}: {e:#}"))
 }
 
+/// Deploying another branch to production resolves *that* branch's tip and
+/// reads its own tip bundle: never the production branch's sha or bundle. The
+/// row records the operator's choice (`branch` intent plus the branch ref in
+/// `actor`), which is what the history paints.
+#[tokio::test]
+async fn branch_deploy_resolves_that_branchs_tip() {
+    let h = Harness::new().await;
+    let app = h.seed_app("branch-deploy").await;
+
+    let bare = crate::host::git_http::http_bare(&h.state.config, &app.slug);
+    let work = h.dir.join("branch-deploy-work");
+    std::fs::create_dir_all(&work).expect("worktree");
+    std::fs::write(work.join("index.ts"), "export const a = 1;\n").expect("source");
+    git(&work, &["init", "-q", "--initial-branch=main", "."]).await;
+    git(&work, &["add", "-A"]).await;
+    git(&work, &["commit", "-qm", "main"]).await;
+    let main_sha = git(&work, &["rev-parse", "HEAD"]).await.trim().to_string();
+    git(&work, &["checkout", "-qb", "feature"]).await;
+    git(&work, &["commit", "-qm", "feature", "--allow-empty"]).await;
+    let feature_sha = git(&work, &["rev-parse", "HEAD"]).await.trim().to_string();
+    std::fs::create_dir_all(bare.parent().expect("mirror parent")).expect("mirror parent");
+    git(
+        &h.dir,
+        &[
+            "init",
+            "-q",
+            "--bare",
+            "--initial-branch=main",
+            bare.to_str().expect("mirror path"),
+        ],
+    )
+    .await;
+    git(
+        &work,
+        &[
+            "push",
+            "-q",
+            bare.to_str().expect("mirror path"),
+            "main:refs/heads/main",
+            "feature:refs/heads/feature",
+        ],
+    )
+    .await;
+    assert_ne!(main_sha, feature_sha);
+
+    let prepared =
+        crate::service::deploys::prepare_branch_deploy(&h.state, &app.id, "feature", Some("push"))
+            .await
+            .expect("prepare branch deploy");
+    assert_eq!(prepared.sha, feature_sha, "the branch tip, not main's");
+    assert_eq!(
+        prepared.key,
+        format!("git/{}/refs/heads/feature/{feature_sha}.bundle", app.slug),
+        "the bundle a branch deploy reads is that branch's own ref"
+    );
+
+    let row = crate::db::get_deploy(&h.state.pool, &app.id, &prepared.deploy_id)
+        .await
+        .expect("read row")
+        .expect("queued row");
+    assert_eq!(row.intent, crate::models::DeployIntent::Branch);
+    assert_eq!(row.actor.as_deref(), Some("refs/heads/feature"));
+    assert_eq!(row.sha.as_deref(), Some(feature_sha.as_str()));
+
+    // A name that looks like a sha is still a branch name.
+    git(
+        &work,
+        &[
+            "push",
+            "-q",
+            bare.to_str().expect("mirror path"),
+            "HEAD:refs/heads/20240101",
+        ],
+    )
+    .await;
+    let dated =
+        crate::service::deploys::prepare_branch_deploy(&h.state, &app.id, "20240101", Some("push"))
+            .await
+            .expect("a hex-looking branch name deploys");
+    assert_eq!(dated.sha, feature_sha);
+
+    // The branch deploy lands: a rollback to its sha must read the branch's own
+    // bundle (the main one does not hold this sha on a cold mirror).
+    crate::db::upsert_deploy(
+        &h.state.pool,
+        Some(&prepared.deploy_id),
+        &app.id,
+        None,
+        crate::models::DeployStatus::Building,
+        Some(&feature_sha),
+        "",
+    )
+    .await
+    .expect("building");
+    crate::db::upsert_deploy(
+        &h.state.pool,
+        Some(&prepared.deploy_id),
+        &app.id,
+        None,
+        crate::models::DeployStatus::Success,
+        Some(&feature_sha),
+        "",
+    )
+    .await
+    .expect("success");
+    let rollback = crate::service::deploys::prepare_rollback(&h.state, &app.id, &feature_sha, None)
+        .await
+        .expect("rollback to a branch deploy");
+    assert_eq!(
+        rollback.key,
+        format!("git/{}/refs/heads/feature/{feature_sha}.bundle", app.slug),
+        "a rollback of a branch deploy reads the branch bundle, not main's"
+    );
+
+    // The rollback lands: the newest success at the sha is now a `rollback`
+    // row, and the next rollback must still read the branch bundle.
+    crate::db::upsert_deploy(
+        &h.state.pool,
+        Some(&rollback.deploy_id),
+        &app.id,
+        None,
+        crate::models::DeployStatus::Building,
+        Some(&feature_sha),
+        "",
+    )
+    .await
+    .expect("rollback building");
+    crate::db::upsert_deploy(
+        &h.state.pool,
+        Some(&rollback.deploy_id),
+        &app.id,
+        None,
+        crate::models::DeployStatus::Success,
+        Some(&feature_sha),
+        "",
+    )
+    .await
+    .expect("rollback success");
+    let again = crate::service::deploys::prepare_rollback(&h.state, &app.id, &feature_sha, None)
+        .await
+        .expect("rollback of a rollback");
+    assert_eq!(
+        again.key,
+        format!("git/{}/refs/heads/feature/{feature_sha}.bundle", app.slug),
+        "a later rollback keeps the branch provenance"
+    );
+
+    // A ref the caller cannot see is refused before anything is queued.
+    let hidden = crate::service::deploys::prepare_branch_deploy(
+        &h.state,
+        &app.id,
+        "refs/previews/user/wip",
+        Some("push"),
+    )
+    .await;
+    assert!(hidden.is_err(), "a reserved ref must not deploy");
+
+    // A read-only collaborator cannot deploy a branch (same gate as Redeploy).
+    let forbidden =
+        crate::service::deploys::prepare_branch_deploy(&h.state, &app.id, "feature", Some("view"))
+            .await;
+    assert!(forbidden.is_err(), "deploying a branch needs push");
+
+    // Branch protection is the admin's policy, so a push member cannot deploy
+    // a branch around it; an admin keeps the override.
+    crate::db::prs::set_branch_rules(&h.state.pool, &app.id, true, 0)
+        .await
+        .expect("branch rules");
+    let protected =
+        crate::service::deploys::prepare_branch_deploy(&h.state, &app.id, "feature", Some("push"))
+            .await;
+    assert!(
+        protected.is_err(),
+        "a push member must open a pull request under branch protection"
+    );
+    let admin =
+        crate::service::deploys::prepare_branch_deploy(&h.state, &app.id, "feature", Some("admin"))
+            .await;
+    assert!(
+        admin.is_ok(),
+        "an admin may deploy a branch under protection"
+    );
+
+    h.finish().await;
+}
+
 /// Seed one branch environment of `app` directly (no mirror needed).
 async fn seed_env(
     h: &Harness,

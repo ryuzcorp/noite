@@ -739,11 +739,31 @@ async fn sweep_needs_tip(
         return Ok(false);
     }
 
-    Ok(
-        db::get_success_deploy(pool, &app.id, tip_sha, target.environment_id())
-            .await?
-            .is_none(),
-    )
+    if db::get_success_deploy(pool, &app.id, tip_sha, target.environment_id())
+        .await?
+        .is_some()
+    {
+        return Ok(false);
+    }
+    // A branch deploy is explicit: production serves that branch's sha while
+    // the production tip may be a sha that failed earlier. The branch deploy
+    // reset the automatic budget (`DeployIntent::Branch` is explicit), so the
+    // sweep would otherwise redeploy the failed tip over it. The next push to
+    // the production branch is what moves production back; until then the
+    // operator's choice stands.
+    if target.environment().is_none() {
+        if let Some(live_sha) = &live {
+            // Any branch success at the live sha, not only the newest row: a
+            // rollback/redeploy of that sha adds a newer `rollback` row.
+            if db::get_success_branch_deploy(pool, &app.id, live_sha)
+                .await?
+                .is_some()
+            {
+                return Ok(false);
+            }
+        }
+    }
+    Ok(true)
 }
 
 /// Hand a fresh tip to the deploy pipeline on its own task: the loop must
@@ -999,6 +1019,146 @@ mod tests {
         assert!(!sweep_needs_tip(&pool, &fresh, &preview, "sha2")
             .await
             .unwrap());
+        pool.close().await;
+    }
+
+    /// A one-off deploy of another branch's tip leaves production serving that
+    /// sha while the production branch's tip is a different, already-built
+    /// release. The fallback sweep must not pull the production tip back: the
+    /// same rule that protects a rollback protects this — a tip the history
+    /// holds a success for is a release the operator moved off on purpose. The
+    /// production branch still deploys on its next push (the push fast path),
+    /// which is the promised behaviour, not a sweep.
+    #[tokio::test]
+    async fn sweep_skips_the_production_tip_after_a_branch_deploy() {
+        use crate::models::DeployIntent;
+        let cfg = crate::config::config_for_tests();
+        let pool = db::connect("sqlite::memory:").await.expect("memory db");
+        let app = db::create_app(
+            &pool,
+            &cfg,
+            db::NewApp {
+                name: "branch-deploy",
+                slug: "branch-deploy",
+                user_id: "local",
+                subdomain: "branch-deploy.localhost",
+                listen: 30410,
+                internal: 30411,
+            },
+        )
+        .await
+        .expect("app");
+        // The production branch's tip was built and live before the branch
+        // deploy: that success row is what keeps the sweep away afterwards.
+        db::upsert_deploy(
+            &pool,
+            None,
+            &app.id,
+            None,
+            DeployStatus::Success,
+            Some("main1111"),
+            "",
+        )
+        .await
+        .expect("main deploy");
+        // The production tip moved after that success and failed; the branch
+        // deploy below resets the automatic budget, so without the branch rule
+        // the sweep would redeploy this failed tip.
+        db::upsert_deploy(
+            &pool,
+            None,
+            &app.id,
+            None,
+            DeployStatus::Failed,
+            Some("main2222"),
+            "boom",
+        )
+        .await
+        .expect("failed main tip");
+        // The operator's one-off deploy of `feature`: its own row, then the
+        // success the run records. Production now serves `feature2222`.
+        let deploy_id = db::queue_deploy(
+            &pool,
+            &app.id,
+            None,
+            DeployIntent::Branch,
+            "feature2222",
+            Some("refs/heads/feature"),
+        )
+        .await
+        .expect("queue branch deploy");
+        db::upsert_deploy(
+            &pool,
+            Some(&deploy_id),
+            &app.id,
+            None,
+            DeployStatus::Building,
+            Some("feature2222"),
+            "",
+        )
+        .await
+        .expect("branch deploy building");
+        db::upsert_deploy(
+            &pool,
+            Some(&deploy_id),
+            &app.id,
+            None,
+            DeployStatus::Success,
+            Some("feature2222"),
+            "",
+        )
+        .await
+        .expect("branch deploy success");
+        // A rollback of that release lands at the same sha: the newest success
+        // row is now `rollback`, and the sweep must still see the branch
+        // provenance from the earlier row.
+        let rollback_id = db::queue_deploy(
+            &pool,
+            &app.id,
+            None,
+            DeployIntent::Rollback,
+            "feature2222",
+            None,
+        )
+        .await
+        .expect("queue rollback");
+        db::upsert_deploy(
+            &pool,
+            Some(&rollback_id),
+            &app.id,
+            None,
+            DeployStatus::Building,
+            Some("feature2222"),
+            "",
+        )
+        .await
+        .expect("rollback building");
+        db::upsert_deploy(
+            &pool,
+            Some(&rollback_id),
+            &app.id,
+            None,
+            DeployStatus::Success,
+            Some("feature2222"),
+            "",
+        )
+        .await
+        .expect("rollback success");
+        let fresh = db::get_app(&pool, &app.id).await.unwrap().expect("app row");
+        assert_eq!(fresh.last_deploy_sha.as_deref(), Some("feature2222"));
+
+        assert!(
+            !sweep_needs_tip(&pool, &fresh, &deploy::DeployTarget::Production, "main1111")
+                .await
+                .unwrap(),
+            "the production tip was already built: the sweep must not revert the branch deploy"
+        );
+        assert!(
+            !sweep_needs_tip(&pool, &fresh, &deploy::DeployTarget::Production, "main2222")
+                .await
+                .unwrap(),
+            "a branch deploy stands even when the production tip failed; the next push moves it"
+        );
         pool.close().await;
     }
 

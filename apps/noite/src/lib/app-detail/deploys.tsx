@@ -18,8 +18,9 @@ import {
   feedValue,
   liveFeed,
 } from "../feeds";
+import { forgeKeys, forgeRefs } from "../forge/data";
 import { islandProps } from "../island";
-import { resourceValue, resourceError } from "../resource";
+import { invalidate, resourceError, resourceValue } from "../resource";
 import { appDetail, deployLog, environments } from "../resources";
 import type { AppRole } from "../roles";
 import type { RunnerDeploy, RunnerEnvironment } from "../runner";
@@ -42,6 +43,7 @@ import {
   updateRow,
 } from "./deploy.machine";
 import type {
+  DropdownAction,
   DropdownMessage,
   DropdownModel,
   RowMessage,
@@ -78,6 +80,135 @@ const DropdownProps = islandProps<{
   username: string;
 }>("DeployDropdown");
 
+/** The Deploy button's branch picker: the production branch by default
+ * (exactly the old Redeploy), any other branch for a one-off production deploy
+ * of that branch's tip. The production branch setting itself never changes, so
+ * its next push deploys as usual. */
+const DeployAction = ({
+  action,
+  appId,
+  branch,
+  dispatch,
+  lastDeploySha,
+}: {
+  action: DropdownAction;
+  appId: string;
+  branch: string | null;
+  dispatch: (message: DropdownMessage) => void;
+  lastDeploySha: string | null;
+}) => {
+  const resource = forgeRefs(appId);
+  const refs = resourceValue(resource.state()) ?? null;
+  const refsError = resourceError(resource.state());
+
+  const branchListError = refsError === undefined ? null : String(refsError);
+
+  const productionBranch = refs?.defaultBranch ?? "main";
+  const selected = branch ?? productionBranch;
+  const listed = (refs?.branches ?? []).map((one) => one.name);
+
+  // The production branch is always offered, even before the refs land (and
+  // for an app whose first push has not happened yet).
+  const names = listed.includes(productionBranch)
+    ? listed
+    : [productionBranch, ...listed];
+
+  const busy =
+    action._tag === "Deploying" ||
+    action._tag === "Redeploying" ||
+    action._tag === "RollingBack";
+
+  const isProduction = selected === productionBranch;
+
+  const label = (() => {
+    if (action._tag === "Redeploying") {
+      return "Redeploying…";
+    }
+
+    if (action._tag === "Deploying") {
+      return "Deploying…";
+    }
+
+    if (!isProduction) {
+      return `Deploy ${selected}`;
+    }
+
+    return `Redeploy ${(lastDeploySha ?? "").slice(0, 12)}`;
+  })();
+
+  return (
+    <div class="flex flex-col gap-2">
+      {action._tag === "Failed" &&
+      (action.kind === "redeploy" || action.kind === "branch") ? (
+        <p class="text-error m-0 text-sm">{action.error}</p>
+      ) : null}
+      <label class="flex flex-col gap-1">
+        <span class="text-xs font-medium">Branch</span>
+        <select
+          class="select select-sm w-full"
+          aria-label="Branch to deploy"
+          disabled={busy}
+          value={selected}
+          onchange={(event) => {
+            dispatch(
+              DropdownMsg.BranchPicked({ branch: event.currentTarget.value })
+            );
+          }}
+        >
+          {names.map((name) => (
+            <option key={name} value={name} selected={name === selected}>
+              {name === productionBranch ? `${name} (production)` : name}
+            </option>
+          ))}
+        </select>
+      </label>
+      {branchListError === null ? null : (
+        <div class="flex items-center gap-2">
+          <p class="text-error m-0 min-w-0 flex-1 text-xs">{branchListError}</p>
+          <button
+            type="button"
+            class="btn btn-sm btn-ghost shrink-0"
+            onclick={() => invalidate(forgeKeys.refs(appId))}
+          >
+            Retry
+          </button>
+        </div>
+      )}
+      <button
+        type="button"
+        class="btn btn-sm btn-neutral w-full"
+        disabled={busy || (isProduction && !lastDeploySha)}
+        title={
+          isProduction
+            ? "Re-run the pipeline at the commit production serves, with the latest env vars and flags"
+            : `Deploy ${selected}'s current tip to production once`
+        }
+        onclick={() => {
+          if (!isProduction) {
+            dispatch(DropdownMsg.BranchDeployRequested({ branch: selected }));
+
+            return;
+          }
+
+          if (!lastDeploySha) {
+            return;
+          }
+
+          dispatch(DropdownMsg.RedeployRequested({ sha: lastDeploySha }));
+        }}
+      >
+        {label}
+      </button>
+      <p class="m-0 text-xs opacity-70">
+        {isProduction
+          ? `Re-runs the release production serves, with the latest env vars and flags. Pushing ${productionBranch} still deploys it.`
+          : `Deploys ${selected}'s current tip once; production keeps deploying from ${productionBranch} on its next push.`}{" "}
+        Progress shows in Deployments.
+      </p>
+    </div>
+  );
+};
+
 /** Deploy (git remote) card dropdown. Lives in the page header next to
  * Code so it works on every tab; the rollback-target lookup and both
  * destructive actions are one machine (`deploy.machine.ts`): a failed lookup
@@ -88,6 +219,7 @@ const DropdownApp = defineApp({
     model: {
       action: DropdownActionTypes.Idle(),
       appId: DropdownProps.read().appId,
+      branch: null,
       liveSha: null,
       lookup: LookupTypes.Idle(),
     } satisfies DropdownModel,
@@ -110,6 +242,7 @@ const DropdownApp = defineApp({
     }
 
     const busy =
+      model.action._tag === "Deploying" ||
       model.action._tag === "Redeploying" ||
       model.action._tag === "RollingBack";
 
@@ -118,7 +251,7 @@ const DropdownApp = defineApp({
       // Stop/Start or Retry import control when the app's status lands, and a
       // positional morph would otherwise replace this subtree — closing an open
       // menu and dropping its state. The key makes ilha move it instead.
-      <div key="deploy" class="dropdown dropdown-end">
+      <div key="deploy" class="dropdown dropdown-end z-50">
         <div
           tabindex={0}
           role="button"
@@ -132,7 +265,7 @@ const DropdownApp = defineApp({
         </div>
         <div
           tabindex={0}
-          class="dropdown-content card bg-base-100 dark:bg-base-200 border-base-300 z-10 w-80 border shadow-md"
+          class="dropdown-content card bg-base-100 dark:bg-base-200 border-base-300 z-50 w-80 border shadow-xl"
         >
           <div class="card-body gap-4">
             <h3 class="card-title m-0 text-base">Deploy</h3>
@@ -161,36 +294,14 @@ const DropdownApp = defineApp({
                 <code>view</code> can fetch.
               </p>
             )}
-            {props.canPush && props.lastDeploySha ? (
-              <div class="flex flex-col gap-2">
-                {model.action._tag === "Failed" &&
-                model.action.kind === "redeploy" ? (
-                  <p class="text-error m-0 text-sm">{model.action.error}</p>
-                ) : null}
-                <button
-                  type="button"
-                  class="btn btn-sm btn-neutral w-full"
-                  disabled={busy}
-                  title="Re-run the pipeline at the current commit with the latest env vars and flags"
-                  onclick={() => {
-                    const sha = props.lastDeploySha;
-
-                    if (!sha) {
-                      return;
-                    }
-
-                    dispatch(DropdownMsg.RedeployRequested({ sha }));
-                  }}
-                >
-                  {model.action._tag === "Redeploying"
-                    ? "Redeploying…"
-                    : `Redeploy ${(props.lastDeploySha ?? "").slice(0, 12)}`}
-                </button>
-                <p class="m-0 text-xs opacity-70">
-                  Picks up the latest env vars and flags. Progress shows in
-                  Deployments.
-                </p>
-              </div>
+            {props.canPush ? (
+              <DeployAction
+                action={model.action}
+                appId={props.appId}
+                branch={model.branch}
+                dispatch={dispatch}
+                lastDeploySha={props.lastDeploySha}
+              />
             ) : null}
             {props.canPush && target ? (
               <div class="flex flex-col gap-2">
@@ -350,7 +461,7 @@ const RowProps = islandProps<{
  * history used to repeat in the app's alert. */
 const DeployRowSummary = ({ appId, d }: { appId: string; d: RunnerDeploy }) => {
   const { finished } = deployStatusFacts(d.status);
-  const intent = deployIntentLabel(d.intent, d.sha);
+  const intent = deployIntentLabel(d.intent, d.sha, d.actor);
   // A finished row never changes again, so its `updatedAt` is the instant it
   // closed: `createdAt` to that is how long the deploy took.
   const took = formatDuration(d.createdAt, finished ? d.updatedAt : null);
@@ -372,7 +483,9 @@ const DeployRowSummary = ({ appId, d }: { appId: string; d: RunnerDeploy }) => {
       </div>
       <div class="text-base-content/70 text-xs">
         {intent === null ? null : <span class="mr-2">{intent}</span>}
-        {d.actor === null ? null : <span class="mr-2">by {d.actor}</span>}
+        {d.actor === null || d.intent === "branch" ? null : (
+          <span class="mr-2">by {d.actor}</span>
+        )}
         {formatDateTime(d.createdAt)}
         {took === null ? null : <span class="ml-2">took {took}</span>}
       </div>

@@ -89,7 +89,8 @@ CREATE TABLE IF NOT EXISTS deploy (
   sha TEXT,
   status TEXT NOT NULL DEFAULT 'queued',
   -- Why the run exists (models::DeployIntent): a push/reconcile `deploy`, a
-  -- `rollback` to an old sha, or an environment `redeploy`. Set once, when the
+  -- `rollback` to an old sha, an environment `redeploy`, or a `branch` deploy
+  -- of one branch's tip to production. Set once, when the
   -- row is created; schema version 101 added it, and older rows read
   -- `'deploy'`.
   intent TEXT NOT NULL DEFAULT 'deploy',

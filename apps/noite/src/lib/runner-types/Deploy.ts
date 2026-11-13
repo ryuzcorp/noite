@@ -15,7 +15,10 @@ intent: DeployIntent,
 /**
  * Who asked for the run, when the caller could say: a profile API key's
  * attributable label ("Ada via key ci") for a redeploy it triggered.
- * `None` is the automatic push/tip pipeline, which has no request.
+ * A [`DeployIntent::Branch`] row has no request behind it, so it records
+ * the branch ref it deployed instead — the history reads
+ * `Deploy <branch>@<sha>`. `None` is the automatic push/tip pipeline,
+ * which has no request.
  */
 actor: string | null, log: string, 
 /**
