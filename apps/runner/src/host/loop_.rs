@@ -564,7 +564,7 @@ async fn reconcile_once(
     supervisor::stop_orphan_fleets(pool, procs).await;
 
     // A build is the largest tenant CPU/IO spike on a small box. Keep the
-    // telemetry tick (DuckDB ingest/compaction, up to its own memory cap) out
+    // telemetry tick (Parquet ingest/compaction, up to its own memory cap) out
     // of its way: spans stay in the bucket and the next tick after the build
     // catches up. The deploy loop itself never waits on the build.
     if deploy::snapshot_claimed(deploying).await.is_empty() {

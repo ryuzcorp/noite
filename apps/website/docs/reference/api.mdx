@@ -181,5 +181,5 @@ Errors map like the HTTP statuses: application errors keep `400`/`404`/`409`, a 
 | `409` | Domain already taken; conflicting sleep/wake transition; lost `source/commit` race |
 | `422` | `PATCH /v1/apps/{id}` body with unknown keys            |
 | `429` | Edge rate limit (+ `Retry-After`)                       |
-| `500` | Runner internal failure (mirror, DuckDB, S3, DB)        |
+| `500` | Runner internal failure (mirror, S3, DB)                |
 | `503` | Fleet shedding load (+ `Retry-After`) or failed wake    |

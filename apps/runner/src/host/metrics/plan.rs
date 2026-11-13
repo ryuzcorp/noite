@@ -124,7 +124,7 @@ pub(super) fn plan_chunks(
 /// written by an earlier node id still reads.
 ///
 /// The walk and its clamps are the old glob expansion's, so a chunk covers
-/// exactly the files the old DuckDB glob named: start floored to the hour (a
+/// exactly the files the old glob named: start floored to the hour (a
 /// window that starts mid-hour must still read its trailing partial hour),
 /// clamped to the retention floor (celld has already deleted older objects),
 /// and bounded to `retention_days * 24 + 1` hours so a stale watermark after

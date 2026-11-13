@@ -18,7 +18,7 @@
 #
 # One celld, one Caddy, one Node, one jup, one npm, one pnpm, one bun and one
 # docker CLI pin; docker/check-versions.ts asserts they appear exactly once.
-# Sidecar versions (esbuild, duckdb) live in docker/install-sidecars.sh.
+# The esbuild sidecar version lives in docker/install-sidecars.sh.
 # celld comes from the ryuzcorp/celld fork (SPEC, celld): upstream
 # denoland/celld at 0.6.3 plus the fork's patches, published as
 # `<version>-ryuzcorp.<level>` with SLSA provenance attestations. The two

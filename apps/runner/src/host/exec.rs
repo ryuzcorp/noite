@@ -516,7 +516,7 @@ fn kill_group(pid: u32) {
     }
 }
 
-/// Runner-owned command (git, celld, duckdb): explicit env, piped output, and
+/// Runner-owned command (git, celld): explicit env, piped output, and
 /// — like [`run_sandboxed`] — its own process group, so a timed-out step's
 /// grandchildren die with it instead of keeping its port or lock.
 pub async fn run_cmd(

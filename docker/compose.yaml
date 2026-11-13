@@ -160,15 +160,6 @@ services:
       RUNNER_PRESSURE_SWEEP_S: ${RUNNER_PRESSURE_SWEEP_S:-30}
       RUNNER_FLEET_DEPLOY_POLL_S: ${RUNNER_FLEET_DEPLOY_POLL_S:-300}
       RUNNER_OTEL_FLUSH_MS: ${RUNNER_OTEL_FLUSH_MS:-30000}
-      # Telemetry ingest/compaction DuckDB (a fresh CLI process per pass).
-      # Unset derives a cap from this container's memory (10%, clamped
-      # 128..1024 MiB) and its cores (capped 4), with spill in
-      # `<work_dir>/duckdb-tmp` capped at 1024 MiB. DuckDB's own default is
-      # 80% of the machine and every core: on a 2 GB install that single scan
-      # is larger than every resident fleet together.
-      RUNNER_DUCKDB_MEMORY_MB: ${RUNNER_DUCKDB_MEMORY_MB:-}
-      RUNNER_DUCKDB_THREADS: ${RUNNER_DUCKDB_THREADS:-}
-      RUNNER_DUCKDB_TEMP_MB: ${RUNNER_DUCKDB_TEMP_MB:-}
       RUNNER_TELEMETRY_RETENTION_DAYS: ${RUNNER_TELEMETRY_RETENTION_DAYS:-30}
       RUNNER_TIP_SWEEP_S: ${RUNNER_TIP_SWEEP_S:-60}
       # Scale to zero (SPEC): park apps idle past this threshold (0 = never);

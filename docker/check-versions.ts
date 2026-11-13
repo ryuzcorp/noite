@@ -17,7 +17,7 @@
  *   once — a split pin fails here instead of shipping mixed toolchains.
  * - The bundled store (rustfs) must match what platforms.mdx documents and
  *   CI's rustfs service, tag and digest.
- * - Sidecar versions and checksums (esbuild, duckdb) live exactly once in
+ * - The esbuild sidecar version and checksum live exactly once in
  *   docker/install-sidecars.sh; the Dockerfile only invokes the script.
  * - The access log path the image sets (CADDY_ACCESS_LOG) is the runner's own
  *   default, so the generator (which writes the Caddyfile `log` block from
@@ -507,8 +507,8 @@ const verifyImageViaDocker = (
 // `--online`: compare every immutable publisher pin with what it serves
 // today. CI runs this leg on every PR; the offline checks above stay the
 // local gate (no network, no docker). A version bumped without its digest
-// fails here: SHASUMS256.txt, npm's `dist.integrity` and the release asset
-// digest are the sources the pins claim to come from.
+// fails here: SHASUMS256.txt and npm's `dist.integrity` are the sources the
+// pins claim to come from.
 //
 // `--online-images` adds the image tag digests. Official images re-push the
 // same tag for a base-OS update (`rust:1-bookworm`, bun's `1.4`, even

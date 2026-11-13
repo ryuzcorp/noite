@@ -132,8 +132,8 @@ jobs:
             *) sh -n "$f" ;;
             esac
           done
-      # Main-database tables only: app_metric, metric_watermark and the rest of
-      # the telemetry live in metrics.sqlite (apps/runner/schema.metrics.sql).
+      # Main-database tables only: the telemetry tables live in metrics.sqlite
+      # (apps/runner/schema.metrics.sql).
       # Strict: the rendered table list must equal the allowlist exactly, so a
       # migration that adds a table without updating this list fails here
       # instead of going unchecked (the alpha.4/alpha.5 tables were silently

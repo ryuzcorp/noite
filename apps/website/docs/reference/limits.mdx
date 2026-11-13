@@ -14,9 +14,6 @@ description: Quotas, fleet bounds, rate limits, and the scale-to-zero sleep mech
 | `RUNNER_BUILD_TIMEOUT_S` | `300` | Each install and build step is killed past this (seconds) |
 | `RUNNER_BUILD_CACHE_MB` | `512` | Per-app build cache cap (Bun, npm, pnpm, Yarn and their jup-managed releases); over it, whole caches are dropped, largest first; `0` disables |
 | `RUNNER_TELEMETRY_RETENTION_DAYS` | `30` | Telemetry lifetime in bucket prune, metric tables, and glob floor |
-| `RUNNER_DUCKDB_MEMORY_MB` | 10% of detected memory, clamped `128`–`1024` | Cap for the telemetry DuckDB pass (ingest every 30 s, compaction per hour). DuckDB's own default is 80% of the machine — larger than every resident fleet together on a 2 GB install; over the cap it spills to disk instead |
-| `RUNNER_DUCKDB_THREADS` | container cores, capped at `4` | DuckDB worker threads |
-| `RUNNER_DUCKDB_TEMP_MB` | `1024` | Spill directory cap (`<work_dir>/duckdb-tmp`); `0` = DuckDB's default (90% of free disk) |
 
 ## Fleet bounds
 

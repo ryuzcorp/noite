@@ -43,7 +43,7 @@ fn bump(map: &Mutex<HashMap<String, u64>>, key: &str, by: u64) {
     }
 }
 
-/// Basename of the spawned program (`/usr/local/bin/duckdb` -> `duckdb`).
+/// Basename of the spawned program (`/usr/local/bin/git` -> `git`).
 fn short(program: &str) -> &str {
     program.rsplit('/').next().unwrap_or(program)
 }

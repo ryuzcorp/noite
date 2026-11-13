@@ -1,8 +1,8 @@
 //! The memory and core count the runner sizes its helpers against.
 //!
 //! The runner is PID 1 in the install's one container. A helper that forks its
-//! own pool (the telemetry DuckDB CLI reads `max_threads` and `memory_limit`
-//! from the machine) must be sized from what the container may actually use:
+//! own pool (the Parquet reader and the deploy helpers size their work from
+//! the machine) must be sized from what the container may actually use:
 //! the cgroup limit when the operator set one, otherwise the host. Sizing from
 //! `/proc/meminfo` while a container limit applies asks for more than the box
 //! has, and sizing from the host on an unbounded container is the same number
