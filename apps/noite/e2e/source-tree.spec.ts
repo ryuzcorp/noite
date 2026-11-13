@@ -55,6 +55,26 @@ test("the tree menu adds and deletes a file, and one Push commits both", async (
 
   pushAppDir(apiKey, new URL("fixtures/intel", import.meta.url), slug);
 
+  // Every blob the pane asked for. The tree's inline add parks an `untitled`
+  // row before the file exists, and its selection event (when the row is
+  // added, or late from a tree a rebuild replaced) must not become a read:
+  // the runner answers 404, and that answer landing after the add opened its
+  // file painted `Internal error (HTTP 500)` over the editor (run
+  // 43487945583).
+  const reads: string[] = [];
+
+  page.on("request", (sent) => {
+    if (!sent.url().endsWith("/api/source/sourceBlob")) {
+      return;
+    }
+
+    // SAFETY: the page's own `sourceBlob` action carries `{ appId, path,
+    // ref }` (see `readBlob` in lib/source/browser.tsx).
+    const body = sent.postDataJSON() as { path: string };
+
+    reads.push(body.path);
+  });
+
   await page.goto(`/apps/${appId}/source?ref=main&panel=changes`);
   await expect(page.getByRole("treeitem", { name: "util.ts" })).toBeVisible();
 
@@ -69,6 +89,9 @@ test("the tree menu adds and deletes a file, and one Push commits both", async (
   // intercepts it) for a file shorter than the pane.
   const editor = page.locator('[contenteditable="true"]').first();
   await expect(editor).toBeVisible({ timeout: 60_000 });
+  // Only a path the session holds is readable: `untitled` is the placeholder
+  // row the add parked, and no commit ever holds it.
+  expect(reads).not.toContain("untitled");
   await editor.focus();
   await page.keyboard.type("export const extra = 1;");
 

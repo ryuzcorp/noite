@@ -55,6 +55,7 @@ import {
   discardAll,
   edit,
   emptySession,
+  holdsPath,
   move,
   openSession,
   prime,
@@ -536,6 +537,16 @@ export const SourceBrowser = ({
           notice.set(message);
         },
         openFile: async (path) => {
+          // Only a path the session holds has bytes to show. A selected row
+          // can be one it does not: pierre parks `untitled` for the inline
+          // add, and its selection event can be delivered after the add
+          // landed as its own file (or from a tree a rebuild replaced), so a
+          // read of it 404s — and that answer, arriving late, paints its
+          // error over the file the add opened.
+          if (!holdsPath(box.session, path)) {
+            return false;
+          }
+
           const opened = (await box.editor?.open(path)) ?? false;
 
           if (opened) {

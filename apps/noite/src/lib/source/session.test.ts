@@ -11,6 +11,7 @@ import {
   discardAll,
   edit,
   emptySession,
+  holdsPath,
   move,
   openSession,
   prime,
@@ -109,6 +110,28 @@ describe("the edit session's path states", () => {
     expect(commitInput(session).files).toEqual([
       { content: "aGVsbG8=", encoding: "base64", path: "logo.png" },
     ]);
+  });
+});
+
+describe("the paths a session holds", () => {
+  test("a committed file, a buffer and a move's destination", () => {
+    const added = ok(add(opened(), "notes.md", "draft"));
+    const moved = move(added, "src/app.ts", "app.ts");
+
+    if (!moved.ok) {
+      throw new Error(moved.reason);
+    }
+
+    expect(holdsPath(moved.session, "README.md")).toBe(true);
+    expect(holdsPath(moved.session, "notes.md")).toBe(true);
+    expect(holdsPath(moved.session, "app.ts")).toBe(true);
+  });
+
+  test("a row no commit and no buffer names", () => {
+    // The tree's inline add parks this row before the file exists: reading it
+    // is a 404, which used to paint over the file the add landed as.
+    expect(holdsPath(opened(), "untitled")).toBe(false);
+    expect(holdsPath(opened(), "")).toBe(false);
   });
 });
 
