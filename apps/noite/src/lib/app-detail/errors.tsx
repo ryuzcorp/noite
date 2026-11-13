@@ -134,7 +134,7 @@ const IssueRow = ({
   issue: RunnerErrorIssue;
   onPick: () => void;
 }) => (
-  <li class="list-row">
+  <li class="list-row px-0 py-3 first:pt-0 last:pb-0">
     <button
       type="button"
       class="col-span-full flex w-full min-w-0 items-center gap-4 text-left"
@@ -245,9 +245,16 @@ const ErrorList = ({
 
   return (
     <section class="card bg-base-100 dark:bg-base-200 border-base-300 w-full border shadow-md">
-      <div class="card-body gap-3">
-        <h2 class="m-0 text-lg font-semibold">Errors</h2>
-        <div class="overflow-x-auto">
+      <div class="card-body gap-4">
+        <div class="flex flex-wrap items-center justify-between gap-x-4 gap-y-2">
+          <h2 class="m-0 flex items-center gap-2 text-lg font-semibold">
+            Errors
+            {data ? (
+              <span class="badge badge-sm tabular-nums">
+                {data.counts[status]}
+              </span>
+            ) : null}
+          </h2>
           <div role="tablist" class="tabs tabs-box tabs-sm w-fit flex-nowrap">
             {STATUSES.map((s) => (
               <button
@@ -668,11 +675,13 @@ export const ErrorsSummary = ({ appId }: { appId: string }) => {
 
   return (
     <section class="card bg-base-100 dark:bg-base-200 border-base-300 w-full border shadow-md">
-      <div class="card-body gap-3">
+      <div class="card-body gap-4">
         <div class="flex items-center justify-between gap-2">
           <span class="flex items-center gap-2">
             <h2 class="m-0 text-lg font-semibold">Errors</h2>
-            {data ? <span class="badge badge-sm">{open}</span> : null}
+            {data ? (
+              <span class="badge badge-sm tabular-nums">{open}</span>
+            ) : null}
           </span>
           <Link href={tabHref} class="btn btn-sm">
             View All
@@ -739,8 +748,7 @@ export const ErrorsPanel = ({
   if (selected()) {
     return (
       <div class="flex flex-col gap-4">
-        <div class="flex items-center justify-between gap-2">
-          <h2 class="m-0 text-lg font-semibold">Errors</h2>
+        <div class="flex items-center justify-end gap-2">
           <EnvPicker
             appId={appId}
             value={environmentId}
@@ -766,8 +774,7 @@ export const ErrorsPanel = ({
 
   return (
     <div class="flex flex-col gap-4">
-      <div class="flex items-center justify-between gap-2">
-        <h2 class="m-0 text-lg font-semibold">Errors</h2>
+      <div class="flex items-center justify-end gap-2">
         <EnvPicker
           appId={appId}
           value={environmentId}

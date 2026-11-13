@@ -402,11 +402,9 @@ const FinishedBuildLog = ({
   const log = resourceValue(res.state())?.log;
 
   return (
-    <div class="bg-base-200 rounded-lg p-3">
-      <pre class="max-h-64 overflow-auto rounded font-mono text-xs whitespace-pre-wrap">
-        {log ?? "(loading build log…)"}
-      </pre>
-    </div>
+    <pre class="max-h-64 overflow-auto font-mono text-xs whitespace-pre-wrap">
+      {log ?? "(loading build log…)"}
+    </pre>
   );
 };
 
@@ -426,20 +424,14 @@ const BuildLogPane = ({
   tab: "build" | "deploy";
 }) => {
   if (tab === "deploy") {
-    return (
-      <div class="bg-base-200 rounded-lg p-3">
-        <RuntimeLogs appId={appId} environmentId={environmentId} />
-      </div>
-    );
+    return <RuntimeLogs appId={appId} environmentId={environmentId} />;
   }
 
   if (d.log) {
     return (
-      <div class="bg-base-200 rounded-lg p-3">
-        <pre class="max-h-64 overflow-auto rounded font-mono text-xs whitespace-pre-wrap">
-          {d.log}
-        </pre>
-      </div>
+      <pre class="max-h-64 overflow-auto font-mono text-xs whitespace-pre-wrap">
+        {d.log}
+      </pre>
     );
   }
 
@@ -614,7 +606,7 @@ const RowApp = defineApp({
           </button>
         </li>
         {open ? (
-          <li class="flex flex-col gap-2 px-4 pb-4">
+          <li class="flex flex-col gap-2 px-4 py-3">
             <div role="tablist" class="tabs tabs-border w-fit">
               <button
                 type="button"

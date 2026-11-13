@@ -33,9 +33,6 @@ const headings = (page: Page) => page.getByRole("heading", { level: 2 });
 const sidebarItems = (page: Page) =>
   page.getByRole("list", { exact: true, name: NAME }).getByRole("link");
 
-const sectionNav = (page: Page) =>
-  page.getByRole("navigation", { name: "Settings sections" });
-
 test(
   "every settings section stacks on one page and ?section= scrolls to it",
   { tag: "@fast" },
@@ -93,67 +90,17 @@ test(
         ).toBeVisible(),
       ]);
 
-      // The contents nav jumps to a section and its deep link follows.
-      await sectionNav(page).getByRole("button", { name: "Domains" }).click();
-      await expect(page).toHaveURL(/\?section=domains$/u);
+      // The page has no in-page section nav: no tab strip, no contents
+      // navigation above the sections.
       await expect(
-        page.getByRole("heading", { level: 2, name: "Domains" })
-      ).toBeInViewport();
-
-      // The sticky strip marks the section in view: the pick at once, then
-      // scrolling the stack moves the marker with the headings (scroll-spy),
-      // not only with clicks.
-      await expect(
-        sectionNav(page).getByRole("button", { name: "Domains" })
-      ).toHaveAttribute("aria-current", "location");
-      await page
-        .locator("#settings-identity")
-        .evaluate((heading) => heading.scrollIntoView({ block: "start" }));
-      await expect(
-        sectionNav(page).getByRole("button", { name: "Identity" })
-      ).toHaveAttribute("aria-current", "location");
-      await expect(
-        sectionNav(page).getByRole("button", { name: "Domains" })
-      ).not.toHaveAttribute("aria-current", "location");
-
-      // The strip is one keyboard row: End/Home move focus along it.
-      await sectionNav(page).getByRole("button", { name: "Identity" }).focus();
-      await page.keyboard.press("End");
-      await expect(
-        sectionNav(page).getByRole("button", { name: "Danger zone" })
-      ).toBeFocused();
-      await page.keyboard.press("Home");
-      await expect(
-        sectionNav(page).getByRole("button", { name: "Identity" })
-      ).toBeFocused();
-
-      // A narrow screen keeps the strip on one row and scrolls it sideways.
-      await page.setViewportSize({ width: 420, height: 800 });
-      await expect
-        .poll(() =>
-          sectionNav(page).evaluate((nav) => {
-            const scroller = nav.querySelector(".tabs")?.parentElement;
-
-            return (
-              scroller !== undefined &&
-              scroller !== null &&
-              scroller.scrollWidth > scroller.clientWidth
-            );
-          })
-        )
-        .toBe(true);
-      await page.setViewportSize({ width: 1280, height: 720 });
+        page.getByRole("navigation", { name: "Settings sections" })
+      ).toHaveCount(0);
 
       // A shared link scrolls to its heading without switching anything.
       await page.goto(`/apps/${appId}/settings?section=danger`);
       await expect(
         page.getByRole("heading", { level: 2, name: "Danger zone" })
       ).toBeInViewport();
-      // …and the strip stayed on screen above the sections.
-      await expect(sectionNav(page)).toBeInViewport({ ratio: 1 });
-      await expect(
-        sectionNav(page).getByRole("button", { name: "Danger zone" })
-      ).toHaveAttribute("aria-current", "location");
       await expect(
         page.getByRole("heading", { level: 2, name: "Identity" })
       ).not.toBeInViewport();

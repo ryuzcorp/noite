@@ -1,8 +1,7 @@
 //! One section of the Settings page: a stable anchor heading and its body.
 //! Every section is stacked on `/apps/<id>/settings`; the heading's `id` is
-//! what a `?section=` deep link scrolls to and what the table of contents
-//! links to, so it must render before (and independently of) the section's
-//! own resource.
+//! what a `?section=` deep link scrolls to, so it must render before (and
+//! independently of) the section's own resource.
 
 import type { View } from "ilha";
 
@@ -30,7 +29,7 @@ export const SettingsSection = ({
     <div class="flex flex-wrap items-center justify-between gap-2">
       <h2
         id={settingsSectionAnchor(section)}
-        class={`m-0 scroll-mt-16 text-lg font-semibold${
+        class={`m-0 scroll-mt-4 text-lg font-semibold${
           section === "danger" ? " text-error" : ""
         }`}
       >

@@ -428,10 +428,6 @@ const GroupApp = defineApp({
     const header = environmentHeaderState(env);
     const pending = groupBusy(model);
 
-    // Say what it tracks only when the label is not the branch (a branch name
-    // the label had to sanitize).
-    const tracks = branch === env.label ? null : branch;
-
     // Scroll a deep-linked group into view once, waiting out the first ref.
     const box = atom.lazy(newLiveRef<HTMLElement>)();
 
@@ -492,10 +488,13 @@ const GroupApp = defineApp({
                 {model.expanded ? <ChevronUp /> : <ChevronDown />}
               </button>
               <span class="text-lg font-semibold">{env.label}</span>
-              {tracks ? (
-                <span class="text-base-content/60 inline-flex items-center gap-1 text-xs">
+              {branch ? (
+                <span
+                  class="text-base-content/60 inline-flex items-center gap-1 text-xs"
+                  title={`Deploys branch ${branch}`}
+                >
                   <GitBranch class="h-3 w-3" />
-                  {tracks}
+                  {branch}
                 </span>
               ) : null}
               <DeployGroupMeta
