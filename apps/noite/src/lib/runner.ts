@@ -222,13 +222,13 @@ const runnerToken = () => {
   return token;
 };
 
-/** What a non-ok runner answer reads as. `ApiError` answers the message it
- * means the caller to read; an interposed proxy answers HTML, which is never
- * ours to forward. */
+/** What a non-ok runner answer reads as. A 4xx `ApiError` answers the message
+ * it means the caller to read; a 5xx body can carry a store or SQL detail,
+ * and an interposed proxy answers HTML — neither is ours to forward. */
 const runnerTextFor = (path: string, status: number, body: string): string => {
   const text = body.trim();
 
-  return text === "" || text.startsWith("<")
+  return status < 400 || status >= 500 || text === "" || text.startsWith("<")
     ? `runner ${path}: ${status}`
     : text;
 };

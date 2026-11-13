@@ -31,6 +31,20 @@ describe("runner failure text", () => {
     );
   });
 
+  test("a 5xx body never reaches the message, even when it is plain text", () => {
+    const error = new RunnerHttpError(
+      "POST /v1/apps",
+      502,
+      "upstream connect error: 127.0.0.1:9000"
+    );
+
+    expect(runnerFailureOf(error)).toMatchObject({
+      kind: "http",
+      message: "runner POST /v1/apps: 502",
+      status: 502,
+    });
+  });
+
   test("a runner rejection keeps the runner's own text", () => {
     const error = new RunnerHttpError(
       "POST /v1/apps",
