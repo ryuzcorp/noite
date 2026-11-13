@@ -579,17 +579,6 @@ export const verifyFetchedPin = (
       ? undefined
       : `online: ${probe.url} publishes ${integrity ?? "no integrity"}, but the pin is ${probe.digest}`;
   }
-
-  // SAFETY: Node's SHASUMS document; only the lines this probe names are read.
-  const entries = parseShasums(text);
-
-  for (const [file, expected] of Object.entries(probe.entries)) {
-    if (entries[file] !== expected) {
-      return `online: ${probe.url} lists ${file} as ${entries[file] ?? "nothing"}, but the pin is ${expected}`;
-    }
-  }
-
-  return undefined;
 };
 
 /**

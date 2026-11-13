@@ -216,7 +216,8 @@ macro_rules! attach_metrics {
         .await?;
         // Telemetry tables this build no longer writes or reads. An upgraded
         // install still carries them (`schema.metrics.sql` only creates, it
-        // never drops), so reclaim their space here. Fully qualified on
+        // never drops), so drop them here; their pages join SQLite's freelist
+        // and later metrics writes reuse them. Fully qualified on
         // purpose: a bare `DROP TABLE` resolves against the main database
         // first (`telemetry_survives_a_reconnect` covers that regression).
         sqlx::Executor::execute(&mut *$conn, sqlx::raw_sql($crate::db::DEAD_METRICS_TABLES))

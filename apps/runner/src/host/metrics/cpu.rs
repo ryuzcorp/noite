@@ -101,7 +101,7 @@ mod tests {
     #[test]
     fn cpu_sampling_includes_the_control_node_when_it_runs() {
         // The control celld is not in the procs map; its pid slot is sampled
-        // too, so its CPU lands in the same `app_metric.cpu_ms` accumulator.
+        // too, so its CPU lands in the same `app_hour` CPU accumulator.
         let procs = crate::host::supervisor::new_procs();
         assert!(
             !sample_cpu(&procs, 0).contains_key(crate::host::control::SLUG),
