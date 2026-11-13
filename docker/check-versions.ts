@@ -507,8 +507,8 @@ const verifyImageViaDocker = (
 // `--online`: compare every immutable publisher pin with what it serves
 // today. CI runs this leg on every PR; the offline checks above stay the
 // local gate (no network, no docker). A version bumped without its digest
-// fails here: SHASUMS256.txt, npm's `dist.integrity` and the release asset
-// digest are the sources the pins claim to come from.
+// fails here: SHASUMS256.txt and npm's `dist.integrity` are the sources the
+// pins claim to come from.
 //
 // `--online-images` adds the image tag digests. Official images re-push the
 // same tag for a base-OS update (`rust:1-bookworm`, bun's `1.4`, even

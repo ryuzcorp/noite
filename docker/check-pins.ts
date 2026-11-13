@@ -609,8 +609,8 @@ export const verifyImageDigest = (
     : `online: ${probe.url} now resolves to ${digest || "nothing"}, but the pin is sha256:${probe.digest}`;
 
 // Where the publishers keep the digest each pin claims: the tag's index
-// digest, the signed SHASUMS file, npm's per-version `dist.integrity`, the
-// release API's asset digest. check-versions.ts `--online` fetches these.
+// digest, the signed SHASUMS file and npm's per-version `dist.integrity`.
+// check-versions.ts `--online` fetches these.
 const onlineProbesForDownload = (download: PinnedDownload): OnlineProbe[] => {
   const probes: OnlineProbe[] = [];
 
