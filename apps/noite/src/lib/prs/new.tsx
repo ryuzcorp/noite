@@ -1,4 +1,5 @@
 import { Link, useRouter } from "@ilha/void";
+import * as Atom from "effect/reactivity/Atom";
 import { atom, watch } from "ilha";
 import type { AtomHandle } from "ilha";
 
@@ -142,12 +143,19 @@ const CompareLine = ({
   const res = forgeCompare(appId, base, head);
   const state = res.state();
   const status = compareStatusOf(state);
-  watch.once(() => {
+  // Two projections, because neither alone sees every settle: the value
+  // keeps its reference through a cold Loading → Failed and a warm
+  // Reloading → Failed (the form would stay "Comparing…"), and the tag stays
+  // `Ready` when a reload lands a new payload.
+  const tag = atom(Atom.readable((get) => get(res.state.atom)._tag));
+
+  const report = (): undefined => {
     onStatus(compareStatusOf(res.state()) ?? { kind: "loading" });
-  });
-  watch(res.value, () => {
-    onStatus(compareStatusOf(res.state()) ?? { kind: "loading" });
-  });
+  };
+
+  watch(tag, report);
+  watch(res.value, report);
+  watch.once(report);
 
   return status?.kind === "ready" && state._tag === "Ready" ? (
     <CompareSummary compare={state.value} />
