@@ -3,35 +3,54 @@
 # Any PR that touches `.github/security-paths.yml`'s `sensitive:` filter fails
 # here until a reviewer — never the change's own author — reads the diff and
 # adds the `security-reviewed` label. Adding that label re-runs this workflow
-# (`labeled`) and passes. A push that changes the PR's own change strips
-# `security-reviewed` and fails again, so every merged version of a sensitive
-# change was reviewed as the diff it merged.
+# (`labeled`) and passes, and records *what* was reviewed: a marker comment
+# carrying the reviewed head, its merge base and the sha256 of the PR's
+# own-change fingerprint list (`.github/scripts/pr-own-change.ts`).
 #
-# "Own change" is the PR's commits on top of their merge base with the base
-# branch, fingerprinted per commit by path, resulting mode and resulting blob
-# (`.github/scripts/pr-own-change.ts`; no patch text, so a rebase's line
-# numbers and context cannot hide a change and a binary or mode-only change
-# cannot slip past one). Two pushes compare equal — and keep the label — when
-# the pushed head replays the same commit fingerprints: a pure rebase onto a
-# moved base, the conventional empty commit that re-triggers CI, and the
-# retarget GitHub performs when a stacked PR's lower layer squash-merges (the
-# dropped prefix must then be present in the new base, so a push that merely
-# drops a commit still strips). Anything else, including every case this
-# comparison cannot read (a merge commit in the PR's own range, a shallow
-# history, a head GitHub no longer serves), strips the label.
+# Every later event compares the current own change with that record. A push
+# that replays exactly the reviewed change keeps the label and re-records it —
+# a rebase onto a moved base, and the stacked retarget after a lower layer's
+# squash merge (there the change gains a leading prefix, accepted only when the
+# base already carries it with the same modes and blobs). Anything else strips
+# the label and fails. The decision is anchored on the record, never on
+# `github.event.before`: a cancelled run (two quick pushes into
+# `cancel-in-progress`) leaves the label alone, so "the previous head" can be an
+# unreviewed head, and comparing against it would launder that change.
 #
-# On `merge_group` this passes by itself: the PR-level check was already
-# required to enqueue, and the strip-on-synchronize above keeps it honest.
+# `edited` is a trigger too: retargeting a PR's base changes what merges
+# without any push, so a base edit runs the same comparison — a retarget that
+# exposes commits the new base does not have strips.
 #
-# Hardening: least privilege (`contents: read`, `pull-requests: write` only
-# on this label job), actions pinned by full SHA like the rest of the repo,
-# and no checkout of PR code is ever executed with write tokens — changed
-# files are listed through the API (paths-filter), the sensitive list is read
-# from the base commit, and the token only adds/removes labels. Never
-# `pull_request_target`. The rebase check fetches the two pushed heads as
-# data for git plumbing (`rev-list`, `diff-tree`, `ls-tree` over raw records:
-# no checkout, no diff driver, no working tree) and reads the base commit's
-# trees; nothing from a PR commit is ever executed.
+# On `merge_group` it no longer passes blindly: every queued PR whose labels say
+# it was sensitive must still carry `security-reviewed`, and its marker must
+# name the queued head. Cheap: labels and comments only, no checkout.
+#
+# Fails closed by construction: no marker, an edited or unreadable newest
+# marker, a merge commit in the PR's own range, a shallow history, a head
+# GitHub no longer serves, or any comparison that cannot be read strips.
+#
+# Bootstrap: the base commit of the PR that introduces this gate has no script,
+# so there the old rule still applies (the label passes, a push or a retarget
+# strips). That is the only way such a PR can be labelled at all; every later
+# base has the record.
+#
+# Hardening: least privilege (`contents: read`, `pull-requests: write` only on
+# this label job), actions pinned by full SHA like the rest of the repo, and no
+# checkout of PR code is ever executed with write tokens — changed files are
+# listed through the API (paths-filter), the sensitive list is read from the
+# base commit, and the token only adds/removes labels and marker comments.
+# Never `pull_request_target`. The comparison fetches the pushed heads as data
+# for git plumbing (`rev-list`, `merge-base`, `diff-tree --raw -z`,
+# `ls-tree -r -z`: no checkout, no worktree, no diff driver, no pathspec), with
+# the token in `GIT_CONFIG_*` environment variables rather than argv; nothing
+# from a PR commit is ever executed.
+#
+# Threat model: same-repo agents share a write token, so this guards against an
+# *accidental* bypass by an honest agent (a cancelled run, a failed label
+# delete, a forgotten retarget, a strip that never ran) and against a silently
+# changed diff — not against a malicious same-repo agent, who can already edit a
+# workflow. Markers are trusted only from github-actions[bot], unedited: a
+# teammate's comment cannot stand in for the gate's own record.
 #
 # Residual risk, by design of `pull_request` workflows: a PR that edits THIS
 # file runs its own edited copy. Such a PR always touches
@@ -41,14 +60,26 @@ name: security-gate
 
 on:
   pull_request:
-    types: [opened, synchronize, reopened, labeled, unlabeled, ready_for_review]
+    types:
+      [
+        opened,
+        synchronize,
+        reopened,
+        labeled,
+        unlabeled,
+        ready_for_review,
+        edited,
+      ]
   merge_group:
 
 permissions:
   contents: read
 
 # Its own group (never `ci-*`): label-triggered re-runs here must never cancel
-# the main gate, and vice versa. Re-runs supersede each other.
+# the main gate, and vice versa. Re-runs supersede each other. Cancellation is
+# harmless now: nothing is inferred from a run that never happened, and a
+# cancelled strip leaves a head that verifies against an older record and
+# therefore strips.
 concurrency:
   group: security-gate-${{ github.event_name == 'merge_group' && github.sha || github.ref }}
   cancel-in-progress: true
@@ -57,7 +88,10 @@ jobs:
   security-gate:
     name: security-gate
     runs-on: ubuntu-latest
-    # ~3x the 0.1 min p95 (50 runs, 2026-11-11), floor 10.
+    # ~3x the 0.1 min p95 (50 runs, 2026-11-11), floor 10. A sensitive review
+    # adds the comparison (unshallow of the base history, bun setup and one
+    # script run: seconds, not minutes); the merge queue adds two API reads per
+    # queued PR and no checkout.
     timeout-minutes: 10
     permissions:
       contents: read
@@ -73,6 +107,15 @@ jobs:
         with:
           ref: ${{ github.event.pull_request.base.sha }}
           persist-credentials: false
+      # The merge queue runs no comparison, but it runs this workflow's script:
+      # take it from the queue entry's base, never from the merged tree (the
+      # workflow file itself comes from the merge ref, like every `merge_group`
+      # run — the base copy of the script is the trusted half).
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        if: github.event_name == 'merge_group'
+        with:
+          ref: ${{ github.event.merge_group.base_sha }}
+          persist-credentials: false
       # A base commit without the list (the PR that introduces it) fails
       # closed: every change counts as sensitive and needs the label.
       - uses: dorny/paths-filter@0e4a8c6effa4802afeda77dc8d303f8176d7dfad # v3
@@ -81,55 +124,53 @@ jobs:
         with:
           filters: .github/security-paths.yml
           list-files: csv
-      # Does this push change the PR's own change? On `synchronize` the
-      # payload carries both heads, so the answer decides whether
-      # `security-reviewed` survives. `--unshallow` first: a depth-1 checkout
-      # cannot answer merge-base at all, and a shallow history would make the
-      # comparison lie (the script fails closed on one). The head fetches are
-      # data only — objects for git plumbing, never a checkout — and a commit
-      # GitHub no longer serves leaves the script to report the miss.
-      - name: fetch the pushed heads as data
-        if: github.event_name == 'pull_request' && github.event.action == 'synchronize' && steps.filter.outputs.sensitive == 'true'
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          BEFORE_SHA: ${{ github.event.before }}
-          AFTER_SHA: ${{ github.event.after }}
-        run: |
-          auth="AUTHORIZATION: basic $(printf 'x-access-token:%s' "${GH_TOKEN}" | base64 -w0)"
-          if [ -s "$(git rev-parse --git-dir)/shallow" ]; then
-            git -c "http.extraheader=${auth}" fetch --no-tags --unshallow origin '+refs/heads/*:refs/remotes/origin/*'
-          fi
-          # BASE_SHA is what was checked out, so its history is already here.
-          git -c "http.extraheader=${auth}" fetch --no-tags origin "${BEFORE_SHA}" "${AFTER_SHA}" || true
+      # The review record, the comparison and the merge-queue check are one
+      # script: bun is needed for both entry points.
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
-        if: github.event_name == 'pull_request' && github.event.action == 'synchronize' && steps.filter.outputs.sensitive == 'true'
+        if: github.event_name == 'merge_group' || steps.filter.outputs.sensitive == 'true'
         timeout-minutes: 3
-      - name: is this push a pure rebase?
-        if: github.event_name == 'pull_request' && github.event.action == 'synchronize' && steps.filter.outputs.sensitive == 'true'
-        id: own_change
-        env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
-          BEFORE_SHA: ${{ github.event.before }}
-          AFTER_SHA: ${{ github.event.after }}
-        run: bun .github/scripts/pr-own-change.ts
       - name: evaluate gate
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           EVENT_NAME: ${{ github.event_name }}
           EVENT_ACTION: ${{ github.event.action }}
+          BASE_CHANGED: ${{ toJSON(github.event.changes.base) != 'null' }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          MERGE_GROUP_HEAD_REF: ${{ github.event.merge_group.head_ref }}
+          MERGE_GROUP_PRS: ${{ toJSON(github.event.merge_group.pull_requests) }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
           SENSITIVE: ${{ steps.filter.outputs.sensitive || 'true' }}
           SENSITIVE_FILES: ${{ steps.filter.outputs.sensitive_files || 'no sensitive list on the base commit, so every change counts as sensitive' }}
-          SAME_CHANGE: ${{ steps.own_change.outputs.same || 'false' }}
-          CHANGE_REASON: ${{ steps.own_change.outputs.reason || 'the push was not compared with the previous head' }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
         run: |
+          gate_script=".github/scripts/pr-own-change.ts"
           if [ "${EVENT_NAME}" = "merge_group" ]; then
+            if [ ! -f "${gate_script}" ]; then
+              {
+                echo "## security-gate: pass (merge_group)"
+                echo ""
+                echo "This base commit predates the recorded review, so the old rule applies: the PR-level gate already required the label before the entry could enqueue."
+              } >> "${GITHUB_STEP_SUMMARY}"
+              exit 0
+            fi
+            if reason="$(bun "${gate_script}" --merge-group)"; then
+              {
+                echo "## security-gate: pass (merge_group)"
+                echo ""
+                echo "${reason}"
+                echo ""
+                echo "Checked against the recorded review, not trusted blindly: every PR the gate marked sensitive carried \`security-reviewed\`, and its record names the queued head."
+              } >> "${GITHUB_STEP_SUMMARY}"
+              exit 0
+            fi
             {
-              echo "## security-gate: pass (merge_group)"
+              echo "## security-gate: fail (merge_group)"
               echo ""
-              echo "The sensitive-change review was already required on each PR before it could enqueue, and a push that changes a PR's own change strips \`security-reviewed\` and fails that PR's gate (a pure rebase, which is not a new diff, keeps it). Nothing further to review on the queued merge."
+              echo "${reason}"
+              echo ""
+              echo "::error::the queued PR(s) no longer match their recorded review"
             } >> "${GITHUB_STEP_SUMMARY}"
-            exit 0
+            exit 1
           fi
           if [ "${SENSITIVE}" != "true" ]; then
             {
@@ -144,52 +185,74 @@ jobs:
           has_sensitive="no"
           printf '%s\n' "${labels}" | grep -qx 'security-reviewed' && has_reviewed="yes" || true
           printf '%s\n' "${labels}" | grep -qx 'security-sensitive' && has_sensitive="yes" || true
-          {
-            echo "## security-gate: sensitive change"
-            echo ""
-            echo "Changed files matching \`sensitive:\`:"
-            echo ""
-            printf '%s' "${SENSITIVE_FILES}" | tr ',' '\n' | sed -e '/^[[:space:]]*$/d' -e 's/^[[:space:]]*/- `/' -e 's/[[:space:]]*$/`/'
-            echo ""
-          } >> "${GITHUB_STEP_SUMMARY}"
-          # New commits invalidate a prior review, even the author's own run:
-          # a fresh read of the new diff is required. A pure rebase is not a
-          # new diff — same commits, new base — so the comparison above
-          # decides. Anything unreadable counts as a change (it already does:
-          # the step only outputs `same=true` when it proved the match).
-          if [ "${EVENT_ACTION}" = "synchronize" ] && [ "${has_reviewed}" = "yes" ]; then
-            if [ "${SAME_CHANGE}" = "true" ]; then
+          if [ "${has_sensitive}" = "no" ]; then
+            gh api "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/labels" -f 'labels[]=security-sensitive' --silent > /dev/null
+          fi
+          if [ "${has_reviewed}" = "no" ]; then
+            {
+              echo "## security-gate: sensitive change"
+              echo ""
+              echo "Changed files matching \`sensitive:\`:"
+              echo ""
+              printf '%s' "${SENSITIVE_FILES}" | tr ',' '\n' | sed -e '/^[[:space:]]*$/d' -e 's/^[[:space:]]*/- `/' -e 's/[[:space:]]*$/`/'
+              echo ""
+              echo "This change touches security-sensitive paths and is not yet reviewed."
+              echo "A reviewer must read the diff and add the \`security-reviewed\` label."
+              echo "The agent or author that wrote the change never labels their own PR."
+              echo ""
+              echo "::error::sensitive change needs the security-reviewed label"
+            } >> "${GITHUB_STEP_SUMMARY}"
+            exit 1
+          fi
+          if [ ! -f "${gate_script}" ]; then
+            # Bootstrap: the PR that introduces this gate is reviewed against a
+            # base without the script. Keep the old rule for it — the label
+            # passes, a push or a retarget strips — so it can be labelled at all.
+            if [ "${EVENT_ACTION}" = "synchronize" ] || { [ "${EVENT_ACTION}" = "edited" ] && [ "${BASE_CHANGED}" = "true" ]; }; then
+              gh api "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/labels/security-reviewed" -X DELETE --silent
               {
-                echo "## security-gate: pure rebase"
+                echo "## security-gate: review invalidated"
                 echo ""
-                echo "Keeping \`security-reviewed\`: ${CHANGE_REASON}."
-              } >> "${GITHUB_STEP_SUMMARY}"
-            else
-              gh api "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/labels/security-reviewed" -X DELETE --silent || true
-              {
-                echo "New commits were pushed: removed \`security-reviewed\` — a fresh review of the new diff is required."
-                echo ""
-                echo "Why: ${CHANGE_REASON}."
+                echo "This base commit predates the recorded review, so every push and retarget still needs a fresh label."
                 echo ""
                 echo "::error::new commits need a fresh security review"
               } >> "${GITHUB_STEP_SUMMARY}"
               exit 1
             fi
-          fi
-          if [ "${has_sensitive}" = "no" ]; then
-            gh api "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/labels" -f 'labels[]=security-sensitive' --silent > /dev/null
-          fi
-          if [ "${has_reviewed}" = "yes" ]; then
             {
-              echo "Label \`security-reviewed\` is present: the sensitive diff was reviewed."
+              echo "## security-gate: reviewed"
+              echo ""
+              echo "This base commit predates the recorded review; the label alone is the review, as before."
             } >> "${GITHUB_STEP_SUMMARY}"
             exit 0
           fi
+          # The label is present. What it stands for was recorded when it was
+          # added; this decides whether the event still shows that diff.
+          # `gh` needs the token in the environment, `git fetch` in
+          # `GIT_CONFIG_*`: never on a command line.
+          authorization="AUTHORIZATION: basic $(printf 'x-access-token:%s' "${GH_TOKEN}" | base64 -w0)"
+          echo "::add-mask::${authorization}"
+          export GIT_AUTHORIZATION="${authorization}"
+          if reason="$(bun "${gate_script}")"; then
+            {
+              echo "## security-gate: reviewed"
+              echo ""
+              echo "${reason}"
+              echo ""
+              echo "\`security-reviewed\` still covers this diff, so it stays."
+            } >> "${GITHUB_STEP_SUMMARY}"
+            exit 0
+          fi
+          # A failed delete must fail the gate: swallowing it turns the next
+          # push into a comparison against a record the label no longer names.
+          gh api "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/labels/security-reviewed" -X DELETE --silent
           {
-            echo "This change touches security-sensitive paths and is not yet reviewed."
-            echo "A reviewer must read the diff and add the \`security-reviewed\` label."
-            echo "The agent or author that wrote the change never labels their own PR."
+            echo "## security-gate: review invalidated"
             echo ""
-            echo "::error::sensitive change needs the security-reviewed label"
+            echo "${reason}"
+            echo ""
+            echo "Removed \`security-reviewed\`: the diff changed, so a fresh read is required."
+            echo ""
+            echo "::error::new commits need a fresh security review"
           } >> "${GITHUB_STEP_SUMMARY}"
           exit 1
