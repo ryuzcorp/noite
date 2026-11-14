@@ -88,6 +88,31 @@ describe("install.sh admin email", () => {
     expect(result.stderr).toContain("NOITE_ADMIN_EMAIL");
   });
 
+  // .env is sourced by bash (docker/lib.sh load_env), so an address carrying
+  // shell syntax must never reach it: it would run as root on the next load.
+  test("an address with shell syntax is refused and never written", () => {
+    for (const hostile of [
+      "a$(touch pwned)@example.com",
+      "a`id`@example.com",
+      "a'b@example.com",
+      'a"b@example.com',
+      "a;id@example.com",
+      "a$HOME@example.com",
+      "a@example",
+    ]) {
+      writeFileSync(path.join(dir, ".env"), "BASE_DOMAIN=example.com\n");
+
+      const result = runBash(
+        `${PRELUDE}
+         ( choose_admin_email )`,
+        { NOITE_ADMIN_EMAIL: hostile, NOITE_DOMAIN: "example.com" }
+      );
+
+      expect(result.status).not.toBe(0);
+      expect(readEnv()).not.toContain("NOITE_ADMIN_EMAIL=");
+    }
+  });
+
   test("a kept .env value survives a re-run without a prompt", () => {
     writeFileSync(
       path.join(dir, ".env"),

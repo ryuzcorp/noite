@@ -300,9 +300,11 @@ choose_domain() {
   fi
 }
 
-# Loose email shape for the admin prompt: one @, no spaces (this reserves the
-# slot, it does not verify the mailbox — the operator proves it by signing up).
-valid_email() { [[ "$1" =~ ^[^@[:space:]]+@[^@[:space:]]+$ ]]; }
+# Admin address shape: a plain local part and a dotted domain, nothing else.
+# It reserves the slot (the operator proves the mailbox by signing up), and
+# the value is written raw into .env, which docker/lib.sh sources with bash,
+# so the charset admits no quote, `$`, backtick, `;` or space.
+valid_email() { [[ "$1" =~ ^[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)+$ ]]; }
 
 # One terminal question: print the prompt and read the answer into
 # `$answer`. Split out so tests can shadow it without a terminal; callers
@@ -323,7 +325,7 @@ choose_admin_email() {
   existing=$(env_get NOITE_ADMIN_EMAIL)
   if [[ -n "${NOITE_ADMIN_EMAIL:-}" ]]; then
     valid_email "$NOITE_ADMIN_EMAIL" ||
-      die "NOITE_ADMIN_EMAIL=\"$NOITE_ADMIN_EMAIL\" is not an email address (need one @, no spaces)"
+      die "NOITE_ADMIN_EMAIL=\"$NOITE_ADMIN_EMAIL\" is not a plain email address (letters, digits and ._%+- before the @, a dotted domain after it)"
     if [[ "$existing" != "$NOITE_ADMIN_EMAIL" ]]; then
       env_set NOITE_ADMIN_EMAIL "$NOITE_ADMIN_EMAIL"
     fi
@@ -353,7 +355,7 @@ choose_admin_email() {
 
         return 0
       fi
-      warn "\"$answer\" is not an email address (need one @, no spaces); try again or press Enter"
+      warn "\"$answer\" is not a plain email address (letters, digits and ._%+- before the @, a dotted domain after it); try again or press Enter"
     done
   else
     warn "no terminal to ask on: no admin email set, this install uses a one-time setup code (printed below)"
