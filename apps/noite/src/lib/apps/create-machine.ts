@@ -261,8 +261,8 @@ export const createSourceOf = (
     }
 
     // The branch and folder stay out when their fields are empty: an
-    // explicit `undefined` is not a JSON value, and the action's RPC encoder
-    // refuses the whole call over it ("Expected JSON value at [args][0]").
+    // explicit `undefined` is not a JSON value, and the action's argument
+    // codec refuses the whole call over it ("Expected JSON value at [args][0]").
     const branch = model.ref.trim();
     const folder = model.path.trim().replaceAll(/^\/+|\/+$/gu, "");
 

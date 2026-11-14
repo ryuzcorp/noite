@@ -128,7 +128,7 @@ describe("createAppForUser", () => {
     } catch (error) {
       expect(error).toBeInstanceOf(ActionFailure);
       expect(errorMessage(error)).toContain("D1 is down");
-      expect(runner.calls).toEqual(["apps.create", "apps.delete"]);
+      expect(runner.calls).toEqual(["POST /v1/apps", "DELETE /v1/apps/app-1"]);
       expect(runner.apps).toEqual([]);
 
       return;
@@ -161,7 +161,7 @@ describe("createAppForUser", () => {
     });
 
     expect(app.id).toBe("app-late");
-    expect(runner.calls).toEqual(["apps.create", "apps.get_by_slug"]);
+    expect(runner.calls).toEqual(["POST /v1/apps", "GET /v1/apps/by-slug/one"]);
     expect(grants).toEqual([
       { appId: "app-late", role: "admin", userId: "u-1" },
     ]);
@@ -294,7 +294,7 @@ describe("the creator grant races the sidebar heal", () => {
 
     expect(app.id).toBe("app-1");
     // No rollback: the app the heal made visible stays.
-    expect(runner.calls).toEqual(["apps.create"]);
+    expect(runner.calls).toEqual(["POST /v1/apps"]);
     expect(runner.apps).toHaveLength(1);
   });
 
@@ -322,7 +322,7 @@ describe("the creator grant races the sidebar heal", () => {
     expect(errorMessage(thrown)).toBe(
       "Could not record your access to the app"
     );
-    expect(runner.calls).toEqual(["apps.create", "apps.delete"]);
+    expect(runner.calls).toEqual(["POST /v1/apps", "DELETE /v1/apps/app-1"]);
     expect(runner.apps).toEqual([]);
   });
 
@@ -355,7 +355,7 @@ describe("the creator grant races the sidebar heal", () => {
     // Never the query, its table or its bound parameters.
     expect(body).not.toContain("app_collaborator");
     expect(body).not.toContain("params:");
-    expect(runner.calls).toEqual(["apps.create", "apps.delete"]);
+    expect(runner.calls).toEqual(["POST /v1/apps", "DELETE /v1/apps/app-1"]);
     expect(runner.apps).toEqual([]);
   });
 });

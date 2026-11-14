@@ -1123,7 +1123,7 @@ export const decodeDeploys = (raw: string): RunnerDeploy[] => {
   return next as RunnerDeploy[];
 };
 
-/** Error list frame (same shape as the `errors.list` RPC result). */
+/** Error list frame (same shape as the errors list route's answer). */
 export const decodeErrors = (raw: string): RunnerErrorList => {
   // SAFETY: field shapes verified below; the runner emits the list result.
   const frame = parseFrame(raw) as Partial<RunnerErrorList> | null;

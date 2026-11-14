@@ -1,4 +1,4 @@
-//! Grouped errors: the unary reads (REST route + `errors.*` RPC) and the
+//! Grouped errors: the unary reads and the ingest path, plus the
 //! hourly/series shaping the errors SSE stream also consumes.
 
 use serde::{Deserialize, Serialize};
@@ -21,7 +21,7 @@ pub struct ErrorCounts {
     pub ignored: i64,
 }
 
-/// One issue plus its 24-hour series (the `hourly` field the RPC inlines).
+/// One issue plus its 24-hour series (the `hourly` field the routes inline).
 #[derive(Debug, Serialize, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export)]
@@ -147,7 +147,7 @@ pub async fn list(
     })
 }
 
-/// The RPC's string status → the closed set, with the message the API has
+/// The caller's string status → the closed set, with the message the API has
 /// always returned.
 fn parse_status(status: &str) -> Result<IssueStatus, ApiError> {
     IssueStatus::parse(status)
@@ -375,7 +375,7 @@ pub struct SdkIngestBatch {
 /// so the response never reveals which apps exist. Returns the fingerprints
 /// that gained occurrences (empty when the envelope held no events). The
 /// protocol allows at most one event per envelope; more is an invalid-params
-/// refusal before any database work, so a direct RPC caller cannot multiply
+/// refusal before any database work, so a direct caller cannot multiply
 /// writes with one fat batch.
 pub async fn ingest(state: &AppState, batch: SdkIngestBatch) -> Result<Vec<String>, ApiError> {
     if batch.events.len() > 1 {
@@ -387,7 +387,10 @@ pub async fn ingest(state: &AppState, batch: SdkIngestBatch) -> Result<Vec<Strin
     let Some((app_id, live)) = row else {
         return Err(ApiError::not_found("unknown project or key"));
     };
-    if batch.key != live {
+    // Constant time: the key is the only secret this route compares, and a
+    // timing oracle on it would be the one way to learn a prefix. An unknown
+    // project and a wrong key stay the same answer either way.
+    if !constant_time_eq::constant_time_eq(batch.key.as_bytes(), live.as_bytes()) {
         return Err(ApiError::not_found("unknown project or key"));
     }
     if batch.events.is_empty() {

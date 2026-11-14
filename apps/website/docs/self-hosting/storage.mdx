@@ -92,7 +92,7 @@ Requests, errors and latency come from the Caddy access log — one JSON line pe
 
 ### The control fleet's own telemetry
 
-The control UI is a celld fleet too, and it runs the same telemetry environment as a tenant (`RUNNER_OTEL_FLUSH_MS`, `RUNNER_TELEMETRY_RETENTION_DAYS`) with its own bucket prefix, so celld writes under `s3://<bucket>/control/telemetry/{traces,logs}/<node>/<yyyy>/<mm>/<dd>/<hh>/`. It is ingested, compacted, pruned and error-grouped exactly like a tenant fleet, keyed on the reserved `_control` slug, and served on the same runner routes (`/v1/apps/_control/metrics|spans|logs|errors`, the RPC equivalents and the UI's SSE streams).
+The control UI is a celld fleet too, and it runs the same telemetry environment as a tenant (`RUNNER_OTEL_FLUSH_MS`, `RUNNER_TELEMETRY_RETENTION_DAYS`) with its own bucket prefix, so celld writes under `s3://<bucket>/control/telemetry/{traces,logs}/<node>/<yyyy>/<mm>/<dd>/<hh>/`. It is ingested, compacted, pruned and error-grouped exactly like a tenant fleet, keyed on the reserved `_control` slug, and served on the same runner routes (`/v1/apps/_control/metrics|spans|logs|errors`) and the UI's SSE streams.
 
 There is deliberately **no `app` row** for `_control` (`_control` is reserved at create): nothing that iterates apps — reconcile, the Caddyfile writer, scale-to-zero, purge, backup, `GET /v1/apps` — ever sees the control plane. The UI shows the surfaces only to a real instance admin, never an impersonated session. Control traffic includes the dashboard's own polling and event streams, so those numbers are real load, not a baseline to subtract.
 

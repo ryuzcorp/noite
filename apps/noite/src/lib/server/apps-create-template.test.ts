@@ -6,6 +6,8 @@
 
 import { afterAll, beforeAll, beforeEach, expect, mock, test } from "bun:test";
 
+import * as Schema from "effect/Schema";
+
 import { createTestD1 } from "../../testing/d1";
 import { installRunnerMock, makeApp } from "../../testing/runner-mock";
 import type { RunnerMock } from "../../testing/runner-mock";
@@ -18,17 +20,17 @@ mock.module("../collaborators", () => ({
   grantCollaborator: () => Promise.resolve("applied" as const),
 }));
 
-/** The JSON-RPC params the create action sends for a template source. */
-interface TemplateCreateParams {
-  source: {
-    actor: { name: string; userId: string };
-    kind: string;
-    path: string;
-    ref: string;
-    squash: boolean;
-    url: string;
-  };
-}
+/** The request body the create action sends for a template source. */
+const TemplateCreateParams = Schema.Struct({
+  source: Schema.Struct({
+    actor: Schema.Struct({ name: Schema.String, userId: Schema.String }),
+    kind: Schema.String,
+    path: Schema.String,
+    ref: Schema.String,
+    squash: Schema.Boolean,
+    url: Schema.String,
+  }),
+});
 
 let runner: RunnerMock;
 
@@ -59,10 +61,13 @@ test("a template create imports its folder from the templates repo", async () =>
   });
 
   expect(app.slug).toBe("ilha-void");
-  expect(runner.calls).toEqual(["apps.create"]);
+  expect(runner.calls).toEqual(["POST /v1/apps"]);
 
-  // SAFETY: the mock records the params object the action sent.
-  const params = runner.requests[0] as TemplateCreateParams;
+  // SAFETY: the mock records the request body object the action sent; this
+  // schema is the shape the test reads back at the boundary.
+  const params = Schema.decodeUnknownSync(TemplateCreateParams)(
+    runner.requests[0]
+  );
 
   expect(params.source).toEqual({
     actor: { name: "One", userId: "u-1" },
@@ -104,7 +109,7 @@ test("a retry recovers an app whose create outlived the call bound", async () =>
   });
 
   expect(app.id).toBe("app-9");
-  expect(runner.calls).toEqual(["apps.create", "apps.get_by_slug"]);
+  expect(runner.calls).toEqual(["POST /v1/apps", "GET /v1/apps/by-slug/taken"]);
 });
 
 test("a retry on another account's slug still fails", async () => {
@@ -119,5 +124,5 @@ test("a retry on another account's slug still fails", async () => {
       slug: "taken",
     })
   ).rejects.toThrow(/slug already taken/u);
-  expect(runner.calls).toEqual(["apps.create", "apps.get_by_slug"]);
+  expect(runner.calls).toEqual(["POST /v1/apps", "GET /v1/apps/by-slug/taken"]);
 });

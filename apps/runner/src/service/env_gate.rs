@@ -3,7 +3,7 @@
 //! `/__noite/auth` (host/env_gate.rs).
 //!
 //! The control UI is the only party that knows the session and the app's
-//! `view` role, and the runner has no session of its own — so this RPC is the
+//! `view` role, and the runner has no session of its own — so this grant is the
 //! one thing the UI cannot do for itself: it turns "this viewer may see this
 //! environment" into a token only the runner can mint.
 

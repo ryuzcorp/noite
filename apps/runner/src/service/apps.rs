@@ -1,5 +1,4 @@
-//! App CRUD + sleep: the operations behind `apps.*` (RPC) and
-//! `/v1/apps...` (REST).
+//! App CRUD + sleep: the operations behind the `/v1/apps` routes.
 
 use std::sync::LazyLock;
 use std::time::Duration;
@@ -67,7 +66,7 @@ fn failure_class(detail: &str) -> &'static str {
 /// supervisor's crash or OOM backoff, process state) and [`App::auto_deploy`]
 /// (the automatic-deploy budget, derived from the deploy rows). Neither is a
 /// column, so every read that answers a client annotates here — one helper so
-/// REST, RPC and the state stream cannot disagree about whether an app is
+/// the API and the state stream cannot disagree about whether an app is
 /// held or paused.
 async fn with_hold(state: &AppState, mut app: App) -> App {
     crate::host::supervisor::annotate_holds(&state.procs, std::slice::from_mut(&mut app)).await;
@@ -81,7 +80,7 @@ async fn annotate_auto_deploy(state: &AppState, apps: &mut [App]) {
 }
 
 /// The single "load the app or answer 404" helper every domain uses, so the
-/// not-found body is uniform across REST and RPC.
+/// not-found body is uniform across every route.
 pub async fn app_or_404(state: &AppState, id: &str) -> Result<App, ApiError> {
     match db::get_app(&state.pool, id).await {
         Ok(Some(app)) => Ok(with_hold(state, app).await),
@@ -514,7 +513,7 @@ async fn rename_inner(
     {
         Ok(app) => Ok(with_hold(state, app).await),
         // `rename_app` reports intent as anyhow strings; keep the mapping here
-        // so REST and RPC cannot drift on it.
+        // so the routes cannot drift on it.
         Err(e) => {
             let msg = format!("{e:#}");
             if msg.contains("deploy in flight") {

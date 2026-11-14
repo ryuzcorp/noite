@@ -16,7 +16,7 @@ pub struct Identity {
     pub email: String,
 }
 
-/// The `actor` every commit-making RPC takes (camelCase JSON): the session
+/// The `actor` every commit-making route takes (camelCase JSON): the session
 /// user the commit is attributed to. The UI fills it from `sessionUser()`;
 /// creation stores it on the app row, so it serializes too.
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]

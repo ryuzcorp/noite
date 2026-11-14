@@ -15,7 +15,7 @@ import type { TestD1 } from "../../testing/d1";
 import {
   installRunnerMock,
   makeApp,
-  RpcRefusal,
+  MockRefusal,
 } from "../../testing/runner-mock";
 import type { RunnerMock } from "../../testing/runner-mock";
 import { grantCollaborator } from "../collaborators";
@@ -163,19 +163,21 @@ const principalFor = (
 let db: TestD1;
 let runner: RunnerMock;
 
-/** One RPC method's canned answer (a `RpcRefusal` refuses like the runner). */
-type RpcAnswer = (params: Record<string, string>) => Json | RpcRefusal;
+/** One route's canned answer (a `MockRefusal` refuses like the runner). */
+type RouteAnswer = (params: Record<string, Json>) => Json | MockRefusal;
 
-/** RPC answers the loop tools read, filled per test. The double reads the map
- * on every call, so a test's assignments always apply. */
-const answers = new Map<string, RpcAnswer>();
+/** Route answers the loop tools read, filled per test. The double reads the
+ * map on every call, so a test's assignments always apply. The key is
+ * `"<METHOD> <path>"`, the way the double records its calls. */
+const answers = new Map<string, RouteAnswer>();
 
 beforeAll(async () => {
   db = createTestD1();
   setD1Binding(db.d1);
   await ensureDb();
   runner = installRunnerMock([APP, OTHER], {
-    resolve: ({ method, params }) => answers.get(method)?.(params),
+    resolve: ({ method, params, path }) =>
+      answers.get(`${method} ${path}`)?.(params),
   });
 });
 
@@ -241,19 +243,19 @@ const invocationResult = async (
   return await tool.invoke({ principal }, args);
 };
 
-/** One recorded RPC call's params, parsed as the JSON object the transport
+/** One recorded call's params, parsed as the JSON object the transport
  * carried. */
 const RequestParams = Schema.Record(Schema.String, Schema.Json);
 
 const decodeParams = Schema.decodeUnknownSync(RequestParams);
 
-/** The params of the last call to one RPC method (the double records the two
+/** The params of the last call to one route (the double records the two
  * lists in step). */
-const requestFor = (method: string): Record<string, Json> => {
-  const index = runner.calls.lastIndexOf(method);
+const requestFor = (route: string): Record<string, Json> => {
+  const index = runner.calls.lastIndexOf(route);
 
   if (index === -1) {
-    throw new Error(`${method} was never called`);
+    throw new Error(`${route} was never called`);
   }
 
   return decodeParams(runner.requests[index]);
@@ -290,7 +292,7 @@ describe("the agent loop's gates", () => {
 
     expect(refusalCode(thrown)).toBe("forbidden");
     expect(thrown instanceof Error && thrown.message).toContain("app-one");
-    expect(runner.calls).not.toContain("git.refs");
+    expect(runner.calls).not.toContain("GET /v1/apps/app-1/git/refs");
   });
 
   test("a view-capped key cannot push even with the push role", async () => {
@@ -301,7 +303,7 @@ describe("the agent loop's gates", () => {
     );
 
     expect(refusalCode(thrown)).toBe("forbidden");
-    expect(runner.calls).not.toContain("git.branch_create");
+    expect(runner.calls).not.toContain("POST /v1/apps/app-1/git/branches");
   });
 
   test("an account with no grant on the app is refused", async () => {
@@ -343,7 +345,7 @@ describe("commit_files", () => {
   };
 
   test("refuses a base on a branch that already exists", async () => {
-    answers.set("git.refs", () => refs);
+    answers.set("GET /v1/apps/app-1/git/refs", () => refs);
 
     const thrown = await invocationError(
       "commit_files",
@@ -357,11 +359,11 @@ describe("commit_files", () => {
     );
 
     expect(refusalCode(thrown)).toBe("invalid");
-    expect(runner.calls).not.toContain("source.commit");
+    expect(runner.calls).not.toContain("POST /v1/apps/app-1/source/commit");
   });
 
   test("refuses a stale expectedTip, naming both tips", async () => {
-    answers.set("git.refs", () => refs);
+    answers.set("GET /v1/apps/app-1/git/refs", () => refs);
 
     const thrown = await invocationError(
       "commit_files",
@@ -376,13 +378,13 @@ describe("commit_files", () => {
 
     expect(refusalCode(thrown)).toBe("stale_tip");
     expect(thrown instanceof Error && thrown.message).toContain("deadbeef");
-    expect(runner.calls).not.toContain("source.commit");
+    expect(runner.calls).not.toContain("POST /v1/apps/app-1/source/commit");
   });
 
   test("a hidden preview base is refused before it can become a parent", async () => {
     // `refs/previews/…` is another user's uncommitted workspace snapshot. The
     // tool refuses a raw ref as invalid, and never forwards it as `fromSha`.
-    answers.set("git.refs", () => refs);
+    answers.set("GET /v1/apps/app-1/git/refs", () => refs);
 
     const thrown = await invocationError(
       "commit_files",
@@ -397,11 +399,11 @@ describe("commit_files", () => {
     );
 
     expect(refusalCode(thrown)).toBe("invalid");
-    expect(runner.calls).not.toContain("source.commit");
+    expect(runner.calls).not.toContain("POST /v1/apps/app-1/source/commit");
   });
 
   test("a raw expectedTip is refused like a raw base", async () => {
-    answers.set("git.refs", () => refs);
+    answers.set("GET /v1/apps/app-1/git/refs", () => refs);
 
     const thrown = await invocationError(
       "commit_files",
@@ -416,7 +418,7 @@ describe("commit_files", () => {
     );
 
     expect(refusalCode(thrown)).toBe("invalid");
-    expect(runner.calls).not.toContain("source.commit");
+    expect(runner.calls).not.toContain("POST /v1/apps/app-1/source/commit");
   });
 
   test("needs at least one change", async () => {
@@ -484,9 +486,9 @@ const prDetailFixture = () => ({
 
 describe("attribution", () => {
   test("a merge made with a key signs the merge commit and the row", async () => {
-    answers.set("prs.get", () => prDetailFixture());
-    answers.set("environments.list", () => []);
-    answers.set("prs.merge", () => ({
+    answers.set("GET /v1/apps/app-1/pull_requests/1", () => prDetailFixture());
+    answers.set("GET /v1/apps/app-1/environments", () => []);
+    answers.set("POST /v1/apps/app-1/pull_requests/1/merge", () => ({
       ...prDetailFixture(),
       mergeState: "merged",
       pullRequest: {
@@ -501,7 +503,7 @@ describe("attribution", () => {
       number: 1,
     });
 
-    const merge = requestFor("prs.merge");
+    const merge = requestFor("POST /v1/apps/app-1/pull_requests/1/merge");
 
     // The actor *is* the attributed name (`keyActor`), so the squash commit's
     // author and committer carry "<user> via key <name>"; the PR row's own
@@ -514,7 +516,7 @@ describe("attribution", () => {
   });
 
   test("an MCP pull request carries the key's label", async () => {
-    answers.set("git.refs", () => ({
+    answers.set("GET /v1/apps/app-1/git/refs", () => ({
       branches: [
         {
           ahead: 1,
@@ -529,8 +531,8 @@ describe("attribution", () => {
       defaultBranch: "main",
       deployedSha: null,
     }));
-    answers.set("prs.create", () => prDetailFixture());
-    answers.set("environments.list", () => []);
+    answers.set("POST /v1/apps/app-1/pull_requests", () => prDetailFixture());
+    answers.set("GET /v1/apps/app-1/environments", () => []);
 
     await invocationResult("create_pr", principalFor("u-push"), {
       app: "app-one",
@@ -538,7 +540,7 @@ describe("attribution", () => {
       title: "t",
     });
 
-    const create = requestFor("prs.create");
+    const create = requestFor("POST /v1/apps/app-1/pull_requests");
 
     expect(create.authorLabel).toBe("u-push via key ci");
   });
@@ -554,7 +556,7 @@ describe("deploy tools", () => {
   });
 
   test("wait_for_deploy answers a settled row without waiting", async () => {
-    answers.set("deploys.list", () => [
+    answers.set("GET /v1/apps/app-1/deploys", () => [
       {
         actor: null,
         appId: "app-1",
@@ -585,7 +587,7 @@ describe("deploy tools", () => {
   });
 
   test("a moving deploy answers a resume hint instead of blocking", async () => {
-    answers.set("deploys.list", () => [
+    answers.set("GET /v1/apps/app-1/deploys", () => [
       {
         actor: null,
         appId: "app-1",
@@ -633,7 +635,7 @@ describe("deploy tools", () => {
     });
 
     try {
-      answers.set("deploys.list", () => {
+      answers.set("GET /v1/apps/app-1/deploys", () => {
         throw new Error("a refused wait must not read the runner");
       });
 
@@ -644,7 +646,9 @@ describe("deploy tools", () => {
       });
 
       expect(refusalCode(thrown)).toBe("too_many_waits");
-      expect(runner.calls.slice(before)).not.toContain("deploys.list");
+      expect(runner.calls.slice(before)).not.toContain(
+        "GET /v1/apps/app-1/deploys"
+      );
       expect(deployWaitGate.active(principal.keyId)).toBe(held.length);
     } finally {
       for (const _ of held) {
@@ -658,7 +662,7 @@ describe("deploy tools", () => {
   test("a completed wait releases its slot", async () => {
     const principal = principalFor("u-view");
 
-    answers.set("deploys.list", () => [
+    answers.set("GET /v1/apps/app-1/deploys", () => [
       {
         actor: null,
         appId: "app-1",
@@ -681,11 +685,11 @@ describe("deploy tools", () => {
 
 describe("pull-request refusals", () => {
   test("merging a conflicting pull request is not_mergeable", async () => {
-    answers.set("prs.get", () => prDetailFixture());
+    answers.set("GET /v1/apps/app-1/pull_requests/1", () => prDetailFixture());
     answers.set(
-      "prs.merge",
+      "POST /v1/apps/app-1/pull_requests/1/merge",
       () =>
-        new RpcRefusal(409, "merge conflicts: src/a.ts — resolve them locally")
+        new MockRefusal(409, "merge conflicts: src/a.ts — resolve them locally")
     );
 
     const thrown = await invocationError("merge_pr", principalFor("u-push"), {
@@ -698,8 +702,8 @@ describe("pull-request refusals", () => {
 
   test("closing a pull request that already merged is not_open", async () => {
     answers.set(
-      "prs.update",
-      () => new RpcRefusal(409, "this pull request is not open")
+      "PATCH /v1/apps/app-1/pull_requests/1",
+      () => new MockRefusal(409, "this pull request is not open")
     );
 
     const thrown = await invocationError("close_pr", principalFor("u-push"), {

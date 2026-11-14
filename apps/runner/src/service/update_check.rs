@@ -1,7 +1,7 @@
 //! Opt-out update-notice admin surface: the effective state, the stored
 //! preference, and the newest promoted release the runner has seen. One
 //! implementation behind `instance.update_status`/`instance.update_set`
-//! (RPC) and `GET`/`PUT /v1/admin/update` (REST).
+//! served by `GET`/`PUT /v1/admin/update`.
 
 use crate::api_error::ApiError;
 use crate::host::update_check::{self, UpdateStatus};

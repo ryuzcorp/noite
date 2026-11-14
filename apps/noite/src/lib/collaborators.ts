@@ -313,7 +313,7 @@ export const listAppsForCollaborator = async (
 
   const granted = new Set(grants.map((grant) => grant.appId));
 
-  // A create whose runner RPC outlived the control plane's bound lands after
+  // A create that outlived the control plane's bound lands after
   // the caller gave up, so its grant below never ran: the row exists, has no
   // grant at all, and is invisible (and undeletable) to everyone. Revoking a
   // creator always leaves another admin on the app, so "no grants anywhere"

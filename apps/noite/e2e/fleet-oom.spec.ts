@@ -1,5 +1,4 @@
 import { expect, test } from "@playwright/test";
-import type { APIRequestContext } from "@playwright/test";
 
 import {
   appListenPort,
@@ -25,50 +24,6 @@ const BURST = 8;
 test.afterAll(async ({ request }) => {
   await deleteApp(request, OOM_SLUG);
 });
-
-interface RpcResponse {
-  jsonrpc: string;
-  id: number;
-  result?: unknown;
-  error?: { message: string };
-}
-
-interface RpcParams {
-  id: string;
-  appRpm?: number | null;
-  clientRpm?: number | null;
-  memoryMb?: number | null;
-  role?: string;
-  channel?: string;
-  limit?: number;
-  environmentId?: string;
-}
-
-const rpc = async <T>(
-  request: APIRequestContext,
-  method: string,
-  params: RpcParams
-): Promise<T> => {
-  const { body, status } = await runnerCall(request, "/rpc", {
-    body: { id: 1, jsonrpc: "2.0", method, params },
-    method: "POST",
-  });
-
-  expect(status, `rpc ${method} answers 200`).toBe(200);
-  const clone: unknown = structuredClone(body);
-  // SAFETY: the runner answers `{ body }`-less JSON matching the method's
-  // result shape (runnerFetch contract). This narrows the boundary clone;
-  // each caller asserts on the shape it reads.
-  const response = clone as RpcResponse;
-
-  expect(response.error, `rpc ${method} has no error`).toBeUndefined();
-
-  const result: unknown = structuredClone(response.result);
-
-  // SAFETY: same boundary clone, narrowed to the caller's expected shape
-  // and asserted on immediately by the caller.
-  return result as T;
-};
 
 interface AppEvent {
   event: string;
@@ -98,19 +53,27 @@ test(
 
     // The cap applies on the fleet's next spawn, so set it before the first
     // deploy: the fleet is born capped.
-    const limits = await rpc<{ memoryMb?: number | null }>(
+    const limitsRes = await runnerCall(
       request,
-      "limits.set",
+      `/v1/apps/${encodeURIComponent(appId)}/limits`,
       {
-        appRpm: null,
-        clientRpm: null,
-        id: appId,
-        memoryMb: OOM_CAP_MB,
-        // The runner re-checks the app role: this lane created the app, so
-        // it calls as its admin.
-        role: "admin",
+        body: {
+          appRpm: null,
+          clientRpm: null,
+          memoryMb: OOM_CAP_MB,
+          // The runner re-checks the app role: this lane created the app, so
+          // it calls as its admin.
+          role: "admin",
+        },
+        method: "PUT",
       }
     );
+
+    expect(limitsRes.status, "limits put answers 200").toBe(200);
+
+    // SAFETY: the limits endpoint answers the `LimitsView` JSON object; the
+    // assertion below reads the one field this spec set.
+    const limits = limitsRes.body as { memoryMb?: number | null };
 
     expect(limits.memoryMb, "per-app memory override stored").toBe(OOM_CAP_MB);
 
@@ -172,14 +135,21 @@ test(
       .toBe(200);
 
     // The kill recorded the tenant-visible app event naming the cap.
+    const eventsQuery = new URLSearchParams({ channel: "fleet", limit: "10" });
+
     await expect
       .poll(
         async () => {
-          const events = await rpc<AppEvent[]>(request, "events.list", {
-            channel: "fleet",
-            id: appId,
-            limit: 10,
-          });
+          const { body, status } = await runnerCall(
+            request,
+            `/v1/apps/${encodeURIComponent(appId)}/events?${eventsQuery.toString()}`
+          );
+
+          expect(status).toBe(200);
+
+          // SAFETY: the events endpoint answers `AppEvent[]`; the assertion
+          // below reads `description` only.
+          const events = body as AppEvent[];
 
           return events.some((event) => event.description === expected);
         },
@@ -188,7 +158,16 @@ test(
       .toBe(true);
 
     // And the fleet log line the tenant reads beside it.
-    const lines = await rpc<string[]>(request, "logs.get", { id: appId });
+    const logsRes = await runnerCall(
+      request,
+      `/v1/apps/${encodeURIComponent(appId)}/logs`
+    );
+
+    expect(logsRes.status).toBe(200);
+
+    // SAFETY: the logs endpoint answers the line array; the assertion below
+    // reads the strings only.
+    const lines = logsRes.body as string[];
 
     expect(
       lines.some((line) => line.includes(expected)),

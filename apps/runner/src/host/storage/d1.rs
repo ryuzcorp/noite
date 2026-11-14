@@ -225,44 +225,6 @@ pub struct D1DeleteRowsBody {
     pub keys: Vec<BTreeMap<String, Option<String>>>,
 }
 
-// RPC parameter envelopes (snake_case, per the runner RPC convention).
-#[derive(Deserialize)]
-pub struct D1TablesParams {
-    pub id: String,
-    pub database_id: String,
-}
-
-#[derive(Deserialize)]
-pub struct D1SchemaParams {
-    pub id: String,
-    pub database_id: String,
-    pub table: String,
-}
-
-#[derive(Deserialize)]
-pub struct D1RowsParams {
-    pub id: String,
-    pub database_id: String,
-    #[serde(flatten)]
-    pub query: D1RowsQuery,
-}
-
-#[derive(Deserialize)]
-pub struct D1WriteParams {
-    pub id: String,
-    pub database_id: String,
-    #[serde(flatten)]
-    pub body: D1WriteBody,
-}
-
-#[derive(Deserialize)]
-pub struct D1DeleteRowsParams {
-    pub id: String,
-    pub database_id: String,
-    pub table: String,
-    pub keys: Vec<BTreeMap<String, Option<String>>>,
-}
-
 // ---------------------------------------------------------------------------
 // SQL building (pure — unit-tested)
 // ---------------------------------------------------------------------------

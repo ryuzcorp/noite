@@ -103,7 +103,10 @@ export const addVirtualAuthenticator = async (page: Page): Promise<void> => {
 export const runnerCall = async (
   request: APIRequestContext,
   path: string,
-  init: { body?: unknown; method?: "GET" | "POST" | "DELETE" | "PATCH" } = {}
+  init: {
+    body?: unknown;
+    method?: "GET" | "POST" | "PUT" | "DELETE" | "PATCH";
+  } = {}
 ): Promise<{
   body: Record<string, never> | unknown[] | string | number | boolean | null;
   status: number;

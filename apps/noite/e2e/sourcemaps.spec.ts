@@ -60,31 +60,14 @@ interface ErrorDetail {
   issue: ErrorIssue;
 }
 
-/** Runner JSON-RPC through the raw-port lane, unwrapping `result`. */
-const rpc = async <T>(
-  request: APIRequestContext,
-  method: string,
-  // oxlint-disable-next-line anti-slop/no-unsafe-dictionary-type -- params differ per method; the runner parses per-method and rejects mismatches.
-  params: Record<string, unknown>
-): Promise<T> => {
-  const { body, status } = await runnerCall(request, "/rpc", {
-    body: { id: 1, jsonrpc: "2.0", method, params },
-    method: "POST",
-  });
-
-  expect(status).toBe(200);
-
-  // SAFETY: the runner answers JSON-RPC `{ result }` on success; anything else fails the expects below.
-  const payload = body as {
-    error?: { code: number; message: string };
-    result?: T;
-  };
-
-  expect(payload.error).toBeUndefined();
-
-  // SAFETY: error is undefined above, so this is a success envelope carrying `result`.
-  return payload.result as T;
-};
+/** `runnerCall` widens its body to a union; each caller already knows the
+ * shape its endpoint answers, so the cast is local to the read. */
+const asJson = <T>(
+  // oxlint-disable-next-line anti-slop/no-unknown-parameters -- runnerCall parses the body at the HTTP boundary; only its static type is unknown here.
+  body: unknown
+): T =>
+  // SAFETY: the caller names the exact response type of the endpoint it hit.
+  body as T;
 
 /** One open issue whose message contains `needle`, or null. */
 const findIssue = async (
@@ -92,18 +75,32 @@ const findIssue = async (
   appId: string,
   needle: string
 ): Promise<ErrorDetail | null> => {
-  const listed = await rpc<ErrorList>(request, "errors.list", {
-    id: appId,
-    status: "open",
-  });
+  const listQuery = new URLSearchParams({ status: "open" });
+
+  const listedRes = await runnerCall(
+    request,
+    `/v1/apps/${encodeURIComponent(appId)}/errors?${listQuery.toString()}`
+  );
+
+  expect(listedRes.status).toBe(200);
+
+  // SAFETY: the errors list endpoint answers `ErrorList`; the loop below
+  // reads `issues` only.
+  const listed = asJson<ErrorList>(listedRes.body);
 
   for (const issue of listed.issues) {
     if (issue.message.includes(needle)) {
       // oxlint-disable-next-line eslint/no-await-in-loop -- one detail read per candidate; issues are few
-      const detail = await rpc<ErrorDetail>(request, "errors.get", {
-        fingerprint: issue.fingerprint,
-        id: appId,
-      });
+      const detailRes = await runnerCall(
+        request,
+        `/v1/apps/${encodeURIComponent(appId)}/errors/${encodeURIComponent(issue.fingerprint)}`
+      );
+
+      expect(detailRes.status).toBe(200);
+
+      // SAFETY: the error detail endpoint answers `ErrorDetail`; the caller
+      // reads its frames and issue only.
+      const detail = asJson<ErrorDetail>(detailRes.body);
 
       return detail;
     }
@@ -127,10 +124,18 @@ test("browser errors symbolicate to original sources", async ({
     slug: SOURCEMAPS_SLUG,
   });
 
-  const ingest = await rpc<IngestKey>(request, "errors.ingest_key", {
-    id: appId,
-    role: "admin",
-  });
+  const ingestQuery = new URLSearchParams({ role: "admin" });
+
+  const ingestRes = await runnerCall(
+    request,
+    `/v1/apps/${encodeURIComponent(appId)}/errors/ingest-key?${ingestQuery.toString()}`
+  );
+
+  expect(ingestRes.status).toBe(200);
+
+  // SAFETY: the ingest-key endpoint answers `IngestKey`; the DSN below reads
+  // `key` and `projectId` only.
+  const ingest = asJson<IngestKey>(ingestRes.body);
 
   const dsn = `http://${ingest.key}@${new URL(control).host}/${ingest.projectId}`;
 

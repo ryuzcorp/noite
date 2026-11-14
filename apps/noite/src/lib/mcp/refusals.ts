@@ -8,7 +8,7 @@
  * parsing English.
  *
  * `refusalOf` is the only classifier. The runner has no sub-codes on its
- * refusals yet, so it maps the RPC status plus the runner's own vocabulary;
+ * refusals yet, so it maps the HTTP status plus the runner's own vocabulary;
  * every new refusal that must be acted on adds a row here and a case in
  * `refusals.test.ts`.
  */
@@ -105,42 +105,30 @@ export const refusalOf = (error: unknown): McpToolError | null => {
 
   const failure = runnerFailureOf(error);
 
-  if (failure.kind === "rpc") {
-    const { message } = failure;
+  if (failure.kind === "http") {
+    const { message, status } = failure;
 
-    if (failure.code === 409) {
+    if (status === 409) {
       const match = CONFLICTS.find(([pattern]) => pattern.test(message));
 
       return refused(match?.[1] ?? "conflict", message);
     }
 
-    if (failure.code === 404) {
+    if (status === 404) {
       return refused(
         BRANCH_NOT_FOUND.test(message) ? "branch_missing" : "not_found",
         message
       );
     }
 
-    if (failure.code === 400) {
-      return refused("invalid", message);
+    if (status === 403) {
+      return refused("forbidden", message);
     }
 
-    return null;
-  }
-
-  if (failure.kind === "http") {
-    if (failure.status === 403) {
-      return refused("forbidden", `the runner refused this call (403)`);
-    }
-
-    if (failure.status === 404) {
-      return refused("not_found", `the runner has no such row (404)`);
-    }
-
-    if (failure.status === 400) {
+    if (status === 400) {
       // A rejected argument: the caller can fix what it sent (a bad ref, path
-      // or body). The body itself is not forwarded, so the code carries it.
-      return refused("invalid", `the runner rejected this call (400)`);
+      // or body).
+      return refused("invalid", message);
     }
 
     return null;

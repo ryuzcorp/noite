@@ -183,6 +183,15 @@ pub async fn get_app(State(state): State<AppState>, Path(id): Path<String>) -> i
     service::apps::get(&state, &id).await.map(Json)
 }
 
+/// Look an app up by slug (the control UI's create flow and the git-auth
+/// hook have a slug, not an id).
+pub async fn get_app_by_slug(
+    State(state): State<AppState>,
+    Path(slug): Path<String>,
+) -> impl IntoResponse {
+    service::apps::get_by_slug(&state, &slug).await.map(Json)
+}
+
 pub async fn patch_app(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -255,8 +264,9 @@ pub async fn app_state_stream(State(state): State<AppState>, Path(id): Path<Stri
 }
 
 /// One `AppStateFrame`, serialized, with every derived field filled: the
-/// fleet hold and the automatic-deploy budget (the same annotations REST and
-/// RPC serve, so a frame never reports `eligible` while a deploy is paused).
+/// fleet hold and the automatic-deploy budget (the same annotations the app
+/// routes serve, so a frame never reports `eligible` while a deploy is
+/// paused).
 /// `None` when the app row is gone or the snapshot failed; the page that
 /// holds the stream navigates away or keeps the previous frame.
 async fn state_frame(

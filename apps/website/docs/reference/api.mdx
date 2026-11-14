@@ -1,6 +1,6 @@
 ---
 title: API
-description: Runner HTTP API reference — auth, per-resource routes, statuses, and the JSON-RPC mirror.
+description: Runner HTTP API reference — auth, per-resource routes and statuses.
 ---
 
 Base: the runner listens on `127.0.0.1:8080` in-container; Caddy serves it at `api.<domain>`. All routes below are prefixed with that host unless noted.
@@ -30,6 +30,7 @@ Public (no credential): `/health`, `/ready`, `/v1/git/*`, `/v1/edge/*`.
 | Method | Route | Notes |
 | --- | --- | --- |
 | `GET` / `POST` | `/v1/apps` | List; create (quota-checked, see [Limits](/reference/limits)) |
+| `GET` | `/v1/apps/by-slug/{slug}` | One app by slug (the create flow and the git-auth hook have a slug, not an id) |
 | `GET` / `PATCH` / `DELETE` | `/v1/apps/{id}` | `PATCH` sets `desired_state: running\|stopped`; an unknown key is rejected (`422`). `DELETE` answers `204` once the purge finished, or `202 {"deleting": true}` when it still runs in the background after 3 s; the app is gone from every listing either way |
 | `POST` | `/v1/apps/{id}/rename` | Renames the app; rotates scoped credentials once a provider exists (none today — see [Tenancy](/self-hosting/tenancy)) |
 | `POST` | `/v1/apps/{id}/sleep` | Parks the app; next request wakes it |
@@ -41,6 +42,8 @@ Public (no credential): `/health`, `/ready`, `/v1/git/*`, `/v1/edge/*`.
 | `GET` | `/v1/apps/{id}/deploys` | Deploy history |
 | `GET` | `/v1/apps/{id}/deploys/stream` | SSE stream of deploys |
 | `GET` | `/v1/apps/{id}/deploys/{deploy_id}/log` | Build/deploy log |
+| `POST` | `/v1/apps/{id}/deploys/{deploy_id}/cancel` | Stops an in-flight deploy; its row closes `cancelled`, a finished deploy is `409` |
+| `POST` | `/v1/apps/{id}/deploy?role=` | Deploys one branch's current tip once (body: `ref`); `push` role |
 | `POST` | `/v1/apps/{id}/rollback` | Redeploys a previous deploy; wakes asleep apps first |
 | `POST` | `/v1/apps/{id}/git-remote` | Clone coordinates: `url` (the public remote) plus `username` and the internal layout (`s3Remote`, `endpoint`, `bucket`, `prefix`). No `remote` key |
 
@@ -113,6 +116,7 @@ Counted approvals are the latest review per reviewer that is `approved`, not dis
 | `GET` | `/v1/apps/{id}/storage/do/{class_name}` | Durable Object instances (`id`, `scope`, `?read=1` preview) |
 | `GET` | `/v1/apps/{id}/storage/r2/{bucket}?prefix=&cursor=` | One page of a bucket folder: folders, files (size, content type) and the continuation cursor |
 | `GET` / `PUT` / `DELETE` | `/v1/apps/{id}/storage/r2/{bucket}/object?key=` | Read a text preview / upload one object (streamed body; `celld r2 put`) / delete it |
+| `POST` | `/v1/apps/{id}/storage/r2/{bucket}/delete` | Delete 1..100 objects by key in one batch (body: `keys`) |
 | `GET` | `/v1/apps/{id}/storage/r2/{bucket}/raw?key=` | Raw object bytes with the object's own content type |
 
 ## Metrics and telemetry
@@ -123,7 +127,23 @@ Counted approvals are the latest review per reviewer that is `approved`, not dis
 | `GET` | `/v1/apps/{id}/metrics/version` | Change counter for the dashboard's poll gate |
 | `GET` | `/v1/apps/{id}/logs` | App logs: 24 h of ingested lines plus the live stdout tail |
 | `GET` | `/v1/apps/{id}/logs/stream` | SSE log stream |
+| `GET` | `/v1/apps/{id}/errors?status=open` | Grouped errors in one status (`open`/`resolved`/`ignored`), with counts and a 24 h series |
+| `GET` | `/v1/apps/{id}/errors/{fingerprint}` | One error issue with its occurrences, parsed frames and logs |
+| `PATCH` | `/v1/apps/{id}/errors/{fingerprint}` | Triage: body `status` (`open`/`resolved`/`ignored`) |
+| `GET` | `/v1/apps/{id}/errors/ingest-key?role=` | The app's error-ingest identity (numeric project id + key); `view` role |
+| `POST` | `/v1/apps/{id}/errors/ingest-key/rotate?role=` | Mint a replacement ingest key, keeping the project id; `admin` role |
 | `GET` | `/v1/apps/{id}/errors/stream?status=open` | SSE stream of grouped errors in one status (`errors.list` shape) |
+
+Every observability read takes an optional `environmentId` (the same for logs, metrics and events): absent or empty means production.
+
+`POST /v1/errors/ingest` records one Sentry envelope's events (body: `projectId`, `key`, `events`) and answers `{ "fingerprints": [...] }`; a wrong key or an unknown project number is one `404` that reveals neither.
+
+## Limits
+
+| Method | Route | Notes |
+| --- | --- | --- |
+| `GET` | `/v1/apps/{id}/limits` | The app's edge rate limits (requests per minute; `null` = platform default, `0` = off), fleet memory cap override and sleep override, beside the platform defaults |
+| `PUT` | `/v1/apps/{id}/limits` | Sets them (body: `clientRpm`, `appRpm`, `memoryMb`, `sleepAfterS`, `role`); `admin` role, otherwise `403` |
 
 ## Events
 
@@ -158,24 +178,11 @@ git remote add noite https://git:<key>@git.<domain>/<slug>
 git push noite main
 ```
 
-## RPC mirror
-
-`POST /rpc` is JSON-RPC 2.0 over the same auth, with a method per REST route (`apps.list`, `env.set`, `deploys.rollback`, `storage.d1.rows`, …). A few methods exist only there, because only the control UI uses them. Request bodies are capped at 2 MiB (axum's default), so a `source.commit` carrying uploads must use the REST route above (40 MiB):
-
-| Method | Params | Does |
-| --- | --- | --- |
-| `apps.get_by_slug` | `slug` | One app by slug |
-| `limits.get` | `id` | The app's edge rate limits (requests per minute; `null` = platform default, `0` = off) and fleet memory cap override (`null` = default) |
-| `limits.set` | `id`, `clientRpm`, `appRpm`, `memoryMb`, `role` (`admin`; otherwise 403) | Sets those limits and the memory cap override |
-| `errors.list` / `errors.get` / `errors.set_status` | `id`, `status` / `fingerprint` | Grouped errors, one error with occurrences, resolve / ignore / reopen |
-
-Errors map like the HTTP statuses: application errors keep `400`/`404`/`409`, a bad param shape is `-32602`, and any internal failure — an `events.*` DB error included — is `-32603`.
-
 ## Statuses
 
 | Code  | Meaning                                                 |
 | ----- | ------------------------------------------------------- |
-| `400` | Invalid path or body (e.g. `blob`, `source/commit`)     |
+| `400` | Invalid path or body (e.g. `blob`, `source/commit`, a malformed ref) |
 | `401` | Missing or wrong bearer token / API key                 |
 | `404` | Unknown app, slug, deploy, key, object, table or source |
 | `409` | Domain already taken; conflicting sleep/wake transition; lost `source/commit` race |
@@ -183,3 +190,5 @@ Errors map like the HTTP statuses: application errors keep `400`/`404`/`409`, a 
 | `429` | Edge rate limit (+ `Retry-After`)                       |
 | `500` | Runner internal failure (mirror, S3, DB)                |
 | `503` | Fleet shedding load (+ `Retry-After`) or failed wake    |
+
+Every error answer is plain text: the runner's own message (`ApiError`), never a store internal.

@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 
-import { RunnerHttpError, RunnerRpcError } from "../runner";
+import { RunnerHttpError } from "../runner";
 import { McpToolError } from "./protocol";
 import { attempt, denyAs, refusalOf, refused } from "./refusals";
 
@@ -31,7 +31,13 @@ describe("refusalOf", () => {
 
     for (const [message, code] of conflicts) {
       expect(
-        codeOf(new RunnerRpcError("prs.merge", 409, message)),
+        codeOf(
+          new RunnerHttpError(
+            "POST /v1/apps/x/pull_requests/1/merge",
+            409,
+            message
+          )
+        ),
         message
       ).toBe(code);
     }
@@ -40,17 +46,33 @@ describe("refusalOf", () => {
   test("separates a missing branch from a missing row", () => {
     expect(
       codeOf(
-        new RunnerRpcError("git.branch_delete", 404, 'branch "x" not found')
+        new RunnerHttpError(
+          "DELETE /v1/apps/x/git/branches/x",
+          404,
+          'branch "x" not found'
+        )
       )
     ).toBe("branch_missing");
     expect(
-      codeOf(new RunnerRpcError("prs.get", 404, "pull request #9 not found"))
+      codeOf(
+        new RunnerHttpError(
+          "GET /v1/apps/x/pull_requests/9",
+          404,
+          "pull request #9 not found"
+        )
+      )
     ).toBe("not_found");
   });
 
   test("a rejected argument is `invalid`, not a conflict", () => {
     expect(
-      codeOf(new RunnerRpcError("source.commit", 400, 'invalid branch "a..b"'))
+      codeOf(
+        new RunnerHttpError(
+          "POST /v1/apps/x/source/commit",
+          400,
+          'invalid branch "a..b"'
+        )
+      )
     ).toBe("invalid");
   });
 
@@ -151,7 +173,11 @@ describe("denyAs and attempt", () => {
     const refusal = await rejectionOf(() =>
       attempt(() =>
         Promise.reject(
-          new RunnerRpcError("prs.merge", 409, "this pull request is not open")
+          new RunnerHttpError(
+            "POST /v1/apps/x/pull_requests/1/merge",
+            409,
+            "this pull request is not open"
+          )
         )
       )
     );

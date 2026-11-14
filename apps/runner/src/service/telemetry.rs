@@ -1,6 +1,6 @@
 //! Instance telemetry admin surface: the effective state, the stored
 //! preference, and the exact payload a send would post. One implementation
-//! behind `telemetry.get`/`telemetry.set` (RPC) and `GET`/`PUT
+//! behind `GET`/`PUT
 //! /v1/admin/telemetry` (REST).
 
 use crate::api_error::ApiError;

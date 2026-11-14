@@ -6,7 +6,7 @@
 //!
 //! Write path: a background task holds its own SQLite connection and polls
 //! `PRAGMA data_version`, which changes whenever *another* connection
-//! commits, so every write counts (REST, RPC, deploys, the reconcile loop),
+//! commits, so every write counts (the API, deploys, the reconcile loop),
 //! not just the API calls someone remembered to mark. Once dirty, it waits
 //! 5 s for bursts to settle and uploads at most every 15 s:
 //! `VACUUM INTO` a temp file, skip when its hash matches the last upload

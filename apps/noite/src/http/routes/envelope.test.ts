@@ -26,35 +26,20 @@ const setFetch = (
   globalThis.fetch = impl as unknown as typeof fetch;
 };
 
-/** A JSON-RPC request body the stubbed runner fetch receives. */
-interface RpcPayload {
-  id: number;
-  method: string;
-  params: {
-    events?: unknown[];
-    key?: string;
-    projectId?: number;
-  };
+/** The ingest body the stubbed runner fetch receives. */
+interface IngestPayload {
+  events?: unknown[];
+  key?: string;
+  projectId?: number;
 }
 
-let calls: { method: string; params: RpcPayload["params"] }[] = [];
-let rpcError: { code: number; message: string } | null = null;
+let calls: { path: string; payload: IngestPayload }[] = [];
+let refusal: string | null = null;
 
-const answerRpc = (payload: RpcPayload): Response => {
-  if (rpcError) {
-    return Response.json({
-      error: rpcError,
-      id: payload.id,
-      jsonrpc: "2.0",
-    });
-  }
-
-  return Response.json({
-    id: payload.id,
-    jsonrpc: "2.0",
-    result: { fingerprints: ["fp-one"] },
-  });
-};
+const answerIngest = (): Response =>
+  refusal === null
+    ? Response.json({ fingerprints: ["fp-one"] })
+    : new Response(refusal, { status: 404 });
 
 const fixture = (name: string): string =>
   readFileSync(
@@ -168,16 +153,17 @@ const resolveRoute = (url: string): string | null => {
 
 beforeEach(() => {
   calls = [];
-  rpcError = null;
+  refusal = null;
   controlEnv.RUNNER_TOKEN = ENV.RUNNER_TOKEN;
   controlEnv.RUNNER_URL = ENV.RUNNER_URL;
   envelopeLimiter.reset();
-  setFetch(async (_url, init) => {
-    // SAFETY: the handler only posts JSON-RPC bodies to the runner.
-    const payload = JSON.parse(String(init?.body ?? "{}")) as RpcPayload;
-    calls.push({ method: payload.method, params: payload.params });
+  setFetch(async (url, init) => {
+    // SAFETY: the handler only posts the envelope's ingest body to the
+    // runner's one ingest route.
+    const payload = JSON.parse(String(init?.body ?? "{}")) as IngestPayload;
+    calls.push({ path: new URL(url).pathname, payload });
 
-    return answerRpc(payload);
+    return answerIngest();
   });
 });
 
@@ -270,7 +256,7 @@ describe("envelope routing and auth", () => {
   });
 
   test("a wrong key and an unknown project share one identical 403", async () => {
-    rpcError = { code: 404, message: "project not found" };
+    refusal = "unknown project or key";
 
     const wrongKey = await run(
       post("42", fixture("exception.envelope.txt"), "key-wrong"),
@@ -333,10 +319,10 @@ describe("envelope bodies", () => {
 
     expect(response?.status).toBe(200);
     expect(calls.length).toBe(1);
-    expect(calls[0]?.method).toBe("errors.ingest");
-    expect(calls[0]?.params.projectId).toBe(42);
-    expect(calls[0]?.params.key).toBe("key-gzip");
-    expect(calls[0]?.params.events?.length).toBe(1);
+    expect(calls[0]?.path).toBe("/v1/errors/ingest");
+    expect(calls[0]?.payload.projectId).toBe(42);
+    expect(calls[0]?.payload.key).toBe("key-gzip");
+    expect(calls[0]?.payload.events?.length).toBe(1);
   });
 
   test("refuses a gzip bomb without inflating it", async () => {

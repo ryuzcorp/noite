@@ -81,34 +81,8 @@ const asJson = <T>(
   // oxlint-disable-next-line anti-slop/no-unknown-parameters -- runnerCall parses the body at the HTTP boundary; only its static type is unknown here.
   body: unknown
 ): T =>
-  // SAFETY: the caller names the exact response type of the endpoint it hit (the REST mirror of the matching RPC).
+  // SAFETY: the caller names the exact response type of the endpoint it hit.
   body as T;
-
-/** Runner JSON-RPC through the raw-port lane, unwrapping `result`. */
-const rpc = async <T>(
-  request: APIRequestContext,
-  method: string,
-  // oxlint-disable-next-line anti-slop/no-unsafe-dictionary-type -- params differ per method; the runner parses per-method and rejects mismatches.
-  params: Record<string, unknown>
-): Promise<T> => {
-  const { body, status } = await runnerCall(request, "/rpc", {
-    body: { id: 1, jsonrpc: "2.0", method, params },
-    method: "POST",
-  });
-
-  expect(status).toBe(200);
-
-  // SAFETY: the runner answers JSON-RPC `{ result }` on success; anything else fails the expects below.
-  const payload = asJson<{
-    error?: { code: number; message: string };
-    result?: T;
-  }>(body);
-
-  expect(payload.error).toBeUndefined();
-
-  // SAFETY: error is undefined above, so this is a success envelope carrying `result`.
-  return payload.result as T;
-};
 
 /** Push the vite sample with a throwing `/api/env-boom` route carrying
  * `token` in the thrown message, so each branch's issue is unambiguous.
@@ -246,13 +220,24 @@ const findIssue = async (
   environmentId: string,
   needle: string
 ): Promise<ErrorIssue | null> => {
-  const listed = await rpc<ErrorList>(request, "errors.list", {
-    environmentId: environmentId === "" ? undefined : environmentId,
-    id: appId,
-    status: "open",
-  });
+  const query = new URLSearchParams({ status: "open" });
 
-  return listed.issues.find((issue) => issue.message.includes(needle)) ?? null;
+  if (environmentId !== "") {
+    query.set("environmentId", environmentId);
+  }
+
+  const { body, status } = await runnerCall(
+    request,
+    `/v1/apps/${encodeURIComponent(appId)}/errors?${query.toString()}`
+  );
+
+  expect(status).toBe(200);
+
+  return (
+    asJson<ErrorList>(body).issues.find((issue) =>
+      issue.message.includes(needle)
+    ) ?? null
+  );
 };
 
 test(
@@ -317,11 +302,16 @@ test(
       column.getByRole("link", { exact: true, name: "Open environment" })
     ).toBeVisible({ timeout: 30_000 });
 
-    const environments = await rpc<RunnerEnvironment[]>(
+    const environmentsQuery = new URLSearchParams({ role: "admin" });
+
+    const environmentsRes = await runnerCall(
       request,
-      "environments.list",
-      { id: appId, role: "admin" }
+      `/v1/apps/${encodeURIComponent(appId)}/environments?${environmentsQuery.toString()}`
     );
+
+    expect(environmentsRes.status).toBe(200);
+
+    const environments = asJson<RunnerEnvironment[]>(environmentsRes.body);
 
     const environment = environments.find((row) => row.label === LABEL);
 

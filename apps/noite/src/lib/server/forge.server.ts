@@ -1,8 +1,8 @@
 /**
  * Forge reads and branch mutations (F1–F3): the runner client functions
- * behind the same role gates their RPCs expect, resolved through the shared
- * `roleFor` helpers. Reads are `view`, branch create is `push`, branch
- * delete is `admin` (contract §"Forge read RPCs").
+ * behind the same role gates their routes expect, resolved through the
+ * shared `roleFor` helpers. Reads are `view`, branch create is `push`,
+ * branch delete is `admin`.
  */
 import * as Schema from "effect/Schema";
 

@@ -220,14 +220,12 @@ const gitAuthCreate = async (
     }
 
     if (isAppLimitReached(failure)) {
-      // Strip the runner RPC envelope ("runner rpc apps.create: 409 …") so the
-      // pusher reads a sentence, not a status code.
-      const readable = runnerFailureMessage(failure).replace(
-        /^runner rpc \S+: \d+ /u,
-        ""
+      // The runner's own text is the sentence the pusher reads, never a
+      // status code.
+      return Response.json(
+        { error: runnerFailureMessage(failure), ok: false },
+        { status: 403 }
       );
-
-      return Response.json({ error: readable, ok: false }, { status: 403 });
     }
 
     throw error;

@@ -947,7 +947,7 @@ pub struct ErrorIssue {
 }
 
 /// One stored occurrence. `frames` and `logs` are JSON arrays as text;
-/// the RPC layer inlines them.
+/// the service layer inlines them.
 #[derive(Debug, Clone, FromRow)]
 pub struct ErrorEvent {
     pub ts_us: i64,

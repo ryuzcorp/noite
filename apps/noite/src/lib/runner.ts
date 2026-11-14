@@ -1,4 +1,3 @@
-/* oxlint-disable eslint/max-classes-per-file -- the two runner error classes are the transport contract: a caught runner error is one of them. */
 import { SOURCE_FORWARD_TIMEOUT_MS } from "./commit-source";
 import { controlEnv, hydrateControlEnv } from "./control-env";
 import { errorMessage } from "./errors";
@@ -223,20 +222,16 @@ const runnerToken = () => {
   return token;
 };
 
-/** A JSON-RPC error from the runner, with its numeric code kept on the
- * error instead of only inside the message: envelope ingest tells a wrong
- * key from a transport failure by matching `code`, never message text. */
-export class RunnerRpcError extends Error {
-  readonly code: number;
-  readonly method: string;
+/** What a non-ok runner answer reads as. A 4xx `ApiError` answers the message
+ * it means the caller to read; a 5xx body can carry a store or SQL detail,
+ * and an interposed proxy answers HTML — neither is ours to forward. */
+const runnerTextFor = (path: string, status: number, body: string): string => {
+  const text = body.trim();
 
-  constructor(method: string, code: number, message: string) {
-    super(`runner rpc ${method}: ${code} ${message}`);
-    this.name = "RunnerRpcError";
-    this.code = code;
-    this.method = method;
-  }
-}
+  return status < 400 || status >= 500 || text === "" || text.startsWith("<")
+    ? `runner ${path}: ${status}`
+    : text;
+};
 
 /** A non-ok HTTP answer from the runner, kept typed so callers never parse
  * the message for the status. */
@@ -246,9 +241,10 @@ export class RunnerHttpError extends Error {
   readonly status: number;
 
   constructor(path: string, status: number, body: string) {
-    // The body stays in the field only: this message reaches `failUnknown`
-    // and therefore a client, and an upstream body is not ours to forward.
-    super(`runner ${path}: ${status}`);
+    // The raw body stays on the field; only the runner's own plain-text
+    // message becomes the error text, because `failUnknown` shows this
+    // message to a client.
+    super(runnerTextFor(path, status, body));
     this.name = "RunnerHttpError";
     this.path = path;
     this.status = status;
@@ -260,22 +256,27 @@ export class RunnerHttpError extends Error {
  * the only classifier: callers branch on this, never on `error.name` or on
  * English text. */
 export type RunnerFailure =
-  | { readonly kind: "http"; readonly path: string; readonly status: number }
-  | { readonly kind: "rpc"; readonly code: number; readonly message: string }
+  | {
+      readonly kind: "http";
+      readonly message: string;
+      readonly path: string;
+      readonly status: number;
+    }
   | { readonly kind: "timeout"; readonly message: string }
   | { readonly kind: "unreachable"; readonly message: string };
 
-/** Classify a caught runner error. `runnerFetch`/`runnerRpc` already threw a
- * typed error for an RPC rejection or a non-ok answer; a fetch-level throw is
- * a timeout when it is the abort signal's, otherwise unreachable. */
+/** Classify a caught runner error. `runnerFetch` already threw a typed error
+ * for a non-ok answer; a fetch-level throw is a timeout when it is the abort
+ * signal's, otherwise unreachable. */
 // oxlint-disable-next-line anti-slop/no-unknown-parameters -- catch-site classifier: the thrown value is unknown by construction, and this is the one place it becomes a domain type.
 export const runnerFailureOf = (error: unknown): RunnerFailure => {
-  if (error instanceof RunnerRpcError) {
-    return { code: error.code, kind: "rpc", message: error.message };
-  }
-
   if (error instanceof RunnerHttpError) {
-    return { kind: "http", path: error.path, status: error.status };
+    return {
+      kind: "http",
+      message: error.message,
+      path: error.path,
+      status: error.status,
+    };
   }
 
   const message = errorMessage(error);
@@ -290,24 +291,20 @@ export const runnerFailureOf = (error: unknown): RunnerFailure => {
  * with this message (there is no machine-readable sub-code yet), so this is
  * the one place the control UI names it. */
 export const isSlugTaken = (failure: RunnerFailure): boolean =>
-  failure.kind === "rpc" &&
-  failure.code === 409 &&
+  failure.kind === "http" &&
+  failure.status === 409 &&
   failure.message.includes("slug already taken");
 
 /** The account's app limit, from the runner's 409 text (see `isSlugTaken`). */
 export const isAppLimitReached = (failure: RunnerFailure): boolean =>
-  failure.kind === "rpc" &&
-  failure.code === 409 &&
+  failure.kind === "http" &&
+  failure.status === 409 &&
   failure.message.includes("app limit reached");
 
-/** The runner's error text without the RPC envelope. */
+/** The runner's error text for a failure, status included for a bare one. */
 export const runnerFailureMessage = (failure: RunnerFailure): string => {
   switch (failure.kind) {
-    case "http": {
-      return `runner ${failure.path}: ${failure.status}`;
-    }
-
-    case "rpc":
+    case "http":
     case "timeout":
     case "unreachable": {
       return failure.message;
@@ -318,13 +315,6 @@ export const runnerFailureMessage = (failure: RunnerFailure): string => {
     }
   }
 };
-
-interface JsonRpcEnvelope<T> {
-  error?: { code: number; message: string };
-  id: number;
-  jsonrpc: string;
-  result?: T;
-}
 
 /** Bound every runner call: a hung upstream must fail with the path in the
  * message, never hang into the platform request deadline. Healthy calls
@@ -403,81 +393,32 @@ export const runnerFetch = async <T = unknown>(
   return payload as T;
 };
 
-let rpcId = 0;
+/** Path of one app's resource. */
+const appPath = (id: string): string => `/v1/apps/${encodeURIComponent(id)}`;
 
-export const runnerRpc = async <T = unknown>(
-  method: string,
-  // oxlint-disable-next-line anti-slop/no-unsafe-dictionary-type -- params differ per method; the server parses per-method and rejects mismatches with InvalidParams.
-  params: Record<string, unknown>,
-  options?: { timeoutMs?: number }
-): Promise<T> => {
-  rpcId += 1;
+/** `?a=b&c=d` from present values: `undefined` and `""` both mean "the
+ * platform default" (production logs, every channel, the deployed sha). */
+const query = (params: Record<string, number | string | undefined>): string => {
+  const search = new URLSearchParams();
 
-  const payload = await runnerFetch<JsonRpcEnvelope<T>>("/rpc", {
-    body: JSON.stringify({ id: rpcId, jsonrpc: "2.0", method, params }),
-    method: "POST",
-    // Lifecycle mutations may move a whole S3 prefix (rename) or clear a
-    // deleted slug's leftovers (create); the runner bounds them itself, but
-    // the default 5 s abort would surface as "operation aborted due to
-    // timeout" while the runner is still working.
-    signal:
-      options?.timeoutMs === undefined
-        ? undefined
-        : AbortSignal.timeout(options.timeoutMs),
-  });
-
-  if (payload.error) {
-    throw new RunnerRpcError(method, payload.error.code, payload.error.message);
+  for (const [key, value] of Object.entries(params)) {
+    if (value !== undefined && value !== "") {
+      search.set(key, String(value));
+    }
   }
 
-  // SAFETY: JSON-RPC success responses always carry `result`; error responses throw above.
-  return payload.result as T;
+  const encoded = search.toString();
+
+  return encoded === "" ? "" : `?${encoded}`;
 };
 
-export interface RpcCall {
-  method: string;
-  // oxlint-disable-next-line anti-slop/no-unsafe-dictionary-type -- same per-method params contract as runnerRpc above.
-  params: Record<string, unknown>;
-}
-
-/** Batch several RPC calls into one POST /rpc round-trip. Results come
- * back in call order; the first per-call error throws with its method. */
-export const runnerRpcBatch = async <T = unknown>(
-  calls: RpcCall[]
-): Promise<T[]> => {
-  const base = rpcId;
-
-  const body = calls.map((call, i) => ({
-    id: base + i + 1,
-    jsonrpc: "2.0",
-    method: call.method,
-    params: call.params,
-  }));
-
-  rpcId += calls.length;
-
-  const payload = await runnerFetch<JsonRpcEnvelope<T>[]>("/rpc", {
-    body: JSON.stringify(body),
-    method: "POST",
-  });
-
-  return body.map((call) => {
-    const res = payload.find((p) => p.id === call.id);
-
-    if (!res) {
-      throw new Error(`runner rpc batch: missing response for ${call.method}`);
-    }
-
-    if (res.error) {
-      throw new Error(
-        `runner rpc ${call.method}: ${res.error.code} ${res.error.message}`
-      );
-    }
-
-    // SAFETY: same envelope contract as runnerRpc; errors throw above.
-    return res.result as T;
-  });
-};
+/** One wildcard tail (`a/b/c` keeps its slashes) with every segment encoded,
+ * for a branch name, a file path or a hostname in a route. */
+const pathTail = (value: string): string =>
+  value
+    .split("/")
+    .map((segment) => encodeURIComponent(segment))
+    .join("/");
 
 /** `GET /v1/admin/stats`: the operator counters, plus `control_fleet` —
  * whether this image supervises the control fleet at all (the dev image does
@@ -503,27 +444,33 @@ export const runnerControlFleet = async (): Promise<boolean> => {
 /** Anonymous instance telemetry: effective + stored state, the lock, the last
  * successful send and the exact payload the next send would POST. */
 export const runnerTelemetryGet = () =>
-  runnerRpc<RunnerTelemetryStatus>("telemetry.get", {});
+  runnerFetch<RunnerTelemetryStatus>("/v1/admin/telemetry");
 
 /** Store the opt-out preference; returns the same status shape. While the
  * setting is locked the preference is stored but effective stays disabled. */
 export const runnerTelemetrySet = (enabled: boolean) =>
-  runnerRpc<RunnerTelemetryStatus>("telemetry.set", { enabled });
+  runnerFetch<RunnerTelemetryStatus>("/v1/admin/telemetry", {
+    body: JSON.stringify({ enabled }),
+    method: "PUT",
+  });
 
 /** Opt-out update check: effective + stored state, the lock, the running
  * version and the newest release seen. */
 export const runnerUpdateGet = () =>
-  runnerRpc<RunnerUpdateStatus>("instance.update_status", {});
+  runnerFetch<RunnerUpdateStatus>("/v1/admin/update");
 
 /** Store the opt-out preference; returns the same status shape. Enabling
  * runs one immediate check, so the banner can appear without waiting for
  * the next hourly tick; a failed fetch keeps the last result. */
 export const runnerUpdateSet = (enabled: boolean) =>
-  runnerRpc<RunnerUpdateStatus>("instance.update_set", { enabled });
+  runnerFetch<RunnerUpdateStatus>("/v1/admin/update", {
+    body: JSON.stringify({ enabled }),
+    method: "PUT",
+  });
 
-export const runnerListApps = () => runnerRpc<RunnerApp[]>("apps.list", {});
+export const runnerListApps = () => runnerFetch<RunnerApp[]>("/v1/apps");
 
-/** Where a new app's content comes from, as the runner's `apps.create` takes
+/** Where a new app's content comes from, as the runner's app create takes
  * it (A2/A3). `blank` is the empty repo. A `git` source is the one the runner
  * allowlists to `https://github.com/<owner>/<repo>` and imports in the
  * background; `squash` collapses a template's history into one initial commit
@@ -546,65 +493,80 @@ export const runnerCreateApp = (body: {
   source?: RunnerCreateSource;
   userId: string;
 }) =>
-  runnerRpc<RunnerApp>(
-    "apps.create",
-    {
+  runnerFetch<RunnerApp>("/v1/apps", {
+    body: JSON.stringify({
       name: body.name,
       slug: body.slug,
-      // `source` is camelCase JSON (undefined keys never reach the wire), the
-      // rest of the params are snake_case.
       source: body.source,
-      user_id: body.userId,
-    },
-    { timeoutMs: CREATE_TIMEOUT_MS }
-  );
+      userId: body.userId,
+    }),
+    method: "POST",
+    // Lifecycle mutations may move a whole S3 prefix (rename) or clear a
+    // deleted slug's leftovers (create); the runner bounds them itself, but
+    // the default 5 s abort would surface as "operation aborted due to
+    // timeout" while the runner is still working.
+    signal: AbortSignal.timeout(CREATE_TIMEOUT_MS),
+  });
 
 /** Retry the import an app was created from (A2): only meaningful when its
  * stored source is an import and it is not already running. */
 export const runnerRetryImport = (id: string) =>
-  runnerRpc<RunnerApp>("apps.retry_import", { id });
+  runnerFetch<RunnerApp>(`${appPath(id)}/retry-import`, { method: "POST" });
 
-export const runnerGetApp = (id: string) =>
-  runnerRpc<RunnerApp>("apps.get", { id });
+export const runnerGetApp = (id: string) => runnerFetch<RunnerApp>(appPath(id));
 
 export const runnerGetAppBySlug = (slug: string, timeoutMs?: number) =>
-  runnerRpc<RunnerApp>(
-    "apps.get_by_slug",
-    { slug },
-    timeoutMs === undefined ? undefined : { timeoutMs }
-  );
+  runnerFetch<RunnerApp>(`/v1/apps/by-slug/${encodeURIComponent(slug)}`, {
+    signal:
+      timeoutMs === undefined ? undefined : AbortSignal.timeout(timeoutMs),
+  });
 
-// `apps.patch` takes camelCase params (like the REST PATCH body), unlike most
-// RPC methods; the runner rejects unknown keys so a mismatch fails loudly.
 export const runnerPatchApp = (id: string, body: { desiredState: string }) =>
-  runnerRpc<RunnerApp>("apps.patch", { desiredState: body.desiredState, id });
+  runnerFetch<RunnerApp>(appPath(id), {
+    body: JSON.stringify({ desiredState: body.desiredState }),
+    method: "PATCH",
+  });
 
 /** `deleting: true` when the purge still runs in the background (a slow
  * store, a deploy holding the app): the runner answers within its 3 s bound
  * either way, and the app is gone from every listing from the start. */
-export const runnerDeleteApp = (id: string) =>
-  runnerRpc<{ deleting: boolean; ok: boolean }>(
-    "apps.delete",
-    { id },
-    { timeoutMs: LIFECYCLE_TIMEOUT_MS }
+export const runnerDeleteApp = async (id: string) => {
+  // 204 once the purge finished, 202 `{ deleting: true }` while it runs.
+  const result = await runnerFetch<{ deleting?: boolean } | undefined>(
+    appPath(id),
+    {
+      method: "DELETE",
+      signal: AbortSignal.timeout(LIFECYCLE_TIMEOUT_MS),
+    }
   );
+
+  return { deleting: result?.deleting === true, ok: true as const };
+};
 
 export const runnerRenameApp = (
   id: string,
   body: { name?: string; slug?: string }
 ) =>
-  runnerRpc<RunnerApp>(
-    "apps.rename",
-    { id, ...body },
-    { timeoutMs: LIFECYCLE_TIMEOUT_MS }
-  );
+  runnerFetch<RunnerApp>(`${appPath(id)}/rename`, {
+    body: JSON.stringify({
+      name: body.name,
+      slug: body.slug,
+    }),
+    method: "POST",
+    signal: AbortSignal.timeout(LIFECYCLE_TIMEOUT_MS),
+  });
 
 export const runnerDeployLog = (id: string, deployId: string) =>
-  runnerRpc<{ log: string }>("deploys.log", { deploy_id: deployId, id });
+  runnerFetch<{ log: string }>(
+    `${appPath(id)}/deploys/${encodeURIComponent(deployId)}/log`
+  );
 
 /** Stop an in-flight deploy (its row closes with the operator's line). */
 export const runnerCancelDeploy = (id: string, deployId: string) =>
-  runnerRpc<{ ok: boolean }>("deploys.cancel", { deploy_id: deployId, id });
+  runnerFetch<{ ok: boolean }>(
+    `${appPath(id)}/deploys/${encodeURIComponent(deployId)}/cancel`,
+    { method: "POST" }
+  );
 
 /** Re-run an old sha: production, or one preview environment (`""`/absent is
  * production; the runner proves the sha was successful *in that target* and,
@@ -615,13 +577,14 @@ export const runnerRollback = (
   environmentId = "",
   role = ""
 ) =>
-  runnerRpc<{ deployId: string; ok: boolean; sha: string }>(
-    "deploys.rollback",
+  runnerFetch<{ deployId: string; ok: boolean; sha: string }>(
+    `${appPath(id)}/rollback${query({ role })}`,
     {
-      environment_id: environmentId === "" ? undefined : environmentId,
-      id,
-      role: role === "" ? undefined : role,
-      sha,
+      body: JSON.stringify({
+        environmentId: environmentId === "" ? undefined : environmentId,
+        sha,
+      }),
+      method: "POST",
     }
   );
 
@@ -629,28 +592,35 @@ export const runnerRollback = (
  * button with another branch picked); the production branch itself is
  * untouched. */
 export const runnerDeployBranch = (id: string, ref: string, role = "") =>
-  runnerRpc<{ deployId: string; ok: boolean; sha: string }>("deploys.deploy", {
-    id,
-    ref,
-    role: role === "" ? undefined : role,
-  });
+  runnerFetch<{ deployId: string; ok: boolean; sha: string }>(
+    `${appPath(id)}/deploy${query({ role })}`,
+    {
+      body: JSON.stringify({ ref }),
+      method: "POST",
+    }
+  );
 
 /** Deploy history, optionally in one preview environment (absent/"" is
  * production): the initial snapshot behind the live Deployments list. */
 export const runnerListDeploys = (id: string, environmentId = "") =>
-  runnerRpc<RunnerDeploy[]>("deploys.list", {
-    environmentId: environmentId === "" ? undefined : environmentId,
-    id,
-  });
+  runnerFetch<RunnerDeploy[]>(
+    `${appPath(id)}/deploys${query({ environmentId })}`
+  );
 
 export const runnerListEnv = (id: string) =>
-  runnerRpc<RunnerEnv[]>("env.list", { id });
+  runnerFetch<RunnerEnv[]>(`${appPath(id)}/env`);
 
 export const runnerSetEnv = (id: string, name: string, value: string) =>
-  runnerRpc<{ ok: boolean; name: string }>("env.set", { id, name, value });
+  runnerFetch<{ ok: boolean; name: string }>(`${appPath(id)}/env`, {
+    body: JSON.stringify({ name, value }),
+    method: "POST",
+  });
 
 export const runnerDeleteEnv = (id: string, name: string) =>
-  runnerRpc<{ ok: boolean }>("env.delete", { id, name });
+  runnerFetch<{ ok: boolean }>(
+    `${appPath(id)}/env/${encodeURIComponent(name)}`,
+    { method: "DELETE" }
+  );
 
 export type ErrorStatus = "open" | "resolved" | "ignored";
 
@@ -664,11 +634,11 @@ export const runnerGetError = (
   fingerprint: string,
   environmentId = ""
 ) =>
-  runnerRpc<RunnerErrorDetail>("errors.get", {
-    environmentId: environmentId === "" ? undefined : environmentId,
-    fingerprint,
-    id,
-  });
+  runnerFetch<RunnerErrorDetail>(
+    `${appPath(id)}/errors/${encodeURIComponent(fingerprint)}${query({
+      environmentId,
+    })}`
+  );
 
 export const runnerSetErrorStatus = (
   id: string,
@@ -676,12 +646,16 @@ export const runnerSetErrorStatus = (
   status: ErrorStatus,
   environmentId = ""
 ) =>
-  runnerRpc<{ ok: boolean }>("errors.set_status", {
-    environmentId: environmentId === "" ? undefined : environmentId,
-    fingerprint,
-    id,
-    status,
-  });
+  runnerFetch<{ ok: boolean }>(
+    `${appPath(id)}/errors/${encodeURIComponent(fingerprint)}`,
+    {
+      body: JSON.stringify({
+        environmentId: environmentId === "" ? undefined : environmentId,
+        status,
+      }),
+      method: "PATCH",
+    }
+  );
 
 /** One status's issue list, optionally in one preview environment
  * (absent/"" is production): the initial snapshot behind the live Errors
@@ -691,11 +665,9 @@ export const runnerListErrors = (
   status: ErrorStatus,
   environmentId = ""
 ) =>
-  runnerRpc<RunnerErrorList>("errors.list", {
-    environmentId: environmentId === "" ? undefined : environmentId,
-    id,
-    status,
-  });
+  runnerFetch<RunnerErrorList>(
+    `${appPath(id)}/errors${query({ environmentId, status })}`
+  );
 
 /** Event feed rows for one channel, optionally in one preview environment
  * (absent/"" is production). */
@@ -705,72 +677,71 @@ export const runnerListEvents = (
   limit: number,
   environmentId = ""
 ) =>
-  runnerRpc<RunnerEvent[]>("events.list", {
-    channel: channel === "" ? undefined : channel,
-    environmentId: environmentId === "" ? undefined : environmentId,
-    id,
-    limit,
-  });
+  runnerFetch<RunnerEvent[]>(
+    `${appPath(id)}/events${query({ channel, environmentId, limit })}`
+  );
 
 /** Channel names with events, optionally in one preview environment
  * (absent/"" is production). */
 export const runnerListEventChannels = (id: string, environmentId = "") =>
-  runnerRpc<string[]>("events.channels", {
-    environmentId: environmentId === "" ? undefined : environmentId,
-    id,
-  });
+  runnerFetch<string[]>(
+    `${appPath(id)}/events/channels${query({ environmentId })}`
+  );
 
 /** Insight widgets, optionally in one preview environment (absent/"" is
  * production). */
 export const runnerListEventInsights = (id: string, environmentId = "") =>
-  runnerRpc<RunnerInsight[]>("events.insights", {
-    environmentId: environmentId === "" ? undefined : environmentId,
-    id,
-  });
+  runnerFetch<RunnerInsight[]>(
+    `${appPath(id)}/insights${query({ environmentId })}`
+  );
 
 /** Merged log tail (ingested ring plus the fleet's live stdout), oldest
  * first — the initial snapshot behind the live Logs tail. */
 export const runnerGetLogs = (id: string, environmentId = "") =>
-  runnerRpc<string[]>("logs.get", {
-    environmentId: environmentId === "" ? undefined : environmentId,
-    id,
-  });
+  runnerFetch<string[]>(`${appPath(id)}/logs${query({ environmentId })}`);
 
 /** The app's public error-ingest identity (numeric project id + key). The
  * runner mints the row on first view; `role` is the caller's resolved app
  * role, enforced runner-side. */
 export const runnerGetIngestKey = (id: string, role: string) =>
-  runnerRpc<RunnerIngestKey>("errors.ingest_key", { id, role });
+  runnerFetch<RunnerIngestKey>(
+    `${appPath(id)}/errors/ingest-key${query({ role })}`
+  );
 
 /** Mint a replacement ingest key, keeping the numeric project id. Admin. */
 export const runnerRotateIngestKey = (id: string, role: string) =>
-  runnerRpc<RunnerIngestKey>("errors.rotate_ingest_key", { id, role });
+  runnerFetch<RunnerIngestKey>(
+    `${appPath(id)}/errors/ingest-key/rotate${query({ role })}`,
+    { method: "POST" }
+  );
 
 /** Record one envelope's events under the app the project number resolves
- * to. A wrong key or unknown number fails with a 404-code RunnerRpcError;
- * callers map that to one refusal that reveals neither. */
+ * to. A wrong key or unknown number fails with a 404 runner error; callers
+ * map that to one refusal that reveals neither. */
 export const runnerIngestErrors = (
   projectId: number,
   key: string,
   events: SentryEventItem[]
 ) =>
-  runnerRpc<{ fingerprints: string[] }>("errors.ingest", {
-    events,
-    key,
-    projectId,
+  runnerFetch<{ fingerprints: string[] }>("/v1/errors/ingest", {
+    body: JSON.stringify({ events, key, projectId }),
+    method: "POST",
   });
 
 /** Custom hostnames attached to an app (all of them, in hostname order).
  * `role` is the caller's resolved app role, enforced runner-side. */
 export const runnerListDomains = (id: string, role: string) =>
-  runnerRpc<RunnerDomain[]>("domains.list", { id, role });
+  runnerFetch<RunnerDomain[]>(`${appPath(id)}/domains${query({ role })}`);
 
 /** Reserve a hostname. The runner validates the shape and rejects a hostname
  * the platform owns or another app already holds. In `multi` tenancy the
  * claim starts pending until its TXT proof verifies; in `single` it is
  * verified immediately. */
 export const runnerAddDomain = (id: string, hostname: string, role: string) =>
-  runnerRpc<RunnerDomain[]>("domains.add", { hostname, id, role });
+  runnerFetch<RunnerDomain[]>(`${appPath(id)}/domains${query({ role })}`, {
+    body: JSON.stringify({ hostname }),
+    method: "POST",
+  });
 
 /** Check this app's pending claim: the TXT record at
  * `_noite-challenge.<hostname>` must contain the claim's token. */
@@ -778,16 +749,27 @@ export const runnerVerifyDomain = (
   id: string,
   hostname: string,
   role: string
-) => runnerRpc<RunnerDomain[]>("domains.verify", { hostname, id, role });
+) =>
+  runnerFetch<RunnerDomain[]>(
+    `${appPath(id)}/domains/verify${query({ role })}`,
+    {
+      body: JSON.stringify({ hostname }),
+      method: "POST",
+    }
+  );
 
 export const runnerRemoveDomain = (
   id: string,
   hostname: string,
   role: string
-) => runnerRpc<RunnerDomain[]>("domains.remove", { hostname, id, role });
+) =>
+  runnerFetch<RunnerDomain[]>(
+    `${appPath(id)}/domains/${encodeURIComponent(hostname)}${query({ role })}`,
+    { method: "DELETE" }
+  );
 
 export const runnerGetLimits = (id: string) =>
-  runnerRpc<RunnerLimits>("limits.get", { id });
+  runnerFetch<RunnerLimits>(`${appPath(id)}/limits`);
 
 /** Replace the limits; null returns one to the platform default. */
 export const runnerSetLimits = (
@@ -798,56 +780,83 @@ export const runnerSetLimits = (
   sleepAfterS: number | null,
   role: string
 ) =>
-  runnerRpc<RunnerLimits>("limits.set", {
-    appRpm,
-    clientRpm,
-    id,
-    memoryMb,
-    role,
-    sleepAfterS,
+  runnerFetch<RunnerLimits>(`${appPath(id)}/limits`, {
+    body: JSON.stringify({
+      appRpm,
+      clientRpm,
+      memoryMb,
+      role,
+      sleepAfterS,
+    }),
+    method: "PUT",
   });
 
 export const runnerGitRemote = (id: string) =>
-  runnerRpc<RunnerGitRemote>("git.remote", { id });
+  runnerFetch<RunnerGitRemote>(`${appPath(id)}/git-remote`, {
+    method: "POST",
+  });
 
 /** Branch tips with distance from `main`, plus the deployed sha. */
 export const runnerGitRefs = (id: string) =>
-  runnerRpc<GitRefs>("git.refs", { id });
+  runnerFetch<GitRefs>(`${appPath(id)}/git/refs`);
 
 /** One page of history; `ref` defaults to `main`, `limit` to 50 (1..100). */
 export const runnerGitLog = (
   id: string,
-  query: { ref?: string; path?: string; skip?: number; limit?: number } = {}
-) => runnerRpc<GitLog>("git.log", { id, ...query });
+  params: { ref?: string; path?: string; skip?: number; limit?: number } = {}
+) =>
+  runnerFetch<GitLog>(
+    `${appPath(id)}/git/log${query({
+      limit: params.limit,
+      path: params.path,
+      ref: params.ref,
+      skip: params.skip,
+    })}`
+  );
 
 /** One commit: metadata, body, per-file stats and the patch against its
  * first parent (or the empty tree for a root commit). */
 export const runnerGitCommit = (id: string, sha: string) =>
-  runnerRpc<GitCommitDetail>("git.commit", { id, sha });
+  runnerFetch<GitCommitDetail>(
+    `${appPath(id)}/git/commits/${encodeURIComponent(sha)}`
+  );
 
 /** `base..head` commits, the three-dot diff, and whether a squash merge
  * would land cleanly. */
 export const runnerGitCompare = (id: string, base: string, head: string) =>
-  runnerRpc<GitCompare>("git.compare", { base, head, id });
+  runnerFetch<GitCompare>(`${appPath(id)}/git/compare${query({ base, head })}`);
 
 /** Create a branch at `from` (a ref or sha); 409 when it exists. */
 export const runnerGitBranchCreate = (id: string, name: string, from: string) =>
-  runnerRpc<GitBranch>("git.branch_create", { from, id, name });
+  runnerFetch<GitBranch>(`${appPath(id)}/git/branches`, {
+    body: JSON.stringify({ from, name }),
+    method: "POST",
+  });
 
 /** Delete a branch; `main` is refused. */
 export const runnerGitBranchDelete = (id: string, name: string) =>
-  runnerRpc<{ ok: boolean }>("git.branch_delete", { id, name });
+  runnerFetch<{ ok: boolean }>(
+    `${appPath(id)}/git/branches/${pathTail(name)}`,
+    { method: "DELETE" }
+  );
 
 // Pull requests (F4). `actor` is `{userId, name}`; `role` is the caller's app
 // role, computed by the UI action and trusted by the runner for policy.
 
 export const runnerPrsList = (
   id: string,
-  query: { state?: string; skip?: number; limit?: number } = {}
-) => runnerRpc<PrList>("prs.list", { id, ...query });
+  params: { state?: string; skip?: number; limit?: number } = {}
+) =>
+  runnerFetch<PrList>(
+    `${appPath(id)}/pull_requests${query({
+      limit: params.limit,
+      skip: params.skip,
+      state: params.state,
+    })}`
+  );
 
 export const runnerPrGet = (id: string, number: number) =>
-  runnerRpc<PrDetail>("prs.get", { id, number });
+  runnerFetch<PrDetail>(`${appPath(id)}/pull_requests/${String(number)}`);
 
 export const runnerPrCreate = (
   id: string,
@@ -860,7 +869,18 @@ export const runnerPrCreate = (
     head: string;
     title: string;
   }
-) => runnerRpc<PrDetail>("prs.create", { id, ...body });
+) =>
+  runnerFetch<PrDetail>(`${appPath(id)}/pull_requests`, {
+    body: JSON.stringify({
+      actor: body.actor,
+      authorLabel: body.authorLabel,
+      base: body.base,
+      body: body.body,
+      head: body.head,
+      title: body.title,
+    }),
+    method: "POST",
+  });
 
 export const runnerPrUpdate = (
   id: string,
@@ -872,7 +892,17 @@ export const runnerPrUpdate = (
     state?: string;
     title?: string;
   }
-) => runnerRpc<PrDetail>("prs.update", { id, number, ...body });
+) =>
+  runnerFetch<PrDetail>(`${appPath(id)}/pull_requests/${String(number)}`, {
+    body: JSON.stringify({
+      actor: body.actor,
+      body: body.body,
+      role: body.role,
+      state: body.state,
+      title: body.title,
+    }),
+    method: "PATCH",
+  });
 
 export const runnerPrComment = (
   id: string,
@@ -888,30 +918,49 @@ export const runnerPrComment = (
     role: string;
     side?: string;
   }
-) => runnerRpc<PrComment>("prs.comment", { id, number, ...body });
+) =>
+  runnerFetch<PrComment>(
+    `${appPath(id)}/pull_requests/${String(number)}/comments`,
+    {
+      body: JSON.stringify({
+        actor: body.actor,
+        authorLabel: body.authorLabel,
+        body: body.body,
+        commitSha: body.commitSha,
+        line: body.line,
+        path: body.path,
+        role: body.role,
+        side: body.side,
+      }),
+      method: "POST",
+    }
+  );
 
 export const runnerPrCommentEdit = (
   id: string,
   commentId: string,
   body: { actor: { name: string; userId: string }; body: string }
 ) =>
-  runnerRpc<{ ok: boolean }>("prs.comment_edit", {
-    actor: body.actor,
-    body: body.body,
-    commentId,
-    id,
-  });
+  runnerFetch<{ ok: boolean }>(
+    `${appPath(id)}/comments/${encodeURIComponent(commentId)}`,
+    {
+      body: JSON.stringify({ actor: body.actor, body: body.body }),
+      method: "PATCH",
+    }
+  );
 
 export const runnerPrCommentDelete = (
   id: string,
   commentId: string,
   body: { actor: { name: string; userId: string }; role: string }
 ) =>
-  runnerRpc<{ ok: boolean }>("prs.comment_delete", {
-    commentId,
-    id,
-    ...body,
-  });
+  runnerFetch<{ ok: boolean }>(
+    `${appPath(id)}/comments/${encodeURIComponent(commentId)}`,
+    {
+      body: JSON.stringify({ actor: body.actor, role: body.role }),
+      method: "DELETE",
+    }
+  );
 
 export const runnerPrReview = (
   id: string,
@@ -923,7 +972,19 @@ export const runnerPrReview = (
     role: string;
     state: "approved" | "changes_requested";
   }
-) => runnerRpc<PrDetail>("prs.review", { id, number, ...body });
+) =>
+  runnerFetch<PrDetail>(
+    `${appPath(id)}/pull_requests/${String(number)}/reviews`,
+    {
+      body: JSON.stringify({
+        actor: body.actor,
+        authorLabel: body.authorLabel,
+        role: body.role,
+        state: body.state,
+      }),
+      method: "POST",
+    }
+  );
 
 export const runnerPrMerge = (
   id: string,
@@ -936,25 +997,48 @@ export const runnerPrMerge = (
     role: string;
     title?: string;
   }
-) => runnerRpc<PrDetail>("prs.merge", { id, number, ...body });
+) =>
+  runnerFetch<PrDetail>(
+    `${appPath(id)}/pull_requests/${String(number)}/merge`,
+    {
+      body: JSON.stringify({
+        actor: body.actor,
+        authorName: body.authorName,
+        deleteBranch: body.deleteBranch,
+        message: body.message,
+        role: body.role,
+        title: body.title,
+      }),
+      method: "POST",
+    }
+  );
 
 export const runnerBranchRulesGet = (id: string) =>
-  runnerRpc<BranchRules>("branch_rules.get", { id });
+  runnerFetch<BranchRules>(`${appPath(id)}/branch_rules`);
 
 export const runnerBranchRulesSet = (
   id: string,
   body: { requirePr: boolean; requiredApprovals: number }
-) => runnerRpc<BranchRules>("branch_rules.set", { id, ...body });
+) =>
+  runnerFetch<BranchRules>(`${appPath(id)}/branch_rules`, {
+    body: JSON.stringify({
+      requiredApprovals: body.requiredApprovals,
+      requirePr: body.requirePr,
+    }),
+    method: "PUT",
+  });
 
 // RunnerTree/Blob are generated from host::source::{TreeResponse,
 // BlobResponse}. `ref` (branch, tag or sha) selects what to browse; absent
 // keeps the deployed-sha resolution.
 
 export const runnerSourceTree = (id: string, ref?: string) =>
-  runnerRpc<RunnerTree>("source.tree", { id, ref });
+  runnerFetch<RunnerTree>(`${appPath(id)}/tree${query({ ref })}`);
 
 export const runnerSourceBlob = (id: string, path: string, ref?: string) =>
-  runnerRpc<RunnerBlob>("source.blob", { id, path, ref });
+  runnerFetch<RunnerBlob>(
+    `${appPath(id)}/blob/${pathTail(path)}${query({ ref })}`
+  );
 
 /** Commit source edits server-side (the MCP `commit_files` path): the same
  * runner endpoint the control route forwards a browser's body to, so both
@@ -976,7 +1060,9 @@ export const runnerSourceCommit = (id: string, body: SourceCommitBody) =>
 // delete and to flip an environment public. `main` is never an environment.
 
 export const runnerEnvironmentsList = (id: string, role: string) =>
-  runnerRpc<RunnerEnvironment[]>("environments.list", { id, role });
+  runnerFetch<RunnerEnvironment[]>(
+    `${appPath(id)}/environments${query({ role })}`
+  );
 
 /** Create the branch's environment (using `label`, no override) and deploy its
  * head; `actor` names the creator. */
@@ -986,11 +1072,9 @@ export const runnerEnvironmentCreate = (
   role: string,
   actor?: SourceCommitBody["actor"]
 ) =>
-  runnerRpc<RunnerEnvironment>("environments.create", {
-    actor,
-    branch,
-    id,
-    role,
+  runnerFetch<RunnerEnvironment>(`${appPath(id)}/environments`, {
+    body: JSON.stringify({ actor, branch, role }),
+    method: "POST",
   });
 
 export const runnerEnvironmentDelete = async (
@@ -998,7 +1082,10 @@ export const runnerEnvironmentDelete = async (
   envId: string,
   role: string
 ): Promise<void> => {
-  await runnerRpc<{ ok: boolean }>("environments.delete", { envId, id, role });
+  await runnerFetch<{ ok: boolean }>(
+    `${appPath(id)}/environments/${encodeURIComponent(envId)}${query({ role })}`,
+    { method: "DELETE" }
+  );
 };
 
 export const runnerEnvironmentUpdate = (
@@ -1007,12 +1094,13 @@ export const runnerEnvironmentUpdate = (
   isPublic: boolean,
   role: string
 ) =>
-  runnerRpc<RunnerEnvironment>("environments.update", {
-    envId,
-    id,
-    public: isPublic,
-    role,
-  });
+  runnerFetch<RunnerEnvironment>(
+    `${appPath(id)}/environments/${encodeURIComponent(envId)}`,
+    {
+      body: JSON.stringify({ public: isPublic, role }),
+      method: "PATCH",
+    }
+  );
 
 /** Re-deploy one environment. `actor` is who asked, when the caller can say
  * (a profile API key's attributable label); the deploy row keeps it. */
@@ -1021,22 +1109,24 @@ export const runnerEnvironmentDeploy = (
   envId: string,
   role: string,
   actor?: string
-) => {
-  const params =
-    actor === undefined ? { envId, id, role } : { actor, envId, id, role };
-
-  return runnerRpc<{ deployId: string; sha: string }>(
-    "environments.deploy",
-    params
+) =>
+  runnerFetch<{ deployId: string; sha: string }>(
+    `${appPath(id)}/environments/${encodeURIComponent(envId)}/deploy`,
+    {
+      body: JSON.stringify({ actor, role }),
+      method: "POST",
+    }
   );
-};
 
 /** One environment's variable overrides (raw rows: the caller redacts). */
 export const runnerEnvironmentVars = (
   id: string,
   envId: string,
   role: string
-) => runnerRpc<RunnerEnv[]>("environments.vars.get", { envId, id, role });
+) =>
+  runnerFetch<RunnerEnv[]>(
+    `${appPath(id)}/environments/${encodeURIComponent(envId)}/env${query({ role })}`
+  );
 
 export const runnerEnvironmentVarSet = (
   id: string,
@@ -1045,13 +1135,13 @@ export const runnerEnvironmentVarSet = (
   value: string,
   role: string
 ) =>
-  runnerRpc<{ ok: boolean; name: string }>("environments.vars.set", {
-    envId,
-    id,
-    name,
-    role,
-    value,
-  });
+  runnerFetch<{ ok: boolean; name: string }>(
+    `${appPath(id)}/environments/${encodeURIComponent(envId)}/env`,
+    {
+      body: JSON.stringify({ name, role, value }),
+      method: "POST",
+    }
+  );
 
 export const runnerEnvironmentVarDelete = async (
   id: string,
@@ -1059,12 +1149,10 @@ export const runnerEnvironmentVarDelete = async (
   name: string,
   role: string
 ): Promise<void> => {
-  await runnerRpc<{ ok: boolean }>("environments.vars.delete", {
-    envId,
-    id,
-    name,
-    role,
-  });
+  await runnerFetch<{ ok: boolean }>(
+    `${appPath(id)}/environments/${encodeURIComponent(envId)}/env/${encodeURIComponent(name)}${query({ role })}`,
+    { method: "DELETE" }
+  );
 };
 
 /** Mint the short-lived hand-back token the control UI's `/api/env-auth` route
@@ -1074,7 +1162,14 @@ export const runnerEnvironmentGrant = (
   id: string,
   envId: string,
   userId: string
-) => runnerRpc<EnvGrant>("environments.grant", { envId, id, userId });
+) =>
+  runnerFetch<EnvGrant>(
+    `${appPath(id)}/environments/${encodeURIComponent(envId)}/grant`,
+    {
+      body: JSON.stringify({ userId }),
+      method: "POST",
+    }
+  );
 
 // RunnerMetric/Span/Device/Path/Ref/Event/UserProps/Insight are generated
 // from the models::App*Stat rows, models::AppEvent, AppUserProps and
@@ -1085,11 +1180,11 @@ export const runnerGetUserProps = (
   userId: string,
   environmentId = ""
 ) =>
-  runnerRpc<RunnerUserProps | null>("events.user_props", {
-    environmentId: environmentId === "" ? undefined : environmentId,
-    id,
-    user_id: userId,
-  });
+  runnerFetch<RunnerUserProps | null>(
+    `${appPath(id)}/users/${encodeURIComponent(userId)}/props${query({
+      environmentId,
+    })}`
+  );
 
 // StorageItem and the R2Folder/Object/Preview/File shapes are generated from
 // host::storage::StorageItem and host::storage::r2.
@@ -1113,7 +1208,7 @@ export interface D1TableInfo extends D1TableInfoBase {
 }
 
 /** A D1 database listing where each table carries the caps the UI server
- * computed (the runner's `storage.d1.tables` has no caps). */
+ * computed (the runner's D1 table listing has no caps). */
 export interface D1Tables extends Omit<D1TablesRaw, "tables"> {
   tables: D1TableInfo[];
 }
@@ -1130,7 +1225,7 @@ export interface D1RowAction {
 }
 
 /** One table's schema plus the policy/role parts the UI server computes on
- * top of the runner's raw schema (`storage.d1.schema`). */
+ * top of the runner's raw schema. */
 export interface D1TableSchema extends D1TableSchemaRaw {
   /** Computed by the action layer (the caller's role, or the control D1
    * policy). */
@@ -1169,39 +1264,39 @@ export type D1Key = Record<string, D1Cell>;
 
 /** D1 databases + DO classes declared by an app's deployed config. */
 export const runnerStorage = (id: string) =>
-  runnerRpc<StorageItem[]>("storage.list", { id });
+  runnerFetch<StorageItem[]>(`${appPath(id)}/storage`);
 
 /** Tables + row counts of one app D1 database (counts in one batch). */
 export const runnerD1Tables = (id: string, databaseId: string) =>
-  runnerRpc<D1TablesRaw>("storage.d1.tables", {
-    database_id: databaseId,
-    id,
-  });
+  runnerFetch<D1TablesRaw>(
+    `${appPath(id)}/storage/d1/${encodeURIComponent(databaseId)}/tables`
+  );
 
 /** One table's schema; the action adds caps (role dependent). */
 export const runnerD1Schema = (id: string, databaseId: string, table: string) =>
-  runnerRpc<D1TableSchemaRaw>("storage.d1.schema", {
-    database_id: databaseId,
-    id,
-    table,
-  });
+  runnerFetch<D1TableSchemaRaw>(
+    `${appPath(id)}/storage/d1/${encodeURIComponent(databaseId)}/tables/${encodeURIComponent(table)}/schema`
+  );
 
 /** One server-side page of rows (sort/filters/search applied in SQL). */
 export const runnerD1Rows = (
   id: string,
   databaseId: string,
-  query: D1RowsQuery
+  params: D1RowsQuery
 ) =>
-  runnerRpc<D1Rows>("storage.d1.rows", {
-    database_id: databaseId,
-    filters: query.filters,
-    id,
-    page: query.page,
-    page_size: query.pageSize,
-    search: query.search,
-    sort: query.sort,
-    table: query.table,
-  });
+  runnerFetch<D1Rows>(
+    `${appPath(id)}/storage/d1/${encodeURIComponent(databaseId)}/tables/${encodeURIComponent(params.table)}/rows`,
+    {
+      body: JSON.stringify({
+        filters: params.filters,
+        page: params.page,
+        pageSize: params.pageSize,
+        search: params.search,
+        sort: params.sort,
+      }),
+      method: "POST",
+    }
+  );
 
 // SourceCommitFile/Body are generated from service::source.
 
@@ -1212,11 +1307,13 @@ export const runnerD1Write = (
   databaseId: string,
   body: D1WriteBody
 ) =>
-  runnerRpc<{ ok: boolean }>("storage.d1.write", {
-    database_id: databaseId,
-    id,
-    ...body,
-  });
+  runnerFetch<{ ok: boolean }>(
+    `${appPath(id)}/storage/d1/${encodeURIComponent(databaseId)}/write`,
+    {
+      body: JSON.stringify(body),
+      method: "POST",
+    }
+  );
 
 /** Delete 1..100 rows by key in one atomic batch (push-gated in the action). */
 export const runnerD1DeleteRows = (
@@ -1224,15 +1321,19 @@ export const runnerD1DeleteRows = (
   databaseId: string,
   body: D1DeleteRowsBody
 ) =>
-  runnerRpc<{ deleted: number; ok: boolean }>("storage.d1.delete_rows", {
-    database_id: databaseId,
-    id,
-    ...body,
-  });
+  runnerFetch<{ deleted: number; ok: boolean }>(
+    `${appPath(id)}/storage/d1/${encodeURIComponent(databaseId)}/delete-rows`,
+    {
+      body: JSON.stringify(body),
+      method: "POST",
+    }
+  );
 
 /** Read-only Durable Object instance list for one class. */
 export const runnerDoInstances = (id: string, className: string) =>
-  runnerRpc<DoPreview>("storage.do.list", { class_name: className, id });
+  runnerFetch<DoPreview>(
+    `${appPath(id)}/storage/do/${encodeURIComponent(className)}`
+  );
 
 /** One page of an R2 bucket folder (prefix + delimiter on the store). */
 export const runnerR2List = (
@@ -1241,20 +1342,28 @@ export const runnerR2List = (
   prefix: string,
   cursor: string | null
 ) =>
-  runnerRpc<R2Preview>("storage.r2.list", {
-    bucket,
-    cursor,
-    id,
-    prefix,
-  });
+  runnerFetch<R2Preview>(
+    `${appPath(id)}/storage/r2/${encodeURIComponent(bucket)}${query({
+      cursor: cursor ?? undefined,
+      prefix,
+    })}`
+  );
 
 /** Read-only R2 object fetch (bounded text preview, null when binary). */
 export const runnerR2Get = (id: string, bucket: string, key: string) =>
-  runnerRpc<R2File>("storage.r2.get", { bucket, id, key });
+  runnerFetch<R2File>(
+    `${appPath(id)}/storage/r2/${encodeURIComponent(bucket)}/object${query({ key })}`
+  );
 
 /** Delete 1..100 R2 objects in one call (push-gated in the action). */
 export const runnerR2Delete = (id: string, bucket: string, keys: string[]) =>
-  runnerRpc<{ deleted: number }>("storage.r2.delete", { bucket, id, keys });
+  runnerFetch<{ deleted: number }>(
+    `${appPath(id)}/storage/r2/${encodeURIComponent(bucket)}/delete`,
+    {
+      body: JSON.stringify({ keys }),
+      method: "POST",
+    }
+  );
 
 /** Browser download URL for one R2 object (UI proxy route — the browser
  * never sees RUNNER_TOKEN; the route gates on session + view role). */

@@ -52,37 +52,40 @@ interface ErrorDetail {
   issue: ErrorIssue;
 }
 
-/** Runner JSON-RPC through the raw-port lane, unwrapping `result`. */
-const rpc = async <T>(
-  request: APIRequestContext,
-  method: string,
-  // oxlint-disable-next-line anti-slop/no-unsafe-dictionary-type -- params differ per method; the runner parses per-method and rejects mismatches.
-  params: Record<string, unknown>
-): Promise<T> => {
-  const { body, status } = await runnerCall(request, "/rpc", {
-    body: { id: 1, jsonrpc: "2.0", method, params },
-    method: "POST",
-  });
-
-  expect(status).toBe(200);
-
-  // SAFETY: the runner answers JSON-RPC `{ result }` on success; anything else fails the expects below.
-  const payload = body as {
-    error?: { code: number; message: string };
-    result?: T;
-  };
-
-  expect(payload.error).toBeUndefined();
-
-  // SAFETY: error is undefined above, so this is a success envelope carrying `result`.
-  return payload.result as T;
-};
-
 const fixture = (name: string): string =>
   readFileSync(
     new URL(`../src/lib/sentry-fixtures/${name}`, import.meta.url),
     "utf-8"
   );
+
+/** `runnerCall` widens its body to a union; each caller already knows the
+ * shape its endpoint answers, so the cast is local to the read. */
+const asJson = <T>(
+  // oxlint-disable-next-line anti-slop/no-unknown-parameters -- runnerCall parses the body at the HTTP boundary; only its static type is unknown here.
+  body: unknown
+): T =>
+  // SAFETY: the caller names the exact response type of the endpoint it hit.
+  body as T;
+
+/** One status's issue list for `appId` on the raw-port lane. */
+const listErrors = async (
+  request: APIRequestContext,
+  appId: string,
+  status: string
+): Promise<ErrorList> => {
+  const query = new URLSearchParams({ status });
+
+  const { body, status: code } = await runnerCall(
+    request,
+    `/v1/apps/${encodeURIComponent(appId)}/errors?${query.toString()}`
+  );
+
+  expect(code).toBe(200);
+
+  // SAFETY: the errors list endpoint answers `ErrorList`; the callers read
+  // `issues` and `counts` only.
+  return asJson<ErrorList>(body);
+};
 
 // One app, one deploy, many assertions: envelope drops, a real SDK browser
 // error, refusals and a transaction envelope all run against the same tenant.
@@ -98,10 +101,18 @@ test(
       slug: SENTRY_SLUG,
     });
 
-    const ingest = await rpc<IngestKey>(request, "errors.ingest_key", {
-      id: appId,
-      role: "admin",
-    });
+    const ingestQuery = new URLSearchParams({ role: "admin" });
+
+    const ingestRes = await runnerCall(
+      request,
+      `/v1/apps/${encodeURIComponent(appId)}/errors/ingest-key?${ingestQuery.toString()}`
+    );
+
+    expect(ingestRes.status).toBe(200);
+
+    // SAFETY: the ingest-key endpoint answers `IngestKey`; the assertions
+    // below read `key` and `projectId` only.
+    const ingest = asJson<IngestKey>(ingestRes.body);
 
     expect(ingest.projectId).toBeGreaterThan(0);
     expect(ingest.key.length).toBeGreaterThan(0);
@@ -142,10 +153,7 @@ test(
 
     expect(dropped.status()).toBe(200);
 
-    const empty = await rpc<ErrorList>(request, "errors.list", {
-      id: appId,
-      status: "open",
-    });
+    const empty = await listErrors(request, appId, "open");
 
     expect(empty.issues).toEqual([]);
     expect(empty.counts.open).toBe(0);
@@ -157,10 +165,7 @@ test(
     await expect
       .poll(
         async () => {
-          const open = await rpc<ErrorList>(request, "errors.list", {
-            id: appId,
-            status: "open",
-          });
+          const open = await listErrors(request, appId, "open");
 
           return open.issues;
         },
@@ -168,17 +173,20 @@ test(
       )
       .toHaveLength(1);
 
-    const listed = await rpc<ErrorList>(request, "errors.list", {
-      id: appId,
-      status: "open",
-    });
+    const listed = await listErrors(request, appId, "open");
 
     const [issue] = listed.issues;
 
-    const detail = await rpc<ErrorDetail>(request, "errors.get", {
-      fingerprint: issue?.fingerprint,
-      id: appId,
-    });
+    const detailRes = await runnerCall(
+      request,
+      `/v1/apps/${encodeURIComponent(appId)}/errors/${encodeURIComponent(String(issue?.fingerprint))}`
+    );
+
+    expect(detailRes.status).toBe(200);
+
+    // SAFETY: the error detail endpoint answers `ErrorDetail`; the assertions
+    // below read the issue message and the occurrence fields only.
+    const detail = asJson<ErrorDetail>(detailRes.body);
 
     expect(detail.issue.message).toContain(token);
 
@@ -231,10 +239,7 @@ test(
 
     expect(stored.status()).toBe(200);
 
-    const still = await rpc<ErrorList>(request, "errors.list", {
-      id: appId,
-      status: "open",
-    });
+    const still = await listErrors(request, appId, "open");
 
     expect(still.issues).toHaveLength(1);
     expect(still.counts.open).toBe(1);

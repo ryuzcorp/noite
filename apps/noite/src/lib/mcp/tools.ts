@@ -55,9 +55,9 @@ import {
   runnerPrReview,
   runnerPrUpdate,
   runnerPrsList,
+  runnerGetLogs,
+  runnerListErrors,
   runnerRollback,
-  runnerRpc,
-  runnerRpcBatch,
   runnerSetEnv,
   runnerSourceBlob,
   runnerSourceCommit,
@@ -73,8 +73,6 @@ import type {
   RunnerBlob,
   RunnerDeploy,
   RunnerEnvironment,
-  RunnerErrorList,
-  RunnerGitRemote,
   RunnerTree,
   SourceCommitBody,
 } from "../runner";
@@ -580,10 +578,10 @@ export const MCP_TOOLS: readonly McpToolDefinition[] = [
         };
       }
 
-      // One batched git.remote gives every app's public URL (the git base
-      // carries the scheme and dev port) without a round trip per app.
-      const remotes = await runnerRpcBatch<RunnerGitRemote>(
-        apps.map((app) => ({ method: "git.remote", params: { id: app.id } }))
+      // One git-remote per app, in parallel: its public URL (the git base
+      // carries the scheme and dev port).
+      const remotes = await Promise.all(
+        apps.map((app) => runnerGitRemote(app.id))
       );
 
       const rows = apps.map((app, index) => ({
@@ -738,10 +736,7 @@ export const MCP_TOOLS: readonly McpToolDefinition[] = [
         ? await requireEnvironment(app, role, environment)
         : null;
 
-      const deploys = await runnerRpc<RunnerDeploy[]>(
-        "deploys.list",
-        env === null ? { id: app.id } : { environmentId: env.id, id: app.id }
-      );
+      const deploys = await runnerListDeploys(app.id, env?.id ?? "");
 
       const recent = deploys.slice(0, 5);
       const latest = recent.at(0) ?? null;
@@ -803,9 +798,7 @@ export const MCP_TOOLS: readonly McpToolDefinition[] = [
       let wanted = deployId;
 
       if (!wanted) {
-        const deploys = await runnerRpc<RunnerDeploy[]>("deploys.list", {
-          id: app.id,
-        });
+        const deploys = await runnerListDeploys(app.id);
 
         const [latest] = deploys;
 
@@ -847,10 +840,7 @@ export const MCP_TOOLS: readonly McpToolDefinition[] = [
         ? await requireEnvironment(app, role, environment)
         : null;
 
-      const all = await runnerRpc<string[]>("logs.get", {
-        environmentId: env?.id,
-        id: app.id,
-      });
+      const all = await runnerGetLogs(app.id, env?.id ?? "");
 
       const lines = all.slice(-(limit ?? 200));
       const where = env === null ? app.slug : `${app.slug}/${env.label}`;
@@ -886,11 +876,11 @@ export const MCP_TOOLS: readonly McpToolDefinition[] = [
         ? await requireEnvironment(app, role, environment)
         : null;
 
-      const list = await runnerRpc<RunnerErrorList>("errors.list", {
-        environmentId: env?.id,
-        id: app.id,
-        status: status ?? "open",
-      });
+      const list = await runnerListErrors(
+        app.id,
+        status ?? "open",
+        env?.id ?? ""
+      );
 
       const issues = list.issues.slice(0, 50).map((issue) => ({
         count: issue.count,

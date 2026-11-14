@@ -2,7 +2,7 @@
 import type { IssueStatus } from "./IssueStatus";
 
 /**
- * One issue plus its 24-hour series (the `hourly` field the RPC inlines).
+ * One issue plus its 24-hour series (the `hourly` field the routes inline).
  */
 export type ErrorIssueView = { hourly: Array<number>, fingerprint: string, kind: string, message: string, culprit: string, handler: string, source: string, count: number, firstSeenUs: number, lastSeenUs: number, firstSha: string | null, lastSha: string | null, status: IssueStatus, 
 /**

@@ -47,18 +47,32 @@ const ENVIRONMENT = {
 };
 
 let db: TestD1;
-let calls: { method: string; params: Record<string, string> }[] = [];
 
-const answer = (method: string): unknown => {
-  if (method === "apps.get") {
+interface RunnerCall {
+  method: string;
+  params: Record<string, string>;
+  path: string;
+}
+
+let calls: RunnerCall[] = [];
+
+const APP_ROUTE = /^\/v1\/apps\/(?<id>[^/]+)$/u;
+
+const ENVIRONMENTS_ROUTE = /^\/v1\/apps\/(?<id>[^/]+)\/environments$/u;
+
+const GRANT_ROUTE =
+  /^\/v1\/apps\/(?<id>[^/]+)\/environments\/(?<env>[^/]+)\/grant$/u;
+
+const answer = (method: string, path: string): unknown => {
+  if (method === "GET" && APP_ROUTE.test(path)) {
     return APP;
   }
 
-  if (method === "environments.list") {
+  if (method === "GET" && ENVIRONMENTS_ROUTE.test(path)) {
     return [ENVIRONMENT];
   }
 
-  if (method === "environments.grant") {
+  if (method === "POST" && GRANT_ROUTE.test(path)) {
     return { token: "tok" };
   }
 
@@ -72,24 +86,33 @@ beforeAll(async () => {
   controlEnv.RUNNER_TOKEN = ENV.RUNNER_TOKEN;
   controlEnv.RUNNER_URL = ENV.RUNNER_URL;
   stampRunnerEnv(ENV as never);
-  // SAFETY: the double only has to satisfy the JSON-RPC call shape runnerRpc makes.
+  // SAFETY: the double only has to satisfy the REST call shape runnerFetch makes.
   globalThis.fetch = (async (
-    _url: string | URL | Request,
+    input: string | URL | Request,
     init?: RequestInit
   ) => {
-    // SAFETY: runnerRpc always sends a JSON-RPC envelope as a string body.
-    const body = JSON.parse(String(init?.body)) as {
-      id: number;
-      method: string;
-      params: Record<string, string>;
-    };
+    const url = new URL(String(input));
+    const method = (init?.method ?? "GET").toUpperCase();
 
-    calls.push({ method: body.method, params: body.params });
-    const result = answer(body.method);
+    // SAFETY: runnerFetch sends a JSON string body on every mutating call and
+    // the route reads it back as a flat object (test double only).
+    // oxlint-disable-next-line anti-slop/no-runtime-typeof -- the body is a plain JSON string on every runner call; there is no other representation to consider.
+    const body: Record<string, string> | undefined =
+      // oxlint-disable-next-line anti-slop/no-runtime-typeof -- same reason as above.
+      typeof init?.body === "string"
+        ? (JSON.parse(init.body) as Record<string, string>)
+        : undefined;
+
+    calls.push({
+      method,
+      params: body ?? Object.fromEntries(url.searchParams.entries()),
+      path: url.pathname,
+    });
+    const result = answer(method, url.pathname);
 
     return result === null
-      ? Response.json({ error: { code: -32_001, message: "no" }, id: body.id })
-      : Response.json({ id: body.id, jsonrpc: "2.0", result });
+      ? new Response("not found", { status: 404 })
+      : Response.json(result);
   }) as unknown as typeof fetch;
 });
 
@@ -172,7 +195,7 @@ describe("GET /api/env-auth", () => {
     signIn("u-stranger");
     const response = await call(`?env=env-1&app=app-1&return=${returnUrl()}`);
     expect(response.status).toBe(403);
-    expect(calls.map((one) => one.method)).toEqual(["apps.get"]);
+    expect(calls.map((one) => one.path)).toEqual(["/v1/apps/app-1"]);
   });
 
   test("answers a frame with a page, never a bare line or the login form", async () => {
@@ -215,16 +238,16 @@ describe("GET /api/env-auth", () => {
     expect(response.headers.get("location")).toBe(
       "http://feat-x.app-one.noite.localhost:9080/__noite/auth?token=tok&return=%2Ffiles%2Fa.ts%3Fline%3D3"
     );
-    expect(calls.map((one) => one.method)).toEqual([
-      "apps.get",
-      "environments.list",
-      "environments.grant",
+    expect(calls.map((one) => one.path)).toEqual([
+      "/v1/apps/app-1",
+      "/v1/apps/app-1/environments",
+      "/v1/apps/app-1/environments/env-1/grant",
     ]);
     expect(
-      calls.find((one) => one.method === "environments.list")?.params.role
+      calls.find((one) => one.path.endsWith("/environments"))?.params.role
     ).toBe("view");
     expect(
-      calls.find((one) => one.method === "environments.grant")?.params.userId
+      calls.find((one) => one.path.endsWith("/grant"))?.params.userId
     ).toBe("u-view");
   });
 

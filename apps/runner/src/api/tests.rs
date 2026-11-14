@@ -1,7 +1,7 @@
-//! Handler-level REST↔RPC parity tests: drive the real `api::router::router`
-//! over a temporary SQLite state and assert both transports (`/v1/...` and
-//! `/rpc`) return the same result for the same operation, including the
-//! not-found / conflict / validation statuses.
+//! Handler-level REST tests: drive the real `api::router::router` over a
+//! temporary SQLite state and assert the `/v1/...` handlers answer with the
+//! documented status and shape, including the not-found / conflict /
+//! validation statuses.
 //!
 //! S3 is stubbed with an in-process LIST-only server: purge, rename and
 //! source-rev resolution answer "nothing there" instead of dialing RustFS.
@@ -133,20 +133,6 @@ impl Harness {
         (status, parse_body(&bytes))
     }
 
-    /// One JSON-RPC call: `Ok(result)` or `Err((code, message))`.
-    pub(crate) async fn rpc(&self, method: &str, params: Value) -> Result<Value, (i64, String)> {
-        let payload = json!({ "id": 1, "jsonrpc": "2.0", "method": method, "params": params });
-        let (status, value) = self.rest("POST", "/rpc", Some(payload)).await;
-        assert_eq!(status, StatusCode::OK, "rpc {method} transport");
-        if let Some(error) = value.get("error") {
-            return Err((
-                error["code"].as_i64().unwrap_or_default(),
-                error["message"].as_str().unwrap_or_default().to_string(),
-            ));
-        }
-        Ok(value.get("result").cloned().unwrap_or(Value::Null))
-    }
-
     pub(crate) async fn finish(&self) {
         self.state.pool.clone().close().await;
         let _ = std::fs::remove_dir_all(&self.dir);
@@ -169,33 +155,8 @@ fn parse_body(bytes: &[u8]) -> Value {
         .unwrap_or_else(|_| Value::String(String::from_utf8_lossy(bytes).into_owned()))
 }
 
-/// Blanks the per-app fields that legitimately differ between two rows
-/// (identity, derived bucket/subdomain, allocated ports, timestamps) so two
-/// apps seeded with the same name compare equal.
-fn normalize_app(mut app: Value) -> Value {
-    let Some(obj) = app.as_object_mut() else {
-        return app;
-    };
-    for key in [
-        "id",
-        "slug",
-        "subdomain",
-        "gitPrefix",
-        "fleetBucket",
-        "listenPort",
-        "internalPort",
-        "createdAt",
-        "updatedAt",
-    ] {
-        if obj.contains_key(key) {
-            obj.insert(key.into(), Value::String("<volatile>".into()));
-        }
-    }
-    app
-}
-
 #[tokio::test]
-async fn apps_create_agrees() {
+async fn apps_create() {
     let h = Harness::new().await;
     let (status, rest_app) = h
         .rest(
@@ -206,36 +167,143 @@ async fn apps_create_agrees() {
         .await;
     assert_eq!(status, StatusCode::CREATED);
     assert_eq!(rest_app["slug"], "rest-app");
-
-    let rpc_app = h
-        .rpc("apps.create", json!({ "name": "App", "slug": "rpc-app" }))
-        .await
-        .expect("apps.create");
-    assert_eq!(rpc_app["slug"], "rpc-app");
-    assert_eq!(normalize_app(rest_app), normalize_app(rpc_app));
     h.finish().await;
 }
 
 #[tokio::test]
-async fn apps_get_agrees() {
+async fn apps_get() {
     let h = Harness::new().await;
     let app = h.seed_app("read-app").await;
     let (status, rest_app) = h.rest("GET", &format!("/v1/apps/{}", app.id), None).await;
     assert_eq!(status, StatusCode::OK);
-    let rpc_app = h
-        .rpc("apps.get", json!({ "id": app.id }))
-        .await
-        .expect("apps.get");
-    assert_eq!(rest_app, rpc_app);
+    assert_eq!(rest_app["id"], json!(app.id));
     h.finish().await;
 }
 
-/// The app API carries the supervisor's crash/OOM hold, on both transports
-/// and in the list: a crash-looping fleet answered `running` with nothing to
+/// The route table's static segments must win over the `{id}` and
+/// `{fingerprint}` parameters: a slug lookup is not an app id, the ingest-key
+/// reads are not error fingerprints, and the errors stream is not one either.
+/// A precedence regression (matchit treats a static sibling over a parameter)
+/// would turn each of these into a 404 of the wrong handler without touching
+/// any handler's code, so each is pinned here.
+#[tokio::test]
+async fn static_segments_win_over_the_parameter_routes() {
+    let h = Harness::new().await;
+    let app = h.seed_app("routed-app").await;
+
+    // `by-slug` is not an app id: the id route would answer 404 (and this
+    // test's own 404 check below would pass for the wrong reason).
+    let (status, by_slug) = h.rest("GET", "/v1/apps/by-slug/routed-app", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(by_slug["id"], json!(app.id));
+    assert_eq!(by_slug["slug"], "routed-app");
+
+    // `ingest-key` is not a fingerprint: the read route answers the app's
+    // ingest identity instead of "no such issue".
+    let (status, key) = h
+        .rest(
+            "GET",
+            &format!("/v1/apps/{}/errors/ingest-key?role=view", app.id),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(key["key"].is_string(), "{key}");
+
+    // `ingest-key/rotate` is two static segments, not `{fingerprint}/…`.
+    let (status, rotated) = h
+        .rest(
+            "POST",
+            &format!("/v1/apps/{}/errors/ingest-key/rotate?role=admin", app.id),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_ne!(rotated["key"], key["key"], "rotate mints a new key");
+
+    // `stream` is not a fingerprint: it answers an SSE stream, so only the
+    // head is read (the body never completes).
+    let request = Request::builder()
+        .method("GET")
+        .uri(format!("/v1/apps/{}/errors/stream?status=open", app.id))
+        .header("authorization", format!("Bearer {TOKEN}"))
+        .body(Body::empty())
+        .expect("build request");
+    let response = h
+        .router
+        .clone()
+        .oneshot(request)
+        .await
+        .expect("router call");
+    assert_eq!(response.status(), StatusCode::OK);
+    let content_type = response
+        .headers()
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+    assert!(
+        content_type.starts_with("text/event-stream"),
+        "{content_type}"
+    );
+
+    // The batch delete is a POST on its own segment: an empty selection is
+    // refused by that handler's service call, never routed to the
+    // single-object `DELETE …/object?key=` above it.
+    let (status, body) = h
+        .rest(
+            "POST",
+            &format!("/v1/apps/{}/storage/r2/assets/delete", app.id),
+            Some(json!({ "keys": [] })),
+        )
+        .await;
+    assert_ne!(status, StatusCode::NOT_FOUND, "{body}");
+    assert_ne!(status, StatusCode::METHOD_NOT_ALLOWED, "{body}");
+    assert!(
+        body.as_str()
+            .is_some_and(|text| text.contains("select 1 to 100 objects")),
+        "{body}"
+    );
+
+    h.finish().await;
+}
+
+/// Rotating the ingest key is admin-only, and the refusal is the runner's
+/// (the role is resolved by the control UI, re-checked here). The view role
+/// may read the key but never rotate it.
+#[tokio::test]
+async fn rotating_the_ingest_key_needs_admin() {
+    let h = Harness::new().await;
+    let app = h.seed_app("key-app").await;
+
+    for role in ["view", "push"] {
+        let (status, body) = h
+            .rest(
+                "POST",
+                &format!("/v1/apps/{}/errors/ingest-key/rotate?role={role}", app.id),
+                None,
+            )
+            .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{role}: {body}");
+    }
+
+    let (status, body) = h
+        .rest(
+            "POST",
+            &format!("/v1/apps/{}/errors/ingest-key/rotate", app.id),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "no role: {body}");
+
+    h.finish().await;
+}
+
+/// The app API carries the supervisor's crash/OOM hold, on the read and in
+/// the list: a crash-looping fleet answered `running` with nothing to
 /// say why, which is what the "crashed, retrying" badge reads. A fleet that is
 /// not held omits the field entirely (the row never carries it).
 #[tokio::test]
-async fn apps_report_a_held_fleet_on_both_transports() {
+async fn apps_report_a_held_fleet() {
     let h = Harness::new().await;
     let held = h.seed_app("held-app").await;
     let fine = h.seed_app("fine-app").await;
@@ -282,11 +350,6 @@ async fn apps_report_a_held_fleet_on_both_transports() {
         "retryAt is RFC 3339: {}",
         rest_app["fleetHold"]["retryAt"]
     );
-    let rpc_app = h
-        .rpc("apps.get", json!({ "id": held.id }))
-        .await
-        .expect("apps.get");
-    assert_eq!(rest_app, rpc_app, "both transports serve the same hold");
 
     let (status, list) = h.rest("GET", "/v1/apps", None).await;
     assert_eq!(status, StatusCode::OK);
@@ -311,10 +374,9 @@ async fn apps_report_a_held_fleet_on_both_transports() {
 }
 
 #[tokio::test]
-async fn apps_patch_agrees() {
+async fn apps_patch() {
     let h = Harness::new().await;
     let a = h.seed_app_named("patch-a", "Patch App").await;
-    let b = h.seed_app_named("patch-b", "Patch App").await;
 
     let (status, rest_app) = h
         .rest(
@@ -325,24 +387,13 @@ async fn apps_patch_agrees() {
         .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(rest_app["desiredState"], "stopped");
-
-    let rpc_app = h
-        .rpc(
-            "apps.patch",
-            json!({ "id": b.id, "desiredState": "stopped" }),
-        )
-        .await
-        .expect("apps.patch");
-    assert_eq!(rpc_app["desiredState"], "stopped");
-    assert_eq!(normalize_app(rest_app), normalize_app(rpc_app));
     h.finish().await;
 }
 
 #[tokio::test]
-async fn apps_rename_agrees() {
+async fn apps_rename() {
     let h = Harness::new().await;
     let a = h.seed_app("rename-a").await;
-    let b = h.seed_app("rename-b").await;
 
     let (status, rest_app) = h
         .rest(
@@ -353,48 +404,27 @@ async fn apps_rename_agrees() {
         .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(rest_app["slug"], "rest-renamed");
-
-    let rpc_app = h
-        .rpc(
-            "apps.rename",
-            json!({ "id": b.id, "name": "Renamed", "slug": "rpc-renamed" }),
-        )
-        .await
-        .expect("apps.rename");
-    assert_eq!(rpc_app["slug"], "rpc-renamed");
-    assert_eq!(normalize_app(rest_app), normalize_app(rpc_app));
     h.finish().await;
 }
 
 #[tokio::test]
-async fn apps_delete_agrees() {
+async fn apps_delete() {
     let h = Harness::new().await;
     let a = h.seed_app("delete-a").await;
-    let b = h.seed_app("delete-b").await;
 
     let (status, body) = h.rest("DELETE", &format!("/v1/apps/{}", a.id), None).await;
     assert_eq!(status, StatusCode::NO_CONTENT);
     assert_eq!(body, Value::Null);
 
-    let rpc_body = h
-        .rpc("apps.delete", json!({ "id": b.id }))
-        .await
-        .expect("apps.delete");
-    assert_eq!(rpc_body, json!({ "ok": true, "deleting": false }));
-
     assert!(crate::db::get_app(&h.state.pool, &a.id)
         .await
         .expect("lookup a")
-        .is_none());
-    assert!(crate::db::get_app(&h.state.pool, &b.id)
-        .await
-        .expect("lookup b")
         .is_none());
     h.finish().await;
 }
 
 #[tokio::test]
-async fn domains_agree() {
+async fn domains() {
     let h = Harness::new().await;
     let app = h.seed_app("dom-app").await;
 
@@ -407,22 +437,18 @@ async fn domains_agree() {
         .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(listed.as_array().map(Vec::len), Some(1));
-    assert_eq!(
-        h.rpc("domains.list", json!({ "id": app.id, "role": "admin" }))
-            .await
-            .expect("domains.list"),
-        listed
-    );
 
-    let added = h
-        .rpc(
-            "domains.add",
-            json!({ "id": app.id, "hostname": "two.example.com", "role": "admin" }),
+    let (status, added) = h
+        .rest(
+            "POST",
+            &format!("/v1/apps/{}/domains?role=admin", app.id),
+            Some(json!({ "hostname": "two.example.com" })),
         )
-        .await
-        .expect("domains.add");
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(added.as_array().map(Vec::len), Some(2));
     // `domains.verify` is a round-trip on an already-verified claim here
-    // (single tenancy verifies on add): both transports return the list.
+    // (single tenancy verifies on add): it answers the list.
     let (status, rest_verified) = h
         .rest(
             "POST",
@@ -432,15 +458,6 @@ async fn domains_agree() {
         .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(rest_verified, added);
-    assert_eq!(
-        h.rpc(
-            "domains.verify",
-            json!({ "id": app.id, "hostname": "one.example.com", "role": "admin" })
-        )
-        .await
-        .expect("domains.verify"),
-        added
-    );
     let (status, rest_list) = h
         .rest(
             "GET",
@@ -451,7 +468,7 @@ async fn domains_agree() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(rest_list, added);
 
-    let (status, after_rest_remove) = h
+    let (status, after_remove) = h
         .rest(
             "DELETE",
             &format!("/v1/apps/{}/domains/one.example.com?role=admin", app.id),
@@ -459,20 +476,17 @@ async fn domains_agree() {
         )
         .await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(
-        h.rpc("domains.list", json!({ "id": app.id, "role": "admin" }))
-            .await
-            .expect("domains.list"),
-        after_rest_remove
-    );
+    assert_eq!(after_remove.as_array().map(Vec::len), Some(1));
 
-    let after_rpc_remove = h
-        .rpc(
-            "domains.remove",
-            json!({ "id": app.id, "hostname": "two.example.com", "role": "admin" }),
+    let (status, empty) = h
+        .rest(
+            "DELETE",
+            &format!("/v1/apps/{}/domains/two.example.com?role=admin", app.id),
+            None,
         )
-        .await
-        .expect("domains.remove");
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(empty.as_array().map(Vec::len), Some(0));
     let (status, rest_list) = h
         .rest(
             "GET",
@@ -481,8 +495,8 @@ async fn domains_agree() {
         )
         .await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(rest_list, after_rpc_remove);
-    // Verifying a detached hostname 404s on both transports.
+    assert_eq!(rest_list, empty);
+    // Verifying a detached hostname 404s.
     let (status, _) = h
         .rest(
             "POST",
@@ -491,22 +505,14 @@ async fn domains_agree() {
         )
         .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
-    assert!(matches!(
-        h.rpc(
-            "domains.verify",
-            json!({ "id": app.id, "hostname": "gone.example.com", "role": "admin" })
-        )
-        .await,
-        Err((404, _))
-    ));
     h.finish().await;
 }
 
 #[tokio::test]
-async fn domains_roles_hold_on_both_transports() {
+async fn domains_roles_hold() {
     let h = Harness::new().await;
     let app = h.seed_app("role-app").await;
-    // No role is a refusal, never a default — on REST and RPC alike.
+    // No role is a refusal, never a default.
     let (status, _) = h
         .rest(
             "POST",
@@ -519,19 +525,7 @@ async fn domains_roles_hold_on_both_transports() {
         .rest("GET", &format!("/v1/apps/{}/domains", app.id), None)
         .await;
     assert_eq!(status, StatusCode::FORBIDDEN);
-    assert!(matches!(
-        h.rpc("domains.list", json!({ "id": app.id })).await,
-        Err((403, _))
-    ));
-    assert!(matches!(
-        h.rpc(
-            "domains.add",
-            json!({ "id": app.id, "hostname": "gated.example.com" })
-        )
-        .await,
-        Err((403, _))
-    ));
-    // A viewer reads but mutates nothing, on either transport.
+    // A viewer reads but mutates nothing.
     let (status, _) = h
         .rest(
             "GET",
@@ -548,14 +542,6 @@ async fn domains_roles_hold_on_both_transports() {
         )
         .await;
     assert_eq!(status, StatusCode::FORBIDDEN);
-    assert!(matches!(
-        h.rpc(
-            "domains.verify",
-            json!({ "id": app.id, "hostname": "gated.example.com", "role": "view" })
-        )
-        .await,
-        Err((403, _))
-    ));
     // An admin passes everywhere: this claim also proves the 200 path still
     // works with a role attached.
     let (status, listed) = h
@@ -615,7 +601,7 @@ async fn pending_domains_mint_no_certificates() {
 }
 
 #[tokio::test]
-async fn env_agrees() {
+async fn env() {
     let h = Harness::new().await;
     let app = h.seed_app("env-app").await;
 
@@ -633,43 +619,31 @@ async fn env_agrees() {
         .rest("GET", &format!("/v1/apps/{}/env", app.id), None)
         .await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(
-        h.rpc("env.list", json!({ "id": app.id }))
-            .await
-            .expect("env.list"),
-        rest_list
-    );
+    assert_eq!(rest_list[0]["name"], "API_KEY");
+    assert_eq!(rest_list[0]["value"], "1");
 
-    let _ = h
-        .rpc(
-            "env.set",
-            json!({ "id": app.id, "name": "TOKEN", "value": "2" }),
+    let (status, _) = h
+        .rest(
+            "POST",
+            &format!("/v1/apps/{}/env", app.id),
+            Some(json!({ "name": "TOKEN", "value": "2" })),
         )
-        .await
-        .expect("env.set");
+        .await;
+    assert_eq!(status, StatusCode::OK);
     let (_, rest_list) = h
         .rest("GET", &format!("/v1/apps/{}/env", app.id), None)
         .await;
-    assert_eq!(
-        h.rpc("env.list", json!({ "id": app.id }))
-            .await
-            .expect("env.list"),
-        rest_list
-    );
+    assert_eq!(rest_list.as_array().map(Vec::len), Some(2));
 
-    let _ = h
-        .rpc("env.delete", json!({ "id": app.id, "name": "TOKEN" }))
-        .await
-        .expect("env.delete");
+    let (status, _) = h
+        .rest("DELETE", &format!("/v1/apps/{}/env/TOKEN", app.id), None)
+        .await;
+    assert_eq!(status, StatusCode::OK);
     let (_, rest_list) = h
         .rest("GET", &format!("/v1/apps/{}/env", app.id), None)
         .await;
-    assert_eq!(
-        h.rpc("env.list", json!({ "id": app.id }))
-            .await
-            .expect("env.list"),
-        rest_list
-    );
+    assert_eq!(rest_list.as_array().map(Vec::len), Some(1));
+    assert_eq!(rest_list[0]["name"], "API_KEY");
 
     let (status, _) = h
         .rest("DELETE", &format!("/v1/apps/{}/env/API_KEY", app.id), None)
@@ -678,17 +652,12 @@ async fn env_agrees() {
     let (_, rest_list) = h
         .rest("GET", &format!("/v1/apps/{}/env", app.id), None)
         .await;
-    assert_eq!(
-        h.rpc("env.list", json!({ "id": app.id }))
-            .await
-            .expect("env.list"),
-        rest_list
-    );
+    assert_eq!(rest_list, json!([]));
     h.finish().await;
 }
 
 #[tokio::test]
-async fn git_remote_agrees_and_drops_the_duplicate_field() {
+async fn git_remote_drops_the_duplicate_field() {
     let h = Harness::new().await;
     let app = h.seed_app("git-app").await;
 
@@ -701,25 +670,15 @@ async fn git_remote_agrees_and_drops_the_duplicate_field() {
         rest_info.get("remote").is_none(),
         "`remote` duplicates `url` and must be gone: {rest_info}"
     );
-
-    let rpc_info = h
-        .rpc("git.remote", json!({ "id": app.id }))
-        .await
-        .expect("git.remote");
-    assert_eq!(rest_info, rpc_info);
     h.finish().await;
 }
 
 #[tokio::test]
-async fn not_found_statuses_agree() {
+async fn not_found_statuses() {
     let h = Harness::new().await;
 
     let (status, _) = h.rest("GET", "/v1/apps/missing", None).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
-    assert_eq!(
-        h.rpc("apps.get", json!({ "id": "missing" })).await,
-        Err((404, "app not found".into()))
-    );
 
     let (status, _) = h
         .rest(
@@ -729,26 +688,14 @@ async fn not_found_statuses_agree() {
         )
         .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
-    assert_eq!(
-        h.rpc(
-            "env.set",
-            json!({ "id": "missing", "name": "A", "value": "1" })
-        )
-        .await,
-        Err((404, "app not found".into()))
-    );
 
     let (status, _) = h.rest("DELETE", "/v1/apps/missing", None).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
-    assert_eq!(
-        h.rpc("apps.delete", json!({ "id": "missing" })).await,
-        Err((404, "app not found".into()))
-    );
     h.finish().await;
 }
 
 #[tokio::test]
-async fn conflict_statuses_agree() {
+async fn conflict_statuses() {
     let h = Harness::new().await;
     let _taken = h.seed_app("taken-slug").await;
 
@@ -760,14 +707,6 @@ async fn conflict_statuses_agree() {
         )
         .await;
     assert_eq!(status, StatusCode::CONFLICT);
-    assert_eq!(
-        h.rpc(
-            "apps.create",
-            json!({ "name": "Other", "slug": "taken-slug" })
-        )
-        .await,
-        Err((409, "slug already taken".into()))
-    );
 
     let a = h.seed_app("conflict-a").await;
     let b = h.seed_app("conflict-b").await;
@@ -779,11 +718,6 @@ async fn conflict_statuses_agree() {
         )
         .await;
     assert_eq!(status, StatusCode::CONFLICT);
-    assert_eq!(
-        h.rpc("apps.rename", json!({ "id": b.id, "slug": "conflict-a" }))
-            .await,
-        Err((409, "slug already taken".into()))
-    );
 
     // A verified hostname belongs to exactly one app (single tenancy verifies
     // on claim, so the second claim conflicts).
@@ -802,19 +736,11 @@ async fn conflict_statuses_agree() {
         )
         .await;
     assert_eq!(status, StatusCode::CONFLICT);
-    assert!(matches!(
-        h.rpc(
-            "domains.add",
-            json!({ "id": b.id, "hostname": "shared.example.com", "role": "admin" })
-        )
-        .await,
-        Err((409, _))
-    ));
     h.finish().await;
 }
 
 #[tokio::test]
-async fn validation_statuses_agree() {
+async fn validation_statuses() {
     let h = Harness::new().await;
     let app = h.seed_app("valid-app").await;
 
@@ -827,11 +753,6 @@ async fn validation_statuses_agree() {
         )
         .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
-    assert_eq!(
-        h.rpc("apps.create", json!({ "name": "x", "slug": "Bad Slug" }))
-            .await,
-        Err((400, "invalid name/slug".into()))
-    );
 
     // Invalid desired state.
     let (status, _) = h
@@ -842,14 +763,6 @@ async fn validation_statuses_agree() {
         )
         .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
-    assert_eq!(
-        h.rpc(
-            "apps.patch",
-            json!({ "id": app.id, "desiredState": "bogus" })
-        )
-        .await,
-        Err((400, "desiredState must be running|stopped".into()))
-    );
 
     // Rename needs at least one field.
     let (status, _) = h
@@ -860,10 +773,6 @@ async fn validation_statuses_agree() {
         )
         .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
-    assert_eq!(
-        h.rpc("apps.rename", json!({ "id": app.id })).await,
-        Err((400, "name or slug required".into()))
-    );
 
     // Env name grammar.
     let (status, _) = h
@@ -874,14 +783,6 @@ async fn validation_statuses_agree() {
         )
         .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
-    assert!(matches!(
-        h.rpc(
-            "env.set",
-            json!({ "id": app.id, "name": "1bad", "value": "x" })
-        )
-        .await,
-        Err((400, _))
-    ));
 
     // Hostname grammar, then a platform hostname (validated after the role
     // gate, so these carry an admin role to reach the shape checks).
@@ -893,18 +794,7 @@ async fn validation_statuses_agree() {
                 Some(json!({ "hostname": hostname })),
             )
             .await;
-        assert_eq!(status, StatusCode::BAD_REQUEST, "rest {hostname}");
-        assert!(
-            matches!(
-                h.rpc(
-                    "domains.add",
-                    json!({ "id": app.id, "hostname": hostname, "role": "admin" })
-                )
-                .await,
-                Err((400, _))
-            ),
-            "rpc {hostname}"
-        );
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{hostname}");
     }
     h.finish().await;
 }
@@ -923,14 +813,6 @@ async fn custom_control_subdomain_is_never_a_tenant_host() {
         )
         .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
-    assert!(matches!(
-        h.rpc(
-            "apps.create",
-            json!({ "name": "Console", "slug": "console" })
-        )
-        .await,
-        Err((400, _))
-    ));
 
     let app = h.seed_app("keep").await;
     let (status, _) = h
@@ -941,11 +823,6 @@ async fn custom_control_subdomain_is_never_a_tenant_host() {
         )
         .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
-    assert!(matches!(
-        h.rpc("apps.rename", json!({ "id": app.id, "slug": "console" }))
-            .await,
-        Err((400, _))
-    ));
 
     let (status, _) = h
         .rest(
@@ -955,30 +832,23 @@ async fn custom_control_subdomain_is_never_a_tenant_host() {
         )
         .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
-    assert!(matches!(
-        h.rpc(
-            "domains.add",
-            json!({ "id": app.id, "hostname": "console.localhost", "role": "admin" })
-        )
-        .await,
-        Err((400, _))
-    ));
 
     // The gate is the derived host, not a blanket ban: a near miss still
     // creates.
-    let created = h
-        .rpc(
-            "apps.create",
-            json!({ "name": "Console Two", "slug": "console2" }),
+    let (status, created) = h
+        .rest(
+            "POST",
+            "/v1/apps",
+            Some(json!({ "name": "Console Two", "slug": "console2" })),
         )
-        .await
-        .expect("apps.create");
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
     assert_eq!(created["slug"], "console2");
     h.finish().await;
 }
 
 #[tokio::test]
-async fn patch_rejects_unknown_keys_on_both_transports() {
+async fn patch_rejects_unknown_keys() {
     let h = Harness::new().await;
     let app = h.seed_app("strict-patch").await;
 
@@ -994,17 +864,8 @@ async fn patch_rejects_unknown_keys_on_both_transports() {
         rest_status.is_client_error(),
         "REST must reject unknown patch keys, got {rest_status}"
     );
-    assert!(
-        h.rpc(
-            "apps.patch",
-            json!({ "id": app.id, "desiredState": "stopped", "extra": true })
-        )
-        .await
-        .is_err(),
-        "RPC must reject unknown patch keys"
-    );
 
-    // The stored state is untouched by the rejected requests.
+    // The stored state is untouched by the rejected request.
     let stored = crate::db::get_app(&h.state.pool, &app.id)
         .await
         .expect("lookup")
@@ -1014,24 +875,19 @@ async fn patch_rejects_unknown_keys_on_both_transports() {
 }
 
 #[tokio::test]
-async fn deploys_list_agrees() {
+async fn deploys_list() {
     let h = Harness::new().await;
     let app = h.seed_app("deploys-app").await;
     let (status, rest_list) = h
         .rest("GET", &format!("/v1/apps/{}/deploys", app.id), None)
         .await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(
-        h.rpc("deploys.list", json!({ "id": app.id }))
-            .await
-            .expect("deploys.list"),
-        rest_list
-    );
+    assert_eq!(rest_list, json!([]));
     h.finish().await;
 }
 
 #[tokio::test]
-async fn source_without_a_mirror_is_not_found_on_both_transports() {
+async fn source_without_a_mirror_is_not_found() {
     let h = Harness::new().await;
     let app = h.seed_app("source-app").await;
 
@@ -1039,48 +895,20 @@ async fn source_without_a_mirror_is_not_found_on_both_transports() {
         .rest("GET", &format!("/v1/apps/{}/tree", app.id), None)
         .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
-    assert!(matches!(
-        h.rpc("source.tree", json!({ "id": app.id })).await,
-        Err((404, _))
-    ));
-    assert_eq!(
-        h.rpc("source.tree", json!({ "id": "missing" })).await,
-        Err((404, "app not found".into()))
-    );
+    let (status, _) = h.rest("GET", "/v1/apps/missing/tree", None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
     h.finish().await;
 }
 
-/// Blanks the volatile preview timestamp: each status call builds the payload
-/// at its own `now`.
-fn normalize_telemetry(mut value: Value) -> Value {
-    if let Some(ts) = value
-        .get_mut("preview")
-        .and_then(|preview| preview.get_mut("timestamp"))
-    {
-        *ts = Value::String("<volatile>".into());
-    }
-    value
-}
-
-/// Instance telemetry over both transports: same status, the kill switch locks
-/// the effective state while the stored preference still moves (the test
-/// harness runs on `localhost`, a local domain), and the preview is the
-/// contract payload.
+/// Instance telemetry: the kill switch locks the effective state while the
+/// stored preference still moves (the test harness runs on `localhost`, a
+/// local domain), and the preview is the contract payload.
 #[tokio::test]
-async fn telemetry_status_agrees() {
+async fn telemetry_status() {
     let h = Harness::new().await;
 
     let (status, rest) = h.rest("GET", "/v1/admin/telemetry", None).await;
     assert_eq!(status, StatusCode::OK);
-    let rpc = h
-        .rpc("telemetry.get", json!({}))
-        .await
-        .expect("telemetry.get");
-    assert_eq!(
-        normalize_telemetry(rest.clone()),
-        normalize_telemetry(rpc),
-        "REST and RPC must agree"
-    );
 
     // localhost is a local domain: locked off, preference still on.
     assert_eq!(rest["enabled"], json!(false));
@@ -1110,7 +938,7 @@ async fn telemetry_status_agrees() {
         "{users}"
     );
 
-    // The preference moves through either transport while the lock holds.
+    // The preference moves through the API while the lock holds.
     let (status, put) = h
         .rest(
             "PUT",
@@ -1122,11 +950,15 @@ async fn telemetry_status_agrees() {
     assert_eq!(put["setting"], json!(true));
     assert_eq!(put["enabled"], json!(false), "still locked");
 
-    let rpc = h
-        .rpc("telemetry.set", json!({ "enabled": false }))
-        .await
-        .expect("telemetry.set");
-    assert_eq!(rpc["setting"], json!(false));
+    let (status, put) = h
+        .rest(
+            "PUT",
+            "/v1/admin/telemetry",
+            Some(json!({ "enabled": false })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(put["setting"], json!(false));
     let (status, rest) = h.rest("GET", "/v1/admin/telemetry", None).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(rest["setting"], json!(false));
@@ -1139,21 +971,16 @@ async fn telemetry_status_agrees() {
     h.finish().await;
 }
 
-/// Update check over both transports: same status, off by default, and the
-/// stored preference moves through either transport. Only the disabled
-/// direction is exercised here — enabling runs a live fetch against the
-/// release list (covered with a stub feed in `host::update_check` tests).
+/// Update check: off by default, and the stored preference moves through the
+/// API. Only the disabled direction is exercised here — enabling runs a live
+/// fetch against the release list (covered with a stub feed in
+/// `host::update_check` tests).
 #[tokio::test]
-async fn update_status_agrees() {
+async fn update_status() {
     let h = Harness::new().await;
 
     let (status, rest) = h.rest("GET", "/v1/admin/update", None).await;
     assert_eq!(status, StatusCode::OK);
-    let rpc = h
-        .rpc("instance.update_status", json!({}))
-        .await
-        .expect("instance.update_status");
-    assert_eq!(rest, rpc, "REST and RPC must agree");
 
     // On by default; the test harness is not locked (only
     // `NOITE_UPDATE_CHECK=off` locks the check).
@@ -1166,18 +993,13 @@ async fn update_status_agrees() {
     assert!(rest["checkedAt"].is_null());
     assert!(rest["notesUrl"].is_null());
 
-    // The preference moves through either transport while staying off.
+    // The preference moves through the API while staying off.
     let (status, put) = h
         .rest("PUT", "/v1/admin/update", Some(json!({ "enabled": false })))
         .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(put["setting"], json!(false));
 
-    let rpc = h
-        .rpc("instance.update_set", json!({ "enabled": false }))
-        .await
-        .expect("instance.update_set");
-    assert_eq!(rpc["setting"], json!(false));
     let (status, rest) = h.rest("GET", "/v1/admin/update", None).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(rest["setting"], json!(false));
@@ -1817,10 +1639,10 @@ async fn rollback_queues_behind_the_apps_in_flight_deploy() {
     h.finish().await;
 }
 
-/// Environments agree across transports, and the role gates are real: a read
-/// needs `view`, toggling public and deleting need `admin`.
+/// The environment role gates are real: a read needs `view`, toggling public
+/// and deleting need `admin`.
 #[tokio::test]
-async fn environments_agree_and_gate_on_role() {
+async fn environments_gate_on_role() {
     let h = Harness::new().await;
     let app = h.seed_app("env-api").await;
     let branch = seed_env(&h, &app, "feature", "refs/heads/feature").await;
@@ -1833,11 +1655,6 @@ async fn environments_agree_and_gate_on_role() {
         )
         .await;
     assert_eq!(status, StatusCode::OK);
-    let rpc = h
-        .rpc("environments.list", json!({ "id": app.id, "role": "view" }))
-        .await
-        .expect("environments.list");
-    assert_eq!(rest, rpc);
     assert_eq!(rest[0]["label"], json!("feature"));
     assert_eq!(rest[0]["kind"], json!("branch"));
     assert_eq!(rest[0]["public"], json!(false));
@@ -1851,13 +1668,10 @@ async fn environments_agree_and_gate_on_role() {
     assert_eq!(rest[0]["appSlug"], json!("env-api"));
 
     // A read without a role is refused (never defaulted to view).
-    assert_eq!(
-        h.rpc("environments.list", json!({ "id": app.id }))
-            .await
-            .expect_err("role required")
-            .0,
-        403
-    );
+    let (status, _) = h
+        .rest("GET", &format!("/v1/apps/{}/environments", app.id), None)
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
 
     // Public toggle: admin only.
     let (status, _) = h
@@ -1907,15 +1721,6 @@ async fn environments_agree_and_gate_on_role() {
         .await;
     assert_eq!(vars[0]["name"], json!("SHARED"));
     assert_eq!(vars[0]["value"], json!("env"));
-    assert_eq!(
-        h.rpc(
-            "environments.vars.get",
-            json!({ "id": app.id, "envId": branch.id, "role": "view" }),
-        )
-        .await
-        .expect("vars.get"),
-        vars
-    );
 
     // Delete: admin only, and it takes the row with it.
     let (status, _) = h
@@ -1986,14 +1791,6 @@ async fn deploys_filter_by_environment() {
             None,
         )
         .await;
-    let rpc = h
-        .rpc(
-            "deploys.list",
-            json!({ "id": app.id, "environmentId": env.id }),
-        )
-        .await
-        .expect("deploys.list");
-    assert_eq!(rest, rpc);
     assert_eq!(rest[0]["sha"], json!("bbb2222"));
     assert_eq!(rest[0]["environmentId"], json!(env.id));
 
@@ -2160,12 +1957,6 @@ async fn logs_scope_to_environment() {
         .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(rest, json!(["env line"]));
-    assert_eq!(
-        h.rpc("logs.get", json!({ "id": app.id, "environmentId": env.id }))
-            .await
-            .expect("logs.get"),
-        rest
-    );
 
     // Another app's environment is a 404, never its own (or production's) key.
     let (status, _) = h
@@ -2282,36 +2073,40 @@ async fn the_state_stream_resends_the_app_and_its_environments_on_change() {
     h.finish().await;
 }
 
-/// `limits.set` gates on the caller's role at the RPC boundary, like the
-/// domains mutations: a missing role, `view` or `push` is a 403 (the role is
-/// deserialized and forwarded, not dropped), `admin` passes, and `limits.get`
-/// stays role-free.
+/// `limits.set` gates on the caller's role, like the domains mutations: a
+/// missing role, `view` or `push` is a 403 (the role is deserialized and
+/// forwarded, not dropped), `admin` passes, and `limits.get` stays role-free.
 #[tokio::test]
-async fn limits_set_role_gate_holds_over_rpc() {
+async fn limits_set_role_gate_holds() {
     let h = Harness::new().await;
-    let app = h.seed_app("limits-rpc").await;
-    for params in [
-        json!({ "id": app.id, "clientRpm": 30 }),
-        json!({ "id": app.id, "clientRpm": 30, "role": "view" }),
-        json!({ "id": app.id, "clientRpm": 30, "role": "push" }),
+    let app = h.seed_app("limits-gate").await;
+    for body in [
+        json!({ "clientRpm": 30 }),
+        json!({ "clientRpm": 30, "role": "view" }),
+        json!({ "clientRpm": 30, "role": "push" }),
     ] {
-        assert!(
-            matches!(h.rpc("limits.set", params.clone()).await, Err((403, _))),
-            "{params}"
-        );
+        let (status, _) = h
+            .rest(
+                "PUT",
+                &format!("/v1/apps/{}/limits", app.id),
+                Some(body.clone()),
+            )
+            .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
     }
-    let set = h
-        .rpc(
-            "limits.set",
-            json!({ "id": app.id, "clientRpm": 30, "role": "admin" }),
+    let (status, set) = h
+        .rest(
+            "PUT",
+            &format!("/v1/apps/{}/limits", app.id),
+            Some(json!({ "clientRpm": 30, "role": "admin" })),
         )
-        .await
-        .expect("admin sets limits");
+        .await;
+    assert_eq!(status, StatusCode::OK);
     assert_eq!(set["clientRpm"], json!(30));
-    let got = h
-        .rpc("limits.get", json!({ "id": app.id }))
-        .await
-        .expect("limits.get needs no role");
+    let (status, got) = h
+        .rest("GET", &format!("/v1/apps/{}/limits", app.id), None)
+        .await;
+    assert_eq!(status, StatusCode::OK, "limits.get needs no role");
     assert_eq!(got["clientRpm"], json!(30));
     h.finish().await;
 }

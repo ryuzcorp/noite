@@ -1,8 +1,4 @@
 //! Pull-request endpoints: thin adapters over `service::prs`.
-//!
-//! Same data as the `prs.*` / `branch_rules.*` RPCs; the UI uses the RPCs, the
-//! REST mirrors exist so every RPC has one (contract §"Every new runner RPC
-//! gets a REST mirror").
 use axum::{
     extract::{Path, Query, State},
     response::IntoResponse,
@@ -73,10 +69,16 @@ pub struct CommentBody {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct CommentEditBody {
+pub struct CommentDeleteBody {
     pub actor: Actor,
     #[serde(default)]
     pub role: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CommentEditBody {
+    pub actor: Actor,
     pub body: String,
 }
 
@@ -209,7 +211,7 @@ pub async fn edit_comment(
 pub async fn delete_comment(
     State(state): State<AppState>,
     Path((id, comment_id)): Path<(String, String)>,
-    Json(body): Json<CommentEditBody>,
+    Json(body): Json<CommentDeleteBody>,
 ) -> impl IntoResponse {
     service::prs::comment_delete(
         &state,

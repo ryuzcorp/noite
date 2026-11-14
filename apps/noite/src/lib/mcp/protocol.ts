@@ -268,15 +268,11 @@ const callTool = async (
       return failure(id, RPC_CODES.invalidParams, error.message);
     }
 
-    // Strip the runner envelope ("runner rpc git.log: 404 …") so a tool error
-    // reads as a sentence, like the push-to-create path does.
-    // `errorMessage` peels Effect's wrapper and replaces a database query
-    // failure with the fixed text: a tool error is a client string, never the
-    // SQL statement or its bound parameters.
-    const message = errorMessage(error).replace(
-      /^runner (?:rpc \S+: \d+|GET \S+: \d+) /u,
-      ""
-    );
+    // The runner's own message is already a sentence (its error answers are
+    // plain text); `errorMessage` peels Effect's wrapper and replaces a
+    // database query failure with the fixed text: a tool error is a client
+    // string, never the SQL statement or its bound parameters.
+    const message = errorMessage(error);
 
     // A refusal keeps `isError: true` (the spec's tool-execution error) and
     // carries its code in `structuredContent`, which the spec leaves to the

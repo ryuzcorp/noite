@@ -61,7 +61,7 @@ const asJson = <T>(
   // oxlint-disable-next-line anti-slop/no-unknown-parameters -- runnerCall parses the body at the HTTP boundary; only its static type is unknown here.
   body: unknown
 ): T =>
-  // SAFETY: the caller names the exact response type of the endpoint it hit (the REST mirror of the matching RPC).
+  // SAFETY: the caller names the exact response type of the endpoint it hit.
   body as T;
 
 const actorOf = (userId: string) => ({ name: userId, userId });

@@ -43,8 +43,8 @@ import { apiAction, fail } from "./api";
 import { requireTelemetryRole } from "./errors.server";
 import { requireViewApp, sessionUser } from "./session.server";
 
-/** A runner failure as the action's 422 text: the runner's own RPC text
- * (e.g. the app limit) or a status line, never an upstream HTTP body. */
+/** A runner failure as the action's 422 text: the runner's own message
+ * (e.g. the app limit) or a status line, never an upstream HTML body. */
 // oxlint-disable-next-line anti-slop/no-unknown-parameters -- catch-site mapper: the thrown value is unknown by construction and becomes the safe runner text here.
 const failRunner = (error: unknown): never =>
   failUnknown(runnerFailureMessage(runnerFailureOf(error)));
@@ -219,13 +219,13 @@ const toRunnerSource = (
  * granted, which is the bug this budget removes. */
 const CREATE_ADOPT_MS = 4000;
 
-/** One create's recovery deadline (create RPC + adopt poll), measured from
- * before the create RPC. Exported so a test pins it under the route bound:
+/** One create's recovery deadline (create request + adopt poll), measured
+ * from before the create. Exported so a test pins it under the route bound:
  * this whole path used to run up to ~24 s inside a 15 s route. */
 export const CREATE_RECOVERY_MS = CREATE_TIMEOUT_MS + CREATE_ADOPT_MS;
 
 /** Adopt the row of a create that outlived the control plane's bound: the
- * runner runs create detached, so the app lands after the RPC was aborted
+ * runner runs create detached, so the app lands after the request was aborted
  * and the grant below never ran — an app with no grant is invisible to every
  * list. Polls by slug until `deadline` (the whole create's recovery budget),
  * each lookup bounded by the time left. `null` when it never appeared or was

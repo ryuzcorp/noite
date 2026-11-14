@@ -1,6 +1,6 @@
 import { DEFAULT_RPM, envelopeLimiter } from "../../lib/rate-limit";
 import {
-  RunnerRpcError,
+  RunnerHttpError,
   runnerIngestErrors,
   stampRunnerEnv,
 } from "../../lib/runner";
@@ -28,8 +28,7 @@ const ALLOW_METHODS = "POST, OPTIONS";
 const PROJECT_PATTERN = /^\d+$/u;
 
 /** One refusal for a wrong key or an unknown project number: the runner
- * reports both as a 404-code JSON-RPC error, and answering them alike
- * reveals neither. */
+ * reports both as a 404, and answering them alike reveals neither. */
 const REFUSAL = "invalid key or project";
 
 /** Stamp the open-CORS header Sentry browser tabs need on every answer. */
@@ -110,8 +109,8 @@ const readEnvelopeBody = (request: Request): Promise<string | null> => {
   return readBoundedText(request, ENVELOPE_MAX_BYTES);
 };
 
-/** Store one envelope's events under the project number. A 404-code runner
- * error (wrong key or unknown number) becomes the one refusal that reveals
+/** Store one envelope's events under the project number. A 404 from the
+ * runner (wrong key or unknown number) becomes the one refusal that reveals
  * neither; a missing token is a 500. */
 const storeEvents = async (
   projectId: number,
@@ -132,7 +131,7 @@ const storeEvents = async (
       "content-type": "application/json",
     });
   } catch (error) {
-    if (error instanceof RunnerRpcError && error.code === 404) {
+    if (error instanceof RunnerHttpError && error.status === 404) {
       return answer(REFUSAL, 403);
     }
 

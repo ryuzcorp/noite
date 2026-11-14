@@ -295,7 +295,7 @@ describe("access gate", () => {
     runner.calls.length = 0;
     const access = await requireAppRoleBySlug("app-one", "u-view", "view");
     expect(access.app.id).toBe(APP.id);
-    expect(runner.calls).toEqual(["apps.get_by_slug"]);
+    expect(runner.calls).toEqual(["GET /v1/apps/by-slug/app-one"]);
     expect(
       await denied(requireAppRoleBySlug("missing", "u-view", "view"))
     ).toBe(true);
@@ -304,7 +304,7 @@ describe("access gate", () => {
 
 describe("listAppsForCollaborator", () => {
   test("heals an app whose creator grant never landed", async () => {
-    // The create RPC outlived the control plane's bound, so APP exists with
+    // The create outlived the control plane's bound, so APP exists with
     // no grant at all: nobody can see or delete it.
     expect(await listCollaboratorRows(APP.id)).toHaveLength(0);
 
