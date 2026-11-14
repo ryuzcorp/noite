@@ -214,7 +214,10 @@ const sendSignInOTP = async (
     return;
   }
 
-  if (isLocalhostDomain(env.BASE_DOMAIN ?? "localhost")) {
+  // Fail closed: a missing base is never localhost (a deployed worker without
+  // one is misconfigured), so the code refuses loudly instead of printing to
+  // the dev console on a real domain.
+  if (isLocalhostDomain(env.BASE_DOMAIN ?? "")) {
     // oxlint-disable-next-line no-console-except-error -- dev-only OTP delivery channel; prod uses the webhook or refuses loudly below.
     console.log(`[noite:otp] sign-in code for ${email}: ${otp}`);
 

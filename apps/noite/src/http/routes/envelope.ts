@@ -1,9 +1,6 @@
+import { stampControlEnv } from "../../lib/control-env";
 import { DEFAULT_RPM, envelopeLimiter } from "../../lib/rate-limit";
-import {
-  RunnerHttpError,
-  runnerIngestErrors,
-  stampRunnerEnv,
-} from "../../lib/runner";
+import { RunnerHttpError, runnerIngestErrors } from "../../lib/runner";
 import type {
   ParsedEnvelope,
   SentryEventItem,
@@ -122,7 +119,7 @@ const storeEvents = async (
     return answer("RUNNER_TOKEN is not configured", 500);
   }
 
-  stampRunnerEnv(env);
+  stampControlEnv(env);
 
   try {
     const stored = await runnerIngestErrors(projectId, key, events);

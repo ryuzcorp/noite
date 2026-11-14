@@ -3,6 +3,7 @@ import { eq, sql } from "void/db";
 
 import { inviteTable } from "../../db/schema";
 import type { InviteLifecycleWire } from "../api-types";
+import { controlBaseDomain } from "../control-env";
 import { getDb, resolveEnv, withDb } from "../db";
 import { countUsersAndAdmins, setupModeOf } from "./setup-code.server";
 import type { SetupMode } from "./setup-code.server";
@@ -75,7 +76,7 @@ export const signupPolicy = async (): Promise<{
     setupMode: setupModeOf({
       adminEmail: resolveEnv().NOITE_ADMIN_EMAIL?.trim().toLowerCase() || null,
       adminExists,
-      baseDomain: resolveEnv().BASE_DOMAIN,
+      baseDomain: controlBaseDomain(),
     }),
   };
 };

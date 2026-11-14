@@ -10,9 +10,8 @@ import {
 } from "bun:test";
 
 import { grantCollaborator } from "../../lib/collaborators";
-import { controlEnv } from "../../lib/control-env";
+import { controlEnv, stampControlEnv } from "../../lib/control-env";
 import { ensureDb, setD1Binding } from "../../lib/db";
-import { stampRunnerEnv } from "../../lib/runner";
 import type { TestD1 } from "../../testing/d1";
 import { createTestD1 } from "../../testing/d1";
 import { handleEnvAuth } from "./env-auth";
@@ -85,7 +84,7 @@ beforeAll(async () => {
   await ensureDb();
   controlEnv.RUNNER_TOKEN = ENV.RUNNER_TOKEN;
   controlEnv.RUNNER_URL = ENV.RUNNER_URL;
-  stampRunnerEnv(ENV as never);
+  stampControlEnv(ENV as KitEnv);
   // SAFETY: the double only has to satisfy the REST call shape runnerFetch makes.
   globalThis.fetch = (async (
     input: string | URL | Request,
