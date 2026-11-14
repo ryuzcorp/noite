@@ -61,6 +61,8 @@ const throughMiddleware = async (env: KitEnv): Promise<void> => {
 
   await dbMiddleware(context, () => {
     next = true;
+
+    return Promise.resolve();
   });
   expect(next).toBe(true);
 };
