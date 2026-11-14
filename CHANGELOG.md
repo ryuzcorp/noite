@@ -10,6 +10,29 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 <!-- New entries go in changelog.d/<topic>.md; the release PR assembles them with `bun docker/changelog-release.ts`. -->
 
+## [0.1.0-alpha.37] - 2026-11-14
+
+### Operator action required
+
+- First-run admin is now proof-gated. On a fresh public install the first registration must present the one-time setup code printed at boot (`docker compose logs noite | grep "FIRST ADMIN"`); `NOITE_ADMIN_EMAIL` additionally restricts which address may present it. The installer now asks for that address and persists it to `.env` (`--admin-email` / `NOITE_ADMIN_EMAIL` for scripted installs). Its end-of-install note prints the current code when the container answers, and otherwise prints the command that mints one. `localhost`-family bases are unchanged (no code, first account wins). If you upgrade with users but no admin on a public base, the next registration must present a fresh code (`docker compose exec noite noite-runner setup-code`).
+- A wrong S3 bucket name or endpoint path now refuses the boot loudly instead of starting with an empty database. "Missing object" requires the store's own `NoSuchKey` code, so a `NoSuchBucket` answer (wrong bucket, often HTTP 404) and a plain 404 page with no store code (wrong endpoint path, proxy or custom-domain page) both fail `restore_if_missing` and state `claim` with the bucket named. If the runner logs `runner state restore failed for bucket <name>` (or the meta-download equivalent), fix `NOITE_S3_BUCKET`/`S3_ENDPOINT` (or the provider-side path) and restart — do not let it boot past the error, and if it already did once on this build, restore the snapshot from bucket versioning before writing new data.
+
+### Changed
+
+- The sign-up form shows a setup-code field on a fresh public install (in both modes), and a notice when the slot is reserved for the configured admin address. The public `/api/invite/status` policy now reports `adminExists` and `setupMode` (`off` | `email` | `code`); it never carries the code or the address.
+
+### Fixed
+
+- On deployed installs the control UI ignored `NOITE_ADMIN_EMAIL` and `NOITE_AUTH_RATE_LIMIT`, and read `BASE_DOMAIN` as the dev default. The worker only copied the runner keys from its platform env, so the admin anchor never promoted its account and the auth rate limit stayed at its built-in value. Every declared control key is now copied from the worker env on each request. A missing `BASE_DOMAIN` fails closed to the strict first-admin modes instead of meaning localhost.
+- A misconfigured object-store boot no longer starts with an empty database that the next upload writes over the good snapshot. "Missing object" is now a typed marker, attached only to a non-5xx answer whose body carries the store's own `NoSuchKey` code. A `NoSuchBucket` answer (wrong bucket, often HTTP 404) and a codeless 404 page (wrong endpoint path, proxy or custom-domain page) are hard configuration errors: they fail `restore_if_missing` and state `claim` with the bucket named, and the git WAL maps a `NoSuchBucket` read to a failure instead of a missing manifest. A 5xx or a transport failure never counts as missing, whatever its body or the key name says.
+
+### Security
+
+- Control actions (`POST /api/...`) and the R2 object upload now refuse cross-site browser requests with `403 Cross-site request refused`. Tenant apps live on sibling subdomains of the control UI (same site, so `SameSite=Lax` still attaches the session cookie on a `text/plain` POST that needs no CORS preflight), and a tenant page could previously drive any control action as a signed-in visitor who opened it. The gate requires the browser's `Origin` to be the control origin (or the configured `BETTER_AUTH_URL` origin), else `Sec-Fetch-Site: same-origin`/`none`; requests with neither header (non-browser API clients) still pass.
+- The first account on a fresh public install no longer becomes admin unconditionally. Before, a stranger who reached the control UI before the operator could take it (the hostname appears in certificate-transparency logs at first issuance). Now registration is refused until someone presents the one-time setup code, and `NOITE_ADMIN_EMAIL` additionally restricts which address may present it. The code has 100 bits, is stored as a SHA-256 hash, works once, and is consumed atomically with the claim, so two racing sign-ups cannot both win.
+- The control UI compares the runner token (`/webhook`, `/internal/*`) in constant time instead of with `===`, so response timing on the public control host no longer reveals how much of a guessed token matched.
+- `.env.example` now carries the same RustFS dev keys as `docker/compose.yaml`, which the runner refuses to boot with on a non-localhost `BASE_DOMAIN`. It previously shipped different placeholder keys that passed that check, so a copied example file booted a public install with published store keys.
+
 ## [0.1.0-alpha.36] - 2026-11-14
 
 ### Operator action required
