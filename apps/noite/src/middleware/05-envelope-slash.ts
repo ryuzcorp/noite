@@ -19,7 +19,7 @@ export default defineMiddleware(async (c, next) => {
     return next();
   }
 
-  // SAFETY: the envelope handler reads only RUNNER_TOKEN/RUNNER_URL off the env, like every http route.
+  // SAFETY: the envelope handler reads its env keys off the stamped request bag (the route bridge stamps every plain route); unset keys stay undefined as handlers tolerate.
   const response = await handleEnvelope(c.req.raw, c.env as KitEnv, {
     projectId: slash.groups.projectId,
   });

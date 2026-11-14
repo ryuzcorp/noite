@@ -4,6 +4,7 @@ import {
   CONTROL_ENV_KEYS,
   controlBaseDomain,
   controlEnv,
+  hydrateControlEnv,
 } from "../lib/control-env";
 import { signupPolicy } from "../lib/server/invites.server";
 import { checkFirstAdminProof } from "../lib/server/setup-code.server";
@@ -131,5 +132,34 @@ describe("control env stamp (dogfood D1)", () => {
     expect(controlEnv.BETTER_AUTH_URL).toBe("https://app.example.com");
     expect(controlEnv.NOITE_AUTH_RATE_LIMIT).toBe("1200");
     expect(controlEnv.RUNNER_TOKEN).toBe("runner-token");
+  });
+
+  test("worker hydrate fills nothing, even with process present", async () => {
+    // The deployed worker has `process` (nodejs_compat, enabled with auth)
+    // but must never hydrate from it or fall back to dev defaults: emulate
+    // the built bundle by defining the marker hydrate gates on.
+    // SAFETY: the test defines and restores the same marker the built bundle carries; nothing else reads this global.
+    const globals = globalThis as typeof globalThis & {
+      __CONTROL_BUILD__?: string;
+    };
+
+    const previous = globals.__CONTROL_BUILD__;
+
+    globals.__CONTROL_BUILD__ = "test-build";
+
+    try {
+      hydrateControlEnv({});
+      expect(controlBaseDomain()).toBe("");
+
+      const policy = await signupPolicy();
+
+      expect(policy.setupMode).toBe("code");
+    } finally {
+      if (previous === undefined) {
+        delete globals.__CONTROL_BUILD__;
+      } else {
+        globals.__CONTROL_BUILD__ = previous;
+      }
+    }
   });
 });

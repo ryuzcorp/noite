@@ -69,13 +69,27 @@ export const controlBaseDomain = (): string => {
 };
 
 export const hydrateControlEnv = (
-  // SAFETY: defaulting to process.env crashes on Workers (no process) — guard with typeof, which is safe on undefined globals.
+  // SAFETY: defaulting to process.env crashes on Workers without node compat — guard with typeof, which is safe on undefined globals.
   from:
     | NodeJS.ProcessEnv
-    | Record<string, string | undefined> = typeof process === "undefined"
-    ? {}
-    : process.env
+    | Record<string, string | undefined> = typeof __CONTROL_BUILD__ ===
+    "undefined" && typeof process !== "undefined"
+    ? process.env
+    : {}
 ) => {
+  // Production bundles (the deployed worker included) never hydrate: the
+  // platform env arrives per request through `stampControlEnv`. Copying
+  // ambient `process.env` — present in the worker under `nodejs_compat`
+  // (Void enables it when auth is on) — or filling dev defaults would mask
+  // a misconfigured deploy as localhost (fail open): with no default, such
+  // a worker reads "" and the setup gate fails closed to its strict modes.
+  // Only unbundled contexts (bun tests, scripts without a vite transform)
+  // hydrate, where `__CONTROL_BUILD__` is undefined. (`vite dev` carries the
+  // marker too and gets everything it needs from the stamped request env.)
+  if (typeof __CONTROL_BUILD__ !== "undefined") {
+    return;
+  }
+
   for (const [key, value] of Object.entries(from)) {
     if (
       value !== undefined &&
@@ -87,28 +101,18 @@ export const hydrateControlEnv = (
     }
   }
 
-  // Dev/test fallback only (vite dev and bun tests run on Node, where
-  // `process` exists; the deployed worker does not have it). Prod values
-  // always arrive via compose environment / void.config.ts vars / deploy
-  // env — never rely on these outside localhost dev. `noite.localhost`
+  // Dev/test fallback only (see the gate above): `noite.localhost`
   // is the dev base every `*.localhost` workaround keys on (`isLocalhostDomain`).
   // The control plane only talks to the runner; it holds no S3 credentials of
   // its own.
-  //
-  // The gate is deliberate: filling these defaults on Workers would mask a
-  // deployed worker whose platform env lost `BASE_DOMAIN`, silently treating
-  // it as localhost (fail open). With no default, such a worker reads "" and
-  // the setup gate fails closed to its strict modes.
-  if (typeof process !== "undefined") {
-    const defaults = {
-      BASE_DOMAIN: "noite.localhost",
-      RUNNER_URL: "http://127.0.0.1:8080",
-    } satisfies Record<string, string>;
+  const defaults = {
+    BASE_DOMAIN: "noite.localhost",
+    RUNNER_URL: "http://127.0.0.1:8080",
+  } satisfies Record<string, string>;
 
-    for (const [key, value] of Object.entries(defaults)) {
-      if (controlEnv[key] === undefined) {
-        controlEnv[key] = value;
-      }
+  for (const [key, value] of Object.entries(defaults)) {
+    if (controlEnv[key] === undefined) {
+      controlEnv[key] = value;
     }
   }
 };
