@@ -17,9 +17,10 @@
 //! Failure mapping keeps "missing" and "unreachable" apart: 404 (or S3's
 //! `NoSuchKey`) is [`StoreError::NotFound`](ryuz_git::store::StoreError),
 //! transport errors, timeouts and 5xx are `Retryable`, everything else is
-//! `Other`. A store that cannot be reached is therefore never reported as
-//! "no manifest", so a WAL reader can never mistake an outage for a fresh
-//! repository and restart its sequence.
+//! `Other`. A `NoSuchBucket` body is `Other` even on 404: a wrong bucket is
+//! a configuration error, and a store that cannot be reached (or named) is
+//! therefore never reported as "no manifest", so a WAL reader can never
+//! mistake an outage for a fresh repository and restart its sequence.
 //! [`build_wal`] builds the process's one WAL over this store: mirrors under
 //! `<work>/git-http/{slug}.git` (the same canonical path the push-mirror
 //! tests seed at), the `git/` layout (manifest `git/{slug}/MANIFEST.json`,
@@ -270,6 +271,16 @@ impl ObjectStore for GitStore {
             return Ok(GetResult::NotModified { version });
         }
         if status == reqwest::StatusCode::NOT_FOUND {
+            // A 404 for a wrong bucket is a configuration error, never a
+            // missing manifest: mistaking it for NotFound would let the WAL
+            // reader restart the sequence over good history.
+            let body = resp.text().await.unwrap_or_default();
+            if body.contains("<Code>NoSuchBucket</Code>") {
+                return Err(StoreError::Other(anyhow::anyhow!(
+                    "s3 GET {key} failed: bucket {} does not exist (NoSuchBucket)",
+                    self.config.s3_bucket
+                )));
+            }
             return Err(StoreError::not_found(key));
         }
         if status == reqwest::StatusCode::PRECONDITION_FAILED {
@@ -691,6 +702,15 @@ mod tests {
         AxumPath((bucket, key)): AxumPath<(String, String)>,
         headers: HeaderMap,
     ) -> Response {
+        // A wrong bucket name: 404 with `NoSuchBucket`, which the adapter
+        // must report as a configuration error, never a missing key.
+        if bucket == "missing-bucket" {
+            return (
+                StatusCode::NOT_FOUND,
+                "<?xml version=\"1.0\"?><Error><Code>NoSuchBucket</Code><Message>missing bucket</Message></Error>",
+            )
+                .into_response();
+        }
         let full = format!("{bucket}/{key}");
         let store = store.lock().await;
         let Some((body, etag)) = store.get(&full) else {
@@ -907,6 +927,25 @@ mod tests {
         assert_eq!(headers.len(), 2);
         assert!(headers.contains(&(reqwest::header::IF_NONE_MATCH, "\"one\"".to_string())));
         assert!(headers.contains(&(reqwest::header::IF_MATCH, "\"two\"".to_string())));
+    }
+
+    /// N-2: a wrong bucket answers 404 with `NoSuchBucket`. That is a
+    /// configuration error (`Other`), never a missing manifest (`NotFound`)
+    /// — the WAL reader must not restart the sequence over good history.
+    #[tokio::test]
+    async fn missing_bucket_is_other_not_not_found() {
+        let (endpoint, _store) = spawn_fake_s3().await;
+        let mut cfg = test_config(&endpoint);
+        cfg.s3_bucket = "missing-bucket".to_string();
+        let store = GitStore::new(&cfg);
+        let err = store
+            .get("git/demo/MANIFEST.json", GetOptions::default())
+            .await
+            .expect_err("a missing bucket must fail the read");
+        assert!(
+            matches!(err, StoreError::Other(_)),
+            "NoSuchBucket is a configuration error, not a missing key: {err:?}"
+        );
     }
 
     #[tokio::test]
