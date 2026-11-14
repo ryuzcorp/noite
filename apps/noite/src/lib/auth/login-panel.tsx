@@ -102,6 +102,17 @@ interface Model {
    * its controls stay disabled rather than swallowing a click. */
   readonly mounted: boolean;
   readonly panel: Panel;
+  /** The last loaded signup policy. Kept outside `panel` so leaving a
+   * sub-flow (the lost-passkey recovery cancels back to the form) restores
+   * the same proof fields instead of a blank default. */
+  readonly policy: PolicySnapshot | null;
+}
+
+/** The signup-policy slice the form branches on. */
+interface PolicySnapshot {
+  readonly firstRun: boolean;
+  readonly requiresInvite: boolean;
+  readonly setupMode: "off" | "email" | "code";
 }
 
 const registrationContext = (
@@ -135,7 +146,7 @@ const INTRO: Record<
     title: "Set up Noite",
   },
   firstRunReserved: {
-    body: "This instance reserves its first account for the configured admin address. Register with that address and it becomes the admin.",
+    body: "This instance reserves its first account for the configured admin address. Register with that address and enter the one-time setup code from the server logs — it becomes the admin.",
     title: "Set up Noite",
   },
   loading: {
@@ -448,7 +459,9 @@ const RegisterForm = ({
   const ready = model.panel._tag === "Ready";
   const requiresInvite = ready && model.panel.requiresInvite;
   const setupMode = ready ? model.panel.setupMode : "off";
-  const requiresSetupCode = setupMode === "code";
+  // Email mode reserves the address *and* requires the code (knowing the
+  // address alone never suffices), so both modes show the code field.
+  const requiresSetupCode = setupMode === "code" || setupMode === "email";
   const reservedForAdmin = setupMode === "email";
 
   return (
@@ -678,16 +691,24 @@ const CredentialsForm = ({
   );
 };
 
-/** Back to the sign-in tab from anywhere (recovery cancels to here). */
-const baseSignin = (panel: Panel): Panel =>
-  isReady(panel)
-    ? { ...panel, mode: "signin" }
-    : Panels.Ready({
-        firstRun: false,
-        mode: "signin",
-        requiresInvite: true,
-        setupMode: "off",
-      });
+/** Back to the sign-in tab from anywhere (recovery cancels to here). The
+ * loaded policy comes along: a recovery cancel must not reset the proof
+ * fields to a blank default. */
+const baseSignin = (panel: Panel, policy: PolicySnapshot | null): Panel => {
+  if (isReady(panel)) {
+    return { ...panel, mode: "signin" };
+  }
+
+  const fallback: PolicySnapshot = {
+    firstRun: false,
+    requiresInvite: true,
+    setupMode: "off",
+  };
+
+  const restored = policy ?? fallback;
+
+  return Panels.Ready({ ...restored, mode: "signin" });
+};
 
 export const LoginPanelApp = defineApp({
   init: () => ({
@@ -697,6 +718,7 @@ export const LoginPanelApp = defineApp({
       error: "",
       mounted: false,
       panel: Panels.Policy(),
+      policy: null,
     },
   }),
   name: "LoginPanel",
@@ -711,15 +733,20 @@ export const LoginPanelApp = defineApp({
       }
 
       case "PolicyLoaded": {
+        const policy: PolicySnapshot = {
+          firstRun: message.firstRun,
+          requiresInvite: message.requiresInvite,
+          setupMode: message.setupMode,
+        };
+
         return {
           model: {
             ...model,
             panel: Panels.Ready({
-              firstRun: message.firstRun,
+              ...policy,
               mode: message.firstRun ? "register" : "signin",
-              requiresInvite: message.requiresInvite,
-              setupMode: message.setupMode,
             }),
+            policy,
           },
         };
       }
@@ -765,7 +792,7 @@ export const LoginPanelApp = defineApp({
             ...model,
             busy: false,
             error: "",
-            panel: baseSignin(model.panel),
+            panel: baseSignin(model.panel, model.policy),
           },
         };
       }

@@ -615,8 +615,17 @@ EOF
 }
 
 # What the operator must do to claim the first admin account: register as the
-# reserved address, or present the one-time setup code (minted here so the
-# summary always shows the current one). Localhost keeps no gate at all.
+# reserved address (when set) and present the one-time setup code (minted here
+# so the summary always shows the current one). Localhost keeps no gate.
+print_setup_code() {
+  local code_out
+  if code_out=$(compose exec -T noite noite-runner setup-code 2>/dev/null); then
+    printf '%s' "$code_out"
+  else
+    printf '%s' "Mint one on the server with: cd $NOITE_DIR && docker compose$(compose_hint) exec noite noite-runner setup-code"
+  fi
+}
+
 first_run_note() {
   local email
   email=$(env_get NOITE_ADMIN_EMAIL)
@@ -628,16 +637,11 @@ first_run_note() {
     ;;
   esac
   if [[ -n "$email" ]]; then
-    printf '%s' "${YELLOW}${BOLD}Register as ${email} now.${RESET} Only that address can claim the admin account: open https://app.$DOMAIN and sign up with it before anyone else can."
-
-    return 0
-  fi
-  local code_out
-  if code_out=$(compose exec -T noite noite-runner setup-code 2>/dev/null); then
-    printf '%s\n%s' "${YELLOW}${BOLD}First admin: a setup code is required.${RESET} No admin email was set, so the first account must present this one-time code:" "$code_out"
+    printf '%s\n' "${YELLOW}${BOLD}Register as ${email} now.${RESET} Only that address can claim the admin account, and it must present the one-time setup code below — open https://app.$DOMAIN and sign up with it before anyone else can:"
   else
-    printf '%s' "${YELLOW}${BOLD}First admin: a setup code is required.${RESET} Mint one on the server with: cd $NOITE_DIR && docker compose$(compose_hint) exec noite noite-runner setup-code"
+    printf '%s\n' "${YELLOW}${BOLD}First admin: a setup code is required.${RESET} No admin email was set, so the first account must present this one-time code:"
   fi
+  print_setup_code
 }
 
 # `run.sh` passes through whatever follows `install` (it consumes --pre
@@ -671,8 +675,9 @@ main() {
 }
 
 # Sourcing (the bun test suite) defines the functions without running the
-# install; executing runs it. Nothing runs before main on the last line, so
-# a truncated download never runs half an install.
-if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+# install; executing runs it — including through `bash -c`, where BASH_SOURCE
+# is unset (that is how run.sh invokes the installer). Nothing runs before
+# main on the last line, so a truncated download never runs half an install.
+if [[ "${BASH_SOURCE[0]-}" == "" || "${BASH_SOURCE[0]}" == "$0" ]]; then
   main "$@"
 fi

@@ -195,23 +195,60 @@ describe("email anchor", () => {
     });
   });
 
-  test("the named address succeeds (case-insensitive) and becomes admin", async () => {
+  test("a stranger is refused even with a valid code", async () => {
+    publicBase("op@example.com");
+    const code = await pendingCode();
+    const policy = await signupPolicy();
+
+    // Knowing the address alone never suffices — and neither does holding a
+    // code with the wrong address.
+    expect(
+      await checkFirstAdminProof("stranger@example.com", code, policy)
+    ).toEqual({ _tag: "Refused", reason: "reserved" });
+    expect(db.raw.query(`SELECT count(*) AS n FROM "user"`).get()).toEqual({
+      n: 0,
+    });
+  });
+
+  test("the named address without a code is refused", async () => {
+    publicBase("op@example.com");
+    await pendingCode();
+    const policy = await signupPolicy();
+
+    expect(
+      await checkFirstAdminProof("op@example.com", ABSENT, policy)
+    ).toEqual({ _tag: "Refused", reason: "missing" });
+  });
+
+  test("the named address with a wrong code is refused", async () => {
+    publicBase("op@example.com");
+    await pendingCode();
+    const policy = await signupPolicy();
+
+    expect(
+      await checkFirstAdminProof(
+        "op@example.com",
+        "AAAA-AAAA-AAAA-AAAA-AAAA",
+        policy
+      )
+    ).toEqual({ _tag: "Refused", reason: "invalid" });
+  });
+
+  test("the named address with the code succeeds and becomes admin", async () => {
     publicBase("Op@Example.com");
+    const code = await pendingCode();
     const policy = await signupPolicy();
     addUser("op", "op@example.com");
 
-    const proof = await checkFirstAdminProof(
-      "op@example.com",
-      undefined,
-      policy
-    );
+    const proof = await checkFirstAdminProof("op@example.com", code, policy);
 
     expect(proof._tag).toBe("Admitted");
 
-    const verdict = await claimFirstAdminSlot("op", undefined, policy);
+    const verdict = await claimFirstAdminSlot("op", code, policy);
 
     expect(verdict._tag).toBe("Admitted");
     expect(roleOf("op")).toBe("admin");
+    expect(await checkSetupCode(code)).toBe("used");
   });
 
   test("two concurrent anchor registrations yield exactly one admin", async () => {
@@ -219,13 +256,14 @@ describe("email anchor", () => {
     // lowercases), so the claim arbitrates — in production a second
     // identical email never reaches the claim (USER_ALREADY_EXISTS).
     publicBase("op@example.com");
+    const code = await pendingCode();
     const policy = await signupPolicy();
     addUser("a", "Op@Example.com");
     addUser("b", "op@example.com");
 
     const [a, b] = await Promise.all([
-      claimFirstAdminSlot("a", undefined, policy),
-      claimFirstAdminSlot("b", undefined, policy),
+      claimFirstAdminSlot("a", code, policy),
+      claimFirstAdminSlot("b", code, policy),
     ]);
 
     expect([a._tag, b._tag].filter((tag) => tag === "Admitted")).toHaveLength(
@@ -238,6 +276,7 @@ describe("email anchor", () => {
       .all() as { id: string; role: string | null }[];
 
     expect(rows.filter((row) => row.role === "admin")).toHaveLength(1);
+    expect(await checkSetupCode(code)).toBe("used");
   });
 });
 
@@ -339,6 +378,62 @@ describe("code bootstrap", () => {
 
     expect(rows.filter((row) => row.role === "admin")).toHaveLength(1);
     expect(await checkSetupCode(code)).toBe("used");
+  });
+
+  test("a rotation between proof and claim refuses without creating an admin", async () => {
+    publicBase();
+    const code = await pendingCode();
+    const policy = await signupPolicy();
+
+    expect(await checkFirstAdminProof("op@example.com", code, policy)).toEqual({
+      _tag: "Admitted",
+    });
+
+    // The operator reissued in between: the checked hash is spent, so the
+    // bound claim writes nothing.
+    await rotateSetupCode();
+    addUser("op", "op@example.com");
+
+    expect(await claimFirstAdminSlot("op", code, policy)).toEqual({
+      _tag: "Refused",
+      reason: "used",
+    });
+    expect(roleOf("op")).toBe("user");
+  });
+
+  test("a consume failure after the claim still admits (and logs)", async () => {
+    publicBase();
+    const code = await pendingCode();
+    const policy = await signupPolicy();
+    addUser("op", "op@example.com");
+    // The banner stays loud in production; the assertion reads the call.
+    const warned = spyOn(console, "warn").mockImplementation(() => {});
+
+    try {
+      const verdict = await claimFirstAdminSlot("op", code, policy, () =>
+        Promise.reject(new Error("db exploded"))
+      );
+
+      expect(verdict).toEqual({ _tag: "Admitted" });
+      expect(roleOf("op")).toBe("admin");
+      expect(warned).toHaveBeenCalledTimes(1);
+    } finally {
+      warned.mockRestore();
+    }
+  });
+
+  test("a lost consume race after the claim still admits", async () => {
+    publicBase();
+    const code = await pendingCode();
+    const policy = await signupPolicy();
+    addUser("op", "op@example.com");
+
+    const verdict = await claimFirstAdminSlot("op", code, policy, () =>
+      Promise.resolve(false)
+    );
+
+    expect(verdict).toEqual({ _tag: "Admitted" });
+    expect(roleOf("op")).toBe("admin");
   });
 });
 

@@ -253,7 +253,7 @@ compose() {
 }
 `;
 
-  test("a reserved address names who must register first", () => {
+  test("a reserved address names who must register first, with the code", () => {
     writeFileSync(
       path.join(dir, ".env"),
       "BASE_DOMAIN=example.com\nNOITE_ADMIN_EMAIL=op@example.com\n"
@@ -262,7 +262,7 @@ compose() {
 
     expect(result.status).toBe(0);
     expect(result.stdout).toContain("op@example.com");
-    expect(result.stdout).not.toContain("setup code is required");
+    expect(result.stdout).toContain("CODE-1");
   });
 
   test("without an address the minted code is printed", () => {
@@ -294,5 +294,31 @@ compose() {
 
     expect(result.status).toBe(0);
     expect(result.stdout).toContain("needs no code");
+  });
+});
+
+describe("install.sh entrypoint", () => {
+  test("run.sh-style execution (bash -c, unset BASH_SOURCE) reaches main", () => {
+    // run.sh invokes the installer as `bash -c "$script" install.sh`, where
+    // BASH_SOURCE is unset: with `set -u` the old guard aborted before main.
+    // `id` is stubbed (the script never defines it) so check_system dies
+    // with its root refusal instead of running the install — as any user.
+    const result = runBash(
+      `id() { echo 1000; }\nexport -f id\nscript=$(cat "${INSTALL}")\nbash -c "$script" install.sh`
+    );
+
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain("run as root");
+    expect(result.stderr).not.toContain("BASH_SOURCE");
+  });
+
+  test("sourcing defines functions without running the install", () => {
+    const result = runBash(
+      `id() { echo 1000; }\nsource "${INSTALL}"\necho "SOURCED"\ntype main`
+    );
+
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain("SOURCED");
+    expect(result.stderr).not.toContain("run as root");
   });
 });

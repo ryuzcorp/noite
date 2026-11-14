@@ -3,6 +3,7 @@ import { eq, sql } from "void/db";
 
 import { bootstrapSetupTable, userTable } from "../../db/schema";
 import { getDb, resolveEnv, withDb } from "../db";
+import { errorLogText } from "../errors";
 import { isLocalhostDomain } from "../local-host";
 
 //! The first-admin setup code (audit N-3).
@@ -12,7 +13,8 @@ import { isLocalhostDomain } from "../local-host";
 //! cases, decided by `setupModeOf`:
 //!
 //! - `email`: `NOITE_ADMIN_EMAIL` is set — only that address may claim the
-//!   bootstrap admin slot while no admin exists.
+//!   bootstrap admin slot, and it must still present the one-time setup code
+//!   (knowing the address alone never suffices — audit review on N-3).
 //! - `code`: no anchor address — the first registration must present the
 //!   one-time setup code the runner printed at boot. The control database
 //!   holds only its SHA-256 hash, so a database reader can never recover it.
@@ -365,18 +367,34 @@ export const Bootstrap = Data.taggedEnum<BootstrapClaim>();
  *
  * One conditional UPDATE: the role is only written while no other account
  * holds `admin`, so of two registrations that both saw no admin, exactly
- * one becomes the admin. The re-read reports which one this account is (an
+ * one becomes the admin. With a `codeHash` the UPDATE additionally requires
+ * that same hash to be still unconsumed in `bootstrap_setup` — one
+ * statement, so a rotation between the proof check and the claim refuses
+ * instead of admitting. The re-read reports which one this account is (an
  * account that a previous run already promoted also reads as `Claimed`).
  * No schema change: the `user.role` column is the claim's cell. */
-export const claimBootstrapAdmin = (userId: string): Promise<BootstrapClaim> =>
+export const claimBootstrapAdmin = (
+  userId: string,
+  codeHash?: string
+): Promise<BootstrapClaim> =>
   withDb(async () => {
     const db = getDb();
 
-    await db.run(sql`
+    const claim =
+      codeHash === undefined
+        ? sql`
       UPDATE "user" SET role = 'admin'
        WHERE id = ${userId}
          AND NOT EXISTS (SELECT 1 FROM "user" WHERE role = 'admin')
-    `);
+    `
+        : sql`
+      UPDATE "user" SET role = 'admin'
+       WHERE id = ${userId}
+         AND NOT EXISTS (SELECT 1 FROM "user" WHERE role = 'admin')
+         AND EXISTS (SELECT 1 FROM bootstrap_setup WHERE id = ${SETUP_ID} AND codeHash = ${codeHash} AND consumedBy IS NULL)
+    `;
+
+    await db.run(claim);
 
     const rows = await db
       .select({ role: userTable.role })
@@ -463,9 +481,9 @@ export const checkFirstAdminProof = async (
   if (policy.setupMode === "email") {
     const anchor = resolveAnchorEmail();
 
-    return !anchor || email !== anchor
-      ? FirstAdmin.Refused({ reason: "reserved" })
-      : FirstAdmin.Admitted();
+    if (!anchor || email !== anchor) {
+      return FirstAdmin.Refused({ reason: "reserved" });
+    }
   }
 
   const problem = await checkSetupCode(setupCode);
@@ -479,30 +497,50 @@ export const checkFirstAdminProof = async (
  * first registrations wins the admin slot (the conditional UPDATE in
  * `claimBootstrapAdmin`), and the winner spends the setup code.
  *
- * Order matters: the admin slot is claimed FIRST, the code spent after, so a
- * crash between them leaves an admin (bootstrap done, code inert) rather
- * than a spent code with no admin (bootstrap impossible). The claim is the
- * real single-use gate — reuse is impossible once an admin exists — and the
- * consume keeps the code's own lifecycle honest. */
+ * The `codeHash` checked at proof time rides into the claim's UPDATE, so a
+ * rotation between proof and claim refuses instead of admitting. Order
+ * otherwise matters: the admin slot is claimed FIRST, the code spent after,
+ * so a crash between them leaves an admin (bootstrap done, code inert)
+ * rather than a spent code with no admin (bootstrap impossible). The claim
+ * is the real single-use gate — reuse is impossible once an admin exists —
+ * and the consume keeps the code's own lifecycle honest.
+ *
+ * `spendCode` is a seam for the consume-failure test; production passes
+ * nothing and gets `consumeSetupCode`. */
 export const claimFirstAdminSlot = async (
   userId: string,
   setupCode: string | undefined,
-  policy: BootstrapPolicy
+  policy: BootstrapPolicy,
+  spendCode: (
+    code: string,
+    claimingUserId: string
+  ) => Promise<boolean> = consumeSetupCode
 ): Promise<FirstAdminOutcome> => {
-  const claim = await claimBootstrapAdmin(userId);
+  const codeHash =
+    policy.setupMode === "off"
+      ? undefined
+      : await hashSetupCode(normalizeSetupCode(setupCode ?? ""));
+
+  const claim = await claimBootstrapAdmin(userId, codeHash);
 
   if (claim._tag === "Lost") {
     return FirstAdmin.Refused({
-      reason: policy.setupMode === "code" ? "used" : "lost",
+      reason: policy.setupMode === "off" ? "lost" : "used",
     });
   }
 
-  if (policy.setupMode === "code") {
-    // Best effort (see the doc comment above): the claim already arbitrated,
-    // and only a rotation racing this registration can lose the consume —
-    // in which case the presented code was valid and this account holds the
-    // only admin slot, so admission still stands.
-    await consumeSetupCode(setupCode ?? "", userId);
+  if (policy.setupMode !== "off") {
+    try {
+      await spendCode(setupCode ?? "", userId);
+    } catch (error) {
+      // The claim already arbitrated and this account holds the only admin
+      // slot, so admission stands: once an admin exists the code is inert.
+      // Loud, so a real store fault still surfaces in the fleet log.
+      console.warn(
+        "[noite:setup] setup code consume failed after the admin claim; admission stands",
+        errorLogText(error)
+      );
+    }
   }
 
   return FirstAdmin.Admitted();

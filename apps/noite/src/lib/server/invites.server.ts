@@ -50,10 +50,10 @@ export const normalizeInviteCode = (raw: string): string => {
 };
 
 /** Public signup policy: the very first account bootstraps the instance. On
- * a `localhost`-family base it needs no code (dev and e2e); on a public
- * base with no admin yet, `setupMode` names the proof the first
- * registration must present (the `NOITE_ADMIN_EMAIL` address, or the
- * one-time setup code). `firstRun` and `adminExists` are fast reads, not
+ * a `localhost`-family base it needs no proof (dev and e2e); on a public
+ * base with no admin yet, `setupMode` names the gate: `email` means the
+ * `NOITE_ADMIN_EMAIL` address *and* the one-time setup code, `code` means
+ * the code alone. `firstRun` and `adminExists` are fast reads, not
  * arbitration points — the bootstrap claim is. */
 export const signupPolicy = async (): Promise<{
   adminExists: boolean;

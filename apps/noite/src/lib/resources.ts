@@ -391,7 +391,8 @@ export interface SignupPolicy {
   readonly invitesPerUser: number;
   readonly requiresInvite: boolean;
   /** Which proof the first registration must present; `off` once an admin
-   * exists or on a `localhost` base. Never the code or address itself. */
+   * exists or on a `localhost` base. `email` needs the reserved address
+   * *and* the setup code. Never the code or address itself. */
   readonly setupMode: "off" | "email" | "code";
 }
 
