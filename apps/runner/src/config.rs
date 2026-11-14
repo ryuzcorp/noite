@@ -841,6 +841,10 @@ pub const CONTROL_UPSTREAM: &str = "127.0.0.1:8090";
 pub const CONTROL_UPSTREAM_URL: &str = "http://127.0.0.1:8090";
 /// The runner's own API, as Caddy reaches it for `api.` and `git.`.
 pub const API_UPSTREAM: &str = "127.0.0.1:8080";
+/// The bundled RustFS store's dev credentials (`docker/compose.yaml`,
+/// `.env.example`). `validate` refuses them on a non-localhost domain.
+const DEV_S3_ACCESS_KEY: &str = "noiteaccess";
+const DEV_S3_SECRET_KEY: &str = "noitesecretnoitesecretnoite12";
 
 /// Cloudflare's published edge ranges (cloudflare.com/ips-v4 and ips-v6),
 /// what `NOITE_TRUSTED_PROXIES=cloudflare` expands to. They change rarely;
@@ -1429,10 +1433,10 @@ impl Config {
             aws_region: env::var("AWS_REGION").unwrap_or_else(|_| "us-east-1".into()),
             aws_access_key_id: env::var("AWS_ACCESS_KEY_ID")
                 .or_else(|_| env::var("RUSTFS_ACCESS_KEY"))
-                .unwrap_or_else(|_| "noiteaccess".into()),
+                .unwrap_or_else(|_| DEV_S3_ACCESS_KEY.into()),
             aws_secret_access_key: env::var("AWS_SECRET_ACCESS_KEY")
                 .or_else(|_| env::var("RUSTFS_SECRET_KEY"))
-                .unwrap_or_else(|_| "noitesecretnoitesecretnoite12".into()),
+                .unwrap_or_else(|_| DEV_S3_SECRET_KEY.into()),
             base_domain: base_domain.clone(),
             control_subdomain: normalize_host(&env::var("CONTROL_SUBDOMAIN").unwrap_or_default()),
             control_extra_hosts: env::var("CONTROL_EXTRA_HOSTS")
@@ -1605,10 +1609,10 @@ impl Config {
                     region: env::var("AWS_REGION").unwrap_or_else(|_| "us-east-1".into()),
                     access_key: env::var("AWS_ACCESS_KEY_ID")
                         .or_else(|_| env::var("RUSTFS_ACCESS_KEY"))
-                        .unwrap_or_else(|_| "noiteaccess".into()),
+                        .unwrap_or_else(|_| DEV_S3_ACCESS_KEY.into()),
                     secret_key: env::var("AWS_SECRET_ACCESS_KEY")
                         .or_else(|_| env::var("RUSTFS_SECRET_KEY"))
-                        .unwrap_or_else(|_| "noitesecretnoitesecretnoite12".into()),
+                        .unwrap_or_else(|_| DEV_S3_SECRET_KEY.into()),
                 },
                 // The install tag derives from the configured store (see
                 // `host::credentials::install_tag`); read the same var as
@@ -1726,8 +1730,8 @@ impl Config {
         let dev_auth = std::env::var("BETTER_AUTH_SECRET")
             .map(|v| v.trim().is_empty() || v.starts_with("dev-"))
             .unwrap_or(true);
-        let dev_s3 = self.aws_access_key_id == "noiteaccess"
-            || self.aws_secret_access_key == "noitesecretnoitesecretnoite12";
+        let dev_s3 = self.aws_access_key_id == DEV_S3_ACCESS_KEY
+            || self.aws_secret_access_key == DEV_S3_SECRET_KEY;
         if !is_localhost_domain(&self.base_domain) {
             if dev_token {
                 problems
@@ -2168,6 +2172,22 @@ pub(crate) fn config_for_tests() -> Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A copied `.env.example` must trip the dev-key boot guard on a public
+    /// domain: its store keys are the placeholders `validate` knows (audit
+    /// N-5, it once shipped different ones that passed the guard).
+    #[test]
+    fn env_example_store_keys_are_the_guarded_dev_defaults() {
+        let example = include_str!("../../../.env.example");
+        let value = |key: &str| {
+            example
+                .lines()
+                .find_map(|line| line.strip_prefix(key)?.strip_prefix('='))
+                .unwrap_or_else(|| panic!("{key} missing from .env.example"))
+        };
+        assert_eq!(value("RUSTFS_ACCESS_KEY"), DEV_S3_ACCESS_KEY);
+        assert_eq!(value("RUSTFS_SECRET_KEY"), DEV_S3_SECRET_KEY);
+    }
 
     /// The endpoint keeps its shape apart from userinfo: a plain endpoint
     /// passes through byte-identical, credentials are dropped (keeping a
