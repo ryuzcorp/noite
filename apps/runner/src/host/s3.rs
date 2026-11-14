@@ -150,7 +150,7 @@ async fn bounded_text_or_empty(resp: reqwest::Response, timeout: Duration) -> St
 /// Visible to the state tests, which pin the missing-vs-misconfigured
 /// boundary at the error-construction site.
 ///
-/// Only a body carrying the store's `<Code>NoSuchKey</Code>` attaches the
+/// Only a non-5xx answer whose body carries the store's `<Code>NoSuchKey</Code>` attaches the
 /// [`S3NotFound`] marker. A body naming `<Code>NoSuchBucket</Code>` is a
 /// wrong-bucket configuration error, and a 404 with no store code at all (a
 /// wrong endpoint path, a proxy or custom-domain page) is a misconfigured
@@ -159,10 +159,17 @@ async fn bounded_text_or_empty(resp: reqwest::Response, timeout: Duration) -> St
 /// composed message, so a key that merely contains those words can never
 /// count as missing. Bodyless HEAD 404s never reach this constructor
 /// (`s3_head_object`/`s3_object_exists` answer `Option`/`bool` directly).
+/// A 5xx is never "missing", whatever its body says: a failing store or an
+/// intermediary can echo a `NoSuchKey` page, and reading that as absent
+/// would boot an empty database that the next upload writes over the good
+/// snapshot.
 pub(crate) fn s3_err_msg(op: &str, target: &str, status: u16, body: &str) -> anyhow::Error {
     let snippet: String = body.trim().chars().take(300).collect();
     let err = anyhow::anyhow!("s3 {op} {target} failed: HTTP {status} {snippet}");
-    if !body.contains("<Code>NoSuchBucket</Code>") && body.contains("<Code>NoSuchKey</Code>") {
+    if status < 500
+        && !body.contains("<Code>NoSuchBucket</Code>")
+        && body.contains("<Code>NoSuchKey</Code>")
+    {
         err.context(S3NotFound)
     } else {
         err
@@ -1683,6 +1690,10 @@ mod tests {
             "ServiceUnavailable",
         );
         assert!(!is_not_found(&slow_on_notfound_key));
+        // A 5xx whose body echoes the store's NoSuchKey code is still a
+        // failing store, never "missing".
+        let key_code_on_503 = s3_err_msg("download", "tip.bundle", 503, "<Code>NoSuchKey</Code>");
+        assert!(!is_not_found(&key_code_on_503));
         // Same for the other code words in key names on non-404 statuses.
         let denied = s3_err_msg("download", "NoSuchKey-manifest.json", 403, "AccessDenied");
         assert!(!is_not_found(&denied));
