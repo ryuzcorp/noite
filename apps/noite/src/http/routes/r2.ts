@@ -2,6 +2,7 @@ import { requireAppRole } from "../../lib/collaborators";
 import { ensureDb } from "../../lib/db";
 import { runnerConfig } from "../config";
 import type { RouteHandler } from "../config";
+import { isSameOriginAction } from "../origin";
 import { routeUserId } from "../session";
 
 /** Content types a browser renders as a document: served inline like the
@@ -90,6 +91,10 @@ const proxyR2Object = async (
  * stored record is what a Worker's `env.BUCKET.put()` writes). Nothing
  * buffers the file — the browser's body is handed to fetch as it arrives. */
 export const handleR2Upload: RouteHandler = async (request, env, params) => {
+  if (!isSameOriginAction(request, env)) {
+    return new Response("Cross-site request refused", { status: 403 });
+  }
+
   const target = r2ObjectTarget(request, params);
 
   if (!target) {

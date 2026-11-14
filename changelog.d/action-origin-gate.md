@@ -1,0 +1,3 @@
+### Security
+
+- Control actions (`POST /api/...`) and the R2 object upload now refuse cross-site browser requests with `403 Cross-site request refused`. Tenant apps live on sibling subdomains of the control UI (same site, so `SameSite=Lax` still attaches the session cookie on a `text/plain` POST that needs no CORS preflight), and a tenant page could previously drive any control action as a signed-in visitor who opened it. The gate requires the browser's `Origin` to be the control origin (or the configured `BETTER_AUTH_URL` origin), else `Sec-Fetch-Site: same-origin`/`none`; requests with neither header (non-browser API clients) still pass.

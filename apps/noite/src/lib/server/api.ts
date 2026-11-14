@@ -27,6 +27,7 @@ import { defineHandler } from "void";
 import type { TypedHandler } from "void";
 
 import { MAX_BODY_BYTES, readBoundedText, tooLarge } from "../../http/body";
+import { isSameOriginAction } from "../../http/origin";
 import { errorLogText, errorMessage } from "../errors";
 
 // oxlint-disable-next-line unicorn/throw-new-error -- Schema.TaggedError factory (same pattern as lib/auth.ts)
@@ -120,6 +121,14 @@ export const apiAction = <S extends Schema.ConstraintDecoder<unknown>>(
     const request = c.req.raw;
     // SAFETY: the platform injects every KitEnv control key the actions read; unset keys stay undefined as actions tolerate.
     const env = c.env as KitEnv;
+
+    if (!isSameOriginAction(request, env)) {
+      return Response.json(
+        { error: "Cross-site request refused" },
+        { status: 403 }
+      );
+    }
+
     const read = await readInput(request, schema);
 
     if ("response" in read) {
@@ -145,6 +154,13 @@ export const apiActionNoInput = (
     const request = c.req.raw;
     // SAFETY: the platform injects every KitEnv control key the actions read; unset keys stay undefined as actions tolerate.
     const env = c.env as KitEnv;
+
+    if (!isSameOriginAction(request, env)) {
+      return Response.json(
+        { error: "Cross-site request refused" },
+        { status: 403 }
+      );
+    }
 
     try {
       const output = await fn({ env, request });
