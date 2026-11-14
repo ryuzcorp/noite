@@ -221,9 +221,10 @@ impl StateSync {
             }
             Err(e) if s3::is_not_found(&e) => {}
             Err(e) => {
-                return Err(e.context(
-                    "runner state meta download failed; refusing to claim the bucket state",
-                ));
+                return Err(e.context(format!(
+                    "runner state meta download failed for bucket {}; refusing to claim the bucket state",
+                    cfg.s3_bucket
+                )));
             }
         }
         let claim = serde_json::json!({
@@ -458,9 +459,10 @@ pub async fn restore_if_missing(cfg: &Config) -> anyhow::Result<bool> {
     }
     match download_snapshot(cfg, &live).await {
         Ok(restored) => Ok(restored),
-        Err(e) => {
-            Err(e.context("runner state restore failed; refusing to start with an empty database"))
-        }
+        Err(e) => Err(e.context(format!(
+            "runner state restore failed for bucket {}; refusing to start with an empty database",
+            cfg.s3_bucket
+        ))),
     }
 }
 
@@ -577,7 +579,7 @@ mod tests {
     use super::{
         should_upload, snapshot_tmp_paths, SnapshotPhase, StateSync, DEBOUNCE, MIN_INTERVAL,
     };
-    use crate::host::s3::is_not_found;
+    use crate::host::s3::{is_not_found, s3_err_msg};
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
     use std::time::Instant;
@@ -645,8 +647,22 @@ mod tests {
 
     #[test]
     fn only_a_missing_object_counts_as_no_snapshot() {
-        let missing = anyhow::anyhow!("aws exit 1\nfatal error: An error occurred (404) when calling the HeadObject operation: Key \"x\" does not exist");
+        let missing = s3_err_msg(
+            "download",
+            "runner/state/noite.sqlite.zst",
+            404,
+            "<Code>NoSuchKey</Code>",
+        );
         assert!(is_not_found(&missing));
+        // A wrong bucket is a configuration error, never "no snapshot" —
+        // even when its status is 404.
+        let missing_bucket = s3_err_msg(
+            "download",
+            "runner/state/noite.sqlite.zst",
+            404,
+            "<Code>NoSuchBucket</Code>",
+        );
+        assert!(!is_not_found(&missing_bucket));
         let down = anyhow::anyhow!(
             "aws exit 255\nCould not connect to the endpoint URL: \"http://rustfs:9000/noite\""
         );
@@ -694,6 +710,54 @@ mod tests {
             "unexpected error: {err:#}"
         );
     }
+
+    /// N-2: a wrong bucket answers 404 with a `NoSuchBucket` body. That is a
+    /// configuration error, never "no snapshot": the boot is refused instead
+    /// of starting with an empty database that the next upload would write
+    /// over the good snapshot. Paused time skips the retry backoff
+    /// deterministically: the clock moves in 100 ms steps (below every
+    /// request timeout, so no in-flight request times out spuriously) while
+    /// the restore future is polled directly — no wall-clock waiting.
+    #[tokio::test]
+    async fn restore_refuses_boot_on_missing_bucket() {
+        tokio::time::pause();
+        let dir = std::env::temp_dir().join(format!("noite-state-{}", uuid::Uuid::new_v4()));
+        let (endpoint, _store, _refuse) = spawn_state_stub_with_missing(
+            b"<?xml version=\"1.0\"?><Error><Code>NoSuchBucket</Code><Message>The specified bucket does not exist</Message></Error>",
+        )
+        .await;
+        let mut cfg = crate::config::config_for_tests();
+        cfg.database_url = format!("sqlite:{}?mode=rwc", dir.join("noite.sqlite").display());
+        cfg.s3_endpoint = endpoint.clone();
+        cfg.s3_public_endpoint = endpoint;
+        cfg.s3_bucket = "wrong-bucket".to_string();
+        let live = crate::db::local_db_path(&cfg).expect("file database");
+        assert!(!live.exists(), "nothing restored yet");
+        let restore = super::restore_if_missing(&cfg);
+        tokio::pin!(restore);
+        let mut settled = None;
+        for _ in 0..2000 {
+            tokio::select! {
+                biased;
+                result = &mut restore => {
+                    settled = Some(result);
+                    break;
+                }
+                _ = tokio::time::advance(std::time::Duration::from_millis(100)) => {}
+            }
+        }
+        let err = settled
+            .expect("restore settles without wall-clock waiting")
+            .expect_err("a missing bucket must fail the boot, not start fresh");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("wrong-bucket"),
+            "the error names the bucket: {msg}"
+        );
+        assert!(!live.exists(), "no empty database is created");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// Injected-clock gate: nothing uploads before its time, whatever the
     /// wall clock says. Pure function on explicit Instants — no sleeps.
     #[test]
@@ -725,11 +789,23 @@ mod tests {
     type RefuseOnce = Arc<Mutex<Option<String>>>;
 
     /// In-test S3 stand-in: PUTs are stored, GETs serve them back, anything
-    /// else is a missing key. Enough of the store for `claim` + `snapshot_now`
-    /// (owner fence, state upload, meta upload) with no sleeps: the listener
-    /// is bound before the first client call. `RefuseOnce` fails one chosen
-    /// PUT.
+    /// else answers `missing` (a missing key by default). Enough of the store
+    /// for `claim` + `snapshot_now` (owner fence, state upload, meta upload)
+    /// with no sleeps: the listener is bound before the first client call.
+    /// `RefuseOnce` fails one chosen PUT.
     async fn spawn_state_stub() -> (String, Arc<Mutex<HashMap<String, Vec<u8>>>>, RefuseOnce) {
+        spawn_state_stub_with_missing(
+            b"<?xml version=\"1.0\"?><Error><Code>NoSuchKey</Code></Error>",
+        )
+        .await
+    }
+
+    /// [`spawn_state_stub`] with the missing-key body chosen by the caller: a
+    /// `NoSuchBucket` body simulates a wrong bucket name on first boot.
+    async fn spawn_state_stub_with_missing(
+        missing: &[u8],
+    ) -> (String, Arc<Mutex<HashMap<String, Vec<u8>>>>, RefuseOnce) {
+        let missing = std::sync::Arc::new(missing.to_vec());
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let store: Arc<Mutex<HashMap<String, Vec<u8>>>> = Arc::new(Mutex::new(HashMap::new()));
         let refuse: RefuseOnce = Arc::new(Mutex::new(None));
@@ -746,6 +822,7 @@ mod tests {
                 };
                 let served = served.clone();
                 let refusing = refusing.clone();
+                let absent = missing.clone();
                 tokio::spawn(async move {
                     let mut head = Vec::new();
                     let mut buf = [0u8; 4096];
@@ -816,11 +893,7 @@ mod tests {
                     } else {
                         match served.lock().expect("store lock").get(&path).cloned() {
                             Some(found) => ("HTTP/1.1 200 OK", found),
-                            None => (
-                                "HTTP/1.1 404 Not Found",
-                                b"<?xml version=\"1.0\"?><Error><Code>NoSuchKey</Code></Error>"
-                                    .to_vec(),
-                            ),
+                            None => ("HTTP/1.1 404 Not Found", (*absent).clone()),
                         }
                     };
                     let _ = sock
