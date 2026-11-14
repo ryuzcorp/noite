@@ -21,7 +21,9 @@
 # Environment (all optional; `curl … | NOITE_DOMAIN=example.com bash -s install`):
 #   NOITE_DOMAIN       base domain; app./api./git./*. must point at this host
 #                      (default: asked, <public-ip>.sslip.io on Enter or without a terminal)
-#   NOITE_ADMIN_EMAIL  promoted to admin at boot
+#   NOITE_ADMIN_EMAIL  the address that may claim the first admin account
+#                      (default: asked; Enter uses a one-time setup code printed
+#                      at the end instead; kept on re-runs and upgrades)
 #   NOITE_EMAIL_WEBHOOK_URL
 #                      receives lost-passkey sign-in codes as JSON; without it,
 #                      recover with `noite-runner recover` (printed at the end)
@@ -37,6 +39,7 @@
 #   NOITE_DIR          install directory (default: /opt/noite)
 #   NOITE_YES=1        skip the upgrade confirmation (`bash -s install --yes`
 #                      does the same; NOITE_CONFIRM=1 is accepted too)
+#   --admin-email <addr>: like NOITE_ADMIN_EMAIL, for scripted installs.
 #   NOITE_SWAP=0       do not create the small-host swapfile (default: on for
 #                      hosts under 4 GB with no swap)
 #
@@ -297,6 +300,66 @@ choose_domain() {
   fi
 }
 
+# Loose email shape for the admin prompt: one @, no spaces (this reserves the
+# slot, it does not verify the mailbox — the operator proves it by signing up).
+valid_email() { [[ "$1" =~ ^[^@[:space:]]+@[^@[:space:]]+$ ]]; }
+
+# One terminal question: print the prompt and read the answer into
+# `$answer`. Split out so tests can shadow it without a terminal; callers
+# only reach it behind `can_ask`.
+ask() {
+  printf '%s' "$1" >/dev/tty || true
+  read -r answer </dev/tty || true
+}
+# Who owns this install: the address that may claim the first admin account.
+# An explicit NOITE_ADMIN_EMAIL (env or --admin-email) wins and is validated
+# loudly; a kept .env value survives re-runs and upgrades without a
+# re-prompt; otherwise ask (Enter = one-time setup code instead), or fall
+# back to the setup-code path with no terminal. Localhost dev stacks keep
+# today's behaviour: no gate, so no prompt (an explicit env value is still
+# honoured).
+choose_admin_email() {
+  local existing
+  existing=$(env_get NOITE_ADMIN_EMAIL)
+  if [[ -n "${NOITE_ADMIN_EMAIL:-}" ]]; then
+    valid_email "$NOITE_ADMIN_EMAIL" ||
+      die "NOITE_ADMIN_EMAIL=\"$NOITE_ADMIN_EMAIL\" is not an email address (need one @, no spaces)"
+    if [[ "$existing" != "$NOITE_ADMIN_EMAIL" ]]; then
+      env_set NOITE_ADMIN_EMAIL "$NOITE_ADMIN_EMAIL"
+    fi
+
+    return 0
+  fi
+  if [[ -n "$existing" ]]; then
+    info "keeping NOITE_ADMIN_EMAIL=$existing"
+
+    return 0
+  fi
+  case "$DOMAIN" in
+  localhost | *.localhost) return 0 ;;
+  esac
+  if can_ask; then
+    local answer=""
+    info "The first account to sign up becomes the admin. Give the admin email"
+    info "and only that address can claim it, or press Enter to use a one-time"
+    info "setup code (printed at the end of this install) instead."
+    while true; do
+      ask '    Admin email (Enter for setup code): '
+      if [[ -z "$answer" ]]; then
+        return 0
+      fi
+      if valid_email "$answer"; then
+        env_set NOITE_ADMIN_EMAIL "$answer"
+
+        return 0
+      fi
+      warn "\"$answer\" is not an email address (need one @, no spaces); try again or press Enter"
+    done
+  else
+    warn "no terminal to ask on: no admin email set, this install uses a one-time setup code (printed below)"
+  fi
+}
+
 # Set KEY to VALUE when .env has no value for it (absent or empty).
 # `--allow-empty` keeps a present-but-empty line: CONTROL_SUBDOMAIN= is a
 # real choice (the control UI on the bare domain).
@@ -422,9 +485,7 @@ EOF
   fi
   env_set NOITE_IMAGE "$NOITE_IMAGE_REPO:$NOITE_VERSION"
 
-  if [[ -n "${NOITE_ADMIN_EMAIL:-}" ]]; then
-    env_set NOITE_ADMIN_EMAIL "$NOITE_ADMIN_EMAIL"
-  fi
+  choose_admin_email
   if [[ -n "${NOITE_EMAIL_WEBHOOK_URL:-}" ]]; then
     env_set NOITE_EMAIL_WEBHOOK_URL "$NOITE_EMAIL_WEBHOOK_URL"
   fi
@@ -532,8 +593,7 @@ ${GREEN}${BOLD}Noite is running.${RESET}
   Git          https://git.$DOMAIN/<slug>
   Apps         https://<slug>.$DOMAIN
 
-${YELLOW}${BOLD}Register now.${RESET} The first account to sign up becomes the admin and needs
-no invite code: open https://app.$DOMAIN before anyone else can.
+$(first_run_note)
 
 ${YELLOW}${BOLD}Telemetry.${RESET} On by default: once a day this install sends Noite's maintainers
 an anonymous, count-only summary (version, platform, apps, deploys, users) — no
@@ -552,15 +612,46 @@ https://app.$DOMAIN/account, or set NOITE_TELEMETRY=0 in $NOITE_DIR/.env and run
 EOF
 }
 
+# What the operator must do to claim the first admin account: register as the
+# reserved address, or present the one-time setup code (minted here so the
+# summary always shows the current one). Localhost keeps no gate at all.
+first_run_note() {
+  local email
+  email=$(env_get NOITE_ADMIN_EMAIL)
+  case "$DOMAIN" in
+  localhost | *.localhost)
+    printf '%s' "${YELLOW}${BOLD}Register now.${RESET} The first account to sign up becomes the admin and needs no code."
+
+    return 0
+    ;;
+  esac
+  if [[ -n "$email" ]]; then
+    printf '%s' "${YELLOW}${BOLD}Register as ${email} now.${RESET} Only that address can claim the admin account: open https://app.$DOMAIN and sign up with it before anyone else can."
+
+    return 0
+  fi
+  local code_out
+  if code_out=$(compose exec -T noite noite-runner setup-code 2>/dev/null); then
+    printf '%s\n%s' "${YELLOW}${BOLD}First admin: a setup code is required.${RESET} No admin email was set, so the first account must present this one-time code:" "$code_out"
+  else
+    printf '%s' "${YELLOW}${BOLD}First admin: a setup code is required.${RESET} Mint one on the server with: cd $NOITE_DIR && docker compose$(compose_hint) exec noite noite-runner setup-code"
+  fi
+}
+
 # `run.sh` passes through whatever follows `install` (it consumes --pre
-# itself, as NOITE_REF + NOITE_VERSION); only --yes is defined here.
+# itself, as NOITE_REF + NOITE_VERSION); `--yes` and `--admin-email` are
+# defined here.
 parse_args() {
-  local arg
-  for arg in "$@"; do
-    case "$arg" in
-      --yes | -y) CONFIRM_SKIP=1 ;;
-      "") ;;
-      *) warn "ignoring unknown argument \"$arg\" (only --yes is understood)" ;;
+  while (($#)); do
+    case "$1" in
+      --yes | -y) CONFIRM_SKIP=1; shift ;;
+      --admin-email)
+        [[ -n "${2:-}" ]] || die "--admin-email needs an address"
+        NOITE_ADMIN_EMAIL="$2"; shift 2 ;;
+      --admin-email=*)
+        NOITE_ADMIN_EMAIL="${1#--admin-email=}"; shift ;;
+      "") shift ;;
+      *) warn "ignoring unknown argument \"$1\" (only --yes and --admin-email are understood)"; shift ;;
     esac
   done
 }
@@ -577,4 +668,9 @@ main() {
   summary
 }
 
-main "$@"
+# Sourcing (the bun test suite) defines the functions without running the
+# install; executing runs it. Nothing runs before main on the last line, so
+# a truncated download never runs half an install.
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+  main "$@"
+fi

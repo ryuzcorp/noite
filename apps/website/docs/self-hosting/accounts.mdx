@@ -3,15 +3,15 @@ title: Accounts
 description: Invite-only registration on a Noite install — bootstrap admin, single-use codes, and admin panels.
 ---
 
-Registration is invite-only once the instance is bootstrapped. The **first** account to sign up needs no code and is promoted to the `admin` role, so the admin home works without `NOITE_ADMIN_EMAIL`; every later registration must present a single-use invitation code. Each new account receives `INVITES_PER_USER = 2` codes of its own, so an invitee can pass one on without admin rights.
+Registration is invite-only once the instance is bootstrapped. The **first** account bootstraps it, and on a public base it must prove it is the operator: with `NOITE_ADMIN_EMAIL` set, only that address may register first and it is promoted to the `admin` role; without it, the first registration must present the one-time setup code printed at boot (see [Install](/self-hosting/install)). On a `localhost`-family base the first account needs no proof and just becomes admin. Every later registration must present a single-use invitation code. Each new account receives `INVITES_PER_USER = 2` codes of its own, so an invitee can pass one on without admin rights.
 
-Codes are 12 characters in four-char groups (`ABCD-EFGH-JKLM`) drawn from an unambiguous alphabet, and a code that is used, revoked or unknown is refused with a specific message before any account is created. Redemption is a single atomic claim (`UPDATE ... WHERE usedBy IS NULL`), so one code admits exactly one account even under concurrent signups.
+Setup codes are 20 characters in four-char groups (`ABCD-EFGH-JKLM-NPQR-STUV`) drawn from an unambiguous alphabet (2^100 codes); only the SHA-256 hash is stored, a code works once, and the claim spends it atomically with the admin grant, so one code admits exactly one account even under concurrent signups. A lost code is reissued on the server (`docker compose exec noite noite-runner setup-code` — the old code dies). Invitation codes are 12 characters in four-char groups (`ABCD-EFGH-JKLM`) from the same alphabet, and a code that is used, revoked or unknown is refused with a specific message before any account is created. Redemption is a single atomic claim (`UPDATE ... WHERE usedBy IS NULL`), so one code admits exactly one account even under concurrent signups.
 
 - Members read their unused codes in the "Invitations" card on `/account`.
 - Admins mint 1–50 more and revoke unused ones from the Invites tab of the admin home (the control app's detail page at `/apps/_control`).
-- The signup form shows the code field only when `GET /api/invite/status` reports the instance is past its first account, so the bootstrap account never sees it.
+- The signup form shows the setup-code field on a fresh public install without `NOITE_ADMIN_EMAIL`, the invitation-code field only when `GET /api/invite/status` reports the instance is past its first account.
 
-`NOITE_ADMIN_EMAIL` promotes the matching account to the admin role at startup; it is documented in [Environment variables](/reference/environment-variables).
+`NOITE_ADMIN_EMAIL` reserves the first account (and promotes the matching account to the admin role at startup); it is documented in [Environment variables](/reference/environment-variables).
 
 ## First-run onboarding
 

@@ -1,9 +1,11 @@
 import { Data } from "effect";
 import { eq, sql } from "void/db";
 
-import { inviteTable, userTable } from "../../db/schema";
+import { inviteTable } from "../../db/schema";
 import type { InviteLifecycleWire } from "../api-types";
-import { getDb, withDb } from "../db";
+import { getDb, resolveEnv, withDb } from "../db";
+import { countUsersAndAdmins, setupModeOf } from "./setup-code.server";
+import type { SetupMode } from "./setup-code.server";
 
 /** Share-able codes every new account receives once it has redeemed one. */
 export const INVITES_PER_USER = 2;
@@ -47,24 +49,34 @@ export const normalizeInviteCode = (raw: string): string => {
   return groups.join("-");
 };
 
-/** Public signup policy: the very first account bootstraps the instance, so
- * it needs no code; every later one does. `firstRun` is a fast read, not an
- * arbitration point — the bootstrap claim (`claimBootstrapAdmin`) is. */
+/** Public signup policy: the very first account bootstraps the instance. On
+ * a `localhost`-family base it needs no code (dev and e2e); on a public
+ * base with no admin yet, `setupMode` names the proof the first
+ * registration must present (the `NOITE_ADMIN_EMAIL` address, or the
+ * one-time setup code). `firstRun` and `adminExists` are fast reads, not
+ * arbitration points — the bootstrap claim is. */
 export const signupPolicy = async (): Promise<{
+  adminExists: boolean;
   firstRun: boolean;
   invitesPerUser: number;
   requiresInvite: boolean;
+  setupMode: SetupMode;
 }> => {
-  const first = await withDb(() =>
-    getDb().get<{ n: number }>(sql`SELECT count(*) AS n FROM "user"`)
-  );
+  const { admins, users } = await countUsersAndAdmins();
 
-  const firstRun = Number(first?.n ?? 0) === 0;
+  const firstRun = users === 0;
+  const adminExists = admins > 0;
 
   return {
+    adminExists,
     firstRun,
     invitesPerUser: INVITES_PER_USER,
     requiresInvite: !firstRun,
+    setupMode: setupModeOf({
+      adminEmail: resolveEnv().NOITE_ADMIN_EMAIL?.trim().toLowerCase() || null,
+      adminExists,
+      baseDomain: resolveEnv().BASE_DOMAIN,
+    }),
   };
 };
 
@@ -292,41 +304,12 @@ export const revokeInvite = async (id: string): Promise<RevokeOutcome> => {
     : RevokeResult.Refused({ reason: "used" });
 };
 
-/** Which account the bootstrap slot belongs to. `firstRun` is only a hint:
- * two concurrent first registrations both read an empty table, so the claim
- * below is what decides which of them owns the instance. */
-export type BootstrapClaim = Data.TaggedEnum<{
-  Claimed: Record<never, never>;
-  Lost: Record<never, never>;
-}>;
+/** The bootstrap admin claim lives in `setup-code.server` (the proof the
+ * first registration presents and the claim arbitrate in one place);
+ * re-exported here so existing importers keep working. */
+export { Bootstrap, claimBootstrapAdmin } from "./setup-code.server";
 
-export const Bootstrap = Data.taggedEnum<BootstrapClaim>();
-
-/** Claim the instance's bootstrap admin slot for `userId`.
- *
- * One conditional UPDATE: the role is only written while no other account
- * holds `admin`, so of two registrations that both saw `firstRun`, exactly
- * one becomes the admin. The re-read reports which one this account is (an
- * account that a previous run already promoted also reads as `Claimed`).
- * No schema change: the `user.role` column is the claim's cell. */
-export const claimBootstrapAdmin = (userId: string): Promise<BootstrapClaim> =>
-  withDb(async () => {
-    const db = getDb();
-
-    await db.run(sql`
-      UPDATE "user" SET role = 'admin'
-       WHERE id = ${userId}
-         AND NOT EXISTS (SELECT 1 FROM "user" WHERE role = 'admin')
-    `);
-
-    const rows = await db
-      .select({ role: userTable.role })
-      .from(userTable)
-      .where(eq(userTable.id, userId))
-      .limit(1);
-
-    return rows[0]?.role === "admin" ? Bootstrap.Claimed() : Bootstrap.Lost();
-  });
+export type { BootstrapClaim } from "./setup-code.server";
 
 export interface InviteView {
   code: string;

@@ -13,9 +13,9 @@ curl -fsSL https://noite.now/run.sh | bash -s install
 
 It elevates itself with `sudo` (no `sudo` in front: piped into `sudo bash`, the script runs in the background and cannot ask anything). It installs Docker Engine and the Compose plugin when missing, asks for the base domain, and writes `/opt/noite/compose.yaml` (option A, from `main`), `/opt/noite/compose.multi.yaml` (the multi-tenant cgroup grant, applied only when `.env` says `NOITE_TENANCY=multi`) and `/opt/noite/.env` with generated secrets, `CONTROL_SUBDOMAIN=app` and the edge on 80/443. On a host under 4 GB with no swap it also creates a `/noite.swap` swapfile (1–2 GB, `vm.swappiness=10`) as a safety net so one transient peak cannot OOM-kill RustFS or Caddy and as the build leaf's bounded overflow (`RUNNER_BUILD_SWAP_MB`): a build larger than the box's spare RAM swaps the difference and finishes instead of dying at its cap, while fleets keep zero swap. Set `NOITE_SWAP=0` to leave the host's swap alone; the uninstaller removes the file. It then opens 80/443 in `ufw` when it is active, starts the stack and waits for `/ready`. Press Enter for the default `<public-ip>.sslip.io`, which needs no DNS and is enough to try Noite out; with no terminal to ask on, it uses that default. For a real domain, point `app.`, `api.`, `git.` and `*.<domain>` at the server first.
 
-:::warning
-Register right away: the first account becomes the admin without an invite code.
-:::
+::::warning
+First admin is proof-gated: the installer asks for the admin email, and only that address may claim the admin account. Without it, the first run prints a one-time setup code (and the end of the install repeats it) that the first registration must present. Register before anyone else can — the hostname appears in certificate-transparency logs at first issuance.
+::::
 
 Re-running the script is the upgrade: it refreshes `compose.yaml`, keeps `.env` (the domain and secrets never change after the first install, since passkeys bind to `BETTER_AUTH_URL`), pulls and recreates. A setting the runner needs that `.env` lacks, or still holds at a dev default (`BASE_DOMAIN`, `CONTROL_SUBDOMAIN`, `BETTER_AUTH_URL`, `GIT_PUBLIC_BASE`, the ports, `RUNNER_TOKEN`, `BETTER_AUTH_SECRET`, the RustFS keys), gets the first-install default instead of a refused boot, and the script lists what it added. A value that is set is never touched; a `noite.localhost` `.env` is left alone. When the pulled image differs from the running container it says so and asks once before recreating — replacing it restarts the runner and every tenant fleet, which cold-boot in a few seconds (see the [downtime model](/self-hosting/operations#updating)) — and a fresh install or a re-run of the same image asks nothing. `--yes` (or `NOITE_YES=1` / `NOITE_CONFIRM=1`) skips the prompt; without a terminal it warns and continues. Inputs are environment variables, set on `bash`, not on `curl`: `curl … | NOITE_DOMAIN=example.com bash -s install` (a variable in front of `curl` only reaches `curl`).
 
@@ -23,7 +23,7 @@ Re-running the script is the upgrade: it refreshes `compose.yaml`, keeps `.env` 
 | --- | --- | --- |
 | `NOITE_DOMAIN` | asked, else `<ip>.sslip.io` | `BASE_DOMAIN` on first install |
 | `NOITE_VERSION` | `alpha` | release channel or version; see [Releases and channels](/self-hosting/operations#releases-and-channels) |
-| `NOITE_ADMIN_EMAIL` | none | account promoted to admin at boot |
+| `NOITE_ADMIN_EMAIL` | asked (Enter = setup code) | only this address may claim the first admin account; kept on re-runs (`--admin-email` sets it for scripted installs) |
 | `NOITE_EMAIL_WEBHOOK_URL` | none | receives lost-passkey sign-in codes; without it, [recover from the server](/self-hosting/accounts#lost-passkey) |
 | `NOITE_TELEMETRY` | unset = on | `0`, `false` or `off` turns off the anonymous daily heartbeat; written to `.env` ([Telemetry](/self-hosting/telemetry)) |
 | `NOITE_UPDATE_CHECK` | unset = on | `0`, `false` or `off` turns off the daily release check; written to `.env` ([Updating](/self-hosting/operations#updating)) |
@@ -103,7 +103,7 @@ RUSTFS_SECRET_KEY=<openssl rand -hex 24>
 Set `BETTER_AUTH_URL` to the final URL **before** anyone registers — passkeys are bound to it.
 :::
 
-Open `https://app.<domain>` and create the owner account (first signup), then deploy an app as in the [Quickstart](/quickstart).
+Open `https://app.<domain>` and create the owner account (first signup): with `NOITE_ADMIN_EMAIL` set, sign up as that address; without it, enter the one-time setup code from the runner logs (`docker compose logs noite | grep "FIRST ADMIN"`). Then deploy an app as in the [Quickstart](/quickstart). `noite.localhost` trials skip the proof entirely: the first account just becomes admin.
 
 Other variables worth setting: `NOITE_S3_BUCKET`, `NOITE_ADMIN_EMAIL`, `NOITE_EMAIL_WEBHOOK_URL` (without it a lost passkey is recovered [from the server](/self-hosting/accounts#lost-passkey)), `NOITE_SMTP_FROM`, `CONTROL_EXTRA_HOSTS` (extra hostnames serving the control UI), `CADDY_AUTO_HTTPS`, `NOITE_TENANCY` (see [Tenancy](/self-hosting/tenancy)). Full detail for every variable lives in [Environment variables](/reference/environment-variables).
 

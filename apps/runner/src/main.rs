@@ -17,6 +17,7 @@ mod models;
 mod recover;
 mod schema_version;
 mod service;
+mod setup_code;
 mod telemetry;
 #[cfg(test)]
 mod testutil;
@@ -162,6 +163,10 @@ async fn main() -> anyhow::Result<()> {
     if argv.first().map(String::as_str) == Some("recover") {
         let config = Config::from_env()?;
         return recover::run(&config, &argv[1..]).await;
+    }
+    if argv.first().map(String::as_str) == Some("setup-code") {
+        let config = Config::from_env()?;
+        return setup_code::run(&config, &argv[1..]).await;
     }
     if argv.first().map(String::as_str) == Some("telemetry") {
         let config = Config::from_env()?;
@@ -729,6 +734,28 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
             tracing::info!(ms = boot.elapsed().as_millis(), "control bundle ready");
+            // First-run proof (audit N-3): on a public base with no admin
+            // yet, make sure the one-time setup code exists and print it —
+            // the operator's only copy until they register. Never rotates
+            // (a restart must not kill a printed code), never fails the
+            // boot: the lazy issue on the signup-policy route covers a miss.
+            // Localhost keeps today's behaviour (no code at all).
+            if !crate::config::is_localhost_domain(&config.base_domain) {
+                match setup_code::ensure_at_boot(&config).await {
+                    setup_code::SetupStatus::Generated(code) => {
+                        tracing::warn!("{}", setup_code::generated_banner(&code));
+                    }
+                    setup_code::SetupStatus::Pending => {
+                        tracing::info!(
+                            "first admin pending: the setup code is in the control log; `noite-runner setup-code` prints a fresh one"
+                        );
+                    }
+                    setup_code::SetupStatus::Claimed => {}
+                    setup_code::SetupStatus::Unreachable(reason) => {
+                        tracing::warn!(error = %reason, "setup code not ensured at boot; the signup page issues it lazily");
+                    }
+                }
+            }
             Some(child)
         }
     } else {

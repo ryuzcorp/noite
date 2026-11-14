@@ -224,6 +224,7 @@ describe("control migrations", () => {
       "account",
       "apikey",
       "app_collaborator",
+      "bootstrap_setup",
       "collaborator_invite",
       "invite",
       "passkey",
