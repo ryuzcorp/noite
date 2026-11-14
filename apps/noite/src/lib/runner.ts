@@ -198,20 +198,6 @@ export const RUNNER_DEFAULT_URL = "http://127.0.0.1:8080";
 const runnerBase = () =>
   (readEnv().RUNNER_URL ?? RUNNER_DEFAULT_URL).replace(/\/$/u, "");
 
-/** Stamp the platform env for runner calls made outside an endpoint handler.
- * The middleware stamps every request, so a plain route handler —
- * `/internal/git-auth`, the SSE pollers — otherwise sees the
- * localhost-family dev defaults and misses the real RUNNER_URL/RUNNER_TOKEN. */
-export const stampRunnerEnv = (env: KitEnv): void => {
-  for (const key of ["RUNNER_TOKEN", "RUNNER_URL"] as const) {
-    const value = env[key];
-
-    if (value) {
-      controlEnv[key] = value;
-    }
-  }
-};
-
 const runnerToken = () => {
   const token = readEnv().RUNNER_TOKEN ?? "";
 

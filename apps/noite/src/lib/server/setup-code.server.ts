@@ -2,6 +2,7 @@ import { Data } from "effect";
 import { eq, sql } from "void/db";
 
 import { bootstrapSetupTable, userTable } from "../../db/schema";
+import { controlBaseDomain } from "../control-env";
 import { getDb, resolveEnv, withDb } from "../db";
 import { errorLogText } from "../errors";
 import { isLocalhostDomain } from "../local-host";
@@ -45,13 +46,15 @@ const SETUP_ID = "setup";
 export type SetupMode = "off" | "email" | "code";
 
 /** Pure constructor: no admin (or localhost) needs nothing, the anchor
- * reserves the slot by address, otherwise the setup code is required. */
+ * reserves the slot by address, otherwise the setup code is required. The
+ * base arrives as a plain string — never defaulted to localhost here: an
+ * empty base (misconfigured deploy) fails closed to the strict modes. */
 export const setupModeOf = (input: {
   adminEmail: string | null;
   adminExists: boolean;
-  baseDomain: string | undefined;
+  baseDomain: string;
 }): SetupMode => {
-  if (input.adminExists || isLocalhostDomain(input.baseDomain ?? "localhost")) {
+  if (input.adminExists || isLocalhostDomain(input.baseDomain)) {
     return "off";
   }
 
@@ -204,7 +207,7 @@ export const bootstrapPolicy = async (): Promise<BootstrapPolicy> => {
     setupMode: setupModeOf({
       adminEmail: resolveAnchorEmail(),
       adminExists,
-      baseDomain: resolveEnv().BASE_DOMAIN,
+      baseDomain: controlBaseDomain(),
     }),
   };
 };

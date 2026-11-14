@@ -439,6 +439,9 @@ describe("code bootstrap", () => {
 
 describe("localhost keeps today's behaviour", () => {
   test("anyone is admitted without a code, first account wins", async () => {
+    // The dev platform provides the base (void.config.ts vars); without it
+    // the gate fails closed, so the test states it explicitly.
+    controlEnv.BASE_DOMAIN = "noite.localhost";
     const policy = await signupPolicy();
 
     expect(policy).toEqual({
@@ -460,6 +463,7 @@ describe("localhost keeps today's behaviour", () => {
   });
 
   test("an anchor address does not gate a localhost base", async () => {
+    controlEnv.BASE_DOMAIN = "noite.localhost";
     controlEnv.NOITE_ADMIN_EMAIL = "op@example.com";
     const policy = await signupPolicy();
 
