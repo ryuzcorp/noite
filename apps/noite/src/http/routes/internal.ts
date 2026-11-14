@@ -18,6 +18,10 @@ import {
   findRecoveryEmail,
   RECOVERY_CODE_TTL_SECONDS,
 } from "../../lib/server/recovery.server";
+import {
+  ensureSetupCode,
+  rotateSetupCode,
+} from "../../lib/server/setup-code.server";
 import { countControlUsers } from "../../lib/server/telemetry.server";
 import { MAX_BODY_BYTES, readBoundedText, tooLarge } from "../body";
 import { runnerConfig, runnerTokenOk } from "../config";
@@ -453,5 +457,84 @@ export const handleTelemetryFacts: RouteHandler = async (request, env) => {
     console.error("[telemetry-facts]", errorLogText(error));
 
     return Response.json({ error: "user count unavailable" }, { status: 500 });
+  }
+};
+
+const SetupCodeBody = Schema.Struct({ mode: Schema.optional(Schema.String) });
+
+/** Operator channel (`noite-runner setup-code`, the installer): issue or
+ * reissue the first-admin setup code over loopback. The caller must hold the
+ * runner token — whoever can run a command in the container. `ensure` mints
+ * only when no pending code exists; `rotate` always mints a fresh one (the
+ * old code dies). The plaintext travels only here, never in a
+ * browser-reachable response: past the first admin this answers `claimed`.
+ * `cache-control: no-store`, like every code-bearing answer. */
+export const handleSetupCode: RouteHandler = async (request, env) => {
+  if (!runnerTokenOk(request, env)) {
+    return new Response("unauthorized", { status: 401 });
+  }
+
+  const text = await readBoundedText(request, MAX_BODY_BYTES);
+
+  if (text === null) {
+    return tooLarge();
+  }
+
+  let raw: unknown;
+
+  try {
+    raw = text.trim() ? JSON.parse(text) : {};
+  } catch {
+    return Response.json({ error: "invalid json", ok: false }, { status: 400 });
+  }
+
+  const decoded = Schema.decodeUnknownResult(SetupCodeBody)(raw);
+
+  if (decoded._tag === "Failure") {
+    return Response.json(
+      { error: "mode must be a string", ok: false },
+      { status: 400 }
+    );
+  }
+
+  const mode = decoded.success.mode ?? "ensure";
+
+  if (mode !== "ensure" && mode !== "rotate") {
+    return Response.json(
+      { error: 'mode must be "ensure" or "rotate"', ok: false },
+      { status: 400 }
+    );
+  }
+
+  try {
+    await ensureDb();
+
+    const result =
+      mode === "rotate" ? await rotateSetupCode() : await ensureSetupCode();
+
+    switch (result._tag) {
+      case "Claimed": {
+        return Response.json(
+          { ok: true, status: "claimed" },
+          { headers: { "cache-control": "no-store" } }
+        );
+      }
+
+      case "Pending": {
+        return Response.json(
+          { ok: true, status: "pending" },
+          { headers: { "cache-control": "no-store" } }
+        );
+      }
+
+      default: {
+        return Response.json(
+          { code: result.code, ok: true, status: "generated" },
+          { headers: { "cache-control": "no-store" } }
+        );
+      }
+    }
+  } catch (error) {
+    return routeFailure("[setup-code]", error);
   }
 };

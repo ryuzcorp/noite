@@ -22,13 +22,18 @@ import { fail } from "./server/api";
 import { revokeApiKeysForUser } from "./server/api-keys.server";
 import {
   checkInvite,
-  claimBootstrapAdmin,
   consumeInvite,
   INVITES_PER_USER,
   mintInvites,
   signupPolicy,
 } from "./server/invites.server";
 import type { InviteProblem } from "./server/invites.server";
+import {
+  checkFirstAdminProof,
+  claimFirstAdminSlot,
+  firstAdminErrorCode,
+  firstAdminProblemMessage,
+} from "./server/setup-code.server";
 
 // oxlint-disable-next-line unicorn/throw-new-error -- Schema.TaggedError factory
 export class MissingAuthSecretError extends Schema.TaggedError<MissingAuthSecretError>()(
@@ -58,6 +63,7 @@ const RegistrationContext = Schema.Struct({
   email: Schema.String,
   invite: Schema.optional(Schema.String),
   name: Schema.String,
+  setupCode: Schema.optional(Schema.String),
 });
 
 const parseRegistration = (context: string | null | undefined) =>
@@ -108,7 +114,12 @@ const parseRegistration = (context: string | null | undefined) =>
       );
     }
 
-    return { email, invite: decoded.invite?.trim() || undefined, name };
+    return {
+      email,
+      invite: decoded.invite?.trim() || undefined,
+      name,
+      setupCode: decoded.setupCode?.trim() || undefined,
+    };
   });
 
 /** User-facing reason a code was refused. The panel shows this verbatim. */
@@ -474,14 +485,30 @@ export const createAuth = (env: KitEnv, baseURL: string) =>
               });
             }
 
-            // Invite-only: the first account bootstraps the instance (it owns
-            // it, so it also becomes the admin), every later one needs a code.
-            // `firstRun` is only a hint: two concurrent first registrations
-            // both read an empty table, and the conditional claim below is
-            // what decides which of them owns the instance.
+            // Bootstrap first, invites after: while no admin exists the first
+            // registration must prove it is the operator (the reserved admin
+            // address, or the one-time setup code on a public base without
+            // one — audit N-3), and the conditional claim below is what
+            // decides which of two concurrent first registrations owns the
+            // instance. Past bootstrap the invite gate applies as before.
             const policy = await signupPolicy();
 
-            if (!policy.firstRun) {
+            if (!policy.adminExists) {
+              // Refuse strangers before an account is created, so no user
+              // row is left behind for a refused registration.
+              const proof = await checkFirstAdminProof(
+                parsed.email,
+                parsed.setupCode,
+                policy
+              );
+
+              if (proof._tag === "Refused") {
+                throw APIError.from("FORBIDDEN", {
+                  code: firstAdminErrorCode(proof.reason),
+                  message: firstAdminProblemMessage(proof.reason),
+                });
+              }
+            } else if (!policy.firstRun) {
               const problem = await checkInvite(parsed.invite);
 
               if (problem) {
@@ -501,14 +528,17 @@ export const createAuth = (env: KitEnv, baseURL: string) =>
               { method: "passkey" }
             );
 
-            if (policy.firstRun) {
-              // One account wins the bootstrap slot (the `role` cell is the
-              // claim, no schema change); the loser is an ordinary account
-              // that skipped the invite gate by racing the first one, so it
-              // is dropped and refused instead of admitted.
-              const claim = await claimBootstrapAdmin(user.id);
+            if (!policy.adminExists) {
+              // Exactly one of two concurrent first registrations wins the
+              // admin slot; the loser is dropped and refused instead of
+              // admitted, and the winner spends the setup code.
+              const verdict = await claimFirstAdminSlot(
+                user.id,
+                parsed.setupCode,
+                policy
+              );
 
-              if (claim._tag === "Lost") {
+              if (verdict._tag === "Refused") {
                 try {
                   await ctx.context.internalAdapter.deleteUser(user.id);
                 } catch {
@@ -516,8 +546,8 @@ export const createAuth = (env: KitEnv, baseURL: string) =>
                 }
 
                 throw APIError.from("FORBIDDEN", {
-                  code: "INVITE_REQUIRED",
-                  message: inviteProblemMessage("missing"),
+                  code: firstAdminErrorCode(verdict.reason),
+                  message: firstAdminProblemMessage(verdict.reason),
                 });
               }
             } else if (parsed.invite) {

@@ -5,7 +5,7 @@
 //! ```mermaid
 //! stateDiagram-v2
 //!   [*] --> Policy: SSR paints the neutral panel, controls disabled
-//!   Policy --> Ready: PolicyLoaded(firstRun, requiresInvite)
+//!   Policy --> Ready: PolicyLoaded(firstRun, requiresInvite, setupMode)
 //!   Policy --> Policy: PolicyFailed(message), Retry re-asks
 //!   Ready --> Ready: Pick(register | signin)
 //!   Ready --> Busy: Register / SignIn (busy flag)
@@ -50,11 +50,13 @@ type Panel = Data.TaggedEnum<{
   Policy: Record<never, never>;
   /** Lost-passkey flow: ask for the address, then for the code. */
   Recovery: { readonly email: string; readonly step: "code" | "email" };
-  /** The policy landed; both tabs work. */
+  /** The policy landed; both tabs work. `setupMode` names the first-run
+   * proof (`off` once an admin exists or on localhost). */
   Ready: {
     readonly firstRun: boolean;
     readonly mode: Mode;
     readonly requiresInvite: boolean;
+    readonly setupMode: "off" | "email" | "code";
   };
 }>;
 
@@ -76,11 +78,13 @@ type Message = Data.TaggedEnum<{
   PolicyLoaded: {
     readonly firstRun: boolean;
     readonly requiresInvite: boolean;
+    readonly setupMode: "off" | "email" | "code";
   };
   Register: {
     readonly email: string;
     readonly invite: string;
     readonly name: string;
+    readonly setupCode: string;
   };
   Retry: Record<never, never>;
   SendOtp: { readonly email: string };
@@ -98,10 +102,25 @@ interface Model {
    * its controls stay disabled rather than swallowing a click. */
   readonly mounted: boolean;
   readonly panel: Panel;
+  /** The last loaded signup policy. Kept outside `panel` so leaving a
+   * sub-flow (the lost-passkey recovery cancels back to the form) restores
+   * the same proof fields instead of a blank default. */
+  readonly policy: PolicySnapshot | null;
 }
 
-const registrationContext = (email: string, name: string, invite: string) =>
-  JSON.stringify({ email, invite, name });
+/** The signup-policy slice the form branches on. */
+interface PolicySnapshot {
+  readonly firstRun: boolean;
+  readonly requiresInvite: boolean;
+  readonly setupMode: "off" | "email" | "code";
+}
+
+const registrationContext = (
+  email: string,
+  name: string,
+  invite: string,
+  setupCode: string
+) => JSON.stringify({ email, invite, name, setupCode });
 
 interface Intro {
   readonly body: string;
@@ -109,9 +128,25 @@ interface Intro {
 }
 
 /** Heading + one line under it, per form state. */
-const INTRO: Record<"firstRun" | "loading" | "register" | "signin", Intro> = {
+const INTRO: Record<
+  | "firstRun"
+  | "firstRunCode"
+  | "firstRunReserved"
+  | "loading"
+  | "register"
+  | "signin",
+  Intro
+> = {
   firstRun: {
     body: "You're the first one here, so this account becomes the admin.",
+    title: "Set up Noite",
+  },
+  firstRunCode: {
+    body: "You're the first one here. Enter the one-time setup code from the server logs — this account becomes the admin.",
+    title: "Set up Noite",
+  },
+  firstRunReserved: {
+    body: "This instance reserves its first account for the configured admin address. Register with that address and enter the one-time setup code from the server logs — it becomes the admin.",
     title: "Set up Noite",
   },
   loading: {
@@ -131,7 +166,19 @@ const INTRO: Record<"firstRun" | "loading" | "register" | "signin", Intro> = {
 const introOf = (panel: Panel): Intro => {
   if (panel._tag === "Ready") {
     if (panel.firstRun) {
-      return INTRO.firstRun;
+      switch (panel.setupMode) {
+        case "code": {
+          return INTRO.firstRunCode;
+        }
+
+        case "email": {
+          return INTRO.firstRunReserved;
+        }
+
+        default: {
+          return INTRO.firstRun;
+        }
+      }
     }
 
     return panel.mode === "register" ? INTRO.register : INTRO.signin;
@@ -208,6 +255,7 @@ const policyCmd: Effect.Effect<Message, never, never> = Effect.promise(
         : Msg.PolicyLoaded({
             firstRun: value.firstRun,
             requiresInvite: value.requiresInvite,
+            setupMode: value.setupMode,
           });
     } catch (error) {
       return Msg.PolicyFailed({ message: errorMessage(error) });
@@ -410,6 +458,11 @@ const RegisterForm = ({
 }) => {
   const ready = model.panel._tag === "Ready";
   const requiresInvite = ready && model.panel.requiresInvite;
+  const setupMode = ready ? model.panel.setupMode : "off";
+  // Email mode reserves the address *and* requires the code (knowing the
+  // address alone never suffices), so both modes show the code field.
+  const requiresSetupCode = setupMode === "code" || setupMode === "email";
+  const reservedForAdmin = setupMode === "email";
 
   return (
     <form
@@ -426,6 +479,7 @@ const RegisterForm = ({
         const email = text(data, "email");
         const name = text(data, "name");
         const invite = text(data, "invite");
+        const setupCode = text(data, "setupcode");
 
         if (!(email && name)) {
           dispatch(Msg.Failed({ message: "Name and email are required" }));
@@ -443,7 +497,18 @@ const RegisterForm = ({
           return;
         }
 
-        dispatch(Msg.Register({ email, invite, name }));
+        if (requiresSetupCode && !setupCode) {
+          dispatch(
+            Msg.Failed({
+              message:
+                "The one-time setup code from the server logs is required",
+            })
+          );
+
+          return;
+        }
+
+        dispatch(Msg.Register({ email, invite, name, setupCode }));
       }}
     >
       <fieldset class="fieldset p-0">
@@ -474,6 +539,32 @@ const RegisterForm = ({
         />
         <p class="validator-hint hidden">Enter a valid email address</p>
       </fieldset>
+      {requiresSetupCode ? (
+        <fieldset class="fieldset p-0">
+          <label class="label" for="register-setupcode">
+            Setup code
+          </label>
+          <input
+            id="register-setupcode"
+            name="setupcode"
+            class="input w-full font-mono"
+            placeholder="XXXX-XXXX-XXXX-XXXX-XXXX"
+            autocomplete="off"
+            spellcheck={false}
+            required
+          />
+          <p class="label whitespace-normal">
+            One-time code from the server logs, printed when the instance first
+            booted. It works once — keep it private.
+          </p>
+        </fieldset>
+      ) : null}
+      {reservedForAdmin ? (
+        <p class="alert text-sm whitespace-normal">
+          This instance reserves its first account for the configured admin
+          address. Register with that address.
+        </p>
+      ) : null}
       {requiresInvite ? (
         <fieldset class="fieldset p-0">
           <label class="label" for="register-invite">
@@ -600,11 +691,24 @@ const CredentialsForm = ({
   );
 };
 
-/** Back to the sign-in tab from anywhere (recovery cancels to here). */
-const baseSignin = (panel: Panel): Panel =>
-  isReady(panel)
-    ? { ...panel, mode: "signin" }
-    : Panels.Ready({ firstRun: false, mode: "signin", requiresInvite: true });
+/** Back to the sign-in tab from anywhere (recovery cancels to here). The
+ * loaded policy comes along: a recovery cancel must not reset the proof
+ * fields to a blank default. */
+const baseSignin = (panel: Panel, policy: PolicySnapshot | null): Panel => {
+  if (isReady(panel)) {
+    return { ...panel, mode: "signin" };
+  }
+
+  const fallback: PolicySnapshot = {
+    firstRun: false,
+    requiresInvite: true,
+    setupMode: "off",
+  };
+
+  const restored = policy ?? fallback;
+
+  return Panels.Ready({ ...restored, mode: "signin" });
+};
 
 export const LoginPanelApp = defineApp({
   init: () => ({
@@ -614,6 +718,7 @@ export const LoginPanelApp = defineApp({
       error: "",
       mounted: false,
       panel: Panels.Policy(),
+      policy: null,
     },
   }),
   name: "LoginPanel",
@@ -628,14 +733,20 @@ export const LoginPanelApp = defineApp({
       }
 
       case "PolicyLoaded": {
+        const policy: PolicySnapshot = {
+          firstRun: message.firstRun,
+          requiresInvite: message.requiresInvite,
+          setupMode: message.setupMode,
+        };
+
         return {
           model: {
             ...model,
             panel: Panels.Ready({
-              firstRun: message.firstRun,
+              ...policy,
               mode: message.firstRun ? "register" : "signin",
-              requiresInvite: message.requiresInvite,
             }),
+            policy,
           },
         };
       }
@@ -681,7 +792,7 @@ export const LoginPanelApp = defineApp({
             ...model,
             busy: false,
             error: "",
-            panel: baseSignin(model.panel),
+            panel: baseSignin(model.panel, model.policy),
           },
         };
       }
@@ -720,7 +831,8 @@ export const LoginPanelApp = defineApp({
                 context: registrationContext(
                   message.email,
                   message.name,
-                  message.invite
+                  message.invite,
+                  message.setupCode
                 ),
                 createSession: true,
                 name: "Primary",

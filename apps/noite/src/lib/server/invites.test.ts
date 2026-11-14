@@ -55,10 +55,12 @@ describe("signup policy", () => {
   test("the first account bootstraps the instance; later ones need a code", async () => {
     const before = await signupPolicy();
     expect(before.firstRun).toBe(true);
+    expect(before.adminExists).toBe(false);
     addUser("first");
     const policy = await signupPolicy();
     expect(policy.firstRun).toBe(false);
     expect(policy.requiresInvite).toBe(true);
+    expect(policy.adminExists).toBe(false);
   });
 });
 

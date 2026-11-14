@@ -385,24 +385,37 @@ export const passkeys = () =>
   });
 
 /** Public policy from `/api/invite/status` (first account bootstraps). */
+export interface SignupPolicy {
+  readonly adminExists: boolean;
+  readonly firstRun: boolean;
+  readonly invitesPerUser: number;
+  readonly requiresInvite: boolean;
+  /** Which proof the first registration must present; `off` once an admin
+   * exists or on a `localhost` base. `email` needs the reserved address
+   * *and* the setup code. Never the code or address itself. */
+  readonly setupMode: "off" | "email" | "code";
+}
+
 export const signupPolicy = () =>
-  tracked(keys.signupPolicy, async () => {
+  tracked(keys.signupPolicy, async (): Promise<SignupPolicy> => {
     try {
       const res = await fetch("/api/invite/status");
 
       if (res.ok) {
         // SAFETY: the route answers exactly this shape (see handleInviteStatus).
-        return (await res.json()) as {
-          firstRun: boolean;
-          invitesPerUser: number;
-          requiresInvite: boolean;
-        };
+        return (await res.json()) as SignupPolicy;
       }
     } catch {
       // Fall through to the stricter default below.
     }
 
-    return { firstRun: false, invitesPerUser: 0, requiresInvite: true };
+    return {
+      adminExists: true,
+      firstRun: false,
+      invitesPerUser: 0,
+      requiresInvite: true,
+      setupMode: "off",
+    };
   });
 
 /** Tables + row counts of one D1 database (left sidebar). */

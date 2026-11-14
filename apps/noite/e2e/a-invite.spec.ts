@@ -19,20 +19,27 @@ test("the signup policy flips to invite-only after the first account", async ({
 
   // SAFETY: the route answers exactly this shape (see handleInviteStatus).
   const policy = (await res.json()) as {
+    adminExists: boolean;
     firstRun: boolean;
     invitesPerUser: number;
     requiresInvite: boolean;
+    setupMode: string;
   };
 
   // The bootstrap account exists, so registration is no longer open.
   expect(policy.firstRun).toBe(false);
   expect(policy.requiresInvite).toBe(true);
+  // The first account became the admin, so the first-admin gate is closed.
+  expect(policy.adminExists).toBe(true);
+  expect(policy.setupMode).toBe("off");
   // Each admitted account can pass the flow on.
   expect(policy.invitesPerUser).toBe(2);
-  // The payload carries no account data.
+  // The payload carries no account data and never the setup code.
   expect(Object.keys(policy).toSorted()).toEqual([
+    "adminExists",
     "firstRun",
     "invitesPerUser",
     "requiresInvite",
+    "setupMode",
   ]);
 });

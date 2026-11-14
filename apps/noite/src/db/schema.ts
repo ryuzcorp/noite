@@ -212,10 +212,24 @@ export const inviteTable = sqliteTable(
   ]
 );
 
+/** The first-admin setup code: one singleton row (`id = 'setup'`), the
+ * plaintext code's SHA-256 hash only. The plaintext exists once — at
+ * generation, when the runner prints it — so a database reader can never
+ * recover the current code. `consumedBy`/`consumedAt` mark the single use;
+ * rotation replaces the row (the old code dies with its hash). */
+export const bootstrapSetupTable = sqliteTable("bootstrap_setup", {
+  codeHash: text("codeHash").notNull(),
+  consumedAt: text("consumedAt"),
+  consumedBy: text("consumedBy"),
+  createdAt: timestamp("createdAt"),
+  id: text("id").primaryKey(),
+});
+
 export const schema = {
   account: accountTable,
   apikey: apikeyTable,
   app_collaborator: appCollaboratorTable,
+  bootstrap_setup: bootstrapSetupTable,
   collaborator_invite: collaboratorInviteTable,
   invite: inviteTable,
   passkey: passkeyTable,
