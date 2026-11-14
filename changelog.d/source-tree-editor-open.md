@@ -1,3 +1,0 @@
-### Fixed
-
-- **New File in the source tree no longer paints `Internal error (HTTP 500)` over the file it just opened.** The tree parks an `untitled` placeholder row for pierre's inline name input, and a selection event for that row (delivered when the row is added, or late from a tree a rebuild replaced) was turned into a blob read of a path no commit holds. The runner answered 404 and the pane painted the failure — sometimes after the real file had opened, so the editor never mounted. `lib/source/browser.tsx` now opens only a path the session holds (a committed file, a buffer, or a move's destination); a placeholder row is refused instead of read.
