@@ -20,17 +20,17 @@ use crate::host::exec::work_root;
 /// Classification never scans free text: the target key rides inside every
 /// message, so a `"NoSuchKey"`/`"NotFound"` substring match reads a 5xx or a
 /// transport failure on a key named `NotFound...` as "missing". Instead
-/// [`s3_err_msg`] attaches an [`S3NotFound`] marker when the store answered
-/// 404 / `<Code>NoSuchKey</Code>`, and this matches that marker by downcast.
-/// A `<Code>NoSuchBucket</Code>` body is a configuration error (wrong
-/// bucket), never "missing": reading it as absent would start fresh and
-/// upload an empty database over the good snapshot.
+/// [`s3_err_msg`] attaches an [`S3NotFound`] marker when the body carries
+/// the store's `<Code>NoSuchKey</Code>`, and this matches that marker by
+/// downcast. A `<Code>NoSuchBucket</Code>` body is a configuration error
+/// (wrong bucket), never "missing": reading it as absent would start fresh
+/// and upload an empty database over the good snapshot.
 pub fn is_not_found(err: &anyhow::Error) -> bool {
     err.downcast_ref::<S3NotFound>().is_some()
 }
 
-/// Marker for "the store answered 404 / NoSuchKey for the object": the key
-/// is absent, not the store unreachable. Attached at construction by
+/// Marker for "the store answered `<Code>NoSuchKey</Code>` for the object":
+/// the key is absent, not the store unreachable. Attached at construction by
 /// [`s3_err_msg`], matched by [`is_not_found`] through the anyhow chain.
 /// Never attached for `<Code>NoSuchBucket</Code>`, which is a wrong-bucket
 /// configuration error even when its status is 404.
@@ -150,18 +150,19 @@ async fn bounded_text_or_empty(resp: reqwest::Response, timeout: Duration) -> St
 /// Visible to the state tests, which pin the missing-vs-misconfigured
 /// boundary at the error-construction site.
 ///
-/// Only the object answering 404 — or a body carrying the store's
-/// `<Code>NoSuchKey</Code>` — attaches the [`S3NotFound`] marker. A body
-/// naming `<Code>NoSuchBucket</Code>` is a wrong-bucket configuration error
-/// and stays a hard error even when its status is 404, so boot refuses to
-/// start past it. The code match runs on `body`, not on the composed
-/// message, so a key that merely contains those words can never count as
-/// missing.
+/// Only a body carrying the store's `<Code>NoSuchKey</Code>` attaches the
+/// [`S3NotFound`] marker. A body naming `<Code>NoSuchBucket</Code>` is a
+/// wrong-bucket configuration error, and a 404 with no store code at all (a
+/// wrong endpoint path, a proxy or custom-domain page) is a misconfigured
+/// endpoint: both stay hard errors even when the status is 404, so boot
+/// refuses to start past them. The code match runs on `body`, not on the
+/// composed message, so a key that merely contains those words can never
+/// count as missing. Bodyless HEAD 404s never reach this constructor
+/// (`s3_head_object`/`s3_object_exists` answer `Option`/`bool` directly).
 pub(crate) fn s3_err_msg(op: &str, target: &str, status: u16, body: &str) -> anyhow::Error {
     let snippet: String = body.trim().chars().take(300).collect();
     let err = anyhow::anyhow!("s3 {op} {target} failed: HTTP {status} {snippet}");
-    let missing_bucket = body.contains("<Code>NoSuchBucket</Code>");
-    if !missing_bucket && (status == 404 || body.contains("<Code>NoSuchKey</Code>")) {
+    if !body.contains("<Code>NoSuchBucket</Code>") && body.contains("<Code>NoSuchKey</Code>") {
         err.context(S3NotFound)
     } else {
         err
@@ -1637,12 +1638,13 @@ mod tests {
         assert!(second <= Duration::from_millis(2500));
     }
 
-    /// Only a store answer counts as missing: a 404 with a `NoSuchKey` body
-    /// (or a bare 404 with no bucket complaint) carries the marker, while a
-    /// `NoSuchBucket` body, a 5xx, and a transport failure never do — even
-    /// when the key or the message names `404`/`NotFound`. The old substring
-    /// arms read those as "start fresh" and callers uploaded an empty
-    /// database over a good one.
+    /// Only the store's own code counts as missing: a body carrying
+    /// `<Code>NoSuchKey</Code>` (and no `<Code>NoSuchBucket</Code>`) carries
+    /// the marker, while a `NoSuchBucket` body, a codeless 404 (a wrong
+    /// endpoint path or proxy page), a 5xx, and a transport failure never
+    /// do — even when the key or the message names `404`/`NotFound`. The old
+    /// substring arms read those as "start fresh" and callers uploaded an
+    /// empty database over a good one.
     #[test]
     fn not_found_ignores_key_names_and_transport_failures() {
         let missing = s3_err_msg("download", "tip.bundle", 404, "<Code>NoSuchKey</Code>");
@@ -1658,10 +1660,18 @@ mod tests {
         // NoSuchKey in the body counts even when the status is not 404.
         let key_code_on_403 = s3_err_msg("download", "tip.bundle", 403, "<Code>NoSuchKey</Code>");
         assert!(is_not_found(&key_code_on_403));
-        // A 404 with an empty body (HeadObject-style) still counts: the
-        // status alone marks it, as long as the body does not name a bucket.
+        // A 404 with no store code (a wrong endpoint path, a proxy page) is
+        // a misconfiguration, never "missing": the marker requires the
+        // store's own `<Code>NoSuchKey</Code>`.
         let bare_404 = s3_err_msg("download", "tip.bundle", 404, "");
-        assert!(is_not_found(&bare_404));
+        assert!(!is_not_found(&bare_404));
+        let proxy_404 = s3_err_msg(
+            "download",
+            "tip.bundle",
+            404,
+            "<html><head><title>404 Not Found</title></head><body><h1>Not Found</h1></body></html>",
+        );
+        assert!(!is_not_found(&proxy_404));
         let legacy =
             anyhow::anyhow!("aws exit 1\nfatal error: An error occurred (404) when calling the HeadObject operation");
         assert!(!is_not_found(&legacy));

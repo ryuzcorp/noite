@@ -22,9 +22,11 @@
 //! installs share one bucket, which is a misconfiguration this surfaces.
 //!
 //! Boot path: if `NOITE_DB` does not exist, download the snapshot before
-//! `db::connect`. "No snapshot" (404) starts fresh; any other error fails the
-//! boot, because starting with an empty database would upload it over the
-//! good snapshot on the next write. If both exist, keep the local file.
+//! `db::connect`. A missing snapshot object (the store's own `NoSuchKey`)
+//! starts fresh; any other error — a wrong bucket, a proxy 404 page, a
+//! transport failure — fails the boot, because starting with an empty
+//! database would upload it over the good snapshot on the next write. If
+//! both exist, keep the local file.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -711,26 +713,21 @@ mod tests {
         );
     }
 
-    /// N-2: a wrong bucket answers 404 with a `NoSuchBucket` body. That is a
-    /// configuration error, never "no snapshot": the boot is refused instead
-    /// of starting with an empty database that the next upload would write
-    /// over the good snapshot. Paused time skips the retry backoff
-    /// deterministically: the clock moves in 100 ms steps (below every
-    /// request timeout, so no in-flight request times out spuriously) while
-    /// the restore future is polled directly — no wall-clock waiting.
-    #[tokio::test]
-    async fn restore_refuses_boot_on_missing_bucket() {
+    /// Drive `restore_if_missing` against the stub with paused time and return
+    /// the failure message: the retry backoff is virtual (100 ms steps, below
+    /// every request timeout so no in-flight request times out spuriously)
+    /// while the restore future is polled directly — no wall-clock waiting.
+    /// The boot must refuse (never `Ok(false)`), the error names the bucket,
+    /// and no local database is created.
+    async fn restore_err_against_missing_body(missing: &[u8], bucket: &str) -> String {
         tokio::time::pause();
         let dir = std::env::temp_dir().join(format!("noite-state-{}", uuid::Uuid::new_v4()));
-        let (endpoint, _store, _refuse) = spawn_state_stub_with_missing(
-            b"<?xml version=\"1.0\"?><Error><Code>NoSuchBucket</Code><Message>The specified bucket does not exist</Message></Error>",
-        )
-        .await;
+        let (endpoint, _store, _refuse) = spawn_state_stub_with_missing(missing).await;
         let mut cfg = crate::config::config_for_tests();
         cfg.database_url = format!("sqlite:{}?mode=rwc", dir.join("noite.sqlite").display());
         cfg.s3_endpoint = endpoint.clone();
         cfg.s3_public_endpoint = endpoint;
-        cfg.s3_bucket = "wrong-bucket".to_string();
+        cfg.s3_bucket = bucket.to_string();
         let live = crate::db::local_db_path(&cfg).expect("file database");
         assert!(!live.exists(), "nothing restored yet");
         let restore = super::restore_if_missing(&cfg);
@@ -748,14 +745,37 @@ mod tests {
         }
         let err = settled
             .expect("restore settles without wall-clock waiting")
-            .expect_err("a missing bucket must fail the boot, not start fresh");
+            .expect_err("a misconfigured store must fail the boot, not start fresh");
         let msg = format!("{err:#}");
-        assert!(
-            msg.contains("wrong-bucket"),
-            "the error names the bucket: {msg}"
-        );
+        assert!(msg.contains(bucket), "the error names the bucket: {msg}");
         assert!(!live.exists(), "no empty database is created");
         std::fs::remove_dir_all(&dir).ok();
+        msg
+    }
+
+    /// N-2: a wrong bucket answers 404 with a `NoSuchBucket` body. That is a
+    /// configuration error, never "no snapshot": the boot is refused instead
+    /// of starting with an empty database that the next upload would write
+    /// over the good snapshot.
+    #[tokio::test]
+    async fn restore_refuses_boot_on_missing_bucket() {
+        restore_err_against_missing_body(
+            b"<?xml version=\"1.0\"?><Error><Code>NoSuchBucket</Code><Message>The specified bucket does not exist</Message></Error>",
+            "wrong-bucket",
+        )
+        .await;
+    }
+
+    /// N-2 follow-up: a wrong endpoint path (or proxy / custom domain) answers
+    /// GET with a plain 404 HTML page carrying no store code. That is a
+    /// misconfiguration too, never "no snapshot": the boot is refused.
+    #[tokio::test]
+    async fn restore_refuses_boot_on_plain_404_page() {
+        restore_err_against_missing_body(
+            b"<html><head><title>404 Not Found</title></head><body><h1>Not Found</h1></body></html>",
+            "wrong-bucket",
+        )
+        .await;
     }
 
     /// Injected-clock gate: nothing uploads before its time, whatever the
