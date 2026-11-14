@@ -184,6 +184,112 @@ describe("apiAction", () => {
   });
 });
 
+/** Drive a handler with explicit request headers. */
+const postHeaders = async (
+  handler: (c: CloudContext) => unknown,
+  headers: Record<string, string>
+): Promise<Response> => {
+  const request = new Request("http://localhost:9080/api/test/guarded", {
+    body: "{}",
+    headers: { "content-type": "application/json", ...headers },
+    method: "POST",
+  });
+
+  // SAFETY: the guarded handlers only read the request and the BETTER_AUTH_URL key the gate compares against.
+  const raw = await handler(
+    testRouteContext(request, ENV as unknown as KitEnv)
+  );
+
+  if (raw instanceof Response) {
+    return raw;
+  }
+
+  throw new Error("the handler did not answer a Response");
+};
+
+describe("cross-site refusal", () => {
+  let ran = 0;
+
+  const guarded = apiAction(Schema.Struct({}), () => {
+    ran += 1;
+
+    return { ok: true };
+  });
+
+  const guardedNoInput = apiActionNoInput(() => {
+    ran += 1;
+
+    return { ok: true };
+  });
+
+  test("a sibling-origin POST is refused 403 before the action runs", async () => {
+    ran = 0;
+
+    const response = await postHeaders(guarded, {
+      origin: "http://evil.localhost:9080",
+      "sec-fetch-site": "same-site",
+    });
+
+    expect(response.status).toBe(403);
+    expect(await response.json()).toEqual({
+      error: "Cross-site request refused",
+    });
+    expect(ran).toBe(0);
+  });
+
+  test("the inputless handler refuses the same way", async () => {
+    ran = 0;
+
+    const response = await postHeaders(guardedNoInput, {
+      origin: "http://evil.localhost:9080",
+      "sec-fetch-site": "same-site",
+    });
+
+    expect(response.status).toBe(403);
+    expect(ran).toBe(0);
+  });
+
+  test("the request's own origin passes", async () => {
+    ran = 0;
+
+    const response = await postHeaders(guarded, {
+      origin: "http://localhost:9080",
+    });
+
+    expect(response.status).toBe(200);
+    expect(ran).toBe(1);
+  });
+
+  test("no Origin and no hint passes (non-browser client)", async () => {
+    ran = 0;
+
+    const response = await postHeaders(guarded, {});
+
+    expect(response.status).toBe(200);
+    expect(ran).toBe(1);
+  });
+
+  test("no Origin with a cross-site hint is refused", async () => {
+    ran = 0;
+
+    const response = await postHeaders(guarded, {
+      "sec-fetch-site": "cross-site",
+    });
+
+    expect(response.status).toBe(403);
+    expect(ran).toBe(0);
+  });
+
+  test("Origin: null is refused", async () => {
+    ran = 0;
+
+    const response = await postHeaders(guarded, { origin: "null" });
+
+    expect(response.status).toBe(403);
+    expect(ran).toBe(0);
+  });
+});
+
 describe("endpoint auth gating", () => {
   test("a signed-out caller gets 401, never Internal error", async () => {
     const response = await post(slugCheckPost, "/api/apps/slugCheck", ENV, {
