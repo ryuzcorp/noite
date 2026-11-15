@@ -117,6 +117,14 @@ impl IsolationStatus {
     }
 }
 
+/// The sandbox gateway runs without per-app attribution exactly when the
+/// install is single-tenant, sandboxing is on, and no per-fleet cgroup
+/// anchor exists to attribute with. Pure so the table test pins the
+/// single/multi × cgroups/no-cgroups branches.
+fn sandbox_unattributed(tenancy: &Tenancy, cgroup_anchor: bool, sandbox_disabled: bool) -> bool {
+    *tenancy == Tenancy::Single && !cgroup_anchor && !sandbox_disabled
+}
+
 pub async fn self_check(cfg: &Config, nft_installed: bool) -> IsolationStatus {
     // One probe is enough: every uid in the range drops the same way.
     let build_uid_ok = match cfg.build_uid_base {
@@ -165,6 +173,18 @@ pub async fn self_check(cfg: &Config, nft_installed: bool) -> IsolationStatus {
         problems.push(format!(
             "tenant fleets hold the root bucket keys ({credentials})"
         ));
+    }
+    // Sandbox gateway attribution (SPEC, Sandbox containers): single tenancy
+    // without per-fleet cgroups cannot tell fleets apart, so an
+    // otherwise-valid dial to a known fleet's container is allowed degraded
+    // (one trust domain). Warn once here — boot log, `/ready` detail and
+    // doctor — never per dial.
+    if sandbox_unattributed(
+        &cfg.tenancy,
+        crate::host::cgroups::anchor().is_some(),
+        cfg.sandbox_disabled,
+    ) {
+        problems.push("sandbox dials not attributed per app: no per-fleet cgroups".to_string());
     }
     let status = IsolationStatus {
         tenancy: cfg.tenancy.as_str().to_string(),
@@ -282,3 +302,23 @@ pub fn harden_data_dir(cfg: &Config) {
 
 #[cfg(not(unix))]
 pub fn harden_data_dir(_cfg: &Config) {}
+
+#[cfg(test)]
+mod tests {
+    use super::{sandbox_unattributed, Tenancy};
+
+    #[test]
+    fn degraded_attribution_is_single_without_cgroups_only() {
+        // The only install that cannot attribute: single tenancy with no
+        // per-fleet cgroup anchor and sandboxing on.
+        assert!(sandbox_unattributed(&Tenancy::Single, false, false));
+        // Any per-fleet cgroups keep the cgroup verdict authoritative.
+        assert!(!sandbox_unattributed(&Tenancy::Single, true, false));
+        // Disabled sandboxing attributes nothing because nothing dials.
+        assert!(!sandbox_unattributed(&Tenancy::Single, false, true));
+        // Multi never takes the degraded path: unknown stays refused.
+        assert!(!sandbox_unattributed(&Tenancy::Multi, false, false));
+        assert!(!sandbox_unattributed(&Tenancy::Multi, true, false));
+        assert!(!sandbox_unattributed(&Tenancy::Multi, false, true));
+    }
+}
