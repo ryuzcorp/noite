@@ -379,12 +379,15 @@ async fn main() -> anyhow::Result<()> {
         let fleet_ids = config
             .fleet_uid
             .map(|uid| (uid, config.fleet_gid.unwrap_or(uid)));
+        // Only single tenancy without per-fleet cgroups may take the
+        // gateway's degraded unattributed-allow path; multi refuses.
+        let single = config.tenancy == crate::config::Tenancy::Single;
         tokio::spawn(async move {
             let first = host::sandbox::plane::ensure_networks().await;
             if first.engine {
                 tracing::info!(subnets = ?first.subnets, "sandbox plane ensured");
                 let relay_ok = host::sandbox::relay::ensure().await;
-                host::sandbox::gateway::spawn(fleet_ids);
+                host::sandbox::gateway::spawn(fleet_ids, single);
                 let table_ok = host::sandbox::gateway::ensure_table(
                     &first.subnets,
                     fleet_ids.map(|(uid, _)| uid),
