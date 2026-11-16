@@ -394,6 +394,10 @@ mod tests {
             "CELLD_CACHE_SCOPE",
             "RUNNER_TOKEN",
             "NOITE_IMAGE",
+            // The boot sweep's install identity: a tenant row under this name
+            // must never reach fleet process env (the `NOITE_` prefix already
+            // refuses it; pinned by name here).
+            "NOITE_FLEET_INSTALL",
             "BETTER_AUTH_URL",
             "CADDY_ADMIN",
             "LD_PRELOAD",

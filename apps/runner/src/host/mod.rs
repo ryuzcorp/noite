@@ -17,6 +17,7 @@ pub mod env_teardown;
 pub mod errors;
 pub mod exec;
 pub mod fleet_env;
+pub mod fleet_orphans;
 pub mod forge;
 pub mod generated_config;
 pub mod git_http;
