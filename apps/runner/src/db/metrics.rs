@@ -389,6 +389,38 @@ pub async fn delete_metric_watermarks_for(pool: &SqlitePool, slug: &str) -> sqlx
     Ok(res.rows_affected())
 }
 
+/// Escape a LIKE pattern's wildcards: slugs cannot carry them today, but a
+/// tombstone predates no grammar, and an unescaped `%` would widen the wipe
+/// past the slug's own fleet keys.
+pub(crate) fn escape_like(slug: &str) -> String {
+    let mut out = String::with_capacity(slug.len());
+    for c in slug.chars() {
+        if c == '\\' || c == '%' || c == '_' {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// Drop an app's watermark rows: its own fleet key plus every preview
+/// environment's (`{slug}.{label}`). Slugs never contain `.`, so the prefix
+/// only matches this slug's fleets. Runs on the purge resume pass, where the
+/// environment rows (and their labels) are long gone and only the tombstone's
+/// slug remains. Callers that still know the labels use the exact
+/// [`delete_metric_watermarks_for`] per key instead.
+pub async fn delete_metric_watermarks_for_slug(pool: &SqlitePool, slug: &str) -> sqlx::Result<u64> {
+    let pattern = format!("{}.%", escape_like(slug));
+    let res = sqlx::query(
+        "DELETE FROM metrics.metric_watermark WHERE slug = ? OR slug LIKE ? ESCAPE '\\'",
+    )
+    .bind(slug)
+    .bind(pattern)
+    .execute(pool)
+    .await?;
+    Ok(res.rows_affected())
+}
+
 /// One pending telemetry replay request (`main.telemetry_replay`, one row).
 /// `floor_us` 0 means the retention floor; `slug` None means every fleet.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -588,6 +620,22 @@ pub async fn prune_app_logs(
     Ok(n)
 }
 
+/// Every metrics table keyed by `(app_id, …)`: one row per app (and
+/// environment) instead of per slug, so the ids — never reused — stay exact
+/// across a slug's delete and re-create. Both telemetry deletes below iterate
+/// this list, so a table added to `schema.metrics.sql` only needs one entry
+/// here (the schema-tie test below fails otherwise).
+const APP_ID_TELEMETRY_TABLES: &[&str] = &[
+    "metrics.app_hour",
+    "metrics.app_hour_lat",
+    "metrics.app_hour_dim",
+    "metrics.app_log",
+    "metrics.app_error_issue",
+    "metrics.app_error_event",
+    "metrics.app_error_hour",
+    "metrics.metric_version",
+];
+
 /// Drop every telemetry row of one environment: the hourly counters, the
 /// breakdown, the log ring, error issues/events/hours, and its metrics
 /// version. Labels can be reused after a delete, so nothing may survive for
@@ -598,16 +646,7 @@ pub async fn delete_environment_telemetry(
     environment_id: &str,
 ) -> sqlx::Result<u64> {
     let mut n = 0;
-    for table in [
-        "metrics.app_hour",
-        "metrics.app_hour_lat",
-        "metrics.app_hour_dim",
-        "metrics.app_log",
-        "metrics.app_error_issue",
-        "metrics.app_error_event",
-        "metrics.app_error_hour",
-        "metrics.metric_version",
-    ] {
+    for table in APP_ID_TELEMETRY_TABLES {
         let res = sqlx::query(sqlx::AssertSqlSafe(format!(
             "DELETE FROM {table} WHERE app_id = ? AND environment_id = ?"
         )))
@@ -618,6 +657,175 @@ pub async fn delete_environment_telemetry(
         n += res.rows_affected();
     }
     Ok(n)
+}
+
+/// Drop every telemetry row of one app, across all its environments: the
+/// same tables [`delete_environment_telemetry`] clears per environment.
+/// Runs where the app's own data is wiped (the delete path and the purge
+/// resume pass), so a deleted app's rows never linger until the retention
+/// prune — which keeps hourly rows 720 h and never touches some of these
+/// tables. Idempotent: a second run deletes nothing.
+pub async fn delete_app_telemetry(pool: &SqlitePool, app_id: &str) -> sqlx::Result<u64> {
+    let mut n = 0;
+    for table in APP_ID_TELEMETRY_TABLES {
+        let res = sqlx::query(sqlx::AssertSqlSafe(format!(
+            "DELETE FROM {table} WHERE app_id = ?"
+        )))
+        .bind(app_id)
+        .execute(pool)
+        .await?;
+        n += res.rows_affected();
+    }
+    Ok(n)
+}
+
+/// Seed one telemetry row per (table, environment) for tests that prove a
+/// delete drops exactly its app's rows: production (`""`) plus `env_id` in
+/// every [`APP_ID_TELEMETRY_TABLES`] table, plus the slug's own and the
+/// `env_label` fleet's marks — 16 app rows and 4 mark rows.
+#[cfg(test)]
+pub(crate) async fn seed_app_telemetry_rows(
+    pool: &SqlitePool,
+    app_id: &str,
+    slug: &str,
+    env_id: &str,
+    env_label: &str,
+) {
+    let hour = "2026-11-13T07:00:00Z";
+    for env in ["", env_id] {
+        sqlx::query(
+            "INSERT INTO metrics.app_hour (app_id, environment_id, bucket_hour, requests) \
+             VALUES (?, ?, ?, 7)",
+        )
+        .bind(app_id)
+        .bind(env)
+        .bind(hour)
+        .execute(pool)
+        .await
+        .expect("seed app_hour");
+        sqlx::query(
+            "INSERT INTO metrics.app_hour_lat (app_id, environment_id, bucket_hour, bucket, n) \
+             VALUES (?, ?, ?, 3, 7)",
+        )
+        .bind(app_id)
+        .bind(env)
+        .bind(hour)
+        .execute(pool)
+        .await
+        .expect("seed app_hour_lat");
+        sqlx::query(
+            "INSERT INTO metrics.app_hour_dim (app_id, environment_id, bucket_hour, kind, value, requests) \
+             VALUES (?, ?, ?, 'path', '/x', 7)",
+        )
+        .bind(app_id)
+        .bind(env)
+        .bind(hour)
+        .execute(pool)
+        .await
+        .expect("seed app_hour_dim");
+        sqlx::query(
+            "INSERT INTO metrics.app_log (app_id, environment_id, ts_us, body) VALUES (?, ?, 1, 'line')",
+        )
+        .bind(app_id)
+        .bind(env)
+        .execute(pool)
+        .await
+        .expect("seed app_log");
+        sqlx::query(
+            "INSERT INTO metrics.app_error_issue \
+             (app_id, environment_id, fingerprint, kind, message, first_seen_us, last_seen_us) \
+             VALUES (?, ?, 'fp', 'TypeError', 'boom', 1, 2)",
+        )
+        .bind(app_id)
+        .bind(env)
+        .execute(pool)
+        .await
+        .expect("seed app_error_issue");
+        sqlx::query(
+            "INSERT INTO metrics.app_error_event \
+             (app_id, environment_id, fingerprint, ts_us, kind, message) \
+             VALUES (?, ?, 'fp', 1, 'TypeError', 'boom')",
+        )
+        .bind(app_id)
+        .bind(env)
+        .execute(pool)
+        .await
+        .expect("seed app_error_event");
+        sqlx::query(
+            "INSERT INTO metrics.app_error_hour (app_id, environment_id, fingerprint, bucket_hour, n) \
+             VALUES (?, ?, 'fp', ?, 1)",
+        )
+        .bind(app_id)
+        .bind(env)
+        .bind(hour)
+        .execute(pool)
+        .await
+        .expect("seed app_error_hour");
+        sqlx::query(
+            "INSERT INTO metrics.metric_version (app_id, environment_id, version) VALUES (?, ?, 3)",
+        )
+        .bind(app_id)
+        .bind(env)
+        .execute(pool)
+        .await
+        .expect("seed metric_version");
+    }
+    for key in [slug.to_string(), format!("{slug}.{env_label}")] {
+        sqlx::query("INSERT INTO metrics.metric_watermark (slug, after_us) VALUES (?, 1)")
+            .bind(&key)
+            .execute(pool)
+            .await
+            .expect("seed metric_watermark");
+        sqlx::query(
+            "INSERT INTO metrics.metric_compaction (slug, hour, compacted_at) \
+             VALUES (?, '2026/11/13/07', '2026-11-13T08:00:00Z')",
+        )
+        .bind(&key)
+        .execute(pool)
+        .await
+        .expect("seed metric_compaction");
+    }
+}
+
+/// Rows left for `app_id` across every [`APP_ID_TELEMETRY_TABLES`] table.
+#[cfg(test)]
+pub(crate) async fn count_app_telemetry_rows(pool: &SqlitePool, app_id: &str) -> u64 {
+    let mut n = 0;
+    for table in APP_ID_TELEMETRY_TABLES {
+        let c: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+            "SELECT COUNT(*) FROM {table} WHERE app_id = ?"
+        )))
+        .bind(app_id)
+        .fetch_one(pool)
+        .await
+        .expect("count telemetry");
+        n += c as u64;
+    }
+    n
+}
+
+/// Watermark plus compaction rows left for `slug` and its `{slug}.{label}`
+/// fleet keys.
+#[cfg(test)]
+pub(crate) async fn count_slug_mark_rows(pool: &SqlitePool, slug: &str) -> u64 {
+    let pattern = format!("{}.%", escape_like(slug));
+    let w: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM metrics.metric_watermark WHERE slug = ? OR slug LIKE ? ESCAPE '\\'",
+    )
+    .bind(slug)
+    .bind(&pattern)
+    .fetch_one(pool)
+    .await
+    .expect("count watermarks");
+    let c: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM metrics.metric_compaction WHERE slug = ? OR slug LIKE ? ESCAPE '\\'",
+    )
+    .bind(slug)
+    .bind(&pattern)
+    .fetch_one(pool)
+    .await
+    .expect("count compactions");
+    (w + c) as u64
 }
 
 #[cfg(test)]
@@ -841,5 +1049,40 @@ mod tests {
             .await
             .expect("delete");
         assert!(dim_rows(pool).await.is_empty());
+    }
+
+    /// The app-id purge covers every `app_id`-keyed metrics table: parse the
+    /// schema's `CREATE TABLE` names and fail when a new `app_id` table is
+    /// not in [`APP_ID_TELEMETRY_TABLES`] (or a listed table is gone from
+    /// the schema), so a future table cannot be forgotten in one delete.
+    #[test]
+    fn app_telemetry_tables_cover_the_schema() {
+        let schema = include_str!("../../schema.metrics.sql");
+        let mut app_tables: Vec<&str> = Vec::new();
+        let mut rest = schema;
+        while let Some(start) = rest.find("CREATE TABLE") {
+            let after = &rest[start..];
+            let end = after.find(';').expect("each CREATE TABLE ends");
+            let def = &after[..end];
+            let name = def
+                .split_whitespace()
+                .nth(5)
+                .expect("CREATE TABLE IF NOT EXISTS metrics.<name>");
+            let table = name.strip_prefix("metrics.").expect("metrics schema");
+            if def.contains("app_id") {
+                app_tables.push(table);
+            }
+            rest = &after[end + 1..];
+        }
+        let mut covered: Vec<&str> = APP_ID_TELEMETRY_TABLES
+            .iter()
+            .map(|t| t.strip_prefix("metrics.").expect("metrics prefix"))
+            .collect();
+        covered.sort_unstable();
+        app_tables.sort_unstable();
+        assert_eq!(
+            covered, app_tables,
+            "every app_id-keyed table in schema.metrics.sql must be purged"
+        );
     }
 }

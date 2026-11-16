@@ -844,6 +844,29 @@ async fn delete_inner(state: &AppState, id: &str) -> Result<(), ApiError> {
         let step = step_failure("could not remove the app row", &e.to_string());
         ApiError::internal(format!("delete {}: {step}", app.slug))
     })?;
+    // The app's metrics rows go with its row: the environment cascade takes
+    // the environment rows but nothing touches the telemetry tables, so a
+    // deleted app's counters, log ring, error rows and metric versions would
+    // otherwise linger until the retention prune (which never touches some of
+    // them). Keyed by the never-reused app id, so a re-created slug is
+    // unaffected. Best-effort: the purge resume pass retries whatever a crash
+    // leaves behind.
+    if let Err(e) = db::delete_app_telemetry(&state.pool, &app.id).await {
+        tracing::warn!(app_id = %app.id, error = %e, "app deleted but its metrics rows remain; the purge resume pass retries");
+    }
+    // The durable fleet marks go too: the watermark and compaction rows are
+    // keyed by fleet key (`<slug>`, `<slug>.<label>`), and a reused slug or
+    // label must start from the floor instead of inheriting the dead fleet's
+    // position. The in-memory copies went above; the labels were read before
+    // the row (and its cascade) went.
+    for key in std::iter::once(&app.slug).chain(env_keys.iter()) {
+        if let Err(e) = db::delete_metric_watermarks_for(&state.pool, key).await {
+            tracing::warn!(app_id = %app.id, error = %e, "app deleted but its ingest watermark remains; the purge resume pass retries");
+        }
+        if let Err(e) = db::delete_compactions_for(&state.pool, key).await {
+            tracing::warn!(app_id = %app.id, error = %e, "app deleted but its compaction marks remain; the purge resume pass retries");
+        }
+    }
     // A reconcile tick (or a wake) that listed the app before the stop above
     // can still have started the fleet again; with the row gone nothing else
     // would stop it. Stop it while the push guard is still ours: releasing
@@ -3161,6 +3184,77 @@ mod tests {
                 .expect("lookup")
                 .is_none(),
             "the environment row survived a dropped delete"
+        );
+        drop(dir);
+    }
+
+    /// Deleting an app drops every metrics row keyed to it — production and
+    /// environment rows in all eight telemetry tables, plus the slug's fleet
+    /// marks — while a sibling app's rows survive untouched. Fails before the
+    /// app-telemetry wipe: the rows stay until retention prunes them.
+    #[tokio::test]
+    async fn delete_drops_the_apps_metrics_rows_and_keeps_the_survivors() {
+        let (state, dir) = test_state(10).await;
+        let doomed = create(&state, "Doomed", "doomed-metrics", Some("u1"), None)
+            .await
+            .expect("create doomed");
+        let keeper = create(&state, "Keeper", "keeper-metrics", Some("u1"), None)
+            .await
+            .expect("create keeper");
+        let env = crate::db::create_environment(
+            &state.pool,
+            &state.config,
+            crate::db::NewEnvironment {
+                app_id: &doomed.id,
+                slug: &doomed.slug,
+                label: "staging",
+                kind: crate::models::EnvironmentKind::Branch,
+                git_ref: "refs/heads/staging",
+                created_by: "user_1",
+                listen: 30410,
+                internal: 30411,
+            },
+        )
+        .await
+        .expect("environment");
+        crate::db::seed_app_telemetry_rows(
+            &state.pool,
+            &doomed.id,
+            &doomed.slug,
+            &env.id,
+            &env.label,
+        )
+        .await;
+        crate::db::seed_app_telemetry_rows(
+            &state.pool,
+            &keeper.id,
+            &keeper.slug,
+            "env1",
+            "staging",
+        )
+        .await;
+
+        delete_inner(&state, &doomed.id).await.expect("delete");
+
+        assert_eq!(
+            crate::db::count_app_telemetry_rows(&state.pool, &doomed.id).await,
+            0,
+            "the deleted app's metrics rows are gone"
+        );
+        assert_eq!(
+            crate::db::count_slug_mark_rows(&state.pool, &doomed.slug).await,
+            0,
+            "the deleted app's fleet marks are gone"
+        );
+        assert_eq!(
+            crate::db::count_app_telemetry_rows(&state.pool, &keeper.id).await,
+            16,
+            "the surviving app keeps every seeded row"
+        );
+        assert_eq!(
+            crate::db::count_slug_mark_rows(&state.pool, &keeper.slug).await,
+            4,
+            "the surviving app keeps its fleet marks"
         );
         drop(dir);
     }

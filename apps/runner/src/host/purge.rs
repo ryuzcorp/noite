@@ -366,6 +366,24 @@ pub async fn resume_pending(
             );
             continue;
         }
+        // The app rows are gone but their telemetry may have survived a crash
+        // between the row delete and the delete's own telemetry wipe (or a
+        // delete from before that wipe existed). App ids are never reused, so
+        // deleting by tombstoned id is safe even when a new app already owns
+        // the slug; the slug-keyed marks only go on the wipe branch below,
+        // where no row owns the slug.
+        match crate::db::purge_app_ids(pool, &slug).await {
+            Ok(ids) => {
+                for app_id in &ids {
+                    if let Err(e) = crate::db::delete_app_telemetry(pool, app_id).await {
+                        tracing::warn!(slug, app_id = %app_id, error = %e, "resumed purge could not drop the app's metrics rows; the next pass retries");
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!(slug, error = %e, "resumed purge could not list its tombstoned app ids; leaving them for the next pass");
+            }
+        }
         // `Ok(true)`: the prefixes are empty (or the taker's wipe made them so)
         // and every tombstone for the slug can go. `Ok(false)`: a create took
         // the slug and stopped the wipe; it clears the tombstone itself once its
@@ -389,7 +407,18 @@ pub async fn resume_pending(
             {
                 Ok(Purged::Done) => {
                     tracing::info!(slug, "resumed purge emptied the slug's data");
-                    Ok(true)
+                    // No row owns the slug (checked above), so its fleet marks
+                    // are dead weight as well: a reused slug or label must
+                    // start from the floor instead of inheriting the wiped
+                    // fleet's position. A failure keeps the tombstone, so the
+                    // next pass retries the marks with the (now empty) wipe.
+                    let marks = crate::db::delete_metric_watermarks_for_slug(pool, &slug)
+                        .await
+                        .and(crate::db::delete_compactions_for_slug(pool, &slug).await);
+                    match marks {
+                        Ok(_) => Ok(true),
+                        Err(e) => Err(e.into()),
+                    }
                 }
                 Ok(Purged::Stopped) => {
                     tracing::info!(slug, "resumed purge stopped: the slug is being reused");
@@ -1436,5 +1465,64 @@ mod tests {
             .is_empty());
         pool.close().await;
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A crash between the row delete and the delete's own metrics wipe leaves
+    /// rows the tombstone still names; the resume pass drops them by
+    /// tombstoned app id (never reused, so safe under slug reuse) along with
+    /// the slug's fleet marks. File-backed: a `:memory:` pool gives every
+    /// connection its own metrics database.
+    #[tokio::test]
+    async fn a_resume_drops_the_deleted_apps_metrics_rows() {
+        let scratch = crate::testutil::TempDir::new("noite-purge-metrics-resume");
+        let mut cfg = crate::config::config_for_tests();
+        cfg.work_dir = scratch.path().join("work").to_string_lossy().into_owned();
+        cfg.s3_endpoint = crate::testutil::spawn_s3_stub().await;
+        let pool = db::connect(&format!(
+            "sqlite:{}?mode=rwc",
+            scratch.path().join("noite.sqlite").display()
+        ))
+        .await
+        .expect("file db");
+        let app = db::create_app(
+            &pool,
+            &cfg,
+            db::NewApp {
+                name: "gone",
+                slug: "gone",
+                user_id: "local",
+                subdomain: "gone.localhost",
+                listen: 30300,
+                internal: 30301,
+            },
+        )
+        .await
+        .expect("app");
+        db::seed_app_telemetry_rows(&pool, &app.id, &app.slug, "env1", "staging").await;
+        // The crash: the row (and its tombstone) is gone, but the delete's own
+        // telemetry wipe never ran.
+        db::delete_app(&pool, &app.id).await.expect("delete row");
+
+        let report = resume_pending(
+            &pool,
+            &cfg,
+            &crate::host::supervisor::new_procs(),
+            &crate::host::logs::new_state(),
+            &ryuz_git::GitSync::default(),
+        )
+        .await;
+
+        assert_eq!(report.failed, 0, "the resumed wipe succeeds");
+        assert_eq!(
+            db::count_app_telemetry_rows(&pool, &app.id).await,
+            0,
+            "the resumed pass drops the deleted app's metrics rows"
+        );
+        assert_eq!(
+            db::count_slug_mark_rows(&pool, &app.slug).await,
+            0,
+            "the resumed pass drops the deleted app's fleet marks"
+        );
+        pool.close().await;
     }
 }

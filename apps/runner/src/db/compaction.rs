@@ -46,6 +46,22 @@ pub async fn delete_compactions_for(pool: &SqlitePool, slug: &str) -> sqlx::Resu
     Ok(res.rows_affected())
 }
 
+/// Drop an app's compaction marks: its own fleet key plus every preview
+/// environment's (`{slug}.{label}`). Same prefix rule as
+/// [`crate::db::metrics::delete_metric_watermarks_for_slug`]: for the purge
+/// resume pass, where the labels are gone with the environment rows.
+pub async fn delete_compactions_for_slug(pool: &SqlitePool, slug: &str) -> sqlx::Result<u64> {
+    let pattern = format!("{}.%", super::metrics::escape_like(slug));
+    let res = sqlx::query(
+        "DELETE FROM metrics.metric_compaction WHERE slug = ? OR slug LIKE ? ESCAPE '\\'",
+    )
+    .bind(slug)
+    .bind(pattern)
+    .execute(pool)
+    .await?;
+    Ok(res.rows_affected())
+}
+
 pub async fn prune_compactions(pool: &SqlitePool, older_than_hour: &str) -> sqlx::Result<u64> {
     let res = sqlx::query("DELETE FROM metrics.metric_compaction WHERE hour < ?")
         .bind(older_than_hour)
