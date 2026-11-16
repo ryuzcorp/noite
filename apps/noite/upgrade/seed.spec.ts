@@ -3,21 +3,27 @@ import { mkdirSync, writeFileSync } from "node:fs";
 import nodePath from "node:path";
 
 import { expect, test } from "@playwright/test";
+import * as Schema from "effect/Schema";
 
+import { appListenPort, pushAppDir, runnerCall } from "../e2e/helpers";
 import {
-  appListenPort,
-  createAppWithKey,
-  pushAppDir,
-  registerInviteeWithFreshCode,
-  runnerCall,
-} from "../e2e/helpers";
+  OWNER,
+  acceptInvitation,
+  createApp,
+  inviteCollaborator,
+  mintKey,
+  pendingInvitationId,
+  readInviteCodeApi,
+  registerAccount,
+} from "./lane";
 
-/** Seed the upgrade lane: create an app with an env var, deploy the sample
- * worker, write tenant state (R2 + D1, both through the worker itself),
- * claim a custom domain, and add a collaborator — then record everything
- * the verify phase re-reads in the state file (`UPGRADE_STATE`, default
- * under the lane's test dir). Runs once, against the previous release's
- * image; the tree image must serve all of this back after the restart. */
+/** Seed the upgrade lane without touching version-skewed UI: after the one
+ * unavoidable passkey registration (see lane.ts), every step goes through
+ * the stable `/api` actions and the runner's `/v1` API plus the sample
+ * worker itself — never a DOM locator. The seed runs against the previous
+ * release's image, so any UI the tree redesigns would otherwise break it.
+ * Records everything the verify phase re-reads in the state file
+ * (`UPGRADE_STATE`, default under the lane's auth dir). */
 const SLUG = `upgrade-${Date.now()}`;
 const MARKER = randomUUID();
 const FILE_BODY = `upgrade-lane ${MARKER}\n`;
@@ -28,6 +34,11 @@ const STATE_PATH =
   `${process.env.E2E_AUTH_DIR ?? "upgrade/.auth"}/upgrade-state.json`;
 
 const tenant = (port: number): string => `http://localhost:${port}`;
+
+const DeployRow = Schema.Struct({
+  sha: Schema.NullOr(Schema.String),
+  status: Schema.String,
+});
 
 // The lane runs this file twice (seed against the old image, verify against
 // the new one); it only seeds in its own phase.
@@ -41,7 +52,22 @@ test("seed the previous release with app, env, deploy, domain and people", async
   page,
   request,
 }) => {
-  const { apiKey, appId } = await createAppWithKey(page, request, {
+  // The setup project registered this session already; re-registering the
+  // same address would fail as taken, so the seed reuses the fixture page
+  // and registers only the second account below.
+  const sessionRes = await page.request.get("/api/auth/get-session");
+
+  const session = Schema.decodeUnknownSync(
+    Schema.Struct({ user: Schema.Struct({ email: Schema.String }) })
+  )(await sessionRes.json());
+
+  if (session.user.email !== OWNER.email) {
+    throw new Error("setup session missing: the setup project must run first");
+  }
+
+  const key = await mintKey(page, `${SLUG}-ci`);
+
+  const appId = await createApp(page, {
     name: "Upgrade Lane",
     slug: SLUG,
   });
@@ -57,7 +83,7 @@ test("seed the previous release with app, env, deploy, domain and people", async
     expect(setEnv.status).toBe(200);
 
     // The sample worker: D1 `demo`, R2 `uploads`, the Counter object.
-    const sha = pushAppDir(apiKey, new URL("../test", import.meta.url), SLUG);
+    const sha = pushAppDir(key, new URL("../test", import.meta.url), SLUG);
 
     // Poll the pushed revision's own row (never a clock): the deploy takes
     // minutes (bun install + celld deploy + fleet boot).
@@ -71,11 +97,9 @@ test("seed the previous release with app, env, deploy, domain and people", async
             `/v1/apps/${appId}/deploys`
           );
 
-          // SAFETY: the runner's deploy list answers deploy rows (RunnerDeploy).
-          const rows = deploys.body as {
-            sha?: string | null;
-            status?: string;
-          }[];
+          const rows = Schema.decodeUnknownSync(Schema.Array(DeployRow))(
+            deploys.body
+          );
 
           const row = rows.find((candidate) => candidate.sha === sha);
           deployStatus = row?.status ?? "no-row";
@@ -97,6 +121,7 @@ test("seed the previous release with app, env, deploy, domain and people", async
     });
 
     expect(put.ok()).toBe(true);
+
     const hit = await request.get(`${tenant(port)}/?marker=${MARKER}`);
     expect(hit.ok()).toBe(true);
 
@@ -104,6 +129,7 @@ test("seed the previous release with app, env, deploy, domain and people", async
 
     expect(back.ok()).toBe(true);
     expect(await back.text()).toBe(FILE_BODY);
+
     const probe = await request.get(`${tenant(port)}/?read=1`);
     expect(probe.ok()).toBe(true);
 
@@ -121,29 +147,28 @@ test("seed the previous release with app, env, deploy, domain and people", async
 
     expect(claim.status).toBe(200);
 
-    // A collaborator: register a second account, invite it as a viewer, and
-    // prove the grant by opening the app in its session.
-    const invitee = await registerInviteeWithFreshCode(browser, page, {
+    // A collaborator: register a second account, invite it as a viewer,
+    // and prove the grant through the invitation it accepts.
+    const inviteCode = await readInviteCodeApi(page);
+
+    const invitee = await registerAccount(browser, {
       email: INVITEE_EMAIL,
+      inviteCode,
       name: "Upgrade Collab",
     });
 
     try {
-      await page.goto(`/apps/${appId}/settings?section=collaborators`);
-      await page.getByRole("button", { exact: true, name: "Invite" }).click();
-      await page.locator("#invite-email").fill(INVITEE_EMAIL);
-      await page.locator("#invite-role").selectOption("view");
-      await page
-        .getByRole("dialog")
-        .getByRole("button", { exact: true, name: "Invite" })
-        .click();
-      await expect(page.getByText(INVITEE_EMAIL).first()).toBeVisible();
+      expect(
+        await inviteCollaborator(page, {
+          appId,
+          email: INVITEE_EMAIL,
+          role: "view",
+        })
+      ).toBe("invited");
 
-      await invitee.page.goto("/apps");
-      await invitee.page
-        .getByRole("button", { exact: true, name: "Accept" })
-        .click();
-      await expect(invitee.page).toHaveURL(new RegExp(`/apps/${appId}`, "u"));
+      const inviteId = await pendingInvitationId(invitee.page, appId);
+
+      expect(await acceptInvitation(invitee.page, inviteId)).toBe(appId);
     } finally {
       await invitee.context.close();
     }
