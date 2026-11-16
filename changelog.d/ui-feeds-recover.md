@@ -1,0 +1,4 @@
+### Fixed
+
+- The Errors tab no longer strands a visit on `LoadError` after one failed detail read: the error-detail fetch retries on a bounded backoff (up to 4 tries, 1s/2s/4s) and the detail view gained a Retry button that re-runs the lookup. A single transient failure (dropped fetch, 504, read-time symbolication hiccup) used to end the visit even though the data existed.
+- Live panels re-read their snapshot when their stream topic drops and reopens: a deploy that finished while the Deployments stream was down now appears without waiting for the next frame. Before, the panel kept its pre-drop snapshot (possibly an empty list) until the stream delivered again, with only the "disconnected — retrying" banner to show for it. A `Live` panel still prefers its frames, and a refused topic stays refused.

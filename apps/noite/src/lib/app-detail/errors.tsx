@@ -533,10 +533,24 @@ const ErrorDetailView = ({
   }
 
   if (!data) {
+    // The fetch already retried on a bounded backoff (see `errorDetail`);
+    // a failure that survives it is lasting, so the panel offers the same
+    // lookup again instead of stranding the visit on the error.
     return (
       <div class="flex flex-col gap-3">
         {back}
         <LoadError error={resourceError(res.state())} />
+        <div>
+          <button
+            type="button"
+            class="btn btn-sm"
+            onclick={() => {
+              void res.refetch();
+            }}
+          >
+            Retry
+          </button>
+        </div>
       </div>
     );
   }

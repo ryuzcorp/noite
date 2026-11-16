@@ -22,8 +22,9 @@ import {
   invalidate as invalidateKey,
   resetResource,
   tracked as trackResource,
+  withRetry,
 } from "./resource";
-import type { Resource, ResourceFetcher } from "./resource";
+import type { Resource, ResourceFetcher, RetryPolicy } from "./resource";
 import type {
   D1Rows,
   D1RowsQuery,
@@ -242,18 +243,32 @@ export const environmentVars = (appId: string, envId: string) =>
   );
 
 /** One error with its latest occurrences, optionally in one preview
- * environment (absent/"" is production). */
+ * environment (absent/"" is production). The fetch retries on a bounded
+ * backoff: the detail is read once per visit, and a single transient
+ * failure (dropped fetch, 504, read-time symbolication hiccup) must not
+ * strand the panel on `LoadError` when the data exists. */
+const ERROR_DETAIL_RETRY: RetryPolicy = {
+  attempts: 4,
+  baseMs: 1000,
+  capMs: 8000,
+};
+
 export const errorDetail = (
   appId: string,
   fingerprint: string,
   environmentId = ""
 ) =>
-  tracked(keys.errorDetail(appId, fingerprint, environmentId), () =>
-    api<RunnerErrorDetail>("/api/errors/errorDetail", {
-      appId,
-      environmentId: environmentId === "" ? undefined : environmentId,
-      fingerprint,
-    })
+  tracked(
+    keys.errorDetail(appId, fingerprint, environmentId),
+    withRetry(
+      () =>
+        api<RunnerErrorDetail>("/api/errors/errorDetail", {
+          appId,
+          environmentId: environmentId === "" ? undefined : environmentId,
+          fingerprint,
+        }),
+      ERROR_DETAIL_RETRY
+    )
   );
 
 /** This app's public error-ingest identity (project id + key) for the DSN. */

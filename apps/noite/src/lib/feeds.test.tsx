@@ -14,6 +14,9 @@ import {
   nextConn,
   nextFeedState,
   paintInitial,
+  reopenedAfterDrop,
+  repaintSnapshot,
+  resetStreamHub,
   streamHubUrl,
 } from "./feeds";
 import type { FeedSink, FeedState, LiveFeed, StreamHooks } from "./feeds";
@@ -1151,6 +1154,232 @@ describe("liveFeed initial snapshot", () => {
       expect(feedValue(sink.current())).toEqual(["fresh"]);
     } finally {
       restore();
+    }
+  });
+});
+
+describe("feed refresh", () => {
+  test("a refresh replaces a stale value but never a live frame", () => {
+    const reconnecting = nextFeedState<string[]>(
+      { _tag: "Reconnecting", value: ["stale"] },
+      { kind: "refresh", value: ["fresh"] }
+    );
+
+    expect(reconnecting._tag).toBe("Reconnecting");
+    expect(feedOf(reconnecting)).toEqual(["fresh"]);
+
+    const cached = nextFeedState<string[]>(
+      { _tag: "Cached", value: ["stale"] },
+      { kind: "refresh", value: ["fresh"] }
+    );
+
+    expect(cached._tag).toBe("Cached");
+    expect(feedOf(cached)).toEqual(["fresh"]);
+
+    const cold = nextFeedState<string[]>(
+      { _tag: "Cold" },
+      { kind: "refresh", value: ["fresh"] }
+    );
+
+    expect(cold._tag).toBe("Cached");
+    expect(feedOf(cold)).toEqual(["fresh"]);
+
+    // A frame that landed first still wins over the re-read.
+    const live = nextFeedState<string[]>(
+      { _tag: "Live", value: ["frame"] },
+      { kind: "refresh", value: ["stale"] }
+    );
+
+    expect(live._tag).toBe("Live");
+    expect(feedOf(live)).toEqual(["frame"]);
+
+    // A refusal is terminal: the re-read must not revive the topic.
+    const refused = nextFeedState<string[]>(
+      { _tag: "Refused", value: ["stale"] },
+      { kind: "refresh", value: ["fresh"] }
+    );
+
+    expect(refused._tag).toBe("Refused");
+    expect(feedOf(refused)).toEqual(["stale"]);
+  });
+
+  test("only a drop followed by a fresh attempt repaints", () => {
+    // No previous link: the initial paint owns the first fetch.
+    expect(reopenedAfterDrop(undefined, ConnTypes.Connecting())).toBe(false);
+    // A lost topic reopening refetches; a live one does not.
+    expect(
+      reopenedAfterDrop(
+        ConnTypes.Retrying({ cause: "lost" }),
+        ConnTypes.Connecting()
+      )
+    ).toBe(true);
+    expect(reopenedAfterDrop(ConnTypes.Closed(), ConnTypes.Connecting())).toBe(
+      true
+    );
+    expect(
+      reopenedAfterDrop(ConnTypes.Retrying({ cause: "lost" }), ConnTypes.Idle())
+    ).toBe(true);
+    expect(reopenedAfterDrop(ConnTypes.Open(), ConnTypes.Connecting())).toBe(
+      false
+    );
+    expect(
+      reopenedAfterDrop(
+        ConnTypes.Retrying({ cause: "lost" }),
+        ConnTypes.Retrying({ cause: "transport" })
+      )
+    ).toBe(false);
+    expect(reopenedAfterDrop(ConnTypes.Open(), ConnTypes.Open())).toBe(false);
+  });
+
+  test("repaintSnapshot re-reads a stale non-live panel", async () => {
+    const restore = installDomFixture();
+
+    try {
+      const key = nextInitialKey();
+
+      const sink = feedSink<string[]>({
+        _tag: "Reconnecting",
+        value: ["stale"],
+      });
+
+      let calls = 0;
+      await repaintSnapshot(key, sink, {
+        initial: () => {
+          calls += 1;
+
+          return Promise.resolve(["fresh"]);
+        },
+      });
+
+      expect(calls).toBe(1);
+      expect(sink.current()._tag).toBe("Reconnecting");
+      expect(feedOf(sink.current())).toEqual(["fresh"]);
+      expect(readSwr<string[]>(key)).toEqual(["fresh"]);
+    } finally {
+      restore();
+    }
+  });
+
+  test("repaintSnapshot leaves a live panel and a failed fetch alone", async () => {
+    const restore = installDomFixture();
+
+    try {
+      const liveKey = nextInitialKey();
+
+      const liveSink = feedSink<string[]>({
+        _tag: "Live",
+        value: ["frame"],
+      });
+
+      let liveCalls = 0;
+      await repaintSnapshot(liveKey, liveSink, {
+        initial: () => {
+          liveCalls += 1;
+
+          return Promise.resolve(["fresh"]);
+        },
+      });
+
+      // The re-read still refreshes the stored snapshot, but the live
+      // frame on the panel stands.
+      expect(liveCalls).toBe(1);
+      expect(liveSink.current()._tag).toBe("Live");
+      expect(feedOf(liveSink.current())).toEqual(["frame"]);
+
+      const deadKey = nextInitialKey();
+      const deadSink = feedSink<string[]>();
+      let deadCalls = 0;
+      await repaintSnapshot(deadKey, deadSink, {
+        initial: () => {
+          deadCalls += 1;
+
+          return Promise.reject(new Error("runner away"));
+        },
+      });
+
+      expect(deadCalls).toBe(1);
+      expect(deadSink.current()._tag).toBe("Cold");
+      expect(feedOf(deadSink.current())).toBeUndefined();
+      expect(readSwr<string[]>(deadKey)).toBeUndefined();
+    } finally {
+      restore();
+    }
+  });
+});
+
+describe("liveFeed reopen", () => {
+  test("a dropped topic repaints from a fresh snapshot on reopen", async () => {
+    const restoreDom = installDomFixture();
+    // Captured, never run: no test waits out a real backoff.
+    installManualClock();
+
+    try {
+      FakeSource.reset();
+      probeKey = nextInitialKey();
+      probeUrl = `/api/apps/a/deploys/stream:${initialKey}`;
+      let version = 1;
+      let calls = 0;
+      probeFetch = () => {
+        calls += 1;
+
+        return Promise.resolve([`v${version}`]);
+      };
+
+      capturedFeed = undefined;
+      const ui = render(FeedProbe);
+      // The hub is a module singleton shared with earlier tests: reconcile
+      // now so this probe's topic gets its own connection in this test
+      // instead of depending on their settle timers.
+      resetStreamHub();
+      await ui.settled();
+
+      const feed = readFeed();
+
+      if (feed === undefined) {
+        throw new Error("the probe did not capture a feed");
+      }
+
+      // The initial paint owns the first fetch.
+      expect(feedValue(feed.state())).toEqual(["v1"]);
+      expect(calls).toBe(1);
+
+      // The server opens the topic on the fresh connection.
+      const [source] = FakeSource.instances;
+
+      if (source === undefined) {
+        throw new Error("the hub opened no source");
+      }
+
+      source.emit("open");
+      source.emit("message", '0:["live"]');
+      await ui.settled();
+      expect(feedValue(feed.state())).toEqual(["live"]);
+
+      // The server drops the topic; the panel keeps its rows and reports
+      // retrying.
+      source.emit("message", "0:!");
+      await ui.settled();
+      expect(feed.state()._tag).toBe("Reconnecting");
+      expect(feedValue(feed.state())).toEqual(["live"]);
+      expect(calls).toBe(1);
+
+      // The server re-runs the handler: `+` reopens the topic, and the
+      // reopen re-reads the snapshot (the deploy finished while dropped).
+      version = 2;
+      source.emit("message", "0:+");
+      await ui.settled();
+      expect(calls).toBe(2);
+      expect(feed.state()._tag).toBe("Reconnecting");
+      expect(feedValue(feed.state())).toEqual(["v2"]);
+
+      // The stream stays the live source: the next frame still wins.
+      source.emit("message", '0:["new"]');
+      await ui.settled();
+      expect(feed.state()._tag).toBe("Live");
+      expect(feedValue(feed.state())).toEqual(["new"]);
+      ui.unmount();
+    } finally {
+      restoreDom();
     }
   });
 });
