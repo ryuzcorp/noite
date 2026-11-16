@@ -1,3 +1,4 @@
+import { AccountPanel } from "../account/panel";
 import { AdminAppsPanel } from "../admin/apps";
 import { AdminInvitesPanel } from "../admin/invites";
 import { AdminSettingsPanel } from "../admin/settings";
@@ -33,9 +34,13 @@ import { adminStatus, session } from "../resources";
 //! Overview lists the control D1, which opens on its own
 //! `/storage/_control/...` page like any app's storage.
 //!
-//! Visibility mirrors the server gate: a real instance admin, never an
-//! impersonated session — and the runner streams behind these panels re-check
-//! the same rule (lib/server/apps.server, src/http/routes).
+//! Visibility mirrors the server gate with one deliberate widening: a real
+//! instance admin sees every tab, never while impersonating — and any other
+//! signed-in account (never banned, anonymous or impersonated) sees only its
+//! own Account tab, the former `/account` page. The runner streams and admin
+//! actions behind the other panels re-check the same rule server-side
+//! (lib/server/apps.server, src/http/routes), so the tab filter is navigation,
+//! not the gate.
 //!
 //! The dev image serves this UI from `vite dev` and supervises no control
 //! celld, so there is no control telemetry at all. The runner reports that on
@@ -57,6 +62,7 @@ const TABS = [
   { id: "apps", label: "Apps" },
   { id: "invites", label: "Invites" },
   { id: "settings", label: "Settings" },
+  { id: "account", label: "Account" },
 ] as const;
 
 type TabId = (typeof TABS)[number]["id"];
@@ -66,6 +72,7 @@ type TabId = (typeof TABS)[number]["id"];
  * `?t=` falls back to Overview) rather than charting data that cannot exist.
  * The admin tabs work either way. */
 const NEEDS_FLEET: Record<TabId, boolean> = {
+  account: false,
   apps: false,
   errors: true,
   invites: false,
@@ -76,9 +83,41 @@ const NEEDS_FLEET: Record<TabId, boolean> = {
   users: false,
 };
 
+/** The tabs one viewer may see, in bar order. Admins see every tab the fleet
+ * allows; any other signed-in viewer sees only their own Account tab (the
+ * former `/account` page). Pure so the unit test pins the matrix. */
+export const visibleControlTabs = (
+  admin: boolean,
+  telemetry: boolean
+): readonly { readonly id: TabId; readonly label: string }[] =>
+  TABS.filter(
+    (item) =>
+      (telemetry || !NEEDS_FLEET[item.id]) && (admin || item.id === "account")
+  );
+
 /** Parse `?t=`: unknown tabs fall back to overview. */
 const toTabId = (raw: string): TabId =>
   TABS.find((tab) => tab.id === raw)?.id ?? "overview";
+
+/** Which tab the control page shows. A non-admin lands on their Account tab
+ * whatever `?t=` says, since it is their only tab; a stale admin `?t=` on an
+ * install without the control fleet falls back to Overview rather than
+ * rendering an empty panel. Pure so the unit test pins the matrix. */
+export const activeControlTab = (
+  admin: boolean,
+  requested: TabId,
+  telemetry: boolean
+): TabId => {
+  if (!admin) {
+    return "account";
+  }
+
+  if (telemetry || !NEEDS_FLEET[requested]) {
+    return requested;
+  }
+
+  return "overview";
+};
 
 /** Metrics tab: the window lives in `?r=` (24 / 168 / 720 hours), like a
  * tenant app. The card is keyed by the window because its live feed opens one
@@ -175,16 +214,18 @@ const FleetUnknownNotice = () => (
   </section>
 );
 
-const ControlAppDetailBody = ({ fleet }: { fleet: FleetState }) => {
+const ControlAppDetailBody = ({
+  admin,
+  fleet,
+}: {
+  admin: boolean;
+  fleet: FleetState;
+}) => {
   const tab = searchParam<TabId>("t", { default: "overview", parse: toTabId });
   const requested = tab();
   const telemetry = telemetryAvailable(fleet);
-
-  // A stale `?t=metrics` on an install without the control fleet falls back
-  // to Overview rather than rendering an empty panel.
-  const active = telemetry || !NEEDS_FLEET[requested] ? requested : "overview";
-
-  const tabs = TABS.filter((item) => telemetry || !NEEDS_FLEET[item.id]);
+  const active = activeControlTab(admin, requested, telemetry);
+  const tabs = visibleControlTabs(admin, telemetry);
 
   // The open error (ErrorsPanel's `?e=`) lives in the URL too: a tab click
   // lands on the tab's top level, so Errors shows the list, not a stale
@@ -240,6 +281,7 @@ const ControlAppDetailBody = ({ fleet }: { fleet: FleetState }) => {
       {active === "apps" ? <AdminAppsPanel /> : null}
       {active === "invites" ? <AdminInvitesPanel /> : null}
       {active === "settings" ? <AdminSettingsPanel /> : null}
+      {active === "account" ? <AccountPanel /> : null}
     </DetailShell>
   );
 };
@@ -256,10 +298,14 @@ export const ControlAppDetail = () => {
     resourceValue(sess.state()) !== undefined;
 
   // The one predicate (lib/authority): role, env anchor, ban and
-  // impersonation are already folded in by the server's overview.
-  const allowed = mayAdministerInstance(
-    overviewAuthority(resourceValue(admin.state()))
-  );
+  // impersonation are already folded in by the server's overview. Admins get
+  // every tab; any other signed-in account gets only its Account tab (the
+  // former `/account` page) — banned, anonymous and impersonated sessions
+  // keep the old answer. Every admin panel and control stream re-checks
+  // server-side, so the tab filter is navigation, not the gate.
+  const authority = overviewAuthority(resourceValue(admin.state()));
+  const isAdmin = mayAdministerInstance(authority);
+  const allowed = isAdmin || authority._tag === "Plain";
 
   if (!ready) {
     return (
@@ -282,6 +328,7 @@ export const ControlAppDetail = () => {
   // runner has not answered) shows a neutral notice rather than guessing.
   return (
     <ControlAppDetailBody
+      admin={isAdmin}
       fleet={fleetState(resourceValue(admin.state())?.controlFleet)}
     />
   );

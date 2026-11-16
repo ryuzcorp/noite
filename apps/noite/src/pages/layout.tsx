@@ -306,7 +306,7 @@ export default function DashboardLayout({ children }: { children?: View }) {
                   class="dropdown-content menu bg-base-100 dark:bg-base-200 rounded-box z-10 w-52 p-2 shadow"
                 >
                   <li>
-                    <a {...link("/account")}>
+                    <a {...link("/apps/_control?t=account")}>
                       <CircleUser />
                       Account
                     </a>

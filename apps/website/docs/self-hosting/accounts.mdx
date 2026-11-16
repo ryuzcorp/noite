@@ -15,7 +15,7 @@ Setup codes are 20 characters in four-char groups (`ABCD-EFGH-JKLM-NPQR-STUV`) d
 
 ## First-run onboarding
 
-A new account sees a one-time three-step tour the first time it reaches the dashboard: create an app and push to its Git remote, mint an API token (keys live on `/account` — used as the Git HTTPS password with username `git`, or as `NOITE_API_KEY` for the CLI), and where to follow the project. Finishing, skipping, or closing the modal marks the account done (`user.onboardedAt`) and it never returns. An account that signed in before this release sees the tour once and is then marked the same way; no operator action is needed.
+A new account sees a one-time three-step tour the first time it reaches the dashboard: create an app and push to its Git remote, mint an API token (keys live on the Account tab of the Noite app — `/apps/_control?t=account` — used as the Git HTTPS password with username `git`, or as `NOITE_API_KEY` for the CLI), and where to follow the project. Finishing, skipping, or closing the modal marks the account done (`user.onboardedAt`) and it never returns. An account that signed in before this release sees the tour once and is then marked the same way; no operator action is needed.
 
 ## Lost passkey
 
@@ -33,7 +33,7 @@ It prints a code and where to enter it. The code is the same kind the email carr
 
 ## The admin home
 
-An instance admin sees the control plane itself in `/apps`: the **Noite** card ("admin"), which is not a user app but a link to a dedicated detail page. That page is the whole admin home — the control plane's telemetry tabs (Overview, Metrics, Errors, Logs) next to instance administration (Users, Apps, Invites) and the instance switches (**Settings**: anonymous telemetry, release check), with the control database linked from Overview. `/account` is personal settings only: profile, passkeys, API keys, the account's own invite codes and agent connect. Every tab re-checks the same rule server-side: a real instance admin, never an impersonated session.
+Every signed-in account sees the control plane itself in `/apps`: the **Noite** card, which is not a user app but a link to a dedicated detail page. For an instance admin that page is the whole admin home — the control plane's telemetry tabs (Overview, Metrics, Errors, Logs) next to instance administration (Users, Apps, Invites) and the instance switches (**Settings**: anonymous telemetry, release check), with the control database linked from Overview. Any other account sees only its own **Account** tab there: profile, passkeys, API keys, the account's own invite codes and agent connect. Every admin tab re-checks the same rule server-side: a real instance admin, never an impersonated session.
 
 **Ban** in the Users tab revokes the account's sessions and deletes its API keys, so `git push`, event ingest and `/mcp` stop immediately. The ban is checked on every request as well, so a key that somehow survived the deletion is still refused. Unbanning does not restore a deleted key: the account mints a new one.
 

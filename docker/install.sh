@@ -599,8 +599,8 @@ $(first_run_note)
 
 ${YELLOW}${BOLD}Telemetry.${RESET} On by default: once a day this install sends Noite's maintainers
 an anonymous, count-only summary (version, platform, apps, deploys, users) — no
-domains, names, emails or IPs. Turn it off under Admin on
-https://app.$DOMAIN/account, or set NOITE_TELEMETRY=0 in $NOITE_DIR/.env and run
+domains, names, emails or IPs. Turn it off under Settings on
+https://app.$DOMAIN/apps/_control?t=settings, or set NOITE_TELEMETRY=0 in $NOITE_DIR/.env and run
   cd $NOITE_DIR && docker compose$files up -d
 
   Config       $NOITE_DIR/.env (keep it: it holds the secrets)

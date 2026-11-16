@@ -40,7 +40,7 @@ A key is at most as powerful as its owner: a ceiling never grants a role the own
 - **Every refusal is uniform.** A key scoped elsewhere, an app you cannot see and an app that does not exist answer the same way, so a key is never an existence oracle for apps it cannot reach. An expired key is the one exception: the caller holds it, so the answer says `API key expired`.
 - **A key whose stored scope cannot be read is refused**, never treated as account-wide.
 - **Bans win.** A banned account's keys stop working immediately and are deleted; unbanning does not restore them.
-- **Not a session.** A key cannot sign in, change the account, mint another key or read `/account`; it only reaches the surfaces in the table above.
+- **Not a session.** A key cannot sign in, change the account, mint another key or open the Account tab; it only reaches the surfaces in the table above.
 
 ## Attribution
 

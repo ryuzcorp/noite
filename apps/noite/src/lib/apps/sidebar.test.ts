@@ -36,7 +36,7 @@ describe("sidebarPlace", () => {
   });
 
   test("pages outside the apps area are not apps pages", () => {
-    for (const path of ["/account", "/"]) {
+    for (const path of ["/login", "/"]) {
       expect(sidebarPlace(path)).toEqual({
         activeAppId: null,
         activeView: null,

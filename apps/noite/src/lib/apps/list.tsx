@@ -25,13 +25,7 @@ import {
   liveFeed,
 } from "../feeds";
 import { resourceValue } from "../resource";
-import {
-  adminStatus,
-  invalidate,
-  keys,
-  myInvitations,
-  session,
-} from "../resources";
+import { invalidate, keys, myInvitations, session } from "../resources";
 import { Avatar } from "../ui/avatar";
 import { ChevronRight } from "../ui/icons";
 import { ListSkeleton } from "../ui/skeletons";
@@ -177,10 +171,11 @@ const InvitationsBanner = () => {
   );
 };
 
-/** The control plane as an extra card above the user's apps. Only a real
- * instance admin sees it, and never on an impersonated session — the same
- * gate every control-D1 action re-checks server-side. It links to the
- * dedicated control app detail, not a runner app row. */
+/** The control plane as an extra card above the user's apps: every signed-in
+ * account sees it (never on an impersonated session), and the detail page
+ * shows each viewer only what they may see — admins every tab, anyone else
+ * only their Account tab. It links to the dedicated control app detail, not
+ * a runner app row. */
 const ControlAppRow = () => (
   <li class="list-row">
     <div>
@@ -219,18 +214,18 @@ const ControlAppRow = () => (
  * no polling, and resubscribe is automatic on drop. */
 export const AppsList = () => {
   const feed = liveFeed(feedKeys.apps, applistUrl(), decodeApps);
-  // `session()` is shared with the layout; `adminStatus()` is one cached call.
-  const admin = adminStatus();
+  // `session()` is shared with the layout. Every signed-in account sees the
+  // card (never while impersonating); the detail page decides which tabs.
   const sess = session();
 
   const showControl = (): boolean => {
     const user = resourceValue(sess.state());
 
-    if (!user || user.session.impersonatedBy !== null) {
-      return false;
-    }
-
-    return resourceValue(admin.state())?.isAdmin ?? false;
+    return (
+      user !== undefined &&
+      user !== null &&
+      user.session.impersonatedBy === null
+    );
   };
 
   const items = (): App[] => feedValue(feed.state()) ?? [];
