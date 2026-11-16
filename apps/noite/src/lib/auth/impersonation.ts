@@ -10,9 +10,9 @@
 //! ```
 //!
 //! The return path used to be hard-coded to the admin home, so an admin who
-//! started from `/account` came back somewhere else. It is remembered per tab
-//! in `sessionStorage` (never a cookie: it must not outlive the tab) and only
-//! ever a rooted, same-origin path.
+//! started from the Account tab came back somewhere else. It is remembered
+//! per tab in `sessionStorage` (never a cookie: it must not outlive the tab)
+//! and only ever a rooted, same-origin path.
 import { sameOriginPath } from "../env-auth";
 
 /** sessionStorage key. Scoped to the tab: two admins in two tabs do not share

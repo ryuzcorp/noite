@@ -296,14 +296,14 @@ export interface KeyScopeOptions {
   expiry?: "1h" | "1d" | "7d" | "30d" | "never";
 }
 
-/** Mint an API key on the signed-in account's Account page. The raw key is
+/** Mint an API key on the signed-in account's Account tab. The raw key is
  * shown exactly once, so it is read from that one screen. */
 export const mintApiKey = async (
   page: Page,
   label: string,
   options: KeyScopeOptions = {}
 ): Promise<string> => {
-  await page.goto("/account");
+  await page.goto("/apps/_control?t=account");
   await page
     .locator('button[type="button"]', { hasText: "Create key" })
     .click();
@@ -378,7 +378,7 @@ export const mintApiKey = async (
   return apiKey;
 };
 
-/** One of the signed-in account's unused invite codes: the Account page lists
+/** One of the signed-in account's unused invite codes: the Account tab lists
  * the share registration minted for it. When the share is used up (every
  * spec that registers a second account spends one), the admin mints one more
  * on the admin Invites tab instead of waiting on a code that never appears. */
@@ -397,7 +397,7 @@ export const readInviteCode = async (page: Page): Promise<string> => {
       response.request().method() === "POST"
   );
 
-  await page.goto("/account");
+  await page.goto("/apps/_control?t=account");
   await expect(invitesCard).toBeVisible();
 
   const listedResponse = await listed;
@@ -417,9 +417,9 @@ export const readInviteCode = async (page: Page): Promise<string> => {
     await expect(page.locator("#invite-count")).toBeVisible();
     await page.locator("#invite-count").fill("1");
 
-    // The mint is a POST the pool reloads after. Navigating to /account
-    // before it answers aborted it on the wire — the trace shows
-    // adminCreateInvites at status -1 and an empty `/account` list right
+    // The mint is a POST the pool reloads after. Navigating to the Account
+    // tab before it answers aborted it on the wire — the trace shows
+    // adminCreateInvites at status -1 and an empty Account list right
     // after (runs 43133528648 and 43180768531) — so the click needs the
     // response as its completion signal: `#admin-invite-search` is on screen
     // before the click, which proved nothing.
@@ -459,7 +459,7 @@ export const readInviteCode = async (page: Page): Promise<string> => {
     ).toBeVisible();
 
     known = mintedCode;
-    await page.goto("/account");
+    await page.goto("/apps/_control?t=account");
   }
 
   // The card is the contract: it must show the code the server says is
@@ -473,7 +473,7 @@ export const readInviteCode = async (page: Page): Promise<string> => {
   const code = raw?.trim() ?? "";
 
   if (code === "") {
-    throw new Error("no invite code on the Account page");
+    throw new Error("no invite code on the Account tab");
   }
 
   return code;

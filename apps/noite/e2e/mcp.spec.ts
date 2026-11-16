@@ -448,8 +448,8 @@ test("a scoped key reaches only its app, over MCP and git", async ({
     pushAppDir(key, new URL("../test", import.meta.url), OUTSIDE_SLUG)
   ).toThrow();
 
-  // The account page names the key's scope and ceiling on its row.
-  await page.goto("/account");
+  // The Account tab names the key's scope and ceiling on its row.
+  await page.goto("/apps/_control?t=account");
   const row = page.locator("li", { hasText: "mcp-scoped-key" });
   // Exact: the key's own label contains the slug as a substring.
   await expect(row.getByText(SCOPED_SLUG, { exact: true })).toBeVisible();

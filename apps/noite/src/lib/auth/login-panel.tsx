@@ -895,7 +895,7 @@ export const LoginPanelApp = defineApp({
               });
 
               return result.error ?? null;
-            }, "/account")
+            }, "/apps/_control?t=account")
           ),
           model: { ...model, busy: true, error: "" },
         };

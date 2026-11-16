@@ -1,6 +1,6 @@
-/** The detail layout shared by app pages, the Noite admin page and
- * `/account`: a header (identity, actions, tabs) that stays put above a
- * scrolling tab body, and an optional side panel, like Code mode. */
+/** The detail layout shared by app pages and the Noite page (admin home plus
+ * the Account tab): a header (identity, actions, tabs) that stays put above
+ * a scrolling tab body, and an optional side panel, like Code mode. */
 import { atom, watch } from "ilha";
 import type { View } from "ilha";
 

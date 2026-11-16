@@ -266,8 +266,12 @@ test("the users tab finds the second account and refuses it admin surfaces", asy
   await expect(row).toBeVisible();
   await expect(row.getByText(`${SECOND_EMAIL} · user`)).toBeVisible();
 
+  // A non-admin lands on their own Account tab whatever `?t=` says: no Users
+  // panel, no instance switches — and the admin APIs behind those panels
+  // refuse the same session.
   await second.goto("/apps/_control?t=users");
-  await expect(second.getByText("App not found.")).toBeVisible();
+  await expect(second.getByRole("heading", { name: "Profile" })).toBeVisible();
+  await expect(second.locator("#admin-user-search")).toHaveCount(0);
 
   const denied = await adminPost(second.request, "/api/admin/listUsers", {
     page: 0,
@@ -277,10 +281,13 @@ test("the users tab finds the second account and refuses it admin surfaces", asy
   expect(denied.status).toBe(422);
   expect(denied.body.errors?.form).toContain("Admin only");
 
-  // The Settings tab (the instance switches moved off `/account`) is behind
-  // the same gate, and so is the action behind its cards.
+  // The Settings tab (the instance switches) is admin-only the same way, and
+  // so is the action behind its cards.
   await second.goto("/apps/_control?t=settings");
-  await expect(second.getByText("App not found.")).toBeVisible();
+  await expect(second.getByRole("heading", { name: "Profile" })).toBeVisible();
+  await expect(
+    second.getByRole("heading", { name: "Instance settings" })
+  ).toHaveCount(0);
 
   const deniedTelemetry = await adminPost(
     second.request,
@@ -508,9 +515,12 @@ test("remove admin takes the gate back", async ({ page }) => {
 
     expect(denied.status).toBe(422);
   }).toPass({ timeout: 30_000 });
+  // Demoted back to a plain account: the admin tabs are gone, only the
+  // Account tab remains.
   await second.goto("/apps/_control?t=users");
   await second.reload();
-  await expect(second.getByText("App not found.")).toBeVisible();
+  await expect(second.getByRole("heading", { name: "Profile" })).toBeVisible();
+  await expect(second.locator("#admin-user-search")).toHaveCount(0);
 });
 
 test("ban freezes the session and sign-in; unban restores both", async ({

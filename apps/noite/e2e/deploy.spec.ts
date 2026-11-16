@@ -96,7 +96,7 @@ test(
     // leave focus (and so the open menu) on the clicked item.
     await page.getByRole("button", { name: "Account menu" }).click();
     await page.getByRole("link", { exact: true, name: "Account" }).click();
-    await expect(page).toHaveURL(/\/account$/u);
+    await expect(page).toHaveURL(/\/apps\/_control\?t=account/u);
     await expect(
       page.getByRole("link", { exact: true, name: "Account" })
     ).toBeHidden();
