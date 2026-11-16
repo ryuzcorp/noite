@@ -190,12 +190,15 @@ test("email invites mint, revoke, and gate registration", async ({
   });
 
   const revokedRow = invites.locator("li.list-row", { hasText: REVOKED_EMAIL });
-  await expect(revokedRow.getByText("available")).toBeVisible();
+  // Badges match exactly: the address itself contains "revoked".
+  await expect(
+    revokedRow.getByText("available", { exact: true })
+  ).toBeVisible();
   const liveRow = invites.locator("li.list-row", { hasText: SECOND_EMAIL });
-  await expect(liveRow.getByText("available")).toBeVisible();
+  await expect(liveRow.getByText("available", { exact: true })).toBeVisible();
 
   await revokedRow.getByRole("button", { name: "Revoke" }).click();
-  await expect(revokedRow.getByText("revoked")).toBeVisible();
+  await expect(revokedRow.getByText("revoked", { exact: true })).toBeVisible();
 
   // Server-side proof of the revoke behind the badge.
   await expect(async () => {
