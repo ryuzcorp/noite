@@ -378,6 +378,28 @@ fn errors_block() -> Vec<String> {
     out
 }
 
+/// The edge access log: JSON lines with the one-time `invite` token redacted
+/// from the logged URI (Caddy `query` filter, matching the pinned caddy
+/// v2.11.9 `QueryFilter` syntax). Registration links arrive as
+/// `/login?invite=…`; the token is single-use, but it must never sit in a
+/// log file. Path and everything else log as before, so the access ingest
+/// keeps working on the same shape.
+fn access_log_block(cfg: &Config) -> Vec<String> {
+    vec![
+        "\tlog {".into(),
+        format!("\t\toutput file {}", cfg.caddy_access_log),
+        "\t\tformat filter {".into(),
+        "\t\t\twrap json".into(),
+        "\t\t\tfields {".into(),
+        "\t\t\t\trequest>uri query {".into(),
+        "\t\t\t\t\tdelete invite".into(),
+        "\t\t\t\t}".into(),
+        "\t\t\t}".into(),
+        "\t\t}".into(),
+        "\t}".into(),
+    ]
+}
+
 /// One serving site: access log (with the trace id), compression, the trace
 /// map, then the shared branch.
 fn serving_site(addr: &str, tls: bool, cfg: &Config) -> Vec<String> {
@@ -387,10 +409,7 @@ fn serving_site(addr: &str, tls: bool, cfg: &Config) -> Vec<String> {
         out.push("\t\ton_demand".into());
         out.push("\t}".into());
     }
-    out.push("\tlog {".into());
-    out.push(format!("\t\toutput file {}", cfg.caddy_access_log));
-    out.push("\t\tformat json".into());
-    out.push("\t}".into());
+    out.extend(access_log_block(cfg));
     out.push(format!("\t{TRACE_LOG_APPEND}"));
     out.push(format!("\t{UPSTREAM_LOG_APPEND}"));
     out.push(format!("\t{EDGE_UPSTREAM_LOG_APPEND}"));
@@ -476,10 +495,7 @@ fn static_caddyfile(cfg: &Config) -> String {
             format!("https://{{host}}:{}{{uri}}", cfg.https_port)
         };
         lines.push(":80 {".into());
-        lines.push("\tlog {".into());
-        lines.push(format!("\t\toutput file {}", cfg.caddy_access_log));
-        lines.push("\t\tformat json".into());
-        lines.push("\t}".into());
+        lines.extend(access_log_block(cfg));
         lines.push(format!("\t{TRACE_LOG_APPEND}"));
         for line in TRACE_MAP {
             lines.push(format!("\t{line}"));
@@ -571,6 +587,16 @@ mod tests {
             out.contains("reverse_proxy {http.vars.edge_upstream}"),
             "{out}"
         );
+    }
+
+    #[test]
+    fn access_log_redacts_the_invite_token() {
+        let cfg = prod_config();
+        let out = static_caddyfile(&cfg);
+        assert!(out.contains("request>uri query {"), "{out}");
+        assert!(out.contains("delete invite"), "{out}");
+        // The filter wraps JSON: the ingest keeps parsing the same lines.
+        assert!(out.contains("wrap json"), "{out}");
     }
 
     #[test]

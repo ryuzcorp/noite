@@ -179,6 +179,10 @@ const authorityOfSession = async (
       email: user.email,
       impersonatedBy: session.impersonatedBy,
       role: "admin",
+      // Unreachable for pending sessions (they resolve `Pending` above and
+      // never enter this branch), but every call site passes `status` so the
+      // audit stays one rule with no exceptions.
+      status: user.status === "pending" ? "pending" : null,
     });
   }
 

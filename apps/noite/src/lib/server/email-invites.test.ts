@@ -10,6 +10,7 @@ import {
   SIGNUP_RATE_LIMIT,
   approvePendingUser,
   checkInviteToken,
+  confirmRedeemOf,
   countPendingAccounts,
   createEmailInvite,
   hashInviteToken,
@@ -237,6 +238,27 @@ describe("redeemEmailInvite", () => {
     expect(
       [first._tag, second._tag].filter((tag) => tag === "Ok")
     ).toHaveLength(1);
+  });
+
+  test("a revoke that wins the race reports Revoked, not Used", () => {
+    expect(
+      confirmRedeemOf(
+        { id: "i-1", revoked: true, usedBy: null },
+        "a@example.com"
+      )._tag
+    ).toBe("Revoked");
+    expect(
+      confirmRedeemOf(
+        { id: "i-1", revoked: false, usedBy: "b@example.com" },
+        "a@example.com"
+      )._tag
+    ).toBe("Used");
+    expect(
+      confirmRedeemOf(
+        { id: "i-1", revoked: false, usedBy: "a@example.com" },
+        "a@example.com"
+      )
+    ).toMatchObject({ _tag: "Ok", id: "i-1" });
   });
 });
 

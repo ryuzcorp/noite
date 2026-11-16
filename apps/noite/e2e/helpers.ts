@@ -485,6 +485,10 @@ export const registerInviteeAccount = async (
     await expect(
       page.getByText("Your invitation from the link is attached")
     ).toBeVisible();
+    // The token is captured into component state and stripped from the URL
+    // on load (replaceState): it must never linger for history, logs or
+    // copy-paste.
+    await expect.poll(() => page.url()).not.toContain("invite=");
   }
 
   await page.getByRole("button", { name: "Create passkey" }).click();

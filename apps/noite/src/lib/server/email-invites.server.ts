@@ -467,9 +467,29 @@ export const checkInviteToken = (
     return row.email === normalized ? null : "wrong-email";
   });
 
+/** The confirm re-read after a burn that changed nothing: our write won when
+ * the row carries our address; a set `revoked` means a revoke beat us to it;
+ * anything else is another registration's win. Pure so the race is a unit
+ * test, not timing. Exported for the test. */
+export const confirmRedeemOf = (
+  after: {
+    readonly id: string;
+    readonly revoked: boolean;
+    readonly usedBy: string | null;
+  },
+  normalized: string
+): RedeemOutcome => {
+  if (after.usedBy === normalized) {
+    return RedeemResult.Ok({ id: after.id });
+  }
+
+  return after.revoked === true ? RedeemResult.Revoked() : RedeemResult.Used();
+};
+
 /** Redeem a token for an email. The burn is a conditional write
  * (`usedAt IS NULL AND revoked = 0`) confirmed by a re-read: two concurrent
- * registrations with one token cannot both win, and the loser reads `Used`. */
+ * registrations with one token cannot both win, and the loser reads its
+ * actual state (`Revoked` when a revoke beat it, else `Used`). */
 export const redeemEmailInvite = (
   token: string,
   email: string
@@ -537,14 +557,18 @@ export const redeemEmailInvite = (
       );
 
     const [after] = await db
-      .select({ usedBy: emailInviteTable.usedBy })
+      .select({
+        id: emailInviteTable.id,
+        revoked: emailInviteTable.revoked,
+        usedBy: emailInviteTable.usedBy,
+      })
       .from(emailInviteTable)
       .where(eq(emailInviteTable.id, row.id))
       .limit(1);
 
-    return after?.usedBy === normalized
-      ? RedeemResult.Ok({ id: row.id })
-      : RedeemResult.Used();
+    return after === undefined
+      ? RedeemResult.Used()
+      : confirmRedeemOf(after, normalized);
   });
 
 /** What a revoke actually did. A spent token is history: the transition is

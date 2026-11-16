@@ -113,6 +113,7 @@ const probeAuthority = async (
     email: user.email,
     impersonatedBy: session.impersonatedBy,
     role: user.role,
+    status: user.status === "pending" ? "pending" : null,
   });
 };
 
@@ -152,6 +153,7 @@ const requireAdmin = async (
       email,
       impersonatedBy: session.impersonatedBy,
       role: user.role,
+      status: user.status === "pending" ? "pending" : null,
     });
 
     if (authority._tag !== "InstanceAdmin") {

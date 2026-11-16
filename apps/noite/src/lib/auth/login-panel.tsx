@@ -30,7 +30,7 @@ import type { Dispatch } from "@ilha/model";
 import { useRouter } from "@ilha/void";
 import { Data } from "effect";
 import * as Effect from "effect/Effect";
-import { watch } from "ilha";
+import { atom, watch } from "ilha";
 
 import { authClient } from "../auth-client";
 import { sameOriginPath } from "../env-auth";
@@ -466,8 +466,18 @@ const RegisterForm = ({
   const requiresSetupCode = setupMode === "code" || setupMode === "email";
   const reservedForAdmin = setupMode === "email";
   // An invite link carries its token in `?invite=`; pasting one into the
-  // field works too. An explicit entry wins over the link.
+  // field works too. An explicit entry wins over the link. The link token is
+  // captured into component state on first render and stripped from the URL
+  // right after (replaceState, no navigation), so it never lingers in
+  // history, logs or a copied address bar — the notice and the submit below
+  // read the captured copy.
   const linkedInvite = searchParam("invite", { default: "" });
+  const linkToken = atom.lazy(() => linkedInvite());
+  const inviteToken = linkToken();
+
+  watch.once(() => {
+    linkedInvite.set("");
+  });
 
   return (
     <form
@@ -483,7 +493,7 @@ const RegisterForm = ({
 
         const email = text(data, "email");
         const name = text(data, "name");
-        const invite = text(data, "invite") || linkedInvite();
+        const invite = text(data, "invite") || inviteToken;
         const setupCode = text(data, "setupcode");
 
         if (!(email && name)) {
@@ -562,7 +572,7 @@ const RegisterForm = ({
       ) : null}
       {firstRun ? null : (
         <>
-          {linkedInvite() ? (
+          {inviteToken ? (
             <p class="alert text-sm whitespace-normal">
               Your invitation from the link is attached — creating this account
               redeems it.

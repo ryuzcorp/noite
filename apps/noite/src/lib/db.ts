@@ -85,7 +85,11 @@ const runDbSetup = async (): Promise<void> => {
   const db = getDb();
 
   const existing = await db
-    .select({ id: userTable.id, role: userTable.role })
+    .select({
+      id: userTable.id,
+      role: userTable.role,
+      status: userTable.status,
+    })
     .from(userTable)
     .where(eq(userTable.email, adminEmail))
     .limit(1);
@@ -95,6 +99,13 @@ const runDbSetup = async (): Promise<void> => {
   if (!user) {
     // Not registered yet: the next pass promotes it. Caching now would lose
     // the promotion for an account created later in this isolate.
+    return;
+  }
+
+  if (user.status === "pending") {
+    // A waitlist account holds no access — never promote it, even at the
+    // anchored address. Approval flips `status` first; the next pass after
+    // that promotes it like any other registered address.
     return;
   }
 

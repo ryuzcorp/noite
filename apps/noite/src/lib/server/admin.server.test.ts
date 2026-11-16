@@ -7,6 +7,7 @@ import { testRouteContext } from "../../testing/context";
 import { createTestD1 } from "../../testing/d1";
 import type { TestD1 } from "../../testing/d1";
 import { authFromEnv } from "../auth";
+import { controlEnv } from "../control-env";
 import { ensureDb, setD1Binding } from "../db";
 import { registrationStatus } from "./account.server";
 import {
@@ -301,6 +302,38 @@ describe("waitlist moderation", () => {
     );
 
     expect(promotePending.status).toBe(422);
+  });
+
+  test("a pending account never administers, even at the anchored address", async () => {
+    controlEnv.NOITE_ADMIN_EMAIL = "boss@example.com";
+
+    try {
+      const waiting = await mintCookie(
+        "boss-1",
+        "boss@example.com",
+        "user",
+        "pending"
+      );
+
+      const denied = await authedPost(
+        getWaitlist,
+        "/api/admin/getWaitlist",
+        {},
+        waiting
+      );
+
+      expect(denied.status).toBe(422);
+
+      // The anchor promotion must not fire either: the row keeps its role,
+      // so approving it later cannot mint an admin.
+      const rows = db.raw
+        .query(`SELECT role, status FROM "user" WHERE email = ?`)
+        .all("boss@example.com") as { role: string; status: string }[];
+
+      expect(rows).toEqual([{ role: "user", status: "pending" }]);
+    } finally {
+      delete controlEnv.NOITE_ADMIN_EMAIL;
+    }
   });
 
   test("the waitlist switch round-trips for admins and refuses everyone else", async () => {
