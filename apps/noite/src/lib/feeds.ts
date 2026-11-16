@@ -1162,10 +1162,11 @@ export const decodeLogs = (raw: string): string[] => {
   return next as string[];
 };
 
-/** Usage frame: the app's hourly counters, oldest first. Literal field types
- * (not the runner interface) so the frame stays a `WatchValue` for
- * `watch(feed.latest, …)` — interfaces carry no implicit index signature and
- * fail the constraint. Mirrors `RunnerMetric` in `lib/runner.ts`
+/** Usage frame: the app's hourly counters, oldest first, plus the Analytics
+ * breakdown over the same window. Literal field types (not the runner
+ * interfaces) so the frame stays a `WatchValue` for `watch(feed.latest, …)`
+ * — interfaces carry no implicit index signature and fail the constraint.
+ * Mirrors `RunnerMetric` and `RunnerBreakdown` in `lib/runner.ts`
  * field-for-field. */
 // oxlint-disable-next-line typescript/consistent-type-definitions -- must stay a type alias: watch(feed.latest) requires a WatchValue, and interfaces carry no implicit index signature (tsc-verified).
 export type MetricsFrame = {
@@ -1180,21 +1181,59 @@ export type MetricsFrame = {
     memoryAvgBytes: number;
     cpuMs: number;
   }[];
+  breakdown: {
+    browsers: { value: string; requests: number }[];
+    os: { value: string; requests: number }[];
+    paths: { value: string; requests: number }[];
+    referrers: { value: string; requests: number }[];
+  };
 };
 
-/** Usage frame: the hourly `metrics` array, validated as an array. */
+/** Usage frame: the hourly `metrics` array, validated as an array, plus the
+ * Analytics breakdown over the same window (absent on frames assembled
+ * before the breakdown read existed — those render empty Analytics cards). */
 export const decodeMetrics = (raw: string): MetricsFrame => {
-  // SAFETY: the one required field is checked below; rows are only rendered
-  // as text and numeric attributes.
-  const frame = parseFrame(raw) as { metrics?: unknown };
+  // SAFETY: required fields are checked below; rows are only rendered as
+  // text and numeric attributes.
+  const frame = parseFrame(raw) as {
+    breakdown?: {
+      browsers?: unknown;
+      os?: unknown;
+      paths?: unknown;
+      referrers?: unknown;
+    };
+    metrics?: unknown;
+  };
 
   if (!Array.isArray(frame.metrics)) {
     throw badFrame("metrics");
   }
 
+  const analytic: MetricsFrame["breakdown"] = {
+    browsers: [],
+    os: [],
+    paths: [],
+    referrers: [],
+  };
+
+  const { breakdown } = frame;
+
+  for (const key of ["browsers", "os", "paths", "referrers"] as const) {
+    const list = breakdown?.[key];
+
+    if (Array.isArray(list)) {
+      // SAFETY: passed Array.isArray above; entries mirror the
+      // `/metrics/breakdown` endpoint and flow only into the Analytics tables.
+      analytic[key] = list as (typeof analytic)[typeof key];
+    }
+  }
+
   // SAFETY: passed Array.isArray above; rows mirror the `/metrics` endpoint
   // and flow only into usage rendering.
-  return { metrics: frame.metrics as MetricsFrame["metrics"] };
+  return {
+    breakdown: analytic,
+    metrics: frame.metrics as MetricsFrame["metrics"],
+  };
 };
 
 /** Runner events-stream snapshot (same rows as the list endpoints). */

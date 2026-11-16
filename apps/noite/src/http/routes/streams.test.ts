@@ -102,6 +102,10 @@ const runMetricsStream = async (versionFor: (call: number) => number) => {
       return Response.json({ version: versionFor(versionCalls) });
     }
 
+    if (url.includes("/metrics/breakdown")) {
+      return Response.json({ browsers: [], os: [], paths: [], referrers: [] });
+    }
+
     return Response.json([]);
   });
   const controller = new AbortController();

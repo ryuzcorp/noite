@@ -89,9 +89,9 @@ pub use instance_setting::{
 pub use metrics::{
     app_hour_lat, backfill_trace_request, clear_telemetry_replay_if, delete_environment_telemetry,
     delete_metric_watermarks_for, get_app_hour, get_metric_watermarks, get_telemetry_replay,
-    last_request_us, list_app_logs, list_app_metrics, prune_app_hours, prune_app_logs,
-    replace_app_hour, replace_app_hour_lat, replace_app_logs, set_metric_watermarks,
-    set_telemetry_replay, AccessTrace, AppHourValues,
+    last_request_us, list_app_logs, list_app_metrics, list_hour_breakdown, prune_app_hours,
+    prune_app_logs, record_hour_dims, replace_app_hour, replace_app_hour_lat, replace_app_logs,
+    set_metric_watermarks, set_telemetry_replay, AccessTrace, AppHourValues, DimKind,
 };
 pub use void_cohost::{delete_environment_hashes, get_cohost_hash, set_cohost_hash};
 
@@ -396,7 +396,7 @@ mod tests {
                 "{dead} must be dropped on attach: {tables:?}"
             );
         }
-        for kept in ["app_hour", "app_log", "metric_watermark", "app_error_issue"] {
+        for kept in ["app_hour", "app_hour_dim", "app_log", "metric_watermark", "app_error_issue"] {
             assert!(
                 tables.iter().any(|t| t == kept),
                 "{kept} must survive the upgrade: {tables:?}"

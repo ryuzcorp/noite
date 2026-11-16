@@ -133,6 +133,25 @@ pub async fn metrics(
     json_rows(db::list_app_metrics(&state.pool, &scope.app_id, &scope.environment_id, &since).await)
 }
 
+/// The Metrics tab's Analytics cards over one window: per-kind top values
+/// with the rest under `(other)`. Same scope and auth as [`metrics`], one
+/// grouped scan instead of one query per kind.
+pub async fn breakdown(
+    state: &AppState,
+    id: &str,
+    hours: Option<i64>,
+    environment: Option<&str>,
+) -> Result<serde_json::Value, ApiError> {
+    let scope = telemetry_scope(&state.pool, id, environment).await?;
+    let since = hours_since(hours, "%Y-%m-%dT%H:00:00Z");
+    match db::list_hour_breakdown(&state.pool, &scope.app_id, &scope.environment_id, &since).await {
+        Ok(breakdown) => {
+            Ok(serde_json::to_value(breakdown).map_err(|e| ApiError::internal(e.to_string()))?)
+        }
+        Err(e) => Err(ApiError::internal(e.to_string())),
+    }
+}
+
 /// Per-app-and-environment metrics version (spec T3.6): dashboard polls fetch
 /// this first and skip their window queries when it hasn't moved. Each tab
 /// (production, each environment) has its own version.

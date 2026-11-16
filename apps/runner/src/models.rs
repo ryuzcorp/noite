@@ -890,6 +890,32 @@ pub struct AppMetric {
     pub cpu_ms: i64,
 }
 
+/// One breakdown row served to the dashboard (`app_hour_dim` summed over the
+/// window): a classified value and its request count. Values are already
+/// privacy-trimmed at write time — a coarse browser/OS name, the query-less
+/// path, the host-only referrer — and the window fold keeps the top 10 per
+/// kind with the rest under `(other)`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct BreakdownEntry {
+    pub value: String,
+    pub requests: i64,
+}
+
+/// The Metrics tab's Analytics cards over one window: per-kind entries
+/// sorted by requests desc, each already folded to its top 10 plus a
+/// trailing `(other)`. Served by `GET /v1/apps/{id}/metrics/breakdown`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct MetricsBreakdown {
+    pub browsers: Vec<BreakdownEntry>,
+    pub os: Vec<BreakdownEntry>,
+    pub paths: Vec<BreakdownEntry>,
+    pub referrers: Vec<BreakdownEntry>,
+}
+
 /// Triage state of a grouped error (ROTH-6). `open` is the only state in
 /// which `regressed` is meaningful: a resolved (or ignored) issue that fires
 /// again goes back to `open` with `regressed = true` in one write, and the

@@ -1,5 +1,7 @@
 //! Usage charts: request / error / latency / memory / CPU bars over a chosen
-//! window (24h / 7d / 1m), from the runner's hourly counters.
+//! window (24h / 7d / 1m), from the runner's hourly counters, plus the
+//! Analytics breakdown (browsers, OSes, paths, referrers) over the same
+//! window.
 import { Link } from "@ilha/void";
 
 import { api } from "../api";
@@ -252,7 +254,66 @@ const StatTiles = ({
   );
 };
 
+/** One Analytics table: the breakdown kind's top values over the window with
+ * the rest folded into a trailing `(other)` by the runner, each with its
+ * share of the card's own traffic. The runner bounds every kind to its top
+ * 10 plus `(other)`, so the card renders what the endpoint returns. */
+const BreakdownSection = ({
+  empty,
+  entries,
+  head,
+  title,
+}: {
+  empty: string;
+  entries: MetricsFrame["breakdown"]["browsers"];
+  head: string;
+  title: string;
+}) => {
+  const total = sum(entries.map((entry) => entry.requests));
+
+  return (
+    <section class="card bg-base-100 dark:bg-base-200 border-base-300 w-full border shadow-md">
+      <div class="card-body gap-4">
+        <h3 class="m-0 text-lg font-semibold">{title}</h3>
+        <div class="flex flex-col gap-2">
+          {entries.length > 0 ? (
+            <div class="overflow-x-auto">
+              <table class="table-sm table">
+                <thead>
+                  <tr>
+                    <th>{head}</th>
+                    <th class="text-right">requests</th>
+                    <th class="text-right">share</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {entries.map((entry) => (
+                    <tr key={entry.value}>
+                      <td class="font-mono text-xs">{entry.value}</td>
+                      <td class="text-right">
+                        {entry.requests.toLocaleString()}
+                      </td>
+                      <td class="text-right">
+                        {total > 0
+                          ? `${((100 * entry.requests) / total).toFixed(1)}%`
+                          : "—"}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          ) : (
+            <p class="m-0 text-sm opacity-70">{empty}</p>
+          )}
+        </div>
+      </div>
+    </section>
+  );
+};
+
 const MetricsDetailCards = ({
+  breakdown,
   cpus,
   errs,
   hours,
@@ -262,6 +323,7 @@ const MetricsDetailCards = ({
   p95s,
   reqs,
 }: {
+  breakdown: MetricsFrame["breakdown"];
   cpus: number[];
   errs: number[];
   hours: number;
@@ -312,11 +374,39 @@ const MetricsDetailCards = ({
           </section>
         ))}
       </div>
+      <h3 class="m-0 text-lg font-semibold">Analytics</h3>
+      <div class="grid grid-cols-1 gap-4 md:grid-cols-2">
+        <BreakdownSection
+          empty="No browser data yet — visit the app URL, then reload."
+          entries={breakdown.browsers}
+          head="Browser"
+          title="Browsers"
+        />
+        <BreakdownSection
+          empty="No OS data yet — visit the app URL, then reload."
+          entries={breakdown.os}
+          head="OS"
+          title="Operating systems"
+        />
+        <BreakdownSection
+          empty="No visited paths yet — browse the app, then reload."
+          entries={breakdown.paths}
+          head="Path"
+          title="Paths"
+        />
+        <BreakdownSection
+          empty="No referrer data yet — share a link to the app, then reload."
+          entries={breakdown.referrers}
+          head="Source"
+          title="Referrers"
+        />
+      </div>
     </>
   );
 };
 
 const MetricsDetailView = ({
+  breakdown,
   cpus,
   errs,
   hasRows,
@@ -329,6 +419,7 @@ const MetricsDetailView = ({
   p95s,
   reqs,
 }: {
+  breakdown: MetricsFrame["breakdown"];
   cpus: number[];
   errs: number[];
   hasRows: boolean;
@@ -364,6 +455,7 @@ const MetricsDetailView = ({
     ) : null}
     {loaded && hasRows && !loadError ? (
       <MetricsDetailCards
+        breakdown={breakdown}
         cpus={cpus}
         errs={errs}
         hours={hours}
@@ -467,6 +559,14 @@ export const MetricsCard = ({
   // so a revisit paints the last numbers in the very first render.
   const frame: MetricsFrame["metrics"] = feedValue(feed.state())?.metrics ?? [];
 
+  const breakdown: MetricsFrame["breakdown"] = feedValue(feed.state())
+    ?.breakdown ?? {
+    browsers: [],
+    os: [],
+    paths: [],
+    referrers: [],
+  };
+
   const loaded = (): boolean => feedLoaded(feed.state());
 
   const loadError = (): string =>
@@ -493,6 +593,7 @@ export const MetricsCard = ({
     <>
       {detail ? (
         <MetricsDetailView
+          breakdown={breakdown}
           cpus={cpus}
           errs={errs}
           hasRows={frame.length > 0}

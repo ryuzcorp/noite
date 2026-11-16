@@ -3,16 +3,28 @@
 //! Caddy appends one JSON line per request to the file next to the Caddyfile
 //! (see caddy.rs `push_block`). Each reconcile tick consumes new lines,
 //! attributes tenant hosts to apps, and folds them into the fleet's hourly
-//! counters (`metrics/hourly.rs`): the status class, latency and timestamp
-//! inside the line's own transaction, so a line is counted exactly once or
-//! not at all. Only lines a fleet's own `reverse_proxy` answered count
+//! counters (`metrics/hourly.rs`) and its per-dimension breakdown
+//! (`metrics.app_hour_dim`): the status class, latency and timestamp inside
+//! the line's own transaction, so a line is counted exactly once or not at
+//! all. Only lines a fleet's own `reverse_proxy` answered count
 //! ([`served_by_fleet`]) — a redirect, a gate refusal, an edge 429 or an
 //! error page the edge rendered itself is not a request.
+//!
+//! Exactly-once is the transaction plus the cursor: a line's counters, its
+//! four dimension upserts and its trace backfill commit in one transaction,
+//! and the offset advances (and is persisted) only after that commit — so a
+//! mid-loop DB error re-reads exactly the lines that were not applied, never
+//! one that already was, and a retried line is all-or-nothing.
 //!
 //! The same line carries the trace → request join the error ingest backfills
 //! with: a classified (browser, os) pair, the query-less path, method and
 //! status. Privacy: raw user-agents and client IPs never leave this module
-//! (neither is parsed), and the join is in memory only.
+//! (neither is parsed), and the persisted breakdown keeps only classified
+//! values — a coarse browser/OS name (an empty OS reads as `Other`), the
+//! query-less path, and the referrer's bare host (named social/search
+//! sources by name, empty as `Direct`); referrer paths and queries are never
+//! stored, and each (app, environment, hour, kind) keeps at most 50 distinct
+//! values before overflow counts under `(other)`.
 //!
 //! Offset tracking survives restarts via a sidecar file next to the log
 //! (`access-log.offset`, holding `ino:off`). Caddy opens the log O_APPEND,
@@ -148,11 +160,88 @@ fn split_path(uri: &str) -> &str {
     }
 }
 
+/// Social networks and search engines served by name; everything else keeps
+/// its bare host (paths and queries never stored — they can carry tokens).
+/// Empty referrer (typed URL, bookmark, in-app navigation) is Direct.
+fn ref_source(referrer: &str) -> String {
+    let lower = referrer.trim().to_lowercase();
+    if lower.is_empty() {
+        return "Direct".to_string();
+    }
+    let host = lower
+        .split_once("://")
+        .map(|(_, rest)| rest)
+        .unwrap_or(&lower);
+    let host = host.split('/').next().unwrap_or(host);
+    let host = host.split('@').next_back().unwrap_or(host);
+    let host = host.split_once(':').map(|(h, _)| h).unwrap_or(host);
+    const DOMAINS: &[(&str, &str)] = &[
+        ("facebook.com", "Facebook"),
+        ("fb.com", "Facebook"),
+        ("fb.watch", "Facebook"),
+        ("messenger.com", "Facebook"),
+        ("instagram.com", "Instagram"),
+        ("threads.com", "Threads"),
+        ("threads.net", "Threads"),
+        ("twitter.com", "X"),
+        ("x.com", "X"),
+        ("t.co", "X"),
+        ("tiktok.com", "TikTok"),
+        ("linkedin.com", "LinkedIn"),
+        ("youtube.com", "YouTube"),
+        ("youtu.be", "YouTube"),
+        ("reddit.com", "Reddit"),
+        ("pinterest.com", "Pinterest"),
+        ("snapchat.com", "Snapchat"),
+        ("whatsapp.com", "WhatsApp"),
+        ("wa.me", "WhatsApp"),
+        ("t.me", "Telegram"),
+        ("discord.com", "Discord"),
+        ("bsky.app", "Bluesky"),
+        ("bing.com", "Bing"),
+        ("duckduckgo.com", "DuckDuckGo"),
+        ("baidu.com", "Baidu"),
+        ("ecosia.org", "Ecosia"),
+        ("search.brave.com", "Brave"),
+    ];
+    // Single-segment keys match any dot-separated segment — this is how
+    // multi-TLD names (google.*, yahoo.*, yandex.*) work. Full-domain
+    // matching above stays exact-or-dot-suffix, so `x.com` never matches
+    // `x.company.com`.
+    const SEGMENTS: &[(&str, &str)] = &[
+        ("google", "Google"),
+        ("yahoo", "Yahoo"),
+        ("yandex", "Yandex"),
+    ];
+    for (key, label) in DOMAINS {
+        if host == *key || host.ends_with(&format!(".{key}")) {
+            return label.to_string();
+        }
+    }
+    for seg in host.split('.') {
+        if let Some((_, label)) = SEGMENTS.iter().find(|(k, _)| seg == *k) {
+            return label.to_string();
+        }
+    }
+    host.chars().take(64).collect()
+}
+
 /// One parsed tenant line.
 struct Line {
     app_id: String,
     environment_id: String,
     bucket: String,
+    /// Classified browser/OS for the breakdown (and the trace join below).
+    /// An empty os reads as `Other` at write time, so grouping never drops
+    /// rows.
+    browser: &'static str,
+    os: &'static str,
+    /// Query-less path (length-capped in `parse_line`) for the breakdown
+    /// and the trace join.
+    path: String,
+    /// Referrer source for the breakdown: a named source, the bare host, or
+    /// `Direct` — never a path or query.
+    source: String,
     /// The request's own start, in epoch microseconds (the log's `ts`): the
     /// hourly counters key their bucket on it and keep the newest one for the
     /// sleep sweeper.
@@ -164,7 +253,7 @@ struct Line {
     /// The edge's status class: 5xx is the error count the counters carry.
     error: bool,
     /// Whether the fleet's own `reverse_proxy` answered. Only these lines
-    /// enter the hourly counters — see [`served_by_fleet`].
+    /// enter the hourly counters and the breakdown — see [`served_by_fleet`].
     served: bool,
     /// The `traceID` fleet sites log (`TENANT_TRACE` in the static edge
     /// config, `traceparent` on tenant/custom/env requests) with the request
@@ -271,6 +360,7 @@ fn parse_line(
     if path.len() > 256 {
         return None;
     }
+    let source = ref_source(first_header(&v, "Referer"));
     let ts = v.pointer("/ts").and_then(|x| x.as_f64()).unwrap_or(0.0);
     let ts_us = (ts * 1_000_000.0) as i64;
     let status = v
@@ -312,6 +402,10 @@ fn parse_line(
         app_id,
         environment_id,
         bucket: hour_bucket(ts as i64),
+        browser,
+        os,
+        path: path.to_string(),
+        source,
         ts_us,
         duration_ms,
         error: status >= 500,
@@ -411,9 +505,10 @@ struct Tail<'a> {
     requests: &'a mut RequestIndex,
 }
 
-/// Commit one access-log line: the trace backfill and the fleet's hourly
-/// counters in one transaction. A failed statement or commit applies nothing,
-/// so the retried line is not counted twice.
+/// Commit one access-log line: the trace backfill, the fleet's hourly
+/// counters and its four breakdown values in one transaction. A failed
+/// statement or commit applies nothing, so the retried line is not counted
+/// twice.
 async fn apply_line(tail: &mut Tail<'_>, l: &Line) -> anyhow::Result<()> {
     let mut tx = tail.pool.begin().await?;
     if let Some((trace_id, ctx)) = &l.trace {
@@ -433,9 +528,9 @@ async fn apply_line(tail: &mut Tail<'_>, l: &Line) -> anyhow::Result<()> {
         )
         .await?;
     }
-    // The hourly counters and the idle clock they feed are fleet activity:
-    // an edge-answered line (redirect, gate refusal, 429, starting page)
-    // neither served the app nor proves anyone used it.
+    // The hourly counters, the breakdown and the idle clock they feed are
+    // fleet activity: an edge-answered line (redirect, gate refusal, 429,
+    // starting page) neither served the app nor proves anyone used it.
     if l.served {
         hourly::record_request(
             &mut tx,
@@ -447,6 +542,22 @@ async fn apply_line(tail: &mut Tail<'_>, l: &Line) -> anyhow::Result<()> {
             l.ts_us,
             l.duration_ms,
             l.error,
+        )
+        .await?;
+        // An empty OS is a real slice of traffic (`Other`, `Bot`, `CLI`);
+        // the classifier reports it empty, and the breakdown names it.
+        let os = if l.os.is_empty() { "Other" } else { l.os };
+        db::record_hour_dims(
+            &mut tx,
+            &l.app_id,
+            &l.environment_id,
+            &l.bucket,
+            &[
+                (db::DimKind::Browser, l.browser),
+                (db::DimKind::Os, os),
+                (db::DimKind::Path, l.path.as_str()),
+                (db::DimKind::Referrer, l.source.as_str()),
+            ],
         )
         .await?;
     }
@@ -491,11 +602,11 @@ async fn consume_lines(
     Ok(cursor)
 }
 
-/// Consume new access-log lines into device stats and the fleet's hourly
-/// counters. A missing log (Caddy not yet reloaded) is a silent skip.
-/// Environment hosts attribute to the environment's own (app, environment)
-/// rows; the trace → request index is shared (trace ids are unique per
-/// request).
+/// Consume new access-log lines into the fleet's hourly counters and its
+/// per-dimension breakdown. A missing log (Caddy not yet reloaded) is a
+/// silent skip. Environment hosts attribute to the environment's own (app,
+/// environment) rows; the trace → request index is shared (trace ids are
+/// unique per request).
 ///
 /// The offset advances (and is persisted) only after a line's rows commit, so
 /// a mid-loop DB error re-reads exactly the lines that were not applied — never
@@ -841,6 +952,274 @@ mod tests {
             OffsetState::At { ino: 4, off: 12 }
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// One fleet-served line helper with caller-chosen UA, referrer and path.
+    fn dim_line(ua: &str, referer: &str, uri: &str, ts: f64) -> String {
+        let v = serde_json::json!({
+            "request": {
+                "host": "blog.localhost",
+                "uri": uri,
+                "method": "GET",
+                "headers": {"User-Agent": [ua], "Referer": [referer]},
+            },
+            "status": 200,
+            "ts": ts,
+            "duration": 0.012,
+            "noite_upstream": "127.0.0.1:9001",
+            "noite_edge_upstream": "127.0.0.1:9001",
+        });
+        format!("{v}\n")
+    }
+
+    async fn dim_test_pool(dir: &std::path::Path) -> (crate::config::Config, sqlx::SqlitePool) {
+        let mut cfg = crate::config::config_for_tests();
+        cfg.caddy_access_log = dir.join("access.log").display().to_string();
+        let pool = crate::db::connect(&format!(
+            "sqlite:{}?mode=rwc",
+            dir.join("noite.sqlite").display()
+        ))
+        .await
+        .expect("file db");
+        (cfg, pool)
+    }
+
+    async fn tick_one(pool: &sqlx::SqlitePool, cfg: &crate::config::Config) {
+        let mut slug_id = HashMap::new();
+        slug_id.insert("blog".to_string(), "app-id".to_string());
+        let mut requests = RequestIndex::default();
+        super::tick(
+            pool,
+            cfg,
+            &slug_id,
+            &HashMap::new(),
+            &HashMap::new(),
+            &mut requests,
+        )
+        .await
+        .expect("tick consumes the log");
+    }
+
+    async fn dim_counts(pool: &sqlx::SqlitePool) -> Vec<(String, String, i64)> {
+        sqlx::query_as(
+            "SELECT kind, value, requests FROM metrics.app_hour_dim ORDER BY kind, value",
+        )
+        .fetch_all(pool)
+        .await
+        .expect("read dims")
+    }
+
+    /// One served line increments the hourly counter and all four breakdown
+    /// dimensions in the same transaction: the fleet-served population is
+    /// exactly the request counter's.
+    #[tokio::test]
+    async fn one_served_line_counts_requests_and_all_four_dims() {
+        let dir =
+            std::env::temp_dir().join(format!("noite-accesslog-dims-{}", crate::models::new_id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let (cfg, pool) = dim_test_pool(&dir).await;
+        std::fs::write(
+            dir.join("access.log"),
+            dim_line(
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) Chrome/131.0.0.0 Safari/537.36",
+                "https://www.google.com/search?q=noite",
+                "/pricing?plan=team",
+                1_767_225_600.0,
+            ),
+        )
+        .expect("write log");
+        tick_one(&pool, &cfg).await;
+        let mut conn = pool.acquire().await.expect("connection");
+        let row =
+            crate::db::get_app_hour(&mut conn, "app-id", "", &super::hour_bucket(1_767_225_600))
+                .await
+                .expect("read hour")
+                .expect("the served line created the hour");
+        assert_eq!(row.requests, 1);
+        assert_eq!(
+            dim_counts(&pool).await,
+            vec![
+                ("browser".to_string(), "Chrome".to_string(), 1),
+                ("os".to_string(), "macOS".to_string(), 1),
+                ("path".to_string(), "/pricing".to_string(), 1),
+                ("referrer".to_string(), "Google".to_string(), 1),
+            ],
+            "browser, os, query-less path and named referrer count once"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Edge-answered lines add no dims: the breakdown shares the request
+    /// counter's fleet-served population, not the edge-wide one.
+    #[tokio::test]
+    async fn edge_answered_lines_add_no_dims() {
+        let dir = std::env::temp_dir().join(format!(
+            "noite-accesslog-edge-dims-{}",
+            crate::models::new_id()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let (mut cfg, pool) = dim_test_pool(&dir).await;
+        cfg.caddy_api_upstream = "127.0.0.1:9000".into();
+        let fleet = "127.0.0.1:9001";
+        let api = "127.0.0.1:9000";
+        let lines = [
+            served_line("blog.localhost", 308, 1_767_225_600.0, None, None, false),
+            served_line(
+                "blog.localhost",
+                401,
+                1_767_225_600.0,
+                Some(api),
+                Some(fleet),
+                false,
+            ),
+            served_line(
+                "blog.localhost",
+                429,
+                1_767_225_600.0,
+                None,
+                Some(fleet),
+                false,
+            ),
+            served_line(
+                "blog.localhost",
+                503,
+                1_767_225_600.0,
+                Some(fleet),
+                Some(fleet),
+                true,
+            ),
+            served_line(
+                "blog.localhost",
+                200,
+                1_767_225_605.0,
+                Some(api),
+                Some(api),
+                false,
+            ),
+        ];
+        std::fs::write(dir.join("access.log"), lines.concat()).expect("write log");
+        tick_one(&pool, &cfg).await;
+        assert!(
+            dim_counts(&pool).await.is_empty(),
+            "no line a fleet answered, no dims"
+        );
+        assert!(
+            crate::db::list_app_metrics(&pool, "app-id", "", "1970-01-01T00:00:00Z")
+                .await
+                .expect("read")
+                .is_empty(),
+            "and no counter row either"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A failed dimension write leaves neither the counter nor the dims: the
+    /// line's rows commit together, so the retried line counts exactly once.
+    #[tokio::test]
+    async fn a_failed_dim_write_leaves_neither_counter_nor_dims() {
+        let dir = std::env::temp_dir().join(format!(
+            "noite-accesslog-dim-boom-{}",
+            crate::models::new_id()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let (cfg, pool) = dim_test_pool(&dir).await;
+        std::fs::write(
+            dir.join("access.log"),
+            dim_line("curl/8.18.0", "", "/ok", 1_767_225_600.0),
+        )
+        .expect("write log");
+        sqlx::query(
+            "CREATE TRIGGER metrics.boom_dim BEFORE INSERT ON app_hour_dim \
+             BEGIN SELECT RAISE(ABORT, 'injected'); END",
+        )
+        .execute(&pool)
+        .await
+        .expect("trigger");
+        let mut slug_id = HashMap::new();
+        slug_id.insert("blog".to_string(), "app-id".to_string());
+        let mut requests = RequestIndex::default();
+        super::tick(
+            &pool,
+            &cfg,
+            &slug_id,
+            &HashMap::new(),
+            &HashMap::new(),
+            &mut requests,
+        )
+        .await
+        .expect_err("the dim write fails");
+        assert!(
+            crate::db::list_app_metrics(&pool, "app-id", "", "1970-01-01T00:00:00Z")
+                .await
+                .expect("read")
+                .is_empty(),
+            "the counter rolls back with the dims"
+        );
+        assert!(dim_counts(&pool).await.is_empty());
+        sqlx::query("DROP TRIGGER metrics.boom_dim")
+            .execute(&pool)
+            .await
+            .expect("drop trigger");
+        super::tick(
+            &pool,
+            &cfg,
+            &slug_id,
+            &HashMap::new(),
+            &HashMap::new(),
+            &mut requests,
+        )
+        .await
+        .expect("retry succeeds");
+        let rows = crate::db::list_app_metrics(&pool, "app-id", "", "1970-01-01T00:00:00Z")
+            .await
+            .expect("read");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].requests, 1, "the retried line counts once");
+        assert_eq!(
+            dim_counts(&pool).await,
+            vec![
+                ("browser".to_string(), "CLI".to_string(), 1),
+                ("os".to_string(), "Other".to_string(), 1),
+                ("path".to_string(), "/ok".to_string(), 1),
+                ("referrer".to_string(), "Direct".to_string(), 1),
+            ],
+            "empty os reads as Other, empty referrer as Direct"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `ref_source` never leaks a path or query: named sources by name, an
+    /// empty referrer as Direct, everything else as its bare lowercase host.
+    #[test]
+    fn ref_source_names_sources_and_hides_paths() {
+        assert_eq!(super::ref_source(""), "Direct");
+        assert_eq!(super::ref_source("   "), "Direct");
+        assert_eq!(
+            super::ref_source("https://www.google.com/search?q=noite"),
+            "Google"
+        );
+        assert_eq!(super::ref_source("https://google.co.uk/"), "Google");
+        assert_eq!(
+            super::ref_source("http://m.facebook.com/post/1?x=2"),
+            "Facebook"
+        );
+        assert_eq!(super::ref_source("https://x.com/a/b?c=d"), "X");
+        assert_eq!(
+            super::ref_source("https://blog.example.com/post?token=abc"),
+            "blog.example.com"
+        );
+        assert_eq!(
+            super::ref_source("https://example.com:8080/a"),
+            "example.com"
+        );
+        assert_eq!(
+            super::ref_source("HTTPS://WWW.YOUTUBE.COM/watch?v=x"),
+            "YouTube"
+        );
+        assert_eq!(
+            super::ref_source("https://user:pass@internal.example.org:8443/a?b=c#d"),
+            "internal.example.org"
+        );
     }
 }
 
