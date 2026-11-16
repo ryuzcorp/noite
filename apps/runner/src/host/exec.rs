@@ -958,4 +958,16 @@ mod tests {
             "timed-out step left a grandchild behind (sleep {marker} still live 5s after the group kill)"
         );
     }
+
+    /// The clone's size walk never fails: an entry that vanishes between the
+    /// listing and the stat (git renames lock/tmp files aside mid-clone)
+    /// counts as nothing instead of failing the walk with ENOENT — the poll
+    /// in `run_grouped` must not turn clone churn into a failed clone.
+    #[test]
+    fn dir_bytes_skips_what_is_not_there() {
+        let dir = crate::testutil::TempDir::new("noite-dir-bytes");
+        std::fs::write(dir.path().join("a"), "12345").expect("seed file");
+        assert_eq!(dir_bytes(dir.path()), 5);
+        assert_eq!(dir_bytes(&dir.path().join("missing")), 0);
+    }
 }
