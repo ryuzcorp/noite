@@ -38,7 +38,10 @@ fn sigterm(pid: u32) -> bool {
 /// child shares its parent's group — `killpg` there would signal the runner
 /// itself — so those get a single-pid kill instead. ESRCH on a fully gone
 /// group is fine either way.
-fn sigkill_tree(pid: u32) {
+///
+/// Shared with the boot orphan sweep (`host::fleet_orphans`), which kills
+/// previous-run fleets by the same rule.
+pub(crate) fn sigkill_tree(pid: u32) {
     #[cfg(unix)]
     {
         // SAFETY: getpgid only reads; kill/killpg signal at most the group
@@ -1477,7 +1480,15 @@ async fn spawn_fleet_inner(
     let listen_addr = format!("0.0.0.0:{}", spec.listen);
     let internal_addr = format!("127.0.0.1:{}", spec.internal);
     let advertise_addr = internal_addr.clone();
+    // Boot-reap identity (`host::fleet_orphans`): the previous run's fleets
+    // are reaped by this install's marker before the first spawn. The marker
+    // rides argv[0], not the environment: fleet nodes are non-dumpable, so
+    // `/proc/<pid>/environ` is EACCES even as root while cmdline stays
+    // readable — and clap ignores argv[0], while an unknown flag would fail
+    // the spawn. This install's tag names no other install's fleet.
+    let install_tag = crate::host::fleet_orphans::install_tag_for(cfg);
     let mut cmd = Command::new(&cfg.celld_bin);
+    cmd.arg0(crate::host::fleet_orphans::fleet_argv0(&install_tag));
     cmd.args([
         "--bucket",
         &spec.bucket,
@@ -1614,6 +1625,7 @@ async fn spawn_fleet_inner(
             tenant_env: &spec.env,
             has_cgroup_leaf: fleet_cgroup.is_some(),
             engine_socket: engine_socket.as_deref(),
+            install_tag: &install_tag,
             inherited: &inherited,
         });
     crate::host::fleet_env::apply(&mut cmd, &fleet_env);

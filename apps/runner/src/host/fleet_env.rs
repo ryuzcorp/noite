@@ -18,6 +18,8 @@
 //! `HOME` (the Python runtime cache and docker-socket fallbacks) and
 //! `TMPDIR` (the `temp_dir()` default; the hot paths use explicit
 //! `CELLD_*` dirs).
+//! `NOITE_FLEET_INSTALL` names this install (the store-derived install tag)
+//! for the boot orphan sweep (`host::fleet_orphans`); celld ignores it.
 //!
 //! The only runner-env values a fleet inherits are [`INHERITED`]: TLS
 //! trust (`SSL_CERT_FILE`/`SSL_CERT_DIR`, so a BYO store behind a private
@@ -49,6 +51,14 @@ pub const FLEET_TMPDIR: &str = "/tmp";
 /// answers nothing, so celld never falls back to probing well-known daemon
 /// paths. Nothing ever listens here — no fleet, sandbox or test binds it.
 pub const DEAD_ENGINE_SOCKET: &str = "unix:///nonexistent/noite-no-engine.sock";
+
+/// Install identity every fleet process carries: the store-derived install
+/// tag (`host::fleet_orphans::install_tag_for`), so the boot sweep can tell
+/// this install's previous-run fleets from any other install's live ones.
+/// Tenant rows can never set it (`db::env_reserved` refuses every `NOITE_`
+/// name), and the builders apply it after the tenant vars, so the platform
+/// wins by construction even so.
+pub const FLEET_INSTALL_ENV: &str = "NOITE_FLEET_INSTALL";
 
 /// The only runner-env names a fleet inherits (see the module docs): TLS
 /// trust for a BYO store, and the operator's proxy settings. Each is passed
@@ -154,6 +164,9 @@ pub struct TenantFleetEnv<'a> {
     pub tenant_env: &'a [(String, String)],
     pub has_cgroup_leaf: bool,
     pub engine_socket: Option<&'a str>,
+    /// This install's tag (`host::fleet_orphans::install_tag_for`): the boot
+    /// sweep's identity for this fleet.
+    pub install_tag: &'a str,
     pub inherited: &'a [(String, String)],
 }
 
@@ -284,6 +297,11 @@ pub fn tenant_fleet_env(input: &TenantFleetEnv<'_>) -> Vec<(String, String)> {
         Some(socket) => put("DOCKER_HOST", format!("unix://{socket}")),
         None => put("DOCKER_HOST", DEAD_ENGINE_SOCKET.to_string()),
     }
+    // Install identity for the boot sweep (`host::fleet_orphans`): after the
+    // tenant vars, so the platform wins even if a tenant row ever named it
+    // (`db::env_reserved` refuses every `NOITE_` name one layer up, so this
+    // is belt and braces).
+    put(FLEET_INSTALL_ENV, input.install_tag.to_string());
     env
 }
 
@@ -293,6 +311,9 @@ pub fn tenant_fleet_env(input: &TenantFleetEnv<'_>) -> Vec<(String, String)> {
 pub struct ControlFleetEnv<'a> {
     pub cfg: &'a Config,
     pub operator_token: &'a str,
+    /// This install's tag (`host::fleet_orphans::install_tag_for`): the boot
+    /// sweep's identity for this fleet.
+    pub install_tag: &'a str,
     pub inherited: &'a [(String, String)],
     /// Whether this spawn runs in its own cgroup leaf (`host::control` creates
     /// one when the install has cgroups): `CELLD_MEMORY_SCOPE=self` then sheds
@@ -364,6 +385,9 @@ pub fn control_fleet_env(input: &ControlFleetEnv<'_>) -> Vec<(String, String)> {
     // The control UI declares no container classes: a dead socket, never an
     // unset `DOCKER_HOST` that would probe well-known daemon paths.
     put("DOCKER_HOST", DEAD_ENGINE_SOCKET.to_string());
+    // Install identity for the boot sweep (`host::fleet_orphans`), like a
+    // tenant fleet's.
+    put(FLEET_INSTALL_ENV, input.install_tag.to_string());
     env
 }
 
@@ -440,6 +464,7 @@ mod tests {
             "CELLD_CACHE_SCOPE",
             "CELLD_MAX_RSS_MB",
             "DOCKER_HOST",
+            "NOITE_FLEET_INSTALL",
             "CELLD_OTEL",
             "CELLD_OTEL_FLUSH_MS",
             "CELLD_OTEL_RETENTION",
@@ -525,6 +550,7 @@ mod tests {
             tenant_env,
             has_cgroup_leaf: false,
             engine_socket: None,
+            install_tag: "a1b2c3d4",
             inherited,
         }
     }
@@ -646,6 +672,7 @@ mod tests {
         assert_eq!(flat["AWS_ACCESS_KEY_ID"], "scoped-access");
         assert_eq!(flat["AWS_SECRET_ACCESS_KEY"], "scoped-secret");
         assert_eq!(flat["CELLD_OPERATOR_TOKEN"], "op-token");
+        assert_eq!(flat["NOITE_FLEET_INSTALL"], "a1b2c3d4");
         assert_eq!(flat["DATABASE_URL"], "postgres://app/db");
         assert_eq!(flat["HTTPS_PROXY"], "http://proxy.op:3128/HTTPS_PROXY");
         assert!(
@@ -692,6 +719,10 @@ mod tests {
                 "tenant-secret".to_string(),
             ),
             ("S3_ENDPOINT".to_string(), "http://tenant:9999".to_string()),
+            (
+                "NOITE_FLEET_INSTALL".to_string(),
+                "tenant-install".to_string(),
+            ),
             // (`SSL_CERT_*` and the proxy names are dropped one layer up,
             // by `db::env_reserved`: the platform sets them only when the
             // operator configured them, so ordering alone cannot win them.
@@ -708,6 +739,10 @@ mod tests {
         assert_eq!(flat["CELLD_CACHE_SCOPE"], "deployment");
         assert_eq!(flat["CELLD_MAX_RSS_MB"], "512");
         assert_eq!(flat["CELLD_OPERATOR_TOKEN"], "op-token");
+        assert_eq!(
+            flat["NOITE_FLEET_INSTALL"], "a1b2c3d4",
+            "platform install tag wins"
+        );
         assert_eq!(flat["DOCKER_HOST"], "unix:///run/noite/app.sock");
         assert_eq!(flat["AWS_REGION"], "us-east-1");
         assert_eq!(flat["AWS_SECRET_ACCESS_KEY"], "scoped-secret");
@@ -730,6 +765,7 @@ mod tests {
         let control = flattened(&control_fleet_env(&ControlFleetEnv {
             cfg: &cfg,
             operator_token: "",
+            install_tag: "a1b2c3d4",
             inherited: &inherited,
             has_cgroup_leaf: false,
         }));
@@ -755,6 +791,7 @@ mod tests {
         let flat = flattened(&control_fleet_env(&ControlFleetEnv {
             cfg: &cfg,
             operator_token: "control-op",
+            install_tag: "a1b2c3d4",
             inherited: &inherited,
             has_cgroup_leaf: false,
         }));
@@ -766,6 +803,7 @@ mod tests {
         assert_eq!(flat["HOME"], "/root");
         assert_eq!(flat["CELLD_WATCH"], "/data/control");
         assert_eq!(flat["CELLD_OPERATOR_TOKEN"], "control-op");
+        assert_eq!(flat["NOITE_FLEET_INSTALL"], "a1b2c3d4");
         assert_eq!(flat["no_proxy"], "http://proxy.op:3128/no_proxy");
         assert!(!flat.contains_key("CELLD_EGRESS"));
         assert!(!flat.contains_key("CELLD_MEMORY_SCOPE"));
@@ -799,6 +837,7 @@ mod tests {
         let no_leaf = flattened(&control_fleet_env(&ControlFleetEnv {
             cfg: &cfg,
             operator_token: "control-op",
+            install_tag: "a1b2c3d4",
             inherited: &inherited,
             has_cgroup_leaf: false,
         }));
@@ -819,6 +858,7 @@ mod tests {
         let leaf = flattened(&control_fleet_env(&ControlFleetEnv {
             cfg: &cfg,
             operator_token: "control-op",
+            install_tag: "a1b2c3d4",
             inherited: &inherited,
             has_cgroup_leaf: true,
         }));

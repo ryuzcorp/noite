@@ -461,6 +461,16 @@ async fn main() -> anyhow::Result<()> {
 
     let procs = host::supervisor::new_procs();
     let logs = host::logs::new_state();
+    // Before the first fleet spawns (the loop's first tick spawns them all,
+    // the control fleet is supervised below): reap the previous run's fleet
+    // processes. A runner restart without a container restart — dev's
+    // cargo-watch, and any in-container relaunch — orphans the old run's
+    // fleets in their own process groups, and the new ProcMap knows nothing
+    // about them; every new spawn on their ports would then crash-loop on
+    // EADDRINUSE. Bounded and never fatal: a failure only logs, and the
+    // existing crash-restart path still reports. This mirrors the sandbox
+    // boot sweep above, which reaps the previous run's fleet containers.
+    host::fleet_orphans::reap_previous_run(&config).await;
     // Rebuild bare mirrors from S3 tip bundles when the work dir is fresh.
     host::rehydrate::rehydrate_all(&pool, &config).await;
     let deploying = host::deploy::new_deploying();

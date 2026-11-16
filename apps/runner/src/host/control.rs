@@ -467,6 +467,20 @@ pub fn supervise(
                 // shared buffer (the OTel ring carries the worker's console).
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped());
+            {
+                use std::os::unix::process::CommandExt;
+                // Its own process group, like a tenant fleet's: the boot
+                // sweep group-kills the previous run's control fleet, and a
+                // group signal can never reach the runner. Shutdown still
+                // signals the leader only; celld shuts its workers down on
+                // SIGTERM either way.
+                cmd.as_std_mut().process_group(0);
+                // Boot-reap identity, like a tenant fleet's
+                // (`host::fleet_orphans`): argv[0] carries this install's
+                // marker, readable in `/proc/<pid>/cmdline` even though the
+                // node is non-dumpable.
+                cmd.arg0(crate::host::fleet_orphans::marker_for(&fleet_cfg));
+            }
             // Explicit environment only (`host::fleet_env`): the spawn
             // inherits nothing — no `RUNNER_TOKEN`, no operator-global
             // `CELLD_*` — and the store credentials the spawn used to
@@ -475,10 +489,12 @@ pub fn supervise(
             // builder and the spawn-path tests in `host::fleet_env` pin
             // what it applies.
             let inherited = crate::host::fleet_env::runner_inherited();
+            let install_tag = crate::host::fleet_orphans::install_tag_for(&fleet_cfg);
             let env = crate::host::fleet_env::control_fleet_env(
                 &crate::host::fleet_env::ControlFleetEnv {
                     cfg: &fleet_cfg,
                     operator_token: &operator_token,
+                    install_tag: &install_tag,
                     inherited: &inherited,
                     has_cgroup_leaf: has_leaf,
                 },
