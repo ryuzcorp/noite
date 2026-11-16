@@ -1086,15 +1086,30 @@ mod tests {
         );
     }
 
-    /// The slug-prefix mark deletes never cross slug boundaries: `foo` takes
-    /// `foo` and `foo.staging` but not `foo-bar` or `foobar`, and a
-    /// pre-grammar mark key carrying LIKE wildcards (`100%`, `a_b`) matches
-    /// literally instead of widening the wipe.
+    /// The slug-prefix mark deletes never cross slug boundaries: each slug
+    /// takes itself and its `{slug}.{label}` fleet keys, and a pre-grammar
+    /// mark key carrying LIKE wildcards matches literally instead of widening
+    /// the wipe — `100%` must not take `100x.y`, `a_b` must not take
+    /// `axb.label`.
     #[tokio::test]
     async fn slug_mark_deletes_do_not_cross_slug_boundaries() {
         let db = FileDb::new().await;
         let pool = &db.pool;
-        for key in ["foo", "foo.staging", "foo-bar", "foobar", "100%", "a_b"] {
+        for key in [
+            "foo",
+            "foo.staging",
+            "foo-bar",
+            "foobar",
+            "100%",
+            "100%.label",
+            "100x",
+            "100x.y",
+            "1000",
+            "a_b",
+            "a_b.label",
+            "axb",
+            "axb.label",
+        ] {
             sqlx::query("INSERT INTO metrics.metric_watermark (slug, after_us) VALUES (?, 1)")
                 .bind(key)
                 .execute(pool)
@@ -1109,21 +1124,31 @@ mod tests {
             .await
             .expect("seed compaction");
         }
-        assert_eq!(
-            delete_metric_watermarks_for_slug(pool, "foo")
-                .await
-                .expect("watermarks"),
-            2,
-            "only the slug and its environment fleet key go"
-        );
-        assert_eq!(
-            crate::db::delete_compactions_for_slug(pool, "foo")
-                .await
-                .expect("compactions"),
-            2,
-            "only the slug and its environment fleet key go"
-        );
-        for key in ["foo-bar", "foobar", "100%", "a_b"] {
+        for slug in ["foo", "100%", "a_b"] {
+            assert_eq!(
+                delete_metric_watermarks_for_slug(pool, slug)
+                    .await
+                    .expect("watermarks"),
+                2,
+                "only {slug} and its environment fleet key go"
+            );
+            assert_eq!(
+                crate::db::delete_compactions_for_slug(pool, slug)
+                    .await
+                    .expect("compactions"),
+                2,
+                "only {slug} and its environment fleet key go"
+            );
+        }
+        for key in [
+            "foo-bar",
+            "foobar",
+            "100x",
+            "100x.y",
+            "1000",
+            "axb",
+            "axb.label",
+        ] {
             let w: i64 =
                 sqlx::query_scalar("SELECT COUNT(*) FROM metrics.metric_watermark WHERE slug = ?")
                     .bind(key)
