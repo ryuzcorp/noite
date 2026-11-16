@@ -68,6 +68,7 @@ test(
     const ui = await request.get(`${edgeBase}/login`, {
       headers: { accept: "text/html" },
     });
+
     expect(ui.ok()).toBe(true);
     expect(ui.headers()["server"]).toBe("noite");
 
@@ -76,6 +77,7 @@ test(
     const unknown = await request.get(`${edgeBase}/`, {
       headers: { host: "nope.noite.localhost" },
     });
+
     expect(unknown.status()).toBe(404);
     expect(unknown.headers()["server"]).toBe("noite");
   }
