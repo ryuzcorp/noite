@@ -30,7 +30,7 @@ import type { Dispatch } from "@ilha/model";
 import { useRouter } from "@ilha/void";
 import { Data } from "effect";
 import * as Effect from "effect/Effect";
-import { atom, watch } from "ilha";
+import { watch } from "ilha";
 
 import { authClient } from "../auth-client";
 import { sameOriginPath } from "../env-auth";
@@ -449,6 +449,10 @@ const RecoveryForm = ({
   );
 };
 
+/** The invite-link token, captured once per page load (see RegisterForm).
+ * Module scope so it survives RegisterForm's remount; client-only. */
+let inviteLinkToken: string | null = null;
+
 /** The sign-in / register panel: tabs, heading and the active form. */
 const RegisterForm = ({
   dispatch,
@@ -466,14 +470,27 @@ const RegisterForm = ({
   const requiresSetupCode = setupMode === "code" || setupMode === "email";
   const reservedForAdmin = setupMode === "email";
   // An invite link carries its token in `?invite=`; pasting one into the
-  // field works too. An explicit entry wins over the link. The link token is
-  // captured into component state on first render and stripped from the URL
+  // field works too. An explicit entry wins over the link. The token is
+  // captured once per page load at module scope and stripped from the URL
   // right after (replaceState, no navigation), so it never lingers in
   // history, logs or a copied address bar — the notice and the submit below
-  // read the captured copy.
+  // read the captured copy. Module scope (not per-fiber state) because
+  // RegisterForm mounts twice on an invite link: once behind the loading
+  // policy, again on the Create account tab — a per-fiber capture loses the
+  // token on the remount after the first mount strips the URL. A fresh
+  // `?invite=` in the URL always wins (a second link in the same tab).
+  // Client-only: SSR never sets the module capture.
   const linkedInvite = searchParam("invite", { default: "" });
-  const linkToken = atom.lazy(() => linkedInvite());
-  const inviteToken = linkToken();
+
+  if (typeof window !== "undefined") {
+    const live = linkedInvite();
+
+    if (live !== "") {
+      inviteLinkToken = live;
+    }
+  }
+
+  const inviteToken = inviteLinkToken ?? "";
 
   watch.once(() => {
     linkedInvite.set("");
