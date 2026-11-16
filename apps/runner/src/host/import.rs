@@ -608,7 +608,10 @@ const REAP: Duration = Duration::from_secs(5);
 /// passes the cap, and again on the timeout, so an oversized (or endless) clone
 /// never finishes writing (NOITE-IMPORT-001). Its own group is what takes git's
 /// helpers down with it (`git-remote-https`, `git-index-pack`, …), which a
-/// plain `kill_on_drop` leaves behind (NOITE-IMPORT-002).
+/// plain `kill_on_drop` leaves behind (NOITE-IMPORT-002). The size walk is
+/// [`exec::dir_bytes`], which skips entries that vanish mid-walk: git renames
+/// lock/tmp files aside while the clone runs, and a strict walk turns that
+/// churn into a spurious ENOENT that fails the clone (and the import/sync).
 ///
 /// stdout is discarded and stderr goes to `clone.log` inside `work_dir` (so it
 /// counts toward the cap and is quoted when the child fails).
@@ -654,7 +657,7 @@ async fn run_grouped(
         match tokio::time::timeout(poll, child.wait()).await {
             Ok(status) => {
                 let status = status.with_context(|| format!("wait for {program}"))?;
-                let bytes = dir_bytes(work_dir)?;
+                let bytes = exec::dir_bytes(work_dir);
                 if bytes > cap {
                     bail!(
                         "repository is over the {}-MiB import cap",
@@ -667,7 +670,7 @@ async fn run_grouped(
                 return Ok(());
             }
             Err(_elapsed) => {
-                if dir_bytes(work_dir)? > cap {
+                if exec::dir_bytes(work_dir) > cap {
                     kill_group(group);
                     let _ = tokio::time::timeout(REAP, child.wait()).await;
                     bail!(
@@ -837,25 +840,6 @@ async fn squash_root(
     )
     .await?;
     Ok(out.trim().to_string())
-}
-
-/// On-disk size of a clone: `run_grouped` measures this on every poll and once
-/// more when the child exits, which is what enforces the import cap.
-fn dir_bytes(dir: &Path) -> std::io::Result<u64> {
-    let mut total = 0;
-    let mut stack = vec![dir.to_path_buf()];
-    while let Some(next) = stack.pop() {
-        for entry in std::fs::read_dir(next)? {
-            let entry = entry?;
-            let meta = entry.metadata()?;
-            if meta.is_dir() {
-                stack.push(entry.path());
-            } else {
-                total += meta.len();
-            }
-        }
-    }
-    Ok(total)
 }
 
 #[cfg(test)]
