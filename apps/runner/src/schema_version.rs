@@ -15,7 +15,7 @@ use sqlx::SqliteConnection;
 pub const FIRST_COMPACTED_VERSION: i64 = 100;
 
 /// Version a database has after every migration ran.
-pub const SCHEMA_VERSION: i64 = FIRST_COMPACTED_VERSION + 6;
+pub const SCHEMA_VERSION: i64 = FIRST_COMPACTED_VERSION + 7;
 
 /// One upgrade step: the statements that take a database from `version - 1`
 /// to `version`. Empty at the compacted baseline; append above it to change
@@ -95,6 +95,14 @@ pub const MIGRATIONS: &[Migration] = &[
               ); \
               CREATE INDEX IF NOT EXISTS main.idx_app_purge_slug \
               ON app_purge(slug);",
+    },
+    Migration {
+        // 107: the origin sha an import or GitHub sync last synced to. Imports
+        // (and syncs) write it; the sync status reads it to count the Noite
+        // commits a sync would overwrite. NULL on every existing row: an app
+        // imported before this step counts its whole history as local.
+        version: FIRST_COMPACTED_VERSION + 7,
+        sql: "ALTER TABLE main.app ADD COLUMN last_sync_sha TEXT;",
     },
 ];
 

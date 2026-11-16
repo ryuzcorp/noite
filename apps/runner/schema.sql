@@ -35,7 +35,11 @@ CREATE TABLE IF NOT EXISTS app (
   build_uid INTEGER,
   -- The `apps.create` source (JSON) this app was imported from: NULL for a
   -- blank app; lets a failed GitHub/template import be retried (A2).
-  import_source TEXT
+  import_source TEXT,
+  -- The origin sha the app's tree was last synced to: the cloned sha after
+  -- an import, the fetched origin tip after a GitHub sync. NULL for a blank
+  -- app or an import that predates the sync lane.
+  last_sync_sha TEXT
 );
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_app_build_uid ON app(build_uid);

@@ -543,6 +543,7 @@ mod tests {
             woke_at: None,
             deployed_config: None,
             import_source: None,
+            last_sync_sha: None,
             imported: false,
             fleet_hold: None,
             auto_deploy: crate::models::AutoDeploy::Eligible,

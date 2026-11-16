@@ -18,8 +18,10 @@ import {
   CREATE_TIMEOUT_MS,
   isSlugTaken,
   runnerCreateApp,
-  runnerGetAppBySlug,
   runnerDeleteApp,
+  runnerGetAppBySlug,
+  runnerGithubSyncStatus,
+  runnerSyncFromGithub,
   runnerCancelDeploy,
   runnerDeployBranch,
   runnerDeployLog,
@@ -34,6 +36,8 @@ import {
   runnerRollback,
 } from "../runner";
 import type {
+  GithubSyncOutcome,
+  GithubSyncStatus,
   RunnerFailure,
   RunnerApp,
   RunnerCreateSource,
@@ -507,6 +511,55 @@ export const retryImport = apiAction(AppId, async (appId, { env, request }) => {
     failRunner(error);
   }
 });
+
+/** The Sync from GitHub status (view-gated): the stored origin, the last
+ * synced sha, the current tip and how many Noite commits a sync would
+ * overwrite in the tree. */
+export const githubSyncStatus = apiAction(
+  AppId,
+  async (appId, { env, request }): Promise<GithubSyncStatus> => {
+    const user = await sessionUser(request, env);
+    await requireAppRole(appId, user.id, "view");
+
+    try {
+      return await runnerGithubSyncStatus(appId);
+    } catch (error) {
+      return failRunner(error);
+    }
+  }
+);
+
+const SyncFromGithubArgs = Schema.Struct({
+  appId: Schema.String,
+  confirm: Schema.Boolean,
+  expectedTip: Schema.optional(Schema.String),
+});
+
+/** Force sync the production branch with the GitHub origin (push-gated, not
+ * admin: a sync writes one commit and deploys, exactly what the push role
+ * already allows through `git push` and browser commits — history is kept,
+ * and a protected branch still needs an admin. Forwards the caller's role so
+ * the runner enforces the branch rule itself. */
+export const syncFromGithub = apiAction(
+  SyncFromGithubArgs,
+  async (
+    { appId, confirm, expectedTip },
+    { env, request }
+  ): Promise<GithubSyncOutcome> => {
+    const user = await sessionUser(request, env);
+    const { role } = await requireAppRole(appId, user.id, "push");
+
+    try {
+      return await runnerSyncFromGithub(appId, {
+        confirm,
+        expectedTip,
+        role,
+      });
+    } catch (error) {
+      return failRunner(error);
+    }
+  }
+);
 
 export const remove = apiAction(AppId, async (appId, { env, request }) => {
   const user = await sessionUser(request, env);

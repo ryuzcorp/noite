@@ -384,6 +384,11 @@ pub struct App {
     /// re-run a failed import. `None` for a blank app. Never served to the UI.
     #[serde(skip)]
     pub import_source: Option<String>,
+    /// The origin sha the tree was last synced to (the cloned sha after an
+    /// import, the fetched tip after a sync). Served through the sync status,
+    /// never on the app row itself.
+    #[serde(skip)]
+    pub last_sync_sha: Option<String>,
     /// Whether the row carries a stored import source — the UI's Retry gate.
     /// Derived in SQL (`import_source IS NOT NULL`), never a column.
     pub imported: bool,

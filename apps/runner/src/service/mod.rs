@@ -15,6 +15,7 @@ pub mod environments;
 pub mod errors;
 pub mod events;
 pub mod git;
+pub mod github_sync;
 pub mod limits;
 pub mod observe;
 pub mod prs;

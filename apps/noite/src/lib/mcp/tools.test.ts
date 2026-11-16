@@ -90,6 +90,7 @@ const LOOP_TOOLS = {
   redeploy: ["app"],
   review_pr: ["app", "number", "state"],
   rollback: ["app", "sha"],
+  sync_from_github: ["app"],
   wait_for_deploy: ["app"],
 } satisfies Record<string, readonly string[]>;
 

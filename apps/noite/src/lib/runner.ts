@@ -31,6 +31,8 @@ import type { ErrorIssueList as RunnerErrorList } from "./runner-types/ErrorIssu
 import type { GitBranch } from "./runner-types/GitBranch";
 import type { GitCommitDetail } from "./runner-types/GitCommitDetail";
 import type { GitCompare } from "./runner-types/GitCompare";
+import type { GithubSyncOutcome } from "./runner-types/GithubSyncOutcome";
+import type { GithubSyncStatus } from "./runner-types/GithubSyncStatus";
 import type { GitLog } from "./runner-types/GitLog";
 import type { GitRefs } from "./runner-types/GitRefs";
 import type { GitRemote as RunnerGitRemote } from "./runner-types/GitRemote";
@@ -139,6 +141,12 @@ export type { GitLog } from "./runner-types/GitLog";
 export type { GitRefs } from "./runner-types/GitRefs";
 
 export type { GitRemote as RunnerGitRemote } from "./runner-types/GitRemote";
+
+export type { GithubSyncBody } from "./runner-types/GithubSyncBody";
+
+export type { GithubSyncOutcome } from "./runner-types/GithubSyncOutcome";
+
+export type { GithubSyncStatus } from "./runner-types/GithubSyncStatus";
 
 export type { IngestKeyView as RunnerIngestKey } from "./runner-types/IngestKeyView";
 
@@ -502,6 +510,28 @@ export const runnerCreateApp = (body: {
  * stored source is an import and it is not already running. */
 export const runnerRetryImport = (id: string) =>
   runnerFetch<RunnerApp>(`${appPath(id)}/retry-import`, { method: "POST" });
+
+/** The Sync from GitHub status: the stored origin, the last synced sha, the
+ * current tip and how many Noite commits a sync would overwrite. */
+export const runnerGithubSyncStatus = (id: string) =>
+  runnerFetch<GithubSyncStatus>(`${appPath(id)}/github-sync`);
+
+/** Force sync the production branch with the GitHub origin: one new commit
+ * with the origin's tree, then the normal deploy path. Bounded by the
+ * lifecycle timeout, not the default 5 s one: a clone takes seconds. Past
+ * the control plane's 15 s action bound the call times out while the runner
+ * keeps working — retrying is safe (up to date is a no-op, a racing second
+ * sync loses the compare-and-swap instead of duplicating the commit).
+ */
+export const runnerSyncFromGithub = (
+  id: string,
+  body: { confirm: boolean; expectedTip?: string; role?: string }
+) =>
+  runnerFetch<GithubSyncOutcome>(`${appPath(id)}/sync-from-github`, {
+    body: JSON.stringify(body),
+    method: "POST",
+    signal: AbortSignal.timeout(LIFECYCLE_TIMEOUT_MS),
+  });
 
 export const runnerGetApp = (id: string) => runnerFetch<RunnerApp>(appPath(id));
 
