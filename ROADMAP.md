@@ -4,6 +4,25 @@ What is left, what is undecided, and the design history behind the locked decisi
 
 ## Roadmap
 
+### Beta: self-hosted (next)
+
+Still self-hosted only: strangers run their own installs, now for real workloads and with a promise about their data. `multi` stays "a sandbox for semi-trusted tenants" ([Known limits](apps/website/docs/self-hosting/known-limits.mdx)). A hosted open beta with public sign-up is a different and larger bar (root store keys in fleets on R2, unverified custom domains, Sandbox containers on the host kernel) and is not this one. Like the alpha bar, the gaps are trust and stability, not features.
+
+**Must have** (blocks `0.1.0-beta.1`):
+
+1. **The rest of the code audited.** The 2026-11-14 pre-open-beta audit covered the control actions, auth, git smart-HTTP and the runner's state restore. It did not cover: the Sandbox container plane, per-app credentials, forge/import/web-commit, the edge and its Caddy config, delete/rename/purge, `void-proxy`, `void-sandbox`, the CLI and `docker/*.sh`. A second pass covers them; every High or Critical finding is fixed, the rest are fixed or accepted on record.
+2. **Known security items fixed:**
+   - the access-log skip stamp is a global no-park switch an attacker can hold;
+   - pressure parking acts on a frozen request clock;
+   - R2 keys can reach celld's argv as options;
+   - `branch_create` and `web_commit` accept `refs/…`-shaped branch names;
+   - the email idempotency digest has no field separators.
+3. **A release gate that can be trusted.** Every open `flake` issue is root-caused and fixed, or closed with the evidence that a later change fixed it.
+4. **The default store qualified.** The bundled RustFS passes celld's store checks at the pinned versions and the storage docs and known limits say so, or they name the guarantee it fails.
+5. **A data promise.** From `beta.1` on, every release upgrades a database written by any earlier beta in place; no beta release refuses one ([Runner schema evolution](SPEC.md#runner-schema-evolution) keeps the migration runners for this). An e2e lane enforces it by upgrading from the previous beta's image. A restore drill for bring-your-own S3 installs, where `make backup` does not apply, is documented and run once.
+6. **Known advisories settled.** `libsqlite3-sys` RUSTSEC-2026-0459 (held at 0.37 by sqlx 0.9.0) is fixed or accepted on record.
+7. **A soaked candidate.** The release candidate runs as an alpha on app.noite.now, with apps deployed and woken, before the beta tag.
+
 ### Alpha: self-hosted only
 
 No cloud version: every alpha user runs their own install. The bar moves from "the author's one install" to "strangers' installs that track our releases", so the gaps are upgrades, releases and honesty about isolation more than features.
