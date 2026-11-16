@@ -14,7 +14,6 @@ describe("visibleControlTabs", () => {
       "logs",
       "users",
       "apps",
-      "invites",
       "settings",
       "account",
     ]);
@@ -25,7 +24,6 @@ describe("visibleControlTabs", () => {
       "overview",
       "users",
       "apps",
-      "invites",
       "settings",
       "account",
     ]);

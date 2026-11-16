@@ -1,15 +1,13 @@
 import { expect, test } from "@playwright/test";
 import type { Page } from "@playwright/test";
 
-import { withInviteLock } from "./helpers";
-
 // The control plane as an app: the e2e account is the first account, so it
 // bootstrapped as admin. Its Noite card opens the admin home, whose Overview
 // lists the control D1; that opens the full table editor backed by the
 // worker's own binding (never the runner). The mask, the per-table
 // capabilities and the server-side filter/sort are the behaviours worth
 // pinning: a session token must render masked, a read-only table must offer
-// no write controls at all, and `invite` must round-trip an insert and an
+// no write controls at all, and `email_invite` must round-trip an insert and an
 // update through the row editor.
 const CONTROL_STORAGE = "/storage/_control/d1%3Anoite-control";
 
@@ -66,51 +64,51 @@ test("an admin browses the control D1 and edits a permitted row", async ({
   await expect(page.getByRole("button", { name: "Delete row" })).toHaveCount(0);
   await page.keyboard.press("Escape");
 
-  // A permitted write: insert an invite through the row editor, then rewrite
-  // its note from the grid. The insert holds the invite lock: admin.spec
-  // diffs the invite list around its mint, and a row landing inside that
-  // window would read as one of its minted codes.
-  await nav.getByRole("button", { name: /^invite\b/u }).click();
+  // A permitted write: insert an email invite through the row editor, then
+  // rewrite who created it from the grid. Invites are single-use and
+  // email-scoped, so this row can never collide with another worker's.
+  await nav.getByRole("button", { name: /^email_invite\b/u }).click();
   await page.getByRole("button", { name: "Insert" }).click();
   await expect(
     page.getByRole("heading", { name: /Insert row/u })
   ).toBeVisible();
-  await page.locator("#d1-field-invite-code").fill("E2E-CONTROL-1");
-  await page.locator("#d1-field-invite-createdBy").fill("e2e");
-  await page.locator("#d1-field-invite-note").fill("e2e note");
-  await withInviteLock(async () => {
-    await page.getByRole("button", { name: "Save" }).click();
-    await expect(page.getByText("Row created")).toBeVisible();
-  });
-  await expect(page.getByRole("cell", { name: "E2E-CONTROL-1" })).toBeVisible();
+  await page.locator("#d1-field-email_invite-email").fill("e2e@example.com");
+  await page.locator("#d1-field-email_invite-tokenHash").fill("E2E-CONTROL-1");
+  await page
+    .locator("#d1-field-email_invite-expiresAt")
+    .fill("2030-01-01T00:00:00.000Z");
+  await page.locator("#d1-field-email_invite-createdBy").fill("e2e");
+  await page.getByRole("button", { name: "Save" }).click();
+  await expect(page.getByText("Row created")).toBeVisible();
+  await expect(
+    page.getByRole("cell", { name: "e2e@example.com" })
+  ).toBeVisible();
 
-  const row = page.locator("tbody tr", { hasText: "E2E-CONTROL-1" });
+  const row = page.locator("tbody tr", { hasText: "e2e@example.com" });
   await row.getByRole("cell").nth(1).click();
   await expect(
     page.getByRole("heading", { name: /Update row/u })
   ).toBeVisible();
-  await page.locator("#d1-field-invite-note").fill("e2e note updated");
+  await page.locator("#d1-field-email_invite-createdBy").fill("e2e updated");
   await page.getByRole("button", { name: "Save" }).click();
   await expect(page.getByText("Row updated")).toBeVisible();
-  await expect(
-    page.getByRole("cell", { name: "e2e note updated" })
-  ).toBeVisible();
+  await expect(page.getByRole("cell", { name: "e2e updated" })).toBeVisible();
 
   // Server-side filter, then a header-click sort (asc → desc).
   const popover = page.locator("#d1-filter-popover");
   await popover.locator("summary").click();
   await popover.getByRole("button", { name: "Add" }).click();
-  await popover.getByLabel("Filter column").selectOption("code");
+  await popover.getByLabel("Filter column").selectOption("email");
   await popover.getByLabel("Operator").selectOption("eq");
-  await popover.getByLabel("Filter value").fill("E2E-CONTROL-1");
+  await popover.getByLabel("Filter value").fill("e2e@example.com");
   await popover.getByRole("button", { name: "Apply" }).click();
   await expect(page).toHaveURL(/[?&]f=/u);
   await expect(page.locator("tbody tr")).toHaveCount(1);
 
-  await page.getByRole("button", { name: /^code\b/u }).click();
-  await expect(page).toHaveURL(/sort=code%3Aasc/u);
-  await page.getByRole("button", { name: /^code\b/u }).click();
-  await expect(page).toHaveURL(/sort=code%3Adesc/u);
+  await page.getByRole("button", { name: /^email\b/u }).click();
+  await expect(page).toHaveURL(/sort=email%3Aasc/u);
+  await page.getByRole("button", { name: /^email\b/u }).click();
+  await expect(page).toHaveURL(/sort=email%3Adesc/u);
 
   // The Definition view describes the same table.
   await page.getByRole("button", { name: "Definition" }).click();

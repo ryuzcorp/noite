@@ -169,6 +169,34 @@ export const Authed = ({
     }
   };
 
+  /** Sign the waiting account out: drop the server session, clear the
+   * user-scoped caches, and let the gate settle to SignedOut (which routes
+   * to /login). Separate from the impersonation return above — a pending
+   * account is never an impersonated admin session. */
+  const signOutWaiting = async () => {
+    returning.set(true);
+    returnError.set("");
+
+    try {
+      const result = await authClient.signOut();
+
+      if (result.error) {
+        returnError.set(
+          result.error.message ?? "Failed to sign out — try again"
+        );
+        returning.set(false);
+
+        return;
+      }
+
+      invalidateSession();
+      await refresh();
+    } catch (error) {
+      returnError.set(errorMessage(error));
+      returning.set(false);
+    }
+  };
+
   // The gate follows the session resource, not only its first read: sign-in,
   // sign-out and impersonation are SPA transitions, so the layout keeps the
   // gate's own copy of the session and must repaint it when the resource
@@ -250,6 +278,49 @@ export const Authed = ({
   }
 
   const { session } = state;
+
+  // SECURITY: a waitlist account holds no access until approval — it sees
+  // this page and nothing else (every JSON action refuses it server-side).
+  // An approval flips the row; "Check again" re-reads the session and the
+  // gate paints the app once the row is active.
+  if (session.user.status === "pending") {
+    return (
+      <div class="mx-auto flex w-full max-w-md flex-col items-start gap-3 p-6">
+        <h1 class="m-0 text-lg font-semibold">Waiting for approval</h1>
+        <p class="m-0 text-sm opacity-70">
+          Your account ({session.user.email}) is on the waiting list. An admin
+          reviews new accounts — you will land in the app as soon as yours is
+          approved.
+        </p>
+        {returnError() ? (
+          <p class="text-error m-0 text-sm">{returnError()}</p>
+        ) : null}
+        <div class="flex gap-2">
+          <button
+            type="button"
+            class="btn btn-sm btn-neutral"
+            disabled={returning()}
+            onclick={() => {
+              void refresh();
+            }}
+          >
+            Check again
+          </button>
+          <button
+            type="button"
+            class="btn btn-sm"
+            disabled={returning()}
+            onclick={() => {
+              void signOutWaiting();
+            }}
+          >
+            Sign out
+          </button>
+        </div>
+      </div>
+    );
+  }
+
   const impersonated = session.session.impersonatedBy !== null;
 
   return (

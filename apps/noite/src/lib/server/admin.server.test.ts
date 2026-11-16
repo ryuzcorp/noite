@@ -1,9 +1,24 @@
-import { beforeEach, describe, expect, test } from "bun:test";
+/* oxlint-disable anti-slop/no-chained-type-assertions, anti-slop/require-safety-comment-for-type-assertion -- test doubles: a minimal KitEnv stands in for the Worker env; row reads mirror the better-auth tables */
+import { beforeEach, describe, expect, spyOn, test } from "bun:test";
 
+import type { TypedHandler } from "void";
+
+import { testRouteContext } from "../../testing/context";
 import { createTestD1 } from "../../testing/d1";
 import type { TestD1 } from "../../testing/d1";
+import { authFromEnv } from "../auth";
 import { ensureDb, setD1Binding } from "../db";
-import { ensureAdminAccount } from "./admin.server";
+import { registrationStatus } from "./account.server";
+import {
+  adminCreateEmailInvite,
+  adminListEmailInvites,
+  approveUser,
+  ensureAdminAccount,
+  getWaitlist,
+  rejectUser,
+  setUserRole,
+  setWaitlist,
+} from "./admin.server";
 
 let db: TestD1;
 
@@ -47,5 +62,359 @@ describe("ensureAdminAccount", () => {
 
     expect(rows).toEqual([{ role: "admin" }]);
     expect(db.executed.length).toBeGreaterThan(0);
+  });
+});
+
+/** Drive a JSON-action handler with a JSON body and an optional session
+ * cookie. Real better-auth sessions (minted below through the OTP flow)
+ * exercise the production gates, not doubles. */
+const authedPost = async (
+  handler: TypedHandler,
+  path: string,
+  // oxlint-disable-next-line anti-slop/no-unknown-parameters -- the helper forwards whatever JSON body the case needs; the endpoint decodes it through its schema.
+  body: unknown,
+  cookie?: string
+): Promise<Response> => {
+  const headers = new Headers({ "content-type": "application/json" });
+
+  if (cookie) {
+    headers.set("cookie", cookie);
+  }
+
+  const request = new Request(`http://localhost:9080${path}`, {
+    body: body === undefined ? undefined : JSON.stringify(body),
+    headers,
+    method: "POST",
+  });
+
+  const raw = await handler(testRouteContext(request, ENV));
+
+  if (raw instanceof Response) {
+    return raw;
+  }
+
+  throw new Error("the handler did not answer a Response");
+};
+
+const ENV = {
+  BASE_DOMAIN: "localhost",
+  BETTER_AUTH_SECRET: "admin-test-secret-0123456789abcdef",
+  BETTER_AUTH_URL: "http://localhost:9080",
+} as unknown as KitEnv;
+
+/** A real better-auth session cookie for a row this test inserts. The OTP
+ * flow mints it exactly as the login panel does (console delivery on
+ * localhost), so the actions below read a production session. */
+let mintCount = 0;
+
+const mintCookie = async (
+  id: string,
+  email: string,
+  role: string,
+  status = "active"
+): Promise<string> => {
+  // better-auth budgets OTP sends/sign-ins per client IP (a shared bucket
+  // when the address is unknown): one address per mint keeps the file's
+  // mints from throttling each other.
+  mintCount += 1;
+  const ip = `10.200.0.${mintCount}`;
+  const headers = { "x-forwarded-for": ip };
+  db.raw.run(
+    `INSERT INTO "user" (id, name, email, role, emailVerified, status) VALUES (?, ?, ?, ?, ?, ?)`,
+    [id, id, email, role, 1, status]
+  );
+
+  const lines: unknown[][] = [];
+
+  const log = spyOn(console, "log").mockImplementation((...args: unknown[]) => {
+    lines.push(args);
+  });
+
+  try {
+    const auth = authFromEnv(ENV, ENV.BETTER_AUTH_URL ?? "");
+    await auth.api.sendVerificationOTP({
+      body: { email, type: "sign-in" },
+      headers: new Headers(headers),
+    });
+  } finally {
+    log.mockRestore();
+  }
+
+  const line = lines
+    .map((args) => String(args[0] ?? ""))
+    .find((text) => text.includes(`sign-in code for ${email}:`));
+
+  const otp = line?.split(":").at(-1)?.trim();
+
+  if (!otp) {
+    throw new Error("better-auth delivered no OTP code");
+  }
+
+  const auth = authFromEnv(ENV, ENV.BETTER_AUTH_URL ?? "");
+
+  const signedIn = await auth.handler(
+    new Request(`${ENV.BETTER_AUTH_URL ?? ""}/api/auth/sign-in/email-otp`, {
+      body: JSON.stringify({ email, otp }),
+      headers: { "content-type": "application/json", ...headers },
+      method: "POST",
+    })
+  );
+
+  if (!signedIn.ok) {
+    throw new Error(`better-auth sign-in failed with ${signedIn.status}`);
+  }
+
+  const session = signedIn.headers
+    .getSetCookie()
+    .find((entry) => entry.startsWith("better-auth.session_token="));
+
+  if (!session) {
+    throw new Error("better-auth signed in with no session cookie");
+  }
+
+  return session.split(";")[0] ?? "";
+};
+
+describe("waitlist moderation", () => {
+  test("approve flips pending to active; a second approval finds nothing waiting", async () => {
+    const admin = await mintCookie("admin-1", "admin@example.com", "admin");
+    await mintCookie("w-1", "waiting@example.com", "user", "pending");
+
+    const first = await authedPost(
+      approveUser,
+      "/api/admin/approveUser",
+      "w-1",
+      admin
+    );
+
+    expect(first.status).toBe(200);
+    expect(await first.json()).toEqual({ ok: true });
+
+    // SAFETY: the approval above flipped exactly this row.
+    const status = db.raw
+      .query(`SELECT status FROM "user" WHERE id = 'w-1'`)
+      .get() as { status: string };
+
+    expect(status).toEqual({ status: "active" });
+
+    const second = await authedPost(
+      approveUser,
+      "/api/admin/approveUser",
+      "w-1",
+      admin
+    );
+
+    expect(second.status).toBe(422);
+  });
+
+  test("approve and reject refuse the admin's own account and strangers", async () => {
+    const admin = await mintCookie("admin-1", "admin@example.com", "admin");
+    const plain = await mintCookie("u-1", "user@example.com", "user");
+    await mintCookie("w-1", "waiting@example.com", "user", "pending");
+
+    const self = await authedPost(
+      approveUser,
+      "/api/admin/approveUser",
+      "admin-1",
+      admin
+    );
+
+    expect(self.status).toBe(422);
+
+    const stranger = await authedPost(
+      rejectUser,
+      "/api/admin/rejectUser",
+      "w-1",
+      plain
+    );
+
+    expect(stranger.status).toBe(422);
+
+    // No session is still "Admin only" (a 422 fail), never a 401: the probe
+    // resolves instead of throwing.
+    const signedOut = await authedPost(
+      rejectUser,
+      "/api/admin/rejectUser",
+      "w-1"
+    );
+
+    expect(signedOut.status).toBe(422);
+  });
+
+  test("reject deletes the waiting account, its sessions and its keys", async () => {
+    const admin = await mintCookie("admin-1", "admin@example.com", "admin");
+
+    const waiting = await mintCookie(
+      "w-1",
+      "waiting@example.com",
+      "user",
+      "pending"
+    );
+
+    const rejected = await authedPost(
+      rejectUser,
+      "/api/admin/rejectUser",
+      "w-1",
+      admin
+    );
+
+    expect(rejected.status).toBe(200);
+
+    // SAFETY: count(*) always returns exactly one `{ n }` row.
+    const count = db.raw
+      .query(`SELECT count(*) AS n FROM "user" WHERE id = 'w-1'`)
+      .get() as {
+      n: number;
+    };
+
+    expect(count).toEqual({ n: 0 });
+
+    // The rejected session is gone with the account.
+    expect(
+      db.raw
+        .query(`SELECT count(*) AS n FROM session WHERE userId = 'w-1'`)
+        .get()
+    ).toEqual({ n: 0 });
+    expect(waiting.length).toBeGreaterThan(0);
+  });
+
+  test("reject and role changes refuse accounts that are not waiting", async () => {
+    const admin = await mintCookie("admin-1", "admin@example.com", "admin");
+    await mintCookie("u-1", "user@example.com", "user");
+
+    const rejectActive = await authedPost(
+      rejectUser,
+      "/api/admin/rejectUser",
+      "u-1",
+      admin
+    );
+
+    expect(rejectActive.status).toBe(422);
+
+    await mintCookie("w-1", "waiting@example.com", "user", "pending");
+
+    const promotePending = await authedPost(
+      setUserRole,
+      "/api/admin/setUserRole",
+      { role: "admin", userId: "w-1" },
+      admin
+    );
+
+    expect(promotePending.status).toBe(422);
+  });
+
+  test("the waitlist switch round-trips for admins and refuses everyone else", async () => {
+    const admin = await mintCookie("admin-1", "admin@example.com", "admin");
+    const plain = await mintCookie("u-1", "user@example.com", "user");
+
+    const before = await authedPost(
+      getWaitlist,
+      "/api/admin/getWaitlist",
+      {},
+      admin
+    );
+
+    expect(await before.json()).toEqual({ enabled: false });
+
+    const saved = await authedPost(
+      setWaitlist,
+      "/api/admin/setWaitlist",
+      { enabled: true },
+      admin
+    );
+
+    expect(await saved.json()).toEqual({ enabled: true });
+
+    const denied = await authedPost(
+      getWaitlist,
+      "/api/admin/getWaitlist",
+      {},
+      plain
+    );
+
+    expect(denied.status).toBe(422);
+  });
+
+  test("email invites are admin-only and return the one-time link", async () => {
+    const admin = await mintCookie("admin-1", "admin@example.com", "admin");
+    const plain = await mintCookie("u-1", "user@example.com", "user");
+
+    const created = await authedPost(
+      adminCreateEmailInvite,
+      "/api/admin/adminCreateEmailInvite",
+      { email: "Friend@Example.com" },
+      admin
+    );
+
+    expect(created.status).toBe(200);
+
+    // SAFETY: the create endpoint answers this exact shape; the link format is asserted below.
+    const body = (await created.json()) as {
+      emailed: boolean;
+      id: string;
+      link: string;
+    };
+
+    expect(body.link).toMatch(/\/login\?invite=[A-Za-z0-9_-]{22}$/u);
+
+    const listed = await authedPost(
+      adminListEmailInvites,
+      "/api/admin/adminListEmailInvites",
+      {},
+      admin
+    );
+
+    expect(await listed.json()).toEqual([
+      expect.objectContaining({
+        email: "friend@example.com",
+        state: "available",
+      }),
+    ]);
+
+    const refused = await authedPost(
+      adminCreateEmailInvite,
+      "/api/admin/adminCreateEmailInvite",
+      { email: "friend@example.com" },
+      plain
+    );
+
+    expect(refused.status).toBe(422);
+  });
+
+  test("registrationStatus answers pending, active, and signed-out", async () => {
+    const waiting = await mintCookie(
+      "w-1",
+      "waiting@example.com",
+      "user",
+      "pending"
+    );
+
+    const active = await mintCookie("u-1", "user@example.com", "user");
+
+    const pending = await authedPost(
+      registrationStatus,
+      "/api/account/registrationStatus",
+      {},
+      waiting
+    );
+
+    expect(await pending.json()).toEqual({ status: "pending" });
+
+    const admitted = await authedPost(
+      registrationStatus,
+      "/api/account/registrationStatus",
+      {},
+      active
+    );
+
+    expect(await admitted.json()).toEqual({ status: "active" });
+
+    const signedOut = await authedPost(
+      registrationStatus,
+      "/api/account/registrationStatus",
+      {}
+    );
+
+    expect(signedOut.status).toBe(401);
   });
 });

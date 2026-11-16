@@ -4,7 +4,7 @@ import type { Page } from "@playwright/test";
 import {
   createAppWithKey,
   deleteApp,
-  registerInviteeWithFreshCode,
+  registerInviteeWithFreshInvite,
 } from "./helpers";
 
 // Removing an app collaborator is destructive, so the panel asks first: the
@@ -28,7 +28,7 @@ test("removing a collaborator asks first; Esc and Cancel keep the grant", async 
 
   const email = `collab-${Date.now()}@example.com`;
 
-  const invitee = await registerInviteeWithFreshCode(browser, page, {
+  const invitee = await registerInviteeWithFreshInvite(browser, request, {
     email,
     name: "Collab User",
   });

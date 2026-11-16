@@ -15,6 +15,7 @@ const session: SessionView = {
     id: "u-1",
     name: "User",
     onboardedAt: "2026-11-01",
+    status: "active",
   },
 };
 

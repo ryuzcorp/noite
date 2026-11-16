@@ -83,16 +83,16 @@ const WRITE_POLICY = {
     lockedColumns: [],
     update: true,
   },
-  invite: { delete: true, insert: true, lockedColumns: [], update: true },
+  email_invite: { delete: true, insert: true, lockedColumns: [], update: true },
   // Sessions are revoked by deleting the row; minting or editing one here
   // would hand out a credential, so both are refused.
   session: { delete: true, insert: false, lockedColumns: [], update: false },
-  // `role` and the ban columns are set only through the admin home's Users
-  // tab; the raw editor refuses them.
+  // `role`, the ban columns and the waitlist `status` are set only through
+  // the admin home's Users tab; the raw editor refuses them.
   user: {
     delete: true,
     insert: true,
-    lockedColumns: ["role", "banned", "banReason", "banExpires"],
+    lockedColumns: ["role", "banned", "banReason", "banExpires", "status"],
     update: true,
   },
 } satisfies Record<string, WriteRule>;
@@ -124,15 +124,15 @@ export const controlTableCaps = (table: string): D1TableCaps => {
 };
 
 /** Per-table link from a raw grid row to the proper admin action: the admin
- * home's Users or Invites tab, its search prefilled from the row. Managed by
- * the server so the policy (which table maps to which tab and search) lives
- * next to the write rules it mirrors. */
+ * home's Users tab (invitations live there now), its search prefilled from
+ * the row. Managed by the server so the policy (which table maps to which
+ * tab and search) lives next to the write rules it mirrors. */
 const ROW_ACTIONS = {
-  invite: {
-    column: "code",
-    label: "Manage in Invites",
-    param: "iq",
-    tab: "invites",
+  email_invite: {
+    column: "email",
+    label: "Manage in Users",
+    param: "uq",
+    tab: "users",
   },
   user: {
     column: "email",

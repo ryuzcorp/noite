@@ -6,7 +6,7 @@ import {
   controlEnv,
   hydrateControlEnv,
 } from "../lib/control-env";
-import { signupPolicy } from "../lib/server/invites.server";
+import { signupPolicy } from "../lib/server/email-invites.server";
 import { checkFirstAdminProof } from "../lib/server/setup-code.server";
 import { testRouteContext } from "../testing/context";
 import type { TestD1 } from "../testing/d1";

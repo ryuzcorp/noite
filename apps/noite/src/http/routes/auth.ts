@@ -1,18 +1,16 @@
 import { authFromEnv, MissingAuthSecretError } from "../../lib/auth";
 import { ensureDb } from "../../lib/db";
 import { withTrustedClientAddress } from "../../lib/rate-limit";
-import {
-  INVITES_PER_USER,
-  signupPolicy,
-} from "../../lib/server/invites.server";
+import { signupPolicy } from "../../lib/server/email-invites.server";
 import { ensureSetupCode } from "../../lib/server/setup-code.server";
 import type { RouteHandler } from "../config";
 import { routeFailure } from "../route-failure";
 
-/** Public signup policy for the login panel: is a code required? Answered
- * without a session (the panel asks before anyone can sign in), carries no
- * account data and never the setup code itself — only whether one is
- * required. A broken check must not block the UI, so it answers with the
+/** Public signup policy for the login panel: who may register, and how.
+ * Answered without a session (the panel asks before anyone can sign in),
+ * carries no account data and never the setup code itself — only whether
+ * one is required, and whether uninvited registrations queue on the
+ * waitlist. A broken check must not block the UI, so it answers with the
  * stricter policy on failure. */
 export const handleInviteStatus: RouteHandler = async () => {
   try {
@@ -38,9 +36,10 @@ export const handleInviteStatus: RouteHandler = async () => {
     return Response.json({
       adminExists: true,
       firstRun: false,
-      invitesPerUser: INVITES_PER_USER,
-      requiresInvite: true,
       setupMode: "off",
+      // Fail closed when the policy cannot be read: no open registration,
+      // no waitlist queue — an admin invites by email instead.
+      waitlistEnabled: false,
     });
   }
 };

@@ -15,7 +15,7 @@ import {
 import type { MetricsPoll } from "../../lib/metrics";
 import { runnerConfig } from "../config";
 import type { RouteHandler } from "../config";
-import { controlStreamRefusal, routeUserId } from "../session";
+import { controlStreamRefusal, routeGate } from "../session";
 import { sleepUnlessAborted } from "../sse";
 
 /** GET a runner SSE endpoint and re-wrap it for the browser. A `fetch` throw
@@ -81,11 +81,13 @@ const proxyRunnerStream = async (
       return refusal;
     }
   } else {
-    const userId = await routeUserId(request, env);
+    const gate = await routeGate(request, env);
 
-    if (!userId) {
-      return new Response("Sign in required", { status: 401 });
+    if ("response" in gate) {
+      return gate.response;
     }
+
+    const { userId } = gate;
 
     try {
       await requireAppRole(appId, userId, "view");
@@ -142,11 +144,13 @@ const APPS_STREAM_POLL_MS = 2000;
  * Session-gated like every other browser route. */
 export const handleAppsStream: RouteHandler = async (request, env) => {
   await ensureDb();
-  const userId = await routeUserId(request, env);
+  const gate = await routeGate(request, env);
 
-  if (!userId) {
-    return new Response("Sign in required", { status: 401 });
+  if ("response" in gate) {
+    return gate.response;
   }
+
+  const { userId } = gate;
 
   return eventStream(
     async (stream) => {
@@ -303,11 +307,13 @@ export const handleMetricsStream: RouteHandler = async (
       return refusal;
     }
   } else {
-    const userId = await routeUserId(request, env);
+    const gate = await routeGate(request, env);
 
-    if (!userId) {
-      return new Response("Sign in required", { status: 401 });
+    if ("response" in gate) {
+      return gate.response;
     }
+
+    const { userId } = gate;
 
     try {
       await requireAppRole(appId, userId, "view");

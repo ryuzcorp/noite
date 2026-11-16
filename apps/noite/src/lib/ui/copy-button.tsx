@@ -1,7 +1,8 @@
 //! The one copy-to-clipboard button: writes the value, confirms in place for
-//! a moment. Every copy affordance (invite codes, git remote, object URLs,
-//! D1 cells and CREATE statements) renders this — labelled or icon-only —
-//! so there is a single confirmation timeout and one clipboard guard.
+//! a moment. Every copy affordance (invitation links, git remote, object
+//! URLs, D1 cells and CREATE statements) renders this — labelled or
+//! icon-only — so there is a single confirmation timeout and one clipboard
+//! guard.
 
 import { atom } from "ilha";
 

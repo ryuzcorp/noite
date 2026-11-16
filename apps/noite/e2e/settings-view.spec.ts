@@ -4,7 +4,7 @@ import type { Page } from "@playwright/test";
 import {
   createAppWithKey,
   deleteApp,
-  registerInviteeWithFreshCode,
+  registerInviteeWithFreshInvite,
 } from "./helpers";
 
 // Settings is a page of its own, under the app in the sidebar right below
@@ -140,7 +140,7 @@ test(
 
     const email = `settings-viewer-${Date.now()}@example.com`;
 
-    const invitee = await registerInviteeWithFreshCode(browser, page, {
+    const invitee = await registerInviteeWithFreshInvite(browser, request, {
       email,
       name: "Settings Viewer",
     });

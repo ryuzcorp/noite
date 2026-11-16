@@ -61,15 +61,15 @@ describe("admin bootstrap", () => {
 describe("withDb", () => {
   test("runs the unit of work against the stamped binding", async () => {
     db.raw.run(
-      `INSERT INTO invite (id, code, createdBy, revoked, createdAt)
-       VALUES ('i-1', 'AAAA-BBBB-CCCC', 'u-1', 0, '2026-11-09')`
+      `INSERT INTO email_invite (id, tokenHash, email, createdBy, expiresAt, createdAt)
+       VALUES ('i-1', 'hash-1', 'friend@example.com', 'u-1', '2026-11-09', '2026-11-09')`
     );
 
     const rows = await withDb(() =>
-      getDb().all<{ code: string }>(sql`SELECT code FROM invite`)
+      getDb().all<{ email: string }>(sql`SELECT email FROM email_invite`)
     );
 
-    expect(rows).toEqual([{ code: "AAAA-BBBB-CCCC" }]);
+    expect(rows).toEqual([{ email: "friend@example.com" }]);
   });
 
   test("propagates the work's failure", async () => {

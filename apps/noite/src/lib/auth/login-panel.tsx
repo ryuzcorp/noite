@@ -5,7 +5,7 @@
 //! ```mermaid
 //! stateDiagram-v2
 //!   [*] --> Policy: SSR paints the neutral panel, controls disabled
-//!   Policy --> Ready: PolicyLoaded(firstRun, requiresInvite, setupMode)
+//!   Policy --> Ready: PolicyLoaded(firstRun, waitlistEnabled, setupMode)
 //!   Policy --> Policy: PolicyFailed(message), Retry re-asks
 //!   Ready --> Ready: Pick(register | signin)
 //!   Ready --> Busy: Register / SignIn (busy flag)
@@ -55,8 +55,9 @@ type Panel = Data.TaggedEnum<{
   Ready: {
     readonly firstRun: boolean;
     readonly mode: Mode;
-    readonly requiresInvite: boolean;
     readonly setupMode: "off" | "email" | "code";
+    /** Whether uninvited registrations queue for approval (default OFF). */
+    readonly waitlistEnabled: boolean;
   };
 }>;
 
@@ -77,8 +78,8 @@ type Message = Data.TaggedEnum<{
   PolicyFailed: { readonly message: string };
   PolicyLoaded: {
     readonly firstRun: boolean;
-    readonly requiresInvite: boolean;
     readonly setupMode: "off" | "email" | "code";
+    readonly waitlistEnabled: boolean;
   };
   Register: {
     readonly email: string;
@@ -111,8 +112,8 @@ interface Model {
 /** The signup-policy slice the form branches on. */
 interface PolicySnapshot {
   readonly firstRun: boolean;
-  readonly requiresInvite: boolean;
   readonly setupMode: "off" | "email" | "code";
+  readonly waitlistEnabled: boolean;
 }
 
 const registrationContext = (
@@ -254,8 +255,8 @@ const policyCmd: Effect.Effect<Message, never, never> = Effect.promise(
         ? Msg.PolicyFailed({ message: "Could not read the signup policy" })
         : Msg.PolicyLoaded({
             firstRun: value.firstRun,
-            requiresInvite: value.requiresInvite,
             setupMode: value.setupMode,
+            waitlistEnabled: value.waitlistEnabled,
           });
     } catch (error) {
       return Msg.PolicyFailed({ message: errorMessage(error) });
@@ -457,12 +458,16 @@ const RegisterForm = ({
   model: Model;
 }) => {
   const ready = model.panel._tag === "Ready";
-  const requiresInvite = ready && model.panel.requiresInvite;
+  const firstRun = ready && model.panel.firstRun;
+  const waitlistEnabled = ready && model.panel.waitlistEnabled;
   const setupMode = ready ? model.panel.setupMode : "off";
   // Email mode reserves the address *and* requires the code (knowing the
   // address alone never suffices), so both modes show the code field.
   const requiresSetupCode = setupMode === "code" || setupMode === "email";
   const reservedForAdmin = setupMode === "email";
+  // An invite link carries its token in `?invite=`; pasting one into the
+  // field works too. An explicit entry wins over the link.
+  const linkedInvite = searchParam("invite", { default: "" });
 
   return (
     <form
@@ -478,21 +483,11 @@ const RegisterForm = ({
 
         const email = text(data, "email");
         const name = text(data, "name");
-        const invite = text(data, "invite");
+        const invite = text(data, "invite") || linkedInvite();
         const setupCode = text(data, "setupcode");
 
         if (!(email && name)) {
           dispatch(Msg.Failed({ message: "Name and email are required" }));
-
-          return;
-        }
-
-        if (requiresInvite && !invite) {
-          dispatch(
-            Msg.Failed({
-              message: "An invitation code is required on this instance",
-            })
-          );
 
           return;
         }
@@ -565,26 +560,34 @@ const RegisterForm = ({
           address. Register with that address.
         </p>
       ) : null}
-      {requiresInvite ? (
-        <fieldset class="fieldset p-0">
-          <label class="label" for="register-invite">
-            Invitation code
-          </label>
-          <input
-            id="register-invite"
-            name="invite"
-            class="input w-full font-mono"
-            placeholder="XXXX-XXXX-XXXX"
-            autocomplete="off"
-            spellcheck={false}
-            required
-          />
-          <p class="label whitespace-normal">
-            This instance is invite-only. Any member can share a code from their
-            Account page.
-          </p>
-        </fieldset>
-      ) : null}
+      {firstRun ? null : (
+        <>
+          {linkedInvite() ? (
+            <p class="alert text-sm whitespace-normal">
+              Your invitation from the link is attached — creating this account
+              redeems it.
+            </p>
+          ) : null}
+          <fieldset class="fieldset p-0">
+            <label class="label" for="register-invite">
+              Invitation token (optional)
+            </label>
+            <input
+              id="register-invite"
+              name="invite"
+              class="input w-full font-mono"
+              placeholder="Paste the token from your invite link"
+              autocomplete="off"
+              spellcheck={false}
+            />
+            <p class="label whitespace-normal">
+              {waitlistEnabled
+                ? "No invitation? You will join the waiting list instead — an admin approves new accounts."
+                : "This instance admits accounts by invitation only — you need an invite link from an admin."}
+            </p>
+          </fieldset>
+        </>
+      )}
       <button
         type="submit"
         class="btn btn-neutral w-full"
@@ -701,8 +704,8 @@ const baseSignin = (panel: Panel, policy: PolicySnapshot | null): Panel => {
 
   const fallback: PolicySnapshot = {
     firstRun: false,
-    requiresInvite: true,
     setupMode: "off",
+    waitlistEnabled: false,
   };
 
   const restored = policy ?? fallback;
@@ -735,8 +738,8 @@ export const LoginPanelApp = defineApp({
       case "PolicyLoaded": {
         const policy: PolicySnapshot = {
           firstRun: message.firstRun,
-          requiresInvite: message.requiresInvite,
           setupMode: message.setupMode,
+          waitlistEnabled: message.waitlistEnabled,
         };
 
         return {

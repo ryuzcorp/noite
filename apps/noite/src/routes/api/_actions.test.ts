@@ -6,7 +6,11 @@ import * as Schema from "effect/Schema";
 import type { CloudContext } from "void";
 
 import { api, ApiError } from "../../lib/api";
-import { MissingAuthSecretError, UnauthorizedError } from "../../lib/auth";
+import {
+  MissingAuthSecretError,
+  PendingApprovalError,
+  UnauthorizedError,
+} from "../../lib/auth";
 import { ensureDb, setD1Binding } from "../../lib/db";
 import {
   actionErrorResponse,
@@ -16,7 +20,7 @@ import {
 } from "../../lib/server/api";
 import { testRouteContext } from "../../testing/context";
 import { createTestD1 } from "../../testing/d1";
-import { POST as myInviteCodesPost } from "./account/myInviteCodes";
+import { POST as registrationStatusPost } from "./account/registrationStatus";
 import { POST as slugCheckPost } from "./apps/slugCheck";
 
 beforeAll(async () => {
@@ -96,6 +100,19 @@ describe("actionErrorResponse", () => {
 
     expect(misconfigured.status).toBe(401);
     expect(await misconfigured.json()).toEqual({ error: "no secret" });
+  });
+
+  test("a waiting account maps to 403, never the 401 that bounces to login", async () => {
+    const waiting = actionErrorResponse(
+      new PendingApprovalError({
+        message: "Your account is waiting for approval",
+      })
+    );
+
+    expect(waiting.status).toBe(403);
+    expect(await waiting.json()).toEqual({
+      error: "Your account is waiting for approval",
+    });
   });
 
   test("a session-store outage is a retryable 503, never 401 or 500", async () => {
@@ -302,8 +319,8 @@ describe("endpoint auth gating", () => {
 
   test("an inputless endpoint gates the same way", async () => {
     const response = await post(
-      myInviteCodesPost,
-      "/api/account/myInviteCodes",
+      registrationStatusPost,
+      "/api/account/registrationStatus",
       ENV
     );
 

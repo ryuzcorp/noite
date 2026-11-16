@@ -4,21 +4,22 @@
 //! `controlAccessRefusal`, the client `isInstanceAdmin`, the sidebar and the
 //! control stream gate), each with a slightly different rule.
 //!
-//! States and transitions (`authorityOf` is the only constructor):
-//!
 //! | state           | may administer | how a session gets here                        |
 //! | --------------- | -------------- | --------------------------------------------- |
 //! | `Anonymous`     | no             | no session cookie                             |
-//! | `Plain`         | no             | signed in, `role != "admin"`, not the anchor  |
-//! | `InstanceAdmin` | yes            | `role == "admin"`, or the `NOITE_ADMIN_EMAIL` |
-//! | `Impersonating` | no             | `session.impersonatedBy` is set               |
 //! | `Banned`        | no             | `user.banned`                                 |
+//! | `Pending`       | no             | `user.status == "pending"` (the waitlist)     |
+//! | `Impersonating` | no             | `session.impersonatedBy` is set               |
+//! | `InstanceAdmin` | yes            | `role == "admin"`, or the `NOITE_ADMIN_EMAIL` |
+//! | `Plain`         | no             | signed in, `role != "admin"`, not the anchor  |
 //!
 //! Precedence (one-way, no return): `Anonymous` -> `Banned` ->
-//! `Impersonating` -> `InstanceAdmin` | `Plain`. An impersonated session is
-//! never an instance admin, so an admin touring another account cannot read
-//! or write the auth database; the same session still renders that account's
-//! apps through the collaborator gate.
+//! `Pending` -> `Impersonating` -> `InstanceAdmin` | `Plain`. An
+//! impersonated session is never an instance admin, so an admin touring
+//! another account cannot read or write the auth database; the same session
+//! still renders that account's apps through the collaborator gate. A
+//! pending account never administers either: approval flips `user.status`
+//! to `active` first (a pending row can never carry the admin role).
 //!
 //! The wire form (`AdminOverview.authority`) is the kebab-cased tag; the
 //! client rebuilds the union with `authorityFromWire`.
@@ -30,6 +31,7 @@ export type InstanceAuthority = Data.TaggedEnum<{
   Banned: Record<never, never>;
   Impersonating: { readonly by: string };
   InstanceAdmin: { readonly via: "anchor" | "role" };
+  Pending: Record<never, never>;
   Plain: Record<never, never>;
 }>;
 
@@ -45,6 +47,8 @@ export interface AuthorityInput {
   readonly impersonatedBy: string | null;
   /** The better-auth user's role field (free text in the database). */
   readonly role: unknown;
+  /** The waitlist state (`user.status`): only `"pending"` refuses. */
+  readonly status?: string | null | undefined;
 }
 
 const ROLE_ADMIN = "admin";
@@ -59,6 +63,10 @@ export const authorityOf = (input: AuthorityInput): InstanceAuthority => {
 
   if (input.banned === true) {
     return Authority.Banned();
+  }
+
+  if (input.status === "pending") {
+    return Authority.Pending();
   }
 
   if (input.impersonatedBy !== null) {
@@ -91,6 +99,7 @@ export type AuthorityWire =
   | "banned"
   | "impersonating"
   | "instance-admin"
+  | "pending"
   | "plain";
 
 /** The wire tag for an authority (kebab case of the union tag). */
@@ -99,8 +108,8 @@ export const authorityWire = (authority: InstanceAuthority): AuthorityWire => {
     return "instance-admin";
   }
 
-  // SAFETY: the remaining tags (Anonymous, Banned, Impersonating, Plain)
-  // lowercase to exactly their wire values.
+  // SAFETY: the remaining tags (Anonymous, Banned, Impersonating, Pending,
+  // Plain) lowercase to exactly their wire values.
   return authority._tag.toLowerCase() as AuthorityWire;
 };
 
@@ -118,6 +127,10 @@ export const authorityFromWire = (wire: AuthorityWire): InstanceAuthority => {
 
     case "banned": {
       return Authority.Banned();
+    }
+
+    case "pending": {
+      return Authority.Pending();
     }
 
     case "plain": {

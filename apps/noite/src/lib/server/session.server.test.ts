@@ -5,7 +5,11 @@ import { createTestD1, gateD1 } from "../../testing/d1";
 import type { TestD1 } from "../../testing/d1";
 import { authFromEnv } from "../auth";
 import { ensureDb, setD1Binding } from "../db";
-import { getSessionOrNull } from "./session.server";
+import {
+  getSessionOrNull,
+  sessionAuthority,
+  sessionUser,
+} from "./session.server";
 
 const ENV = {
   BASE_DOMAIN: "localhost",
@@ -126,5 +130,31 @@ describe("getSessionOrNull", () => {
     );
 
     expect(session).toBeNull();
+  });
+});
+
+describe("pending accounts", () => {
+  test("a pending session reads back, but sessionUser refuses it", async () => {
+    const cookie = await mintSessionCookie("waiting@example.com");
+    // The waitlist flips the row after the passkey ceremony minted the
+    // session — or registration created it pending outright.
+    db.raw.run(`UPDATE "user" SET status = 'pending' WHERE email = ?`, [
+      "waiting@example.com",
+    ]);
+    const request = authedRequest(cookie);
+    const env = ENV as unknown as KitEnv;
+    const session = await getSessionOrNull(request, env);
+    expect(session?.user.email).toBe("waiting@example.com");
+
+    await expect(sessionUser(request, env)).rejects.toMatchObject({
+      _tag: "PendingApprovalError",
+    });
+
+    if (session) {
+      const authority = await sessionAuthority(session);
+      expect(authority._tag).toBe("Pending");
+    } else {
+      throw new Error("the pending session did not read back");
+    }
   });
 });

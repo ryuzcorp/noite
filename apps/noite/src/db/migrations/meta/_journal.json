@@ -15,6 +15,13 @@
       "when": 1794670944519,
       "tag": "20261114120000_first_admin_setup_code",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "6",
+      "when": 1794844223676,
+      "tag": "20261116120000_email_invites_waitlist",
+      "breakpoints": true
     }
   ]
 }

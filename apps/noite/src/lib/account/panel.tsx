@@ -26,7 +26,6 @@ import { resourceValue, resourceError } from "../resource";
 import {
   apiKeys,
   invalidate,
-  inviteCodes,
   keys as resourceKeys,
   passkeys,
   session,
@@ -34,7 +33,6 @@ import {
 import { parseAppRole } from "../roles";
 import type { AppRole } from "../roles";
 import { confirmDialog } from "../ui/confirm";
-import { CopyButton } from "../ui/copy-button";
 import { Dialog } from "../ui/dialog";
 import { LoadError } from "../ui/load-error";
 import { SectionSkeleton } from "../ui/skeletons";
@@ -140,51 +138,6 @@ const scopeBadges = (
   const badges = Object.keys(permissions).map(scopeLabel);
 
   return badges.length > 0 ? badges : ["Full access"];
-};
-
-/** The codes this account can still hand out. Every account receives a share
- * on registration (`INVITES_PER_USER`); this is the only place a non-admin can
- * read them, so it is part of the invite flow rather than a nicety. */
-const MyInvitesCard = () => {
-  const res = inviteCodes();
-  const codes = resourceValue(res.state()) ?? [];
-
-  if (res.state()._tag === "Loading") {
-    return <SectionSkeleton lines={2} />;
-  }
-
-  return (
-    <div class="card bg-base-100 dark:bg-base-200 border-base-300 w-full border shadow-md">
-      <div class="card-body gap-3">
-        <h2 class="card-title m-0 text-base">Invitations</h2>
-        <p class="m-0 text-sm opacity-70">
-          This instance is invite-only. Share a code with someone you want to
-          let in; each one works once.
-        </p>
-        {codes.length === 0 ? (
-          <p class="m-0 text-sm opacity-70">
-            No codes left — ask an admin for one.
-          </p>
-        ) : (
-          <ul class="m-0 flex list-none flex-col gap-2 p-0">
-            {codes.map((row) => (
-              <li
-                key={row.id}
-                class="border-base-300 flex items-center justify-between gap-2 rounded border p-2"
-              >
-                <code class="font-mono text-xs">{row.code}</code>
-                <CopyButton
-                  class="btn btn-sm btn-ghost gap-1"
-                  label="Copy invite code"
-                  value={row.code}
-                />
-              </li>
-            ))}
-          </ul>
-        )}
-      </div>
-    </div>
-  );
 };
 
 /** Registered passkeys: list, add another device, rename, remove. This is
@@ -1025,7 +978,6 @@ export const AccountPanel = () => {
           </ul>
         )}
       </section>
-      <MyInvitesCard />
       <ConnectAgentCard apiKey={freshKey} />
     </div>
   );
