@@ -87,13 +87,23 @@ remove_project() {
 # is the operator's call. Under `set -e` a refusal aborts the caller.
 require_private_dir() {
   if [ -e "$1" ]; then
-    _rpd_bits="$(ls -ld "$1" | awk '{ print substr($1, 6, 5) }')"
-    case "$_rpd_bits" in
-    -----) return 0 ;;
+    # Numeric test (mode & 077 == 0): string-slicing `ls -ld` misses the
+    # group-read bit (a 0740 dir reads as private). The operator scripts
+    # run on Linux (install.sh refuses anything else, and backup.sh needs
+    # GNU `timeout`), so GNU stat is the rule; the BSD form is a fallback.
+    _rpd_mode="$(stat -c %a "$1" 2>/dev/null || stat -f %Lp "$1" 2>/dev/null || true)"
+    case "$_rpd_mode" in
+      "" | *[!0-7]*)
+        echo "error: cannot read mode of $1" >&2
+        return 1
+        ;;
     esac
-    echo "error: $1 is group- or world-accessible; backups hold plaintext secrets." >&2
-    echo "  chmod 700 $1 (or pick another directory) and run again." >&2
-    return 1
+    if [ "$(( 0${_rpd_mode} & 077 ))" -ne 0 ]; then
+      echo "error: $1 is group- or world-accessible (mode ${_rpd_mode}); backups hold plaintext secrets." >&2
+      echo "  chmod 700 $1 (or pick another directory) and run again." >&2
+      return 1
+    fi
+    return 0
   fi
   mkdir -p "$1"
   chmod 700 "$1"

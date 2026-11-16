@@ -87,4 +87,19 @@ describe("require_private_dir", () => {
     expect(r.status).toBe(0);
     expect(modeOf(dest)).toBe("700");
   });
+
+  test.each([["740"], ["750"], ["701"], ["710"]])(
+    "refuses a pre-existing %s directory",
+    (mode) => {
+      const dest = path.join(dir, `mode-${mode}`);
+
+      const r = runBash(
+        `source "$LIB"\nmkdir -p "${dest}"\nchmod ${mode} "${dest}"\nrequire_private_dir "${dest}"`
+      );
+
+      expect(r.status).not.toBe(0);
+      expect(r.stderr).toMatch(/group- or world-accessible/u);
+      expect(modeOf(dest)).toBe(mode);
+    }
+  );
 });

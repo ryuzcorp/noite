@@ -1,6 +1,6 @@
 ### Fixed
 
-- `make backup` no longer writes secrets world-readable. The destination directory is created 0700 under `umask 077`, a pre-existing group- or world-accessible destination is refused with instructions instead of filled, and each volume tar is written 0600 (umask inside the helper plus a host-side chmod). Before, the destination inherited the caller's umask and root's helper wrote 0644 tars holding the runner SQLite (plaintext env values) and every tenant's objects.
+- `make backup` no longer writes secrets world-readable. The destination directory is created 0700 under `umask 077`, a pre-existing group- or world-accessible destination is refused with instructions instead of filled, and each volume tar is written 0600 (umask plus a `chmod` inside the root-running helper, which also covers a pre-existing archive). Before, the destination inherited the caller's umask and root's helper wrote 0644 tars holding the runner SQLite (plaintext env values) and every tenant's objects.
 
 ### Operator action required
 

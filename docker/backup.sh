@@ -106,14 +106,15 @@ for vol in $VOLUMES; do
   # The control operator token file is derived state (rewritten on every
   # control spawn from the encrypted DB row) and a plaintext secret: leave it
   # out. The pattern matches nothing in the other volumes.
-  # The helper runs as root with a default umask: force 0600 on the tar on
-  # both sides (umask in the helper, chmod on the host in case the image's
-  # sh ignores it). The MANIFEST below inherits 0600 from the script's umask.
+  # The helper runs as root with a default umask, so the tar is root-owned:
+  # force 0600 inside the helper (umask for creation, chmod for a pre-
+  # existing archive, which tar truncates in place without touching its
+  # mode). No host-side chmod: the invoking user may not own the file, and
+  # an EPERM there would abort after the stack is already stopped.
   "$ENGINE" run --rm --entrypoint sh \
     -v "${name}:/vol:ro" \
     -v "${DEST_DIR}:/out:z" \
-    "$HELPER" -c "umask 077; tar -cf /out/${vol}.tar --exclude=./runner/control-operator-token -C /vol ."
-  chmod 600 "${DEST_DIR}/${vol}.tar"
+    "$HELPER" -c "umask 077; tar -cf /out/${vol}.tar --exclude=./runner/control-operator-token -C /vol . && chmod 600 /out/${vol}.tar"
   echo "    ${vol}.tar"
 done
 
