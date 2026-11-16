@@ -91,6 +91,20 @@ pub(crate) const PROXY_TRANSPORT: &[&str] = &[
     "flush_interval -1",
 ];
 
+/// `Server: noite` on every response the edge sends, like Cloudflare's
+/// `server: cloudflare`: it replaces Caddy's own `Server: Caddy` and any
+/// `Server` header the upstream sent.
+///
+/// The `>` (deferred) form is load-bearing, not style: Caddy 2.11.9 sets
+/// `Server: Caddy` when the request enters, then `reverse_proxy` deletes
+/// that value and copies the upstream's headers over whatever a plain
+/// `header` wrote before it — only an op applied at write time survives
+/// the fleet hop. A deferred op is dropped when an error unwinds the
+/// handler chain, so `handle_errors` carries its own copy (the starting
+/// page and Caddy's default 502s); the :80 redirect site carries one too
+/// (Caddy sorts `header` before `redir`, so it wraps the redirect write).
+pub(crate) const SERVER_HEADER: &str = "header >Server noite";
+
 /// `forward_auth` hop into the runner, for a named matcher. Caddy holds the
 /// original request (body included) while the hop runs and proxies it
 /// unchanged when the hop answers 200; any other status is copied back to
@@ -262,6 +276,7 @@ fn proxy_block(upstream: &str, extra: &[&str]) -> Vec<String> {
 fn route_block(cfg: &Config) -> Vec<String> {
     let mut out = vec![
         "route {".into(),
+        format!("\t{SERVER_HEADER}"),
         "\tedge_routes {".into(),
         format!("\t\ttable {}", cfg.routes_path),
         "\t}".into(),
@@ -350,6 +365,7 @@ fn route_block(cfg: &Config) -> Vec<String> {
 fn errors_block() -> Vec<String> {
     let mut out = vec![
         "handle_errors {".into(),
+        format!("\t{SERVER_HEADER}"),
         format!("\t{EDGE_ERROR_LOG_APPEND}"),
         "\thandle @fleetish_err {".into(),
     ];
@@ -468,6 +484,7 @@ fn static_caddyfile(cfg: &Config) -> String {
         for line in TRACE_MAP {
             lines.push(format!("\t{line}"));
         }
+        lines.push(format!("\t{SERVER_HEADER}"));
         lines.push(format!("\tredir {target} 308"));
         lines.push("}".into());
         lines.push(String::new());
@@ -651,7 +668,7 @@ mod tests {
         assert!(out.contains("log_append noite_edge_error 1"), "{out}");
         let errors = out.split("handle_errors {").nth(1).expect("errors block");
         assert!(
-            errors.starts_with("\n\t\tlog_append noite_edge_error 1"),
+            errors.starts_with("\n\t\theader >Server noite\n\t\tlog_append noite_edge_error 1"),
             "{errors}"
         );
         // The :80 redirect site answers with a 308 and never proxies: its
@@ -751,5 +768,48 @@ mod tests {
         assert!(!out.contains("@controlblocked"), "{out}");
         assert!(!out.contains("@hostframe"), "{out}");
         assert!(!out.contains("@sw {"), "{out}");
+    }
+    #[test]
+    fn every_site_answers_with_server_noite() {
+        // Data-driven over the generated blocks, not one hardcoded string:
+        // a future site block without the header fails here. All three
+        // platform shapes are covered: local plain HTTP, direct TLS with
+        // the :80 redirect, and behind a terminating proxy.
+        let mut behind_proxy = prod_config();
+        behind_proxy.auto_https = false;
+        for cfg in [config_for_tests(), prod_config(), behind_proxy] {
+            let out = static_caddyfile(&cfg);
+            let sites: Vec<&str> = out
+                .split("\n\n")
+                .filter(|block| block.starts_with(":80 {") || block.starts_with(":443 {"))
+                .collect();
+            assert!(!sites.is_empty(), "no site blocks generated\n{out}");
+            for site in &sites {
+                assert!(
+                    site.contains("\theader >Server noite"),
+                    "site block without the deferred Server header:\n{site}\n{out}"
+                );
+            }
+            // The deferred form is load-bearing: reverse_proxy deletes a
+            // pre-proxy Server value and copies the upstream's, so a plain
+            // `header Server` would not survive the fleet hop.
+            assert!(
+                !out.contains("\theader Server "),
+                "non-deferred Server header would lose to the upstream\n{out}"
+            );
+        }
+        // The direct-TLS :80 block is a redirect, not a serving site, and
+        // it carries the header too. Caddy's own automatic-HTTPS redirect
+        // never fires — every mode defines an explicit :80 site, and Caddy
+        // appends its catch-all redirect after existing routes, where our
+        // earlier catch-all already matched — so nothing answers without it.
+        let out = static_caddyfile(&prod_config());
+        let redirect = out
+            .split(":80 {")
+            .nth(1)
+            .and_then(|rest| rest.split(":443 {").next())
+            .expect("redirect site");
+        assert!(redirect.contains("redir https://"), "{redirect}");
+        assert!(redirect.contains("\theader >Server noite"), "{redirect}");
     }
 }

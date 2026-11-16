@@ -56,3 +56,29 @@ test(
     expect(res.status()).toBe(401);
   }
 );
+
+test(
+  "every edge response carries Server: noite",
+  { tag: "@fast" },
+  async ({ request }) => {
+    const edgeBase = process.env.E2E_BASE_URL ?? "http://noite.localhost:8090";
+
+    // Control UI through the edge (the runner API behind it is direct on
+    // :8080 in this lane, so the UI proves the proxied path).
+    const ui = await request.get(`${edgeBase}/login`, {
+      headers: { accept: "text/html" },
+    });
+
+    expect(ui.ok()).toBe(true);
+    expect(ui.headers()["server"]).toBe("noite");
+
+    // Edge-rendered 404 for an unknown host: the route table answers, no
+    // upstream is ever dialed, so this proves the edge's own pages too.
+    const unknown = await request.get(`${edgeBase}/`, {
+      headers: { host: "nope.noite.localhost" },
+    });
+
+    expect(unknown.status()).toBe(404);
+    expect(unknown.headers()["server"]).toBe("noite");
+  }
+);
