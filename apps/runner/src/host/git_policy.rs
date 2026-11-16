@@ -83,6 +83,17 @@ pub fn check_push_policy(role: &str, cmds: &[PushCommand]) -> PolicyDecision {
             "rule push-policy: refs/previews/* is retired and may not be written".into(),
         );
     }
+    // A branch literally named `refs/…` would land as `refs/heads/refs/…`,
+    // shadowing the reserved namespaces the rule above protects: no role may
+    // push one (branch create and the web commit refuse them the same way).
+    if cmds
+        .iter()
+        .any(|cmd| cmd.refname.starts_with("refs/heads/refs/"))
+    {
+        return PolicyDecision::Deny(
+            "rule push-policy: a branch name may not start with refs/".into(),
+        );
+    }
     if role == "admin" {
         return PolicyDecision::Allow;
     }
@@ -232,6 +243,23 @@ mod tests {
             match check_push_policy(role, &cmds) {
                 PolicyDecision::Deny(msg) => assert!(msg.contains("retired"), "{msg}"),
                 PolicyDecision::Allow => panic!("preview ref allowed for {role}"),
+            }
+        }
+    }
+
+    #[test]
+    fn policy_denies_a_refs_shaped_branch_name() {
+        // A branch literally named `refs/…` would land as
+        // `refs/heads/refs/…`: no role may push one.
+        let cmds = vec![PushCommand {
+            old: "0".repeat(40),
+            new: "b".repeat(40),
+            refname: "refs/heads/refs/previews/x".into(),
+        }];
+        for role in ["push", "admin"] {
+            match check_push_policy(role, &cmds) {
+                PolicyDecision::Deny(msg) => assert!(msg.contains("refs/"), "{msg}"),
+                PolicyDecision::Allow => panic!("refs-shaped branch allowed for {role}"),
             }
         }
     }

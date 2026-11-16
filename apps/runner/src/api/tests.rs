@@ -1169,7 +1169,8 @@ async fn caller_refs_refuse_hidden_preview_refs() {
         assert_eq!(status, StatusCode::OK, "log{query}");
     }
 
-    // Environment create: the existence check must not leak a preview ref.
+    // Environment create: a `refs/…` name is refused as a branch name before
+    // the existence check runs (which must not leak a preview ref).
     let (status, body) = h
         .rest(
             "POST",
@@ -1181,7 +1182,7 @@ async fn caller_refs_refuse_hidden_preview_refs() {
         status.is_client_error(),
         "environment create: {status} {body}"
     );
-    assert!(body.to_string().contains("invalid ref"), "{body}");
+    assert!(body.to_string().contains("invalid branch name"), "{body}");
     let (status, body) = h
         .rest(
             "POST",

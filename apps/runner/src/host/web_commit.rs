@@ -205,7 +205,10 @@ async fn commit_into(
     // The ref this commit moves, and the parent it grows from: a branch grows
     // from its own tip (fromSha/main/root on creation).
     let branch = branch.unwrap_or(DEFAULT_BRANCH);
-    if !forge::valid_branch_name(branch) {
+    // A caller-supplied branch, never a full ref: `refs/…` would be stored as
+    // `refs/heads/refs/…`, shadowing the runner's reserved namespaces. A branch
+    // already stored under such a name stays readable, but no new commit grows it.
+    if !forge::valid_user_branch_name(branch) {
         bail!("invalid branch {branch:?}");
     }
     let refname = format!("refs/heads/{branch}");
