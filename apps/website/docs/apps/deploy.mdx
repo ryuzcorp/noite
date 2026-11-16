@@ -43,7 +43,7 @@ Open the result at `https://<slug>.<domain>`. With a `package.json`, the runner 
 1. **Create the app** and an API key (above).
 2. **Describe the Worker** with a `wrangler.jsonc` or, if you use the `cf` CLI, a `cloudflare.config.ts` ([which one](/apps/build#wranglerjsonc-or-cloudflareconfigts)). Or neither, for a static site or a `fetch` module ([no config at all](/apps/build#no-config-at-all)).
 3. **Add a build** if you have one: a `build` script or `build.command` ([Build](/apps/build#steps)).
-4. **Set env vars** in the app's Settings if the build or release command needs them. They do not reach the running Worker; use `vars` in the config for that ([Configure](/apps/configure#environment-variables)).
+4. **Set env vars** in the app's Settings → Environment. They reach the build and the release command, and the running Worker reads each one as `env.NAME` ([Configure](/apps/configure#environment-variables)).
 5. **Push to `main`**, watch the Deployments tab, open `https://<slug>.<domain>`.
 6. **Check what does not run**: Node HTTP servers (Express, Fastify, `app.listen()`) are refused at deploy ([Frameworks and Node servers](/apps/build#frameworks-and-node-servers)). Quotas, rate limits and memory bounds are on [Limits](/reference/limits).
 
