@@ -301,6 +301,53 @@ pub(crate) async fn clear_purges_if_no_rename(
     Ok(cleared)
 }
 
+/// Drop the telemetry rows every tombstone for `slug` still owes: one
+/// [`crate::db::delete_app_telemetry`] per tombstoned app id. App ids are
+/// never reused, so this is safe even when a new app already owns the slug.
+/// The first error aborts: the caller keeps the tombstone so the next pass
+/// retries.
+pub(crate) async fn delete_tombstoned_telemetry(
+    pool: &sqlx::SqlitePool,
+    slug: &str,
+) -> anyhow::Result<()> {
+    for app_id in crate::db::purge_app_ids(pool, slug)
+        .await
+        .with_context(|| format!("list the tombstoned app ids of {slug}"))?
+    {
+        crate::db::delete_app_telemetry(pool, &app_id)
+            .await
+            .with_context(|| format!("drop the telemetry rows of deleted app {app_id}"))?;
+    }
+    Ok(())
+}
+
+/// The telemetry half of a take-over: run the tombstoned app ids' row deletes
+/// plus the slug's fleet-mark deletes, then clear the tombstones. Any error
+/// skips the clear, so [`resume_pending`] retries whatever remains.
+/// Idempotent: every delete is a `DELETE WHERE`, so a re-run only removes
+/// what a crash left behind.
+///
+/// Only call this where no live row owns the slug (the caller's wipe just
+/// proved it) or where the caller lands its own row next under the slug
+/// guard (create, rename): the fleet marks belong to the wiped generation,
+/// and a slug a live row owns carries that row's own marks.
+pub(crate) async fn clear_app_telemetry_and_purges(
+    cfg: &Config,
+    pool: &sqlx::SqlitePool,
+    slug: &str,
+) -> anyhow::Result<u64> {
+    delete_tombstoned_telemetry(pool, slug).await?;
+    crate::db::delete_metric_watermarks_for_slug(pool, slug)
+        .await
+        .with_context(|| format!("clear the ingest marks of {slug}"))?;
+    crate::db::delete_compactions_for_slug(pool, slug)
+        .await
+        .with_context(|| format!("clear the compaction marks of {slug}"))?;
+    clear_purges_if_no_rename(cfg, pool, slug)
+        .await
+        .with_context(|| format!("clear the purge tombstones of {slug}"))
+}
+
 /// Resume every wipe the durable tombstones (`app_purge`) still owe.
 ///
 /// A hard delete writes its tombstone in the same transaction as the row
@@ -368,25 +415,13 @@ pub async fn resume_pending(
         }
         // The app rows are gone but their telemetry may have survived a crash
         // between the row delete and the delete's own telemetry wipe (or a
-        // delete from before that wipe existed). App ids are never reused, so
-        // deleting by tombstoned id is safe even when a new app already owns
-        // the slug; the slug-keyed marks only go on the wipe branch below,
-        // where no row owns the slug. A failure keeps the tombstone below, so
-        // the next pass retries the rows.
+        // delete from before that wipe existed). The slug-keyed marks only go
+        // on the wipe branch below, where no row owns the slug. A failure
+        // keeps the tombstone below, so the next pass retries the rows.
         let mut telemetry_clean = true;
-        match crate::db::purge_app_ids(pool, &slug).await {
-            Ok(ids) => {
-                for app_id in &ids {
-                    if let Err(e) = crate::db::delete_app_telemetry(pool, app_id).await {
-                        tracing::warn!(slug, app_id = %app_id, error = %e, "resumed purge could not drop the app's metrics rows; the next pass retries");
-                        telemetry_clean = false;
-                    }
-                }
-            }
-            Err(e) => {
-                tracing::warn!(slug, error = %e, "resumed purge could not list its tombstoned app ids; leaving them for the next pass");
-                telemetry_clean = false;
-            }
+        if let Err(e) = delete_tombstoned_telemetry(pool, &slug).await {
+            tracing::warn!(slug, error = %e, "resumed purge could not drop the tombstoned telemetry rows; the next pass retries");
+            telemetry_clean = false;
         }
         // `Ok(true)`: the prefixes are empty (or the taker's wipe made them so)
         // and every tombstone for the slug can go. `Ok(false)`: a create took

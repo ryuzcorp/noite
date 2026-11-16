@@ -242,26 +242,17 @@ async fn create_inner(
     {
         Ok(purge::Purged::Done) => {
             // The prefixes are empty and no row owns the slug (checked under
-            // this guard): every pending-purge tombstone for it is satisfied.
-            // A failure only leaves them for the resume pass, which re-checks
-            // the row and wipes an empty prefix — never fail the create for it.
-            if let Err(e) = purge::clear_purges_if_no_rename(&state.config, &state.pool, slug).await
+            // this guard). The dead generation's telemetry and fleet marks go
+            // before the row lands: once it exists nothing retries them, and
+            // a reused slug or label would inherit the dead fleet's position.
+            // A failure fails the create — the tombstones stay for the resume
+            // pass, which re-checks the row and converges.
+            if let Err(e) =
+                purge::clear_app_telemetry_and_purges(&state.config, &state.pool, slug).await
             {
-                tracing::warn!(slug, error = %e, "could not clear the slug's purge tombstones");
-            }
-            // The dead fleet's marks go before the row lands: they are keyed
-            // by fleet key (`<slug>`, `<slug>.<label>`), and once the row
-            // exists nothing retries them — the new app would inherit the
-            // dead fleet's watermark and skipped compactions. Unlike the
-            // tombstone, a failure here fails the create.
-            if let Err(e) = db::delete_metric_watermarks_for_slug(&state.pool, slug).await {
-                let step = step_failure("could not clear the slug's ingest marks", &e.to_string());
-                return Err(ApiError::internal(format!("create {slug}: {step}")));
-            }
-            if let Err(e) = db::delete_compactions_for_slug(&state.pool, slug).await {
                 let step = step_failure(
-                    "could not clear the slug's compaction marks",
-                    &e.to_string(),
+                    "could not clear the slug's leftover telemetry",
+                    &format!("{e:#}"),
                 );
                 return Err(ApiError::internal(format!("create {slug}: {step}")));
             }
@@ -961,10 +952,10 @@ async fn delete_inner(state: &AppState, id: &str) -> Result<(), ApiError> {
             // are empty (this wipe's `Done`, or the taker's authoritative wipe
             // when a row exists again). A stopped or failed wipe keeps them,
             // so `purge::resume_pending` retries at boot and on the loop.
-            let satisfied = match db::get_app_by_slug(&state.pool, &slug).await {
+            let (satisfied, row_owned) = match db::get_app_by_slug(&state.pool, &slug).await {
                 Ok(Some(_)) => {
                     tracing::debug!(slug, "purge skipped: the slug was re-created");
-                    true
+                    (true, true)
                 }
                 Ok(None) => {
                     let out = purge::purge_slug(
@@ -979,30 +970,47 @@ async fn delete_inner(state: &AppState, id: &str) -> Result<(), ApiError> {
                     )
                     .await;
                     match out {
-                        Ok(purge::Purged::Done) => true,
+                        Ok(purge::Purged::Done) => (true, false),
                         Ok(purge::Purged::Stopped) => {
                             tracing::info!(slug, "purge stopped: the slug is being re-created");
-                            false
+                            (false, false)
                         }
                         Err(e) => {
                             // The tombstone is where a retry comes from: this is
                             // an operator-visible warning, not the end of the
                             // story.
                             tracing::warn!(slug, error = %format!("{e:#}"), "background purge failed; the slug's data is left for the resume pass");
-                            false
+                            (false, false)
                         }
                     }
                 }
                 Err(e) => {
                     tracing::warn!(slug, error = %e, "purge skipped: could not check whether the slug was re-created");
-                    false
+                    (false, false)
                 }
             };
             if satisfied {
-                if let Err(e) =
-                    purge::clear_purges_if_no_rename(&state.config, &state.pool, &slug).await
-                {
-                    tracing::warn!(slug, error = %e, "could not clear the slug's purge tombstones");
+                // The tombstone goes only once the telemetry it owes is gone,
+                // or the warn below promises a retry that never comes: the
+                // row deletes re-run here, and the slug's marks when no row
+                // owns it (a re-created slug carries its new owner's marks).
+                // Any error keeps the tombstone for the resume pass.
+                let cleared = if row_owned {
+                    match purge::delete_tombstoned_telemetry(&state.pool, &slug).await {
+                        Ok(()) => {
+                            purge::clear_purges_if_no_rename(&state.config, &state.pool, &slug)
+                                .await
+                                .map_err(|e| format!("{e:#}"))
+                        }
+                        Err(e) => Err(format!("{e:#}")),
+                    }
+                } else {
+                    purge::clear_app_telemetry_and_purges(&state.config, &state.pool, &slug)
+                        .await
+                        .map_err(|e| format!("{e:#}"))
+                };
+                if let Err(e) = cleared {
+                    tracing::warn!(slug, error = %e, "could not clear the slug's telemetry and purge tombstones; the resume pass retries");
                 }
             }
             drop(guard);
@@ -3332,6 +3340,71 @@ mod tests {
             db::count_slug_mark_rows(&state.pool, "mk-target").await,
             0,
             "the target wipe drops the dead fleet's marks before anything moves"
+        );
+        drop(dir);
+    }
+
+    /// The delete's background wipe clears the tombstone only once the
+    /// telemetry it owes is gone: with a poisoned telemetry table the wipe
+    /// succeeds but the tombstone stays, and a later resume — once healed —
+    /// drops the rows and clears it. Fails before the cleanup-then-clear
+    /// helper: the tombstone went with the wipe.
+    #[tokio::test]
+    async fn a_poisoned_telemetry_table_keeps_the_tombstone_until_resume_heals() {
+        let (state, dir) = test_state(10).await;
+        let app = create(&state, "Poison", "poison-metrics", Some("u1"), None)
+            .await
+            .expect("create");
+        db::seed_app_telemetry_rows(&state.pool, &app.id, &app.slug, "env1", "staging").await;
+        // Poison the per-id wipe on every connection: a trigger lives in the
+        // metrics file itself (a dropped table would be re-created by the
+        // pool's per-connection schema apply), so the delete's own telemetry
+        // delete and the chore's re-run both error until it is dropped.
+        sqlx::query(
+            "CREATE TRIGGER metrics.poison_app_hour_delete BEFORE DELETE ON app_hour \
+             BEGIN SELECT RAISE(ABORT, 'poisoned'); END",
+        )
+        .execute(&state.pool)
+        .await
+        .expect("poison app_hour");
+        let wiped = crate::service::detached::finished(&format!("purge:{}", app.slug));
+
+        delete_inner(&state, &app.id).await.expect("delete");
+        tokio::time::timeout(Duration::from_secs(30), wiped.notified())
+            .await
+            .expect("the background wipe finishes");
+
+        assert_eq!(
+            db::pending_purges(&state.pool).await.expect("tombstones"),
+            vec![app.slug.clone()],
+            "the wipe cannot clear the tombstone while telemetry remains"
+        );
+        // Heal and let the resume pass converge: the rows the poisoned delete
+        // left go, and the tombstone with them.
+        sqlx::query("DROP TRIGGER metrics.poison_app_hour_delete")
+            .execute(&state.pool)
+            .await
+            .expect("heal app_hour");
+        let report = crate::host::purge::resume_pending(
+            &state.pool,
+            &state.config,
+            &state.procs,
+            &state.logs,
+            state.wal.sync(),
+        )
+        .await;
+        assert_eq!(report.failed, 0, "the healed resume converges");
+        assert_eq!(
+            db::count_app_telemetry_rows(&state.pool, &app.id).await,
+            0,
+            "the resume drops the rows the poisoned delete left"
+        );
+        assert!(
+            db::pending_purges(&state.pool)
+                .await
+                .expect("tombstones")
+                .is_empty(),
+            "the tombstone clears once the rows are gone"
         );
         drop(dir);
     }

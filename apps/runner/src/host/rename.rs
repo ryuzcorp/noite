@@ -1019,32 +1019,18 @@ async fn rename_app_inner(
             crate::host::purge::Purged::Done => {
                 // The target prefix is empty while we hold its guard: every
                 // pending-purge tombstone for the slug is satisfied, and this
-                // app owns the row from the move below. A failure only leaves
-                // the tombstone for `purge::resume_pending`, which re-checks
-                // the row (we hold the guard until the row write) and wipes
-                // again.
-                // A tombstone left behind would let the purge resume pass wipe
-                // the target *after* this rename moved objects into it: fail
-                // before moving anything instead.
-                crate::host::purge::clear_purges_if_no_rename(cfg, pool, new_slug)
+                // app owns the row from the move below.
+                // The dead generation's telemetry and fleet marks go before
+                // anything moves: once the row names the target nothing
+                // retries them. A tombstone left behind would let the purge
+                // resume pass wipe the target *after* this rename moved
+                // objects into it: fail before moving anything instead.
+                crate::host::purge::clear_app_telemetry_and_purges(cfg, pool, new_slug)
                     .await
                     .with_context(|| {
-                        format!("clear the target slug's purge tombstone for {new_slug}")
-                    })?;
-                // The dead fleet's marks go before anything moves: they are
-                // keyed by fleet key, and once the row names the target
-                // nothing retries them — the renamed app would inherit the
-                // dead fleet's watermark and skipped compactions. Fail before
-                // moving anything instead, like the tombstone above.
-                db::delete_metric_watermarks_for_slug(pool, new_slug)
-                    .await
-                    .with_context(|| {
-                        format!("clear the target slug's ingest marks for {new_slug}")
-                    })?;
-                db::delete_compactions_for_slug(pool, new_slug)
-                    .await
-                    .with_context(|| {
-                        format!("clear the target slug's compaction marks for {new_slug}")
+                        format!(
+                            "clear the target slug's telemetry and purge tombstone for {new_slug}"
+                        )
                     })?;
                 // Written *after* the wipe (so it never vouches for a prefix
                 // the wipe did not finish) and *before* the first move.
