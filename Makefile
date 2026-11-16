@@ -165,7 +165,7 @@ logs:
 	$(COMPOSE) logs -f noite rustfs
 
 backup:
-	sh docker/backup.sh $(DEST)
+	sh docker/backup.sh "$(DEST)"
 
 restore:
 	@if [ -z "$(FROM)" ]; then echo "usage: make restore FROM=backups/<stamp>"; exit 1; fi
