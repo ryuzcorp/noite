@@ -591,8 +591,20 @@ struct D1<'a> {
     proj: PathBuf,
 }
 
+/// A D1 database name bound for a `celld d1` positional: nonempty and never
+/// leading with `-`. celld's parser has no `--` terminator, so a dash-led
+/// name either refuses as a missing database or parses as an option. The
+/// name itself resolves against the deployed project's declared databases
+/// downstream; this only keeps option-shaped input off the argv.
+fn database_id_ok(id: &str) -> bool {
+    !id.is_empty() && !id.starts_with('-')
+}
+
 impl<'a> D1<'a> {
     async fn connect(cfg: &'a Config, app: &'a App, database_id: &str) -> anyhow::Result<D1<'a>> {
+        if !database_id_ok(database_id) {
+            anyhow::bail!("invalid database");
+        }
         let proj = ensure_project(cfg, app).await?;
         Ok(D1 {
             cfg,
@@ -1586,5 +1598,17 @@ mod tests {
         assert!(
             serde_json::from_str::<D1Filter>(r#"{"column":"a","op":"nope","value":""}"#).is_err()
         );
+    }
+
+    /// The database name rides as `celld d1`'s positional, and celld has
+    /// no `--` terminator: a dash-led name must never reach the argv.
+    #[test]
+    fn database_names_reject_option_spelling() {
+        assert!(database_id_ok("db"));
+        assert!(database_id_ok("my-db_1"));
+        assert!(!database_id_ok(""));
+        assert!(!database_id_ok("--bucket"));
+        assert!(!database_id_ok("--command"));
+        assert!(!database_id_ok("-db"));
     }
 }

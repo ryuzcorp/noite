@@ -31,12 +31,23 @@ pub struct DoPreview {
     pub instances: Vec<DoInstance>,
 }
 
+/// A DO class name bound for `celld cell list`'s positional: nonempty and
+/// never leading with `-`. celld's parser has no `--` terminator, so a
+/// dash-led name either refuses as `unknown option` or parses as an
+/// option; anything else resolves against the fleet's cells downstream.
+fn class_name_ok(class_name: &str) -> bool {
+    !class_name.is_empty() && !class_name.starts_with('-')
+}
+
 /// Read-only Durable Object instance list for one class: `celld cell list`
 /// walks the fleet bucket directly (no live node needed) and prints one
 /// JSON row per instance. celld exposes no generic storage read route for
 /// a DO instance, so each instance is also probed with `GET /do/{scope}
 /// ?read=1` — the object's own handler decides what its preview says.
 pub async fn do_instances(cfg: &Config, app: &App, class_name: &str) -> anyhow::Result<DoPreview> {
+    if !class_name_ok(class_name) {
+        anyhow::bail!("invalid class");
+    }
     let bucket = app.fleet_bucket.clone();
     let scope_key = crate::host::credentials::Scope::app(app).key();
     let env_owned = s3::celld_cli_env(cfg, &scope_key);
@@ -260,5 +271,15 @@ mod tests {
             "a 200 previews"
         );
         pool.close().await;
+    }
+
+    /// The class name rides as `celld cell list`'s positional, and celld
+    /// has no `--` terminator: a dash-led name must never reach the argv.
+    #[test]
+    fn class_names_reject_option_spelling() {
+        assert!(class_name_ok("Cart"));
+        assert!(!class_name_ok(""));
+        assert!(!class_name_ok("--json"));
+        assert!(!class_name_ok("-Cart"));
     }
 }
