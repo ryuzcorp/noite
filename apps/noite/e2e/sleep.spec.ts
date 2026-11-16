@@ -39,19 +39,26 @@ test(
     const readThroughEdge = async (): Promise<{
       status: number;
       body: string;
+      server: string | undefined;
     }> => {
       const res = await request.get(`${edgeBase}/?read=1`, {
         headers: { host: edgeHost },
         timeout: 120_000,
       });
 
-      return { body: await res.text(), status: res.status() };
+      return {
+        body: await res.text(),
+        server: res.headers()["server"],
+        status: res.status(),
+      };
     };
 
-    // Sanity: the deployed app serves through the edge before sleep.
+    // Sanity: the deployed app serves through the edge before sleep, with
+    // the edge's Server header instead of the fleet's.
     const before = await readThroughEdge();
     expect(before.status).toBe(200);
     expect(before.body).toContain('"n"');
+    expect(before.server).toBe("noite");
 
     // Park the fleet through the operator lever.
     const slept = await runnerCall(request, `/v1/apps/${appId}/sleep`, {
@@ -67,9 +74,11 @@ test(
     expect(woken.status).toBe(200);
     expect(woken.body).toContain('"n"');
     expect(woken.body).not.toContain("This app is starting");
+    expect(woken.server).toBe("noite");
 
     // Awake now: the next request is fast, with no hold.
     const again = await readThroughEdge();
     expect(again.status).toBe(200);
+    expect(again.server).toBe("noite");
   }
 );
