@@ -1603,12 +1603,17 @@ mod tests {
         .expect("app");
         db::seed_app_telemetry_rows(&pool, &app.id, &app.slug, "env1", "staging").await;
         db::delete_app(&pool, &app.id).await.expect("delete row");
-        // Break the telemetry delete on every connection: without its first
-        // table the per-id wipe always errors.
-        sqlx::query("DROP TABLE metrics.app_hour")
-            .execute(&pool)
-            .await
-            .expect("drop app_hour");
+        // Break the telemetry delete on every connection. A trigger lives in
+        // the metrics file itself; a dropped table would come back on the
+        // next pooled connection, whose `attach_metrics` re-applies
+        // `schema.metrics.sql`, and the wipe would then succeed.
+        sqlx::query(
+            "CREATE TRIGGER metrics.poison_app_hour_delete BEFORE DELETE ON app_hour \
+             BEGIN SELECT RAISE(ABORT, 'poisoned'); END",
+        )
+        .execute(&pool)
+        .await
+        .expect("poison app_hour");
 
         let report = resume_pending(
             &pool,
