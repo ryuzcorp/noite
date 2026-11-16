@@ -6,11 +6,13 @@
 #
 # The end-to-end lanes (`make e2e`, `make e2e-isolation`) need a container
 # engine plus a few minutes, so the pull-request default is the fast suite:
-# PRs that touch runtime code run the tagged gate automatically, and the
-# `e2e` label upgrades the run to the release suite (every spec). Dispatch
-# from the Actions tab runs the chosen suite. They are the release gate too:
-# `images.yml` runs the release suite on every `v*` tag before pushing an
-# image.
+# PRs that touch runtime code run the tagged gate automatically, PRs that
+# touch schema or migration paths also run the upgrade lane (`make
+# e2e-upgrade`: the previous release seeds data, the tree must serve it
+# back), and the `e2e` label upgrades the run to the release suite (every
+# spec). Dispatch from the Actions tab runs the chosen suite. They are the
+# release gate too: `images.yml` runs the release suite plus the upgrade
+# lane on every `v*` tag before pushing an image.
 #
 # Labels never start this workflow: `pull_request` has no `labeled`/`unlabeled`
 # trigger on purpose. A label change (security labels, `e2e`) neither starts
@@ -208,6 +210,7 @@ jobs:
       pull-requests: read
     outputs:
       code: ${{ steps.filter.outputs.code }}
+      schema: ${{ steps.filter.outputs.schema }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -231,6 +234,11 @@ jobs:
               - '.github/workflows/e2e.yml'
               - 'LICENSE'
               - 'NOTICE'
+            schema:
+              - 'apps/runner/schema*.sql'
+              - 'apps/runner/src/schema_version.rs'
+              - 'apps/noite/src/db/migrations/**'
+              - 'docker/**'
 
   # Fast on code pull requests, release on the `e2e` label or by hand from the
   # Actions tab, always release on merge_group. The lanes live in e2e.yml,
@@ -251,6 +259,23 @@ jobs:
       suite: ${{ (github.event_name == 'merge_group' || contains(github.event.pull_request.labels.*.name, 'e2e')) && 'release' || inputs.suite || 'fast' }}
       image_artifact: noite-ci-image
 
+  # The previous-release -> tree lane, on pull requests that touch schema
+  # or migration paths only (`docker/**` overlaps `code`, so a compose or
+  # lane change alone runs it too — the lane owns those files). The tag
+  # gate (`images.yml`) and the nightly schedule (upgrade.yml) cover the
+  # rest; the merge queue inherits the PR run.
+  upgrade:
+    needs: [changes, image]
+    if: always() && needs.image.result == 'success' && github.event_name == 'pull_request' && needs.changes.outputs.schema == 'true'
+    # Permission envelope for the called workflow: the lane downloads the
+    # shared image artifact (`actions: read`).
+    permissions:
+      contents: read
+      actions: read
+    uses: ./.github/workflows/upgrade.yml
+    with:
+      image_artifact: noite-ci-image
+
   # The merge-queue gate (required check, with `security-gate`): fails if any
   # needed job failed or was cancelled. `skipped` is accepted only where the
   # paths-filter legitimately skips: docs-only PRs run no lane, and the
@@ -259,7 +284,7 @@ jobs:
   ci-ok:
     name: ci-ok
     if: always()
-    needs: [check, rust, worker, image, changes, e2e]
+    needs: [check, rust, worker, image, changes, e2e, upgrade]
     runs-on: ubuntu-latest
     # ~3x the 0.1 min p95 (49 runs, 2026-11-11), floor 10.
     timeout-minutes: 10
@@ -272,6 +297,7 @@ jobs:
           image_result="${{ needs.image.result }}"
           changes_result="${{ needs.changes.result }}"
           e2e_result="${{ needs.e2e.result }}"
+          upgrade_result="${{ needs.upgrade.result }}"
           event_name="${{ github.event_name }}"
           fail=0
           require_success() {
@@ -303,6 +329,18 @@ jobs:
               *) echo "::error::e2e must be success or skipped, was $e2e_result"; fail=1 ;;
             esac
           fi
+          # The upgrade lane runs on schema-path pull requests only: `skipped`
+          # is accepted everywhere else, exactly when the upgrade job's own
+          # condition is false.
+          upgrade_expected="${{ github.event_name == 'pull_request' && needs.changes.outputs.schema == 'true' }}"
+          if [ "$upgrade_expected" = "true" ]; then
+            require_success upgrade "$upgrade_result"
+          else
+            case "$upgrade_result" in
+              success|skipped) ;;
+              *) echo "::error::upgrade must be success or skipped, was $upgrade_result"; fail=1 ;;
+            esac
+          fi
           {
             echo "## ci-ok: per-job results (${event_name})"
             echo ""
@@ -314,6 +352,7 @@ jobs:
             echo "| image | ${image_result} |"
             echo "| changes | ${changes_result} |"
             echo "| e2e | ${e2e_result} |"
+            echo "| upgrade | ${upgrade_result} |"
           } >> "${GITHUB_STEP_SUMMARY}"
           if [ "$fail" -ne 0 ]; then
             exit 1

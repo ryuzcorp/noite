@@ -16,6 +16,13 @@ test-results/
 test-results-*/
 e2e/.auth/
 e2e/.auth-*/
+upgrade/.auth/
+upgrade/.auth-*/
+upgrade/.state.json
+upgrade-report/
+upgrade-report-*/
+upgrade-results/
+upgrade-results-*/
 
 # local celld/wrangler data
 data/

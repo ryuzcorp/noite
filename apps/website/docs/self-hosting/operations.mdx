@@ -76,7 +76,28 @@ docker compose up -d
 # multi: docker compose -f compose.yaml -f compose.multi.yaml up -d
 ```
 
-With your own bucket, turn on versioning at the provider instead; `rustfs-data` then does not exist and only `noite-data` needs the tar.
+With your own bucket, `rustfs-data` does not exist and only `noite-data` needs the tar — but the bucket itself needs a backup too. Everything the install cannot rebuild lives under five prefixes of `NOITE_S3_BUCKET`:
+
+| Prefix | What it holds |
+| --- | --- |
+| `runner/state/` | runner snapshots (the SQLite restore source on an empty volume) |
+| `control/` | control UI worker, its D1 (accounts, invites) and its telemetry |
+| `fleets/` | every tenant app's celld state and storage |
+| `envs/` | every preview environment's celld state and storage |
+| `git/` | every app's tip bundle (the push/deploy source of truth) |
+
+### Backing up a bring-your-own-S3 install
+
+Snapshot first (this uploads a fresh `runner/state/` snapshot), then copy the five prefixes to a backup location:
+
+```bash
+curl -fsS -X POST -H "Authorization: Bearer $RUNNER_TOKEN" \
+  http://127.0.0.1:8080/v1/admin/snapshot
+# provider-side copy of runner/state/, control/, fleets/, envs/, git/
+# to a backup bucket or prefix (tooling differs per provider)
+```
+
+Turn on versioning (or replication to a second bucket/region) at the provider: a deleted or overwritten object is then recoverable without a full restore, and a bad deploy cannot destroy the only copy of a fleet. `rustfs-data` never exists on these installs, so there is no volume to tar for the bucket — the prefix copy plus the `noite-data` tar above is the whole backup.
 
 ## Restore
 
@@ -100,6 +121,25 @@ docker compose up -d
 ```
 
 Compose warns that the volumes were not created by it; that is expected. Verify with `docker compose exec noite curl -s http://127.0.0.1:8080/ready`, then open an app.
+
+### Restoring a bring-your-own-S3 install onto a fresh host
+
+The image is disposable and `noite-data` is portable, so a fresh host only needs the backup plus the bucket contents:
+
+```bash
+# 1. Install normally on the fresh host (it starts empty), then stop it.
+# 2. Copy the five prefixes (runner/state/, control/, fleets/, envs/, git/)
+#    from the backup into the install's bucket — the same bucket (same
+#    S3_ENDPOINT/keys/NOITE_S3_BUCKET) or a new one.
+# 3. Restore the noite-data tar over the fresh host's volume:
+docker volume rm -f "noite_noite-data" && docker volume create "noite_noite-data"
+docker run --rm --entrypoint tar -v "noite_noite-data:/vol" -v "$PWD/backups/<stamp>:/in:ro" \
+  ghcr.io/ryuzcorp/noite:alpha -xf "/in/noite-data.tar" -C /vol
+# 4. Point the install at the bucket (S3_ENDPOINT, keys, NOITE_S3_BUCKET in
+#    /opt/noite/.env) if it moved, and start: docker compose up -d
+```
+
+On boot with an empty volume the runner downloads the snapshot from `runner/state/` before serving, so even a lost `noite-data` tar recovers the database rows from the bucket copy — the tar is what restores git mirrors, builds and certificates exactly. Verify with `make doctor`: the snapshot line names the restore source, and every app serves once its fleet cold-boots.
 
 ## Void email and AI
 
