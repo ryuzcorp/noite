@@ -2015,7 +2015,7 @@ export const MCP_TOOLS: readonly McpToolDefinition[] = [
       }),
       expectedTip: Schema.optional(SourceRef).annotate({
         description:
-          "Compare-and-set: refuse the sync unless the origin is still at this commit.",
+          "Compare-and-set: refuse the sync unless the app's branch is still at this commit (the tip read from the status, not the origin's sha).",
       }),
     }),
     run: async ({ principal }, { app: ref, confirm, expectedTip }) => {
