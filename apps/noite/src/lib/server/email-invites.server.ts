@@ -639,7 +639,8 @@ export const listEmailInvites = (): Promise<EmailInviteView[]> =>
       email: string;
       expiresAt: string | null;
       id: string;
-      revoked: boolean | null;
+      // Raw SQL bypasses drizzle's boolean mode: SQLite answers 0/1.
+      revoked: number | boolean | null;
       usedAt: string | null;
       usedBy: string | null;
       usedByEmail: string | null;
@@ -666,7 +667,7 @@ export const listEmailInvites = (): Promise<EmailInviteView[]> =>
         inviteLifecycle(
           {
             expiresAt: row.expiresAt,
-            revoked: row.revoked,
+            revoked: row.revoked === true || row.revoked === 1,
             usedBy: row.usedBy,
           },
           now

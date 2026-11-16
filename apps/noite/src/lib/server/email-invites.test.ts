@@ -316,12 +316,23 @@ describe("listEmailInvites", () => {
     );
 
     expect(redeemed._tag).toBe("Ok");
+
+    const withdrawn = await createEmailInvite(
+      "withdrawn@example.com",
+      "admin",
+      "https://x.example"
+    );
+
+    const withdrew = await revokeEmailInvite(withdrawn.id);
+    expect(withdrew._tag).toBe("Revoked");
     const rows = await listEmailInvites();
     const byId = new Map(rows.map((row) => [row.id, row]));
     expect(byId.get(live.id)?.state).toBe("available");
     expect(byId.get(live.id)?.email).toBe("live@example.com");
     expect(byId.get(spent.id)?.state).toBe("used");
     expect(byId.get(spent.id)?.usedByEmail).toBe("spent@example.com");
+    // The list reads raw SQL, where SQLite answers the flag as 0/1.
+    expect(byId.get(withdrawn.id)?.state).toBe("revoked");
   });
 });
 

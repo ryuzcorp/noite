@@ -127,8 +127,13 @@ const adminPostId = (
 ): Promise<{ body: { errors?: { form?: string } }; status: number }> =>
   adminPostBody(request.post(path, { data: JSON.stringify(id) }));
 
+/** An account's row in the Users card. The "Invite by email" card above it
+ * lists the same addresses (an invite and the account it admitted), so the
+ * row is scoped to its own card. */
 const userRow = (page: Page, email: string) =>
-  page.locator("li.list-row", { hasText: email });
+  page
+    .getByRole("list", { exact: true, name: "Users" })
+    .locator("li.list-row", { hasText: email });
 
 const appRow = (page: Page, slug: string) =>
   page.locator("li.list-row", { hasText: slug });
@@ -178,9 +183,15 @@ test("email invites mint, revoke, and gate registration", async ({
   const liveToken = inviteTokenOf(liveLink);
 
   await page.goto("/apps/_control?t=users");
-  const revokedRow = userRow(page, REVOKED_EMAIL);
+
+  const invites = page.getByRole("list", {
+    exact: true,
+    name: "Invite by email",
+  });
+
+  const revokedRow = invites.locator("li.list-row", { hasText: REVOKED_EMAIL });
   await expect(revokedRow.getByText("available")).toBeVisible();
-  const liveRow = userRow(page, SECOND_EMAIL);
+  const liveRow = invites.locator("li.list-row", { hasText: SECOND_EMAIL });
   await expect(liveRow.getByText("available")).toBeVisible();
 
   await revokedRow.getByRole("button", { name: "Revoke" }).click();
