@@ -5,6 +5,7 @@ import nodePath from "node:path";
 
 import { expect, test } from "@playwright/test";
 import type { APIRequestContext } from "@playwright/test";
+import * as Schema from "effect/Schema";
 
 import {
   CHILD_PROC_TIMEOUT_MS,
@@ -177,6 +178,87 @@ test("syncing an unchanged GitHub import is a no-op", async ({
   await page.getByRole("button", { name: "Sync from GitHub" }).click();
   await expect(page.getByText(/Up to date with the origin/u)).toBeVisible();
 });
+
+test(
+  "syncing after a Noite-side commit asks for confirmation, then syncs",
+  { tag: "@fast" },
+  async ({ page, request }) => {
+    createdApps.push("hello-confirm");
+    await page.goto("/apps/new");
+    await page.getByRole("radio", { name: /Import from GitHub/u }).check();
+    await page.locator("#create-url").fill(UPSTREAM);
+    await page.locator("#create-slug").fill("hello-confirm");
+    await page.locator("#create-name").fill("Hello Confirm");
+    await page.getByRole("button", { name: "Create app" }).click();
+    await waitForCreatedApp(page);
+
+    const appId = await findAppId(request, "hello-confirm");
+    expect(appId).not.toBeNull();
+    const id = appId ?? "";
+    await waitForDeploy(request, id);
+
+    // A Noite-side commit through the runner (what a browser edit writes):
+    // the branch now holds a commit the origin lacks, so the sync must ask
+    // first instead of syncing straight through. The dead button (beta.1
+    // bug 1) painted nothing on this click — no confirmation, no request.
+    const commit = await runnerCall(request, `/v1/apps/${id}/source/commit`, {
+      body: {
+        actor: { name: "E2E", userId: "e2e" },
+        files: [{ content: "noite-side note\n", path: "noite-note.txt" }],
+        message: "noite-side note",
+      },
+      method: "POST",
+    });
+
+    expect(commit.status).toBe(200);
+
+    // `POST /v1/apps/:id/source/commit` answers `{ sha }` (api/source.rs).
+    const { sha: noiteSha } = Schema.decodeUnknownSync(
+      Schema.Struct({ sha: Schema.String })
+    )(commit.body);
+
+    expect(noiteSha).toMatch(/^[0-9a-f]{40}$/u);
+
+    await waitForDeploy(request, id, 8 * 60_000, noiteSha);
+
+    // The card's Origin tip is the GitHub tip (beta.1 bug 2 showed the
+    // local mirror's main here): it still names the imported head, not the
+    // Noite-side commit above it.
+    const [upstreamHead] = execFileSync(
+      "git",
+      ["ls-remote", UPSTREAM, "HEAD"],
+      {
+        encoding: "utf-8",
+        // Egress to github.com: the one child call that leaves localhost.
+        killSignal: "SIGKILL",
+        timeout: CHILD_PROC_TIMEOUT_MS,
+      }
+    )
+      .trim()
+      .split(/\s+/u);
+
+    expect(noiteSha).not.toBe(upstreamHead);
+
+    await page.goto(`/apps/${id}`);
+
+    const card = page.locator("section", {
+      has: page.getByRole("heading", { name: "Sync from GitHub" }),
+    });
+
+    // "Last synced" names the same imported head, so read the Origin tip row.
+    const originTip = card.locator("dl > div", {
+      has: page.locator("dt", { hasText: /^Origin tip$/u }),
+    });
+
+    await expect(originTip.getByText(upstreamHead.slice(0, 7))).toBeVisible();
+    await card.getByRole("button", { name: "Sync from GitHub" }).click();
+    await expect(
+      card.getByText(/will be overwritten in the tree/u)
+    ).toBeVisible();
+    await card.getByRole("button", { name: "Sync anyway" }).click();
+    await expect(card.getByText(/Synced to/u)).toBeVisible();
+  }
+);
 
 test("rejects an import URL that is not a public GitHub repo", async ({
   page,

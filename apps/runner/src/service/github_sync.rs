@@ -51,9 +51,13 @@ const SYNC_REF: &str = "refs/noite/sync";
 const CHANNEL: &str = "sync";
 
 /// What the Sync button needs before it asks: the stored origin, the last
-/// synced sha, the current tip and how many Noite commits a sync would
-/// overwrite in the tree. Computed locally — no clone, so no `upToDate`: the
-/// sync answer itself says whether the origin moved.
+/// synced sha, the local tip, the origin's tip and how many Noite commits a
+/// sync would overwrite in the tree. `current_tip` is the mirror's `main`
+/// (the compare-and-swap the sync builds on); `origin_tip` is GitHub's tip
+/// from an `ls-remote` of the stored source through the hardened clone path
+/// (`None` when that lookup fails — the local counts stay authoritative).
+/// No clone, so no `upToDate`: the sync answer itself says whether the
+/// origin moved.
 #[derive(Debug, Clone, Serialize, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export)]
@@ -67,6 +71,7 @@ pub struct GithubSyncStatus {
     pub path: Option<String>,
     pub last_sync_sha: Option<String>,
     pub current_tip: Option<String>,
+    pub origin_tip: Option<String>,
     pub noite_commits: u64,
 }
 
@@ -181,6 +186,41 @@ async fn current_tip(mirror: &Path) -> anyhow::Result<Option<String>> {
         .cloned())
 }
 
+/// The origin's tip from an `ls-remote` of the stored source, through the
+/// same hardened path the clone uses: the protocol allowlist (https-only,
+/// `file://` only behind the test seam) and no redirects, with the URL built
+/// from the validated owner/repo so nothing the caller typed reaches git
+/// verbatim. `reference` pins the query to the imported ref; absent queries
+/// `HEAD`. A sha-pinned source needs no lookup — the pin is the tip. `None`
+/// on any failure: the status answers the local counts anyway.
+async fn origin_tip(
+    target: &import::ImportTarget,
+    reference: Option<&str>,
+    protocols: import::Protocols,
+) -> Option<String> {
+    if let Some(pinned) = reference {
+        if pinned.len() == 40 && pinned.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Some(pinned.to_string());
+        }
+    }
+    let mut owned = protocols.args();
+    owned.extend([
+        "ls-remote".to_string(),
+        "--".to_string(),
+        target.clone_url.clone(),
+        reference.unwrap_or("HEAD").to_string(),
+    ]);
+    let args: Vec<&str> = owned.iter().map(String::as_str).collect();
+    let out = exec::run_cmd("git", &args, None, &[], GIT_TIMEOUT)
+        .await
+        .ok()?;
+    // `<sha>\t<ref>` per line; the first 40-hex field is the tip.
+    out.lines().find_map(|line| {
+        let sha = line.split_whitespace().next()?;
+        (sha.len() == 40 && sha.chars().all(|c| c.is_ascii_hexdigit())).then(|| sha.to_string())
+    })
+}
+
 async fn tree_of(mirror: &Path, rev: &str) -> anyhow::Result<String> {
     import::rev_parse(mirror, &format!("{rev}^{{tree}}")).await
 }
@@ -222,9 +262,20 @@ async fn local_commits(mirror: &Path, last_sync: Option<&str>, tip: &str) -> u64
 
 const GIT_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// The sync status: the stored origin plus the local counts the confirmation
-/// dialog shows. Reads the mirror; never clones.
+/// The sync status: the stored origin, the origin's tip, and the local
+/// counts the confirmation dialog shows. Reads the mirror plus one
+/// `ls-remote` of the stored source; never clones.
 pub async fn status(state: &AppState, id: &str) -> Result<GithubSyncStatus, ApiError> {
+    status_with(state, id, import::Protocols::default()).await
+}
+
+/// [`status`] with the lookup's protocol set: the tests pass `file: true`
+/// so a fixture repo stands in for github.com. The REST path never does.
+pub(crate) async fn status_with(
+    state: &AppState,
+    id: &str,
+    protocols: import::Protocols,
+) -> Result<GithubSyncStatus, ApiError> {
     let app = app_or_404(state, id).await?;
     let empty = || GithubSyncStatus {
         imported: false,
@@ -234,6 +285,7 @@ pub async fn status(state: &AppState, id: &str) -> Result<GithubSyncStatus, ApiE
         path: None,
         last_sync_sha: None,
         current_tip: None,
+        origin_tip: None,
         noite_commits: 0,
     };
     let source = match stored_source(&app) {
@@ -254,6 +306,12 @@ pub async fn status(state: &AppState, id: &str) -> Result<GithubSyncStatus, ApiE
         Some(sha) => local_commits(&bare, app.last_sync_sha.as_deref(), sha).await,
         None => 0,
     };
+    // Best effort: a failed lookup leaves `origin_tip` empty while the
+    // local counts above stay authoritative.
+    let origin = match resolve_target(&source.url, protocols) {
+        Ok(target) => origin_tip(&target, source.reference.as_deref(), protocols).await,
+        Err(_) => None,
+    };
     Ok(GithubSyncStatus {
         imported: true,
         owner,
@@ -262,6 +320,7 @@ pub async fn status(state: &AppState, id: &str) -> Result<GithubSyncStatus, ApiE
         path: source.path,
         last_sync_sha: app.last_sync_sha,
         current_tip: tip,
+        origin_tip: origin,
         noite_commits: noche,
     })
 }
@@ -986,6 +1045,104 @@ mod tests {
             .await
             .expect("an admin syncs");
         assert!(matches!(ok, GithubSyncOutcome::Synced(_)));
+        h.finish().await;
+    }
+
+    /// The status names the origin's tip from an `ls-remote` of the stored
+    /// source — not the local mirror's `main` — and still reports the app's
+    /// own tip separately for the sync's compare-and-set.
+    #[tokio::test]
+    async fn status_reports_the_origin_tip_not_the_local_main() {
+        let h = SyncHarness::new().await;
+        let upstream = fixture(&h.dir, "upstream", "v1").await;
+        let app = seed_imported(&h, "sync-status-tip", &upstream).await;
+
+        // Before the first sync the mirror has no `main`, but the origin
+        // tip is already known.
+        let before = status_with(&h.state, &app.id, file_protocols())
+            .await
+            .expect("status");
+        let origin_v1 = git(&upstream, &["rev-parse", "HEAD"])
+            .await
+            .trim()
+            .to_string();
+        assert_eq!(before.origin_tip.as_deref(), Some(origin_v1.as_str()));
+        assert_eq!(before.current_tip, None);
+        assert!(before.imported);
+
+        // Sync, then move the origin without syncing: the local tip stays
+        // behind while the reported origin tip follows the move.
+        let first = sync_with(&h.state, &app.id, &confirm(None), file_protocols())
+            .await
+            .expect("first sync");
+        let GithubSyncOutcome::Synced(first) = first else {
+            panic!("a fresh app always syncs, got {first:?}");
+        };
+        commit_all(&upstream, "v2", "two").await;
+        let origin_v2 = git(&upstream, &["rev-parse", "HEAD"])
+            .await
+            .trim()
+            .to_string();
+        assert_ne!(origin_v1, origin_v2);
+
+        let after = status_with(&h.state, &app.id, file_protocols())
+            .await
+            .expect("status");
+        assert_eq!(after.origin_tip.as_deref(), Some(origin_v2.as_str()));
+        assert_eq!(after.current_tip.as_deref(), Some(first.sha.as_str()));
+        h.finish().await;
+    }
+
+    /// A Noite-side commit after the last sync counts toward the
+    /// confirmation while the origin tip stays the origin's own.
+    #[tokio::test]
+    async fn status_counts_noite_commits_against_the_local_tip() {
+        let h = SyncHarness::new().await;
+        let upstream = fixture(&h.dir, "upstream", "v1").await;
+        let app = seed_imported(&h, "sync-status-count", &upstream).await;
+        let first = sync_with(&h.state, &app.id, &confirm(None), file_protocols())
+            .await
+            .expect("first sync");
+        let GithubSyncOutcome::Synced(first) = first else {
+            panic!("a fresh app always syncs, got {first:?}");
+        };
+
+        let pushed = crate::host::web_commit::web_commit(
+            &h.state,
+            &app,
+            &git_identity::noreply(&h.state.config, "user_1", "User One"),
+            "noite-side edit",
+            crate::host::web_commit::WebChanges {
+                files: &[crate::host::web_commit::WebFile {
+                    path: "noite.txt".to_string(),
+                    content: crate::host::web_commit::WebContent::Text("mine".to_string()),
+                }],
+                moves: &[],
+                deletes: &[],
+            },
+            Some("main"),
+            None,
+            None,
+        )
+        .await
+        .expect("push");
+
+        let status = status_with(&h.state, &app.id, file_protocols())
+            .await
+            .expect("status");
+        let origin = git(&upstream, &["rev-parse", "HEAD"])
+            .await
+            .trim()
+            .to_string();
+        assert_eq!(status.current_tip.as_deref(), Some(pushed.as_str()));
+        assert_eq!(status.origin_tip.as_deref(), Some(origin.as_str()));
+        // The sync commit itself plus the Noite-side commit: everything on
+        // the branch since the last sync is overwritten in the tree.
+        assert_eq!(status.noite_commits, 2);
+        assert_eq!(
+            status.last_sync_sha.as_deref(),
+            Some(first.origin_sha.as_str())
+        );
         h.finish().await;
     }
 }

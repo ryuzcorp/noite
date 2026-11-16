@@ -15,6 +15,7 @@ const status = (patch: Partial<GithubSyncStatus> = {}): GithubSyncStatus => ({
   imported: true,
   lastSyncSha: "base",
   noiteCommits: 0,
+  originTip: null,
   owner: "octocat",
   path: null,
   ref: "main",

@@ -2,8 +2,12 @@
 
 /**
  * What the Sync button needs before it asks: the stored origin, the last
- * synced sha, the current tip and how many Noite commits a sync would
- * overwrite in the tree. Computed locally — no clone, so no `upToDate`: the
- * sync answer itself says whether the origin moved.
+ * synced sha, the local tip, the origin's tip and how many Noite commits a
+ * sync would overwrite in the tree. `current_tip` is the mirror's `main`
+ * (the compare-and-swap the sync builds on); `origin_tip` is GitHub's tip
+ * from an `ls-remote` of the stored source through the hardened clone path
+ * (`None` when that lookup fails — the local counts stay authoritative).
+ * No clone, so no `upToDate`: the sync answer itself says whether the
+ * origin moved.
  */
-export type GithubSyncStatus = { imported: boolean, owner: string | null, repo: string | null, ref?: string, path: string | null, lastSyncSha: string | null, currentTip: string | null, noiteCommits: number, };
+export type GithubSyncStatus = { imported: boolean, owner: string | null, repo: string | null, ref?: string, path: string | null, lastSyncSha: string | null, currentTip: string | null, originTip: string | null, noiteCommits: number, };
