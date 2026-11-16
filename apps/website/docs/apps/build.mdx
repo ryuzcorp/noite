@@ -66,6 +66,8 @@ celld also honors declared module `rules` but ships none of Wrangler's defaults,
 
 Noite does not apply a tenant app's D1 `migrations_dir` either: celld records the declaration, but migrations run only through its manual CLI, so a Worker that expects `wrangler d1 migrations apply` semantics starts on an empty database. Apps that migrate themselves on first open (Durable Objects do) are unaffected.
 
+Noite runs the build, not a project's own deploy script, so anything that script provisions is yours to set. [Ember](https://github.com/NYLLON-SOFTWARE/ember-cloudflare) deploys as-is with its default Durable Object storage, but its deploy script mints `SESSION_SECRET`: add it under Settings → Environment ([Environment variables](/apps/configure#environment-variables)) and redeploy before the first sign-in, or setup answers 500.
+
 ## Which config deploys
 
 After a build, the runner deploys what the build produced, in this order:
