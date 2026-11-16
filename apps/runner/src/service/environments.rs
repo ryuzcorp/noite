@@ -131,7 +131,9 @@ pub async fn create(
     if branch == forge::DEFAULT_BRANCH {
         return Err(ApiError::bad("main is the app itself, not an environment"));
     }
-    if !forge::valid_branch_name(branch) {
+    // A caller-supplied branch, never a full ref: `refs/…` would resolve under
+    // `refs/heads/refs/…`, shadowing the runner's reserved namespaces.
+    if !forge::valid_user_branch_name(branch) {
         return Err(ApiError::bad(format!("invalid branch name {branch:?}")));
     }
     let git_ref = format!("refs/heads/{branch}");

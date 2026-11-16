@@ -1575,6 +1575,23 @@ mod tests {
         assert!(!valid_ref("-x"));
     }
 
+    #[test]
+    fn user_branch_names_reject_full_refs() {
+        // A caller may name a branch, never a full ref: `refs/…` would be
+        // stored as `refs/heads/refs/…`, shadowing the reserved namespaces.
+        for bad in [
+            "refs/heads/main",
+            "refs/previews/x",
+            "refs/notes/x",
+            "refs/tags/v1",
+        ] {
+            assert!(!valid_user_branch_name(bad), "{bad:?} must be rejected");
+        }
+        for good in ["main", "feature/x"] {
+            assert!(valid_user_branch_name(good), "{good:?} must be accepted");
+        }
+    }
+
     /// A publish is only ever for an app that still owns its slug. A delete
     /// (or a rename) frees the slug; a caller holding the old row must be
     /// refused inside the push guard, or a late import would create

@@ -402,14 +402,13 @@ fn branch_ref(reference: &str) -> Result<String, ApiError> {
     if name.is_empty() {
         return Err(ApiError::bad("branch is required"));
     }
-    let refname = if name.starts_with("refs/heads/") {
-        name.to_string()
-    } else if name.starts_with("refs/") {
+    // A branch name, never a full ref in disguise: `refs/heads/refs/…` would
+    // resolve under `refs/heads/refs/…`, shadowing the reserved namespaces.
+    let branch = name.strip_prefix("refs/heads/").unwrap_or(name);
+    if !crate::host::forge::valid_user_branch_name(branch) {
         return Err(ApiError::bad("deploy ref must be a branch"));
-    } else {
-        format!("refs/heads/{name}")
-    };
-    Ok(refname)
+    }
+    Ok(format!("refs/heads/{branch}"))
 }
 
 /// Re-run the pipeline at an old successful tip bundle (immutable per-sha),
