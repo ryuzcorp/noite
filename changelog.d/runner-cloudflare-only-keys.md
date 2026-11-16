@@ -1,0 +1,3 @@
+### Fixed
+
+- Apps whose `wrangler.jsonc` carries Cloudflare-only keys now deploy: the runner translates `observability`, `upload_source_maps`, `workers_dev`, `preview_urls`, `previews`, `images` and `send_email` away before `celld deploy` (which refuses them) and names the dropped keys in the deploy log. Deployment-target metadata is inert; `images` and `send_email` read as missing bindings in the Worker, so an app that needs them must degrade without them. The runner also injects Wrangler's default module rules (Text for `**/*.txt`, `**/*.html` and `**/*.sql`, Data for `**/*.bin`, CompiledWasm for `**/*.wasm`) when the config names no `rules` of its own, matching what `wrangler deploy` bundles. Anything else celld refuses still fails the deploy.

@@ -55,6 +55,17 @@ export default defineConfig({ worker });
 
 A Wrangler config in the tree wins over `cloudflare.config.ts`, and a build that writes `dist/wrangler.json` wins over both — unless it also wrote Void's `dist/ssr/wrangler.json`, which then wins ([Which config deploys](#which-config-deploys)). Durable Object `exports` are limited to creating classes; renames, deletes and transfers fail the convert step.
 
+## Cloudflare-only keys
+
+celld refuses any config key it does not know, so the runner translates the Cloudflare-only ones away before `celld deploy` and names them in the deploy log (`config: ignoring Cloudflare-only keys …`):
+
+- Deployment-target metadata with no Noite equivalent: `observability`, `upload_source_maps`, `workers_dev`, `preview_urls`, `previews`. Dropping them changes nothing the app can observe.
+- Bindings Noite does not provide: `images` (Cloudflare Images) and `send_email` (Email Service). The Worker reads both as missing (`env.IMAGES`/`env.EMAIL` are `undefined`), so an app that needs them must degrade without them — Ember, for example, shows a picture as a file download without `IMAGES` and sends email through a `RESEND_API_KEY` secret instead of `EMAIL`. Anything else celld refuses still fails the deploy, so a typo'd key can never silently lose a binding.
+
+celld also honors declared module `rules` but ships none of Wrangler's defaults, so the runner injects Wrangler's `DEFAULT_MODULE_RULES` (Text for `**/*.txt`, `**/*.html` and `**/*.sql`, Data for `**/*.bin`, CompiledWasm for `**/*.wasm`) when the config names no `rules` of its own, and says so in the deploy log. A config with its own `rules` is left alone.
+
+Noite does not apply a tenant app's D1 `migrations_dir` either: celld records the declaration, but migrations run only through its manual CLI, so a Worker that expects `wrangler d1 migrations apply` semantics starts on an empty database. Apps that migrate themselves on first open (Durable Objects do) are unaffected.
+
 ## Which config deploys
 
 After a build, the runner deploys what the build produced, in this order:

@@ -1229,9 +1229,34 @@ async fn deploy_inner(
     let deploy_root = contained_deploy_root(&src_dir, &deploy_root)?;
     // `release` and `build` are keys the runner consumes: celld deploy
     // refuses any config key it does not know, so drop them once they ran.
-    strip_runner_keys(&deploy_root).await?;
+    // Cloudflare-only keys celld refuses are translated away too, and named
+    // in the log: a Worker binding by the same name reads as missing.
+    let (mut dropped, mut rules_added) = strip_runner_keys(&deploy_root).await?;
     if deploy_root != src_dir {
-        strip_runner_keys(&src_dir).await?;
+        let (more, added) = strip_runner_keys(&src_dir).await?;
+        dropped.extend(more);
+        rules_added |= added;
+    }
+    dropped.sort();
+    dropped.dedup();
+    if !dropped.is_empty() {
+        progress
+            .log(
+                DeployStatus::Building,
+                &format!(
+                    "config: ignoring Cloudflare-only keys celld does not support: {}\n",
+                    dropped.join(", ")
+                ),
+            )
+            .await?;
+    }
+    if rules_added {
+        progress
+            .log(
+                DeployStatus::Building,
+                "config: adding Wrangler's default module rules (the config names none)\n",
+            )
+            .await?;
     }
     progress
         .step(
@@ -2584,21 +2609,68 @@ fn has_build_script(package: &serde_json::Value) -> bool {
 /// celld does not accept: Noite's `release` and Wrangler's `build`.
 const RUNNER_WRANGLER_KEYS: &[&str] = &["release", "build"];
 
-/// Remove runner-consumed keys from `dir`'s wrangler.json(c) before `celld
-/// deploy`. A file is rewritten only when it carried one; comments in a
-/// .jsonc are dropped then, which only affects this build's copy.
-async fn strip_runner_keys(dir: &Path) -> anyhow::Result<()> {
+/// Cloudflare-only config keys `celld deploy` refuses that the runner
+/// translates away instead of failing the deploy:
+/// - deployment-target metadata with no Noite equivalent: `observability`,
+///   `upload_source_maps`, `workers_dev`, `preview_urls`, `previews`;
+/// - bindings Noite does not provide: `images` (Cloudflare Images) and
+///   `send_email` (Email Service). The Worker reads both as missing
+///   (`env.IMAGES`/`env.EMAIL` are `undefined`): an app that degrades without
+///   them (Ember falls back to file previews and Resend-or-nothing email)
+///   deploys and serves; anything else fails at runtime, named in the deploy
+///   log — never silently.
+///
+/// Anything else celld refuses still fails the deploy, so a typo'd key can
+/// never silently lose a binding.
+const CELLD_UNSUPPORTED_KEYS: &[&str] = &[
+    "images",
+    "send_email",
+    "observability",
+    "upload_source_maps",
+    "workers_dev",
+    "preview_urls",
+    "previews",
+];
+
+/// Wrangler's default module rules (`DEFAULT_MODULE_RULES` in its bundle):
+/// Text for `**/*.txt`, `**/*.html` and `**/*.sql`, Data for `**/*.bin`,
+/// CompiledWasm for `**/*.wasm` and `**/*.wasm?module`. celld honors
+/// declared `rules` but ships no defaults, so a worker importing a text
+/// file would fail its build; the runner injects these when the config names
+/// no `rules` of its own.
+fn wrangler_default_module_rules() -> serde_json::Value {
+    serde_json::json!([
+        { "type": "Text", "globs": ["**/*.txt", "**/*.html", "**/*.sql"] },
+        { "type": "Data", "globs": ["**/*.bin"] },
+        { "type": "CompiledWasm", "globs": ["**/*.wasm", "**/*.wasm?module"] },
+    ])
+}
+
+/// Translate `dir`'s wrangler.json(c) for `celld deploy`: drop
+/// runner-consumed and Cloudflare-only keys (answering the translated
+/// Cloudflare-only keys for the deploy log), and inject Wrangler's default
+/// module rules when the config names none. A file is rewritten only when it
+/// needs one of those; comments in a .jsonc are dropped then, which only
+async fn strip_runner_keys(dir: &Path) -> anyhow::Result<(Vec<String>, bool)> {
+    let mut dropped = Vec::new();
+    let mut rules_added = false;
     for name in ["wrangler.jsonc", "wrangler.json"] {
         let path = dir.join(name);
         let Ok(text) = tokio::fs::read_to_string(&path).await else {
             continue;
         };
-        let Some(stripped) = without_runner_keys(&text)? else {
+        let Some((stripped, names, added)) = translate_wrangler_config(&text)? else {
             continue;
         };
+        for name in names {
+            if !dropped.contains(&name) {
+                dropped.push(name);
+            }
+        }
+        rules_added |= added;
         tokio::fs::write(&path, stripped).await?;
     }
-    Ok(())
+    Ok((dropped, rules_added))
 }
 
 /// The runner's arch as a container platform suffix for
@@ -2612,20 +2684,40 @@ fn go_arch(arch: &str) -> &str {
     }
 }
 
-/// The config without runner-consumed keys, or `None` when it has none.
-fn without_runner_keys(text: &str) -> anyhow::Result<Option<String>> {
+/// The config translated for `celld deploy`: runner-consumed and
+/// Cloudflare-only keys removed (the latter answered for the deploy log),
+/// plus Wrangler's default module rules when the config names none (answered
+/// alongside) — or `None` when the config needs no translation at all.
+fn translate_wrangler_config(text: &str) -> anyhow::Result<Option<(String, Vec<String>, bool)>> {
     let mut value = crate::host::storage::parse_wrangler(text)?;
     let Some(obj) = value.as_object_mut() else {
         return Ok(None);
     };
-    let before = obj.len();
+    let mut changed = false;
     for key in RUNNER_WRANGLER_KEYS {
-        obj.remove(*key);
+        changed |= obj.remove(*key).is_some();
     }
-    if obj.len() == before {
+    let mut dropped = Vec::new();
+    for key in CELLD_UNSUPPORTED_KEYS {
+        if obj.remove(*key).is_some() {
+            dropped.push((*key).to_string());
+            changed = true;
+        }
+    }
+    let mut rules_added = false;
+    if !obj.contains_key("rules") {
+        obj.insert("rules".to_string(), wrangler_default_module_rules());
+        rules_added = true;
+        changed = true;
+    }
+    if !changed {
         return Ok(None);
     }
-    Ok(Some(serde_json::to_string_pretty(&value)?))
+    Ok(Some((
+        serde_json::to_string_pretty(&value)?,
+        dropped,
+        rules_added,
+    )))
 }
 
 /// The `cf` CLI config (https://github.com/cloudflare/cf).
@@ -2743,7 +2835,7 @@ mod tests {
         activate_after_staged_migrate, ci_cache_volume, ci_cache_volume_install_prefix,
         ci_cache_volume_prefix, contained_deploy_root, failure_summary, go_arch, has_build_script,
         log_migrate_warnings, migrate_void_app, migrate_void_app_staged, parse_wrangler_build,
-        probe_staged_generation, quoted, route_live, wipe_worktree, without_runner_keys,
+        probe_staged_generation, quoted, route_live, translate_wrangler_config, wipe_worktree,
         DeployTarget, MigrateInputs, Progress,
     };
     use crate::models::DeployStatus;
@@ -2980,14 +3072,88 @@ mod tests {
     #[test]
     fn runner_keys_are_stripped_and_other_keys_survive() {
         let jsonc = "{\n  // tenant comment\n  \"name\": \"a\",\n  \"release\": \"bun run migrate\",\n  \"build\": { \"command\": \"make\" },\n  \"main\": \"index.js\"\n}";
-        let out = without_runner_keys(jsonc).unwrap().expect("rewritten");
+        let (out, dropped, _) = translate_wrangler_config(jsonc)
+            .unwrap()
+            .expect("rewritten");
         let v: serde_json::Value = serde_json::from_str(&out).unwrap();
         assert!(v.get("release").is_none());
         assert!(v.get("build").is_none());
         assert_eq!(v["name"], "a");
         assert_eq!(v["main"], "index.js");
-        // Nothing to strip: the file is left alone.
-        assert!(without_runner_keys("{\"name\": \"a\"}").unwrap().is_none());
+        assert!(
+            dropped.is_empty(),
+            "runner keys are not reported: {dropped:?}"
+        );
+        // No keys to strip, but the missing default rules still rewrite it.
+        let (out, _, _) = translate_wrangler_config("{\"name\": \"a\"}")
+            .unwrap()
+            .expect("rewritten for the missing rules");
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert!(v["rules"].is_array());
+    }
+
+    #[test]
+    fn cloudflare_only_keys_are_translated_away_before_celld_deploy() {
+        // Ember's shape: deployment-target metadata plus bindings Noite does
+        // not provide. celld refuses every one, so the runner translates them
+        // away and the deploy succeeds with the bindings reading as missing.
+        let jsonc = "{\n  \"name\": \"ember\",\n  \"main\": \"apps/worker/src/index.ts\",\n  \"compatibility_flags\": [\"nodejs_compat\"],\n  \"observability\": { \"enabled\": true },\n  \"upload_source_maps\": true,\n  \"workers_dev\": true,\n  \"preview_urls\": false,\n  \"previews\": {},\n  \"images\": { \"binding\": \"IMAGES\" },\n  \"send_email\": [{ \"name\": \"EMAIL\" }],\n  \"vars\": { \"STORAGE_BACKEND\": \"do-sqlite\" },\n  \"d1_databases\": [{ \"binding\": \"DB\" }]\n}";
+        let (out, mut dropped, _) = translate_wrangler_config(jsonc)
+            .unwrap()
+            .expect("rewritten");
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        dropped.sort();
+        assert_eq!(
+            dropped,
+            [
+                "images",
+                "observability",
+                "preview_urls",
+                "previews",
+                "send_email",
+                "upload_source_maps",
+                "workers_dev",
+            ]
+        );
+        for key in dropped.iter() {
+            assert!(v.get(key).is_none(), "{key} survives");
+        }
+        assert_eq!(v["name"], "ember");
+        assert_eq!(v["main"], "apps/worker/src/index.ts");
+        assert_eq!(v["vars"]["STORAGE_BACKEND"], "do-sqlite");
+        assert_eq!(v["d1_databases"][0]["binding"], "DB");
+    }
+
+    #[test]
+    fn wrangler_default_module_rules_are_added_when_absent() {
+        // Wrangler bundles Text (.txt, .html, .sql), Data (.bin) and
+        // CompiledWasm (.wasm) without a `rules` key; celld only honors
+        // declared rules, so the runner injects the same defaults instead of
+        // failing the build on the first text import.
+        let (out, _, rules_added) =
+            translate_wrangler_config("{\"name\": \"a\", \"main\": \"w.ts\"}")
+                .unwrap()
+                .expect("rewritten for the missing rules");
+        assert!(rules_added, "the log line needs the flag");
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        let rules = v["rules"].as_array().expect("rules injected");
+        let text = rules
+            .iter()
+            .find(|r| r["type"] == "Text")
+            .expect("a Text rule");
+        for glob in ["**/*.txt", "**/*.html", "**/*.sql"] {
+            assert!(
+                text["globs"]
+                    .as_array()
+                    .is_some_and(|g| g.contains(&json!(glob))),
+                "{glob} covered"
+            );
+        }
+        // A config that names its own rules is left alone: the author took
+        // control of loaders, so there is nothing to translate.
+        let untouched =
+            "{\"name\": \"a\", \"rules\": [{\"type\": \"Text\", \"globs\": [\"**/*.md\"]}]}";
+        assert!(translate_wrangler_config(untouched).unwrap().is_none());
     }
 
     #[test]
