@@ -191,6 +191,20 @@ pub async fn record_request(
     let touched = row.push_request(ts_us, duration_ms, error);
     store(tx, key, &row, touched).await
 }
+/// Mark one fleet active at `ts_us` without counting anything: a burst the
+/// tail had to skip still proves the fleet saw traffic (its lines were
+/// dropped, not absent), so the idle clock must survive the skip. The
+/// counters, the histogram and the dims are untouched — the burst stays
+/// uncounted, exactly as a blind skip left it.
+pub async fn touch_request(
+    tx: &mut Transaction<'_, Sqlite>,
+    key: Key<'_>,
+    ts_us: i64,
+) -> sqlx::Result<()> {
+    let mut row = load(tx, key).await?;
+    row.last_request_us = row.last_request_us.max(ts_us);
+    store(tx, key, &row, None).await
+}
 
 /// Fold one cgroup memory sample into the fleet's hour: the hour keeps the peak
 /// and the mean over every sample the fleet was resident for.

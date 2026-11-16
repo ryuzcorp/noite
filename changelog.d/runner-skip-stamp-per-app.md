@@ -1,0 +1,12 @@
+### Fixed
+
+- The access-log tail no longer leaves a blind spot when the backlog exceeds 8 MiB in a
+  tick. Instead of dropping the skipped bytes blind, it stream-scans the skipped region
+  for request hosts (64 KiB chunks, one bounded 8 KiB line prefix, never the whole file)
+  and touches each distinct fleet's idle clock at the skip time. The burst stays
+  uncounted — no counters, no dims — but every fleet's clock stays trustworthy through
+  the skip, so header-inflated traffic against the unrate-limited `:80` site can no
+  longer hold the whole fleet awake by sustaining the backlog. The sleep sweep and
+  memory-pressure parking needed no skip gate afterward: an app that served in the burst
+  looks active on its touched clock, and an app absent from the burst parks normally.
+  The `access_log_skip_at` setting is gone with the gate.
