@@ -27,7 +27,7 @@ The edge also drops connections that take more than 10 seconds to send their req
 
 Asleep apps: when requests wake apps, at most `RUNNER_WAKE_CONCURRENCY` (default 4) cold-start at once. Later wakes wait their turn within `RUNNER_WAKE_TIMEOUT_S`, so a flood aimed at many sleeping apps cannot start all of them together.
 
-Every response from the edge carries `Server: noite`, replacing Caddy's own value and any `Server` header the app sent — the same way Cloudflare answers `server: cloudflare`. Fingerprint the stack on that value; a proxy in front (Cloudflare included) may replace it with its own.
+Every response the edge's routes answer carries `Server: noite`. That covers apps, the control UI, the API and the edge's own pages, and it replaces Caddy's value and any `Server` header the app sent, the same way Cloudflare answers `server: cloudflare`. One exception: Caddy answers an active ACME HTTP-01 certificate challenge before any route runs, so that response keeps `Server: Caddy`. A proxy in front (Cloudflare included) may also replace the value with its own, so don't treat `noite` as an unconditional fingerprint.
 
 ## Behind a proxy
 

@@ -1,3 +1,3 @@
 ### Added
 
-- Every HTTP response from a Noite edge carries `Server: noite`, replacing Caddy's default and any `Server` header the app sent (Cloudflare and Vercel do the same for their edges). Fingerprint the stack on that value; a proxy in front may replace it with its own.
+- Responses from a Noite edge's routes carry `Server: noite`: apps, the control UI, the API and the edge's own pages. The value replaces Caddy's default and any `Server` header the app sent, as Cloudflare and Vercel do for their edges. An ACME HTTP-01 challenge response, which Caddy answers before any route, keeps `Server: Caddy`, and a proxy in front may replace the value.
