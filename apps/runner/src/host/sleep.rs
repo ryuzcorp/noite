@@ -626,6 +626,12 @@ pub async fn wake_app(
     if app.is_stopped() {
         anyhow::bail!("app is stopped");
     }
+    // A delete in flight owns this fleet (it marked the app before its first
+    // stop): refuse the wake instead of respawning onto ports the row delete
+    // is about to hand to another tenant.
+    if supervisor::app_teardown_began(app_id) {
+        anyhow::bail!("app is being deleted");
+    }
     let Some(port) = app.listen_port else {
         anyhow::bail!("app has no port");
     };
@@ -809,6 +815,12 @@ pub async fn wake_environment(
     if env.is_stopped() {
         anyhow::bail!("environment is stopped");
     }
+    // Teardown in flight owns this fleet (it marked the environment before
+    // its first stop): refuse the wake instead of respawning onto ports the
+    // row delete is about to hand to another tenant.
+    if supervisor::env_teardown_began(env_id) || supervisor::app_teardown_began(&env.app_id) {
+        anyhow::bail!("environment is being torn down");
+    }
     let Some(port) = env.listen_port else {
         anyhow::bail!("environment has no port");
     };
@@ -956,6 +968,11 @@ async fn park_after_failed_wake(
 /// A deploy is activity: wake an asleep environment before its pipeline runs,
 /// so the reconcile loop spawns the fleet the new release lands in.
 pub async fn wake_environment_for_deploy(pool: &SqlitePool, procs: &ProcMap, env: &Environment) {
+    // Teardown owns this fleet now: leave the entry alone instead of
+    // unparking a fleet the deploy's own start step must refuse.
+    if supervisor::env_teardown_began(&env.id) || supervisor::app_teardown_began(&env.app_id) {
+        return;
+    }
     if !env.is_asleep() {
         return;
     }
@@ -985,6 +1002,11 @@ pub async fn wake_environment_for_deploy(pool: &SqlitePool, procs: &ProcMap, env
 /// A deploy is activity: wake an asleep app before its pipeline runs so the
 /// reconcile loop spawns the fleet the new release lands in.
 pub async fn wake_for_deploy(pool: &SqlitePool, procs: &ProcMap, app: &App) {
+    // A delete owns this fleet now: leave the entry alone instead of
+    // unparking a fleet the deploy's own start step must refuse.
+    if supervisor::app_teardown_began(&app.id) {
+        return;
+    }
     if !app.is_asleep() {
         return;
     }

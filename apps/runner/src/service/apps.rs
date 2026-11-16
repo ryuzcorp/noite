@@ -814,6 +814,12 @@ async fn delete_inner(state: &AppState, id: &str) -> Result<(), ApiError> {
         let step = step_failure("could not stop the app", &e.to_string());
         return Err(ApiError::internal(format!("delete {}: {step}", app.slug)));
     }
+    // The generation check every spawn path honors (same contract as the
+    // environment teardown's mark): from here no deploy, wake, reconcile
+    // tick or restart may (re)start this app's fleets, so the row delete
+    // below hands the allocator port pairs no live process holds. After the
+    // stopped mark above, so a failed stop leaves no live app marked.
+    supervisor::mark_app_teardown(&app.id);
     // Remember whether anything was running before the stops remove the map
     // entries: the background wipe must still settle when it killed a node,
     // and `any_fleet` inside it would see the map already empty.

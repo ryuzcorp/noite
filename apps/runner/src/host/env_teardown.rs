@@ -60,6 +60,13 @@ pub async fn teardown(
     env: EnvTarget<'_>,
     strict_credentials: bool,
 ) -> anyhow::Result<()> {
+    // The generation check every spawn path honors: from here no deploy,
+    // wake, reconcile tick or restart may (re)start this fleet, so the row
+    // delete at the end hands the allocator a port pair no live process
+    // holds. Set before the first stop — the stop removes the supervisor
+    // entry, and without the mark a tick landing between the stop and the row
+    // delete would respawn onto ports about to be reused.
+    supervisor::mark_env_teardown(env.id);
     supervisor::stop_environment_fleet(procs, env.app_slug, env.label).await;
     // Brief settle, same as purge: don't clear a dying node's prefix.
     tokio::time::sleep(Duration::from_millis(500)).await;
@@ -684,6 +691,112 @@ mod tests {
         )
         .await
         .expect("env")
+    }
+
+    /// The merge-queue flake: teardown stops the fleet first and deletes the
+    /// row last, and a reconcile tick landing between the two respawned the
+    /// fleet (`started celld` 93 ms after the stop) onto ports the row delete
+    /// then handed to another tenant's fleet — whose deploy died at its
+    /// health gate on the bind conflict after its reload answered from the
+    /// leaked fleet. Teardown marks the environment before its first stop
+    /// now, and every spawn path refuses a marked fleet, so the row delete
+    /// frees a port pair no live process holds. Deterministic: the racing
+    /// start runs exactly where the tick's `ensure_environment_fleet` ran —
+    /// after the stop, before the row delete, while the row still reads as
+    /// wanted.
+    #[tokio::test]
+    async fn teardown_refuses_a_fleet_start_that_races_it() {
+        let dir = std::env::temp_dir().join(format!("noite-env-race-{}", new_id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        // A stand-in celld: the spawn path only needs an executable that
+        // stays alive (the sleep wake tests use the same stand-in).
+        let fake = dir.join("celld");
+        std::fs::write(&fake, "#!/bin/sh\nsleep 60\n").expect("write fake celld");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        }
+        let (state, app) = ref_teardown_state(&dir, &crate::testutil::spawn_s3_stub().await).await;
+        let mut cfg = (*state.config).clone();
+        cfg.celld_bin = fake.to_string_lossy().into_owned();
+        // Root keys: the spawn mints credentials, and this test is about the
+        // spawn race, not the store's IAM (same reason as the wake tests).
+        cfg.credentials = crate::host::credentials::Credentials::Root {
+            reason: "test".into(),
+        };
+        let env = ref_teardown_env(&state, &app, "gone", "refs/heads/gone", 30110).await;
+        let fleet = supervisor::env_fleet_key(&env.app_slug, &env.label);
+
+        // The fleet is up before the ref disappears.
+        supervisor::ensure_environment_fleet(&state.pool, &cfg, &state.procs, &state.logs, &env)
+            .await
+            .expect("fleet starts");
+        assert!(supervisor::has_process(&state.procs, &fleet).await);
+
+        // Teardown's first two steps: mark, then stop. The row still reads as
+        // wanted here — exactly what the tick's `env_still_wanted` saw.
+        supervisor::mark_env_teardown(&env.id);
+        supervisor::stop_environment_fleet(&state.procs, &env.app_slug, &env.label).await;
+        assert!(
+            db::get_environment(&state.pool, &env.id)
+                .await
+                .unwrap()
+                .is_some(),
+            "the row outlives the stop; the race window is open"
+        );
+
+        // The competing start (the tick's `ensure_environment_fleet`): it
+        // must refuse instead of respawning onto ports about to be reused.
+        let raced = supervisor::ensure_environment_fleet(
+            &state.pool,
+            &cfg,
+            &state.procs,
+            &state.logs,
+            &env,
+        )
+        .await;
+        assert!(
+            raced.is_err(),
+            "a start racing teardown must refuse (it respawned the fleet instead)"
+        );
+        assert!(
+            supervisor::live_keys(&state.procs).await.is_empty(),
+            "nothing was spawned for the race"
+        );
+
+        // Teardown runs to completion: the row (and with it the port pair)
+        // goes, with no live fleet left behind to squat on it.
+        teardown(
+            &cfg,
+            &state.pool,
+            &state.procs,
+            &state.logs,
+            (&env).into(),
+            false,
+        )
+        .await
+        .expect("teardown completes");
+        assert!(
+            db::get_environment(&state.pool, &env.id)
+                .await
+                .unwrap()
+                .is_none(),
+            "the row is gone"
+        );
+        assert!(
+            !supervisor::has_process(&state.procs, &fleet).await,
+            "teardown leaves no live fleet behind"
+        );
+
+        // The freed pair is claimable again — with no live holder, so the
+        // next environment binds it cleanly.
+        let claim = crate::db::alloc::claim_ports_in(&state.pool, 30110, 30111)
+            .await
+            .expect("the torn-down pair returns to the allocator");
+        assert_eq!((claim.listen, claim.internal), (30110, 30111));
+        state.pool.clone().close().await;
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The wipe must not hold the ref move: `prs.merge`'s `deleteBranch`

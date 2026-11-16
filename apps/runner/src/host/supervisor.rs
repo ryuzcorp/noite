@@ -1,6 +1,6 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::process::Stdio;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
@@ -73,6 +73,62 @@ pub type ProcMap = Arc<Mutex<HashMap<String, FleetEntry>>>;
 
 pub fn new_procs() -> ProcMap {
     Arc::new(Mutex::new(HashMap::new()))
+}
+
+/// Fleets whose teardown has begun and must never spawn again: environments
+/// in `host::env_teardown` and apps in `service::apps::delete_inner` mark
+/// their id here **before** stopping the fleet, and every spawn path refuses
+/// them below. Keyed by the never-reused row id (not the fleet key or slug,
+/// both of which a later app or label reuses), and never cleared: a deploy
+/// holding a stale struct past the row delete must still refuse, and a retry
+/// of a failed teardown re-marks idempotently and completes the wipe it
+/// retries. A failed teardown leaves its row (and the mark) behind, which is
+/// fail-closed — the reconcile loop keeps refusing a fleet whose ref is gone
+/// until the retry removes the row.
+static TEARDOWN_ENVS: LazyLock<std::sync::Mutex<HashSet<String>>> =
+    LazyLock::new(|| std::sync::Mutex::new(HashSet::new()));
+static TEARDOWN_APPS: LazyLock<std::sync::Mutex<HashSet<String>>> =
+    LazyLock::new(|| std::sync::Mutex::new(HashSet::new()));
+
+/// Mark one environment's fleet unrestorable: teardown's first step. After
+/// this, `ensure_environment_fleet` (and the reconcile, wake and deploy paths
+/// that call it) refuse to (re)start the fleet, so the row delete at the end
+/// of the wipe hands the allocator a port pair no live process holds.
+pub fn mark_env_teardown(env_id: &str) {
+    TEARDOWN_ENVS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(env_id.to_string());
+}
+
+/// Whether the environment's teardown began: every spawn path for its fleet
+/// refuses these. Sync so the check runs before (and without) the proc-map
+/// lock; the adoption epoch guard still covers a claim taken just before the
+/// mark (a stop removes the entry, so the stale claim adopts nothing).
+pub fn env_teardown_began(env_id: &str) -> bool {
+    TEARDOWN_ENVS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .contains(env_id)
+}
+
+/// Mark one app's fleets unrestorable: app delete's step right after the row
+/// is marked stopped, before the first fleet stop. Covers the app fleet and
+/// every preview environment fleet (cascade-deleted with the app row).
+pub fn mark_app_teardown(app_id: &str) {
+    TEARDOWN_APPS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(app_id.to_string());
+}
+
+/// Whether the app's delete began: every spawn path for its fleets refuses
+/// these, same contract as [`env_teardown_began`].
+pub fn app_teardown_began(app_id: &str) -> bool {
+    TEARDOWN_APPS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .contains(app_id)
 }
 
 /// One fleet's supervised lifecycle. See the module docs on
@@ -989,6 +1045,13 @@ pub async fn ensure_fleet(
     logs: &LogState,
     app: &App,
 ) -> anyhow::Result<()> {
+    // A delete in flight owns this fleet: it marked the app before its first
+    // stop, and a spawn after the mark would hand the allocator's next owner
+    // of these ports a live squatter (or serve one tenant's traffic on a
+    // deleted app's process). Refuse instead of racing the stop.
+    if app_teardown_began(&app.id) {
+        anyhow::bail!("app {} is being deleted; not starting its fleet", app.id);
+    }
     let (Some(listen), Some(internal)) = (app.listen_port, app.internal_port) else {
         return Ok(());
     };
@@ -1018,6 +1081,16 @@ pub async fn ensure_environment_fleet(
     logs: &LogState,
     env: &crate::models::Environment,
 ) -> anyhow::Result<()> {
+    // Teardown in flight owns this fleet: it marked the environment (and an
+    // app delete marks the app) before its first stop, and a spawn after the
+    // mark would come back to life on ports the row delete is about to hand
+    // to another tenant's fleet. Refuse instead of racing the stop.
+    if env_teardown_began(&env.id) || app_teardown_began(&env.app_id) {
+        anyhow::bail!(
+            "environment {} is being torn down; not starting its fleet",
+            env.id
+        );
+    }
     let (Some(listen), Some(internal)) = (env.listen_port, env.internal_port) else {
         return Ok(());
     };

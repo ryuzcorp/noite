@@ -582,6 +582,12 @@ async fn still_wanted(pool: &SqlitePool, app_id: &str) -> sqlx::Result<bool> {
     if crate::service::apps::deleting(app_id) {
         return Ok(false);
     }
+    // The delete marked the app before its first stop: a row still marked
+    // running but already doomed must not spawn (the stopped mark lands just
+    // after, and the row delete later).
+    if supervisor::app_teardown_began(app_id) {
+        return Ok(false);
+    }
     Ok(db::get_app(pool, app_id)
         .await?
         .is_some_and(|row| row.desired() == DesiredState::Running))
@@ -594,6 +600,13 @@ async fn env_still_wanted(
     env: &crate::models::Environment,
 ) -> sqlx::Result<bool> {
     if crate::service::apps::deleting(&env.app_id) {
+        return Ok(false);
+    }
+    // Teardown marks the environment before its first stop but deletes the
+    // row last: without this the tick respawns the fleet it just stopped
+    // into the window where the row still reads as wanted (merge-queue
+    // flake: the respawn lived past the row delete onto reused ports).
+    if supervisor::env_teardown_began(&env.id) || supervisor::app_teardown_began(&env.app_id) {
         return Ok(false);
     }
     Ok(db::get_environment(pool, &env.id)

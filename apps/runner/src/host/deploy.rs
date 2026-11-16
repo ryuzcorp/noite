@@ -420,13 +420,26 @@ async fn load_deploy_target(
 ) -> anyhow::Result<Option<Environment>> {
     match target {
         DeployTarget::Production => {
+            if supervisor::app_teardown_began(&app.id) {
+                anyhow::bail!("app {} is being deleted; skipping fleet start", app.id);
+            }
             if db::get_app(pool, &app.id).await?.is_none() {
                 anyhow::bail!("app {} deleted during deploy; skipping fleet start", app.id);
             }
             Ok(None)
         }
         DeployTarget::Environment(env) => match db::get_environment(pool, &env.id).await? {
-            Some(fresh) => Ok(Some(fresh)),
+            Some(fresh) => {
+                if supervisor::env_teardown_began(&env.id)
+                    || supervisor::app_teardown_began(&env.app_id)
+                {
+                    anyhow::bail!(
+                        "environment {} is being torn down; skipping fleet start",
+                        env.id
+                    );
+                }
+                Ok(Some(fresh))
+            }
             None => anyhow::bail!(
                 "environment {} deleted during deploy; skipping fleet start",
                 env.id
