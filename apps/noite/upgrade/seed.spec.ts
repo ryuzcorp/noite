@@ -10,7 +10,9 @@ import {
   OWNER,
   acceptInvitation,
   createApp,
+  createEmailInvite,
   inviteCollaborator,
+  inviteMode,
   mintKey,
   pendingInvitationId,
   readInviteCodeApi,
@@ -148,14 +150,28 @@ test("seed the previous release with app, env, deploy, domain and people", async
     expect(claim.status).toBe(200);
 
     // A collaborator: register a second account, invite it as a viewer,
-    // and prove the grant through the invitation it accepts.
-    const inviteCode = await readInviteCodeApi(page);
+    // and prove the grant through the invitation it accepts. The invite
+    // mechanism changed across releases (codes, then email links), so the
+    // seed asks the image under test which one it speaks.
+    const invitee = await (async () => {
+      if ((await inviteMode(page)) === "email") {
+        const inviteToken = await createEmailInvite(page, INVITEE_EMAIL);
 
-    const invitee = await registerAccount(browser, {
-      email: INVITEE_EMAIL,
-      inviteCode,
-      name: "Upgrade Collab",
-    });
+        return registerAccount(browser, {
+          email: INVITEE_EMAIL,
+          inviteToken,
+          name: "Upgrade Collab",
+        });
+      }
+
+      const inviteCode = await readInviteCodeApi(page);
+
+      return registerAccount(browser, {
+        email: INVITEE_EMAIL,
+        inviteCode,
+        name: "Upgrade Collab",
+      });
+    })();
 
     try {
       expect(

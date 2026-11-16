@@ -161,6 +161,35 @@ export const hasCollaborator = async (
   return rows.some((candidate) => candidate.email === email);
 };
 
+/** How a second account registers on the image under test: releases before
+ * the email-invite change gate registration behind single-use invite codes
+ * (`requiresInvite`), later ones behind single-use email invitations
+ * (`waitlistEnabled`). Read off the public policy endpoint, so the seed
+ * tracks whatever release it boots. */
+export const inviteMode = async (page: Page): Promise<"code" | "email"> => {
+  const res = await page.request.get("/api/invite/status");
+
+  if (!res.ok()) {
+    throw new Error(`invite status answered ${res.status()}`);
+  }
+
+  const policy = Schema.decodeUnknownSync(
+    Schema.Record(Schema.String, Schema.Unknown)
+  )(await res.json());
+
+  if ("waitlistEnabled" in policy) {
+    return "email";
+  }
+
+  if ("requiresInvite" in policy) {
+    return "code";
+  }
+
+  throw new Error(
+    `unrecognized invite policy: ${JSON.stringify(Object.keys(policy))}`
+  );
+};
+
 /** Register an account through the passkey ceremony and mark it onboarded.
  * The ceremony itself has no HTTP equivalent (WebAuthn needs a browser
  * authenticator), so this is the one UI step the lane keeps; everything
@@ -170,7 +199,12 @@ export const hasCollaborator = async (
  * whose API lacks the endpoint. */
 export const registerAccount = async (
   browser: Browser,
-  account: { email: string; name: string; inviteCode?: string }
+  account: {
+    email: string;
+    inviteCode?: string;
+    inviteToken?: string;
+    name: string;
+  }
 ): Promise<{ context: BrowserContext; page: Page }> => {
   const context = await browser.newContext({
     storageState: { cookies: [], origins: [] },
@@ -180,7 +214,15 @@ export const registerAccount = async (
 
   try {
     await addVirtualAuthenticator(page);
-    await page.goto("/login");
+
+    // The email-invite link pre-attaches the invitation (the field stays
+    // for pasting a token by hand); a code release uses the plain form.
+    await page.goto(
+      account.inviteToken === undefined
+        ? "/login"
+        : `/login?invite=${account.inviteToken}`
+    );
+
     await page.getByRole("tab", { name: "Create account" }).click();
     await page.locator("#register-name").fill(account.name);
     await page.locator("#register-email").fill(account.email);
@@ -258,4 +300,33 @@ export const readInviteCodeApi = async (page: Page): Promise<string> => {
   }
 
   return code;
+};
+
+/** Create an email invite for one address and answer its one-time token
+ * (the `?invite=` query of the returned link). Only exists on releases
+ * past the email-invite change; the seed calls it behind `inviteMode`. */
+export const createEmailInvite = async (
+  page: Page,
+  email: string
+): Promise<string> => {
+  const created = await apiObject(
+    page,
+    "/api/admin/adminCreateEmailInvite",
+    { email },
+    Schema.Struct({ link: NonEmptyString })
+  );
+
+  let token = "";
+
+  try {
+    token = new URL(created.link).searchParams.get("invite") ?? "";
+  } catch {
+    throw new Error("the invite link is not a URL");
+  }
+
+  if (token === "") {
+    throw new Error("the invite link carried no token");
+  }
+
+  return token;
 };

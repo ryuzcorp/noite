@@ -9,9 +9,10 @@
 # Previous tag: the newest `v*` reachable before HEAD (a HEAD tag's
 # predecessor on a tag build), else `gh release list`. Override with
 # PREV_TAG=<tag> (the image is `ghcr.io/ryuzcorp/noite:<tag without v>`)
-# or PREV_IMAGE=<ref> outright. The new side builds from the tree by
-# default; E2E_IMAGE=<tag> tests a prebuilt image instead (CI hands over
-# its one shared build this way).
+# or PREV_IMAGE=<ref> outright — a local image for proving a branch
+# (never pulled; the daemon must already hold the tag). The new side builds
+# from the tree by default; E2E_IMAGE=<tag> tests a prebuilt image instead
+# (CI hands over its one shared build this way).
 #
 # Knobs (mirroring docker/e2e-local.sh, own project/bucket/ports):
 #   E2E_SLOT=<n>          parallel lane <n> (default 0 = today's ports);
@@ -56,7 +57,15 @@ case "$PREV_TAG_RESOLVED" in
   v*) PREV_VERSION="$(printf '%s\n' "$PREV_TAG_RESOLVED" | sed 's/^v//')" ;;
   *) PREV_VERSION="$PREV_TAG_RESOLVED" ;;
 esac
-PREV_IMAGE="${PREV_IMAGE:-ghcr.io/ryuzcorp/noite:${PREV_VERSION}}"
+if [ -z "${PREV_IMAGE:-}" ]; then
+  # The published previous release: always pull, never a stale local tag.
+  PREV_IMAGE="ghcr.io/ryuzcorp/noite:${PREV_VERSION}"
+  PREV_PULL="--pull always"
+else
+  # An explicit ref (a locally built image for proving a branch): the
+  # daemon already holds it, so never pull.
+  PREV_PULL=""
+fi
 
 E2E_IMAGE="${E2E_IMAGE:-}"
 NEW_IMAGE="$E2E_IMAGE"
@@ -217,7 +226,7 @@ done
 export NOITE_IMAGE="$PREV_IMAGE"
 # The seed starts on a fresh bucket and fresh volumes.
 # shellcheck disable=SC2086
-$CE2E up -d --pull always || fail_down "old image failed to start"
+$CE2E up -d $PREV_PULL || fail_down "old image failed to start"
 echo "==> wait for the old stack (5 min)"
 wait_ready || fail_down "old stack never became ready"
 echo "==> seed through the old image"
