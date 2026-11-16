@@ -9,6 +9,7 @@
 
 import { Link } from "@ilha/void";
 import { atom, watch } from "ilha";
+import type { AtomHandle } from "ilha";
 
 import { api } from "../api";
 import { errorMessage } from "../errors";
@@ -34,28 +35,26 @@ const SHA_CHARS = 7;
 const shortSha = (sha: string | null): string =>
   sha === null ? "never" : sha.slice(0, SHA_CHARS);
 
-/** Per-instance card state: the machine (null until the first click, when
- * the loaded status seeds `Idle`) and whether the component mounted —
- * controls stay disabled until mount, since the sync is a client fetch. */
-interface SyncCardBox {
-  machine: GithubSyncState | null;
-  mounted: boolean;
-}
-
-const newBox = (): SyncCardBox => ({ machine: null, mounted: false });
+/** Per-instance card state, as reactive atoms (never a mutable box: box
+ * writes do not repaint, so the confirmation never painted and the button
+ * fired no request): the machine (null until the first click, when the
+ * loaded status seeds `Idle`) and whether the component mounted — controls
+ * stay disabled until mount, since the sync is a client fetch. */
 
 /** Run one sync against the runner, folding its answer into the machine. A
  * 409 for an unconfirmed overwrite re-opens the confirmation (the tree
  * moved under the dialog); anything else succeeds or fails. */
 const runSync = async (
   appId: string,
-  box: SyncCardBox,
+  machine: AtomHandle<GithubSyncState | null>,
   status: GithubSyncStatus,
   confirm: boolean
 ): Promise<void> => {
-  box.machine = confirm
-    ? confirmSync(status)
-    : GithubSync.Syncing({ confirm: false, status });
+  machine.set(
+    confirm
+      ? confirmSync(status)
+      : GithubSync.Syncing({ confirm: false, status })
+  );
 
   try {
     const outcome = await api<GithubSyncOutcome>("/api/apps/syncFromGithub", {
@@ -64,34 +63,36 @@ const runSync = async (
       expectedTip: status.currentTip ?? undefined,
     });
 
-    box.machine = syncSucceeded(status, outcome);
+    machine.set(syncSucceeded(status, outcome));
     invalidate(keys.githubSync(appId));
   } catch (error) {
-    box.machine = syncFailed(status, errorMessage(error));
+    machine.set(syncFailed(status, errorMessage(error)));
   }
 };
 
 const SyncButton = ({
   appId,
-  box,
+  machine,
+  mounted,
   label,
   status,
 }: {
   appId: string;
-  box: SyncCardBox;
+  machine: AtomHandle<GithubSyncState | null>;
+  mounted: boolean;
   label: string;
   status: GithubSyncStatus;
 }) => (
   <button
     class="btn btn-sm btn-primary"
-    disabled={!box.mounted}
+    disabled={!mounted}
     onclick={() => {
       const next = requestSync(status);
 
       if (next._tag === "Syncing") {
-        void runSync(appId, box, status, false);
+        void runSync(appId, machine, status, false);
       } else {
-        box.machine = next;
+        machine.set(next);
       }
     }}
     type="button"
@@ -107,11 +108,13 @@ const SyncButton = ({
  * fails the build instead of painting nothing. */
 const SyncBody = ({
   appId,
-  box,
+  machine,
+  mounted,
   state,
 }: {
   appId: string;
-  box: SyncCardBox;
+  machine: AtomHandle<GithubSyncState | null>;
+  mounted: boolean;
   state: GithubSyncState;
 }) => {
   switch (state._tag) {
@@ -119,7 +122,8 @@ const SyncBody = ({
       return (
         <SyncButton
           appId={appId}
-          box={box}
+          machine={machine}
+          mounted={mounted}
           label="Sync from GitHub"
           status={state.status}
         />
@@ -137,9 +141,9 @@ const SyncBody = ({
           <div class="flex flex-wrap gap-2">
             <button
               class="btn btn-sm btn-warning"
-              disabled={!box.mounted}
+              disabled={!mounted}
               onclick={() => {
-                void runSync(appId, box, state.status, true);
+                void runSync(appId, machine, state.status, true);
               }}
               type="button"
             >
@@ -147,9 +151,9 @@ const SyncBody = ({
             </button>
             <button
               class="btn btn-sm"
-              disabled={!box.mounted}
+              disabled={!mounted}
               onclick={() => {
-                box.machine = cancelConfirm(state.status);
+                machine.set(cancelConfirm(state.status));
               }}
               type="button"
             >
@@ -186,7 +190,8 @@ const SyncBody = ({
             </Link>
             <SyncButton
               appId={appId}
-              box={box}
+              machine={machine}
+              mounted={mounted}
               label="Sync again"
               status={state.status}
             />
@@ -205,7 +210,8 @@ const SyncBody = ({
           <div>
             <SyncButton
               appId={appId}
-              box={box}
+              machine={machine}
+              mounted={mounted}
               label="Sync again"
               status={state.status}
             />
@@ -221,7 +227,8 @@ const SyncBody = ({
           <div>
             <SyncButton
               appId={appId}
-              box={box}
+              machine={machine}
+              mounted={mounted}
               label="Retry sync"
               status={state.status}
             />
@@ -242,17 +249,29 @@ const SyncBody = ({
  * caller can push. Anything else (blank apps, templates without a stored
  * origin, viewers) paints nothing. */
 export const GithubSyncCard = ({ appId }: { appId: string }) => {
-  const box = atom.lazy(newBox)();
-
-  watch.once(() => {
-    box.mounted = true;
-  });
-
   const info = resourceValue(appDetail(appId).state());
 
   if (!info || !info.app.imported || !capabilities(info.myRole).push) {
     return null;
   }
+
+  return <GithubSyncIsland appId={appId} />;
+};
+
+/** The island owns the card's atoms and resource, every call unconditional
+ * in one slot order. The outer gate must not call `githubSync` itself: a
+ * `tracked` resource creates its atom on call, so calling it after the
+ * gate's early return (or skipping it on some renders) scrambles ilha's
+ * slots — the ILHA002 warning behind the dead button. A mutable
+ * `atom.lazy` box is no substitute either: box writes do not repaint, so
+ * the confirmation the click assigned never painted. */
+const GithubSyncIsland = ({ appId }: { appId: string }) => {
+  const machine = atom<GithubSyncState | null>(null);
+  const mounted = atom(false);
+
+  watch.once(() => {
+    mounted.set(true);
+  });
 
   const res = githubSync(appId);
   const snapshot = resourceValue(res.state());
@@ -294,7 +313,7 @@ export const GithubSyncCard = ({ appId }: { appId: string }) => {
     return null;
   }
 
-  const state = box.machine ?? GithubSync.Idle({ status: snapshot });
+  const state = machine() ?? GithubSync.Idle({ status: snapshot });
   const status = snapshot;
 
   return (
@@ -316,10 +335,19 @@ export const GithubSyncCard = ({ appId }: { appId: string }) => {
           </div>
           <div class="flex gap-2">
             <dt class="opacity-70">Origin tip</dt>
-            <dd class="m-0 font-mono">{shortSha(status.currentTip)}</dd>
+            <dd class="m-0 font-mono">
+              {status.originTip === null
+                ? "unknown"
+                : shortSha(status.originTip)}
+            </dd>
           </div>
         </dl>
-        <SyncBody appId={appId} box={box} state={state} />
+        <SyncBody
+          appId={appId}
+          machine={machine}
+          mounted={mounted()}
+          state={state}
+        />
       </div>
     </section>
   );
