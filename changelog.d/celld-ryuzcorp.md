@@ -5,6 +5,14 @@
 
 ### Changed
 
-- The image ships celld `0.6.3-ryuzcorp.10` from the [ryuzcorp/celld](https://github.com/ryuzcorp/celld) fork: upstream celld 0.6.3 plus the fork's patches, built with celld's full upstream test suite, pinned by digest and published with SLSA provenance attestations. Upstream celld ships only security fixes from 0.6.x on, so the fork carries the patches. Nodes on `.9` and `.10` share a bucket with no migration: no format, API or CLI change.
+- The image ships celld `0.6.3-ryuzcorp.11` from the [ryuzcorp/celld](https://github.com/ryuzcorp/celld) fork. That is upstream celld 0.6.3 plus the fork's patches, built with celld's full upstream test suite, pinned by digest and published with SLSA provenance attestations. Upstream celld ships only security fixes from 0.6.x on, so the fork carries the patches. Nodes on `.9`, `.10` and `.11` share a bucket with no migration: there is no API or CLI change, and a `.11` node's bucket format 3 is readable by older nodes.
 - Fewer bucket requests and smaller stored state, no action: a bucket-posture eviction skips the visibility LISTs for prefixes this residency uploaded itself (`0054`); a lone fleet-posture node backs its `nodes/` scan off to the 30 s maintenance tick instead of retrying every second, so a node that starts next to it is recruited within ~30 s (`0055`); concurrent bucket-posture writes on one cell share one `cells/<cell>/own.json` read per cell epoch instead of one per write (`0056`); and the handoff-snapshot eviction deletes the superseded per-cell L0/L1 objects (2.47 MB → 0.57 MB stored on 200 short-lived Durable Objects) (`0057`).
+- Lower memory, no action needed:
+  - a node returns freed C heap to the OS sooner after evictions (`0065`); post-drain RSS fell by about 10–15 MiB in the fork's benchmark;
+  - a deployment generation projects its `/bundle` tree once instead of once per isolate (`0067`).
+- An eviction proves a journaled epoch with one HEAD request instead of a prefix LIST (`0061`).
+- New opt-in knobs; Noite sets none of them:
+  - `CELLD_BUCKET_BUNDLES=1` groups concurrent bucket-posture writes into shared bundle objects. It cuts billed write requests by ~40% on many-agent workloads, but roughly doubles write-ack latency (p50 210 → 445 ms at R2-like latency), so it stays off.
+  - `CELLD_SQLITE_CACHE_KB` caps the per-connection SQLite page cache.
+  - `CELLD_C_TRIM_MB` tunes the heap-trim threshold.
 - Deployment artifact reads can optionally use their own credential (celld `0052`): with the `CELLD_DEPLOY_AWS_*` trio set, a node serves `deploy/` and `deploy-blobs/` through a second S3 client, so a read-only deployment grant plus a read-write state grant keeps a copied credential from publishing. Noite leaves the trio unset and keeps one credential for everything, exactly as before; a managed or control-plane node must not set it.
