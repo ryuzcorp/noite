@@ -10,6 +10,20 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 <!-- New entries go in changelog.d/<topic>.md; the release PR assembles them with `bun docker/changelog-release.ts`. -->
 
+## [0.1.0-beta.2] - 2026-11-16
+
+### Operator action required
+
+- None.
+
+### Fixed
+
+- `make backup` always brings the stack back. The restart now runs in an `EXIT` trap instead of inline, so a mid-backup abort after the stop (a tar error, a full disk, a daemon hiccup, Ctrl-C or a SIGTERM from a CI timeout) still restarts the edge instead of leaving both containers `Exited (0)` until a manual `up -d`. A restart that reports failure counts as up only when the `noite` edge and every other container of the project are `running`, so a dependency left alone (rustfs) or podman's `initialized` state no longer passes. A failed restart exits nonzero without printing "backup complete" over a dead edge. Before, either failure mode ended silent and down.
+- The backup restart converges the same compose files the Makefile drives: on a multi install the restart keeps the `compose.multi.yaml` overlay instead of recreating the edge from the base file alone. A direct `sh docker/backup.sh` run computes the overlay with the same single/multi rule; under `make` the Makefile's file set is reused as is. The caller's `NOITE_TENANCY`/`BASE_DOMAIN` now win over `.env` for the snapshot Host header and the overlay, mirroring `PROJECT`.
+- `make backup` with a spaced `DEST` no longer word-splits the destination.
+- **Sync from GitHub button no longer dead when a confirmation is due.** Clicking it with Noite-side commits on the branch painted nothing and fired no request: the card kept its lifecycle in a mutable `atom.lazy` box whose writes never repaint, and it called the `githubSync` resource after an early return, scrambling ilha's atom/watch slots (the ILHA002 warning). The card is now a gate plus an island that owns reactive `machine`/`mounted` atoms and calls every atom/resource unconditionally, so the click paints the overwrite confirmation (or syncs straight through when the tree is clean).
+- **The sync card's "Origin tip" names the GitHub tip again.** The status read the local mirror's `main`, so after a Noite-side push the card claimed the origin had moved. The status now reports `originTip` from an `ls-remote` of the stored import source through the hardened clone path (protocol allowlist, no redirects) alongside the local `currentTip` the sync's compare-and-set still builds on.
+
 ## [0.1.0-beta.1] - 2026-11-16
 
 ### Operator action required
