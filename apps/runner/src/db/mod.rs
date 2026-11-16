@@ -396,7 +396,13 @@ mod tests {
                 "{dead} must be dropped on attach: {tables:?}"
             );
         }
-        for kept in ["app_hour", "app_hour_dim", "app_log", "metric_watermark", "app_error_issue"] {
+        for kept in [
+            "app_hour",
+            "app_hour_dim",
+            "app_log",
+            "metric_watermark",
+            "app_error_issue",
+        ] {
             assert!(
                 tables.iter().any(|t| t == kept),
                 "{kept} must survive the upgrade: {tables:?}"

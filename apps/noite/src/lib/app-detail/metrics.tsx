@@ -377,25 +377,25 @@ const MetricsDetailCards = ({
       <h3 class="m-0 text-lg font-semibold">Analytics</h3>
       <div class="grid grid-cols-1 gap-4 md:grid-cols-2">
         <BreakdownSection
-          empty="No browser data yet — visit the app URL, then reload."
+          empty="No browser data in this window."
           entries={breakdown.browsers}
           head="Browser"
           title="Browsers"
         />
         <BreakdownSection
-          empty="No OS data yet — visit the app URL, then reload."
+          empty="No OS data in this window."
           entries={breakdown.os}
           head="OS"
           title="Operating systems"
         />
         <BreakdownSection
-          empty="No visited paths yet — browse the app, then reload."
+          empty="No paths in this window."
           entries={breakdown.paths}
           head="Path"
           title="Paths"
         />
         <BreakdownSection
-          empty="No referrer data yet — share a link to the app, then reload."
+          empty="No referrer data in this window."
           entries={breakdown.referrers}
           head="Source"
           title="Referrers"

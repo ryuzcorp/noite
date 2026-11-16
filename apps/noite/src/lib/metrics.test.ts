@@ -31,9 +31,11 @@ const BREAKDOWN = {
   referrers: [{ requests: 3, value: "Google" }],
 };
 
+// `Partial` so a test can send a breakdown with a kind missing, which the
+// poll must reject; the stub only serializes it.
 const stubRunner = (
   requests: number,
-  breakdown: typeof BREAKDOWN = BREAKDOWN
+  breakdown: Partial<typeof BREAKDOWN> = BREAKDOWN
 ): void => {
   // SAFETY: the poll only needs the (url, init) call shape.
   // oxlint-disable-next-line anti-slop/no-chained-type-assertions -- test double for the global fetch.
