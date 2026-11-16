@@ -40,8 +40,8 @@ pub use apps::{
     verify_domain, write_app_status, NewApp, VerifyOutcome,
 };
 pub use compaction::{
-    bump_metric_version, delete_compactions_for, get_compacted_hours, get_metric_version,
-    mark_hour_compacted, prune_compactions,
+    bump_metric_version, delete_compactions_for, delete_compactions_for_slug, get_compacted_hours,
+    get_metric_version, mark_hour_compacted, prune_compactions,
 };
 pub use credentials::{
     all_scoped_credential_handles, delete_scoped_credential, get_operator_token,
@@ -87,12 +87,15 @@ pub use instance_setting::{
     TELEMETRY_LAST_SENT_AT, UPDATE_CHECK_ENABLED, UPDATE_CHECK_LAST_AT, UPDATE_CHECK_RESULT,
 };
 pub use metrics::{
-    app_hour_lat, backfill_trace_request, clear_telemetry_replay_if, delete_environment_telemetry,
-    delete_metric_watermarks_for, get_app_hour, get_metric_watermarks, get_telemetry_replay,
-    last_request_us, list_app_logs, list_app_metrics, list_hour_breakdown, prune_app_hours,
-    prune_app_logs, record_hour_dims, replace_app_hour, replace_app_hour_lat, replace_app_logs,
-    set_metric_watermarks, set_telemetry_replay, AccessTrace, AppHourValues, DimKind,
+    app_hour_lat, backfill_trace_request, clear_telemetry_replay_if, delete_app_telemetry,
+    delete_environment_telemetry, delete_metric_watermarks_for, delete_metric_watermarks_for_slug,
+    get_app_hour, get_metric_watermarks, get_telemetry_replay, last_request_us, list_app_logs,
+    list_app_metrics, list_hour_breakdown, prune_app_hours, prune_app_logs, record_hour_dims,
+    replace_app_hour, replace_app_hour_lat, replace_app_logs, set_metric_watermarks,
+    set_telemetry_replay, AccessTrace, AppHourValues, DimKind,
 };
+#[cfg(test)]
+pub(crate) use metrics::{count_app_telemetry_rows, count_slug_mark_rows, seed_app_telemetry_rows};
 pub use void_cohost::{delete_environment_hashes, get_cohost_hash, set_cohost_hash};
 
 /// Columns every `app`-row query selects, in struct order.

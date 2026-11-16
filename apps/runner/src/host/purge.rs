@@ -301,6 +301,53 @@ pub(crate) async fn clear_purges_if_no_rename(
     Ok(cleared)
 }
 
+/// Drop the telemetry rows every tombstone for `slug` still owes: one
+/// [`crate::db::delete_app_telemetry`] per tombstoned app id. App ids are
+/// never reused, so this is safe even when a new app already owns the slug.
+/// The first error aborts: the caller keeps the tombstone so the next pass
+/// retries.
+pub(crate) async fn delete_tombstoned_telemetry(
+    pool: &sqlx::SqlitePool,
+    slug: &str,
+) -> anyhow::Result<()> {
+    for app_id in crate::db::purge_app_ids(pool, slug)
+        .await
+        .with_context(|| format!("list the tombstoned app ids of {slug}"))?
+    {
+        crate::db::delete_app_telemetry(pool, &app_id)
+            .await
+            .with_context(|| format!("drop the telemetry rows of deleted app {app_id}"))?;
+    }
+    Ok(())
+}
+
+/// The telemetry half of a take-over: run the tombstoned app ids' row deletes
+/// plus the slug's fleet-mark deletes, then clear the tombstones. Any error
+/// skips the clear, so [`resume_pending`] retries whatever remains.
+/// Idempotent: every delete is a `DELETE WHERE`, so a re-run only removes
+/// what a crash left behind.
+///
+/// Only call this where no live row owns the slug (the caller's wipe just
+/// proved it) or where the caller lands its own row next under the slug
+/// guard (create, rename): the fleet marks belong to the wiped generation,
+/// and a slug a live row owns carries that row's own marks.
+pub(crate) async fn clear_app_telemetry_and_purges(
+    cfg: &Config,
+    pool: &sqlx::SqlitePool,
+    slug: &str,
+) -> anyhow::Result<u64> {
+    delete_tombstoned_telemetry(pool, slug).await?;
+    crate::db::delete_metric_watermarks_for_slug(pool, slug)
+        .await
+        .with_context(|| format!("clear the ingest marks of {slug}"))?;
+    crate::db::delete_compactions_for_slug(pool, slug)
+        .await
+        .with_context(|| format!("clear the compaction marks of {slug}"))?;
+    clear_purges_if_no_rename(cfg, pool, slug)
+        .await
+        .with_context(|| format!("clear the purge tombstones of {slug}"))
+}
+
 /// Resume every wipe the durable tombstones (`app_purge`) still owe.
 ///
 /// A hard delete writes its tombstone in the same transaction as the row
@@ -366,6 +413,16 @@ pub async fn resume_pending(
             );
             continue;
         }
+        // The app rows are gone but their telemetry may have survived a crash
+        // between the row delete and the delete's own telemetry wipe (or a
+        // delete from before that wipe existed). The slug-keyed marks only go
+        // on the wipe branch below, where no row owns the slug. A failure
+        // keeps the tombstone below, so the next pass retries the rows.
+        let mut telemetry_clean = true;
+        if let Err(e) = delete_tombstoned_telemetry(pool, &slug).await {
+            tracing::warn!(slug, error = %e, "resumed purge could not drop the tombstoned telemetry rows; the next pass retries");
+            telemetry_clean = false;
+        }
         // `Ok(true)`: the prefixes are empty (or the taker's wipe made them so)
         // and every tombstone for the slug can go. `Ok(false)`: a create took
         // the slug and stopped the wipe; it clears the tombstone itself once its
@@ -389,7 +446,18 @@ pub async fn resume_pending(
             {
                 Ok(Purged::Done) => {
                     tracing::info!(slug, "resumed purge emptied the slug's data");
-                    Ok(true)
+                    // No row owns the slug (checked above), so its fleet marks
+                    // are dead weight as well: a reused slug or label must
+                    // start from the floor instead of inheriting the wiped
+                    // fleet's position. A failure keeps the tombstone, so the
+                    // next pass retries the marks with the (now empty) wipe.
+                    let marks = crate::db::delete_metric_watermarks_for_slug(pool, &slug)
+                        .await
+                        .and(crate::db::delete_compactions_for_slug(pool, &slug).await);
+                    match marks {
+                        Ok(_) => Ok(true),
+                        Err(e) => Err(e.into()),
+                    }
                 }
                 Ok(Purged::Stopped) => {
                     tracing::info!(slug, "resumed purge stopped: the slug is being reused");
@@ -401,11 +469,18 @@ pub async fn resume_pending(
         };
         match satisfied {
             Ok(true) => {
-                match clear_purges_if_no_rename(cfg, pool, &slug).await {
-                    Ok(_) => report.cleared += 1,
-                    Err(e) => {
-                        tracing::warn!(slug, error = %e, "pending purge wiped the slug but could not clear its tombstone");
-                        report.failed += 1;
+                if !telemetry_clean {
+                    // The wipe is done but the app's metrics rows may remain:
+                    // keep the tombstone so the next pass retries them with
+                    // the (now empty) wipe.
+                    report.failed += 1;
+                } else {
+                    match clear_purges_if_no_rename(cfg, pool, &slug).await {
+                        Ok(_) => report.cleared += 1,
+                        Err(e) => {
+                            tracing::warn!(slug, error = %e, "pending purge wiped the slug but could not clear its tombstone");
+                            report.failed += 1;
+                        }
                     }
                 }
                 // The resume pass wiped the target (or a new owner did): a
@@ -1436,5 +1511,125 @@ mod tests {
             .is_empty());
         pool.close().await;
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A crash between the row delete and the delete's own metrics wipe leaves
+    /// rows the tombstone still names; the resume pass drops them by
+    /// tombstoned app id (never reused, so safe under slug reuse) along with
+    /// the slug's fleet marks. File-backed: a `:memory:` pool gives every
+    /// connection its own metrics database.
+    #[tokio::test]
+    async fn a_resume_drops_the_deleted_apps_metrics_rows() {
+        let scratch = crate::testutil::TempDir::new("noite-purge-metrics-resume");
+        let mut cfg = crate::config::config_for_tests();
+        cfg.work_dir = scratch.path().join("work").to_string_lossy().into_owned();
+        cfg.s3_endpoint = crate::testutil::spawn_s3_stub().await;
+        let pool = db::connect(&format!(
+            "sqlite:{}?mode=rwc",
+            scratch.path().join("noite.sqlite").display()
+        ))
+        .await
+        .expect("file db");
+        let app = db::create_app(
+            &pool,
+            &cfg,
+            db::NewApp {
+                name: "gone",
+                slug: "gone",
+                user_id: "local",
+                subdomain: "gone.localhost",
+                listen: 30300,
+                internal: 30301,
+            },
+        )
+        .await
+        .expect("app");
+        db::seed_app_telemetry_rows(&pool, &app.id, &app.slug, "env1", "staging").await;
+        // The crash: the row (and its tombstone) is gone, but the delete's own
+        // telemetry wipe never ran.
+        db::delete_app(&pool, &app.id).await.expect("delete row");
+
+        let report = resume_pending(
+            &pool,
+            &cfg,
+            &crate::host::supervisor::new_procs(),
+            &crate::host::logs::new_state(),
+            &ryuz_git::GitSync::default(),
+        )
+        .await;
+
+        assert_eq!(report.failed, 0, "the resumed wipe succeeds");
+        assert_eq!(
+            db::count_app_telemetry_rows(&pool, &app.id).await,
+            0,
+            "the resumed pass drops the deleted app's metrics rows"
+        );
+        assert_eq!(
+            db::count_slug_mark_rows(&pool, &app.slug).await,
+            0,
+            "the resumed pass drops the deleted app's fleet marks"
+        );
+        pool.close().await;
+    }
+
+    /// A failing telemetry delete keeps the tombstone: the wipe may be done,
+    /// but the rows are not, so the next pass must retry them instead of
+    /// clearing the only record that they are owed.
+    #[tokio::test]
+    async fn a_failed_telemetry_delete_keeps_the_tombstone() {
+        let scratch = crate::testutil::TempDir::new("noite-purge-metrics-fail");
+        let mut cfg = crate::config::config_for_tests();
+        cfg.work_dir = scratch.path().join("work").to_string_lossy().into_owned();
+        cfg.s3_endpoint = crate::testutil::spawn_s3_stub().await;
+        let pool = db::connect(&format!(
+            "sqlite:{}?mode=rwc",
+            scratch.path().join("noite.sqlite").display()
+        ))
+        .await
+        .expect("file db");
+        let app = db::create_app(
+            &pool,
+            &cfg,
+            db::NewApp {
+                name: "kept",
+                slug: "kept",
+                user_id: "local",
+                subdomain: "kept.localhost",
+                listen: 30310,
+                internal: 30311,
+            },
+        )
+        .await
+        .expect("app");
+        db::seed_app_telemetry_rows(&pool, &app.id, &app.slug, "env1", "staging").await;
+        db::delete_app(&pool, &app.id).await.expect("delete row");
+        // Break the telemetry delete on every connection: without its first
+        // table the per-id wipe always errors.
+        sqlx::query("DROP TABLE metrics.app_hour")
+            .execute(&pool)
+            .await
+            .expect("drop app_hour");
+
+        let report = resume_pending(
+            &pool,
+            &cfg,
+            &crate::host::supervisor::new_procs(),
+            &crate::host::logs::new_state(),
+            &ryuz_git::GitSync::default(),
+        )
+        .await;
+
+        assert_eq!(report.pending, 1);
+        assert_eq!(
+            report.cleared, 0,
+            "nothing clears while telemetry may remain"
+        );
+        assert_eq!(report.failed, 1);
+        assert_eq!(
+            db::pending_purges(&pool).await.expect("tombstones"),
+            vec!["kept".to_string()],
+            "the tombstone stays for the next pass"
+        );
+        pool.close().await;
     }
 }
