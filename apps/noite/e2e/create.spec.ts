@@ -5,6 +5,7 @@ import nodePath from "node:path";
 
 import { expect, test } from "@playwright/test";
 import type { APIRequestContext } from "@playwright/test";
+import * as Schema from "effect/Schema";
 
 import {
   CHILD_PROC_TIMEOUT_MS,
@@ -210,9 +211,14 @@ test(
     });
 
     expect(commit.status).toBe(200);
-    // SAFETY: `POST /v1/apps/:id/source/commit` answers the new commit's sha (200 above).
-    const noiteSha = commit.body as string;
-    expect(noiteSha.length).toBeGreaterThan(0);
+
+    // `POST /v1/apps/:id/source/commit` answers `{ sha }` (api/source.rs).
+    const { sha: noiteSha } = Schema.decodeUnknownSync(
+      Schema.Struct({ sha: Schema.String })
+    )(commit.body);
+
+    expect(noiteSha).toMatch(/^[0-9a-f]{40}$/u);
+
     await waitForDeploy(request, id, 8 * 60_000, noiteSha);
 
     // The card's Origin tip is the GitHub tip (beta.1 bug 2 showed the
@@ -239,7 +245,12 @@ test(
       has: page.getByRole("heading", { name: "Sync from GitHub" }),
     });
 
-    await expect(card.getByText(upstreamHead.slice(0, 7))).toBeVisible();
+    // "Last synced" names the same imported head, so read the Origin tip row.
+    const originTip = card.locator("dl > div", {
+      has: page.locator("dt", { hasText: /^Origin tip$/u }),
+    });
+
+    await expect(originTip.getByText(upstreamHead.slice(0, 7))).toBeVisible();
     await card.getByRole("button", { name: "Sync from GitHub" }).click();
     await expect(
       card.getByText(/will be overwritten in the tree/u)
