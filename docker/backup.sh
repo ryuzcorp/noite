@@ -18,6 +18,7 @@
 # (a quiesced copy is the only honest one), tar each volume, start again.
 # Downtime is the tar time.
 set -eu
+umask 077
 cd "$(dirname "$0")/.."
 # shellcheck source=docker/lib.sh
 . "$(dirname "$0")/lib.sh"
@@ -78,7 +79,9 @@ case "$DEST" in
 /*) DEST_DIR="$DEST" ;;
 *) DEST_DIR="$(pwd)/${DEST}" ;;
 esac
-mkdir -p "$DEST_DIR"
+# Secrets land here (runner SQLite with plaintext env values, every tenant's
+# objects): 0700 fresh, or refuse a shared directory rather than filling it.
+require_private_dir "$DEST_DIR"
 
 echo "==> snapshot the runner database"
 if [ -n "$API_HOST_HEADER" ]; then
@@ -103,10 +106,15 @@ for vol in $VOLUMES; do
   # The control operator token file is derived state (rewritten on every
   # control spawn from the encrypted DB row) and a plaintext secret: leave it
   # out. The pattern matches nothing in the other volumes.
+  # The helper runs as root with a default umask, so the tar is root-owned:
+  # force 0600 inside the helper (umask for creation, chmod for a pre-
+  # existing archive, which tar truncates in place without touching its
+  # mode). No host-side chmod: the invoking user may not own the file, and
+  # an EPERM there would abort after the stack is already stopped.
   "$ENGINE" run --rm --entrypoint sh \
     -v "${name}:/vol:ro" \
     -v "${DEST_DIR}:/out:z" \
-    "$HELPER" -c "tar -cf /out/${vol}.tar --exclude=./runner/control-operator-token -C /vol ."
+    "$HELPER" -c "umask 077; tar -cf /out/${vol}.tar --exclude=./runner/control-operator-token -C /vol . && chmod 600 /out/${vol}.tar"
   echo "    ${vol}.tar"
 done
 

@@ -20,7 +20,7 @@ Still self-hosted only: strangers run their own installs, now for real workloads
 3. **A release gate that can be trusted.** Every open `flake` issue is root-caused and fixed, or closed with the evidence that a later change fixed it.
 4. **The default store qualified.** The bundled RustFS passes celld's store checks at the pinned versions and the storage docs and known limits say so, or they name the guarantee it fails.
 5. **A data promise.** From `beta.1` on, every release upgrades a database written by any earlier beta in place; no beta release refuses one ([Runner schema evolution](SPEC.md#runner-schema-evolution) keeps the migration runners for this). An e2e lane enforces it by upgrading from the previous beta's image. A restore drill for bring-your-own S3 installs, where `make backup` does not apply, is documented and run once.
-6. **Known advisories settled.** `libsqlite3-sys` RUSTSEC-2026-0459 (held at 0.37 by sqlx 0.9.0) is fixed or accepted on record.
+6. **Known advisories settled.** `libsqlite3-sys` RUSTSEC-2026-0459 (held at 0.37 by sqlx 0.9.0) is accepted on record: the runner opens only its own databases and restores snapshots only from `runner/state/`, which scoped fleet keys cannot write ([Known limits](apps/website/docs/self-hosting/known-limits.mdx)). Lifted when sqlx releases on `libsqlite3-sys` ≥ 0.39.
 7. **A soaked candidate.** The release candidate runs as an alpha on app.noite.now, with apps deployed and woken, before the beta tag.
 
 ### Alpha: self-hosted only
