@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import {
-  chmodSync,
+  copyFileSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -20,8 +20,9 @@ import path from "node:path";
 //! multi overlay on multi installs).
 //!
 //! The engine is a stub `docker` on PATH: no daemon, no sleeps, no retries.
-const REPO = path.resolve(import.meta.dir, "..");
-const BACKUP = path.join(REPO, "docker", "backup.sh");
+//! The script runs from a copy in a temp tree (it cd's to its repo root and
+//! loads `./.env`), so an operator's `.env` never leaks into a run.
+const SRC = path.resolve(import.meta.dir);
 
 let dir: string;
 let fakebin: string;
@@ -71,10 +72,19 @@ case "$1" in
     if [ -n "$BK_TAR_SIGNAL" ]; then kill -s "$BK_TAR_SIGNAL" "$PPID"; sleep 1; fi
     ;;
   ps)
-    # project_running asks once per engine label; answer the docker one.
+    # project_running asks per engine's compose labels: every container's
+    # state, then the edge's (service=noite). Only the docker labels answer.
+    # BK_EDGE_GONE: up removed the edge and failed to recreate it, so only
+    # the dependency runs. BK_DEP_STATE: the dependency's state (podman
+    # reports initialized / stopped for down containers).
     case "$*" in
+      *com.docker.compose.service=noite*)
+        if [ "$(state)" = running ] && [ "$BK_EDGE_GONE" != 1 ]; then printf 'running\n'; fi
+        ;;
       *com.docker.compose.project=*)
-        if [ "$(state)" = running ]; then printf 'running\nrunning\n'; else printf 'exited\nexited\n'; fi
+        if [ "$(state)" != running ]; then printf 'exited\nexited\n'
+        elif [ "$BK_EDGE_GONE" = 1 ]; then printf 'running\n'
+        else dep="$BK_DEP_STATE"; [ -n "$dep" ] || dep=running; printf 'running\n%s\n' "$dep"; fi
         ;;
     esac
     ;;
@@ -95,8 +105,11 @@ interface RunResult {
 }
 
 interface BackupOpts {
-  baseDomain?: string;
+  baseDomain?: string | null;
   curlFail?: boolean;
+  depState?: string;
+  edgeGone?: boolean;
+  envFile?: string;
   tarSignal?: "INT" | "TERM";
   tenancy?: string;
   tarFail?: boolean;
@@ -108,6 +121,9 @@ const runBackup = (opts: BackupOpts = {}): RunResult & { log: string } => {
   const {
     baseDomain = "noite.localhost",
     curlFail,
+    depState,
+    edgeGone,
+    envFile,
     tarSignal,
     tenancy,
     tarFail,
@@ -116,10 +132,20 @@ const runBackup = (opts: BackupOpts = {}): RunResult & { log: string } => {
   } = opts;
 
   mkdirSync(fakebin, { recursive: true });
-  Bun.write(path.join(fakebin, "docker"), DOCKER_STUB);
-  Bun.write(path.join(fakebin, "curl"), CURL_STUB);
-  chmodSync(path.join(fakebin, "docker"), 0o755);
-  chmodSync(path.join(fakebin, "curl"), 0o755);
+  writeFileSync(path.join(fakebin, "docker"), DOCKER_STUB, { mode: 0o755 });
+  writeFileSync(path.join(fakebin, "curl"), CURL_STUB, { mode: 0o755 });
+
+  const tree = path.join(dir, "tree");
+  mkdirSync(path.join(tree, "docker"), { recursive: true });
+
+  for (const name of ["backup.sh", "lib.sh"]) {
+    copyFileSync(path.join(SRC, name), path.join(tree, "docker", name));
+  }
+
+  if (envFile !== undefined) {
+    writeFileSync(path.join(tree, ".env"), envFile);
+  }
+
   const logFile = path.join(dir, "calls.log");
   const stateFile = path.join(dir, "state");
   writeFileSync(logFile, "");
@@ -144,7 +170,8 @@ const runBackup = (opts: BackupOpts = {}): RunResult & { log: string } => {
     ...clean,
     PATH: `${fakebin}:/usr/bin:/bin`,
     PROJECT: "bk-test",
-    BASE_DOMAIN: baseDomain,
+    // null: no caller BASE_DOMAIN, so the tree's `.env` decides.
+    BASE_DOMAIN: baseDomain ?? undefined,
     NOITE_API_URL: "http://127.0.0.1:9/v1",
     NOITE_BACKUP_IMAGE: "stub-image",
     BK_LOG: logFile,
@@ -155,14 +182,19 @@ const runBackup = (opts: BackupOpts = {}): RunResult & { log: string } => {
     BK_UP_FAIL: upFail === true ? "1" : undefined,
     BK_UP_WEDGE: upWedge === true ? "1" : undefined,
     BK_CURL_FAIL: curlFail === true ? "1" : undefined,
+    BK_DEP_STATE: depState,
+    BK_EDGE_GONE: edgeGone === true ? "1" : undefined,
   };
 
-  const proc = Bun.spawnSync(["sh", BACKUP, dest], {
-    env,
-    stderr: "pipe",
-    stdin: new Uint8Array(),
-    stdout: "pipe",
-  });
+  const proc = Bun.spawnSync(
+    ["sh", path.join(tree, "docker", "backup.sh"), dest],
+    {
+      env,
+      stderr: "pipe",
+      stdin: new Uint8Array(),
+      stdout: "pipe",
+    }
+  );
 
   return {
     status: proc.exitCode,
@@ -248,5 +280,39 @@ describe("make backup restart", () => {
     expect(r.status).toBe(0);
     expect(r.stdout).toContain("every container is running");
     expect(r.stdout).toContain("backup complete:");
+  });
+
+  test("a failed up that leaves only a dependency running fails loudly", () => {
+    const r = runBackup({ edgeGone: true, upWedge: true });
+    expect(r.status).not.toBe(0);
+    expect(r.stdout).not.toContain("backup complete:");
+    expect(r.stderr).toContain("automatic restart failed");
+  });
+
+  test("a failed up with a container in podman's initialized state fails loudly", () => {
+    const r = runBackup({ depState: "initialized", upWedge: true });
+    expect(r.status).not.toBe(0);
+    expect(r.stdout).not.toContain("backup complete:");
+    expect(r.stderr).toContain("automatic restart failed");
+  });
+
+  test("a direct run follows the .env base domain to the multi overlay", () => {
+    const r = runBackup({
+      baseDomain: null,
+      envFile: "BASE_DOMAIN=example.com\n",
+    });
+
+    expect(r.status).toBe(0);
+    expect(composeLines(r.log, "up")[0]).toContain("compose.multi.yaml");
+  });
+
+  test("the caller's tenancy wins over the .env one", () => {
+    const r = runBackup({
+      envFile: "NOITE_TENANCY=multi\n",
+      tenancy: "single",
+    });
+
+    expect(r.status).toBe(0);
+    expect(composeLines(r.log, "up")[0]).not.toContain("multi");
   });
 });

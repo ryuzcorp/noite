@@ -85,14 +85,23 @@ run_with_timeout() {
   fi
 }
 
-# Every container of this project up: raw engine `ps` (both engines label
-# their containers; `compose ps` output differs between them).
+# The stack is up only when the edge (`noite`) runs and every container of
+# this project is `running`: a live dependency alone (rustfs) is not a stack,
+# and only `running` counts as up because engines name the down states
+# differently (podman also reports `initialized`, `stopped`, `configured`).
+# Raw engine `ps`, once per engine's compose labels (`compose ps` output
+# differs between them).
 project_running() {
-  states="$("$CLI" ps -a --filter "label=com.docker.compose.project=${PROJECT}" --format '{{.State}}' 2>/dev/null || true)"
-  states="$states $("$CLI" ps -a --filter "label=io.podman.compose.project=${PROJECT}" --format '{{.State}}' 2>/dev/null || true)"
+  states=""
+  edge=""
+  for label in com.docker.compose io.podman.compose; do
+    states="$states $("$CLI" ps -a --filter "label=${label}.project=${PROJECT}" --format '{{.State}}' 2>/dev/null || true)"
+    edge="$edge $("$CLI" ps -a --filter "label=${label}.project=${PROJECT}" --filter "label=${label}.service=noite" --format '{{.State}}' 2>/dev/null || true)"
+  done
   states="$(printf '%s' "$states" | tr ' ' '\n' | grep -v '^$' || true)"
   [ -n "$states" ] || return 1
-  ! printf '%s\n' "$states" | grep -qiE '^(exited|dead|paused|removing|restarting|created)$'
+  printf '%s' "$edge" | tr ' ' '\n' | grep -qx 'running' || return 1
+  ! printf '%s\n' "$states" | grep -qvx 'running'
 }
 
 # Set to 1 just before `ce stop`: the trap below restarts only a stack this
