@@ -2632,17 +2632,19 @@ const CELLD_UNSUPPORTED_KEYS: &[&str] = &[
     "previews",
 ];
 
-/// Wrangler's default module rules (`DEFAULT_MODULE_RULES` in its bundle):
-/// Text for `**/*.txt`, `**/*.html` and `**/*.sql`, Data for `**/*.bin`,
-/// CompiledWasm for `**/*.wasm` and `**/*.wasm?module`. celld honors
-/// declared `rules` but ships no defaults, so a worker importing a text
-/// file would fail its build; the runner injects these when the config names
-/// no `rules` of its own.
+/// Wrangler's default module rules (`DEFAULT_MODULE_RULES` in its bundle),
+/// minus what celld cannot express: Text for `**/*.txt`, `**/*.html` and
+/// `**/*.sql`, Data for `**/*.bin`, CompiledWasm for `**/*.wasm`. Wrangler's
+/// `**/*.wasm?module` is left out: celld takes `**/*.<ext>` globs only and
+/// refuses the whole deploy on any other shape. celld honors declared `rules`
+/// but ships no defaults, so a worker importing a text file would fail its
+/// build; the runner injects these when the config names no `rules` of its
+/// own.
 fn wrangler_default_module_rules() -> serde_json::Value {
     serde_json::json!([
         { "type": "Text", "globs": ["**/*.txt", "**/*.html", "**/*.sql"] },
         { "type": "Data", "globs": ["**/*.bin"] },
-        { "type": "CompiledWasm", "globs": ["**/*.wasm", "**/*.wasm?module"] },
+        { "type": "CompiledWasm", "globs": ["**/*.wasm"] },
     ])
 }
 
@@ -2650,12 +2652,24 @@ fn wrangler_default_module_rules() -> serde_json::Value {
 /// runner-consumed and Cloudflare-only keys (answering the translated
 /// Cloudflare-only keys for the deploy log), and inject Wrangler's default
 /// module rules when the config names none. A file is rewritten only when it
-/// needs one of those; comments in a .jsonc are dropped then, which only
+/// needs one of those; comments in a .jsonc are dropped then.
+///
+/// The rewrite runs as the runner, so a config that is a symlink is refused
+/// rather than followed: a tenant tree could otherwise point it at any JSON
+/// object the runner can write and have it rewritten. No tenant process is
+/// left to swap the file after this check (the worktree was taken back).
 async fn strip_runner_keys(dir: &Path) -> anyhow::Result<(Vec<String>, bool)> {
     let mut dropped = Vec::new();
     let mut rules_added = false;
     for name in ["wrangler.jsonc", "wrangler.json"] {
         let path = dir.join(name);
+        match tokio::fs::symlink_metadata(&path).await {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                anyhow::bail!("{name} is a symlink; refusing to deploy it");
+            }
+            Ok(_) => {}
+            Err(_) => continue,
+        }
         let Ok(text) = tokio::fs::read_to_string(&path).await else {
             continue;
         };
@@ -2704,8 +2718,11 @@ fn translate_wrangler_config(text: &str) -> anyhow::Result<Option<(String, Vec<S
             changed = true;
         }
     }
+    // celld refuses `rules` next to `no_bundle` (the files deploy as-is, so
+    // there is nothing to apply them to): inject only for bundled configs.
+    let no_bundle = obj.get("no_bundle").and_then(serde_json::Value::as_bool) == Some(true);
     let mut rules_added = false;
-    if !obj.contains_key("rules") {
+    if !no_bundle && !obj.contains_key("rules") {
         obj.insert("rules".to_string(), wrangler_default_module_rules());
         rules_added = true;
         changed = true;
@@ -3154,6 +3171,67 @@ mod tests {
         let untouched =
             "{\"name\": \"a\", \"rules\": [{\"type\": \"Text\", \"globs\": [\"**/*.md\"]}]}";
         assert!(translate_wrangler_config(untouched).unwrap().is_none());
+    }
+
+    /// A source config that is a symlink is refused, not rewritten through:
+    /// the default-rule injection makes nearly every config need a rewrite,
+    /// and the write runs as the runner.
+    #[tokio::test]
+    async fn a_symlinked_source_config_is_refused_not_rewritten() {
+        let tree = crate::testutil::TempDir::new("noite-strip-symlink");
+        let outside = crate::testutil::TempDir::new("noite-strip-outside");
+        let target = outside.path().join("victim.json");
+        let original = "{\"name\": \"victim\"}";
+        std::fs::write(&target, original).unwrap();
+        std::os::unix::fs::symlink(&target, tree.path().join("wrangler.json")).unwrap();
+        let err = super::strip_runner_keys(tree.path())
+            .await
+            .expect_err("a symlinked config is refused");
+        assert!(err.to_string().contains("symlink"), "{err:#}");
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), original);
+    }
+
+    /// celld refuses the whole deploy on one rule glob it cannot read as an
+    /// extension match (`rule_extension` in celld's `deploy.rs`: `**/*.`
+    /// then a name with none of `* ? . / \ [ {`). The injected defaults land
+    /// in every rule-less config, so one bad glob fails every such deploy.
+    #[test]
+    fn injected_module_rule_globs_are_celld_extension_matches() {
+        let rules = super::wrangler_default_module_rules();
+        let globs: Vec<&str> = rules
+            .as_array()
+            .expect("rules")
+            .iter()
+            .flat_map(|rule| rule["globs"].as_array().expect("globs"))
+            .map(|glob| glob.as_str().expect("glob string"))
+            .collect();
+        assert!(!globs.is_empty());
+        for glob in globs {
+            let ext = glob.strip_prefix("**/*.").unwrap_or_else(|| {
+                panic!("{glob:?} is not of the form **/*.ext");
+            });
+            assert!(
+                !ext.is_empty() && !ext.contains(['*', '?', '.', '/', '\\', '[', '{']),
+                "celld refuses {glob:?}"
+            );
+        }
+    }
+
+    /// celld refuses `rules` next to `no_bundle`, so a no-bundle config gets
+    /// none injected (and is not rewritten for them).
+    #[test]
+    fn no_bundle_configs_get_no_injected_rules() {
+        let config = "{\"name\": \"a\", \"main\": \"w.js\", \"no_bundle\": true}";
+        assert!(translate_wrangler_config(config).unwrap().is_none());
+        let with_cf_key =
+            "{\"name\": \"a\", \"main\": \"w.js\", \"no_bundle\": true, \"workers_dev\": true}";
+        let (out, dropped, rules_added) = translate_wrangler_config(with_cf_key)
+            .unwrap()
+            .expect("rewritten for the Cloudflare-only key");
+        assert_eq!(dropped, vec!["workers_dev".to_string()]);
+        assert!(!rules_added);
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert!(v.get("rules").is_none(), "{out}");
     }
 
     #[test]
