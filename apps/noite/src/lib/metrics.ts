@@ -5,7 +5,7 @@
 //! the poll helpers live here so neither side reaches into the other's
 //! module. `METRICS_WINDOWS_HOURS` is the single source for the windows both
 //! sides serve (a second `Set` here would drift).
-import type { RunnerMetric } from "./runner";
+import type { RunnerBreakdown, RunnerMetric } from "./runner";
 
 /** Windows the metrics endpoint serves, in hours: 24 h, 7 d, and 1 month,
  * within the runner's telemetry retention (720 h). Anything else falls back
@@ -50,10 +50,10 @@ export const pollMetricsVersion = async (
   return Number(record?.version);
 };
 
-/** One metrics poll: null when the request total hasn't moved. The version
- * gate in the stream already skips unchanged windows, so this is the single
- * read behind a frame. Also reused by the metrics frame action (the stream's
- * initial snapshot). */
+/** One metrics poll: the hourly counters plus the Analytics breakdown, both
+ * behind the version gate (dims move with the counters, so one total still
+ * decides). Null when the request total hasn't moved. Also reused by the
+ * metrics frame action (the stream's initial snapshot). */
 export const pollMetricsFrame = async (
   poll: MetricsPoll,
   lastTotal: number,
@@ -62,28 +62,55 @@ export const pollMetricsFrame = async (
 ): Promise<{ frame: string; total: number } | null> => {
   const { auth, base, windowQuery } = poll;
 
-  const res = await fetch(`${base}/metrics?${windowQuery}`, {
-    headers: auth,
-    signal,
-  });
+  const [res, bRes] = await Promise.all([
+    fetch(`${base}/metrics?${windowQuery}`, { headers: auth, signal }),
+    fetch(`${base}/metrics/breakdown?${windowQuery}`, {
+      headers: auth,
+      signal,
+    }),
+  ]);
 
-  if (!res.ok) {
-    throw new Error(`runner metrics ${res.status}`);
+  if (!res.ok || !bRes.ok) {
+    throw new Error(`runner metrics ${res.status}/${bRes.status}`);
   }
 
-  const rows: unknown = await res.json();
+  const [rows, breakdown]: unknown[] = await Promise.all([
+    res.json(),
+    bRes.json(),
+  ]);
 
   if (!Array.isArray(rows)) {
     throw new TypeError("runner metrics sent invalid data");
   }
 
+  // SAFETY: fetch boundary — each optional field is verified below, and a
+  // non-object reads every field as undefined, which fails the check.
+  const record = breakdown as {
+    browsers?: unknown;
+    os?: unknown;
+    paths?: unknown;
+    referrers?: unknown;
+  };
+
+  if (
+    !Array.isArray(record.browsers) ||
+    !Array.isArray(record.os) ||
+    !Array.isArray(record.paths) ||
+    !Array.isArray(record.referrers)
+  ) {
+    throw new TypeError("runner breakdown sent invalid data");
+  }
+
   // SAFETY: rows passed Array.isArray above; each row is an hourly AppMetric.
   const metrics = rows as RunnerMetric[];
+  // SAFETY: every breakdown field passed Array.isArray above; entries flow
+  // only into the Analytics tables.
+  const analytic = breakdown as RunnerBreakdown;
   const total = metrics.reduce((a, r) => a + r.requests, 0);
 
   if (total === lastTotal) {
     return null;
   }
 
-  return { frame: JSON.stringify({ metrics }), total };
+  return { frame: JSON.stringify({ breakdown: analytic, metrics }), total };
 };

@@ -124,6 +124,7 @@ Counted approvals are the latest review per reviewer that is `approved`, not dis
 | Method | Route | Notes |
 | --- | --- | --- |
 | `GET` | `/v1/apps/{id}/metrics?hours=24` | Hourly counters (requests, 5xx errors, p50/p95 latency in ms, memory peak/mean in bytes, CPU ms) |
+| `GET` | `/v1/apps/{id}/metrics/breakdown?hours=24` | Analytics breakdown over the window: top 10 browsers, OSes, paths and referrers with the rest under `(other)` |
 | `GET` | `/v1/apps/{id}/metrics/version` | Change counter for the dashboard's poll gate |
 | `GET` | `/v1/apps/{id}/logs` | App logs: 24 h of ingested lines plus the live stdout tail |
 | `GET` | `/v1/apps/{id}/logs/stream` | SSE log stream |

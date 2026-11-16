@@ -62,7 +62,7 @@ pub use git::{
     git_branch_create, git_branch_delete, git_commit, git_compare, git_log, git_refs, git_remote,
 };
 pub use limits::{get_limits, set_limits};
-pub use observe::{app_logs, app_logs_stream, app_metrics, app_metrics_version};
+pub use observe::{app_breakdown, app_logs, app_logs_stream, app_metrics, app_metrics_version};
 pub use prs::{
     add_comment, add_review, create_pr, delete_comment, edit_comment, get_branch_rules, get_pr,
     list_prs, merge_pr, set_branch_rules, update_pr,

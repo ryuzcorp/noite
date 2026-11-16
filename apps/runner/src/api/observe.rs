@@ -37,6 +37,20 @@ pub async fn app_metrics(
         .map(Json)
 }
 
+/// The Metrics tab's Analytics cards over one window (`?hours=`, same
+/// `?environmentId=` scope as `/metrics`): per-kind top values with the
+/// rest under `(other)`. Same auth and scope as the counters read, so the
+/// dashboard fetches both in one poll.
+pub async fn app_breakdown(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Query(q): Query<MetricsQuery>,
+) -> impl IntoResponse {
+    service::observe::breakdown(&state, &id, q.hours, q.environment_id.as_deref())
+        .await
+        .map(Json)
+}
+
 /// Per-app metrics version (spec T3.6): dashboard polls fetch this first and
 /// skip their window queries when it hasn't moved.
 pub async fn app_metrics_version(

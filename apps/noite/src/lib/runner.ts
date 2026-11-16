@@ -65,6 +65,10 @@ export type { AppUserProps as RunnerUserProps } from "./runner-types/AppUserProp
 
 export type { BlobResponse as RunnerBlob } from "./runner-types/BlobResponse";
 
+export type { BreakdownEntry as RunnerBreakdownEntry } from "./runner-types/BreakdownEntry";
+
+export type { MetricsBreakdown as RunnerBreakdown } from "./runner-types/MetricsBreakdown";
+
 export type { D1Column } from "./runner-types/D1Column";
 
 export type { D1DeleteRowsBody } from "./runner-types/D1DeleteRowsBody";

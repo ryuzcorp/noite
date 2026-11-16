@@ -24,10 +24,26 @@ const HOUR_ROW = {
   requests: 0,
 };
 
-const stubRunner = (requests: number): void => {
+const BREAKDOWN = {
+  browsers: [{ requests: 3, value: "Chrome" }],
+  os: [{ requests: 3, value: "macOS" }],
+  paths: [{ requests: 2, value: "/pricing" }],
+  referrers: [{ requests: 3, value: "Google" }],
+};
+
+// `Partial` so a test can send a breakdown with a kind missing, which the
+// poll must reject; the stub only serializes it.
+const stubRunner = (
+  requests: number,
+  breakdown: Partial<typeof BREAKDOWN> = BREAKDOWN
+): void => {
   // SAFETY: the poll only needs the (url, init) call shape.
   // oxlint-disable-next-line anti-slop/no-chained-type-assertions -- test double for the global fetch.
   globalThis.fetch = ((url: string) => {
+    if (url.includes("/metrics/breakdown?")) {
+      return Promise.resolve(Response.json(breakdown));
+    }
+
     if (!url.includes("/metrics?")) {
       return Promise.reject(new Error(`unexpected runner call: ${url}`));
     }
@@ -68,9 +84,25 @@ describe("pollMetricsFrame", () => {
     ]);
   });
 
+  test("polls the breakdown in the same frame", async () => {
+    stubRunner(3);
+
+    const polled = await pollMetricsFrame(poll, -1);
+
+    expect(JSON.parse(polled?.frame ?? "{}").breakdown).toEqual(BREAKDOWN);
+  });
+
   test("answers null when the request total hasn't moved", async () => {
     stubRunner(3);
 
     expect(await pollMetricsFrame(poll, 3)).toBeNull();
+  });
+
+  test("rejects a breakdown with a missing kind", async () => {
+    stubRunner(3, { browsers: [], os: [], paths: [] });
+
+    await expect(pollMetricsFrame(poll, -1)).rejects.toThrow(
+      "runner breakdown sent invalid data"
+    );
   });
 });

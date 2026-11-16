@@ -33,6 +33,23 @@ CREATE TABLE IF NOT EXISTS metrics.app_hour_lat (
   n INTEGER NOT NULL DEFAULT 0,
   PRIMARY KEY (app_id, environment_id, bucket_hour, bucket)
 );
+-- Per-dimension request breakdown behind the Metrics tab's Analytics cards:
+-- one row per (app, environment, hour, kind, value), where kind is
+-- `browser`, `os`, `path` or `referrer`. Written in the access-log line's own
+-- transaction alongside `app_hour`, so a line counts exactly once or not at
+-- all. Values are already classified (a coarse browser/OS pair, the query-less
+-- path, the host-only referrer), never raw user input. Path and referrer are
+-- attacker-controlled, so each (app, environment, hour, kind) keeps at most
+-- 50 distinct values — overflow counts under `(other)` instead.
+CREATE TABLE IF NOT EXISTS metrics.app_hour_dim (
+  app_id TEXT NOT NULL,
+  environment_id TEXT NOT NULL DEFAULT '',
+  bucket_hour TEXT NOT NULL,
+  kind TEXT NOT NULL,
+  value TEXT NOT NULL DEFAULT '',
+  requests INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (app_id, environment_id, bucket_hour, kind, value)
+);
 CREATE TABLE IF NOT EXISTS metrics.metric_watermark (
   slug TEXT PRIMARY KEY NOT NULL,
   after_us INTEGER NOT NULL

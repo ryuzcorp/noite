@@ -89,6 +89,7 @@ pub fn router(state: AppState) -> Router {
             delete(api::git_branch_delete),
         )
         .route("/v1/apps/{id}/metrics", get(api::app_metrics))
+        .route("/v1/apps/{id}/metrics/breakdown", get(api::app_breakdown))
         .route(
             "/v1/apps/{id}/metrics/version",
             get(api::app_metrics_version),
