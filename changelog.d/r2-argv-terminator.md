@@ -1,3 +1,0 @@
-### Fixed
-
-- The storage browser's R2 keys can no longer redirect a `celld r2` call: a key starting with `-` failed closed with `invalid key` instead of reaching celld's argv, where the pinned parser (no `--` end-of-options) would read an exact flag match such as `--bucket` or `--endpoint` as that flag and take the next key as its value. Bucket names are validated against celld's own resource-name rule on every R2 verb, and D1 database and Durable Object class names refuse option spelling before they reach their `celld` positionals. Keys that legitimately start with `-` are unreachable through the browser until celld learns a `--` terminator.

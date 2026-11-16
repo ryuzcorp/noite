@@ -1,3 +1,0 @@
-### Added
-
-- An upgrade lane proves every release upgrades the previous release's data in place (`sh docker/e2e-upgrade.sh`, `make e2e-upgrade`): the previous published image boots, seeds an app with an env var, a deploy, a custom domain claim, a collaborator and worker-written D1/R2 state, then stops; the tree image restarts on the same volumes and bucket and must boot, serve the seed back through the API, and keep the app serving. The lane runs on pull requests that touch schema or migration paths, nightly on main, and as a gate on every release tag — a tag cannot ship an image that refuses the previous release's data.
