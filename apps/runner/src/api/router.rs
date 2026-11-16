@@ -233,7 +233,7 @@ pub fn router(state: AppState) -> Router {
         )
         .route(
             "/v1/git/{slug}/git-receive-pack",
-            post(host::git_http::receive_pack),
+            post(host::git_http::receive_pack).layer(DefaultBodyLimit::disable()),
         )
         .layer(middleware::from_fn_with_state(
             state.clone(),

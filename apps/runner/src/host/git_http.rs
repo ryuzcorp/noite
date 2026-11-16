@@ -16,12 +16,13 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use axum::{
-    body::Bytes,
+    body::{Body, Bytes},
     extract::{Path as AxumPath, Query, State},
     http::{header, HeaderMap, StatusCode},
     response::{IntoResponse, Response},
 };
 use base64::Engine;
+use http_body_util::{BodyExt, Limited};
 use serde::Deserialize;
 use serde_json::json;
 
@@ -588,6 +589,46 @@ pub async fn upload_pack(
     }
 }
 
+/// git's RPC probe (`remote-curl.c: probe_rpc`): when a push body exceeds
+/// `http.postBuffer` (1 MiB default), git first POSTs a flush-only body to the
+/// same receive-pack URL, and only streams the real pack (chunked, no
+/// Content-Length) on a 200. The probe is exactly `0000` — anything else
+/// without commands stays refused by `policy_head` below.
+fn is_probe_request(body: &[u8]) -> bool {
+    body == b"0000"
+}
+
+/// The empty receive-pack result the RPC probe gets: `unpack ok` and the
+/// flush, shaped like git-http-backend's answer to an empty push. The client
+/// discards it and streams the real pack; no ref is read or written.
+fn probe_response() -> Response {
+    (
+        StatusCode::OK,
+        [(
+            header::CONTENT_TYPE,
+            "application/x-git-receive-pack-result",
+        )],
+        [pkt_line("unpack ok\n"), b"0000".to_vec()].concat(),
+    )
+        .into_response()
+}
+
+/// Collect a push body up to `cap` bytes, frames included: a chunked
+/// probe-follow-up carries no Content-Length, so the cap counts streamed
+/// bytes, not declared ones. Over the cap answers 413 with the knob to turn.
+/// The error is `(StatusCode, String)` like `policy_head`'s, so the large
+/// `Response` is built once at the call site, not in this `Result`.
+async fn bounded_push_body(body: Body, cap: u64) -> Result<Bytes, (StatusCode, String)> {
+    let limit = usize::try_from(cap).unwrap_or(usize::MAX);
+    match Limited::new(body, limit).collect().await {
+        Ok(collected) => Ok(collected.to_bytes()),
+        Err(_) => Err((
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!("noite: push exceeds the {cap}-byte worktree quota (RUNNER_BUILD_MAX_MB)"),
+        )),
+    }
+}
+
 /// The head the push policy works on, or the response receive-pack answers when
 /// it cannot be read. NOITE-GIT-001: an unreadable head (malformed pkt-lines, a
 /// ref name this layer cannot decode, or no commands at all) is refused — the
@@ -632,14 +673,36 @@ pub async fn receive_pack(
     State(state): State<AppState>,
     AxumPath(slug): AxumPath<String>,
     headers: HeaderMap,
-    body: Bytes,
+    body: Body,
 ) -> Response {
+    // The push cap is the worktree quota: a bundle that does not fit
+    // `RUNNER_BUILD_MAX_MB` can never deploy past the worktree check, so it
+    // is refused at the door (413) instead of buffered past it. The floor
+    // keeps probes and small pushes working when the quota is zeroed.
+    let cap = state
+        .config
+        .build_max_mb
+        .saturating_mul(1024 * 1024)
+        .max(1024 * 1024);
+    let body = match bounded_push_body(body, cap).await {
+        Ok(bytes) => bytes,
+        Err((status, message)) => return (status, message).into_response(),
+    };
     // NOITE-GIT-001: the parsed head IS the policy input, so a head the policy
     // layer cannot read is refused outright — it is never handed to git with
     // every check skipped. This runs before `authorize`, so a malformed push
-    // cannot even create an app on the push-to-create path (A5).
+    // cannot even create an app on the push-to-create path (A5). The RPC
+    // probe is the one exemption: it is exactly `0000`, carries no commands
+    // to misread, and is authorized like any push before its empty 200.
     let parsed = match policy_head(&body) {
         Ok(cmds) => cmds,
+        Err(_) if is_probe_request(&body) => {
+            let Authed { .. } = match authorize(&state, &slug, &headers, "push").await {
+                Ok(t) => t,
+                Err(r) => return r,
+            };
+            return probe_response();
+        }
         Err((status, message)) => {
             tracing::warn!(slug = %slug, "git receive: refused an unparseable request head");
             return (status, message).into_response();
@@ -1037,5 +1100,64 @@ mod tests {
             .expect("refs")
             .contains_key("refs/heads/kept"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// git's RPC probe is exactly one flush packet: a large push POSTs `0000`
+    /// first and streams the real pack only on a 200. Anything else without
+    /// commands — empty, doubled, or garbage — stays refused.
+    #[test]
+    fn rpc_probe_is_detected_exactly() {
+        assert!(is_probe_request(b"0000"));
+        assert!(!is_probe_request(b""));
+        assert!(!is_probe_request(b"00000000"));
+        assert!(!is_probe_request(b"not a pkt line"));
+        // A real head is not a probe, even a command-less one with trailing bytes.
+        let mut head = pkt_line_bytes(
+            format!(
+                "{} {} refs/heads/main\0report-status\n",
+                "a".repeat(40),
+                "b".repeat(40)
+            )
+            .as_bytes(),
+        );
+        head.extend_from_slice(b"0000");
+        assert!(!is_probe_request(&head));
+    }
+
+    /// The probe answers 200 with an empty receive-pack result (`unpack ok`
+    /// and the flush), like git-http-backend's answer to an empty push — the
+    /// client discards it and streams the real pack.
+    #[tokio::test]
+    async fn probe_answers_200_with_an_empty_result() {
+        let res = probe_response();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(res.into_body(), 1024)
+            .await
+            .expect("probe body");
+        assert_eq!(&body[..], b"000eunpack ok\n0000");
+    }
+
+    /// Push bodies are capped at the worktree quota, frames included: a
+    /// chunked probe-follow-up carries no Content-Length, so the cap counts
+    /// streamed bytes, not declared ones.
+    #[tokio::test]
+    async fn push_bodies_are_capped_at_the_worktree_quota() {
+        const CAP: u64 = 1024;
+        let small = bounded_push_body(Body::from(vec![0u8; 512]), CAP)
+            .await
+            .expect("under cap");
+        assert_eq!(small.len(), 512);
+        // Two frames past the cap together: chunked-shaped bodies are summed.
+        let chunked = Body::from_stream(futures::stream::iter([
+            Ok::<Bytes, std::convert::Infallible>(Bytes::from(vec![0u8; 512])),
+            Ok::<Bytes, std::convert::Infallible>(Bytes::from(vec![0u8; 513])),
+        ]));
+        let refused = bounded_push_body(chunked, CAP).await.expect_err("over cap");
+        assert_eq!(refused.0, StatusCode::PAYLOAD_TOO_LARGE);
+        // One byte over in a single frame is refused too.
+        let refused = bounded_push_body(Body::from(vec![0u8; 1025]), CAP)
+            .await
+            .expect_err("over cap");
+        assert_eq!(refused.0, StatusCode::PAYLOAD_TOO_LARGE);
     }
 }
