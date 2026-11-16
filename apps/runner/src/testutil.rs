@@ -524,11 +524,26 @@ mod tests {
     #[test]
     fn kill_cmdline_kills_its_marker() {
         let marker = format!("31339{}", std::process::id());
+        let _cleanup = KillMarkerOnDrop::new(&marker);
         let mut child = std::process::Command::new("sleep")
             .arg(&marker)
             .spawn()
             .expect("spawn sleeper");
-        assert!(live_cmdline_has(&marker), "sleeper is visible");
+        // `spawn` returns once the kernel releases the vfork parent, and that
+        // happens when the child switches to its new address space, before
+        // `execve` writes the argument bounds (`create_elf_tables`). Until then
+        // `/proc/<pid>/cmdline` reads empty, so a single scan right after
+        // `spawn` can miss the marker: CI run 43858637029 failed here. Wait for
+        // it the way the group-kill tests do: yield between scans, and only
+        // the deadline fails.
+        let spawned = std::time::Instant::now();
+        while !live_cmdline_has(&marker) {
+            assert!(
+                spawned.elapsed() < std::time::Duration::from_secs(5),
+                "sleeper never became visible"
+            );
+            std::thread::yield_now();
+        }
         kill_cmdline(&marker);
         let start = std::time::Instant::now();
         while live_cmdline_has(&marker) {
