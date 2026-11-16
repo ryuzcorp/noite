@@ -103,6 +103,18 @@ jobs:
       - run: cargo check --locked --all-targets
       - run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo test --locked
+      # The storage contract the runner depends on: celld fences cells with
+      # conditional writes and restores from listings and ranges, so the
+      # pinned store is re-qualified here on every PR — a RustFS bump that
+      # breaks the contract fails the gate instead of shipping it.
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        timeout-minutes: 3
+      - name: qualify bundled store
+        working-directory: .
+        env:
+          S3_ENDPOINT: http://localhost:9000
+          NOITE_S3_BUCKET: qualify-ci
+        run: bun docker/qualify-store.ts
 
   worker:
     runs-on: ubuntu-latest
