@@ -686,6 +686,99 @@ pub async fn run_cmd_output_stdin(
     })
 }
 
+/// [`run_cmd_output_stdin`] with the child's stdin coming from a file instead
+/// of bytes: the child reads a spooled push at its own pace, so a large push
+/// is never held in RAM. Cancel, kill-group and timeout semantics match
+/// [`run_cmd_output_stdin`] — keep the two in step; there is no writer task
+/// because nothing is piped.
+pub async fn run_cmd_output_file_stdin(
+    program: &str,
+    args: &[&str],
+    stdin_path: &Path,
+    cwd: Option<&Path>,
+    env: &[(&str, &str)],
+    timeout: Duration,
+) -> anyhow::Result<CmdOutput> {
+    super::stats::count_spawn(program);
+    let file = tokio::fs::File::open(stdin_path)
+        .await
+        .with_context(|| format!("open push spool {}", stdin_path.display()))?;
+    let mut cmd = Command::new(program);
+    cmd.args(args)
+        .env_clear()
+        .env("PATH", "/usr/local/bin:/usr/bin:/bin")
+        .env("LANG", "C.UTF-8")
+        .env("HOME", "/root")
+        .stdin(std::process::Stdio::from(file.into_std().await))
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    if let Some(cwd) = cwd {
+        cmd.current_dir(cwd);
+    }
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.as_std_mut().process_group(0);
+    }
+    let child = cmd.spawn().with_context(|| format!("spawn {program}"))?;
+    let pid = child.id();
+    // Same race as [`run_cmd_output_stdin`]: an operator stop wins over the
+    // step's timeout, and the group kill below reaps whatever the stop
+    // leaves — there is no writer task to abort here.
+    let (result, stopped) = match super::cancel::current() {
+        Some(token) => tokio::select! {
+            r = tokio::time::timeout(timeout, child.wait_with_output()) => (r, false),
+            () = token.cancelled() => (
+                Ok(Err(std::io::Error::from(std::io::ErrorKind::Interrupted))),
+                true,
+            ),
+        },
+        None => (
+            tokio::time::timeout(timeout, child.wait_with_output()).await,
+            false,
+        ),
+    };
+    #[cfg(unix)]
+    if let Some(pid) = pid {
+        kill_group(pid);
+    }
+    let output = if stopped {
+        bail!("cancelled by the operator");
+    } else {
+        result.context("command timeout")?.context("wait output")?
+    };
+    Ok(CmdOutput {
+        status: output.status,
+        stdout: output.stdout,
+        stderr: output.stderr,
+    })
+}
+
+/// [`run_cmd_stdin`] from a spooled file: the child's exit decides, and its
+/// stderr explains the refusal.
+pub async fn run_cmd_file_stdin(
+    program: &str,
+    args: &[&str],
+    stdin_path: &Path,
+    cwd: Option<&Path>,
+    env: &[(&str, &str)],
+    timeout: Duration,
+) -> anyhow::Result<Vec<u8>> {
+    let output = run_cmd_output_file_stdin(program, args, stdin_path, cwd, env, timeout).await?;
+    if !output.status.success() {
+        let err = String::from_utf8_lossy(&output.stderr);
+        bail!(
+            "{program} {:?} exit {:?}\n{err}",
+            args,
+            output.status.code()
+        );
+    }
+    Ok(output.stdout)
+}
+
 pub fn work_root(cfg: &Config) -> PathBuf {
     PathBuf::from(&cfg.work_dir)
 }

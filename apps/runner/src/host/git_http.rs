@@ -15,13 +15,15 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use anyhow::Context as _;
 use axum::{
-    body::Bytes,
+    body::{Body, Bytes},
     extract::{Path as AxumPath, Query, State},
     http::{header, HeaderMap, StatusCode},
     response::{IntoResponse, Response},
 };
 use base64::Engine;
+use http_body_util::BodyExt;
 use serde::Deserialize;
 use serde_json::json;
 
@@ -588,6 +590,277 @@ pub async fn upload_pack(
     }
 }
 
+/// git's RPC probe (`remote-curl.c: probe_rpc`): when a push body exceeds
+/// `http.postBuffer` (1 MiB default), git first POSTs a flush-only body to the
+/// same receive-pack URL, and only streams the real pack (chunked, no
+/// Content-Length) on a 200. The probe is exactly `0000` — anything else
+/// without commands stays refused by `policy_head` below.
+fn is_probe_request(body: &[u8]) -> bool {
+    body == b"0000"
+}
+
+/// The empty receive-pack result the RPC probe gets: `unpack ok` and the
+/// flush, shaped like git-http-backend's answer to an empty push. The client
+/// discards it and streams the real pack; no ref is read or written.
+fn probe_response() -> Response {
+    (
+        StatusCode::OK,
+        [(
+            header::CONTENT_TYPE,
+            "application/x-git-receive-pack-result",
+        )],
+        [pkt_line("unpack ok\n"), b"0000".to_vec()].concat(),
+    )
+        .into_response()
+}
+
+/// Bytes of push head the policy layer reads before key auth (A5 order
+/// below): enough for any realistic command section (~5000 ref updates). The
+/// full body is never buffered pre-auth — in RAM (frames stream through) or
+/// on disk (the pump stops here until auth succeeds).
+const PUSH_HEAD_MAX: u64 = 1024 * 1024;
+
+/// Spool files live in their own subdirectory of the work dir, so the boot
+/// sweep below can clear crash leftovers without touching anything else.
+const SPOOL_SUBDIR: &str = "push-spool";
+
+/// The spool directory for this install. Created on demand by the first
+/// push, cleared of crash leftovers at boot.
+pub(crate) fn spool_dir(cfg: &Config) -> PathBuf {
+    exec::work_root(cfg).join(SPOOL_SUBDIR)
+}
+
+/// Remove `push-*.pack` files a killed runner left in the spool dir
+/// (SIGKILL skips every `Drop`). Runs once at boot; anything else in the
+/// directory is left alone.
+pub(crate) async fn sweep_orphaned_spools(dir: &Path) -> usize {
+    let mut entries = match tokio::fs::read_dir(dir).await {
+        Ok(entries) => entries,
+        Err(_) => return 0,
+    };
+    let mut swept = 0;
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.starts_with("push-")
+            && name.ends_with(".pack")
+            && tokio::fs::remove_file(entry.path()).await.is_ok()
+        {
+            swept += 1;
+        }
+    }
+    swept
+}
+/// A push body spooled to disk under the work dir: the full request in a
+/// temp file, the head (through the first flush, bounded by PUSH_HEAD_MAX)
+/// in memory for the policy layer. The file is removed on drop, so pre-auth
+/// refusals, 413s and crashes all clean it.
+struct SpooledPush {
+    path: PathBuf,
+    head: Vec<u8>,
+}
+
+impl Drop for SpooledPush {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+/// The pump behind [`SpooledPush`]: frames stream into the temp file with a
+/// running byte count, so the pack is never held in RAM. The temp file
+/// exists from creation, so dropping the pump on any pre-finish exit (413,
+/// 403, 401, crash) removes it — the guard below only covers the finished
+/// push, which `receive_pack` drops after git runs.
+struct SpoolPump {
+    file: tokio::fs::File,
+    path: Option<PathBuf>,
+    len: u64,
+    head: Vec<u8>,
+    /// Offset of the next length prefix the boundary walk has not parsed:
+    /// the walk resumes there, so each head byte is scanned once.
+    head_pos: usize,
+    /// The pump stops here; the command section is not necessarily complete.
+    head_done: bool,
+    /// A flush packet ended the command section inside the bound: only then
+    /// is the head valid policy input. A head that runs past the bound (or a
+    /// malformed one) is refused even when it parses — the parser accepts a
+    /// prefix cut at a packet boundary, which would let trailing commands
+    /// bypass the policy while git still runs them.
+    head_complete: bool,
+    /// Refuse past this many bytes with 413: the worktree quota, since a
+    /// bigger bundle could never deploy.
+    cap: u64,
+}
+
+impl SpoolPump {
+    async fn create(parent: &Path, cap: u64) -> anyhow::Result<Self> {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let dir = parent.join(SPOOL_SUBDIR);
+        tokio::fs::create_dir_all(&dir)
+            .await
+            .with_context(|| format!("create push spool dir {}", dir.display()))?;
+        let name = format!(
+            "push-{}-{}-{:016x}.pack",
+            std::process::id(),
+            COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            rand::random::<u64>()
+        );
+        let path = dir.join(name);
+        let file = tokio::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+            .await
+            .with_context(|| format!("create push spool {}", path.display()))?;
+        Ok(Self {
+            file,
+            path: Some(path),
+            len: 0,
+            head: Vec::new(),
+            head_pos: 0,
+            head_done: false,
+            head_complete: false,
+            cap,
+        })
+    }
+
+    /// Write one frame, 413 past the cap, and extend the boundary-walked
+    /// head. The walk parses packet boundaries like the policy parser, so a
+    /// `0000` inside a payload cannot end the head early.
+    async fn write_frame(&mut self, data: &[u8]) -> Result<(), (StatusCode, String)> {
+        use tokio::io::AsyncWriteExt as _;
+        if self.len.saturating_add(data.len() as u64) > self.cap {
+            return Err((
+                StatusCode::PAYLOAD_TOO_LARGE,
+                format!(
+                    "noite: push exceeds the {}-byte worktree quota (RUNNER_BUILD_MAX_MB)",
+                    self.cap
+                ),
+            ));
+        }
+        self.file.write_all(data).await.map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("noite: could not spool the push: {e:#}"),
+            )
+        })?;
+        self.len += data.len() as u64;
+        if !self.head_done {
+            self.head.extend_from_slice(data);
+            self.scan_head();
+        }
+        Ok(())
+    }
+
+    /// Walk packet boundaries from the last parsed prefix: a flush ends the
+    /// head, the bound or a malformed prefix stops the scan (the policy
+    /// parser refuses those — and a malformed prefix already decides it, so
+    /// the pump stops pulling). Truncated prefixes simply wait for more data.
+    fn scan_head(&mut self) {
+        let mut pos = self.head_pos;
+        while pos + 4 <= self.head.len() {
+            let Ok(len) = usize::from_str_radix(
+                std::str::from_utf8(&self.head[pos..pos + 4]).unwrap_or(""),
+                16,
+            ) else {
+                // Present but unparseable: more bytes cannot fix these four.
+                self.head_done = true;
+                break;
+            };
+            if len == 0 {
+                self.head.truncate(pos + 4);
+                self.head_done = true;
+                self.head_complete = true;
+                return;
+            }
+            if len < 4 {
+                // The parser bails on these the same way.
+                self.head_done = true;
+                break;
+            }
+            pos += len;
+            if pos as u64 > PUSH_HEAD_MAX {
+                break;
+            }
+        }
+        self.head_pos = pos;
+        if self.head.len() as u64 > PUSH_HEAD_MAX {
+            self.head.truncate(PUSH_HEAD_MAX as usize);
+            self.head_done = true;
+        }
+    }
+
+    /// Poll `body` until the head is complete, the head bound lands, or the
+    /// stream ends. True on a clean EOF (probes and small pushes end here —
+    /// the caller keeps `body` for the rest after auth).
+    async fn pump_head(&mut self, body: &mut Body) -> Result<bool, (StatusCode, String)> {
+        while !self.head_done && self.len < PUSH_HEAD_MAX {
+            match body.frame().await {
+                Some(Ok(frame)) => {
+                    if let Some(data) = frame.data_ref() {
+                        self.write_frame(data).await?;
+                    }
+                }
+                Some(Err(_)) => {
+                    return Err((
+                        StatusCode::BAD_REQUEST,
+                        "noite: could not read the push body".to_string(),
+                    ));
+                }
+                None => return Ok(true),
+            }
+        }
+        Ok(false)
+    }
+
+    /// Poll the rest after auth, enforcing the cap.
+    async fn pump_rest(&mut self, mut body: Body) -> Result<(), (StatusCode, String)> {
+        while let Some(frame) = body.frame().await {
+            match frame {
+                Ok(frame) => {
+                    if let Some(data) = frame.data_ref() {
+                        self.write_frame(data).await?;
+                    }
+                }
+                Err(_) => {
+                    return Err((
+                        StatusCode::BAD_REQUEST,
+                        "noite: could not read the push body".to_string(),
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Hand the spool to git. `tokio::fs::File` completes writes on a
+    /// blocking thread: `write_all` returns once the last chunk is queued, not
+    /// written, so the file must be flushed before git opens the path, or git
+    /// can read a truncated pack. A late write error surfaces here too.
+    async fn finish(mut self) -> Result<SpooledPush, (StatusCode, String)> {
+        use tokio::io::AsyncWriteExt as _;
+        if let Err(e) = self.file.flush().await {
+            tracing::warn!(error = %e, "git receive: could not write the push spool");
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "noite: could not spool the push".to_string(),
+            ));
+        }
+        let path = self.path.take().expect("spool path");
+        Ok(SpooledPush {
+            path,
+            head: std::mem::take(&mut self.head),
+        })
+    }
+}
+
+impl Drop for SpoolPump {
+    fn drop(&mut self) {
+        if let Some(path) = self.path.take() {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
 /// The head the push policy works on, or the response receive-pack answers when
 /// it cannot be read. NOITE-GIT-001: an unreadable head (malformed pkt-lines, a
 /// ref name this layer cannot decode, or no commands at all) is refused — the
@@ -632,13 +905,74 @@ pub async fn receive_pack(
     State(state): State<AppState>,
     AxumPath(slug): AxumPath<String>,
     headers: HeaderMap,
-    body: Bytes,
+    body: Body,
 ) -> Response {
+    // The push cap is the worktree quota: a bundle that does not fit
+    // `RUNNER_BUILD_MAX_MB` can never deploy past the worktree check, so it
+    // is refused at the door (413) instead of spooled past it. The floor
+    // keeps probes and small pushes working when the quota is zeroed.
+    let cap = state
+        .config
+        .build_max_mb
+        .saturating_mul(1024 * 1024)
+        .max(1024 * 1024);
+    // Phase one runs before any auth decision and stays bounded either way:
+    // frames stream into the spool file (never RAM) and the pump stops at
+    // the head, the head bound, or EOF. An unauthenticated client therefore
+    // pins at most a head window of disk and memory — never the pack.
+    let mut pump = match SpoolPump::create(&exec::work_root(&state.config), cap).await {
+        Ok(pump) => pump,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")).into_response(),
+    };
+    let mut body = body;
+    let _head_eof = match pump.pump_head(&mut body).await {
+        Ok(eof) => eof,
+        Err((status, message)) => return (status, message).into_response(),
+    };
+    // The RPC probe is not a push: constant empty answer, no auth, no DB, no
+    // mutation. `pump_head` stops at the head without polling for EOF, so a
+    // lone `0000` needs one more poll to prove it is the whole body: EOF
+    // answers the probe, data is spooled for the refusal below, error 400s.
+    // A head that ended at EOF already (empty or truncated body) falls
+    // through to the policy refusal; the extra poll on it answers None at
+    // once.
+    if pump.len == 4 && is_probe_request(&pump.head) {
+        match body.frame().await {
+            None => return probe_response(),
+            Some(Ok(frame)) => {
+                if let Some(data) = frame.data_ref() {
+                    if let Err((status, message)) = pump.write_frame(data).await {
+                        return (status, message).into_response();
+                    }
+                }
+            }
+            Some(Err(_)) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    "noite: could not read the push body".to_string(),
+                )
+                    .into_response();
+            }
+        }
+    }
+    // The command section must end with a flush inside the bound: the policy
+    // parser accepts a prefix cut at a packet boundary, so without this gate
+    // a head past the bound would let trailing commands bypass the policy
+    // while git still runs them.
+    if !pump.head_complete {
+        tracing::warn!(slug = %slug, "git receive: refused a head with no flush");
+        return (
+            StatusCode::FORBIDDEN,
+            "noite: refused: the push request could not be parsed".to_string(),
+        )
+            .into_response();
+    }
     // NOITE-GIT-001: the parsed head IS the policy input, so a head the policy
     // layer cannot read is refused outright — it is never handed to git with
     // every check skipped. This runs before `authorize`, so a malformed push
-    // cannot even create an app on the push-to-create path (A5).
-    let parsed = match policy_head(&body) {
+    // cannot even create an app on the push-to-create path (A5); only the
+    // bounded head above was consumed to decide that.
+    let parsed = match policy_head(&pump.head) {
         Ok(cmds) => cmds,
         Err((status, message)) => {
             tracing::warn!(slug = %slug, "git receive: refused an unparseable request head");
@@ -648,6 +982,15 @@ pub async fn receive_pack(
     let Authed { app, role } = match authorize(&state, &slug, &headers, "push").await {
         Ok(t) => t,
         Err(r) => return r,
+    };
+    // Phase two runs only after auth, still under the cap; the finished
+    // spool drops its file after git runs below.
+    if let Err((status, message)) = pump.pump_rest(body).await {
+        return (status, message).into_response();
+    }
+    let spooled = match pump.finish().await {
+        Ok(spooled) => spooled,
+        Err((status, message)) => return (status, message).into_response(),
     };
     match git_policy::check_push_policy(&role, &parsed) {
         PolicyDecision::Allow => {}
@@ -720,11 +1063,19 @@ pub async fn receive_pack(
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")).into_response(),
     };
     let argv: Vec<&str> = argv.iter().map(String::as_str).collect();
-    let out =
-        match exec::run_cmd_stdin("git", &argv, &body, None, &[], Duration::from_secs(300)).await {
-            Ok(o) => o,
-            Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")).into_response(),
-        };
+    let out = match exec::run_cmd_file_stdin(
+        "git",
+        &argv,
+        &spooled.path,
+        None,
+        &[],
+        Duration::from_secs(300),
+    )
+    .await
+    {
+        Ok(o) => o,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")).into_response(),
+    };
     // Push-driven deploy (T2.2): notify the reconcile loop, which drains the
     // channel every tick and deploys. A crash here only delays the deploy to
     // the next fallback sweep — the bundle and manifest are already stored.
@@ -769,7 +1120,7 @@ pub async fn receive_pack(
     // the first push to an app created blank) — print the app URL as a
     // `remote:` line, where the client already looks for push feedback.
     let mut out = out;
-    if first_main_push && wants_sideband(&body) {
+    if first_main_push && wants_sideband(&spooled.head) {
         let url = state.config.public_app_url(&app.subdomain);
         out = with_notes(out, &[format!("noite: {url}")]);
     }
@@ -1037,5 +1388,435 @@ mod tests {
             .expect("refs")
             .contains_key("refs/heads/kept"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// git's RPC probe is exactly one flush packet: a large push POSTs `0000`
+    /// first and streams the real pack only on a 200. Anything else without
+    /// commands — empty, doubled, or garbage — stays refused.
+    #[test]
+    fn rpc_probe_is_detected_exactly() {
+        assert!(is_probe_request(b"0000"));
+        assert!(!is_probe_request(b""));
+        assert!(!is_probe_request(b"00000000"));
+        assert!(!is_probe_request(b"not a pkt line"));
+        // A real head is not a probe, even a command-less one with trailing bytes.
+        let mut head = pkt_line_bytes(
+            format!(
+                "{} {} refs/heads/main\0report-status\n",
+                "a".repeat(40),
+                "b".repeat(40)
+            )
+            .as_bytes(),
+        );
+        head.extend_from_slice(b"0000");
+        assert!(!is_probe_request(&head));
+    }
+
+    /// The probe answers 200 with an empty receive-pack result (`unpack ok`
+    /// and the flush), like git-http-backend's answer to an empty push — the
+    /// client discards it and streams the real pack.
+    #[tokio::test]
+    async fn probe_answers_200_with_an_empty_result() {
+        let res = probe_response();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(res.into_body(), 1024)
+            .await
+            .expect("probe body");
+        assert_eq!(&body[..], b"000eunpack ok\n0000");
+    }
+
+    /// Frames stream into the spool file with a running count; the head stops
+    /// at the first flush while the pack keeps spooling. The finished spool
+    /// reads back whole, and dropping it removes the file.
+    #[tokio::test]
+    async fn spooled_push_holds_frames_on_disk_not_in_memory() {
+        let guard = temp_dir("spool-disk");
+        let dir = guard.path().join("work");
+        std::fs::create_dir_all(&dir).expect("work dir");
+        let mut head = pkt_line_bytes(
+            format!(
+                "{} {} refs/heads/main\0report-status side-band-64k\n",
+                "a".repeat(40),
+                "b".repeat(40)
+            )
+            .as_bytes(),
+        );
+        head.extend_from_slice(b"0000");
+        let pack: Vec<u8> = (0..3)
+            .map(|i| vec![i; 512 * 1024])
+            .collect::<Vec<_>>()
+            .concat();
+        let mut pump = SpoolPump::create(&dir, 100 * 1024 * 1024)
+            .await
+            .expect("spool");
+        let frames = futures::stream::iter(
+            std::iter::once(head.clone())
+                .chain((0..3).map(|i| vec![i; 512 * 1024]))
+                .map(|chunk| Ok::<Bytes, axum::Error>(Bytes::from(chunk))),
+        );
+        // The head completes on its frame; the pack streams after, frame by frame.
+        let mut body = Body::from_stream(frames);
+        pump.pump_head(&mut body).await.expect("head");
+        pump.pump_rest(body).await.expect("rest");
+        let spooled = pump.finish().await.expect("finish");
+        assert_eq!(spooled.head, head, "head stops at the flush");
+        let on_disk = std::fs::read(&spooled.path).expect("spool file");
+        assert_eq!(on_disk.len(), head.len() + pack.len());
+        assert_eq!(on_disk, [head.clone(), pack].concat());
+        let path = spooled.path.clone();
+        drop(spooled);
+        assert!(!path.exists(), "the spool file is removed on drop");
+        let _ = std::fs::remove_dir_all(guard.path());
+    }
+
+    /// git opens the spool the moment `finish` returns, so every byte must be
+    /// on disk by then: `tokio::fs::File` writes the last chunk of a large
+    /// frame on a blocking thread after `write_all` has already returned.
+    #[tokio::test]
+    async fn a_finished_spool_holds_every_byte_of_a_large_last_frame() {
+        let guard = temp_dir("spool-flush");
+        let dir = guard.path().join("work");
+        std::fs::create_dir_all(&dir).expect("work dir");
+        let mut head = pkt_line_bytes(
+            format!(
+                "{} {} refs/heads/main\0report-status\n",
+                "a".repeat(40),
+                "b".repeat(40)
+            )
+            .as_bytes(),
+        );
+        head.extend_from_slice(b"0000");
+        // Two full tokio write chunks (2 MiB each): the second is still in
+        // flight on a blocking thread when `write_all` returns.
+        let pack = vec![7u8; 4 * 1024 * 1024];
+        for _ in 0..200 {
+            let mut pump = SpoolPump::create(&dir, 1024 * 1024 * 1024)
+                .await
+                .expect("spool");
+            let frames = futures::stream::iter(
+                [head.clone(), pack.clone()]
+                    .into_iter()
+                    .map(|chunk| Ok::<Bytes, axum::Error>(Bytes::from(chunk))),
+            );
+            let mut body = Body::from_stream(frames);
+            pump.pump_head(&mut body).await.expect("head");
+            pump.pump_rest(body).await.expect("rest");
+            let spooled = pump.finish().await.expect("finish");
+            let on_disk = std::fs::metadata(&spooled.path).expect("spool file").len();
+            assert_eq!(
+                on_disk,
+                (head.len() + pack.len()) as u64,
+                "git must see the whole pack"
+            );
+        }
+        let _ = std::fs::remove_dir_all(guard.path());
+    }
+
+    /// Over the cap answers 413 and deletes the partial spool: a refused
+    /// push leaves no file behind.
+    #[tokio::test]
+    async fn spool_refuses_past_the_cap_and_deletes_the_file() {
+        let guard = temp_dir("spool-cap");
+        let dir = guard.path().join("work");
+        std::fs::create_dir_all(&dir).expect("work dir");
+        let mut pump = SpoolPump::create(&dir, 1024).await.expect("spool");
+        let path = pump.path.clone().expect("spool path");
+        let mut body = Body::from(vec![0u8; 2048]);
+        let refused = pump.pump_head(&mut body).await.expect_err("over cap");
+        assert_eq!(refused.0, StatusCode::PAYLOAD_TOO_LARGE);
+        drop(pump);
+        assert!(!path.exists(), "the partial spool is removed");
+        let _ = std::fs::remove_dir_all(guard.path());
+    }
+
+    /// A spooled file with no finished push behind it is removed when its
+    /// pump drops: every pre-finish exit (401, 403, 413, crash) cleans up.
+    #[tokio::test]
+    async fn unfinished_spools_are_removed_on_drop() {
+        let guard = temp_dir("spool-drop");
+        let dir = guard.path().join("work");
+        std::fs::create_dir_all(&dir).expect("work dir");
+        let path = {
+            let mut pump = SpoolPump::create(&dir, 1024 * 1024).await.expect("spool");
+            let path = pump.path.clone().expect("spool path");
+            pump.write_frame(b"0000").await.expect("frame");
+            assert!(path.exists(), "the spool file exists while pumping");
+            path
+        };
+        assert!(!path.exists(), "dropping the pump removes the file");
+        let _ = std::fs::remove_dir_all(guard.path());
+    }
+
+    use std::sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    };
+
+    /// A body that counts the bytes the handler actually polls: proves what a
+    /// refused push consumed, frame by frame.
+    fn counting_body(chunks: Vec<Vec<u8>>, count: Arc<AtomicU64>) -> Body {
+        Body::from_stream(futures::stream::iter(chunks.into_iter().map(
+            move |chunk| {
+                let count = count.clone();
+                Ok::<Bytes, axum::Error>(Bytes::from({
+                    count.fetch_add(chunk.len() as u64, Ordering::Relaxed);
+                    chunk
+                }))
+            },
+        )))
+    }
+
+    /// A handler state with a migrated file DB, a seeded app, and the spool
+    /// dir inside the test's temp dir: refusals must leave it file-free.
+    async fn handler_state(dir: &std::path::Path) -> (AppState, Arc<Config>, sqlx::SqlitePool) {
+        let mut cfg = crate::config::config_for_tests();
+        cfg.database_url = format!("sqlite:{}?mode=rwc", dir.join("noite.sqlite").display());
+        cfg.work_dir = dir.join("work").to_string_lossy().into_owned();
+        std::fs::create_dir_all(&cfg.work_dir).expect("work dir");
+        let config = Arc::new(cfg);
+        let pool = crate::db::connect(&config.database_url)
+            .await
+            .expect("connect db");
+        let (tip_tx, _tip_rx) = crate::host::tips::channel();
+        let (log_notify, _log_rx) = tokio::sync::watch::channel(0u64);
+        let state = AppState {
+            pool: pool.clone(),
+            config: config.clone(),
+            procs: crate::host::supervisor::new_procs(),
+            logs: crate::host::logs::new_state(),
+            deploying: crate::host::deploy::new_deploying(),
+            log_notify,
+            wal: crate::host::git_store::build_wal(&config),
+            tip_tx,
+            ready: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            isolation: Arc::new(tokio::sync::RwLock::new(
+                crate::host::isolation::IsolationStatus::default(),
+            )),
+            state_sync: crate::host::state::StateSync::new(),
+            dns: Arc::new(crate::dns::FakeResolver::default()),
+            bucket_ok: Arc::new(tokio::sync::RwLock::new((
+                true,
+                String::new(),
+                std::time::Instant::now(),
+            ))),
+            started_at: chrono::Utc::now(),
+            source_maps: Default::default(),
+            control_boot: Default::default(),
+        };
+        (state, config, pool)
+    }
+
+    async fn seed_app(pool: &sqlx::SqlitePool, cfg: &Config, slug: &str) {
+        crate::db::create_app(
+            pool,
+            cfg,
+            crate::db::NewApp {
+                name: slug,
+                slug,
+                user_id: "local",
+                subdomain: &format!("{slug}.localhost"),
+                listen: 30000,
+                internal: 30001,
+            },
+        )
+        .await
+        .expect("seed app");
+    }
+
+    fn spool_files(dir: &std::path::Path) -> Vec<String> {
+        std::fs::read_dir(dir)
+            .expect("work dir")
+            .filter_map(|entry| {
+                let name = entry.ok()?.file_name().to_string_lossy().into_owned();
+                name.starts_with("push-").then_some(name)
+            })
+            .collect()
+    }
+
+    fn valid_head() -> Vec<u8> {
+        let mut head = pkt_line_bytes(
+            format!(
+                "{} {} refs/heads/main\0report-status\n",
+                "c".repeat(40),
+                "d".repeat(40)
+            )
+            .as_bytes(),
+        );
+        head.extend_from_slice(b"0000");
+        head
+    }
+
+    /// Key auth runs before the bulk: a valid head with no credentials gets
+    /// 401 after only the bounded head window, and the spool is gone.
+    #[tokio::test]
+    async fn unauthenticated_large_push_is_refused_inside_the_head_bound() {
+        let guard = temp_dir("refuse-noauth");
+        let (state, config, pool) = handler_state(guard.path()).await;
+        seed_app(&pool, &config, "blog").await;
+        let count = Arc::new(AtomicU64::new(0));
+        let mut chunks = vec![valid_head()];
+        chunks.extend((0..96).map(|_| vec![7u8; 65536]));
+        let body = counting_body(chunks, count.clone());
+        let res = receive_pack(
+            State(state),
+            AxumPath("blog".to_string()),
+            HeaderMap::new(),
+            body,
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+        let consumed = count.load(Ordering::Relaxed);
+        assert!(
+            consumed <= PUSH_HEAD_MAX + 65536,
+            "unauthenticated push consumed {consumed} bytes"
+        );
+        assert!(spool_files(&spool_dir(&config)).is_empty());
+        let _ = std::fs::remove_dir_all(guard.path());
+    }
+
+    /// Garbage to an unknown slug never reaches auth: the bounded head
+    /// decides the 403, and the spool is gone.
+    #[tokio::test]
+    async fn garbage_to_an_unknown_slug_is_refused_inside_the_head_bound() {
+        let guard = temp_dir("refuse-garbage");
+        let (state, config, _pool) = handler_state(guard.path()).await;
+        let count = Arc::new(AtomicU64::new(0));
+        let chunks = (0..96).map(|_| vec![9u8; 65536]).collect();
+        let body = counting_body(chunks, count.clone());
+        let res = receive_pack(
+            State(state),
+            AxumPath("ghost".to_string()),
+            HeaderMap::new(),
+            body,
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
+        let consumed = count.load(Ordering::Relaxed);
+        assert!(
+            consumed <= PUSH_HEAD_MAX + 65536,
+            "garbage push consumed {consumed} bytes"
+        );
+        assert!(spool_files(&spool_dir(&config)).is_empty());
+        let _ = std::fs::remove_dir_all(guard.path());
+    }
+
+    fn probe_body(frames: Vec<Bytes>) -> Body {
+        Body::from_stream(futures::stream::iter(
+            frames.into_iter().map(Ok::<Bytes, axum::Error>),
+        ))
+    }
+
+    /// An exact single-frame probe answers 200 with no auth, no DB and no
+    /// mutation — and leaves no spool behind.
+    #[tokio::test]
+    async fn exact_probe_answers_200_unauthenticated() {
+        let guard = temp_dir("probe-exact");
+        let (state, config, _pool) = handler_state(guard.path()).await;
+        let res = receive_pack(
+            State(state),
+            AxumPath("ghost".to_string()),
+            HeaderMap::new(),
+            probe_body(vec![Bytes::from_static(b"0000")]),
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(res.into_body(), 1024)
+            .await
+            .expect("probe body");
+        assert_eq!(&body[..], b"000eunpack ok\n0000");
+        assert!(spool_files(&spool_dir(&config)).is_empty());
+        let _ = std::fs::remove_dir_all(guard.path());
+    }
+
+    /// A probe split across frames is still exactly four bytes on the wire.
+    #[tokio::test]
+    async fn split_frame_probe_answers_200() {
+        let guard = temp_dir("probe-split");
+        let (state, config, _pool) = handler_state(guard.path()).await;
+        let res = receive_pack(
+            State(state),
+            AxumPath("ghost".to_string()),
+            HeaderMap::new(),
+            probe_body(vec![Bytes::from_static(b"00"), Bytes::from_static(b"00")]),
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::OK);
+        assert!(spool_files(&spool_dir(&config)).is_empty());
+        let _ = std::fs::remove_dir_all(guard.path());
+    }
+
+    /// `0000` with pack bytes behind it is an empty command list, not a
+    /// probe: the policy layer refuses it and the spool is gone.
+    #[tokio::test]
+    async fn probe_head_with_trailing_bytes_is_refused() {
+        let guard = temp_dir("probe-trailing");
+        let (state, config, _pool) = handler_state(guard.path()).await;
+        let res = receive_pack(
+            State(state),
+            AxumPath("ghost".to_string()),
+            HeaderMap::new(),
+            probe_body(vec![
+                Bytes::from_static(b"0000"),
+                Bytes::from_static(b"PACK junk"),
+            ]),
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
+        assert!(spool_files(&spool_dir(&config)).is_empty());
+        let _ = std::fs::remove_dir_all(guard.path());
+    }
+    /// The boot sweep removes only crash leftovers: `push-*.pack` files go,
+    /// anything else stays.
+    #[tokio::test]
+    async fn boot_sweep_removes_only_orphaned_spools() {
+        let guard = temp_dir("spool-sweep");
+        let dir = guard.path().join("work").join("push-spool");
+        std::fs::create_dir_all(&dir).expect("spool dir");
+        std::fs::write(dir.join("push-1-2-0000000000000000.pack"), b"x").expect("orphan");
+        std::fs::write(dir.join("push-3-4-ffffffffffffffff.pack"), b"y").expect("orphan");
+        std::fs::write(dir.join("keep.txt"), b"z").expect("keeper");
+        assert_eq!(sweep_orphaned_spools(&dir).await, 2);
+        assert!(dir.join("keep.txt").exists(), "non-spool files stay");
+        assert!(spool_files(&dir).is_empty());
+        // Missing directory sweeps zero, not an error.
+        assert_eq!(sweep_orphaned_spools(&dir.join("nope")).await, 0);
+        let _ = std::fs::remove_dir_all(guard.path());
+    }
+    /// A command section that runs past the head bound with no flush is
+    /// refused even when it parses: the parser accepts a prefix cut at a
+    /// packet boundary, which would let trailing commands bypass the policy
+    /// while git still runs them.
+    #[tokio::test]
+    async fn flushless_head_past_the_bound_is_refused() {
+        let guard = temp_dir("refuse-noflush");
+        let (state, config, _pool) = handler_state(guard.path()).await;
+        // Valid command packets, no flush, past the head bound — each packet
+        // exactly 128 bytes so the bound cut lands on a packet boundary (the
+        // parser accepts that prefix, which is the bypass).
+        let mut giant: Vec<u8> = Vec::new();
+        for i in 0..9_000u32 {
+            let line = format!(
+                "{} {} refs/heads/b{i:015}\0report-status\n",
+                "e".repeat(40),
+                "f".repeat(40)
+            );
+            let packet = pkt_line_bytes(line.as_bytes());
+            assert_eq!(packet.len(), 128, "test packets must tile the bound");
+            giant.extend_from_slice(&packet);
+        }
+        assert!(
+            giant.len() as u64 > PUSH_HEAD_MAX,
+            "test head must pass the bound"
+        );
+        let res = receive_pack(
+            State(state),
+            AxumPath("ghost".to_string()),
+            HeaderMap::new(),
+            Body::from(giant),
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
+        assert!(spool_files(&spool_dir(&config)).is_empty());
+        let _ = std::fs::remove_dir_all(guard.path());
     }
 }
