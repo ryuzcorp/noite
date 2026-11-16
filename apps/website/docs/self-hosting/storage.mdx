@@ -7,8 +7,8 @@ description: Object-store backends, volumes, snapshots, and the telemetry pipeli
 
 celld qualifies Amazon S3, Cloudflare R2, Google Cloud Storage, Tigris, and Azure Blob Storage; the store must provide conditional writes, read-after-write consistency, and ranged reads. celld runs a storage-contract check at node startup — a contract violation stops startup, an ambiguous transport error warns — so a store that fails the contract stops loudly instead of corrupting state later. MinIO community edition passes celld's storage test but is not qualified for production.
 
-:::warning
-Noite's bundled default is RustFS, which is **not** on celld's qualified list. celld's own startup check still runs and passes on it, and every node boots normally, but for production the recommended path is your own bucket on a qualified store. Bundled RustFS stays the zero-config default for trying Noite out and for single-host installs.
+:::note
+Noite's bundled default is RustFS 1.0.5, qualified by Noite for single-host installs at the pinned version: celld's own `diagnose` probe passes against it (`bucket conditional write: create, reject-create, update, reject-stale`), and [`docker/qualify-store.ts`](https://github.com/ryuzcorp/noite/blob/main/docker/qualify-store.ts) covers the rest of the contract — a 16-way racing conditional create with exactly one winner, read-after-write and immediate list-after-write, three ranged-read spellings, a multipart round-trip at celld's 5 MiB threshold plus abort, and delete-then-404. Re-run it against any S3 endpoint with `S3_ENDPOINT=... NOITE_S3_BUCKET=... bun docker/qualify-store.ts`; CI runs it against the pinned image on every PR, so a RustFS bump cannot silently regress. celld's own startup check still runs on every node boot. For multi-host production the recommended path is still your own bucket on a store celld qualifies. Bundled RustFS stays the zero-config default.
 :::
 
 Store connection variables (`S3_ENDPOINT`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `NOITE_S3_BUCKET`) are documented in [Environment variables](/reference/environment-variables).
