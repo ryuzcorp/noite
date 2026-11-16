@@ -832,12 +832,24 @@ impl SpoolPump {
         Ok(())
     }
 
-    fn finish(mut self) -> SpooledPush {
+    /// Hand the spool to git. `tokio::fs::File` completes writes on a
+    /// blocking thread: `write_all` returns once the last chunk is queued, not
+    /// written, so the file must be flushed before git opens the path, or git
+    /// can read a truncated pack. A late write error surfaces here too.
+    async fn finish(mut self) -> Result<SpooledPush, (StatusCode, String)> {
+        use tokio::io::AsyncWriteExt as _;
+        if let Err(e) = self.file.flush().await {
+            tracing::warn!(error = %e, "git receive: could not write the push spool");
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "noite: could not spool the push".to_string(),
+            ));
+        }
         let path = self.path.take().expect("spool path");
-        SpooledPush {
+        Ok(SpooledPush {
             path,
             head: std::mem::take(&mut self.head),
-        }
+        })
     }
 }
 
@@ -976,7 +988,10 @@ pub async fn receive_pack(
     if let Err((status, message)) = pump.pump_rest(body).await {
         return (status, message).into_response();
     }
-    let spooled = pump.finish();
+    let spooled = match pump.finish().await {
+        Ok(spooled) => spooled,
+        Err((status, message)) => return (status, message).into_response(),
+    };
     match git_policy::check_push_policy(&role, &parsed) {
         PolicyDecision::Allow => {}
         PolicyDecision::Deny(msg) => {
@@ -1443,7 +1458,7 @@ mod tests {
         let mut body = Body::from_stream(frames);
         pump.pump_head(&mut body).await.expect("head");
         pump.pump_rest(body).await.expect("rest");
-        let spooled = pump.finish();
+        let spooled = pump.finish().await.expect("finish");
         assert_eq!(spooled.head, head, "head stops at the flush");
         let on_disk = std::fs::read(&spooled.path).expect("spool file");
         assert_eq!(on_disk.len(), head.len() + pack.len());
@@ -1451,6 +1466,49 @@ mod tests {
         let path = spooled.path.clone();
         drop(spooled);
         assert!(!path.exists(), "the spool file is removed on drop");
+        let _ = std::fs::remove_dir_all(guard.path());
+    }
+
+    /// git opens the spool the moment `finish` returns, so every byte must be
+    /// on disk by then: `tokio::fs::File` writes the last chunk of a large
+    /// frame on a blocking thread after `write_all` has already returned.
+    #[tokio::test]
+    async fn a_finished_spool_holds_every_byte_of_a_large_last_frame() {
+        let guard = temp_dir("spool-flush");
+        let dir = guard.path().join("work");
+        std::fs::create_dir_all(&dir).expect("work dir");
+        let mut head = pkt_line_bytes(
+            format!(
+                "{} {} refs/heads/main\0report-status\n",
+                "a".repeat(40),
+                "b".repeat(40)
+            )
+            .as_bytes(),
+        );
+        head.extend_from_slice(b"0000");
+        // Two full tokio write chunks (2 MiB each): the second is still in
+        // flight on a blocking thread when `write_all` returns.
+        let pack = vec![7u8; 4 * 1024 * 1024];
+        for _ in 0..200 {
+            let mut pump = SpoolPump::create(&dir, 1024 * 1024 * 1024)
+                .await
+                .expect("spool");
+            let frames = futures::stream::iter(
+                [head.clone(), pack.clone()]
+                    .into_iter()
+                    .map(|chunk| Ok::<Bytes, axum::Error>(Bytes::from(chunk))),
+            );
+            let mut body = Body::from_stream(frames);
+            pump.pump_head(&mut body).await.expect("head");
+            pump.pump_rest(body).await.expect("rest");
+            let spooled = pump.finish().await.expect("finish");
+            let on_disk = std::fs::metadata(&spooled.path).expect("spool file").len();
+            assert_eq!(
+                on_disk,
+                (head.len() + pack.len()) as u64,
+                "git must see the whole pack"
+            );
+        }
         let _ = std::fs::remove_dir_all(guard.path());
     }
 
