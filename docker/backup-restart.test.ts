@@ -54,6 +54,8 @@ case "$1" in
       up)
         if [ "$BK_UP_FAIL" = 1 ]; then exit 1; fi
         printf 'running' > "$BK_STATE"
+        # A wedged up: the containers come up, the command still fails.
+        if [ "$BK_UP_WEDGE" = 1 ]; then exit 1; fi
         ;;
       ps)
         if [ "$(state)" = running ]; then printf 'running\nrunning\n'; else printf 'exited\nexited\n'; fi
@@ -65,6 +67,16 @@ case "$1" in
   run)
     log "engine-run"
     if [ "$BK_TAR_FAIL" = 1 ]; then exit 1; fi
+    # Ctrl-C or a CI timeout landing on the script mid-tar.
+    if [ -n "$BK_TAR_SIGNAL" ]; then kill -s "$BK_TAR_SIGNAL" "$PPID"; sleep 1; fi
+    ;;
+  ps)
+    # project_running asks once per engine label; answer the docker one.
+    case "$*" in
+      *com.docker.compose.project=*)
+        if [ "$(state)" = running ]; then printf 'running\nrunning\n'; else printf 'exited\nexited\n'; fi
+        ;;
+    esac
     ;;
   *) log "engine-$1" ;;
 esac
@@ -72,6 +84,7 @@ exit 0
 `;
 
 const CURL_STUB = String.raw`#!/bin/sh
+if [ "$BK_CURL_FAIL" = 1 ]; then exit 22; fi
 exit 0
 `;
 
@@ -83,13 +96,25 @@ interface RunResult {
 
 interface BackupOpts {
   baseDomain?: string;
+  curlFail?: boolean;
+  tarSignal?: "INT" | "TERM";
   tenancy?: string;
   tarFail?: boolean;
   upFail?: boolean;
+  upWedge?: boolean;
 }
 
 const runBackup = (opts: BackupOpts = {}): RunResult & { log: string } => {
-  const { baseDomain = "noite.localhost", tenancy, tarFail, upFail } = opts;
+  const {
+    baseDomain = "noite.localhost",
+    curlFail,
+    tarSignal,
+    tenancy,
+    tarFail,
+    upFail,
+    upWedge,
+  } = opts;
+
   mkdirSync(fakebin, { recursive: true });
   Bun.write(path.join(fakebin, "docker"), DOCKER_STUB);
   Bun.write(path.join(fakebin, "curl"), CURL_STUB);
@@ -126,7 +151,10 @@ const runBackup = (opts: BackupOpts = {}): RunResult & { log: string } => {
     BK_STATE: stateFile,
     NOITE_TENANCY: tenancy,
     BK_TAR_FAIL: tarFail === true ? "1" : undefined,
+    BK_TAR_SIGNAL: tarSignal,
     BK_UP_FAIL: upFail === true ? "1" : undefined,
+    BK_UP_WEDGE: upWedge === true ? "1" : undefined,
+    BK_CURL_FAIL: curlFail === true ? "1" : undefined,
   };
 
   const proc = Bun.spawnSync(["sh", BACKUP, dest], {
@@ -194,5 +222,31 @@ describe("make backup restart", () => {
     const r = runBackup({ baseDomain: "example.com", tenancy: "single" });
     expect(r.status).toBe(0);
     expect(composeLines(r.log, "up")[0]).not.toContain("multi");
+  });
+
+  test("a signal mid-backup still restarts the stack, with the signal's status", () => {
+    for (const [signal, code] of [
+      ["INT", 130],
+      ["TERM", 143],
+    ] as const) {
+      const r = runBackup({ tarSignal: signal });
+      expect(r.status).toBe(code);
+      expect(r.stdout).not.toContain("backup complete:");
+      expect(composeLines(r.log, "up")).toHaveLength(1);
+    }
+  });
+
+  test("a failure before the stop never touches the stack", () => {
+    const r = runBackup({ curlFail: true });
+    expect(r.status).not.toBe(0);
+    expect(composeLines(r.log, "stop")).toHaveLength(0);
+    expect(composeLines(r.log, "up")).toHaveLength(0);
+  });
+
+  test("an up that fails with every container running still succeeds, with a note", () => {
+    const r = runBackup({ upWedge: true });
+    expect(r.status).toBe(0);
+    expect(r.stdout).toContain("every container is running");
+    expect(r.stdout).toContain("backup complete:");
   });
 });

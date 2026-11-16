@@ -95,8 +95,11 @@ project_running() {
   ! printf '%s\n' "$states" | grep -qiE '^(exited|dead|paused|removing|restarting|created)$'
 }
 
-# Set to 1 once `ce stop` has run: the trap below restarts only a stack this
-# script actually stopped, never a project it never touched.
+# Set to 1 just before `ce stop`: the trap below restarts only a stack this
+# script may have stopped, never a project it never touched. Setting it before
+# the stop (not after) leaves no window where a signal lands on a stopped
+# stack with the flag still 0; a restart of a stack that never stopped is a
+# no-op `up -d`.
 STOPPED=0
 # Set to 1 when the restart was attempted but the stack is still down: the
 # trap turns the run red instead of printing a success line over a dead edge.
@@ -126,6 +129,12 @@ restart_stack() {
 # runs first, then a failed backup (or a failed restart) exits nonzero, and
 # only a clean backup that restarted prints the success lines.
 trap 'status=$?; restart_stack; if [ "$UP_FAILED" = 1 ]; then exit 1; fi; [ "$status" = 0 ] || exit "$status"; echo; echo "backup complete: ${DEST}"; echo "  restore it with: make restore FROM=${DEST}"; echo "  (verify the copy first: run make doctor)"' EXIT
+# Neither dash nor bash runs the EXIT trap on an uncaught fatal signal, so
+# Ctrl-C or a CI/orchestrator timeout after `ce stop` would leave the stack
+# down silently. Route both through `exit`, which runs the trap above with
+# the conventional signal status.
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 # The published HTTP port of this project's edge (the `noite` service publishes
 # container port 80), so a backup of `PROJECT=x` snapshots x's runner and not
@@ -173,10 +182,10 @@ echo
 
 echo "==> stop the stack for a consistent copy (downtime = the tar)"
 echo "    project ${PROJECT}, api ${API_URL}"
-ce stop
 # From here on the EXIT trap owns the restart: it runs even when a later
-# step aborts the script under `set -e`.
+# step aborts the script under `set -e` or a signal ends it.
 STOPPED=1
+ce stop
 
 echo "==> tar volumes into ${DEST}"
 for vol in $VOLUMES; do
