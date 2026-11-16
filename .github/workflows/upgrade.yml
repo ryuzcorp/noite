@@ -1,0 +1,92 @@
+# The upgrade lane: the previous release's published image seeds live data
+# (app + env var, deploy, custom domain, collaborator, worker-written D1/R2
+# state), then the tree image restarts on the SAME volumes and bucket and
+# proves the seed reads back and the app still serves
+# (`sh docker/e2e-upgrade.sh`, `make e2e-upgrade` locally).
+#
+# From `beta.1` on, every release upgrades a database written by any earlier
+# beta in place: this lane is the release gate that proves it (a tag cannot
+# ship an image that refuses the previous release's data), runs nightly on
+# main, and runs on pull requests that touch schema or migration paths.
+# No retries anywhere: a failure is a finding.
+name: upgrade
+
+on:
+  workflow_call:
+    inputs:
+      image_artifact:
+        default: ""
+        description: Run-local artifact holding the tree image (docker save piped to zstd). When set, the lane loads it instead of building.
+        required: false
+        type: string
+  workflow_dispatch:
+  # Nightly on main: the tag gate only runs on `v*`, so this is what catches
+  # a slow main-branch schema regression outside a release.
+  schedule:
+    - cron: "0 6 * * *"
+
+permissions:
+  contents: read
+
+jobs:
+  upgrade:
+    name: upgrade lane (previous release -> tree)
+    runs-on: ubuntu-latest
+    # The lane boots two stacks and a full sample deploy in sequence; ~3x the
+    # e2e single-lane p95, rounded up.
+    timeout-minutes: 40
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      # Tags, not just HEAD: the lane resolves the previous `v*` tag from git.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        timeout-minutes: 3
+      - run: bun install
+        timeout-minutes: 5
+      - name: install UI deps
+        working-directory: apps/noite
+        timeout-minutes: 5
+        run: bun install --frozen-lockfile
+      - name: cache playwright browsers
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
+        with:
+          key: playwright-${{ runner.os }}-${{ hashFiles('apps/noite/bun.lock') }}
+          path: ~/.cache/ms-playwright
+      - name: playwright chromium
+        working-directory: apps/noite
+        timeout-minutes: 10
+        run: bunx playwright install chromium
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
+      - name: build tree image
+        if: inputs.image_artifact == ''
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
+        with:
+          cache-from: type=gha,scope=noite-linux/amd64
+          cache-to: type=gha,mode=max,scope=noite-linux/amd64
+          context: .
+          file: docker/Dockerfile
+          load: true
+          tags: noite:upgrade
+          target: noite
+      - name: download tree image
+        if: inputs.image_artifact != ''
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: ${{ inputs.image_artifact }}
+          path: /tmp/noite-image
+      - name: load tree image
+        if: inputs.image_artifact != ''
+        run: zstd -d -c /tmp/noite-image/noite-ci.tar.zst | docker load
+      - name: upgrade lane
+        run: E2E_IMAGE=${{ inputs.image_artifact == '' && 'noite:upgrade' || 'noite:ci' }} sh docker/e2e-upgrade.sh
+      - name: upload upgrade report
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: playwright-upgrade-report
+          path: apps/noite/upgrade-report/
+          retention-days: 7

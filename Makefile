@@ -111,6 +111,7 @@ help:
 	@echo "      E2E_SUITE=fast (tagged PR gate) or release (default, every spec)"
 	@echo "      E2E_SLOT=<n> (parallel lane, default 0 = today's lane) or auto"
 	@echo "      (first free slot); E2E_SLOT=<n> make e2e-down stops that slot"
+	@echo "  make e2e-upgrade  previous-release seed, tree restart, verify (PREV_TAG/E2E_IMAGE/E2E_SLOT)"
 	@echo "  make backup    consistent backup of both volumes (brief downtime)"
 	@echo "  make restore   restore a backup directory (FROM=<dir>; replaces volumes)"
 	@echo "  make down      stop (keeps volumes)"
@@ -141,6 +142,12 @@ e2e-isolation:
 
 e2e-down:
 	sh docker/e2e-local.sh down
+
+e2e-upgrade:
+	sh docker/e2e-upgrade.sh
+
+e2e-upgrade-down:
+	sh docker/e2e-upgrade.sh down
 
 dev:
 	@echo "project $(PROJECT)"
@@ -188,5 +195,7 @@ nuke:
 	-$(COMPOSE) down -v --remove-orphans
 	-$(COMPOSE_CMD) -p noite-e2e -f docker/compose.yaml -f docker/compose.e2e.yaml down -v --remove-orphans
 	-@for s in 1 2 3 4 5 6 7 8; do $(COMPOSE_CMD) -p noite-e2e-$$s -f docker/compose.yaml -f docker/compose.e2e.yaml down -v --remove-orphans; done
-	@CLI=$(ENGINE) sh -c '. ./docker/lib.sh && remove_project "$$@"' nuke $(PROJECT) noite-e2e noite-e2e-1 noite-e2e-2 noite-e2e-3 noite-e2e-4 noite-e2e-5 noite-e2e-6 noite-e2e-7 noite-e2e-8
+	-$(COMPOSE_CMD) -p noite-upg -f docker/compose.yaml -f docker/compose.e2e.yaml down -v --remove-orphans
+	-@for s in 1 2 3 4 5 6 7 8; do $(COMPOSE_CMD) -p noite-upg-$$s -f docker/compose.yaml -f docker/compose.e2e.yaml down -v --remove-orphans; done
+	@CLI=$(ENGINE) sh -c '. ./docker/lib.sh && remove_project "$$@"' nuke $(PROJECT) noite-e2e noite-e2e-1 noite-e2e-2 noite-e2e-3 noite-e2e-4 noite-e2e-5 noite-e2e-6 noite-e2e-7 noite-e2e-8 noite-upg noite-upg-1 noite-upg-2 noite-upg-3 noite-upg-4 noite-upg-5 noite-upg-6 noite-upg-7 noite-upg-8
 	rm -rf apps/noite/.wrangler apps/noite/.void

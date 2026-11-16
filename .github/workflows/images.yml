@@ -16,8 +16,9 @@
 #                    moves: try it with `run.sh | bash -s install --pre`.
 #
 # A release tag is a gate, not a trigger: the e2e lanes (`make e2e`,
-# `make e2e-isolation`) and the CHANGELOG check must pass before anything is
-# pushed to GHCR.
+# `make e2e-isolation`), the upgrade lane (`make e2e-upgrade`: the previous
+# release seeds data, the tree serves it back) and the CHANGELOG check must
+# pass before anything is pushed to GHCR.
 name: images
 
 on:
@@ -81,11 +82,26 @@ jobs:
     with:
       suite: release
 
+  # Release tags only: the previous release seeds data, the tree image must
+  # serve it back in place. A tag never ships an image that refuses the
+  # previous release's data; the lane pulls the previous image from GHCR and
+  # builds the tree image itself.
+  upgrade:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: check
+    # Permission envelope for the called workflow (see ci.yml): no artifact
+    # input, so nothing to download, but the envelope must cover the
+    # callee's jobs.
+    permissions:
+      contents: read
+      actions: read
+    uses: ./.github/workflows/upgrade.yml
+
   image:
-    needs: [check, e2e]
-    # `e2e` is skipped off a tag, which would skip this job too: run when it
-    # was skipped or passed, never when it failed.
-    if: ${{ !cancelled() && needs.check.result == 'success' && contains(fromJSON('["success","skipped"]'), needs.e2e.result) }}
+    needs: [check, e2e, upgrade]
+    # `e2e`/`upgrade` are skipped off a tag, which would skip this job too:
+    # run when both were skipped or passed, never when either failed.
+    if: ${{ !cancelled() && needs.check.result == 'success' && contains(fromJSON('["success","skipped"]'), needs.e2e.result) && contains(fromJSON('["success","skipped"]'), needs.upgrade.result) }}
     strategy:
       fail-fast: false
       matrix:
