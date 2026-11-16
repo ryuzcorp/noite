@@ -126,6 +126,72 @@ export type ResourceFetcher<T> = (
   ctx: { signal: AbortSignal }
 ) => Promise<T>;
 
+/** Bounded retry for one fetch series: total tries (including the first)
+ * and the backoff between them. Tests inject `sleep` (a hand-fired clock);
+ * the UI keeps the default wall-clock sleep. */
+export interface RetryPolicy {
+  /** Total attempts including the first; 1 (or less) means no retry. */
+  attempts: number;
+  /** First delay; doubles per retry. */
+  baseMs: number;
+  /** Delay cap (default: unbounded). */
+  capMs?: number;
+  /** Wait primitive (default: wall-clock `setTimeout`). */
+  sleep?: (ms: number) => Promise<void>;
+}
+
+/** Run `fetch` under a bounded backoff: a transient failure (dropped
+ * connection, 504, read-time hiccup) retries instead of surfacing at once;
+ * a lasting failure rejects with its last error after `attempts` tries.
+ * One series per call — concurrent callers share nothing (dedup lives in
+ * `tracked`/the feed in-flight slots, not here). */
+export const withRetry = <T>(
+  fetch: () => Promise<T>,
+  policy: RetryPolicy
+): (() => Promise<T>) => {
+  const attempts = Math.max(1, Math.floor(policy.attempts));
+
+  const sleep =
+    policy.sleep ??
+    ((ms: number): Promise<undefined> => {
+      const { promise, resolve } = Promise.withResolvers<undefined>();
+      setTimeout(() => {
+        resolve(undefined);
+      }, ms);
+
+      return promise;
+    });
+
+  // Exponential backoff with a cap: names the retry pricing in one place.
+  const delayMs = (retry: number): number =>
+    Math.min(
+      policy.baseMs * 2 ** (retry - 1),
+      policy.capMs ?? Number.POSITIVE_INFINITY
+    );
+
+  return async (): Promise<T> => {
+    try {
+      return await fetch();
+    } catch (error_) {
+      let error: unknown = error_;
+
+      for (let retry = 1; retry < attempts; retry += 1) {
+        // oxlint-disable-next-line eslint/no-await-in-loop -- one sequential backoff per retry by design
+        await sleep(delayMs(retry));
+
+        try {
+          // oxlint-disable-next-line eslint/no-await-in-loop -- one sequential attempt per retry by design
+          return await fetch();
+        } catch (error__) {
+          error = error__;
+        }
+      }
+
+      throw error;
+    }
+  };
+};
+
 /** How a settled lookup lands: a fresh value, or the rejection to record. */
 type SettleOutcome =
   | { ok: true; value: unknown }
@@ -274,7 +340,8 @@ const settleGet = async (key: string, generation: number): Promise<void> => {
 /** First paint for a newly mounted reader: serve the cache (concurrent mounts
  * of one key share the lookup) and settle every mounted reader when it lands.
  * A failed load surfaces on every reader's `error` and evicts the entry, so
- * a remount refetches; nothing retries on a timer. */
+ * a remount refetches; nothing retries on a timer except a fetcher wrapped
+ * in `withRetry` (bounded, opt-in per key). */
 const kick = (key: string): void => {
   const generation = (generations.get(key) ?? 0) + 1;
   generations.set(key, generation);
@@ -329,7 +396,7 @@ export const invalidate = (key: string): void => {
  * false` keeps the snapshot in memory only, for bulky entries (file
  * contents, build logs) that would crowd the small sessionStorage quota. A
  * failed load lands on `Failed` and evicts the entry, so a remount refetches;
- * nothing retries on a timer. */
+ * nothing retries on a timer except a fetcher wrapped in `withRetry`. */
 export const tracked = <T>(
   key: string,
   fetcher: ResourceFetcher<T>,

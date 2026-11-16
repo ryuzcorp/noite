@@ -198,10 +198,14 @@ export const feedProblem = <T>(state: FeedState<T>): string | null => {
   }
 };
 
-/** What moves a {@link FeedState}. */
+/** What moves a {@link FeedState}. `snapshot` is the first paint (it fills
+ * only a panel with no value yet); `refresh` is a re-read after the topic
+ * dropped and reopened (it replaces any non-live value — the stream stays
+ * the live source, so a `Live` panel and a `Refused` topic keep theirs). */
 export type FeedEvent<T> =
   | { readonly kind: "conn"; readonly conn: Conn }
   | { readonly kind: "frame"; readonly value: T }
+  | { readonly kind: "refresh"; readonly value: T }
   | { readonly kind: "snapshot"; readonly value: T };
 
 /** A snapshot paint: it fills a panel that has no value yet, keeping
@@ -216,6 +220,40 @@ const feedFromSnapshot = <T>(state: FeedState<T>, value: T): FeedState<T> => {
   switch (state._tag) {
     case "Refused": {
       return Feed.Refused({ value });
+    }
+
+    case "Offline": {
+      return Feed.Offline({ value });
+    }
+
+    case "Paused": {
+      return Feed.Paused({ value });
+    }
+
+    case "Reconnecting": {
+      return Feed.Reconnecting({ value });
+    }
+
+    case "Cold":
+    case "Cached": {
+      return Feed.Cached({ value });
+    }
+
+    default: {
+      return state;
+    }
+  }
+};
+
+/** A refresh paint: the re-read after the topic dropped and reopened. A
+ * `Live` panel keeps its frame and a `Refused` topic keeps its verdict;
+ * every other panel adopts the fresh value (a stale snapshot must not
+ * outlive the drop that made it stale). */
+const feedFromRefresh = <T>(state: FeedState<T>, value: T): FeedState<T> => {
+  switch (state._tag) {
+    case "Live":
+    case "Refused": {
+      return state;
     }
 
     case "Offline": {
@@ -290,8 +328,9 @@ const feedFromConn = <T>(state: FeedState<T>, conn: Conn): FeedState<T> => {
 };
 
 /** The one transition function for {@link FeedState}. A frame always wins; a
- * snapshot only fills a cold or cached panel (the stream stays the live
- * source, and `paintInitial` guards the write anyway). */
+ * snapshot only fills a panel with no value yet (the stream stays the live
+ * source, and `paintInitial` guards the write anyway); a refresh replaces
+ * any non-live value after the topic dropped and reopened. */
 export const nextFeedState = <T>(
   state: FeedState<T>,
   event: FeedEvent<T>
@@ -299,6 +338,10 @@ export const nextFeedState = <T>(
   switch (event.kind) {
     case "frame": {
       return Feed.Live({ value: event.value });
+    }
+
+    case "refresh": {
+      return feedFromRefresh<T>(state, event.value);
     }
 
     case "snapshot": {
@@ -838,32 +881,24 @@ export interface FeedSink<T> {
   current: () => FeedState<T>;
 }
 
-/** Fetch the current snapshot for a cold key (no stored snapshot): the
- * panel paints it unless a stream frame landed first. Shared per key, so
- * panels on one key (a tab badge and its list) fetch once. Failures are
- * ignored — the stream stays the live source. Answers when the paint
- * settles, so tests can await it instead of sleeping. Exported for the
- * unit tests. */
-export const paintInitial = async <T>(
+/** One shared snapshot read per key, so panels on one key (a tab badge and
+ * its list, or two reopens racing) fetch once. Resolves empty on failure
+ * or timeout — the stream stays the live source. */
+const fetchSnapshotFrame = async <T>(
   key: string,
-  sink: FeedSink<T>,
-  opts: LiveFeedOptions<T> | undefined
-): Promise<void> => {
+  opts: LiveFeedOptions<T> | undefined,
+  startedAt: number
+): Promise<T | undefined> => {
   const initial = opts?.initial;
 
-  if (initial === undefined || readSwr<T>(key) !== undefined) {
-    return;
+  if (initial === undefined || startedAt !== swrEpoch()) {
+    return undefined;
   }
-
-  // Capture the account epoch before fetching: an auth change while the
-  // fetch is in flight makes its result the previous account's, and the feed
-  // keys carry no account id.
-  const startedAt = swrEpoch();
 
   let pending = initialInflight.get(key);
 
   if (pending === undefined) {
-    // oxlint-disable-next-line anti-slop/no-unknown-returns -- the shared slot erases T across panels; paintInitial restores it with a SAFETY cast below.
+    // oxlint-disable-next-line anti-slop/no-unknown-returns -- the shared slot erases T across panels; the painters restore it with a SAFETY cast each.
     const run = (async (): Promise<unknown> => {
       const timeoutMs = opts?.timeoutMs ?? INITIAL_TIMEOUT_MS;
       const { promise, reject } = Promise.withResolvers<never>();
@@ -892,15 +927,71 @@ export const paintInitial = async <T>(
 
   const frame = await pending;
 
-  if (
-    frame !== undefined &&
-    startedAt === swrEpoch() &&
-    feedValue(sink.current()) === undefined
-  ) {
-    writeSwr(key, frame, opts);
-    // SAFETY: one key carries one T (see `writeSwr`); an empty fetch is a failure, never a frame.
-    sink.apply({ kind: "snapshot", value: frame as T });
+  // SAFETY: one key carries one T (see `writeSwr`); an empty fetch is a failure, never a frame.
+  return startedAt === swrEpoch() ? (frame as T | undefined) : undefined;
+};
+
+/** Fetch the current snapshot for a cold key (no stored snapshot): the
+ * panel paints it unless a stream frame landed first. Shared per key, so
+ * panels on one key (a tab badge and its list) fetch once. Failures are
+ * ignored — the stream stays the live source. Answers when the paint
+ * settles, so tests can await it instead of sleeping. Exported for the
+ * unit tests. */
+export const paintInitial = async <T>(
+  key: string,
+  sink: FeedSink<T>,
+  opts: LiveFeedOptions<T> | undefined
+): Promise<void> => {
+  if (readSwr<T>(key) !== undefined) {
+    return;
   }
+
+  // Capture the account epoch before fetching: an auth change while the
+  // fetch is in flight makes its result the previous account's, and the feed
+  // keys carry no account id.
+  const frame = await fetchSnapshotFrame(key, opts, swrEpoch());
+
+  if (frame !== undefined && feedValue(sink.current()) === undefined) {
+    writeSwr(key, frame, opts);
+    sink.apply({ kind: "snapshot", value: frame });
+  }
+};
+
+/** Re-read the snapshot after the topic dropped and reopened: the panel
+ * adopts it unless a stream frame landed first (or the account changed
+ * mid-flight). Unlike `paintInitial` this also runs on a warm key — a stale
+ * snapshot must not outlive the drop that made it stale. Failures are
+ * ignored, like the initial paint. Exported for the unit tests. */
+export const repaintSnapshot = async <T>(
+  key: string,
+  sink: FeedSink<T>,
+  opts: LiveFeedOptions<T> | undefined
+): Promise<void> => {
+  const frame = await fetchSnapshotFrame(key, opts, swrEpoch());
+
+  if (frame !== undefined) {
+    writeSwr(key, frame, opts);
+    sink.apply({ kind: "refresh", value: frame });
+  }
+};
+
+/** Whether the topic dropped and its link is trying again: the previous
+ * conn said the topic was lost (`Retrying`) or the transport was down
+ * (`Closed`), and the next one is a fresh attempt (`Connecting`/`Idle`),
+ * not a frame or a verdict. A planned link replacement (live topic, new
+ * connection) never matches, so tab switches refetch nothing. */
+export const reopenedAfterDrop = (
+  prev: Conn | undefined,
+  next: Conn
+): boolean => {
+  if (prev === undefined) {
+    return false;
+  }
+
+  const lost = prev._tag === "Retrying" || prev._tag === "Closed";
+  const retrying = next._tag === "Connecting" || next._tag === "Idle";
+
+  return lost && retrying;
 };
 
 let pageHub: StreamHub | undefined;
@@ -958,8 +1049,21 @@ export const liveFeed = <T>(
     void paintInitial(key, { apply, current: state }, opts);
     pageHub ??= createStreamHub();
 
+    // A drop followed by a fresh attempt re-reads the snapshot: the panel
+    // may hold rows the drop made stale (an empty Deployments list while
+    // its deploy finished), and nothing else refreshes it until the next
+    // frame lands. `repaintSnapshot` only adopts the re-read on a non-live
+    // panel, so a frame that lands first still wins.
+    let lastConn: Conn | undefined;
+
     return pageHub.subscribe(url, {
       onConn: (conn) => {
+        if (reopenedAfterDrop(lastConn, conn)) {
+          void repaintSnapshot(key, { apply, current: state }, opts);
+        }
+
+        lastConn = conn;
+
         apply({ conn, kind: "conn" });
       },
       onMessage: (data) => {

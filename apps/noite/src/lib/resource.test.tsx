@@ -13,8 +13,11 @@ import {
   resourceError,
   resourceValue,
   tracked,
+  withRetry,
 } from "./resource";
 import type { Resource, ResourceState } from "./resource";
+import { errorDetail } from "./resources";
+import type { RunnerErrorDetail } from "./runner";
 import { clearSwrStore, readSwr, writeSwr } from "./swr-store";
 
 class FakeNode {
@@ -171,9 +174,14 @@ let signalSettled: (() => void) | undefined;
 let probeKey = "";
 let probeFetch: () => Promise<string[]> = () => Promise.resolve([]);
 
+let probeWrap:
+  | ((fetch: () => Promise<string[]>) => () => Promise<string[]>)
+  | undefined;
+
 /** A mounted `tracked` reader reporting its paint and failure as signals. */
 const ResourceProbe = () => {
-  const res = tracked<string[]>(probeKey, probeFetch);
+  const run = probeWrap === undefined ? probeFetch : probeWrap(probeFetch);
+  const res = tracked<string[]>(probeKey, run);
   captured = res;
   watch(res.value, (value) => {
     if (value !== undefined) {
@@ -502,6 +510,286 @@ describe("tracked mount failures", () => {
         ui.unmount();
       }
     } finally {
+      resetSignals();
+      restoreDom();
+    }
+  });
+});
+
+/** Hand-fired sleep: delays are recorded, resolvers fire by hand, so no
+ * test waits out a real backoff. Module scope: the factory captures
+ * nothing, so every test shares one definition. */
+const manualSleep = () => {
+  const delays: number[] = [];
+  const queue: (() => void)[] = [];
+
+  const sleep = (ms: number): Promise<void> => {
+    delays.push(ms);
+
+    const gate = Promise.withResolvers<undefined>();
+    queue.push(() => {
+      gate.resolve(undefined);
+    });
+
+    return gate.promise;
+  };
+
+  const fire = (): void => {
+    const next = queue.shift();
+
+    if (next === undefined) {
+      throw new Error("no backoff scheduled");
+    }
+
+    next();
+  };
+
+  return { delays, fire, sleep };
+};
+
+describe("withRetry", () => {
+  test("a first-try success fetches once and never sleeps", async () => {
+    const { delays, sleep } = manualSleep();
+    let calls = 0;
+
+    const value = await withRetry(
+      () => {
+        calls += 1;
+
+        return Promise.resolve("ok");
+      },
+      { attempts: 3, baseMs: 1000, sleep }
+    )();
+
+    expect(value).toBe("ok");
+    expect(calls).toBe(1);
+    expect(delays).toEqual([]);
+  });
+
+  test("transient failures retry with the exact backoff, then resolve", async () => {
+    const { delays, fire, sleep } = manualSleep();
+    let calls = 0;
+
+    const done = withRetry(
+      () => {
+        calls += 1;
+
+        return calls < 3
+          ? Promise.reject(new Error(`boom-${calls}`))
+          : Promise.resolve("ok");
+      },
+      { attempts: 3, baseMs: 1000, sleep }
+    )();
+
+    await flush();
+    expect(calls).toBe(1);
+    expect(delays).toEqual([1000]);
+    fire();
+    await flush();
+    expect(calls).toBe(2);
+    expect(delays).toEqual([1000, 2000]);
+    fire();
+    await expect(done).resolves.toBe("ok");
+    expect(calls).toBe(3);
+  });
+
+  test("a lasting failure rejects with the last error after its attempts", async () => {
+    const { delays, fire, sleep } = manualSleep();
+    let calls = 0;
+
+    const done = withRetry(
+      () => {
+        calls += 1;
+
+        return Promise.reject(new Error(`boom-${calls}`));
+      },
+      { attempts: 2, baseMs: 1000, sleep }
+    )();
+
+    await flush();
+    expect(calls).toBe(1);
+    expect(delays).toEqual([1000]);
+    fire();
+    await expect(done).rejects.toThrow("boom-2");
+    expect(calls).toBe(2);
+  });
+
+  test("the backoff caps and a single attempt never sleeps", async () => {
+    const capped = manualSleep();
+    let cappedCalls = 0;
+
+    const cappedDone = withRetry(
+      () => {
+        cappedCalls += 1;
+
+        return cappedCalls < 4
+          ? Promise.reject(new Error("down"))
+          : Promise.resolve("ok");
+      },
+      { attempts: 4, baseMs: 1000, capMs: 1500, sleep: capped.sleep }
+    )();
+
+    await flush();
+    capped.fire();
+    await flush();
+    capped.fire();
+    await flush();
+    capped.fire();
+    await expect(cappedDone).resolves.toBe("ok");
+    expect(capped.delays).toEqual([1000, 1500, 1500]);
+
+    const single = manualSleep();
+    let singleCalls = 0;
+
+    const singleDone = withRetry(
+      () => {
+        singleCalls += 1;
+
+        return Promise.resolve("once");
+      },
+      { attempts: 0, baseMs: 1000, sleep: single.sleep }
+    )();
+
+    await expect(singleDone).resolves.toBe("once");
+    expect(singleCalls).toBe(1);
+    expect(single.delays).toEqual([]);
+  });
+
+  test("a detail resource whose first fetch fails recovers on its own", async () => {
+    const restoreDom = installDomFixture();
+    const { delays, fire, sleep } = manualSleep();
+
+    try {
+      let calls = 0;
+      probeKey = nextKey();
+      probeFetch = () => {
+        calls += 1;
+
+        return calls === 1
+          ? Promise.reject(new Error("runner away"))
+          : Promise.resolve(["detail"]);
+      };
+
+      probeWrap = (fetch) =>
+        withRetry(fetch, { attempts: 3, baseMs: 1000, sleep });
+
+      const painted = nextPainted();
+      const ui = render(ResourceProbe);
+
+      try {
+        await ui.settled();
+        await flush();
+        // The first attempt failed and the retry is backing off: still
+        // loading, not failed.
+        expect(calls).toBe(1);
+        expect(delays).toEqual([1000]);
+        expect(capturedState()._tag).toBe("Loading");
+        fire();
+        expect(await painted).toEqual(["detail"]);
+        await ui.settled();
+        expect(calls).toBe(2);
+        expect(resourceError(capturedState())).toBeUndefined();
+        expect(resourceValue(capturedState())).toEqual(["detail"]);
+      } finally {
+        ui.unmount();
+      }
+    } finally {
+      probeWrap = undefined;
+      resetSignals();
+      restoreDom();
+    }
+  });
+});
+
+describe("errorDetail recovery", () => {
+  test("the real detail fetcher retries a failed first read", async () => {
+    const restoreDom = installDomFixture();
+    const realFetch = globalThis.fetch;
+
+    try {
+      let calls = 0;
+      const seen: string[] = [];
+
+      const body: RunnerErrorDetail = {
+        events: [],
+        issue: {
+          count: 1,
+          culprit: "fetch",
+          fingerprint: "fp-flake",
+          firstSeenUs: 1_794_436_039_000_000,
+          firstSha: null,
+          handler: "fetch",
+          hourly: [1],
+          kind: "Error",
+          lastSeenUs: 1_794_436_039_000_000,
+          lastSha: null,
+          message: "phase1-boom-e2e",
+          regressed: false,
+          source: "uncaught",
+          status: "open",
+          statusAtUs: null,
+        },
+      };
+
+      globalThis.fetch = ((url: string | URL | Request) => {
+        calls += 1;
+        seen.push(String(url));
+
+        if (calls === 1) {
+          return Promise.resolve(
+            Response.json({ error: "away" }, { status: 500 })
+          );
+        }
+
+        return Promise.resolve(Response.json(body, { status: 200 }));
+      }) as typeof fetch;
+
+      let capturedDetail: Resource<RunnerErrorDetail> | undefined;
+
+      const ErrorDetailProbe = () => {
+        const res = errorDetail("app-e2e", "fp-flake");
+        capturedDetail = res;
+
+        const settled = atom(
+          Atom.readable((get) => get(res.state.atom)._tag !== "Loading")
+        );
+
+        watch(settled, (done) => {
+          if (done) {
+            signalSettled?.();
+          }
+        });
+
+        return <span />;
+      };
+
+      const done = nextSettled();
+      const ui = render(ErrorDetailProbe);
+
+      try {
+        await ui.settled();
+        // The first read fails; the bounded backoff below is the product's
+        // own (1 s), awaited here as the resource settling — a real signal,
+        // not a sleep.
+        await done;
+        await ui.settled();
+        expect(calls).toBe(2);
+        expect(seen).toEqual([
+          "/api/errors/errorDetail",
+          "/api/errors/errorDetail",
+        ]);
+
+        if (capturedDetail === undefined) {
+          throw new Error("the probe captured no detail resource");
+        }
+
+        expect(resourceValue(capturedDetail.state())).toEqual(body);
+        expect(resourceError(capturedDetail.state())).toBeUndefined();
+      } finally {
+        ui.unmount();
+      }
+    } finally {
+      globalThis.fetch = realFetch;
       resetSignals();
       restoreDom();
     }
