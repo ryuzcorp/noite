@@ -3,10 +3,9 @@ import type {
   AdminAppRow,
   AdminUserRow,
   AppDetail,
+  EmailInviteView,
   EnvironmentVarView,
   EnvVarView,
-  InviteCode,
-  InviteLifecycleWire,
 } from "./api-types";
 import { authClient } from "./auth-client";
 import type { AuthorityWire } from "./authority";
@@ -123,7 +122,7 @@ export const invalidateR2 = (appId: string, bucket: string): void => {
 
 export const keys = {
   adminApps: "admin:apps",
-  adminInvites: "admin:invites",
+  adminEmailInvites: "admin:email-invites",
   adminOverview: "admin:overview",
   adminUsers: (query: string, page: number) => `admin:users:${page}:${query}`,
   apiKeys: "me:apikeys",
@@ -149,7 +148,6 @@ export const keys = {
     `app:${appId}:error:${fingerprint}${environmentId === "" ? "" : `:env:${environmentId}`}`,
   githubSync: (id: string) => `app:${id}:github-sync`,
   ingestKey: (id: string) => `app:${id}:ingest-key`,
-  inviteCodes: "me:invites",
   limits: (id: string) => `app:${id}:limits`,
   myInvitations: "me:collaborator-invitations",
   passkeys: "me:passkeys",
@@ -162,10 +160,12 @@ export const keys = {
     prefix: string,
     cursor: string | null
   ) => `app:${appId}:r2:${bucket}:${prefix}:${cursor ?? ""}`,
+  registrationStatus: "me:registration-status",
   session: "session",
   signupPolicy: "signup:policy",
   telemetry: "admin:telemetry",
   update: "admin:update",
+  waitlist: "admin:waitlist",
 } as const;
 
 export const appDetail = (id: string) =>
@@ -299,6 +299,8 @@ export interface SessionView {
     name: string;
     /** Server-set first-run marker; null until `completeOnboarding`. */
     onboardedAt: string | null;
+    /** The waitlist state: `pending` paints the waiting page, never the app. */
+    status: "active" | "pending";
   };
 }
 
@@ -319,6 +321,10 @@ export const session = () =>
     // serialized over JSON as an ISO string or null; a SQLite-backed value
     // may also arrive as an epoch number, so stringify whatever is set.
     const { onboardedAt } = data.user as { onboardedAt?: unknown };
+    // SAFETY: status is a better-auth additional field (`type: "string"`,
+    // `input: false`); only the exact waitlist word counts as pending, so a
+    // stale or foreign value can never paint the waiting page by accident.
+    const { status } = data.user as { status?: unknown };
 
     return {
       session: {
@@ -332,6 +338,7 @@ export const session = () =>
           onboardedAt === null || onboardedAt === undefined
             ? null
             : String(onboardedAt),
+        status: status === "pending" ? "pending" : "active",
       },
     };
   });
@@ -365,9 +372,12 @@ export const updateStatus = () =>
     api<RunnerUpdateStatus>("/api/update/getUpdateStatus", {})
   );
 
-export const inviteCodes = () =>
-  tracked(keys.inviteCodes, () =>
-    api<InviteCode[]>("/api/account/myInviteCodes", {})
+/** The signed-in account's own approval state: the one JSON action a
+ * waiting account may call, polled by the waiting page until an admin
+ * approves it. Refuses (never null) when signed out. */
+export const registrationStatus = () =>
+  tracked(keys.registrationStatus, () =>
+    api<{ status: "active" | "pending" }>("/api/account/registrationStatus", {})
   );
 
 export const apiKeys = () =>
@@ -413,12 +423,12 @@ export const passkeys = () =>
 export interface SignupPolicy {
   readonly adminExists: boolean;
   readonly firstRun: boolean;
-  readonly invitesPerUser: number;
-  readonly requiresInvite: boolean;
   /** Which proof the first registration must present; `off` once an admin
    * exists or on a `localhost` base. `email` needs the reserved address
    * *and* the setup code. Never the code or address itself. */
   readonly setupMode: "off" | "email" | "code";
+  /** Whether uninvited registrations queue as `pending` (default OFF). */
+  readonly waitlistEnabled: boolean;
 }
 
 export const signupPolicy = () =>
@@ -437,9 +447,8 @@ export const signupPolicy = () =>
     return {
       adminExists: true,
       firstRun: false,
-      invitesPerUser: 0,
-      requiresInvite: true,
       setupMode: "off",
+      waitlistEnabled: false,
     };
   });
 
@@ -505,20 +514,16 @@ export const listAllApps = () =>
     api<AdminAppRow[]>("/api/admin/listAllApps", {})
   );
 
-/** Every invitation code with both ends of the exchange (admin panel). */
-export interface AdminInviteView {
-  code: string;
-  createdAt: string;
-  createdByEmail: string;
-  id: string;
-  revoked: boolean;
-  /** The derived lifecycle state (lib/server/invites.server). */
-  state: InviteLifecycleWire;
-  usedAt: string;
-  usedByEmail: string;
-}
+/** Every email invitation with the addresses on both ends (admin Users tab).
+ * The token itself is never sent again: it was shown once, at creation. */
+export const adminListEmailInvites = () =>
+  tracked(keys.adminEmailInvites, () =>
+    api<EmailInviteView[]>("/api/admin/adminListEmailInvites", {})
+  );
 
-export const adminListInvites = () =>
-  tracked(keys.adminInvites, () =>
-    api<AdminInviteView[]>("/api/admin/adminListInvites", {})
+/** The waitlist switch (admin Settings tab). Registration reads it through
+ * the signup policy instead, so this is the control surface only. */
+export const waitlist = () =>
+  tracked(keys.waitlist, () =>
+    api<{ enabled: boolean }>("/api/admin/getWaitlist", {})
   );

@@ -7,7 +7,7 @@ import {
   deleteApp,
   mintApiKey,
   pushAppDir,
-  registerInviteeWithFreshCode,
+  registerInviteeWithFreshInvite,
   runnerCall,
 } from "./helpers";
 
@@ -336,16 +336,15 @@ test("an MCP client creates an app, pushes, follows the deploy, reads it back an
 
 test("a wrong key is refused and another account's app is denied", async ({
   browser,
-  page,
   request,
 }) => {
   // The lane's account bootstrapped the instance, so it is the instance admin:
   // an agent key on it resolves a role on every app, exactly as the UI does
   // (docs/reference/mcp). The denial has to come from a plain account's key —
-  // register one with an invite code the admin's Account page hands out. The
-  // read-plus-redeem is locked across workers: codes are single-use, so
-  // parallel redeems would collide.
-  const invitee = await registerInviteeWithFreshCode(browser, page, {
+  // register one with an email invite the admin mints for its address. Each
+  // invite is single-use and bound to its address, so parallel workers never
+  // collide.
+  const invitee = await registerInviteeWithFreshInvite(browser, request, {
     email: `mcp-denied-${Date.now()}@example.com`,
     name: "MCP Denied",
   });

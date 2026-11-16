@@ -33,6 +33,10 @@ export const userTable = sqliteTable(
     name: text("name").notNull(),
     onboardedAt: text("onboardedAt"),
     role: text("role").notNull().default("user"),
+    /** Registration state: `active` holds full access, `pending` holds none
+     * until an instance admin approves the account (the waitlist). Existing
+     * rows read `active` (see the migration default). */
+    status: text("status").notNull().default("active"),
     updatedAt: timestamp("updatedAt"),
   },
   (table) => [unique("uq_user_email").on(table.email)]
@@ -192,25 +196,41 @@ export const collaboratorInviteTable = sqliteTable(
   ]
 );
 
-export const inviteTable = sqliteTable(
-  "invite",
+/** Instance invitations by email: one single-use, expiring token per invited
+ * address. Registration has no mailbox proof, so the address alone never
+ * grants access — the token is the proof, and it is stored hashed (a database
+ * reader can never redeem it), bound to the invited email, and burned
+ * atomically on use. See lib/server/email-invites.server.ts. */
+export const emailInviteTable = sqliteTable(
+  "email_invite",
   {
-    code: text("code").notNull(),
     createdAt: timestamp("createdAt"),
     createdBy: text("createdBy").notNull(),
+    email: text("email").notNull(),
+    expiresAt: text("expiresAt").notNull(),
     id: text("id")
       .primaryKey()
       .$defaultFn(() => crypto.randomUUID()),
-    note: text("note"),
     revoked: integer("revoked", { mode: "boolean" }).notNull().default(false),
+    tokenHash: text("tokenHash").notNull(),
     usedAt: text("usedAt"),
     usedBy: text("usedBy"),
   },
   (table) => [
-    unique("uq_invite_code").on(table.code),
-    index("idx_invite_createdBy").on(table.createdBy),
+    unique("uq_email_invite_tokenHash").on(table.tokenHash),
+    index("idx_email_invite_email").on(table.email),
+    index("idx_email_invite_createdBy").on(table.createdBy),
   ]
 );
+
+/** Instance-wide switches the Noite app owns (the Settings tab writes them,
+ * registration and the UI read them). One row per key; absent means the
+ * default (every switch defaults to its fail-closed value). */
+export const instanceSettingTable = sqliteTable("instance_setting", {
+  key: text("key").primaryKey(),
+  updatedAt: timestamp("updatedAt"),
+  value: text("value").notNull(),
+});
 
 /** The first-admin setup code: one singleton row (`id = 'setup'`), the
  * plaintext code's SHA-256 hash only. The plaintext exists once — at
@@ -231,7 +251,8 @@ export const schema = {
   app_collaborator: appCollaboratorTable,
   bootstrap_setup: bootstrapSetupTable,
   collaborator_invite: collaboratorInviteTable,
-  invite: inviteTable,
+  email_invite: emailInviteTable,
+  instance_setting: instanceSettingTable,
   passkey: passkeyTable,
   session: sessionTable,
   user: userTable,

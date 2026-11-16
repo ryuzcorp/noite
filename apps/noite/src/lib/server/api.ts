@@ -58,6 +58,13 @@ export const actionErrorResponse = (error: unknown): Response => {
     return Response.json({ error: errorMessage(error) }, { status: 401 });
   }
 
+  // SECURITY: a waiting-list account is signed in but holds no access. 403,
+  // never 401: the client must show "waiting for approval", not bounce to
+  // the login page.
+  if (tag === "PendingApprovalError") {
+    return Response.json({ error: errorMessage(error) }, { status: 403 });
+  }
+
   if (tag === "SessionStoreUnavailableError") {
     return Response.json(
       { error: errorMessage(error) },

@@ -1,9 +1,8 @@
 import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { cpSync, existsSync, mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { cpSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import nodePath from "node:path";
-import { pathToFileURL } from "node:url";
 
 import { expect } from "@playwright/test";
 import type {
@@ -378,107 +377,6 @@ export const mintApiKey = async (
   return apiKey;
 };
 
-/** One of the signed-in account's unused invite codes: the Account tab lists
- * the share registration minted for it. When the share is used up (every
- * spec that registers a second account spends one), the admin mints one more
- * on the admin Invites tab instead of waiting on a code that never appears. */
-export const readInviteCode = async (page: Page): Promise<string> => {
-  const invitesCard = page.locator("div.card", {
-    has: page.getByRole("heading", { name: "Invitations" }),
-  });
-
-  // The card paints this tab's last snapshot (sessionStorage) until the fresh
-  // list lands, and that snapshot can name codes a parallel worker has spent
-  // since. So "does this account still have a code" is answered by the
-  // myInviteCodes call itself, never by what the card has painted.
-  const listed = page.waitForResponse(
-    (response) =>
-      response.url().includes("/api/account/myInviteCodes") &&
-      response.request().method() === "POST"
-  );
-
-  await page.goto("/apps/_control?t=account");
-  await expect(invitesCard).toBeVisible();
-
-  const listedResponse = await listed;
-
-  if (!listedResponse.ok()) {
-    throw new Error(`myInviteCodes failed with ${listedResponse.status()}`);
-  }
-
-  // SAFETY: account.server's myInviteCodes answers the account's unused codes;
-  // the first one is handed out.
-  const available = (await listedResponse.json()) as { code: string }[];
-
-  let known = available[0]?.code ?? "";
-
-  if (known === "") {
-    await page.goto("/apps/_control?t=invites");
-    await expect(page.locator("#invite-count")).toBeVisible();
-    await page.locator("#invite-count").fill("1");
-
-    // The mint is a POST the pool reloads after. Navigating to the Account
-    // tab before it answers aborted it on the wire — the trace shows
-    // adminCreateInvites at status -1 and an empty Account list right
-    // after (runs 43133528648 and 43180768531) — so the click needs the
-    // response as its completion signal: `#admin-invite-search` is on screen
-    // before the click, which proved nothing.
-    const minted = page.waitForResponse(
-      (response) =>
-        response.url().includes("/api/admin/adminCreateInvites") &&
-        response.request().method() === "POST"
-    );
-
-    await page.getByRole("button", { exact: true, name: "Generate" }).click();
-
-    const mintedResponse = await minted;
-
-    if (!mintedResponse.ok()) {
-      throw new Error(
-        `adminCreateInvites failed with ${mintedResponse.status()}`
-      );
-    }
-
-    // SAFETY: admin.server's adminCreateInvites answers the minted codes
-    // (`mintInvites` returns them as strings); only the first one is read.
-    const created = (await mintedResponse.json()) as {
-      codes?: string[];
-    };
-
-    const mintedCode = created.codes?.[0] ?? "";
-
-    if (mintedCode === "") {
-      throw new Error("adminCreateInvites answered no code");
-    }
-
-    // Then the row: the panel refetches the pool after the mint, so the new
-    // code being on screen is the proof the write landed and the panel saw
-    // it.
-    await expect(
-      page.locator("code", { hasText: mintedCode }).first()
-    ).toBeVisible();
-
-    known = mintedCode;
-    await page.goto("/apps/_control?t=account");
-  }
-
-  // The card is the contract: it must show the code the server says is
-  // available. It cannot paint that one by stale accident — the snapshot from
-  // the previous load predates either read.
-  const shown = invitesCard.locator("code", { hasText: known }).first();
-
-  await expect(shown).toBeVisible();
-
-  const raw = await shown.textContent();
-  const code = raw?.trim() ?? "";
-
-  if (code === "") {
-    throw new Error("no invite code on the Account tab");
-  }
-
-  return code;
-};
-
 /** Finish the onboarding tour's last step and prove the write landed. The
  * caller walks to the last step first. The Finish click fires the
  * onboarding write, so the reload below must wait for it — navigation
@@ -517,12 +415,54 @@ export const finishOnboarding = async (page: Page): Promise<void> => {
   await expect(page.getByRole("dialog")).toBeHidden();
 };
 
-/** Register a second account with `inviteCode` in a browser context of its
- * own (virtual authenticator, onboarding dismissed, on /apps). The caller
- * owns the context and closes it. */
+/** Create an email invite for `email` through the admin API and return the
+ * one-time link. Each address gets its own single-use invite, so parallel
+ * workers never contend: the old shared code pool is gone, and with it the
+ * cross-worker lock. */
+export const createEmailInviteLink = async (
+  request: APIRequestContext,
+  email: string
+): Promise<string> => {
+  const res = await request.post("/api/admin/adminCreateEmailInvite", {
+    data: { email },
+  });
+
+  if (!res.ok()) {
+    throw new Error(`adminCreateEmailInvite failed with ${res.status()}`);
+  }
+
+  // SAFETY: adminCreateEmailInvite answers the created invite (id, link,
+  // emailed, expiresAt); only the one-time link is read.
+  const created = (await res.json()) as { link?: string };
+  const link = created.link ?? "";
+
+  if (!link) {
+    throw new Error("adminCreateEmailInvite answered no link");
+  }
+
+  return link;
+};
+
+/** The token riding an invite link (`/login?invite=`): the registration
+ * redeems exactly this. */
+export const inviteTokenOf = (link: string): string => {
+  const token = new URL(link).searchParams.get("invite") ?? "";
+
+  if (!token) {
+    throw new Error("the invite link carried no token");
+  }
+
+  return token;
+};
+
+/** Register a second account in a browser context of its own (virtual
+ * authenticator), through an invite link when `token` is set. Without a
+ * token the account queues on the waitlist: it sees the pending page, never
+ * the app or the onboarding tour. The caller owns the context and closes
+ * it. */
 export const registerInviteeAccount = async (
   browser: Browser,
-  inviteCode: string,
+  token: string | null,
   email: string,
   name: string
 ): Promise<{ context: BrowserContext; page: Page }> => {
@@ -535,11 +475,22 @@ export const registerInviteeAccount = async (
 
   const page = await context.newPage();
   await addVirtualAuthenticator(page);
-  await page.goto("/login");
+  await page.goto(token ? `/login?invite=${token}` : "/login");
   await page.getByRole("tab", { name: "Create account" }).click();
   await page.locator("#register-name").fill(name);
   await page.locator("#register-email").fill(email);
-  await page.locator("#register-invite").fill(inviteCode);
+
+  if (token) {
+    // The link pre-attaches the invitation; the field stays for pasting one.
+    await expect(
+      page.getByText("Your invitation from the link is attached")
+    ).toBeVisible();
+    // The token is captured into component state and stripped from the URL
+    // on load (replaceState): it must never linger for history, logs or
+    // copy-paste.
+    await expect.poll(() => page.url()).not.toContain("invite=");
+  }
+
   await page.getByRole("button", { name: "Create passkey" }).click();
   await expect(async () => {
     const res = await page.request.get("/api/auth/get-session");
@@ -547,6 +498,11 @@ export const registerInviteeAccount = async (
     const session = (await res.json()) as { user?: { email?: string } };
     expect(session.user?.email).toBe(email);
   }).toPass({ timeout: 30_000 });
+
+  if (!token) {
+    return { context, page };
+  }
+
   await page.goto("/apps");
   await page.locator("#onboarding-next").click();
   await page.locator("#onboarding-next").click();
@@ -555,73 +511,18 @@ export const registerInviteeAccount = async (
   return { context, page };
 };
 
-/** Run `fn` holding the cross-worker invite lock. Invite codes are
- * single-use, and invite listings are diffed by the admin spec, so every
- * read-mint-redeem section runs under a filesystem lock (mkdir is atomic;
- * workers are separate processes on the one lane machine). The lane script
- * deletes a lock a killed worker left behind before every run. Contention
- * waits on the real condition (the holder removes its directory in
- * `finally`), never on a clock: `expect.poll` re-checks until the
- * directory is gone, and only its deadline can fail the wait. */
-export const withInviteLock = async <T>(fn: () => Promise<T>): Promise<T> => {
-  // Parallel lanes keep their auth state apart (E2E_AUTH_DIR, set by the lane
-  // script); slot 0 keeps today's dir.
-  const authDir = process.env.E2E_AUTH_DIR
-    ? pathToFileURL(`${process.env.E2E_AUTH_DIR}/`)
-    : new URL(".auth/", import.meta.url);
-
-  const lockDir = new URL("invite.lock", authDir);
-  const start = Date.now();
-
-  mkdirSync(authDir, { recursive: true });
-
-  for (;;) {
-    try {
-      mkdirSync(lockDir);
-      break;
-    } catch (error) {
-      // SAFETY: node:fs throws ErrnoException; any code but EEXIST is a real error, not contention.
-      if ((error as NodeJS.ErrnoException).code !== "EEXIST") {
-        throw error;
-      }
-
-      const remaining = 120_000 - (Date.now() - start);
-
-      if (remaining <= 0) {
-        throw new Error("invite lock timed out after 120s", { cause: error });
-      }
-
-      // oxlint-disable-next-line eslint/no-await-in-loop -- sequential lock acquisition: the poll must finish before retrying the atomic mkdir
-      await expect
-        .poll(() => !existsSync(lockDir), {
-          intervals: [200],
-          timeout: remaining,
-        })
-        .toBe(true);
-    }
-  }
-
-  try {
-    return await fn();
-  } finally {
-    rmSync(lockDir, { force: true, recursive: true });
-  }
-};
-
-/** Register a second account on a freshly-read invite code, under the
- * invite lock (see `withInviteLock`). */
-export const registerInviteeWithFreshCode = (
+/** Register a second account on a freshly-minted email invite for its
+ * address. */
+export const registerInviteeWithFreshInvite = async (
   browser: Browser,
-  page: Page,
+  request: APIRequestContext,
   account: { email: string; name: string }
 ): Promise<{ context: BrowserContext; page: Page }> =>
-  withInviteLock(async () =>
-    registerInviteeAccount(
-      browser,
-      await readInviteCode(page),
-      account.email,
-      account.name
-    )
+  registerInviteeAccount(
+    browser,
+    inviteTokenOf(await createEmailInviteLink(request, account.email)),
+    account.email,
+    account.name
   );
 
 /** Create an app through the UI and mint an API key for pushing to it,

@@ -151,23 +151,45 @@ CREATE TABLE "paranorm_idempotency" (
 );
 `;
 
-/** The shipped migrations, in file order (the same SQL the worker applies). */
-const migrations = (): string[] => {
+/** The shipped migrations, in file order (the same SQL the worker applies),
+ * with their file names: the runner applies each migration once
+ * (journal-tracked), never the whole chain twice. */
+const migrations = (): { name: string; sql: string }[] => {
   const dir = path.join(import.meta.dir, "migrations");
 
   return readdirSync(dir)
     .filter((name) => name.endsWith(".sql"))
     .toSorted()
-    .map((name) => readFileSync(path.join(dir, name), "utf-8"));
+    .map((name) => ({
+      name,
+      sql: readFileSync(path.join(dir, name), "utf-8"),
+    }));
 };
 
 const applyShippedMigrations = (raw: Database): void => {
-  for (const sql of migrations()) {
+  // A TEMP table: per-connection, so it never leaks into the `sqlite_master`
+  // shape assertions below, and it survives across `applyShippedMigrations`
+  // calls the way the runner's journal survives across boots.
+  raw.run(
+    `CREATE TEMP TABLE IF NOT EXISTS __test_journal (name TEXT PRIMARY KEY NOT NULL)`
+  );
+
+  for (const { name, sql } of migrations()) {
+    const done =
+      raw.query(`SELECT name FROM __test_journal WHERE name = ?`).get(name) !==
+      null;
+
+    if (done) {
+      continue;
+    }
+
     for (const statement of sql.split("--> statement-breakpoint")) {
       if (statement.trim()) {
         raw.run(statement);
       }
     }
+
+    raw.run(`INSERT INTO __test_journal (name) VALUES (?)`, [name]);
   }
 };
 
@@ -188,7 +210,7 @@ describe("control migrations", () => {
     applyShippedMigrations(raw);
 
     const user = raw
-      .query(`SELECT id, email, role, onboardedAt FROM "user"`)
+      .query(`SELECT id, email, role, onboardedAt, status FROM "user"`)
       .get();
 
     expect(user).toEqual({
@@ -196,10 +218,26 @@ describe("control migrations", () => {
       id: "u-1",
       onboardedAt: "2026-11-08T10:00:00.000Z",
       role: "admin",
+      // The waitlist migration defaults every pre-existing account to
+      // active: nobody already on the instance waits for approval.
+      status: "active",
     });
-    expect(raw.query(`SELECT count(*) AS n FROM invite`).get()).toEqual({
-      n: 1,
-    });
+    // The invite-code pool is gone: outstanding codes stop working, table
+    // and all. Nothing else dropped or rewrote the data.
+    expect(
+      raw
+        .query(
+          `SELECT count(*) AS n FROM sqlite_master WHERE type = 'table' AND name = 'invite'`
+        )
+        .get()
+    ).toEqual({ n: 0 });
+    expect(
+      raw
+        .query(
+          `SELECT count(*) AS n FROM sqlite_master WHERE type = 'table' AND name = 'email_invite'`
+        )
+        .get()
+    ).toEqual({ n: 1 });
     // The old ledger is inert; nothing dropped or rewrote the data.
     expect(
       raw.query(`SELECT count(*) AS n FROM paranorm_migrations`).get()
@@ -226,7 +264,8 @@ describe("control migrations", () => {
       "app_collaborator",
       "bootstrap_setup",
       "collaborator_invite",
-      "invite",
+      "email_invite",
+      "instance_setting",
       "passkey",
       "session",
       "user",

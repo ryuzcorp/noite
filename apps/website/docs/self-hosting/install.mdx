@@ -24,7 +24,7 @@ Re-running the script is the upgrade: it refreshes `compose.yaml`, keeps `.env` 
 | `NOITE_DOMAIN` | asked, else `<ip>.sslip.io` | `BASE_DOMAIN` on first install |
 | `NOITE_VERSION` | `alpha` | release channel or version; see [Releases and channels](/self-hosting/operations#releases-and-channels) |
 | `NOITE_ADMIN_EMAIL` | asked (Enter = setup code) | only this address may claim the first admin account, and it must still present the setup code; kept on re-runs (`--admin-email` sets it for scripted installs) |
-| `NOITE_EMAIL_WEBHOOK_URL` | none | receives lost-passkey sign-in codes; without it, [recover from the server](/self-hosting/accounts#lost-passkey) |
+| `NOITE_EMAIL_WEBHOOK_URL` | none | receives platform email (lost-passkey sign-in codes, invitation links, approval notices); without it, [recover from the server](/self-hosting/accounts#lost-passkey) |
 | `NOITE_TELEMETRY` | unset = on | `0`, `false` or `off` turns off the anonymous daily heartbeat; written to `.env` ([Telemetry](/self-hosting/telemetry)) |
 | `NOITE_UPDATE_CHECK` | unset = on | `0`, `false` or `off` turns off the daily release check; written to `.env` ([Updating](/self-hosting/operations#updating)) |
 | `NOITE_DIR` | `/opt/noite` | install directory |

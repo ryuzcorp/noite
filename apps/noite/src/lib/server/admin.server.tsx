@@ -24,8 +24,18 @@ import {
 } from "../runner";
 import type { RunnerApp } from "../runner";
 import { apiAction, apiActionNoInput, fail } from "./api";
-import { listInvites, mintInvites, revokeInvite } from "./invites.server";
-import { readSession } from "./session.server";
+import {
+  approvePendingUser,
+  createEmailInvite,
+  listEmailInvites,
+  revokeEmailInvite,
+  sendApprovalEmail,
+  sendInviteEmail,
+  setWaitlistEnabled,
+  userStatusOf,
+  waitlistEnabled,
+} from "./email-invites.server";
+import { readSession, requestOrigin } from "./session.server";
 
 /** Explicit user-row shape (mirrors the paranorm `user` table). Written
  * out instead of `Selectable<DB["user"]>`, whose instantiation blows up
@@ -37,6 +47,7 @@ interface DbUser {
   id: string;
   name: string | null;
   role: string | null;
+  status: string | null;
 }
 
 /** Promote the env-anchored address to `admin` (idempotent, no-op if unset
@@ -102,6 +113,7 @@ const probeAuthority = async (
     email: user.email,
     impersonatedBy: session.impersonatedBy,
     role: user.role,
+    status: user.status === "pending" ? "pending" : null,
   });
 };
 
@@ -141,6 +153,7 @@ const requireAdmin = async (
       email,
       impersonatedBy: session.impersonatedBy,
       role: user.role,
+      status: user.status === "pending" ? "pending" : null,
     });
 
     if (authority._tag !== "InstanceAdmin") {
@@ -189,6 +202,7 @@ const asUserRow = (row: DbUser, actorId: string): AdminUserRow => ({
   role: adminRoleOf(row.role).role,
   roleKnown: adminRoleOf(row.role).known,
   self: row.id === actorId,
+  status: row.status === "pending" ? ("pending" as const) : ("active" as const),
 });
 
 /** Probe for the admin UI: resolves instead of throwing, so the panel
@@ -261,7 +275,7 @@ export const listUsers = apiAction(
 
       const rows = await withDb(() =>
         getDb().all<DbUser>(sql`
-          SELECT id, email, name, banned, role, createdAt FROM "user"
+          SELECT id, email, name, banned, role, status, createdAt FROM "user"
           ${filter}
           ORDER BY createdAt DESC, id
           LIMIT ${ADMIN_USERS_PAGE_SIZE + 1} OFFSET ${offset}
@@ -457,6 +471,12 @@ export const setUserRole = apiAction(
       return fail("Cannot change your own role");
     }
 
+    // A waitlist account holds no role worth changing: approval flips it
+    // active first, so a pending row can never carry the admin role.
+    if ((await userStatusOf(userId)) === "pending") {
+      return fail("Approve this account before changing its role");
+    }
+
     const { auth, headers } = await adminAuth(request, env);
 
     try {
@@ -536,41 +556,48 @@ export const deleteUser = apiAction(
   }
 );
 
-// ---- Invitations (admin-gated; see invites.server.ts for the code rules) ----
+// ---- Instance invitations by email (admin-gated; see email-invites.server.ts) ----
 
-const InviteCount = Schema.Struct({ count: Schema.Number });
+const InviteEmail = Schema.Struct({ email: Schema.String });
 
-/** Every invitation code with both ends of the exchange. */
-export const adminListInvites = apiActionNoInput(async ({ env, request }) => {
-  const admin = await requireAdmin(request, env);
-
-  if (!admin) {
-    fail("Admin only");
-  }
-
-  try {
-    return await listInvites();
-  } catch (error) {
-    if (error instanceof UnauthorizedError) {
-      throw error;
-    }
-
-    failUnknown(error);
-  }
-});
-
-/** Mint more codes for the admin to hand out. */
-export const adminCreateInvites = apiAction(
-  InviteCount,
-  async ({ count }, { env, request }) => {
+/** Invite one address: mint a single-use 7-day token bound to it and link it
+ * to the control origin. The token is returned — and emailed when delivery
+ * is configured — once, at creation; only its hash is stored. */
+export const adminCreateEmailInvite = apiAction(
+  InviteEmail,
+  async ({ email }, { env, request }) => {
     const admin = (await requireAdmin(request, env)) ?? fail("Admin only");
+    const address = email.trim().toLowerCase();
 
-    if (!Number.isInteger(count) || count < 1 || count > 50) {
-      fail("Ask for between 1 and 50 codes");
+    if (!address) {
+      fail("An email address is required");
     }
 
     try {
-      return { codes: await mintInvites(admin.id, count, "admin") };
+      const created = await createEmailInvite(
+        address,
+        admin.id,
+        requestOrigin(request) ?? env.BETTER_AUTH_URL ?? ""
+      );
+
+      // Best effort: the creation above already succeeded, and the admin
+      // copies the link from the UI either way — a failed send only flips
+      // the flag, never the invite.
+      let emailed = false;
+
+      try {
+        await sendInviteEmail(created.email, created.link, env);
+        emailed = true;
+      } catch (error) {
+        console.error("[adminCreateEmailInvite]", errorLogText(error));
+      }
+
+      return {
+        emailed,
+        expiresAt: created.expiresAt,
+        id: created.id,
+        link: created.link,
+      };
     } catch (error) {
       if (error instanceof UnauthorizedError) {
         throw error;
@@ -581,8 +608,44 @@ export const adminCreateInvites = apiAction(
   }
 );
 
-/** Revoke an unused code (a redeemed one is history and stays visible). */
-export const adminRevokeInvite = apiAction(
+/** Every invitation with the addresses on both ends. */
+export const adminListEmailInvites = apiActionNoInput(
+  async ({ env, request }) => {
+    const admin = await requireAdmin(request, env);
+
+    if (!admin) {
+      fail("Admin only");
+    }
+
+    try {
+      return await listEmailInvites();
+    } catch (error) {
+      if (error instanceof UnauthorizedError) {
+        throw error;
+      }
+
+      failUnknown(error);
+    }
+  }
+);
+
+/** Why a revoke changed nothing, in the admin's words. */
+const revokeRefusalMessage = (
+  reason: "missing" | "revoked" | "used"
+): string => {
+  if (reason === "used") {
+    return "That invitation has already been used — it cannot be revoked.";
+  }
+
+  if (reason === "revoked") {
+    return "That invitation was already revoked.";
+  }
+
+  return "That invitation no longer exists.";
+};
+
+/** Revoke an unused invitation (a redeemed one is history and stays visible). */
+export const adminRevokeEmailInvite = apiAction(
   Schema.String,
   async (id: string, { env, request }) => {
     const admin = await requireAdmin(request, env);
@@ -592,19 +655,151 @@ export const adminRevokeInvite = apiAction(
     }
 
     try {
-      const outcome = await revokeInvite(id);
+      const outcome = await revokeEmailInvite(id);
 
       if (outcome._tag === "Refused") {
-        // A spent code is history: say so instead of reporting a revoke that
-        // changed nothing.
-        return fail(
-          outcome.reason === "used"
-            ? "That code has already been used — it cannot be revoked."
-            : "That code no longer exists."
-        );
+        // A spent token is history: say so instead of reporting a revoke
+        // that changed nothing.
+        return fail(revokeRefusalMessage(outcome.reason));
       }
 
       return { ok: true as const };
+    } catch (error) {
+      if (error instanceof UnauthorizedError) {
+        throw error;
+      }
+
+      failUnknown(error);
+    }
+  }
+);
+
+// ---- Waitlist moderation (admin-gated) ----
+
+/** Approve a waiting account: the conditional flip admits exactly one of two
+ * racing approvals, and the approval notice goes out when delivery is
+ * configured (best effort — the account is active either way). Never your
+ * own: an admin is never waiting, and the explicit refusal keeps it so. */
+export const approveUser = apiAction(
+  Schema.String,
+  async (userId: string, { env, request }) => {
+    const admin = (await requireAdmin(request, env)) ?? fail("Admin only");
+
+    if (userId === admin.id) {
+      fail("Cannot approve your own account");
+    }
+
+    try {
+      const approved = await approvePendingUser(userId);
+
+      if (!approved) {
+        return fail("That account is not waiting for approval");
+      }
+
+      try {
+        await sendApprovalEmail(
+          approved.email,
+          requestOrigin(request) ?? env.BETTER_AUTH_URL ?? "",
+          env
+        );
+      } catch (error) {
+        console.error("[approveUser]", errorLogText(error));
+      }
+
+      return { ok: true as const };
+    } catch (error) {
+      if (error instanceof UnauthorizedError) {
+        throw error;
+      }
+
+      return failUnknown(error);
+    }
+  }
+);
+
+/** Reject a waiting account: delete it, its passkeys and its sessions — the
+ * same removal as `deleteUser`, refused while the account is anyone's last
+ * admin (hand the app over first). Never your own. */
+export const rejectUser = apiAction(
+  Schema.String,
+  async (userId: string, { env, request }) => {
+    const admin = (await requireAdmin(request, env)) ?? fail("Admin only");
+
+    if (userId === admin.id) {
+      fail("Cannot reject your own account");
+    }
+
+    try {
+      const status = await userStatusOf(userId);
+
+      if (status === null) {
+        fail("That account no longer exists");
+      }
+
+      if (status !== "pending") {
+        fail("Only accounts waiting for approval can be rejected");
+      }
+
+      const stranded = await soleAdminApps(userId);
+
+      if (stranded > 0) {
+        fail(
+          `This account is the only admin of ${stranded} app${stranded === 1 ? "" : "s"} — make someone else an admin or delete the app first`
+        );
+      }
+
+      const { auth, headers } = await adminAuth(request, env);
+      await auth.api.removeUser({ body: { userId }, headers });
+      await dropUserLeftovers(userId);
+
+      return { ok: true as const };
+    } catch (error) {
+      if (error instanceof UnauthorizedError) {
+        throw error;
+      }
+
+      return failUnknown(error);
+    }
+  }
+);
+
+// ---- Waitlist switch (admin-gated; read by registration and the Settings tab) ----
+
+/** Whether uninvited registrations queue as `pending` (default OFF). */
+export const getWaitlist = apiActionNoInput(async ({ env, request }) => {
+  const admin = await requireAdmin(request, env);
+
+  if (!admin) {
+    fail("Admin only");
+  }
+
+  try {
+    return { enabled: await waitlistEnabled() };
+  } catch (error) {
+    if (error instanceof UnauthorizedError) {
+      throw error;
+    }
+
+    failUnknown(error);
+  }
+});
+
+const SetWaitlist = Schema.Struct({ enabled: Schema.Boolean });
+
+/** Flip the waitlist switch. */
+export const setWaitlist = apiAction(
+  SetWaitlist,
+  async ({ enabled }, { env, request }) => {
+    const admin = await requireAdmin(request, env);
+
+    if (!admin) {
+      fail("Admin only");
+    }
+
+    try {
+      await setWaitlistEnabled(enabled);
+
+      return { enabled };
     } catch (error) {
       if (error instanceof UnauthorizedError) {
         throw error;

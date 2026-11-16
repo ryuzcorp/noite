@@ -218,7 +218,7 @@ if [ "$DOWN" = 1 ]; then
     fi
     rm -f "$KEEP_FILE"
   fi
-  rm -rf "$E2E_AUTH_DIR/user.json" "$E2E_AUTH_DIR/invite.lock"
+  rm -rf "$E2E_AUTH_DIR/user.json"
   echo "==> E2E slot ${SLOT} is down"
   exit 0
 fi
@@ -241,9 +241,7 @@ echo "==> reset lane state (fresh volumes, fresh bucket, no session)"
 $CE2E down -v --remove-orphans >/dev/null 2>&1 || true
 # `down -v` is best-effort (podman-compose) — remove whatever it left behind.
 remove_project "$PROJECT"
-# A worker killed mid-run (cancel, timeout) leaves the invite lock behind,
-# which would stall the next run's invite specs for 120 s.
-rm -rf "$E2E_AUTH_DIR/user.json" "$E2E_AUTH_DIR/invite.lock"
+rm -rf "$E2E_AUTH_DIR/user.json"
 for p in "$API_PORT" "$LANE_HTTP_PORT" "$LANE_HTTPS_PORT" "$RUSTFS_API_PORT"; do
   if curl -s -o /dev/null --max-time 2 "http://127.0.0.1:${p}/"; then
     echo "error: something already answers on :${p} (make down first?)"

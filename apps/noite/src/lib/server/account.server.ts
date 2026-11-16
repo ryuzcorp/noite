@@ -3,15 +3,14 @@ import * as Schema from "effect/Schema";
 import { sql } from "void/db";
 
 import { userTable } from "../../db/schema";
-import { authFromEnv, failUnknown, UnauthorizedError } from "../auth";
+import { authFromEnv, UnauthorizedError } from "../auth";
 import { listAppsForCollaborator } from "../collaborators";
 import { getDb, withDb } from "../db";
 import { EXPIRY_PRESETS } from "../key-principal";
 import { parseAppRole, roleAtLeast } from "../roles";
 import { apiAction, apiActionNoInput, fail } from "./api";
 import { keyOwnerActive } from "./api-keys.server";
-import { listUnusedInvitesFor } from "./invites.server";
-import { requestOrigin, sessionUser } from "./session.server";
+import { readSession, requestOrigin, sessionUser } from "./session.server";
 
 /** Mark the signed-in account as having completed the first-run onboarding.
  * Idempotent: the `onboardedAt IS NULL` guard means a second call (a
@@ -64,17 +63,25 @@ const checkedApps = async (
 
   return ids;
 };
-// ---- Invitations a member can hand out ----
 
-/** The signed-in account's unused codes (see `INVITES_PER_USER`). */
-export const myInviteCodes = apiActionNoInput(async ({ env, request }) => {
-  const user = await sessionUser(request, env);
+/** The signed-in account's own approval state: the one JSON action a
+ * waitlist (`pending`) account may call besides sign-out. It reads the
+ * session directly instead of `sessionUser` — which refuses pending — so a
+ * waiting account can learn it was approved without signing out and back
+ * in. The waiting page polls this, then reloads into the app. */
+export const registrationStatus = apiActionNoInput(async ({ env, request }) => {
+  const read = await readSession(request, env);
 
-  try {
-    return await listUnusedInvitesFor(user.id);
-  } catch (error) {
-    failUnknown(error);
+  if (read._tag === "SignedOut") {
+    throw new UnauthorizedError({ message: "Sign in required" });
   }
+
+  return {
+    status:
+      read.session.user.status === "pending"
+        ? ("pending" as const)
+        : ("active" as const),
+  };
 });
 
 const CreateApiKey = Schema.Struct({

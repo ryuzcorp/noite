@@ -1,21 +1,27 @@
 //! Settings tab of the control app (`/apps/_control?t=settings`): the
 //! instance-wide switches, in the one place every other admin surface lives.
-//! Two cards, one machine: the anonymous-telemetry opt-out
-//! (`./settings.machine.ts`, rendered by `./settings-section.tsx`) and the
-//! release check. Both actions re-check instance admin server-side
-//! (`lib/server/{telemetry,update}.server.ts`), so this page is presentation,
-//! not the gate.
+//! Three cards, one machine: the anonymous-telemetry opt-out, the release
+//! check (`./settings.machine.ts`, rendered by `./settings-section.tsx`)
+//! and the registration waitlist. All actions re-check instance admin
+//! server-side, so this page is presentation, not the gate.
+
 import { atom } from "ilha";
 
 import { api } from "../api";
 import { formatDateTime } from "../dates";
 import { errorMessage } from "../errors";
 import { resourceError, resourceValue } from "../resource";
-import { invalidate, keys, telemetry, updateStatus } from "../resources";
+import {
+  invalidate,
+  keys,
+  telemetry,
+  updateStatus,
+  waitlist,
+} from "../resources";
 import type { RunnerTelemetryStatus, RunnerUpdateStatus } from "../runner";
 import { SettingsSection } from "./settings-section";
 import { Evt, Settings, syncStatus, transition } from "./settings.machine";
-import type { SettingsState } from "./settings.machine";
+import type { SettingsState, SettingStatus } from "./settings.machine";
 
 /** The payload the runner would POST right now, minus the write-only PostHog
  * key (public-safe, but it has no place on the page). */
@@ -207,6 +213,87 @@ const UpdateCard = () => {
   );
 };
 
+/** The registration waitlist: uninvited registrations queue as `pending`
+ * (an admin approves them on the Users tab) instead of being refused. The
+ * machine is shared with the runner-backed cards; the status is folded from
+ * the D1-backed answer (`locked` never applies — the switch is local). */
+const WaitlistCard = () => {
+  const res = waitlist();
+  const reply = resourceValue(res.state());
+
+  // The machine speaks `SettingStatus`; the waitlist answer is just the
+  // switch, so the fold names the stored value twice and never locks.
+  const status: SettingStatus | undefined =
+    reply === undefined
+      ? undefined
+      : {
+          enabled: reply.enabled,
+          locked: false,
+          lockReason: null,
+          setting: reply.enabled,
+        };
+
+  const machine = atom<SettingsState>(Settings.Loading());
+  const model = syncStatus(machine(), status, resourceError(res.state()));
+
+  const save = (value: boolean) => {
+    machine.set(transition(model, Evt.SaveStarted()));
+
+    void (async () => {
+      try {
+        const saved = await api<{ enabled: boolean }>(
+          "/api/admin/setWaitlist",
+          { enabled: value }
+        );
+
+        const next: SettingStatus = {
+          enabled: saved.enabled,
+          locked: false,
+          lockReason: null,
+          setting: saved.enabled,
+        };
+
+        machine.set(
+          transition(
+            machine(),
+            Evt.SaveSucceeded({ checking: false, status: next, value })
+          )
+        );
+        invalidate(keys.waitlist);
+      } catch (error) {
+        machine.set(
+          transition(
+            machine(),
+            Evt.SaveFailed({ message: errorMessage(error) })
+          )
+        );
+      }
+    })();
+  };
+
+  return (
+    <SettingsSection
+      description={
+        <p class="m-0 text-sm opacity-80">
+          With the waitlist on, someone who registers without an invitation
+          waits for approval instead of being turned away: their account holds
+          no access until an admin approves it on the Users tab. With it off
+          (the default), uninvited registration is refused outright.
+        </p>
+      }
+      id="waitlist-enabled"
+      label="Queue uninvited registrations for approval"
+      onSave={save}
+      savedMessage="Waitlist setting saved."
+      onToggle={(value) => {
+        machine.set(transition(model, Evt.Toggled({ value })));
+      }}
+      state={model}
+      title="Registration waitlist"
+    />
+  );
+};
+
 /** The Settings tab: instance-wide switches, stacked like the app-detail
  * settings sections. Nothing here is per app. */
 export const AdminSettingsPanel = () => (
@@ -219,5 +306,6 @@ export const AdminSettingsPanel = () => (
     </div>
     <TelemetryCard />
     <UpdateCard />
+    <WaitlistCard />
   </div>
 );

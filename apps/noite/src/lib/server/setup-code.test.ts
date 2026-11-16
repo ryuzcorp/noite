@@ -4,7 +4,7 @@ import { createTestD1 } from "../../testing/d1";
 import type { TestD1 } from "../../testing/d1";
 import { controlEnv } from "../control-env";
 import { ensureDb, setD1Binding } from "../db";
-import { signupPolicy } from "./invites.server";
+import { signupPolicy } from "./email-invites.server";
 import {
   checkFirstAdminProof,
   checkSetupCode,
@@ -447,9 +447,8 @@ describe("localhost keeps today's behaviour", () => {
     expect(policy).toEqual({
       adminExists: false,
       firstRun: true,
-      invitesPerUser: 2,
-      requiresInvite: false,
       setupMode: "off",
+      waitlistEnabled: false,
     });
     expect(
       await checkFirstAdminProof("anyone@example.com", ABSENT, policy)
@@ -480,9 +479,8 @@ describe("signup policy", () => {
     expect(await signupPolicy()).toEqual({
       adminExists: false,
       firstRun: true,
-      invitesPerUser: 2,
-      requiresInvite: false,
       setupMode: "code",
+      waitlistEnabled: false,
     });
   });
 
@@ -491,9 +489,8 @@ describe("signup policy", () => {
     expect(await signupPolicy()).toEqual({
       adminExists: false,
       firstRun: true,
-      invitesPerUser: 2,
-      requiresInvite: false,
       setupMode: "email",
+      waitlistEnabled: false,
     });
   });
 
@@ -505,8 +502,8 @@ describe("signup policy", () => {
 
     expect(policy.adminExists).toBe(true);
     expect(policy.setupMode).toBe("off");
-    // Users exist, so the invite gate applies as before — the bootstrap
-    // proof only matters while no admin exists.
-    expect(policy.requiresInvite).toBe(true);
+    // Users exist, so uninvited registration is refused while the waitlist
+    // is off — the bootstrap proof only matters while no admin exists.
+    expect(policy.waitlistEnabled).toBe(false);
   });
 });

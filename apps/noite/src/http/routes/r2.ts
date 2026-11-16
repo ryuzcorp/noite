@@ -3,7 +3,7 @@ import { ensureDb } from "../../lib/db";
 import { runnerConfig } from "../config";
 import type { RouteHandler } from "../config";
 import { isSameOriginAction } from "../origin";
-import { routeUserId } from "../session";
+import { routeGate } from "../session";
 
 /** Content types a browser renders as a document: served inline like the
  * rest, but under a sandbox, so a direct visit to the proxy URL cannot run
@@ -102,11 +102,13 @@ export const handleR2Upload: RouteHandler = async (request, env, params) => {
   }
 
   await ensureDb();
-  const userId = await routeUserId(request, env);
+  const gate = await routeGate(request, env);
 
-  if (!userId) {
-    return new Response("Sign in required", { status: 401 });
+  if ("response" in gate) {
+    return gate.response;
   }
+
+  const { userId } = gate;
 
   try {
     await requireAppRole(target.appId, userId, "push");
@@ -157,11 +159,13 @@ export const handleR2Raw: RouteHandler = async (request, env, params) => {
   }
 
   await ensureDb();
-  const userId = await routeUserId(request, env);
+  const gate = await routeGate(request, env);
 
-  if (!userId) {
-    return new Response("Sign in required", { status: 401 });
+  if ("response" in gate) {
+    return gate.response;
   }
+
+  const { userId } = gate;
 
   try {
     await requireAppRole(target.appId, userId, "view");

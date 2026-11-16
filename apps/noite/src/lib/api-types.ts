@@ -37,9 +37,9 @@ export interface EnvVarView {
  * write-only rule as `EnvVarView`). */
 export type EnvironmentVarView = EnvVarView;
 
-/** The invite-code lifecycle as the admin list sends it (the tag of
- * `InviteLifecycle` in lib/server/invites.server). */
-export type InviteLifecycleWire = "available" | "revoked" | "used";
+/** The email-invite lifecycle as the admin list sends it (the tag of
+ * `EmailInviteLifecycle` in lib/server/email-invites.server). */
+export type EmailInviteWire = "available" | "expired" | "revoked" | "used";
 
 /** One account row on the admin home's Users tab. The actions a row offers
  * are decided by the server (`self`), not by comparing emails in the browser:
@@ -56,6 +56,8 @@ export interface AdminUserRow {
   roleKnown: boolean;
   /** This row is the signed-in admin's own account. */
   self: boolean;
+  /** The waitlist state: `pending` rows show Approve/Reject, never adminship. */
+  status: "active" | "pending";
 }
 
 /** One app row on the admin home's Apps tab. `runtime` is the server's
@@ -112,8 +114,15 @@ export interface PrMergeInput {
   title?: string;
 }
 
-/** A profile invite code the account can hand out. */
-export interface InviteCode {
-  code: string;
+/** One instance invitation by email, as the admin Users tab reads it. The
+ * token itself is never sent again: it was shown once, at creation. */
+export interface EmailInviteView {
+  createdAt: string;
+  createdByEmail: string;
+  email: string;
+  expiresAt: string;
   id: string;
+  state: EmailInviteWire;
+  usedAt: string;
+  usedByEmail: string;
 }

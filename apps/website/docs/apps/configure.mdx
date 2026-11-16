@@ -83,4 +83,4 @@ Clicking a row opens the right-side row editor: every field stays raw text (neve
 
 Footer paging (page input, prev/next, 25/50/100 per page, record count) sits next to a **Data | Definition** switch; Definition shows the columns, indexes, foreign keys and the `CREATE TABLE` statement with a copy button.
 
-The control plane's own database (the `_control` admin home) uses the same editor: capabilities come from its write policy per table, secret columns render masked (`•••• redacted`) and are never filtered, sorted or written, and rows of `user`/`invite` link to the Users/Invites tab that owns them. A `view`-role collaborator sees the same editor with no write controls.
+The control plane's own database (the `_control` admin home) uses the same editor: capabilities come from its write policy per table, secret columns render masked (`•••• redacted`) and are never filtered, sorted or written, and rows of `user`/`email_invite` link to the Users tab that owns them ("Manage in Users", with the tab's search prefilled from the row). A `view`-role collaborator sees the same editor with no write controls.

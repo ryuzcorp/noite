@@ -45,8 +45,8 @@ These are install-level variables (Compose, the image environment). Per-app valu
 | `RUNNER_TOKEN` | `dev-runner-token` | Bearer token for runner API + UI server calls; refused off a `localhost` base at default | runner-owned |
 | `BETTER_AUTH_SECRET` | `dev-only-change-me-to-a-long-random-string` | Session signing secret; `dev-` values refused on real domains | worker-passthrough |
 | `NOITE_ADMIN_EMAIL` | _(empty)_ | Only this address may claim the first admin account, and it must still present the one-time setup code (asked by the installer; kept on re-runs). Also promotes the matching account to admin at startup. Empty on a public base means the first registration needs the code alone instead | worker-passthrough |
-| `NOITE_EMAIL_WEBHOOK_URL` | _(empty)_ | Receives lost-passkey OTP JSON; unset = printed to the control log on a `localhost` base, not sent (the failure is logged) on real domains. Without it, use [`noite-runner recover`](/self-hosting/accounts#lost-passkey) | worker-passthrough |
-| `NOITE_SMTP_FROM` | _(empty)_ | OTP sender label | worker-passthrough |
+| `NOITE_EMAIL_WEBHOOK_URL` | _(empty)_ | Receives platform email JSON — lost-passkey OTPs (`type: "sign-in"`), invitation links (`type: "invite"`) and approval notices (`type: "approved"`); unset = printed to the control log on a `localhost` base, not sent (the failure is logged) on real domains. Without it, use [`noite-runner recover`](/self-hosting/accounts#lost-passkey) | worker-passthrough |
+| `NOITE_SMTP_FROM` | _(empty)_ | Platform email sender label (OTP, invitation and approval mail) | worker-passthrough |
 
 ## Store
 

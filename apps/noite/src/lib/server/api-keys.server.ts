@@ -23,18 +23,20 @@ import { apikeyTable, userTable } from "../../db/schema";
 import { getDb, withDb } from "../db";
 
 /** Whether an API key's owner may still act. A missing row counts as banned:
- * never serve a credential whose owner cannot be established. */
+ * never serve a credential whose owner cannot be established. A waitlist
+ * (`pending`) account holds no access at all — its keys, if any were minted
+ * before approval, refuse exactly like a banned owner's. */
 export const keyOwnerActive = (userId: string): Promise<boolean> =>
   withDb(async () => {
     const rows = await getDb()
-      .select({ banned: userTable.banned })
+      .select({ banned: userTable.banned, status: userTable.status })
       .from(userTable)
       .where(eq(userTable.id, userId))
       .limit(1);
 
     const [row] = rows;
 
-    return row !== undefined && row.banned !== true;
+    return row !== undefined && row.banned !== true && row.status !== "pending";
   });
 
 /** Delete every API key owned by an account. Called when the account is

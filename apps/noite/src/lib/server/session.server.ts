@@ -1,7 +1,7 @@
 import * as Schema from "effect/Schema";
 
 import { sleepUnlessAborted } from "../../http/sse";
-import { authFromEnv, UnauthorizedError } from "../auth";
+import { authFromEnv, PendingApprovalError, UnauthorizedError } from "../auth";
 import type { SessionUser } from "../auth";
 import { authorityOf, mayAdministerInstance } from "../authority";
 import type { InstanceAuthority } from "../authority";
@@ -12,7 +12,8 @@ import { fail } from "./api";
 import { controlAccessRefusal } from "./control-d1.server";
 
 /** The raw better-auth user plus the impersonation marker. `role` and
- * `banned` are the admin plugin's fields, unknown on purpose. */
+ * `banned` are the admin plugin's fields, `status` the waitlist state
+ * (`user.status`, via `additionalFields`); all unknown on purpose. */
 export interface RequestSession {
   impersonatedBy: string | null;
   user: {
@@ -21,6 +22,7 @@ export interface RequestSession {
     id: string;
     name: string;
     role?: unknown;
+    status?: unknown;
   };
 }
 
@@ -163,6 +165,7 @@ const authorityOfSession = async (
     email: user.email,
     impersonatedBy: session.impersonatedBy,
     role: user.role,
+    status: user.status === "pending" ? "pending" : null,
   });
 
   if (
@@ -176,6 +179,10 @@ const authorityOfSession = async (
       email: user.email,
       impersonatedBy: session.impersonatedBy,
       role: "admin",
+      // Unreachable for pending sessions (they resolve `Pending` above and
+      // never enter this branch), but every call site passes `status` so the
+      // audit stays one rule with no exceptions.
+      status: user.status === "pending" ? "pending" : null,
     });
   }
 
@@ -199,6 +206,16 @@ export const sessionUser = async (
   }
 
   const { session } = read;
+
+  // SECURITY: a waitlist account holds no access at all until approval —
+  // every JSON action (except the approval-status read, which never calls
+  // this) refuses it here, not just in the UI. The account signs out and
+  // reads its status through dedicated paths instead.
+  if (session.user.status === "pending") {
+    throw new PendingApprovalError({
+      message: "Your account is waiting for approval",
+    });
+  }
 
   return {
     authority: await authorityOfSession(session),

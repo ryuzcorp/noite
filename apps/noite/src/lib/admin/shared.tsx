@@ -78,7 +78,10 @@ export const PanelCard = ({
   note: string;
   title: string;
 }) => (
-  <ul class="list bg-base-100 dark:bg-base-200 border-base-300 rounded-box w-full border shadow-md">
+  <ul
+    aria-label={title}
+    class="list bg-base-100 dark:bg-base-200 border-base-300 rounded-box w-full border shadow-md"
+  >
     <li class="flex min-h-14 flex-wrap items-center justify-between gap-2 p-4 pb-2">
       <span class="text-lg font-semibold tracking-wide">{title}</span>
       <span class="flex items-center gap-2">{controls}</span>

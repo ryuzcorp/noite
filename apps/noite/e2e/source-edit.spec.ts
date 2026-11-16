@@ -5,7 +5,7 @@ import {
   createAppWithKey,
   deleteApp,
   pushAppDir,
-  registerInviteeWithFreshCode,
+  registerInviteeWithFreshInvite,
 } from "./helpers";
 
 // Browser edits across files: the in-page buffers survive opening another
@@ -175,7 +175,7 @@ test("branch protection re-targets a push collaborator's commit", async ({
 
   const email = `code-push-${Date.now()}@example.com`;
 
-  const invitee = await registerInviteeWithFreshCode(browser, page, {
+  const invitee = await registerInviteeWithFreshInvite(browser, request, {
     email,
     name: "Code Push",
   });

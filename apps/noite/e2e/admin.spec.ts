@@ -10,15 +10,16 @@ import {
   addVirtualAuthenticator,
   appListenPort,
   createAppWithKey,
+  createEmailInviteLink,
   deleteApp,
   findAppId,
+  inviteTokenOf,
   pushAppDir,
   readSampleApp,
   registerInviteeAccount,
   runnerApi,
   waitForCreatedApp,
   waitForDeploy,
-  withInviteLock,
 } from "./helpers";
 
 // Instance admin page (`/apps/_control?t=users|apps|invites|settings`): every
@@ -38,16 +39,16 @@ const DOOMED_SLUG = "admin-doomed";
 const DOOMED_NAME = "Admin Doomed";
 const OWN_SLUG = "admin-own";
 const OWN_NAME = "Admin Own";
-const MINT_COUNT = 2;
 
 const control = process.env.E2E_BASE_URL ?? "http://noite.localhost:8090";
 const CONTROL_STORAGE = "/storage/_control/d1%3Anoite-control";
 
-interface InviteView {
-  code: string;
+interface EmailInviteView {
   createdByEmail: string;
+  email: string;
+  expiresAt: string;
   id: string;
-  revoked: boolean;
+  state: string;
   usedAt: string;
   usedByEmail: string;
 }
@@ -80,18 +81,21 @@ const secondOrThrow = () => {
   return { context: secondContext, page: secondPage };
 };
 
-const adminListInvites = async (
+const adminListEmailInvites = async (
   request: APIRequestContext
-): Promise<InviteView[]> => {
-  const res = await request.post("/api/admin/adminListInvites", { data: {} });
+): Promise<EmailInviteView[]> => {
+  const res = await request.post("/api/admin/adminListEmailInvites", {
+    data: {},
+  });
+
   expect(res.ok()).toBe(true);
 
-  // SAFETY: adminListInvites answers the InviteView array directly (apiActionNoInput serializes the return value as JSON).
-  return (await res.json()) as InviteView[];
+  // SAFETY: adminListEmailInvites answers the EmailInviteView array directly (apiActionNoInput serializes the return value as JSON).
+  return (await res.json()) as EmailInviteView[];
 };
 
 type AdminActionInput =
-  | { count: number }
+  | { email: string }
   | { enabled: boolean }
   | { page: number; query: string }
   | { role: string; userId: string };
@@ -123,8 +127,13 @@ const adminPostId = (
 ): Promise<{ body: { errors?: { form?: string } }; status: number }> =>
   adminPostBody(request.post(path, { data: JSON.stringify(id) }));
 
+/** An account's row in the Users card. The "Invite by email" card above it
+ * lists the same addresses (an invite and the account it admitted), so the
+ * row is scoped to its own card. */
 const userRow = (page: Page, email: string) =>
-  page.locator("li.list-row", { hasText: email });
+  page
+    .getByRole("list", { exact: true, name: "Users" })
+    .locator("li.list-row", { hasText: email });
 
 const appRow = (page: Page, slug: string) =>
   page.locator("li.list-row", { hasText: slug });
@@ -160,97 +169,91 @@ test.afterAll(async ({ request }) => {
   }
 });
 
-test("invite codes mint, revoke, and gate registration", async ({
+test("email invites mint, revoke, and gate registration", async ({
   browser,
   page,
   request,
 }) => {
-  await withInviteLock(async () => {
-    const listed = await adminListInvites(request);
+  // One single-use invite per address, minted through the admin API. Each
+  // invite is bound to its own address, so parallel workers minting theirs
+  // never collide and no lock is needed.
+  const revokedLink = await createEmailInviteLink(request, REVOKED_EMAIL);
+  const liveLink = await createEmailInviteLink(request, SECOND_EMAIL);
+  const revokedToken = inviteTokenOf(revokedLink);
+  const liveToken = inviteTokenOf(liveLink);
 
-    const before = new Set(
-      listed
-        .filter((inv) => !(inv.revoked || inv.usedByEmail))
-        .map((inv) => inv.code)
-    );
+  await page.goto("/apps/_control?t=users");
 
-    await page.goto("/apps/_control?t=invites");
-    await expect(page.locator("#admin-invite-search")).toBeVisible();
-    await page.locator("#invite-count").fill(String(MINT_COUNT));
-    await page.getByRole("button", { exact: true, name: "Generate" }).click();
-
-    // Exactly the minted codes appear, available: no other worker can mint
-    // while this lock is held, so the diff is this test's own codes.
-    let minted: InviteView[] = [];
-    await expect(async () => {
-      const current = await adminListInvites(request);
-      minted = current.filter(
-        (inv) => !before.has(inv.code) && !(inv.revoked || inv.usedByEmail)
-      );
-      expect(minted).toHaveLength(MINT_COUNT);
-    }).toPass({ timeout: 30_000 });
-
-    for (const inv of minted) {
-      // oxlint-disable-next-line eslint/no-await-in-loop -- one row assertion at a time; the rows arrive together
-      await expect(appRow(page, inv.code)).toBeVisible();
-    }
-
-    const revokedCode = minted[0]?.code ?? "";
-    const liveCode = minted[1]?.code ?? "";
-    expect(revokedCode).not.toBe("");
-    expect(liveCode).not.toBe("");
-
-    await appRow(page, revokedCode)
-      .getByRole("button", { name: "Revoke" })
-      .click();
-    await expect(async () => {
-      const current = await adminListInvites(request);
-      expect(current.find((inv) => inv.code === revokedCode)?.revoked).toBe(
-        true
-      );
-    }).toPass({ timeout: 30_000 });
-    await expect(appRow(page, revokedCode).getByText("revoked")).toBeVisible();
-
-    // The revoked code is refused at the real gate: registration itself.
-    const attemptContext = await browser.newContext({
-      baseURL: control,
-      storageState: { cookies: [], origins: [] },
-    });
-
-    try {
-      const attempt = await attemptContext.newPage();
-      await addVirtualAuthenticator(attempt);
-      await attempt.goto("/login");
-      await attempt.getByRole("tab", { name: "Create account" }).click();
-      await attempt.locator("#register-name").fill(REVOKED_NAME);
-      await attempt.locator("#register-email").fill(REVOKED_EMAIL);
-      await attempt.locator("#register-invite").fill(revokedCode);
-      await attempt.getByRole("button", { name: "Create passkey" }).click();
-      await expect(
-        attempt.getByText(
-          "That invitation code was revoked. Ask for a new one."
-        )
-      ).toBeVisible();
-      const refused = await sessionOf(attempt.request);
-      expect(refused.user ?? null).toBeNull();
-    } finally {
-      await attemptContext.close();
-    }
-
-    // The unrevoked minted code still registers an account: this file's
-    // second account is that proof.
-    const second = await registerInviteeAccount(
-      browser,
-      liveCode,
-      SECOND_EMAIL,
-      SECOND_NAME
-    );
-
-    secondContext = second.context;
-    secondPage = second.page;
-    const registered = await sessionOf(second.page.request);
-    expect(registered.user?.email).toBe(SECOND_EMAIL);
+  const invites = page.getByRole("list", {
+    exact: true,
+    name: "Invite by email",
   });
+
+  const revokedRow = invites.locator("li.list-row", { hasText: REVOKED_EMAIL });
+  // Badges match exactly: the address itself contains "revoked".
+  await expect(
+    revokedRow.getByText("available", { exact: true })
+  ).toBeVisible();
+  const liveRow = invites.locator("li.list-row", { hasText: SECOND_EMAIL });
+  await expect(liveRow.getByText("available", { exact: true })).toBeVisible();
+
+  await revokedRow.getByRole("button", { name: "Revoke" }).click();
+  await expect(revokedRow.getByText("revoked", { exact: true })).toBeVisible();
+
+  // Server-side proof of the revoke behind the badge.
+  await expect(async () => {
+    const current = await adminListEmailInvites(request);
+    expect(current.find((inv) => inv.email === REVOKED_EMAIL)?.state).toBe(
+      "revoked"
+    );
+  }).toPass({ timeout: 30_000 });
+
+  // The revoked token is refused at the real gate: registration itself.
+  const attemptContext = await browser.newContext({
+    baseURL: control,
+    storageState: { cookies: [], origins: [] },
+  });
+
+  try {
+    const attempt = await attemptContext.newPage();
+    await addVirtualAuthenticator(attempt);
+    await attempt.goto(`/login?invite=${revokedToken}`);
+    await attempt.getByRole("tab", { name: "Create account" }).click();
+    await attempt.locator("#register-name").fill(REVOKED_NAME);
+    await attempt.locator("#register-email").fill(REVOKED_EMAIL);
+    await attempt.getByRole("button", { name: "Create passkey" }).click();
+    await expect(
+      attempt.getByText(
+        "That invitation was revoked. Ask your admin for a new link."
+      )
+    ).toBeVisible();
+    const refused = await sessionOf(attempt.request);
+    expect(refused.user ?? null).toBeNull();
+  } finally {
+    await attemptContext.close();
+  }
+
+  // The live token still registers an account: this file's second account
+  // is that proof, through the invite link itself.
+  const second = await registerInviteeAccount(
+    browser,
+    liveToken,
+    SECOND_EMAIL,
+    SECOND_NAME
+  );
+
+  secondContext = second.context;
+  secondPage = second.page;
+  const registered = await sessionOf(second.page.request);
+  expect(registered.user?.email).toBe(SECOND_EMAIL);
+
+  // Server-side proof: the invite reads used by the new address.
+  await expect(async () => {
+    const current = await adminListEmailInvites(request);
+    expect(current.find((inv) => inv.email === SECOND_EMAIL)?.usedByEmail).toBe(
+      SECOND_EMAIL
+    );
+  }).toPass({ timeout: 30_000 });
 });
 
 test("the users tab finds the second account and refuses it admin surfaces", async ({
@@ -663,17 +666,13 @@ test("self-guards and invite validation hold at the real gate", async ({
   expect(demoteSelf.status).toBe(422);
   expect(demoteSelf.body.errors?.form).toContain("Cannot change your own role");
 
-  for (const count of [0, 51]) {
-    // oxlint-disable-next-line eslint/no-await-in-loop -- two sequential validation probes; order is irrelevant but parallelism buys nothing
-    const minted = await adminPost(request, "/api/admin/adminCreateInvites", {
-      count,
-    });
+  // A blank address is refused before a row lands.
+  const blank = await adminPost(request, "/api/admin/adminCreateEmailInvite", {
+    email: "   ",
+  });
 
-    expect(minted.status).toBe(422);
-    expect(minted.body.errors?.form).toContain(
-      "Ask for between 1 and 50 codes"
-    );
-  }
+  expect(blank.status).toBe(422);
+  expect(blank.body.errors?.form).toContain("An email address is required");
 
   // The admin's own row offers no actions: this is the UI side of the
   // self-guards above.
@@ -692,9 +691,12 @@ test("self-guards and invite validation hold at the real gate", async ({
   });
 
   try {
-    const response = await anon.request.post("/api/admin/adminListInvites", {
-      data: {},
-    });
+    const response = await anon.request.post(
+      "/api/admin/adminListEmailInvites",
+      {
+        data: {},
+      }
+    );
 
     expect(response.status()).toBe(422);
 

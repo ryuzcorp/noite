@@ -18,6 +18,7 @@ import { runnerConfig } from "../config";
 import type { RouteHandler } from "../config";
 import { originAllowed } from "../origin";
 import { routeFailure } from "../route-failure";
+import { routeUserRefused } from "../session";
 
 /** The commit-shaped payload a caller posts (the runner validates its
  * contents). `expectedTip` is an agent's compare-and-set precondition; the
@@ -106,6 +107,13 @@ const sourceCaller = async (
 
     if (!user) {
       return new Response("Sign in required", { status: 401 });
+    }
+
+    // A waitlist-pending or banned account holds no access at any gate: the
+    // refusal runs before any role check, so even a stale grant cannot admit
+    // it (matching `routeGate` on the stream/R2 routes).
+    if (routeUserRefused(user)) {
+      return new Response("forbidden", { status: 403 });
     }
 
     const grant = await requireAppRole(appId, user.id, "push").catch(

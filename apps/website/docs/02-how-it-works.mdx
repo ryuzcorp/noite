@@ -33,7 +33,7 @@ Under `s3://<bucket>/`:
 | `git/{slug}/` | Tip bundles from Git HTTP plus a `MANIFEST.json` linearization point (`{seq, refs}`) |
 | `fleets/{slug}/` | Tenant celld state, deploys, and telemetry |
 | `envs/{slug}/{label}/` | One [preview environment](/apps/environments)'s celld and storage (starts empty, never seeded from production) |
-| `control/` | UI worker bundle, its D1 (accounts, invites) and the control fleet's own telemetry |
+| `control/` | UI worker bundle, its D1 (accounts, email invitations, the waitlist switch) and the control fleet's own telemetry |
 | `runner/state/` | Runner SQLite snapshots plus the `owner.json` fence |
 
 The bundled RustFS store provides this bucket with zero config; production uses a qualified store. See [Storage](/self-hosting/storage).

@@ -21,13 +21,12 @@ import { isLocalhostDomain } from "./local-host";
 import { fail } from "./server/api";
 import { revokeApiKeysForUser } from "./server/api-keys.server";
 import {
-  checkInvite,
-  consumeInvite,
-  INVITES_PER_USER,
-  mintInvites,
+  checkRegistrationGate,
+  redeemEmailInvite,
+  setUserStatus,
   signupPolicy,
-} from "./server/invites.server";
-import type { InviteProblem } from "./server/invites.server";
+} from "./server/email-invites.server";
+import type { RedeemProblem } from "./server/email-invites.server";
 import {
   checkFirstAdminProof,
   claimFirstAdminSlot,
@@ -44,6 +43,12 @@ export class MissingAuthSecretError extends Schema.TaggedError<MissingAuthSecret
 // oxlint-disable-next-line unicorn/throw-new-error -- Schema.TaggedError factory
 export class UnauthorizedError extends Schema.TaggedError<UnauthorizedError>()(
   "UnauthorizedError",
+  { message: Schema.String }
+) {}
+
+// oxlint-disable-next-line unicorn/throw-new-error -- Schema.TaggedError factory
+export class PendingApprovalError extends Schema.TaggedError<PendingApprovalError>()(
+  "PendingApprovalError",
   { message: Schema.String }
 ) {}
 
@@ -122,23 +127,57 @@ const parseRegistration = (context: string | null | undefined) =>
     };
   });
 
-/** User-facing reason a code was refused. The panel shows this verbatim. */
-const inviteProblemMessage = (problem: InviteProblem): string => {
+/** User-facing reason an invitation token was refused. The panel shows this
+ * verbatim. Registration has no mailbox proof, so every refusal names the
+ * admin-issued link — never the address alone. */
+const tokenProblemMessage = (problem: RedeemProblem): string => {
   switch (problem) {
-    case "missing": {
-      return "This instance is invite-only. Enter an invitation code.";
+    case "wrong-email": {
+      return "This invitation was sent to a different email address.";
     }
 
-    case "unknown": {
-      return "That invitation code is not valid.";
+    case "expired": {
+      return "That invitation has expired. Ask your admin for a new link.";
     }
 
     case "revoked": {
-      return "That invitation code was revoked. Ask for a new one.";
+      return "That invitation was revoked. Ask your admin for a new link.";
+    }
+
+    case "used": {
+      return "That invitation has already been used. Ask your admin for a new link.";
     }
 
     default: {
-      return "That invitation code has already been used. Ask for a new one.";
+      return "That invitation is not valid. Ask your admin for a new link.";
+    }
+  }
+};
+
+/** The burn's capitalized tag as the lowercase problem the panel reads.
+ * Total: an unlisted tag can only mean the lookup missed, i.e. unknown. */
+const redeemProblemOf = (
+  tag: "Expired" | "Revoked" | "Unknown" | "Used" | "WrongEmail"
+): RedeemProblem => {
+  switch (tag) {
+    case "WrongEmail": {
+      return "wrong-email";
+    }
+
+    case "Expired": {
+      return "expired";
+    }
+
+    case "Revoked": {
+      return "revoked";
+    }
+
+    case "Used": {
+      return "used";
+    }
+
+    default: {
+      return "unknown";
     }
   }
 };
@@ -408,14 +447,22 @@ export const createAuth = (env: KitEnv, baseURL: string) =>
 
         const read = await getSessionFromCtx(ctx);
 
-        if (read?.user.banned !== true) {
-          return;
+        if (read?.user.banned === true) {
+          throw APIError.from("FORBIDDEN", {
+            code: "BANNED_USER",
+            message: "This account is banned",
+          });
         }
 
-        throw APIError.from("FORBIDDEN", {
-          code: "BANNED_USER",
-          message: "This account is banned",
-        });
+        // SECURITY: a waiting-list account holds no access at all until
+        // approval — including minting machine credentials, the same rule
+        // `keyOwnerActive` enforces when a key is used.
+        if (read?.user.status === "pending") {
+          throw APIError.from("FORBIDDEN", {
+            code: "PENDING_APPROVAL",
+            message: "Your account is waiting for approval",
+          });
+        }
       }),
     },
     plugins: [
@@ -488,15 +535,46 @@ export const createAuth = (env: KitEnv, baseURL: string) =>
               });
             }
 
-            // Bootstrap first, invites after: while no admin exists the first
-            // registration must prove it is the operator (the reserved admin
-            // address, or the one-time setup code on a public base without
-            // one — audit N-3), and the conditional claim below is what
-            // decides which of two concurrent first registrations owns the
-            // instance. Past bootstrap the invite gate applies as before.
+            // Bootstrap first, invites and the waitlist after: while no
+            // admin exists the first registration must prove it is the
+            // operator (the reserved admin address, or the one-time setup
+            // code on a public base without one — audit N-3), and the
+            // conditional claim below is what decides which of two
+            // concurrent first registrations owns the instance. Past
+            // bootstrap an invited email redeems its token for an ACTIVE
+            // account; an uninvited one queues as `pending` while the
+            // waitlist is enabled and is refused — leaving no row behind —
+            // while it is not. Registration has NO mailbox proof either
+            // way: the address alone never grants access.
             const policy = await signupPolicy();
 
-            if (!policy.adminExists) {
+            if (policy.adminExists) {
+              // The whole pre-create gate lives in one tested function: the
+              // abuse bound, the token pre-check (never a burn), and the
+              // waitlist refusal/cap all run before any row is created.
+              const verdict = await checkRegistrationGate({
+                email: parsed.email,
+                invite: parsed.invite,
+                request: ctx.request,
+                waitlistEnabled: policy.waitlistEnabled,
+              });
+
+              if (verdict._tag === "Refuse") {
+                throw APIError.from(
+                  verdict.code === "SIGNUP_RATE_LIMITED"
+                    ? "TOO_MANY_REQUESTS"
+                    : "FORBIDDEN",
+                  { code: verdict.code, message: verdict.message }
+                );
+              }
+
+              if (verdict._tag === "BadToken") {
+                throw APIError.from("FORBIDDEN", {
+                  code: "INVITE_INVALID",
+                  message: tokenProblemMessage(verdict.problem),
+                });
+              }
+            } else {
               // Refuse strangers before an account is created, so no user
               // row is left behind for a refused registration.
               const proof = await checkFirstAdminProof(
@@ -509,15 +587,6 @@ export const createAuth = (env: KitEnv, baseURL: string) =>
                 throw APIError.from("FORBIDDEN", {
                   code: firstAdminErrorCode(proof.reason),
                   message: firstAdminProblemMessage(proof.reason),
-                });
-              }
-            } else if (!policy.firstRun) {
-              const problem = await checkInvite(parsed.invite);
-
-              if (problem) {
-                throw APIError.from("FORBIDDEN", {
-                  code: "INVITE_REQUIRED",
-                  message: inviteProblemMessage(problem),
                 });
               }
             }
@@ -554,12 +623,16 @@ export const createAuth = (env: KitEnv, baseURL: string) =>
                 });
               }
             } else if (parsed.invite) {
-              const claimed = await consumeInvite(parsed.invite, user.id);
+              // The atomic burn: exactly one of two concurrent registrations
+              // with one token wins; the loser drops its half-created
+              // account (best effort — the registration fails either way)
+              // instead of keeping one that no invite covers.
+              const verdict = await redeemEmailInvite(
+                parsed.invite,
+                parsed.email
+              );
 
-              if (!claimed) {
-                // Lost the race for this code: drop the half-created account
-                // instead of leaving one that no invite covers. Best effort —
-                // the registration fails either way.
+              if (verdict._tag !== "Ok") {
                 try {
                   await ctx.context.internalAdapter.deleteUser(user.id);
                 } catch {
@@ -567,14 +640,27 @@ export const createAuth = (env: KitEnv, baseURL: string) =>
                 }
 
                 throw APIError.from("FORBIDDEN", {
-                  code: "INVITE_REQUIRED",
-                  message: inviteProblemMessage("used"),
+                  code: "INVITE_INVALID",
+                  message: tokenProblemMessage(redeemProblemOf(verdict._tag)),
                 });
               }
-            }
+            } else {
+              // The waitlist gate already approved this path (enabled, with
+              // room): the account queues as `pending` and holds no access
+              // until an admin approves it. If the flip fails the account
+              // is dropped rather than admitted active by accident.
+              try {
+                await setUserStatus(user.id, "pending");
+              } catch (error) {
+                try {
+                  await ctx.context.internalAdapter.deleteUser(user.id);
+                } catch {
+                  // Nothing to do: the account is unusable without a passkey.
+                }
 
-            // Every account can invite its own share.
-            await mintInvites(user.id, INVITES_PER_USER);
+                throw error;
+              }
+            }
 
             return { userId: user.id };
           },
@@ -614,6 +700,13 @@ export const createAuth = (env: KitEnv, baseURL: string) =>
           input: false,
           required: false,
           type: "date",
+        },
+        // The waitlist state (`user.status`): `input: false` keeps it
+        // server-only — approval flips it, never a client body.
+        status: {
+          input: false,
+          required: false,
+          type: "string",
         },
       },
     },

@@ -13,7 +13,7 @@ import {
   execGit,
   mintApiKey,
   pushAppDir,
-  registerInviteeWithFreshCode,
+  registerInviteeWithFreshInvite,
   runnerApi,
   runnerCall,
   waitForDeploy,
@@ -481,13 +481,12 @@ test("require_pr rejects a push-role push to main while an admin push lands", as
   await expect(page.locator("#branch-require-pr")).toBeChecked();
   await expect(page.locator("#branch-approvals")).toHaveValue("1");
 
-  // A second account joins as a push collaborator. It gets its invite code
-  // from the e2e account's Account page, registers with it, then the e2e
-  // admin invites the address and it accepts. The read-plus-redeem is locked
-  // across workers: codes are single-use, so parallel redeems would collide.
+  // A second account joins as a push collaborator. The e2e admin mints an
+  // email invite for its address and it registers with the link, then the
+  // e2e admin invites the address and it accepts.
   const email = `push-user-${Date.now()}@example.com`;
 
-  const invitee = await registerInviteeWithFreshCode(browser, page, {
+  const invitee = await registerInviteeWithFreshInvite(browser, request, {
     email,
     name: "Push User",
   });

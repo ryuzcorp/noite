@@ -66,12 +66,24 @@ describe("authorityOf", () => {
     expect(mayAdministerInstance(authority)).toBe(false);
   });
 
+  test("a pending account holds no authority, whatever its stored role", () => {
+    const authority = authorityOf({
+      ...base,
+      role: "admin",
+      status: "pending",
+    });
+
+    expect(authority).toEqual(Authority.Pending());
+    expect(mayAdministerInstance(authority)).toBe(false);
+  });
+
   test("the wire form round-trips for the states the client reads", () => {
     for (const authority of [
       Authority.Anonymous(),
       Authority.Banned(),
       Authority.Impersonating({ by: "x" }),
       Authority.InstanceAdmin({ via: "role" }),
+      Authority.Pending(),
       Authority.Plain(),
     ]) {
       expect(authorityFromWire(authorityWire(authority))._tag).toBe(

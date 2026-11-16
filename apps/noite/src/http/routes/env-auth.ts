@@ -21,6 +21,7 @@ import {
 } from "../../lib/runner";
 import { getSessionOrNull } from "../../lib/server/session.server";
 import type { RouteHandler } from "../config";
+import { routeUserRefused } from "../session";
 
 const redirect = (location: string): Response =>
   new Response(null, { headers: { location }, status: 302 });
@@ -169,6 +170,13 @@ export const handleEnvAuth: RouteHandler = async (request, env) => {
     }
 
     return loginRedirect(url);
+  }
+
+  // A waitlist-pending or banned account holds no access at any gate: refuse
+  // before any role check, so even a stale grant cannot admit it (matching
+  // `routeGate` on the stream/R2/source routes).
+  if (routeUserRefused(user)) {
+    return new Response("forbidden", { status: 403 });
   }
 
   const grant = await requireAppRole(appId, user.id, "view").catch(() => null);

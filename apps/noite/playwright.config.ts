@@ -14,7 +14,7 @@ const baseURL = process.env.E2E_BASE_URL ?? "http://noite.localhost:8090";
 // sibling test. Every file is hermetic — its own apps, its own deploys —
 // except the two ordered projects below, so any file may run beside any
 // other. Shared lane resources are bounded instead: the app quota is raised
-// for the lane (compose.e2e.yaml) and invite-code redemption is file-locked
+// for the lane (compose.e2e.yaml) and email invites are single-use
 // (e2e/helpers.ts). Runner capacity note: deploys have no global semaphore
 // (per-app locks only), so concurrent deploys contend on CPU but proceed;
 // each deploy keeps its 8-minute budget, and 3 workers leave headroom on a
@@ -96,7 +96,7 @@ export default defineConfig({
     { name: "setup", testMatch: /auth\.setup\.ts/u },
     // The signup-policy probe runs right after setup, before the parallel
     // bulk: it pins the policy the bootstrap account established, and later
-    // specs spend invite codes and register accounts beside it.
+    // specs redeem email invites and register accounts beside it.
     {
       dependencies: ["setup"],
       name: "policy",

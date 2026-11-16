@@ -38,10 +38,10 @@ const addSession = (id: string, token: string, userId: string) => {
   );
 };
 
-const addInvite = (id: string, code: string, note: string | null) => {
+const addEmailInvite = (id: string, email: string, tokenHash: string) => {
   db.raw.run(
-    `INSERT INTO invite (id, code, createdBy, note) VALUES (?, ?, 'a', ?)`,
-    [id, code, note]
+    `INSERT INTO email_invite (id, email, tokenHash, createdBy, expiresAt) VALUES (?, ?, ?, 'a', ?)`,
+    [id, email, tokenHash, "2030-01-01T00:00:00.000Z"]
   );
 };
 
@@ -88,18 +88,26 @@ describe("tables", () => {
   test("lists the real tables with row counts, hides internals, attaches caps", async () => {
     db.raw.run(`CREATE TABLE "_hidden" (x TEXT)`);
     db.raw.run(`CREATE TABLE d1_migrations (id INTEGER)`);
-    addInvite("i1", "CODE-1", "note");
+    addEmailInvite("i1", "e1@example.com", "HASH-1");
     const listed = await listControlTables(db.d1);
     const names = listed.tables.map((table) => table.name);
     expect(names).toContain("user");
     expect(names).toContain("session");
-    expect(names).toContain("invite");
+    expect(names).toContain("email_invite");
     expect(names).not.toContain("_hidden");
     expect(names).not.toContain("d1_migrations");
     expect(listed.databaseId).toBe("noite-control");
-    const invite = listed.tables.find((table) => table.name === "invite");
-    expect(invite?.rowCount).toBe(1);
-    expect(invite?.caps).toEqual({ delete: true, insert: true, update: true });
+
+    const emailInvite = listed.tables.find(
+      (table) => table.name === "email_invite"
+    );
+
+    expect(emailInvite?.rowCount).toBe(1);
+    expect(emailInvite?.caps).toEqual({
+      delete: true,
+      insert: true,
+      update: true,
+    });
     const session = listed.tables.find((table) => table.name === "session");
     expect(session?.caps).toEqual({
       delete: true,
@@ -134,6 +142,7 @@ describe("schema", () => {
     expect(schema.locked.banned).toBe("managed in Users");
     expect(schema.locked.banReason).toBe("managed in Users");
     expect(schema.locked.banExpires).toBe("managed in Users");
+    expect(schema.locked.status).toBe("managed in Users");
     expect(schema.redacted).toEqual([]);
     expect(schema.rowAction).toEqual({
       column: "email",
@@ -144,19 +153,19 @@ describe("schema", () => {
     expect(schema.sql).toContain("CREATE TABLE");
   });
 
-  test("marks redacted columns locked and points invite rows at Invites", async () => {
+  test("marks redacted columns locked and points invite rows at Users", async () => {
     const session = await controlSchema(db.d1, "session");
     expect(session.redacted).toContain("token");
     expect(session.locked.token).toBe("redacted");
     expect(session.rowAction).toBeNull();
-    const invite = await controlSchema(db.d1, "invite");
-    expect(invite.locked).toEqual({});
-    expect(invite.redacted).toEqual([]);
-    expect(invite.rowAction).toEqual({
-      column: "code",
-      label: "Manage in Invites",
-      param: "iq",
-      tab: "invites",
+    const emailInvite = await controlSchema(db.d1, "email_invite");
+    expect(emailInvite.locked).toEqual({});
+    expect(emailInvite.redacted).toEqual([]);
+    expect(emailInvite.rowAction).toEqual({
+      column: "email",
+      label: "Manage in Users",
+      param: "uq",
+      tab: "users",
     });
   });
 
@@ -188,12 +197,12 @@ describe("schema", () => {
 describe("rows", () => {
   test("pages server-side with a total and a stable column order", async () => {
     for (let i = 0; i < 5; i += 1) {
-      addInvite(`i${i}`, `CODE-${i}`, `note ${i}`);
+      addEmailInvite(`i${i}`, `e${i}@example.com`, `HASH-${i}`);
     }
 
     const first = await controlRows(
       db.d1,
-      rowsQuery("invite", { pageSize: 2 })
+      rowsQuery("email_invite", { pageSize: 2 })
     );
 
     expect(first.columns[0]).toBe("id");
@@ -206,7 +215,7 @@ describe("rows", () => {
 
     const last = await controlRows(
       db.d1,
-      rowsQuery("invite", { page: 2, pageSize: 2 })
+      rowsQuery("email_invite", { page: 2, pageSize: 2 })
     );
 
     expect(last.rows).toHaveLength(1);
@@ -216,7 +225,7 @@ describe("rows", () => {
   test("clamps the page size and the page", async () => {
     const result = await controlRows(
       db.d1,
-      rowsQuery("invite", { page: -3, pageSize: 1000 })
+      rowsQuery("email_invite", { page: -3, pageSize: 1000 })
     );
 
     expect(result.page).toBe(0);
@@ -534,7 +543,7 @@ describe("write refusals", () => {
       writeControlD1(db.d1, {
         actorId: "admin1",
         op: "insert",
-        table: "invite",
+        table: "email_invite",
         values: { nope: "x" },
       })
     ).rejects.toThrow(/unknown column/u);
@@ -542,7 +551,7 @@ describe("write refusals", () => {
       writeControlD1(db.d1, {
         actorId: "admin1",
         op: "insert",
-        table: "invite",
+        table: "email_invite",
         values: {},
       })
     ).rejects.toThrow(/no values/u);
@@ -559,95 +568,118 @@ describe("write refusals", () => {
 });
 
 describe("permitted writes", () => {
-  test("an invite round-trips (explicit id, then an update)", async () => {
+  test("an email invite round-trips (explicit id, then an update)", async () => {
     await writeControlD1(db.d1, {
       actorId: "admin1",
       op: "insert",
-      table: "invite",
+      table: "email_invite",
       values: {
-        code: "ABCD-EFGH-JKLM",
         createdBy: "admin1",
+        email: "friend@example.com",
+        expiresAt: "2030-01-01T00:00:00.000Z",
         id: "11111111-1111-1111-1111-111111111111",
-        note: "first",
+        tokenHash: "HASH-1",
       },
     });
 
     // SAFETY: the query selects exactly these two columns from bun:sqlite,
     // which returns one plain row object (or null).
-    const inserted = db.raw.query(`SELECT id, note FROM invite`).get() as {
+    const inserted = db.raw
+      .query(`SELECT id, email FROM email_invite`)
+      .get() as {
       id: string;
-      note: string;
+      email: string;
     } | null;
 
-    expect(inserted?.note).toBe("first");
+    expect(inserted?.email).toBe("friend@example.com");
     expect(inserted?.id).toBe("11111111-1111-1111-1111-111111111111");
 
     await writeControlD1(db.d1, {
       actorId: "admin1",
       key: { id: inserted?.id ?? "" },
       op: "update",
-      table: "invite",
-      values: { note: "second note" },
+      table: "email_invite",
+      values: { email: "other@example.com" },
     });
-    expect(db.raw.query(`SELECT note FROM invite`).get()).toEqual({
-      note: "second note",
+    expect(db.raw.query(`SELECT email FROM email_invite`).get()).toEqual({
+      email: "other@example.com",
     });
-    const result = await controlRows(db.d1, rowsQuery("invite"));
-    expect(cell(result, "note")).toBe("second note");
+    const result = await controlRows(db.d1, rowsQuery("email_invite"));
+    expect(cell(result, "email")).toBe("other@example.com");
   });
 
   test('null binds SQL NULL and "" an empty string', async () => {
     await writeControlD1(db.d1, {
       actorId: "admin1",
       op: "insert",
-      table: "invite",
-      values: { code: "C1", createdBy: "a", id: "i1", note: null },
+      table: "email_invite",
+      values: {
+        createdBy: "a",
+        email: "e1@example.com",
+        expiresAt: "2030-01-01T00:00:00.000Z",
+        id: "i1",
+        tokenHash: "H1",
+        usedBy: null,
+      },
     });
     await writeControlD1(db.d1, {
       actorId: "admin1",
       op: "insert",
-      table: "invite",
-      values: { code: "C2", createdBy: "a", id: "i2", note: "" },
+      table: "email_invite",
+      values: {
+        createdBy: "a",
+        email: "e2@example.com",
+        expiresAt: "2030-01-01T00:00:00.000Z",
+        id: "i2",
+        tokenHash: "H2",
+        usedBy: "",
+      },
     });
-    const result = await controlRows(db.d1, rowsQuery("invite"));
-    expect(cell(result, "note", 0)).toBeNull();
-    expect(cell(result, "note", 1)).toBe("");
+    const result = await controlRows(db.d1, rowsQuery("email_invite"));
+    expect(cell(result, "usedBy", 0)).toBeNull();
+    expect(cell(result, "usedBy", 1)).toBe("");
 
     // The same round-trip through update.
     await writeControlD1(db.d1, {
       actorId: "admin1",
       key: { id: "i1" },
       op: "update",
-      table: "invite",
-      values: { note: "" },
+      table: "email_invite",
+      values: { usedBy: "" },
     });
     await writeControlD1(db.d1, {
       actorId: "admin1",
       key: { id: "i2" },
       op: "update",
-      table: "invite",
-      values: { note: null },
+      table: "email_invite",
+      values: { usedBy: null },
     });
-    const after = await controlRows(db.d1, rowsQuery("invite"));
-    expect(cell(after, "note", 0)).toBe("");
-    expect(cell(after, "note", 1)).toBeNull();
+    const after = await controlRows(db.d1, rowsQuery("email_invite"));
+    expect(cell(after, "usedBy", 0)).toBe("");
+    expect(cell(after, "usedBy", 1)).toBeNull();
   });
 
   test("an insert omitting a column applies its DDL default", async () => {
     await writeControlD1(db.d1, {
       actorId: "admin1",
       op: "insert",
-      table: "invite",
-      values: { code: "CODE", createdBy: "admin1", id: "i1" },
+      table: "email_invite",
+      values: {
+        createdBy: "admin1",
+        email: "e@example.com",
+        expiresAt: "2030-01-01T00:00:00.000Z",
+        id: "i1",
+        tokenHash: "H",
+      },
     });
 
     // SAFETY: the query selects exactly these columns from bun:sqlite, which
     // returns one plain row object (or null).
     const row = db.raw
-      .query(`SELECT note, revoked, createdAt FROM invite`)
+      .query(`SELECT usedBy, revoked, createdAt FROM email_invite`)
       .get() as {
       createdAt: string;
-      note: string | null;
+      usedBy: string | null;
       revoked: number;
     } | null;
 
@@ -655,20 +687,25 @@ describe("permitted writes", () => {
     // default instead of a NULL that would violate the schema.
     expect(row?.revoked).toBe(0);
     expect(row?.createdAt).toBeTruthy();
-    expect(row?.note).toBeNull();
+    expect(row?.usedBy).toBeNull();
     // An omitted empty `id` primary key is filled with a generated UUID
     // (the control schema's `id(uuidv4)` convention).
     await writeControlD1(db.d1, {
       actorId: "admin1",
       op: "insert",
-      table: "invite",
-      values: { code: "NO-ID", createdBy: "a" },
+      table: "email_invite",
+      values: {
+        createdBy: "a",
+        email: "n@example.com",
+        expiresAt: "2030-01-01T00:00:00.000Z",
+        tokenHash: "NO-ID",
+      },
     });
 
     // SAFETY: the query selects exactly `id` from bun:sqlite, which returns
     // one plain row object (or null).
     const generated = db.raw
-      .query(`SELECT id FROM invite WHERE code = 'NO-ID'`)
+      .query(`SELECT id FROM email_invite WHERE tokenHash = 'NO-ID'`)
       .get() as { id: string } | null;
 
     expect(generated?.id).toHaveLength(36);
@@ -677,10 +714,14 @@ describe("permitted writes", () => {
       writeControlD1(db.d1, {
         actorId: "admin1",
         op: "insert",
-        table: "invite",
-        values: { createdBy: "a" },
+        table: "email_invite",
+        values: {
+          createdBy: "a",
+          email: "m@example.com",
+          expiresAt: "2030-01-01T00:00:00.000Z",
+        },
       })
-    ).rejects.toThrow(/invite\.code is required/u);
+    ).rejects.toThrow(/email_invite\.tokenHash is required/u);
   });
 
   test("a session can be revoked by primary key", async () => {
@@ -698,22 +739,24 @@ describe("permitted writes", () => {
   });
 
   test("deleteRows removes 1..100 rows in one policy-checked batch", async () => {
-    addInvite("i1", "C1", "a");
-    addInvite("i2", "C2", "b");
-    addInvite("i3", "C3", "c");
+    addEmailInvite("i1", "e1@example.com", "H1");
+    addEmailInvite("i2", "e2@example.com", "H2");
+    addEmailInvite("i3", "e3@example.com", "H3");
     const before = db.executed.length;
 
     const result = await deleteControlRows(db.d1, {
       actorId: "admin1",
       keys: [{ id: "i1" }, { id: "i2" }, { id: "i3" }],
-      table: "invite",
+      table: "email_invite",
     });
 
     expect(result).toEqual({ deleted: 3, ok: true });
     expect(
       db.executed.slice(before).filter((sql) => sql.startsWith("DELETE"))
     ).toHaveLength(3);
-    expect(db.raw.query(`SELECT COUNT(*) AS n FROM invite`).get()).toEqual({
+    expect(
+      db.raw.query(`SELECT COUNT(*) AS n FROM email_invite`).get()
+    ).toEqual({
       n: 0,
     });
   });
@@ -756,13 +799,17 @@ describe("permitted writes", () => {
       })
     ).rejects.toThrow(/your own account cannot be deleted/u);
     await expect(
-      deleteControlRows(db.d1, { actorId: "admin1", keys: [], table: "invite" })
+      deleteControlRows(db.d1, {
+        actorId: "admin1",
+        keys: [],
+        table: "email_invite",
+      })
     ).rejects.toThrow(/delete 1 to 100/u);
     await expect(
       deleteControlRows(db.d1, {
         actorId: "admin1",
         keys: Array.from({ length: 101 }, (_, index) => ({ id: `i${index}` })),
-        table: "invite",
+        table: "email_invite",
       })
     ).rejects.toThrow(/delete 1 to 100/u);
   });
@@ -782,7 +829,7 @@ describe("gate", () => {
   });
 
   test("capabilities are default-deny per table", () => {
-    expect(controlTableCaps("invite")).toEqual({
+    expect(controlTableCaps("email_invite")).toEqual({
       delete: true,
       insert: true,
       update: true,
