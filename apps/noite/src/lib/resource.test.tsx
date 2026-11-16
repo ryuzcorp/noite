@@ -710,13 +710,24 @@ describe("errorDetail recovery", () => {
       let calls = 0;
       const seen: string[] = [];
 
-      const body = {
+      const body: RunnerErrorDetail = {
         events: [],
         issue: {
+          count: 1,
+          culprit: "fetch",
           fingerprint: "fp-flake",
+          firstSeenUs: 1_794_436_039_000_000,
+          firstSha: null,
+          handler: "fetch",
+          hourly: [1],
           kind: "Error",
+          lastSeenUs: 1_794_436_039_000_000,
+          lastSha: null,
           message: "phase1-boom-e2e",
+          regressed: false,
           source: "uncaught",
+          status: "open",
+          statusAtUs: null,
         },
       };
 
