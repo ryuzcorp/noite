@@ -1085,4 +1085,58 @@ mod tests {
             "every app_id-keyed table in schema.metrics.sql must be purged"
         );
     }
+
+    /// The slug-prefix mark deletes never cross slug boundaries: `foo` takes
+    /// `foo` and `foo.staging` but not `foo-bar` or `foobar`, and a
+    /// pre-grammar mark key carrying LIKE wildcards (`100%`, `a_b`) matches
+    /// literally instead of widening the wipe.
+    #[tokio::test]
+    async fn slug_mark_deletes_do_not_cross_slug_boundaries() {
+        let db = FileDb::new().await;
+        let pool = &db.pool;
+        for key in ["foo", "foo.staging", "foo-bar", "foobar", "100%", "a_b"] {
+            sqlx::query("INSERT INTO metrics.metric_watermark (slug, after_us) VALUES (?, 1)")
+                .bind(key)
+                .execute(pool)
+                .await
+                .expect("seed watermark");
+            sqlx::query(
+                "INSERT INTO metrics.metric_compaction (slug, hour, compacted_at) \
+                 VALUES (?, '2026/11/13/07', '2026-11-13T08:00:00Z')",
+            )
+            .bind(key)
+            .execute(pool)
+            .await
+            .expect("seed compaction");
+        }
+        assert_eq!(
+            delete_metric_watermarks_for_slug(pool, "foo")
+                .await
+                .expect("watermarks"),
+            2,
+            "only the slug and its environment fleet key go"
+        );
+        assert_eq!(
+            crate::db::delete_compactions_for_slug(pool, "foo")
+                .await
+                .expect("compactions"),
+            2,
+            "only the slug and its environment fleet key go"
+        );
+        for key in ["foo-bar", "foobar", "100%", "a_b"] {
+            let w: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM metrics.metric_watermark WHERE slug = ?")
+                    .bind(key)
+                    .fetch_one(pool)
+                    .await
+                    .expect("watermark survivor");
+            let c: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM metrics.metric_compaction WHERE slug = ?")
+                    .bind(key)
+                    .fetch_one(pool)
+                    .await
+                    .expect("compaction survivor");
+            assert_eq!((w, c), (1, 1), "neighbour slug {key} keeps its marks");
+        }
+    }
 }

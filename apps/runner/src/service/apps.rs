@@ -249,6 +249,22 @@ async fn create_inner(
             {
                 tracing::warn!(slug, error = %e, "could not clear the slug's purge tombstones");
             }
+            // The dead fleet's marks go before the row lands: they are keyed
+            // by fleet key (`<slug>`, `<slug>.<label>`), and once the row
+            // exists nothing retries them — the new app would inherit the
+            // dead fleet's watermark and skipped compactions. Unlike the
+            // tombstone, a failure here fails the create.
+            if let Err(e) = db::delete_metric_watermarks_for_slug(&state.pool, slug).await {
+                let step = step_failure("could not clear the slug's ingest marks", &e.to_string());
+                return Err(ApiError::internal(format!("create {slug}: {step}")));
+            }
+            if let Err(e) = db::delete_compactions_for_slug(&state.pool, slug).await {
+                let step = step_failure(
+                    "could not clear the slug's compaction marks",
+                    &e.to_string(),
+                );
+                return Err(ApiError::internal(format!("create {slug}: {step}")));
+            }
         }
         Ok(purge::Purged::Stopped) => {
             return Err(ApiError::internal(format!(
@@ -3255,6 +3271,67 @@ mod tests {
             crate::db::count_slug_mark_rows(&state.pool, &keeper.slug).await,
             4,
             "the surviving app keeps its fleet marks"
+        );
+        drop(dir);
+    }
+
+    /// A create re-taking a slug with stale marks starts from the floor: the
+    /// take-over wipe drops the dead fleet's watermark and compaction rows
+    /// before the row lands, so the new app never skips the old ranges.
+    #[tokio::test]
+    async fn create_on_a_slug_with_stale_marks_starts_from_the_floor() {
+        let (state, dir) = test_state(10).await;
+        db::seed_app_telemetry_rows(&state.pool, "dead-app-id", "retake", "env1", "staging").await;
+        assert_eq!(
+            db::count_slug_mark_rows(&state.pool, "retake").await,
+            4,
+            "stale marks exist before the create"
+        );
+
+        let app = create(&state, "Retake", "retake", Some("u1"), None)
+            .await
+            .expect("create");
+
+        assert_eq!(
+            db::count_slug_mark_rows(&state.pool, &app.slug).await,
+            0,
+            "the take-over wipe drops the dead fleet's marks before the row lands"
+        );
+        drop(dir);
+    }
+
+    /// Same for a rename onto a slug with stale marks: the target wipe drops
+    /// them before anything moves, so the renamed app starts from the floor.
+    #[tokio::test]
+    async fn rename_onto_a_slug_with_stale_marks_starts_from_the_floor() {
+        let store = spawn_object_store().await;
+        let (state, dir) = test_state_with_s3(10, store.endpoint.clone()).await;
+        let keeper = db::create_app(
+            &state.pool,
+            &state.config,
+            db::NewApp {
+                name: "Keeper",
+                slug: "mk-old",
+                user_id: "u1",
+                subdomain: "mk-old.localhost",
+                listen: 30630,
+                internal: 30631,
+            },
+        )
+        .await
+        .expect("keeper row");
+        db::seed_app_telemetry_rows(&state.pool, "dead-app-id", "mk-target", "env1", "staging")
+            .await;
+
+        let renamed = rename(&state, &keeper.id, None, Some("mk-target"))
+            .await
+            .expect("rename onto a slug with stale marks");
+
+        assert_eq!(renamed.slug, "mk-target");
+        assert_eq!(
+            db::count_slug_mark_rows(&state.pool, "mk-target").await,
+            0,
+            "the target wipe drops the dead fleet's marks before anything moves"
         );
         drop(dir);
     }

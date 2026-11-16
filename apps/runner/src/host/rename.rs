@@ -1031,6 +1031,21 @@ async fn rename_app_inner(
                     .with_context(|| {
                         format!("clear the target slug's purge tombstone for {new_slug}")
                     })?;
+                // The dead fleet's marks go before anything moves: they are
+                // keyed by fleet key, and once the row names the target
+                // nothing retries them — the renamed app would inherit the
+                // dead fleet's watermark and skipped compactions. Fail before
+                // moving anything instead, like the tombstone above.
+                db::delete_metric_watermarks_for_slug(pool, new_slug)
+                    .await
+                    .with_context(|| {
+                        format!("clear the target slug's ingest marks for {new_slug}")
+                    })?;
+                db::delete_compactions_for_slug(pool, new_slug)
+                    .await
+                    .with_context(|| {
+                        format!("clear the target slug's compaction marks for {new_slug}")
+                    })?;
                 // Written *after* the wipe (so it never vouches for a prefix
                 // the wipe did not finish) and *before* the first move.
                 write_rename_marker(cfg, &app.id, &app.slug, new_slug).await?;

@@ -371,17 +371,21 @@ pub async fn resume_pending(
         // delete from before that wipe existed). App ids are never reused, so
         // deleting by tombstoned id is safe even when a new app already owns
         // the slug; the slug-keyed marks only go on the wipe branch below,
-        // where no row owns the slug.
+        // where no row owns the slug. A failure keeps the tombstone below, so
+        // the next pass retries the rows.
+        let mut telemetry_clean = true;
         match crate::db::purge_app_ids(pool, &slug).await {
             Ok(ids) => {
                 for app_id in &ids {
                     if let Err(e) = crate::db::delete_app_telemetry(pool, app_id).await {
                         tracing::warn!(slug, app_id = %app_id, error = %e, "resumed purge could not drop the app's metrics rows; the next pass retries");
+                        telemetry_clean = false;
                     }
                 }
             }
             Err(e) => {
                 tracing::warn!(slug, error = %e, "resumed purge could not list its tombstoned app ids; leaving them for the next pass");
+                telemetry_clean = false;
             }
         }
         // `Ok(true)`: the prefixes are empty (or the taker's wipe made them so)
@@ -430,11 +434,18 @@ pub async fn resume_pending(
         };
         match satisfied {
             Ok(true) => {
-                match clear_purges_if_no_rename(cfg, pool, &slug).await {
-                    Ok(_) => report.cleared += 1,
-                    Err(e) => {
-                        tracing::warn!(slug, error = %e, "pending purge wiped the slug but could not clear its tombstone");
-                        report.failed += 1;
+                if !telemetry_clean {
+                    // The wipe is done but the app's metrics rows may remain:
+                    // keep the tombstone so the next pass retries them with
+                    // the (now empty) wipe.
+                    report.failed += 1;
+                } else {
+                    match clear_purges_if_no_rename(cfg, pool, &slug).await {
+                        Ok(_) => report.cleared += 1,
+                        Err(e) => {
+                            tracing::warn!(slug, error = %e, "pending purge wiped the slug but could not clear its tombstone");
+                            report.failed += 1;
+                        }
                     }
                 }
                 // The resume pass wiped the target (or a new owner did): a
@@ -1522,6 +1533,67 @@ mod tests {
             db::count_slug_mark_rows(&pool, &app.slug).await,
             0,
             "the resumed pass drops the deleted app's fleet marks"
+        );
+        pool.close().await;
+    }
+
+    /// A failing telemetry delete keeps the tombstone: the wipe may be done,
+    /// but the rows are not, so the next pass must retry them instead of
+    /// clearing the only record that they are owed.
+    #[tokio::test]
+    async fn a_failed_telemetry_delete_keeps_the_tombstone() {
+        let scratch = crate::testutil::TempDir::new("noite-purge-metrics-fail");
+        let mut cfg = crate::config::config_for_tests();
+        cfg.work_dir = scratch.path().join("work").to_string_lossy().into_owned();
+        cfg.s3_endpoint = crate::testutil::spawn_s3_stub().await;
+        let pool = db::connect(&format!(
+            "sqlite:{}?mode=rwc",
+            scratch.path().join("noite.sqlite").display()
+        ))
+        .await
+        .expect("file db");
+        let app = db::create_app(
+            &pool,
+            &cfg,
+            db::NewApp {
+                name: "kept",
+                slug: "kept",
+                user_id: "local",
+                subdomain: "kept.localhost",
+                listen: 30310,
+                internal: 30311,
+            },
+        )
+        .await
+        .expect("app");
+        db::seed_app_telemetry_rows(&pool, &app.id, &app.slug, "env1", "staging").await;
+        db::delete_app(&pool, &app.id).await.expect("delete row");
+        // Break the telemetry delete on every connection: without its first
+        // table the per-id wipe always errors.
+        sqlx::query("DROP TABLE metrics.app_hour")
+            .execute(&pool)
+            .await
+            .expect("drop app_hour");
+
+        let report = resume_pending(
+            &pool,
+            &cfg,
+            &crate::host::supervisor::new_procs(),
+            &crate::host::logs::new_state(),
+            &ryuz_git::GitSync::default(),
+        )
+        .await;
+
+        assert_eq!(report.pending, 1);
+        assert_eq!(
+            report.cleared, 0,
+            "nothing clears while telemetry may remain"
+        );
+        assert_eq!(report.failed, 1);
+        assert_eq!(
+            db::pending_purges(&pool).await.expect("tombstones"),
+            vec!["kept".to_string()],
+            "the tombstone stays for the next pass"
         );
         pool.close().await;
     }
