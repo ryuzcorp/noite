@@ -178,6 +178,27 @@ pub async fn retry_import(
 ) -> impl IntoResponse {
     service::apps::retry_import(&state, &id).await.map(Json)
 }
+/// The Sync from GitHub status: the stored origin, the last synced sha, the
+/// current tip and how many Noite commits a sync would overwrite.
+pub async fn github_sync_status(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    service::github_sync::status(&state, &id).await.map(Json)
+}
+
+/// Force sync the production branch with the GitHub origin (one new commit
+/// with the origin's tree, then the normal deploy path). A sync that would
+/// overwrite Noite commits needs `confirm`; a stale `expectedTip` is a 409.
+pub async fn sync_from_github(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<service::github_sync::GithubSyncBody>,
+) -> impl IntoResponse {
+    service::github_sync::sync(&state, &id, &body)
+        .await
+        .map(Json)
+}
 
 pub async fn get_app(State(state): State<AppState>, Path(id): Path<String>) -> impl IntoResponse {
     service::apps::get(&state, &id).await.map(Json)

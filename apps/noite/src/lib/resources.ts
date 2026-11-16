@@ -31,6 +31,7 @@ import type {
   D1Tables,
   D1TableSchema,
   DoPreview,
+  GithubSyncStatus,
   R2File,
   R2Preview,
   RunnerDomain,
@@ -146,6 +147,7 @@ export const keys = {
   environments: (id: string) => `app:${id}:environments`,
   errorDetail: (appId: string, fingerprint: string, environmentId = "") =>
     `app:${appId}:error:${fingerprint}${environmentId === "" ? "" : `:env:${environmentId}`}`,
+  githubSync: (id: string) => `app:${id}:github-sync`,
   ingestKey: (id: string) => `app:${id}:ingest-key`,
   inviteCodes: "me:invites",
   limits: (id: string) => `app:${id}:limits`,
@@ -168,6 +170,14 @@ export const keys = {
 
 export const appDetail = (id: string) =>
   tracked(keys.appDetail(id), () => api<AppDetail>("/api/apps/get", id));
+
+/** The Sync from GitHub status: the stored origin, the last synced sha, the
+ * current tip and how many Noite commits a sync would overwrite. Read by the
+ * Overview's sync card (imported apps with the push role only). */
+export const githubSync = (id: string) =>
+  tracked(keys.githubSync(id), () =>
+    api<GithubSyncStatus>("/api/apps/githubSyncStatus", id)
+  );
 
 export const appStorage = (id: string) =>
   tracked(keys.appStorage(id), () =>

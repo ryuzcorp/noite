@@ -48,6 +48,11 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/v1/apps/{id}/rename", post(api::rename_app))
         .route("/v1/apps/{id}/retry-import", post(api::retry_import))
+        .route("/v1/apps/{id}/github-sync", get(api::github_sync_status))
+        .route(
+            "/v1/apps/{id}/sync-from-github",
+            post(api::sync_from_github),
+        )
         .route("/v1/apps/{id}/sleep", post(api::sleep_app))
         .route("/v1/apps/{id}/state/stream", get(api::app_state_stream))
         .route(

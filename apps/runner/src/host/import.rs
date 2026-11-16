@@ -61,13 +61,14 @@ pub struct ImportTarget {
 /// Whether a clone may use `file://` — only the tests turn this on, so the API
 /// path can never reach a local path (the security boundary is
 /// [`github_url`], and this keeps the seam explicit instead of loosening it).
+/// The GitHub sync lane reuses the same seam for its own tests.
 #[derive(Debug, Clone, Copy, Default)]
-struct Protocols {
-    file: bool,
+pub(crate) struct Protocols {
+    pub(crate) file: bool,
 }
 
 impl Protocols {
-    fn args(&self) -> Vec<String> {
+    pub(crate) fn args(&self) -> Vec<String> {
         let mut args = vec!["-c".to_string(), "protocol.allow=never".to_string()];
         args.push("-c".to_string());
         args.push("protocol.https.allow=always".to_string());
@@ -257,10 +258,19 @@ struct ImportRun {
 static IMPORTS: LazyLock<Mutex<HashMap<String, ImportRun>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
+/// One attempt per app: the slot check and the insert are one locked step (see
+/// [`spawn`]).
 fn imports() -> std::sync::MutexGuard<'static, HashMap<String, ImportRun>> {
     IMPORTS
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Whether this process currently runs an import for the app. The sync lane
+/// reads it to refuse a sync while an import is running; the map's value
+/// type stays private behind this predicate.
+pub(crate) fn is_running(app_id: &str) -> bool {
+    imports().contains_key(app_id)
 }
 
 /// The cancel-registry key of one app's import: its own namespace, so an
@@ -381,7 +391,8 @@ const IMPORT_STOP_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The whole import, with the app row's status moved by the outcome. Only runs
 /// while the app is still `importing`, so a push that raced the import (and
-/// already started a deploy) is never clobbered.
+/// already started a deploy) is never clobbered. Records the cloned origin
+/// sha, so a later GitHub sync can count the Noite commits it would overwrite.
 async fn run(
     state: &AppState,
     app: &App,
@@ -389,7 +400,7 @@ async fn run(
     protocols: Protocols,
 ) -> anyhow::Result<()> {
     match import_once(state, app, source, protocols).await {
-        Ok(sha) => {
+        Ok((sha, origin)) => {
             note(
                 state,
                 &app.id,
@@ -397,6 +408,11 @@ async fn run(
                 &format!("{} at {}", source.url, &sha[..sha.len().min(7)]),
             )
             .await;
+            // Best effort: a lost write only makes the next sync status count
+            // more local history, never a wrong tree.
+            if let Err(e) = db::set_last_sync_sha(&state.pool, &app.id, &origin).await {
+                tracing::warn!(app_id = %app.id, error = %format!("{e:#}"), "import last-sync record");
+            }
             if !db::finish_app_import(&state.pool, &app.id, AppStatus::Provisioned, None)
                 .await?
                 .is_applied()
@@ -427,13 +443,14 @@ async fn run(
 
 /// Clone, fetch into the push mirror, optionally squash, then publish `main`
 /// (bundles + manifest + TipNotify through the one publish path a push uses).
-/// Returns the published sha.
+/// Returns the published sha and the cloned origin sha (the same when the
+/// history is kept; the upstream tip when it is squashed).
 async fn import_once(
     state: &AppState,
     app: &App,
     source: &GitSource,
     protocols: Protocols,
-) -> anyhow::Result<String> {
+) -> anyhow::Result<(String, String)> {
     let target = github_url(&source.url).map_err(|e| anyhow::anyhow!("{e}"))?;
     if let Some(reference) = &source.reference {
         import_ref(reference).map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -478,7 +495,7 @@ async fn import_into(
     target: &ImportTarget,
     scratch: &Path,
     protocols: Protocols,
-) -> anyhow::Result<String> {
+) -> anyhow::Result<(String, String)> {
     // The clone itself enforces the size cap while it runs and on exit
     // (`run_grouped`), so by here the repository is within it.
     let upstream_sha =
@@ -538,14 +555,14 @@ async fn import_into(
         Some(&published),
     )
     .await?;
-    Ok(published)
+    Ok((published, upstream_sha))
 }
 
 /// The tree a squashed import commits, and the `owner/repo[/path]` its commit
 /// message names: the whole fetched tree, or — for a `path` import — that
 /// subdirectory's own tree, so it becomes the app's root. A path that is
 /// missing, or names a file, fails with a message the app's import error shows.
-async fn squash_tree(
+pub(crate) async fn squash_tree(
     mirror: &Path,
     staged: &str,
     target: &ImportTarget,
@@ -694,7 +711,7 @@ fn log_tail(path: &Path) -> String {
 }
 
 /// Clone `target` bare into `scratch`; returns the cloned sha (`HEAD`).
-async fn clone_scratch(
+pub(crate) async fn clone_scratch(
     target: &ImportTarget,
     reference: Option<&str>,
     scratch: &Path,
@@ -735,7 +752,7 @@ fn git_dir(repo: &Path) -> String {
 
 /// `rev-parse --verify --end-of-options <rev>`: fails (rather than echoing the
 /// input back) on anything unborn or unknown.
-async fn rev_parse(repo: &Path, rev: &str) -> anyhow::Result<String> {
+pub(crate) async fn rev_parse(repo: &Path, rev: &str) -> anyhow::Result<String> {
     let dir = git_dir(repo);
     let out = exec::run_cmd(
         "git",
@@ -763,7 +780,7 @@ async fn object_type(repo: &Path, id: &str) -> anyhow::Result<String> {
 }
 
 /// Fetch one local ref (or HEAD) into `dest_ref` in the mirror.
-async fn fetch_into(
+pub(crate) async fn fetch_into(
     mirror: &Path,
     from: &Path,
     source_ref: &str,
@@ -783,7 +800,7 @@ async fn fetch_into(
     .map(|_| ())
 }
 
-async fn drop_ref(repo: &Path, refname: &str) -> anyhow::Result<()> {
+pub(crate) async fn drop_ref(repo: &Path, refname: &str) -> anyhow::Result<()> {
     let dir = git_dir(repo);
     exec::run_cmd(
         "git",

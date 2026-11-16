@@ -37,8 +37,8 @@ pub(crate) mod tests;
 
 pub use admin::{snapshot, stats};
 pub use apps::{
-    app_state_stream, create_app, delete_app, get_app, get_app_by_slug, health, list_apps,
-    patch_app, ready, rename_app, retry_import, sleep_app,
+    app_state_stream, create_app, delete_app, get_app, get_app_by_slug, github_sync_status, health,
+    list_apps, patch_app, ready, rename_app, retry_import, sleep_app, sync_from_github,
 };
 pub use deploys::{
     cancel_deploy, deploy_branch, deploy_log, list_deploys, list_deploys_stream, rollback,

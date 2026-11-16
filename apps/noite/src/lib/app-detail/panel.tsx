@@ -29,6 +29,7 @@ import type { HeaderMessage, HeaderModel } from "./app-header.machine";
 import { capabilities } from "./capabilities";
 import { DeployDropdown } from "./deploys";
 import { ErrorsSummary } from "./errors";
+import { GithubSyncCard } from "./github-sync";
 import { appLifecycle, lifecycleView } from "./lifecycle";
 import type { LifecycleView } from "./lifecycle";
 import { MetricsCard } from "./metrics";
@@ -344,6 +345,7 @@ const FirstPushCard = ({ appId }: { appId: string }) => {
 export const AppDetailPanel = ({ appId }: { appId: string }) => (
   <div class="@container flex flex-col gap-4">
     <FirstPushCard appId={appId} />
+    <GithubSyncCard appId={appId} />
     {/* Columns follow the tab body's width, not the viewport's, so a narrow
         body stacks the cards instead of squeezing them. */}
     <div class="grid grid-cols-1 gap-4 @4xl:grid-cols-2">

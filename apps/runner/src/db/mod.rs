@@ -36,8 +36,8 @@ pub use apps::{
     list_all_apps, list_app_domains, list_app_limits, list_apps, list_domains_for,
     patch_app_desired, pending_purges, purge_app_ids, rebind_local_subdomains, remove_domain,
     rename_app, rename_app_name, rename_app_slug, set_app_asleep, set_app_awake,
-    set_app_import_source, set_app_limit, set_deployed_config, verified_domain_owner,
-    verify_domain, write_app_status, NewApp, VerifyOutcome,
+    set_app_import_source, set_app_limit, set_deployed_config, set_last_sync_sha,
+    verified_domain_owner, verify_domain, write_app_status, NewApp, VerifyOutcome,
 };
 pub use compaction::{
     bump_metric_version, delete_compactions_for, delete_compactions_for_slug, get_compacted_hours,
@@ -102,7 +102,7 @@ pub use void_cohost::{delete_environment_hashes, get_cohost_hash, set_cohost_has
 pub(super) const APP_COLS: &str = r#"id, slug, name, user_id, status, subdomain, git_prefix, fleet_bucket,
                   listen_port, internal_port, last_deploy_sha, last_error, desired_state,
                   created_at, updated_at, asleep_since, woke_at, deployed_config, import_source,
-                  (import_source IS NOT NULL) AS imported"#;
+                  last_sync_sha, (import_source IS NOT NULL) AS imported"#;
 
 /// Columns every error-issue query selects, in struct order. `regressed` is
 /// derived on read: the flag only means something for an `open` issue, so a

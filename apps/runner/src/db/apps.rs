@@ -64,6 +64,19 @@ pub async fn set_app_import_source(
     Ok(())
 }
 
+/// Record the origin sha an import or GitHub sync last synced to. Best
+/// effort: a lost write only makes the next sync status count more local
+/// history, never a wrong tree.
+pub async fn set_last_sync_sha(pool: &SqlitePool, id: &str, sha: &str) -> sqlx::Result<()> {
+    sqlx::query("UPDATE app SET last_sync_sha = ?, updated_at = ? WHERE id = ?")
+        .bind(sha)
+        .bind(now_iso())
+        .bind(id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
 pub async fn list_apps(pool: &SqlitePool) -> sqlx::Result<Vec<App>> {
     let sql = format!("SELECT {APP_COLS} FROM app ORDER BY created_at DESC");
     sqlx::query_as::<_, App>(sqlx::AssertSqlSafe(sql))

@@ -62,11 +62,13 @@ import {
   runnerSourceBlob,
   runnerSourceCommit,
   runnerSourceTree,
+  runnerSyncFromGithub,
 } from "../runner";
 import type {
   GitCommitDetail,
   GitLog,
   GitRefs,
+  GithubSyncBody,
   PrDetail,
   PrSummary,
   RunnerApp,
@@ -1999,6 +2001,56 @@ export const MCP_TOOLS: readonly McpToolDefinition[] = [
           slug: app.slug,
         },
         text: `Re-deploying ${app.slug} at ${sha10(result.sha)} (deploy ${result.deployId}) — wait_for_deploy follows it.`,
+      };
+    },
+  }),
+  defineTool({
+    description:
+      "Sync the production branch with the GitHub origin the app was imported from (needs the push role): one new commit with the origin's tree, then the normal deploy. Answers the new sha, or that the origin is unchanged. `confirm` acknowledges overwriting Noite commits in the tree (they stay in history); `expectedTip` is the compare-and-set — the sync is refused when the origin moved since it was read.",
+    name: "sync_from_github",
+    params: appParams({
+      confirm: Schema.optional(Schema.Boolean).annotate({
+        description:
+          "Acknowledge overwriting Noite commits in the tree (they stay in history). Omit unless a first attempt named the count.",
+      }),
+      expectedTip: Schema.optional(SourceRef).annotate({
+        description:
+          "Compare-and-set: refuse the sync unless the origin is still at this commit.",
+      }),
+    }),
+    run: async ({ principal }, { app: ref, confirm, expectedTip }) => {
+      const { app, role } = await requireGatedApp(principal, ref, "push");
+
+      const body: GithubSyncBody = { confirm: confirm ?? false, role };
+
+      if (expectedTip !== undefined) {
+        body.expectedTip = expectedTip;
+      }
+
+      const result = await attempt(() => runnerSyncFromGithub(app.id, body));
+
+      if (result.status === "upToDate") {
+        return {
+          structured: {
+            appId: app.id,
+            noiteOverwritten: null,
+            originSha: result.originSha,
+            sha: result.sha,
+            slug: app.slug,
+          },
+          text: `${app.slug} is already up to date with the origin at ${sha10(result.sha)}: no commit, no deploy.`,
+        };
+      }
+
+      return {
+        structured: {
+          appId: app.id,
+          noiteOverwritten: result.noiteOverwritten,
+          originSha: result.originSha,
+          sha: result.sha,
+          slug: app.slug,
+        },
+        text: `${app.slug}: synced with the origin at ${sha10(result.sha)}${result.noiteOverwritten === 0 ? "" : ` (${result.noiteOverwritten} Noite ${result.noiteOverwritten === 1 ? "commit was" : "commits were"} overwritten in the tree)`} — follow the deploy with wait_for_deploy.`,
       };
     },
   }),
