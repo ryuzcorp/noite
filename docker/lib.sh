@@ -77,6 +77,28 @@ remove_project() {
   done
 }
 
+# require_private_dir <dir>: ensure <dir> exists with mode 0700. Backup
+# destinations hold plaintext secrets (the runner SQLite with env values,
+# every tenant's objects), so they must never land in a shared directory by
+# accident. A directory this creates is chmod'd 0700 outright (independent
+# of the caller's umask); an existing directory that is group- or
+# world-accessible is refused instead of silently re-permissioned — like
+# ssh, fail loud: it may be shared with a backup agent on purpose, and that
+# is the operator's call. Under `set -e` a refusal aborts the caller.
+require_private_dir() {
+  if [ -e "$1" ]; then
+    _rpd_bits="$(ls -ld "$1" | awk '{ print substr($1, 6, 5) }')"
+    case "$_rpd_bits" in
+    -----) return 0 ;;
+    esac
+    echo "error: $1 is group- or world-accessible; backups hold plaintext secrets." >&2
+    echo "  chmod 700 $1 (or pick another directory) and run again." >&2
+    return 1
+  fi
+  mkdir -p "$1"
+  chmod 700 "$1"
+}
+
 # is_multi_tenancy: mirror the runner's parse_tenancy (apps/runner/src/config.rs).
 # Explicit NOITE_TENANCY wins (blank counts as unset); otherwise a
 # localhost-family BASE_DOMAIN means single, anything else means multi.

@@ -24,7 +24,7 @@ If a tenant is not someone you would give shell access to a shared server, do no
 
 ## Custom domains
 
-A hostname is reserved on first claim, and Noite does not check DNS or ownership: **a tenant can claim a hostname they do not own**, and the first claimant wins. The certificate is issued on demand on the first visit. Treat custom domains as an admin-trusted feature until a DNS/TXT check ships.
+Adding a hostname claims it for the app, and the claim stays **pending** until ownership is proven: publish the TXT record the panel shows (`_noite-challenge.<hostname>`) and press **Verify**. Only a verified hostname routes, resolves and gets a certificate (issued on demand on the first visit). Several apps may hold a pending claim for one hostname, but the first to verify wins: a hostname another app already verified answers 409, and verifying drops rival pending claims. Under `single` tenancy the one operator owns the DNS, so claims are born verified by design.
 
 ## Platforms
 
@@ -39,3 +39,4 @@ A hostname is reserved on first claim, and Noite does not check DNS or ownership
 - **Telemetry recovery is bounded by retention.** Metrics, logs and errors are rebuilt from bucket Parquet: a failed ingest pass now holds its watermark and catches up hour by hour, and a window can be replayed by hand. Nothing older than `RUNNER_TELEMETRY_RETENTION_DAYS` (30 days by default) can be recovered — celld has pruned it ([Telemetry](/self-hosting/storage#replaying-a-window)).
 - **One node.** The control UI and the runner restart together and nothing fails over; availability is that of the one container and its bucket.
 - **RustFS is not a qualified store.** It is the zero-config default and passes celld's startup check, but for production use one celld qualifies: S3, R2, GCS, Tigris or Azure Blob ([Storage](/self-hosting/storage)).
+- **Bundled SQLite carries a known advisory.** `libsqlite3-sys` RUSTSEC-2026-0459 / CVE-2026-119375: SQLite before 3.54.0 can return uninitialized page-cache memory when opening a database alongside a crafted `-wal` with a mismatched page size. Accepted on record: the runner opens only its own databases and restores snapshots only from `runner/state/`, which scoped fleet keys cannot write — and under the documented root-credential mode (R2) fleets already hold full store trust, so no less-trusted party can hand the runner a crafted pair. Lifted when sqlx releases on `libsqlite3-sys` ≥ 0.39.
