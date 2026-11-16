@@ -89,10 +89,21 @@ pub struct R2Raw {
 }
 
 /// A key the browser may write or delete: 1..=1024 bytes, no absolute path
-/// and no `..` segment, no control character. A trailing `/` is legal — it
-/// is the folder marker.
+/// and no `..` segment, no control character, and never a leading `-`. A
+/// trailing `/` is legal — it is the folder marker.
+///
+/// The leading dash is refused because celld's parser has no `--`
+/// end-of-options terminator (pinned fork, `crates/celld/r2_cli.rs`): a
+/// dash-led positional either refuses as `unknown option` or — when it
+/// exactly matches a flag — is consumed as that flag, taking the next key
+/// as its value. A `--bucket`/`--endpoint` key would redirect the call
+/// onto another fleet bucket or S3 endpoint with the runner's full store
+/// credentials, so the effect is not confined to the caller's bucket.
+/// R2 itself allows leading dashes, so such keys fail closed with
+/// `invalid key` here until celld learns `--`.
 pub fn r2_key_ok(key: &str) -> bool {
     !key.is_empty()
+        && !key.starts_with('-')
         && key.len() <= R2_MAX_KEY_BYTES
         && !key.starts_with('/')
         && !key.split('/').any(|segment| segment == "..")
@@ -103,6 +114,25 @@ pub fn r2_key_ok(key: &str) -> bool {
 /// passes `r2_key_ok` after its trailing `/` is normalized on.
 pub fn r2_prefix_ok(prefix: &str) -> bool {
     prefix.is_empty() || r2_key_ok(prefix)
+}
+
+/// An R2 bucket (binding) name bound for celld's first positional, mirroring
+/// celld's own `valid_resource_name` (`crates/celld/deploy.rs`): at most 64
+/// characters, first `_` or ASCII alphanumeric, the rest those plus `-`.
+/// The runner refuses a bad name with `invalid bucket` instead of spawning
+/// celld to refuse it — in particular a leading `-` must never reach the
+/// argv, where celld would read it as an option rather than the bucket.
+pub fn r2_bucket_ok(bucket: &str) -> bool {
+    !bucket.is_empty()
+        && bucket.len() <= 64
+        && bucket
+            .chars()
+            .next()
+            .is_some_and(|first| first == '_' || first.is_ascii_alphanumeric())
+        && bucket
+            .chars()
+            .skip(1)
+            .all(|other| other == '_' || other == '-' || other.is_ascii_alphanumeric())
 }
 
 /// A content type (or any header value) that is safe to place in a command
@@ -180,6 +210,38 @@ fn fleet_args<'a>(app: &'a App, cfg: &'a Config) -> [&'a str; 4] {
         "--endpoint",
         &cfg.s3_endpoint,
     ]
+}
+
+/// One `celld r2 <verb>` argv: the verb, the bucket celld reads as the arg
+/// right after it, then every fleet/option arg, then the user keys last.
+/// The bucket must stay third — celld takes it positionally before its
+/// flag loop, so a flag placed ahead of it reads as the bucket going
+/// missing. celld accepts its flags anywhere and has no `--` terminator,
+/// so keys go last by construction but every one is still validated:
+/// a leading-dash positional parses as an option even in last place.
+fn r2_argv<'a>(
+    verb: &'static str,
+    bucket: &'a str,
+    keys: &[&'a str],
+    options: &[&'a str],
+    fleet: &[&'a str],
+) -> anyhow::Result<Vec<&'a str>> {
+    if !r2_bucket_ok(bucket) {
+        anyhow::bail!("invalid bucket");
+    }
+    for key in keys {
+        if !r2_key_ok(key) {
+            anyhow::bail!("invalid key");
+        }
+    }
+    let mut args = Vec::with_capacity(2 + 1 + fleet.len() + options.len() + keys.len());
+    args.push("r2");
+    args.push(verb);
+    args.push(bucket);
+    args.extend_from_slice(fleet);
+    args.extend_from_slice(options);
+    args.extend_from_slice(keys);
+    Ok(args)
 }
 
 /// The `httpMetadata` half of a listed object. Only the content type reaches
@@ -290,25 +352,16 @@ pub async fn r2_list(
     let prefix = normalize_prefix(prefix);
     let fleet = fleet_args(app, cfg);
     let limit_arg = limit.clamp(1, R2_PAGE_LIMIT).to_string();
-    let mut args: Vec<&str> = vec![
-        "r2",
-        "list",
-        bucket,
-        "--delimiter",
-        "/",
-        "--page",
-        "--limit",
-        &limit_arg,
-    ];
+    let mut options: Vec<&str> = vec!["--delimiter", "/", "--page", "--limit", &limit_arg];
     if !prefix.is_empty() {
-        args.push("--prefix");
-        args.push(&prefix);
+        options.push("--prefix");
+        options.push(&prefix);
     }
     if let Some(token) = cursor {
-        args.push("--cursor");
-        args.push(token);
+        options.push("--cursor");
+        options.push(token);
     }
-    args.extend(fleet);
+    let args = r2_argv("list", bucket, &[], &options, &fleet)?;
     let out = run_celld(cfg, app, &args, CELD_TIMEOUT).await?;
     let page: CelldPage = serde_json::from_str(&out).context("parse celld r2 list --page")?;
     shape_page(app, bucket, &prefix, page)
@@ -335,8 +388,7 @@ struct CelldHead {
 /// object's error field instead of the English stderr.
 async fn r2_head(cfg: &Config, app: &App, bucket: &str, key: &str) -> anyhow::Result<R2Head> {
     let fleet = fleet_args(app, cfg);
-    let mut args: Vec<&str> = vec!["r2", "head", bucket, key, "--json"];
-    args.extend(fleet);
+    let args = r2_argv("head", bucket, &[key], &["--json"], &fleet)?;
     let output = run_celld_output(cfg, app, &args, None, CELD_TIMEOUT).await?;
     if output.status.success() {
         let out = String::from_utf8_lossy(&output.stdout);
@@ -364,8 +416,7 @@ async fn r2_head(cfg: &Config, app: &App, bucket: &str, key: &str) -> anyhow::Re
 /// bytes untouched; a missing key prints the not-found object instead.
 async fn r2_get_bytes(cfg: &Config, app: &App, bucket: &str, key: &str) -> anyhow::Result<Vec<u8>> {
     let fleet = fleet_args(app, cfg);
-    let mut args: Vec<&str> = vec!["r2", "get", bucket, key, "--json"];
-    args.extend(fleet);
+    let args = r2_argv("get", bucket, &[key], &["--json"], &fleet)?;
     let output = run_celld_output(cfg, app, &args, Some(&[]), CELD_UPLOAD_TIMEOUT).await?;
     if output.status.success() {
         return Ok(output.stdout);
@@ -428,12 +479,6 @@ pub async fn r2_put(
     content_type: Option<&str>,
     source: &Path,
 ) -> anyhow::Result<()> {
-    if !r2_key_ok(key) {
-        anyhow::bail!("invalid key");
-    }
-    if !r2_key_ok(bucket) {
-        anyhow::bail!("invalid bucket");
-    }
     if let Some(value) = content_type {
         if !r2_header_ok(value) {
             anyhow::bail!("invalid content type");
@@ -443,12 +488,12 @@ pub async fn r2_put(
         .to_str()
         .ok_or_else(|| anyhow::anyhow!("upload path is not UTF-8"))?;
     let fleet = fleet_args(app, cfg);
-    let mut args: Vec<&str> = vec!["r2", "put", bucket, key, "--path", path];
+    let mut options: Vec<&str> = vec!["--path", path];
     if let Some(value) = content_type {
-        args.push("--content-type");
-        args.push(value);
+        options.push("--content-type");
+        options.push(value);
     }
-    args.extend(fleet);
+    let args = r2_argv("put", bucket, &[key], &options, &fleet)?;
     run_celld(cfg, app, &args, CELD_UPLOAD_TIMEOUT).await?;
     Ok(())
 }
@@ -463,20 +508,9 @@ pub async fn r2_delete_many(
     if keys.is_empty() || keys.len() > R2_DELETE_LIMIT {
         anyhow::bail!("select 1 to {R2_DELETE_LIMIT} objects");
     }
-    if !r2_key_ok(bucket) {
-        anyhow::bail!("invalid bucket");
-    }
-    for key in keys {
-        if !r2_key_ok(key) {
-            anyhow::bail!("invalid key");
-        }
-    }
     let fleet = fleet_args(app, cfg);
-    let mut args: Vec<&str> = vec!["r2", "delete", bucket];
-    for key in keys {
-        args.push(key);
-    }
-    args.extend(fleet);
+    let key_refs: Vec<&str> = keys.iter().map(String::as_str).collect();
+    let args = r2_argv("delete", bucket, &key_refs, &[], &fleet)?;
     run_celld(cfg, app, &args, CELD_TIMEOUT).await?;
     Ok(keys.len())
 }
@@ -674,15 +708,9 @@ mod tests {
         let calls = fake.invocations();
         assert_eq!(calls.len(), 1, "{calls:?}");
         assert!(
-            calls[0].starts_with("r2 list uploads --delimiter / --page --limit 100"),
-            "{calls:?}"
-        );
-        assert!(
-            calls[0].contains("--bucket s3://noite/fleets/r2app"),
-            "{calls:?}"
-        );
-        assert!(
-            calls[0].contains("--endpoint http://rustfs:9000"),
+            calls[0].starts_with(
+                "r2 list uploads --bucket s3://noite/fleets/r2app --endpoint http://rustfs:9000 --delimiter / --page --limit 100"
+            ),
             "{calls:?}"
         );
         assert!(!calls[0].contains("--prefix"), "{calls:?}");
@@ -755,11 +783,15 @@ mod tests {
         let calls = fake.invocations();
         assert_eq!(calls.len(), 2, "{calls:?}");
         assert!(
-            calls[0].starts_with("r2 head uploads dir/a.txt --json"),
+            calls[0].starts_with(
+                "r2 head uploads --bucket s3://noite/fleets/r2app --endpoint http://rustfs:9000 --json dir/a.txt"
+            ),
             "{calls:?}"
         );
         assert!(
-            calls[1].starts_with("r2 get uploads dir/a.txt --json"),
+            calls[1].starts_with(
+                "r2 get uploads --bucket s3://noite/fleets/r2app --endpoint http://rustfs:9000 --json dir/a.txt"
+            ),
             "{calls:?}"
         );
     }
@@ -902,10 +934,121 @@ mod tests {
         assert!(!r2_header_ok(""));
     }
 
+    /// celld's parser has no `--` terminator, so a dash-led key either
+    /// refuses as `unknown option` or — when it exactly matches a flag —
+    /// is consumed as that flag with the next key as its value. The
+    /// validator must refuse them before they reach the argv.
+    #[test]
+    fn write_keys_reject_leading_dash() {
+        assert!(!r2_key_ok("--bucket"));
+        assert!(!r2_key_ok("--endpoint=http://127.0.0.1:9"));
+        assert!(!r2_key_ok("-x"));
+        assert!(!r2_prefix_ok("-dir/"));
+        assert!(r2_key_ok("dir/file.txt"));
+    }
+
+    /// An option-shaped key must fail closed with `invalid key` without
+    /// spawning celld: `delete` is the variadic verb where a `--bucket`
+    /// key would otherwise redirect the call onto another fleet bucket.
+    #[tokio::test]
+    async fn option_like_delete_keys_never_spawn() {
+        let fake = FakeCelld::spawn();
+        for keys in [
+            vec![
+                "--bucket".to_string(),
+                "s3://noite/fleets/other".to_string(),
+            ],
+            vec![
+                "a.txt".to_string(),
+                "--endpoint".to_string(),
+                "http://127.0.0.1:9".to_string(),
+            ],
+        ] {
+            let error = r2_delete_many(&fake.cfg(), &test_app(), "uploads", &keys)
+                .await
+                .unwrap_err();
+            assert!(format!("{error:#}").contains("invalid key"), "{error:#}");
+        }
+        assert!(fake.invocations().is_empty());
+    }
+
+    /// The bucket rides as celld's first positional, so a dash-led bucket
+    /// must fail closed with `invalid bucket` without spawning — on the
+    /// verbs that never validated it at all.
+    #[tokio::test]
+    async fn option_like_buckets_never_spawn() {
+        let fake = FakeCelld::spawn();
+        let error = r2_list(&fake.cfg(), &test_app(), "--bucket", "", None, 100)
+            .await
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("invalid bucket"), "{error:#}");
+        let error = r2_get(&fake.cfg(), &test_app(), "--endpoint", "a.txt")
+            .await
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("invalid bucket"), "{error:#}");
+        assert!(fake.invocations().is_empty());
+    }
+
     #[test]
     fn nested_page_prefix_is_normalized() {
         assert_eq!(normalize_prefix(""), "");
         assert_eq!(normalize_prefix("dir"), "dir/");
         assert_eq!(normalize_prefix("dir/"), "dir/");
+    }
+
+    /// The bucket validator mirrors celld's `valid_resource_name`: real
+    /// binding names pass, and anything that would parse as an option —
+    /// or that celld would refuse — fails here instead of at the spawn.
+    #[test]
+    fn buckets_match_celld_resource_names() {
+        assert!(r2_bucket_ok("uploads"));
+        assert!(r2_bucket_ok("_private"));
+        assert!(r2_bucket_ok("a-b_c9"));
+        assert!(!r2_bucket_ok(""));
+        assert!(!r2_bucket_ok("--bucket"));
+        assert!(!r2_bucket_ok("-uploads"));
+        assert!(!r2_bucket_ok("a/b"));
+        assert!(!r2_bucket_ok("a b"));
+        assert!(!r2_bucket_ok(&"x".repeat(65)));
+        assert!(r2_bucket_ok(&"x".repeat(64)));
+    }
+
+    /// The argv builder keeps the bucket third (celld reads it as the arg
+    /// right after the verb), fleet/option args next, and user keys last —
+    /// and an option-shaped bucket or key is refused, never placed.
+    #[test]
+    fn argv_orders_bucket_then_options_then_user_keys() {
+        let fleet = [
+            "--bucket",
+            "s3://noite/fleets/a",
+            "--endpoint",
+            "http://s3:9000",
+        ];
+        let args = r2_argv("delete", "uploads", &["a.txt", "b/c.txt"], &[], &fleet).unwrap();
+        assert_eq!(
+            args,
+            vec![
+                "r2",
+                "delete",
+                "uploads",
+                "--bucket",
+                "s3://noite/fleets/a",
+                "--endpoint",
+                "http://s3:9000",
+                "a.txt",
+                "b/c.txt",
+            ]
+        );
+        // The equals-form flag spelling has no meaning to celld's parser,
+        // but it still starts with a dash, so it must never reach the argv.
+        for keys in [
+            vec!["--endpoint=http://127.0.0.1:9"],
+            vec!["a.txt", "--bucket", "s3://noite/fleets/other"],
+        ] {
+            let error = r2_argv("delete", "uploads", &keys, &[], &fleet).unwrap_err();
+            assert!(format!("{error:#}").contains("invalid key"), "{error:#}");
+        }
+        let error = r2_argv("delete", "--bucket", &["a.txt"], &[], &fleet).unwrap_err();
+        assert!(format!("{error:#}").contains("invalid bucket"), "{error:#}");
     }
 }
