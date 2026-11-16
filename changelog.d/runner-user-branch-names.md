@@ -1,3 +1,0 @@
-### Fixed
-
-- A caller can no longer create a branch literally named `refs/…` (stored as `refs/heads/refs/…`, which shadows ref resolution for reserved namespaces such as `refs/previews/`, `refs/notes/` and `refs/seed/`). Branch create, the web commit's `branch` (which MCP `commit_files` reaches through REST), environment create, one-off branch deploys, and smart-HTTP pushes (`refs/heads/refs/*` is denied for every role) all refuse such names with a 400. PR create already refused them. A branch already stored under such a name stays readable and can still be deleted, so an affected repo can be cleaned up; `forge::publish_ref` itself is unchanged for internal callers.
