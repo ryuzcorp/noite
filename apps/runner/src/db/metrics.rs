@@ -14,6 +14,11 @@ use crate::models::{new_id, now_iso, AppMetric};
 /// the exact stamp, not just the bucket), or None when it never served within
 /// retention. The scale-to-zero sweep reads this: hour granularity would have
 /// loosened idle detection by up to an hour.
+///
+/// The filter is the stamp, not the counter: a burst the tail skips still
+/// touches the fleets it saw (`hourly::touch_request`, zero requests, stamp
+/// only), so their idle clocks survive the skip. Memory-only rows keep a zero
+/// stamp and stay invisible, exactly as before.
 pub async fn last_request_us(
     pool: &SqlitePool,
     app_id: &str,
@@ -21,7 +26,7 @@ pub async fn last_request_us(
 ) -> sqlx::Result<Option<i64>> {
     sqlx::query_scalar::<_, Option<i64>>(
         r#"SELECT MAX(last_request_us) FROM metrics.app_hour
-           WHERE app_id = ? AND environment_id = ? AND requests > 0"#,
+           WHERE app_id = ? AND environment_id = ? AND last_request_us > 0"#,
     )
     .bind(app_id)
     .bind(environment_id)

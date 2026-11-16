@@ -30,7 +30,7 @@
 //! (`access-log.offset`, holding `ino:off`). Caddy opens the log O_APPEND,
 //! so truncating below can't strand its file offset; truncation still only
 //! fires when the size is unchanged since the read, closing the usual race.
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use chrono::{DateTime, Utc};
@@ -41,12 +41,22 @@ use crate::db;
 use crate::host::edge::{parse_edge_slug, parse_env_host};
 use crate::host::errors::{RequestCtx, RequestIndex};
 use crate::host::metrics::hourly;
-
 /// Log lines are tiny; past this the file is truncated after consuming.
 const TRUNCATE_BYTES: u64 = 2 * 1024 * 1024;
-/// Burst guard: past this, skip to the end rather than buffering it all.
+/// Burst guard: past this, scan the skipped bytes for their fleets and jump
+/// to the end, rather than buffering it all.
 const MAX_CATCHUP_BYTES: u64 = 8 * 1024 * 1024;
-
+/// The burst scan streams the skipped region through this chunk: it never
+/// holds more than one chunk plus one bounded line prefix, however large the
+/// burst is.
+const SCAN_CHUNK_BYTES: usize = 64 * 1024;
+/// A line's host lives in its first bytes — Caddy's default JSON access log
+/// writes the fixed envelope (`level`, `ts`, `logger`, `msg`) then
+/// `request.remote_ip/remote_port/client_ip/proto/method/host`, so
+/// `request.host` lands within a few hundred bytes and the header block (the
+/// part header inflation bloats) only follows `uri`. An over-long line still
+/// attributes from this prefix; the rest is skipped without buffering.
+const SCAN_LINE_PREFIX_MAX: usize = 8 * 1024;
 /// Caddy writes here (its view of the shared volume); the runner reads the
 /// same file. Single source of truth is `CADDY_ACCESS_LOG`.
 pub fn access_log_path(cfg: &Config) -> PathBuf {
@@ -330,27 +340,7 @@ fn parse_line(
     // host (`<label>.<slug>.<base>`) to that environment's fleet, whose
     // rows key on the environment id. Slugs never contain dots, so the two
     // parsers never claim the same host (edge.rs pins this).
-    let (app_id, environment_id) =
-        match parse_edge_slug(host, &cfg.tenant_bases(), &cfg.control_subdomain) {
-            Some(slug) => (slug_id.get(&slug)?.clone(), String::new()),
-            None => match parse_env_host(host, &cfg.tenant_bases()) {
-                Some((slug, label)) => {
-                    let key = format!("{slug}.{label}");
-                    (slug_id.get(&key)?.clone(), slug_env.get(&key)?.clone())
-                }
-                // The control UI's own requests — its polling and SSE — are real load
-                // on the control node, so they land on the reserved control key the
-                // metrics ingest also uses. `api.`/`git.` hosts stay out (the runner's
-                // own edge is not a dashboard).
-                None if is_control_host(host, &cfg.control_hosts()) => {
-                    (crate::host::control::SLUG.to_string(), String::new())
-                }
-                // A verified custom domain is the app's own traffic, served by the
-                // same edge: without this the counters (and the idle clock that reads
-                // them) would see nothing for an app on its own hostname.
-                None => (domain_id.get(&bare_host(host))?.clone(), String::new()),
-            },
-        };
+    let (app_id, environment_id) = attribute_host(host, cfg, slug_id, slug_env, domain_id)?;
     let ua = first_header(&v, "User-Agent");
     let uri = v
         .pointer("/request/uri")
@@ -425,6 +415,148 @@ fn first_header<'a>(v: &'a serde_json::Value, name: &str) -> &'a str {
             }
         })
         .unwrap_or("")
+}
+
+/// A host's fleet: the production fleet for a tenant host, the
+/// environment's fleet for an environment host, the reserved control key
+/// for the control plane's own hosts, the owning app for a verified custom
+/// domain — the same rules the consuming tail uses, so the burst scan
+/// touches exactly the fleets the tail would have counted.
+fn attribute_host(
+    host: &str,
+    cfg: &Config,
+    slug_id: &HashMap<String, String>,
+    slug_env: &HashMap<String, String>,
+    domain_id: &HashMap<String, String>,
+) -> Option<(String, String)> {
+    match parse_edge_slug(host, &cfg.tenant_bases(), &cfg.control_subdomain) {
+        Some(slug) => Some((slug_id.get(&slug)?.clone(), String::new())),
+        None => match parse_env_host(host, &cfg.tenant_bases()) {
+            Some((slug, label)) => {
+                let key = format!("{slug}.{label}");
+                Some((slug_id.get(&key)?.clone(), slug_env.get(&key)?.clone()))
+            }
+            // The control UI's own requests — its polling and SSE — are real load
+            // on the control node, so they land on the reserved control key the
+            // metrics ingest also uses. `api.`/`git.` hosts stay out (the runner's
+            // own edge is not a dashboard).
+            None if is_control_host(host, &cfg.control_hosts()) => {
+                Some((crate::host::control::SLUG.to_string(), String::new()))
+            }
+            // A verified custom domain is the app's own traffic, served by the
+            // same edge: without this the counters (and the idle clock that reads
+            // them) would see nothing for an app on its own hostname.
+            None => Some((domain_id.get(&bare_host(host))?.clone(), String::new())),
+        },
+    }
+}
+
+/// The line's request host, found with a byte search for Caddy's JSON
+/// `request.host` field — no JSON parse of the dropped burst. The first
+/// occurrence wins: the fixed envelope before it carries no `host` key, and
+/// attacker-controlled header values only follow it. Returns `None` for a
+/// missing, empty, unterminated or badly escaped value; never panics.
+fn scan_line_host(line: &[u8]) -> Option<String> {
+    const NEEDLE: &[u8] = b"\"host\":\"";
+    let mut pos = line.windows(NEEDLE.len()).position(|w| w == NEEDLE)? + NEEDLE.len();
+    let mut out = Vec::new();
+    while let Some(&b) = line.get(pos) {
+        match b {
+            b'"' => {
+                return if out.is_empty() {
+                    None
+                } else {
+                    String::from_utf8(out).ok()
+                };
+            }
+            b'\\' => {
+                pos += 1;
+                out.push(*line.get(pos)?);
+                pos += 1;
+            }
+            0x00..=0x1f => return None,
+            _ => {
+                out.push(b);
+                pos += 1;
+            }
+        }
+    }
+    None
+}
+
+/// Stream-scan at most `limit` bytes for request hosts, holding never more
+/// than one chunk plus one bounded line prefix: whole lines attribute from
+/// their bytes, over-long lines from their prefix (the host precedes the
+/// header block), and a trailing partial line stays unread — the consume
+/// loop picks it up once its newline lands. Returns each distinct attributed
+/// fleet once.
+fn scan_skipped_hosts(
+    reader: &mut impl std::io::Read,
+    mut limit: u64,
+    cfg: &Config,
+    slug_id: &HashMap<String, String>,
+    slug_env: &HashMap<String, String>,
+    domain_id: &HashMap<String, String>,
+) -> anyhow::Result<HashSet<(String, String)>> {
+    let mut found = HashSet::new();
+    let mut chunk = vec![0u8; SCAN_CHUNK_BYTES];
+    let mut prefix: Vec<u8> = Vec::new();
+    let mut over_long = false;
+    while limit > 0 {
+        let want = (chunk.len() as u64).min(limit) as usize;
+        let n = reader.read(&mut chunk[..want])?;
+        if n == 0 {
+            break;
+        }
+        limit -= n as u64;
+        let mut start = 0;
+        for (i, b) in chunk[..n].iter().enumerate() {
+            if *b != b'\n' {
+                continue;
+            }
+            if !over_long {
+                prefix.extend_from_slice(&chunk[start..i]);
+            }
+            // Whole lines attribute from their bytes, over-long lines from
+            // the capped prefix they left behind.
+            if let Some(host) = scan_line_host(&prefix) {
+                if let Some(target) = attribute_host(&host, cfg, slug_id, slug_env, domain_id) {
+                    found.insert(target);
+                }
+            }
+            prefix.clear();
+            over_long = false;
+            start = i + 1;
+        }
+        if start < n && !over_long {
+            if prefix.len() + (n - start) > SCAN_LINE_PREFIX_MAX {
+                let take = SCAN_LINE_PREFIX_MAX.saturating_sub(prefix.len());
+                prefix.extend_from_slice(&chunk[start..start + take]);
+                over_long = true;
+            } else {
+                prefix.extend_from_slice(&chunk[start..n]);
+            }
+        }
+    }
+    Ok(found)
+}
+
+/// Open the log at `pos` and stream-scan the next `len` bytes for request
+/// hosts (see `scan_skipped_hosts`). A replaced file mid-scan just ends the
+/// scan early; the cursor still jumps past the burst.
+fn scan_skipped_region(
+    path: &std::path::Path,
+    pos: u64,
+    len: u64,
+    cfg: &Config,
+    slug_id: &HashMap<String, String>,
+    slug_env: &HashMap<String, String>,
+    domain_id: &HashMap<String, String>,
+) -> anyhow::Result<HashSet<(String, String)>> {
+    use std::io::Seek;
+    let mut file = std::fs::File::open(path)?;
+    file.seek(std::io::SeekFrom::Start(pos))?;
+    scan_skipped_hosts(&mut file, len, cfg, slug_id, slug_env, domain_id)
 }
 
 /// The access-log tail cursor, persisted as the `ino:off` sidecar. The pair
@@ -636,25 +768,55 @@ pub async fn tick(
     if len - cursor.pos() > MAX_CATCHUP_BYTES {
         let skipped = len - cursor.pos();
         tracing::warn!(skipped, "access log burst skipped");
-        // The counters, and the idle clock that reads them, get no lines for
-        // the skipped burst. Record when it happened *before* moving the
-        // cursor: the sleep sweep refuses idle-based parking while the skip
-        // falls inside the app's window, so a write that fails retries the
-        // whole skip instead of leaving a silent blind spot.
-        db::set_setting(pool, db::ACCESS_LOG_SKIP_AT, &crate::models::now_iso()).await?;
+        // The skipped bytes are dropped, not counted — but they still name
+        // their fleets. Stream-scan the region for request hosts and touch
+        // each distinct fleet's idle clock at the skip time, so every fleet's
+        // clock stays trustworthy through the burst. The scan holds one chunk
+        // plus one bounded line prefix, never the burst; a scan or touch
+        // failure aborts before the cursor moves, so the next tick retries
+        // the whole skip instead of leaving a silent blind spot.
+        let skip_us = Utc::now().timestamp_micros();
+        let targets = scan_skipped_region(
+            &path,
+            cursor.pos(),
+            skipped,
+            cfg,
+            slug_id,
+            slug_env,
+            domain_id,
+        )?;
+        if !targets.is_empty() {
+            let mut tx = pool.begin().await?;
+            let bucket = hour_bucket(skip_us / 1_000_000);
+            for (app_id, environment_id) in &targets {
+                hourly::touch_request(
+                    &mut tx,
+                    hourly::Key {
+                        app_id,
+                        environment_id,
+                        bucket_hour: &bucket,
+                    },
+                    skip_us,
+                )
+                .await?;
+            }
+            tx.commit().await?;
+        }
         cursor = OffsetState::skipped_to(meta.ino(), len);
         cursor.persist(&offset_file)?;
     }
-    let bytes = std::fs::read(&path)?;
-    let mut tail = Tail {
-        pool,
-        cfg,
-        slug_id,
-        slug_env,
-        domain_id,
-        requests,
-    };
-    consume_lines(&mut tail, &bytes, meta.ino(), cursor, &offset_file).await?;
+    if cursor.pos() < len {
+        let bytes = std::fs::read(&path)?;
+        let mut tail = Tail {
+            pool,
+            cfg,
+            slug_id,
+            slug_env,
+            domain_id,
+            requests,
+        };
+        consume_lines(&mut tail, &bytes, meta.ino(), cursor, &offset_file).await?;
+    }
     // Bound growth: truncate only when nothing was appended mid-tick and the
     // file is still the one we read (a rotation in the window is left alone).
     let unchanged = std::fs::metadata(&path)
@@ -875,18 +1037,29 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A burst skip drops every buffered line, so it has to leave evidence:
-    /// the sleep sweep refuses idle-based parking while the skip is inside an
-    /// app's sleep window (the lines it lost may have been that app's
-    /// requests).
+    /// A burst skip drops every buffered line but still names its fleets: the
+    /// scan touches each distinct fleet's idle clock at the skip time, while
+    /// the burst stays uncounted — no counters, no dims.
     #[tokio::test]
-    async fn a_burst_skip_records_when_it_happened() {
+    async fn a_burst_skip_touches_but_never_counts() {
         let dir =
             std::env::temp_dir().join(format!("noite-accesslog-skip-{}", crate::models::new_id()));
         std::fs::create_dir_all(&dir).expect("temp dir");
         let log = dir.join("access.log");
-        let size = MAX_CATCHUP_BYTES as usize + 1;
-        std::fs::write(&log, vec![b'\n'; size]).expect("write an oversized log");
+        // Header-inflated lines: the host sits early, kilobytes of junk
+        // follow it.
+        let junk = "x".repeat(4096);
+        let line = |host: &str| {
+            format!(
+                "{{\"request\":{{\"host\":\"{host}\",\"uri\":\"/\",\"method\":\"GET\",\"headers\":{{\"X-Junk\":[\"{junk}\"]}}}},\"status\":200,\"ts\":1.0}}\n"
+            )
+        };
+        let mut burst = String::new();
+        while burst.len() <= MAX_CATCHUP_BYTES as usize + 1024 {
+            burst.push_str(&line("blog.localhost"));
+            burst.push_str(&line("shop.localhost"));
+        }
+        std::fs::write(&log, &burst).expect("write an oversized log");
         let mut cfg = crate::config::config_for_tests();
         cfg.caddy_access_log = log.display().to_string();
         let pool = crate::db::connect(&format!(
@@ -895,29 +1068,48 @@ mod tests {
         ))
         .await
         .expect("file db");
+        let slug_id = HashMap::from([
+            ("blog".to_string(), "app-blog".to_string()),
+            ("shop".to_string(), "app-shop".to_string()),
+        ]);
         let before = Utc::now();
         let mut requests = RequestIndex::default();
         super::tick(
             &pool,
             &cfg,
-            &HashMap::new(),
+            &slug_id,
             &HashMap::new(),
             &HashMap::new(),
             &mut requests,
         )
         .await
         .expect("the skip is not an error");
-        let stamp = crate::db::get_setting(&pool, crate::db::ACCESS_LOG_SKIP_AT)
+        for app in ["app-blog", "app-shop"] {
+            let touched = crate::db::last_request_us(&pool, app, "")
+                .await
+                .expect("clock readable")
+                .expect("the burst touched this fleet");
+            assert!(
+                touched >= before.timestamp_micros(),
+                "{app} is touched at the skip"
+            );
+            let mut conn = pool.acquire().await.expect("connection");
+            let row = crate::db::get_app_hour(
+                &mut conn,
+                app,
+                "",
+                &super::hour_bucket((touched / 1_000_000) as i64),
+            )
             .await
-            .expect("read the setting")
-            .expect("the skip is recorded");
-        let at = DateTime::parse_from_rfc3339(&stamp)
-            .expect("RFC3339 stamp")
-            .with_timezone(&Utc);
-        assert!(
-            at + chrono::Duration::milliseconds(1) >= before,
-            "the skip is stamped when it happens: {stamp}"
-        );
+            .expect("read hour")
+            .expect("the touch wrote the hour");
+            assert_eq!(
+                (row.requests, row.errors),
+                (0, 0),
+                "the burst stays uncounted for {app}"
+            );
+        }
+        assert!(dim_counts(&pool).await.is_empty(), "and writes no dims");
         let offset = std::fs::read_to_string(dir.join("access-log.offset")).expect("offset");
         assert_eq!(
             offset.split(':').nth(1).and_then(|o| o.parse::<u64>().ok()),
@@ -930,6 +1122,206 @@ mod tests {
             "and starts over empty"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The burst scan never holds more than one chunk plus one bounded line
+    /// prefix: a reader that watches every read proves a 32 MiB burst
+    /// streams through 64 KiB at a time and still attributes every fleet.
+    #[tokio::test]
+    async fn the_scan_is_bounded_for_a_large_burst() {
+        use std::io::Write;
+        struct Metered<R> {
+            inner: R,
+            max_read: usize,
+        }
+        impl<R: std::io::Read> std::io::Read for Metered<R> {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                self.max_read = self.max_read.max(buf.len());
+                self.inner.read(buf)
+            }
+        }
+        let dir = std::env::temp_dir().join(format!(
+            "noite-accesslog-bounded-{}",
+            crate::models::new_id()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let log = dir.join("access.log");
+        let junk = "x".repeat(2048);
+        let line = |host: &str| {
+            format!(
+                "{{\"request\":{{\"host\":\"{host}\",\"uri\":\"/\",\"method\":\"GET\",\"headers\":{{\"X-Junk\":[\"{junk}\"]}}}},\"status\":200,\"ts\":1.0}}\n"
+            )
+        };
+        let mut out = std::io::BufWriter::new(std::fs::File::create(&log).expect("create"));
+        while out.get_ref().metadata().expect("size").len() <= 32 * 1024 * 1024 {
+            out.write_all(line("blog.localhost").as_bytes())
+                .expect("write");
+            out.write_all(line("shop.localhost").as_bytes())
+                .expect("write");
+        }
+        out.flush().expect("flush");
+        drop(out);
+        let len = std::fs::metadata(&log).expect("log").len();
+        assert!(len > 32 * 1024 * 1024, "the burst is really 32 MiB");
+        let cfg = crate::config::config_for_tests();
+        let slug_id = HashMap::from([
+            ("blog".to_string(), "app-blog".to_string()),
+            ("shop".to_string(), "app-shop".to_string()),
+        ]);
+        let mut metered = Metered {
+            inner: std::fs::File::open(&log).expect("open"),
+            max_read: 0,
+        };
+        let found = super::scan_skipped_hosts(
+            &mut metered,
+            len,
+            &cfg,
+            &slug_id,
+            &HashMap::new(),
+            &HashMap::new(),
+        )
+        .expect("the scan streams");
+        assert_eq!(
+            found,
+            HashSet::from([
+                ("app-blog".to_string(), String::new()),
+                ("app-shop".to_string(), String::new()),
+            ]),
+            "every fleet in the burst is found"
+        );
+        assert!(
+            metered.max_read <= super::SCAN_CHUNK_BYTES,
+            "no single read exceeds the chunk: {}",
+            metered.max_read
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An over-long line still attributes when its host sits in the prefix;
+    /// an over-long garbage line and every malformed shape are ignored, and
+    /// nothing here panics.
+    #[test]
+    fn oversized_and_malformed_lines_never_break_the_scan() {
+        let cfg = crate::config::config_for_tests();
+        let slug_id = HashMap::from([("blog".to_string(), "app-blog".to_string())]);
+        let scan = |input: &[u8]| {
+            let mut cursor = std::io::Cursor::new(input.to_vec());
+            super::scan_skipped_hosts(
+                &mut cursor,
+                input.len() as u64,
+                &cfg,
+                &slug_id,
+                &HashMap::new(),
+                &HashMap::new(),
+            )
+            .expect("the scan never fails on content")
+        };
+        let blog = ("app-blog".to_string(), String::new());
+        // A header-inflated line: the host is early, 200 KiB of junk follow.
+        let fat = format!(
+            "{{\"request\":{{\"host\":\"blog.localhost\",\"uri\":\"/\",\"headers\":{{\"X-Junk\":[\"{}\"]}}}}}}\n",
+            "x".repeat(200 * 1024)
+        );
+        assert_eq!(
+            scan(fat.as_bytes()),
+            HashSet::from([blog.clone()]),
+            "the host in the prefix still attributes"
+        );
+        // Same size, no host anywhere: ignored.
+        let garbage = format!("{}\n", "y".repeat(200 * 1024));
+        assert!(
+            scan(garbage.as_bytes()).is_empty(),
+            "oversized garbage is skipped"
+        );
+        // A line whose host starts on the far side of a chunk boundary still
+        // attributes: the prefix carries across chunks.
+        let mut split = vec![b'x'; super::SCAN_CHUNK_BYTES - 200];
+        split.push(b'\n');
+        split.extend_from_slice(b"{\"request\":{\"host\":\"blog.localhost\",\"uri\":\"/\"}}\n");
+        assert_eq!(
+            scan(&split),
+            HashSet::from([blog.clone()]),
+            "a host split across chunks attributes"
+        );
+        // Malformed shapes: truncated escape, control byte in the value,
+        // empty host, non-UTF8 — all ignored, none panics.
+        for bad in [
+            "{\"request\":{\"host\":\"blog.localhost\\",
+            "{\"request\":{\"host\":\"blo\ng.localhost\"}}",
+            "{\"request\":{\"host\":\"\"}}",
+            "{\"request\":{\"host\":\"\\ud800\"}}",
+        ] {
+            let mut line = bad.as_bytes().to_vec();
+            line.push(b'\n');
+            assert!(scan(&line).is_empty(), "malformed line ignored: {bad:?}");
+        }
+        // Non-UTF8 bytes where the host would be: ignored, not panicking.
+        let mut binary = b"{\"request\":{\"host\":\"".to_vec();
+        binary.extend_from_slice(&[0xff, 0xfe, b'"', b'}', b'}', b'\n']);
+        assert!(scan(&binary).is_empty(), "non-UTF8 host ignored");
+        // The host search takes the first occurrence; attacker header values
+        // later in the line cannot reroute the attribution.
+        let spoof = "{\"request\":{\"host\":\"blog.localhost\",\"headers\":{\"X-Evil\":[\"\\\"host\\\":\\\"shop.localhost\\\"\"]}}}\n";
+        assert_eq!(
+            scan(spoof.as_bytes()),
+            HashSet::from([blog]),
+            "the real host wins over a header value"
+        );
+        // A trailing partial line stays unread until its newline lands.
+        let partial =
+            b"{\"request\":{\"host\":\"blog.localhost\"}}\n{\"request\":{\"host\":\"blog.local"
+                .to_vec();
+        assert_eq!(
+            {
+                let mut cursor = std::io::Cursor::new(partial.clone());
+                super::scan_skipped_hosts(
+                    &mut cursor,
+                    (partial.len() - 10) as u64,
+                    &cfg,
+                    &slug_id,
+                    &HashMap::new(),
+                    &HashMap::new(),
+                )
+                .expect("scan")
+            },
+            HashSet::from([("app-blog".to_string(), String::new())]),
+            "only the whole line attributes; the partial tail stays unread"
+        );
+    }
+
+    /// The scan reuses the consuming tail's attribution: tenant, environment,
+    /// control and custom-domain hosts resolve the same way, and unknown
+    /// hosts land nowhere.
+    #[test]
+    fn the_scan_reuses_tail_attribution() {
+        let cfg = crate::config::config_for_tests();
+        let slug_id = HashMap::from([
+            ("blog".to_string(), "app-blog".to_string()),
+            ("blog.feature".to_string(), "app-blog".to_string()),
+        ]);
+        let slug_env = HashMap::from([("blog.feature".to_string(), "env-1".to_string())]);
+        let domains = HashMap::from([("example.com".to_string(), "app-blog".to_string())]);
+        let attribute =
+            |host: &str| super::attribute_host(host, &cfg, &slug_id, &slug_env, &domains);
+        assert_eq!(
+            attribute("blog.localhost"),
+            Some(("app-blog".to_string(), String::new()))
+        );
+        assert_eq!(
+            attribute("feature.blog.localhost"),
+            Some(("app-blog".to_string(), "env-1".to_string()))
+        );
+        assert_eq!(
+            attribute("example.com"),
+            Some(("app-blog".to_string(), String::new()))
+        );
+        assert_eq!(
+            attribute("localhost"),
+            Some((crate::host::control::SLUG.to_string(), String::new())),
+            "the control plane's own host resolves to the reserved key"
+        );
+        assert_eq!(attribute("unknown.localhost"), None);
+        assert_eq!(attribute("ghost.blog.localhost"), None);
     }
 
     #[test]
