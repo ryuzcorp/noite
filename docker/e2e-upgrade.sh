@@ -36,11 +36,11 @@ resolve_prev_tag() {
     printf '%s\n' "$PREV_TAG"
     return 0
   fi
-  current="$(git describe --tags --exact-match HEAD 2>/dev/null || true)"
+  current="$(git describe --tags --match 'v*' --exact-match HEAD 2>/dev/null || true)"
   if [ -n "$current" ]; then
-    git describe --tags --abbrev=0 "${current}^" 2>/dev/null || true
+    git describe --tags --match 'v*' --abbrev=0 "${current}^" 2>/dev/null || true
   else
-    git describe --tags --abbrev=0 HEAD 2>/dev/null || true
+    git describe --tags --match 'v*' --abbrev=0 HEAD 2>/dev/null || true
   fi
 }
 
