@@ -191,6 +191,14 @@ async fn main() -> anyhow::Result<()> {
 
     let mut config = Arc::new(Config::from_env()?);
     tokio::fs::create_dir_all(&config.work_dir).await.ok();
+    // A killed runner skips every spool `Drop`: clear the push-spool
+    // leftovers before serving, so they cannot pile up across crashes.
+    let swept =
+        crate::host::git_http::sweep_orphaned_spools(&crate::host::git_http::spool_dir(&config))
+            .await;
+    if swept > 0 {
+        tracing::info!(swept, "swept orphaned push spools on boot");
+    }
     // Config strips `S3_ENDPOINT` userinfo; say so rather than drop it
     // silently (the store authenticates with the access keys).
     if config.s3_endpoint_as_configured != config.s3_endpoint {

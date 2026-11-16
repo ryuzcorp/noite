@@ -620,6 +620,36 @@ fn probe_response() -> Response {
 /// on disk (the pump stops here until auth succeeds).
 const PUSH_HEAD_MAX: u64 = 1024 * 1024;
 
+/// Spool files live in their own subdirectory of the work dir, so the boot
+/// sweep below can clear crash leftovers without touching anything else.
+const SPOOL_SUBDIR: &str = "push-spool";
+
+/// The spool directory for this install. Created on demand by the first
+/// push, cleared of crash leftovers at boot.
+pub(crate) fn spool_dir(cfg: &Config) -> PathBuf {
+    exec::work_root(cfg).join(SPOOL_SUBDIR)
+}
+
+/// Remove `push-*.pack` files a killed runner left in the spool dir
+/// (SIGKILL skips every `Drop`). Runs once at boot; anything else in the
+/// directory is left alone.
+pub(crate) async fn sweep_orphaned_spools(dir: &Path) -> usize {
+    let mut entries = match tokio::fs::read_dir(dir).await {
+        Ok(entries) => entries,
+        Err(_) => return 0,
+    };
+    let mut swept = 0;
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.starts_with("push-")
+            && name.ends_with(".pack")
+            && tokio::fs::remove_file(entry.path()).await.is_ok()
+        {
+            swept += 1;
+        }
+    }
+    swept
+}
 /// A push body spooled to disk under the work dir: the full request in a
 /// temp file, the head (through the first flush, bounded by PUSH_HEAD_MAX)
 /// in memory for the policy layer. The file is removed on drop, so pre-auth
@@ -647,13 +677,26 @@ struct SpoolPump {
     /// Offset of the next length prefix the boundary walk has not parsed:
     /// the walk resumes there, so each head byte is scanned once.
     head_pos: usize,
+    /// The pump stops here; the command section is not necessarily complete.
     head_done: bool,
+    /// A flush packet ended the command section inside the bound: only then
+    /// is the head valid policy input. A head that runs past the bound (or a
+    /// malformed one) is refused even when it parses — the parser accepts a
+    /// prefix cut at a packet boundary, which would let trailing commands
+    /// bypass the policy while git still runs them.
+    head_complete: bool,
+    /// Refuse past this many bytes with 413: the worktree quota, since a
+    /// bigger bundle could never deploy.
     cap: u64,
 }
 
 impl SpoolPump {
-    async fn create(dir: &Path, cap: u64) -> anyhow::Result<Self> {
+    async fn create(parent: &Path, cap: u64) -> anyhow::Result<Self> {
         static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let dir = parent.join(SPOOL_SUBDIR);
+        tokio::fs::create_dir_all(&dir)
+            .await
+            .with_context(|| format!("create push spool dir {}", dir.display()))?;
         let name = format!(
             "push-{}-{}-{:016x}.pack",
             std::process::id(),
@@ -664,6 +707,7 @@ impl SpoolPump {
         let file = tokio::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
+            .mode(0o600)
             .open(&path)
             .await
             .with_context(|| format!("create push spool {}", path.display()))?;
@@ -674,6 +718,7 @@ impl SpoolPump {
             head: Vec::new(),
             head_pos: 0,
             head_done: false,
+            head_complete: false,
             cap,
         })
     }
@@ -724,6 +769,7 @@ impl SpoolPump {
             if len == 0 {
                 self.head.truncate(pos + 4);
                 self.head_done = true;
+                self.head_complete = true;
                 return;
             }
             if len < 4 {
@@ -867,15 +913,47 @@ pub async fn receive_pack(
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")).into_response(),
     };
     let mut body = body;
-    let head_eof = match pump.pump_head(&mut body).await {
+    let _head_eof = match pump.pump_head(&mut body).await {
         Ok(eof) => eof,
         Err((status, message)) => return (status, message).into_response(),
     };
     // The RPC probe is not a push: constant empty answer, no auth, no DB, no
-    // mutation. It must be the whole body — a `0000` head with pack bytes
-    // behind it is an empty command list, refused below like any other.
-    if head_eof && pump.len == 4 && is_probe_request(&pump.head) {
-        return probe_response();
+    // mutation. `pump_head` stops at the head without polling for EOF, so a
+    // lone `0000` needs one more poll to prove it is the whole body: EOF
+    // answers the probe, data is spooled for the refusal below, error 400s.
+    // A head that ended at EOF already (empty or truncated body) falls
+    // through to the policy refusal; the extra poll on it answers None at
+    // once.
+    if pump.len == 4 && is_probe_request(&pump.head) {
+        match body.frame().await {
+            None => return probe_response(),
+            Some(Ok(frame)) => {
+                if let Some(data) = frame.data_ref() {
+                    if let Err((status, message)) = pump.write_frame(data).await {
+                        return (status, message).into_response();
+                    }
+                }
+            }
+            Some(Err(_)) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    "noite: could not read the push body".to_string(),
+                )
+                    .into_response();
+            }
+        }
+    }
+    // The command section must end with a flush inside the bound: the policy
+    // parser accepts a prefix cut at a packet boundary, so without this gate
+    // a head past the bound would let trailing commands bypass the policy
+    // while git still runs them.
+    if !pump.head_complete {
+        tracing::warn!(slug = %slug, "git receive: refused a head with no flush");
+        return (
+            StatusCode::FORBIDDEN,
+            "noite: refused: the push request could not be parsed".to_string(),
+        )
+            .into_response();
     }
     // NOITE-GIT-001: the parsed head IS the policy input, so a head the policy
     // layer cannot read is refused outright — it is never handed to git with
@@ -1534,7 +1612,7 @@ mod tests {
             consumed <= PUSH_HEAD_MAX + 65536,
             "unauthenticated push consumed {consumed} bytes"
         );
-        assert!(spool_files(std::path::Path::new(&config.work_dir)).is_empty());
+        assert!(spool_files(&spool_dir(&config)).is_empty());
         let _ = std::fs::remove_dir_all(guard.path());
     }
 
@@ -1560,7 +1638,127 @@ mod tests {
             consumed <= PUSH_HEAD_MAX + 65536,
             "garbage push consumed {consumed} bytes"
         );
-        assert!(spool_files(std::path::Path::new(&config.work_dir)).is_empty());
+        assert!(spool_files(&spool_dir(&config)).is_empty());
+        let _ = std::fs::remove_dir_all(guard.path());
+    }
+
+    fn probe_body(frames: Vec<Bytes>) -> Body {
+        Body::from_stream(futures::stream::iter(
+            frames.into_iter().map(Ok::<Bytes, axum::Error>),
+        ))
+    }
+
+    /// An exact single-frame probe answers 200 with no auth, no DB and no
+    /// mutation — and leaves no spool behind.
+    #[tokio::test]
+    async fn exact_probe_answers_200_unauthenticated() {
+        let guard = temp_dir("probe-exact");
+        let (state, config, _pool) = handler_state(guard.path()).await;
+        let res = receive_pack(
+            State(state),
+            AxumPath("ghost".to_string()),
+            HeaderMap::new(),
+            probe_body(vec![Bytes::from_static(b"0000")]),
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(res.into_body(), 1024)
+            .await
+            .expect("probe body");
+        assert_eq!(&body[..], b"000eunpack ok\n0000");
+        assert!(spool_files(&spool_dir(&config)).is_empty());
+        let _ = std::fs::remove_dir_all(guard.path());
+    }
+
+    /// A probe split across frames is still exactly four bytes on the wire.
+    #[tokio::test]
+    async fn split_frame_probe_answers_200() {
+        let guard = temp_dir("probe-split");
+        let (state, config, _pool) = handler_state(guard.path()).await;
+        let res = receive_pack(
+            State(state),
+            AxumPath("ghost".to_string()),
+            HeaderMap::new(),
+            probe_body(vec![Bytes::from_static(b"00"), Bytes::from_static(b"00")]),
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::OK);
+        assert!(spool_files(&spool_dir(&config)).is_empty());
+        let _ = std::fs::remove_dir_all(guard.path());
+    }
+
+    /// `0000` with pack bytes behind it is an empty command list, not a
+    /// probe: the policy layer refuses it and the spool is gone.
+    #[tokio::test]
+    async fn probe_head_with_trailing_bytes_is_refused() {
+        let guard = temp_dir("probe-trailing");
+        let (state, config, _pool) = handler_state(guard.path()).await;
+        let res = receive_pack(
+            State(state),
+            AxumPath("ghost".to_string()),
+            HeaderMap::new(),
+            probe_body(vec![
+                Bytes::from_static(b"0000"),
+                Bytes::from_static(b"PACK junk"),
+            ]),
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
+        assert!(spool_files(&spool_dir(&config)).is_empty());
+        let _ = std::fs::remove_dir_all(guard.path());
+    }
+    /// The boot sweep removes only crash leftovers: `push-*.pack` files go,
+    /// anything else stays.
+    #[tokio::test]
+    async fn boot_sweep_removes_only_orphaned_spools() {
+        let guard = temp_dir("spool-sweep");
+        let dir = guard.path().join("work").join("push-spool");
+        std::fs::create_dir_all(&dir).expect("spool dir");
+        std::fs::write(dir.join("push-1-2-0000000000000000.pack"), b"x").expect("orphan");
+        std::fs::write(dir.join("push-3-4-ffffffffffffffff.pack"), b"y").expect("orphan");
+        std::fs::write(dir.join("keep.txt"), b"z").expect("keeper");
+        assert_eq!(sweep_orphaned_spools(&dir).await, 2);
+        assert!(dir.join("keep.txt").exists(), "non-spool files stay");
+        assert!(spool_files(&dir).is_empty());
+        // Missing directory sweeps zero, not an error.
+        assert_eq!(sweep_orphaned_spools(&dir.join("nope")).await, 0);
+        let _ = std::fs::remove_dir_all(guard.path());
+    }
+    /// A command section that runs past the head bound with no flush is
+    /// refused even when it parses: the parser accepts a prefix cut at a
+    /// packet boundary, which would let trailing commands bypass the policy
+    /// while git still runs them.
+    #[tokio::test]
+    async fn flushless_head_past_the_bound_is_refused() {
+        let guard = temp_dir("refuse-noflush");
+        let (state, config, _pool) = handler_state(guard.path()).await;
+        // Valid command packets, no flush, past the head bound — each packet
+        // exactly 128 bytes so the bound cut lands on a packet boundary (the
+        // parser accepts that prefix, which is the bypass).
+        let mut giant: Vec<u8> = Vec::new();
+        for i in 0..9_000u32 {
+            let line = format!(
+                "{} {} refs/heads/b{i:015}\0report-status\n",
+                "e".repeat(40),
+                "f".repeat(40)
+            );
+            let packet = pkt_line_bytes(line.as_bytes());
+            assert_eq!(packet.len(), 128, "test packets must tile the bound");
+            giant.extend_from_slice(&packet);
+        }
+        assert!(
+            giant.len() as u64 > PUSH_HEAD_MAX,
+            "test head must pass the bound"
+        );
+        let res = receive_pack(
+            State(state),
+            AxumPath("ghost".to_string()),
+            HeaderMap::new(),
+            Body::from(giant),
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
+        assert!(spool_files(&spool_dir(&config)).is_empty());
         let _ = std::fs::remove_dir_all(guard.path());
     }
 }
