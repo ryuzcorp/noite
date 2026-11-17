@@ -256,8 +256,10 @@ jobs:
         with:
           node-version: 24
           registry-url: "https://registry.npmjs.org"
-      - run: bun install
+      # No package cache on the publish path: install straight from the registry.
+      - name: install root deps
         timeout-minutes: 5
+        run: sh .github/scripts/bun-install.sh
       - name: build
         working-directory: packages/cli
         run: bun run build

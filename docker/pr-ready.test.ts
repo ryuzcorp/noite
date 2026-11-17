@@ -16,6 +16,7 @@ const indentOf = (line: string): number =>
 interface WorkflowInstallStep {
   bounded: boolean;
   name: string;
+  unfrozen: boolean;
 }
 
 interface WorkflowJob {
@@ -159,13 +160,27 @@ const workflowJobs = (yaml: string): WorkflowJob[] => {
         .filter((line) => !line.trimStart().startsWith("#"))
         .join("\n");
 
+      // The blessed wrapper installs with the frozen lockfile from inside
+      // the script, so it counts as an install step without a literal
+      // `bun install` line.
       const installs =
         stepUses.startsWith("oven-sh/setup-bun@") ||
-        /\bbun install\b/u.test(stepBody);
+        /\bbun install\b/u.test(stepBody) ||
+        stepBody.includes("bun-install.sh");
 
       if (!installs) {
         return [];
       }
+
+      // A literal `bun install` must pin its lockfile on the same command
+      // line; a new bare install fails the frozen suite below. Comment
+      // lines are already out of `stepBody`, so only real commands match.
+      const unfrozen = step
+        .filter((line) => !line.trimStart().startsWith("#"))
+        .some(
+          (line) =>
+            /\bbun install\b/u.test(line) && !line.includes("--frozen-lockfile")
+        );
 
       return [
         {
@@ -179,6 +194,7 @@ const workflowJobs = (yaml: string): WorkflowJob[] => {
             run.split("\n")[0] ||
             step[0]?.trim() ||
             "install step",
+          unfrozen,
         },
       ];
     });
@@ -229,6 +245,26 @@ const timeoutProblems = (yaml: string): string[] =>
 
     return problems;
   });
+
+/**
+ * Every literal `bun install` pins its lockfile: without
+ * `--frozen-lockfile` CI resolves floating ranges and rewrites the tree's
+ * lockfile mid-run (the 2026-11-17 merge-group hang was the one install
+ * still running bare). Wrapper steps (`.github/scripts/bun-install.sh`)
+ * carry the flag inside the script, so only literal commands are checked.
+ *
+ * Returns `<job>: <problem>` lines, empty when every install is pinned.
+ */
+const frozenProblems = (yaml: string): string[] =>
+  workflowJobs(yaml).flatMap((job) =>
+    job.installSteps.flatMap((step) =>
+      step.unfrozen
+        ? [
+            `${job.name}: install step "${step.name}" runs bun install without --frozen-lockfile`,
+          ]
+        : []
+    )
+  );
 
 const readRepoFile = (rel: string): string =>
   readFileSync(new URL(`../${rel}`, import.meta.url), "utf-8");
@@ -645,6 +681,44 @@ describe("workflow job timeouts", () => {
     ]);
   });
 
+  test("the rule rejects a bare bun install and accepts frozen or wrapped installs", () => {
+    expect(
+      frozenProblems(
+        [
+          "jobs:",
+          "  plain:",
+          "    runs-on: ubuntu-latest",
+          "    timeout-minutes: 10",
+          "    steps:",
+          "      - run: bun install",
+          "        timeout-minutes: 5",
+          "      - run: |",
+          "          bun install --frozen-lockfile",
+        ].join("\n")
+      )
+    ).toEqual([
+      'plain: install step "bun install" runs bun install without --frozen-lockfile',
+    ]);
+
+    expect(
+      frozenProblems(
+        [
+          "jobs:",
+          "  plain:",
+          "    runs-on: ubuntu-latest",
+          "    timeout-minutes: 10",
+          "    steps:",
+          "      - name: install root deps",
+          "        timeout-minutes: 5",
+          "        run: sh .github/scripts/bun-install.sh",
+          "      - name: install UI deps",
+          "        timeout-minutes: 5",
+          "        run: sh .github/scripts/bun-install.sh --cwd apps/noite",
+        ].join("\n")
+      )
+    ).toEqual([]);
+  });
+
   test("reusable-workflow calls point at a workflow this repo ships", () => {
     for (const file of workflowFiles) {
       for (const job of workflowJobs(
@@ -690,6 +764,8 @@ describe("workflow job timeouts", () => {
       "ci.yml",
       "e2e.yml",
       "images.yml",
+      "pin-drift.yml",
+      "upgrade.yml",
       "website.yml",
     ]) {
       expect(
@@ -702,6 +778,23 @@ describe("workflow job timeouts", () => {
     // merge-group `check` hung in `bun install` for 40+ minutes, outlived
     // `gh run cancel --force`, and held the merge queue until the PR was
     // dequeued. Each timeout is ~3x that job's p95 (50 runs, 2026-11-11).
+    expect(problems).toEqual([]);
+  });
+
+  test("every bun install pins its lockfile, so CI cannot drift the tree", () => {
+    const problems: string[] = [];
+
+    for (const file of workflowFiles) {
+      const yaml = readRepoFile(`.github/workflows/${file}`);
+      problems.push(
+        ...frozenProblems(yaml).map((problem) => `${file}: ${problem}`)
+      );
+    }
+
+    // The 2026-11-17 merge-group hang was the one install still running
+    // bare: the root `bun install` fetched floating ranges while every UI
+    // install was already frozen. A new bare `bun install` fails here
+    // instead of drifting the lockfile mid-run.
     expect(problems).toEqual([]);
   });
 });
