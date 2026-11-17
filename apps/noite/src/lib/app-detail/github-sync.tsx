@@ -73,30 +73,18 @@ const runSync = async (
 };
 
 const SyncButton = ({
-  appId,
-  machine,
-  mounted,
   label,
-  status,
+  mounted,
+  onSync,
 }: {
-  appId: string;
-  machine: AtomHandle<GithubSyncState | null>;
-  mounted: boolean;
   label: string;
-  status: GithubSyncStatus;
+  mounted: boolean;
+  onSync: () => void;
 }) => (
   <button
     class="btn btn-sm btn-primary"
     disabled={!mounted}
-    onclick={() => {
-      const next = requestSync(status);
-
-      if (next._tag === "Syncing") {
-        void runSync(appId, machine, status, false);
-      } else {
-        machine.set(next);
-      }
-    }}
+    onclick={onSync}
     type="button"
   >
     <span class="inline-flex items-center gap-1">
@@ -139,22 +127,24 @@ const SyncBody = ({
   machine,
   mounted,
   state,
+  syncNow,
 }: {
   appId: string;
   idleLabel: string;
   machine: AtomHandle<GithubSyncState | null>;
   mounted: boolean;
   state: GithubSyncState;
+  syncNow: (confirm: boolean) => void;
 }) => {
   switch (state._tag) {
     case "Idle": {
       return (
         <SyncButton
-          appId={appId}
-          machine={machine}
-          mounted={mounted}
           label={idleLabel}
-          status={state.status}
+          mounted={mounted}
+          onSync={() => {
+            syncNow(false);
+          }}
         />
       );
     }
@@ -172,7 +162,7 @@ const SyncBody = ({
               class="btn btn-sm btn-warning"
               disabled={!mounted}
               onclick={() => {
-                void runSync(appId, machine, state.status, true);
+                syncNow(true);
               }}
               type="button"
             >
@@ -218,11 +208,11 @@ const SyncBody = ({
               View deploy
             </Link>
             <SyncButton
-              appId={appId}
-              machine={machine}
-              mounted={mounted}
               label="Sync again"
-              status={state.status}
+              mounted={mounted}
+              onSync={() => {
+                syncNow(false);
+              }}
             />
           </div>
         </div>
@@ -238,11 +228,11 @@ const SyncBody = ({
           </p>
           <div>
             <SyncButton
-              appId={appId}
-              machine={machine}
-              mounted={mounted}
               label="Sync again"
-              status={state.status}
+              mounted={mounted}
+              onSync={() => {
+                syncNow(false);
+              }}
             />
           </div>
         </div>
@@ -255,11 +245,11 @@ const SyncBody = ({
           <p class="text-error m-0 text-sm">{state.message}</p>
           <div>
             <SyncButton
-              appId={appId}
-              machine={machine}
-              mounted={mounted}
               label="Retry sync"
-              status={state.status}
+              mounted={mounted}
+              onSync={() => {
+                syncNow(false);
+              }}
             />
           </div>
         </div>
@@ -275,8 +265,9 @@ const SyncBody = ({
 };
 
 /** The dialog the tiny button opens: the origin facts plus the machine body.
- * A close resets the machine, so the next open seeds a fresh `Idle` from
- * the latest status (a sync invalidates it, so the facts never go stale). */
+ * The machine survives closes, so reopening re-reads the last result; every
+ * button click still decides fresh from the latest status (a sync
+ * invalidates it, so the facts never go stale). */
 const SyncDialog = ({
   appId,
   machine,
@@ -284,6 +275,7 @@ const SyncDialog = ({
   open,
   snapshot,
   syncError,
+  syncNow,
 }: {
   appId: string;
   machine: AtomHandle<GithubSyncState | null>;
@@ -291,6 +283,7 @@ const SyncDialog = ({
   open: AtomHandle<boolean>;
   snapshot: GithubSyncStatus | undefined;
   syncError: unknown;
+  syncNow: (confirm: boolean) => void;
 }) => {
   const loading = snapshot === undefined;
 
@@ -298,14 +291,7 @@ const SyncDialog = ({
     machine() ?? (snapshot ? GithubSync.Idle({ status: snapshot }) : null);
 
   return (
-    <Dialog
-      open={open}
-      class="modal"
-      labelledBy="github-sync-title"
-      onClose={() => {
-        machine.set(null);
-      }}
-    >
+    <Dialog open={open} class="modal" labelledBy="github-sync-title">
       <div class="modal-box bg-base-100 dark:bg-base-200">
         <h2 id="github-sync-title" class="m-0 text-lg font-bold">
           Sync from GitHub
@@ -328,20 +314,26 @@ const SyncDialog = ({
               machine={machine}
               mounted={mounted}
               state={state}
+              syncNow={syncNow}
             />
           ) : null}
         </div>
-        <div class="modal-action m-0">
-          <button
-            type="button"
-            class="btn btn-sm"
-            onclick={() => {
-              open.set(false);
-            }}
-          >
-            Close
-          </button>
-        </div>
+        {/* One dismiss action only: the overwrite confirmation dismisses
+            with Cancel next to "Sync anyway"; every other state closes
+            here. */}
+        {state?._tag === "Confirming" ? null : (
+          <div class="modal-action m-0">
+            <button
+              type="button"
+              class="btn btn-sm"
+              onclick={() => {
+                open.set(false);
+              }}
+            >
+              Close
+            </button>
+          </div>
+        )}
       </div>
     </Dialog>
   );
@@ -366,25 +358,47 @@ const GithubSyncIsland = ({ appId }: { appId: string }) => {
   const res = githubSync(appId);
   const snapshot = resourceValue(res.state());
 
+  /** Sync from the latest status, never the snapshot the dialog opened with:
+   * a refetch first, so a click after the tree moved (or Retry after a
+   * tip-moved refusal) decides from the moved tree instead of looping on
+   * the stale one. The dialog opens immediately; the decision lands when
+   * the refetch does. */
+  const syncNow = (confirm: boolean): void => {
+    void (async () => {
+      let status: GithubSyncStatus | undefined;
+
+      try {
+        status = await res.refetch();
+      } catch {
+        status = undefined;
+      }
+
+      const current = status ?? resourceValue(res.state());
+
+      if (!current) {
+        return;
+      }
+
+      if (!confirm) {
+        const next = requestSync(current);
+
+        if (next._tag !== "Syncing") {
+          machine.set(next);
+
+          return;
+        }
+      }
+
+      void runSync(appId, machine, current, confirm);
+    })();
+  };
+
   /** One click does the whole decision: a clean tree syncs straight (the
    * dialog opens on the progress), a tree with Noite-side commits opens on
    * the overwrite confirmation instead. */
   const start = () => {
-    if (!snapshot) {
-      open.set(true);
-
-      return;
-    }
-
-    const next = requestSync(snapshot);
-
     open.set(true);
-
-    if (next._tag === "Syncing") {
-      void runSync(appId, machine, snapshot, false);
-    } else {
-      machine.set(next);
-    }
+    syncNow(false);
   };
 
   return (
@@ -392,7 +406,7 @@ const GithubSyncIsland = ({ appId }: { appId: string }) => {
       <button
         type="button"
         class="btn btn-xs"
-        disabled={!mounted() || !snapshot}
+        disabled={!mounted() || !snapshot || machine()?._tag === "Syncing"}
         title={snapshot ? syncTitle(snapshot) : "Loading the origin…"}
         onclick={start}
       >
@@ -408,6 +422,7 @@ const GithubSyncIsland = ({ appId }: { appId: string }) => {
         open={open}
         snapshot={snapshot}
         syncError={resourceError(res.state())}
+        syncNow={syncNow}
       />
     </>
   );
