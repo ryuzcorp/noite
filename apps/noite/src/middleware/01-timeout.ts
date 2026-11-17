@@ -47,6 +47,10 @@
  */
 import { defineMiddleware } from "void";
 
+// The per-request AsyncLocalStorage backend (server-only): registering it
+// here keeps `node:async_hooks` out of the browser bundle that includes
+// `request-timeout.ts` via `lib/runner.ts`.
+import "../lib/request-timeout-node";
 import {
   ClientDisconnectError,
   RequestTimeoutError,

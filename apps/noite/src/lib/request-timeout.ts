@@ -1,28 +1,29 @@
-/* eslint-disable max-classes-per-file -- the bound's and the disconnect's quiet abort reasons live with the store they abort through */
+/* eslint-disable max-classes-per-file -- the bound's and the disconnect's quiet abort reasons live with the interruption mechanism they describe */
 /**
  * The per-request abort behind the route bound (`middleware/01-timeout.ts`):
  * one `AbortController` per bounded request, aborted with a typed reason when
- * the bound fires. Downstream work observes it through the `AsyncLocalStorage`
- * store below — strictly per request, so overlapping requests can never see
- * each other's bound — and every outbound call is covered without threading a
+ * the bound fires. Downstream work observes it through the injected backend
+ * below — strictly per request, so overlapping requests can never see each
+ * other's bound — and every outbound call is covered without threading a
  * signal through each action and each of the hundred `runner*` helpers.
  *
+ * Client-safe by construction: this module has no `node:` imports, so the
+ * browser bundle that includes it (via `lib/runner.ts`) never touches a
+ * platform builtin. The `AsyncLocalStorage` backend lives in
+ * `request-timeout-node.ts` (server-only, imported for its side effect by
+ * the timeout middleware); without it — the browser bundle, a bare unit
+ * test — every accessor passes through with no bound. A previous revision
+ * built the store here at module load and broke every storage page in the
+ * browser, where the `node:async_hooks` stub cannot be constructed; there is
+ * a regression test pinning this (`request-timeout.test.ts`).
+ *
  * Wiring (one mechanism, two touch points, no per-route boilerplate):
- * - the timeout middleware runs the whole downstream pipeline inside
- *   {@link runWithRequestTimeout} with the bound request's signal;
+ * - the timeout middleware registers the backend once and runs the whole
+ *   downstream pipeline inside {@link runWithRequestTimeout} with the bound
+ *   request's signal;
  * - `runnerFetch` (`lib/runner.ts`) combines that signal into every runner
  *   call, and the hand-rolled forwards (`http/routes/source.ts`,
  *   `http/routes/ingest.ts`) combine it into theirs.
- *
- * The store works on every runtime this worker executes under: celld resolves
- * `node:async_hooks` to real `AsyncLocalStorage` over V8
- * continuation-preserved embedder data (the same primitive workerd's
- * `AsyncContextFrame` rides), and the dev server (Node) and `bun test` both
- * implement it natively. Void's worker build externalizes `node:*` imports,
- * so the import below stays an external in the bundle celld loads. There is
- * no ambient global slot: concurrent same-isolate requests are isolated by
- * construction, and outside a request (a CLI probe, a bare unit test)
- * `getRequestTimeoutSignal` is simply `undefined`.
  *
  * Semantics:
  * - After the 504, no further outbound runner call starts for that request:
@@ -52,7 +53,6 @@
  *   `http/routes/`), so the `AbortSignal` below IS the interruption
  *   mechanism.
  */
-import { AsyncLocalStorage } from "node:async_hooks";
 
 /** The abort reason the bound fires with. Typed (not a bare string) so
  * catch sites branch on it instead of parsing English. */
@@ -78,19 +78,35 @@ export class ClientDisconnectError extends Error {
   }
 }
 
-/** The bound request's signal, strictly per request. */
-const store = new AsyncLocalStorage<AbortSignal>();
+/** The per-request signal store. Implemented by `request-timeout-node.ts`
+ * (real `AsyncLocalStorage`); absent here, every accessor below passes
+ * through with no bound. */
+interface RequestTimeoutBackend {
+  run: <T>(signal: AbortSignal, fn: () => T) => T;
+  getStore: () => AbortSignal | undefined;
+}
+
+let backend: RequestTimeoutBackend | undefined;
+
+/** Register the per-request store. Called once by server-only entry
+ * (`request-timeout-node.ts`, imported for its side effect by the timeout
+ * middleware). Never called in the browser bundle, which stays passive. */
+export const setRequestTimeoutBackend = (next: RequestTimeoutBackend): void => {
+  backend = next;
+};
 
 /** Run `fn` under the bound request's `signal`: everything `fn` schedules —
  * the whole downstream middleware and handler pipeline, including the
- * `await`s — observes it through {@link getRequestTimeoutSignal}. */
+ * `await`s — observes it through {@link getRequestTimeoutSignal}. Without a
+ * backend (the browser bundle) this just runs `fn`. */
 export const runWithRequestTimeout = <T>(signal: AbortSignal, fn: () => T): T =>
-  store.run(signal, fn);
+  backend === undefined ? fn() : backend.run(signal, fn);
 
 /** The bound request's signal for the current run, or `undefined` on an
- * exempt route or outside a request entirely (e.g. a CLI probe). */
+ * exempt route, without a backend, or outside a request entirely (e.g. a
+ * CLI probe). */
 export const getRequestTimeoutSignal = (): AbortSignal | undefined =>
-  store.getStore();
+  backend?.getStore();
 
 /** Fold the request bound into a call's own signal. Absent a bound (an
  * exempt route, or outside a request entirely) the call's own signal passes
