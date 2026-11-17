@@ -134,6 +134,7 @@ const nextStreams = (page: Page) =>
  * already carried by the tab badges) reopens nothing, so the tab's own
  * loaded paint is the signal that its loading state is behind us. */
 const TAB_LOADED = {
+  Analytics: "to see the breakdown",
   Deployments: "No deployments yet. Push to main to trigger one.",
   Errors: "No open errors",
   Events: "Send events",
@@ -176,6 +177,7 @@ test("pages and tabs never paint an error before a load settles", async ({
     for (const name of [
       "Deployments",
       "Metrics",
+      "Analytics",
       "Errors",
       "Events",
       "Overview",

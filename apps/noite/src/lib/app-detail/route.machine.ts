@@ -24,6 +24,7 @@ export const APP_TABS = [
   "overview",
   "deployments",
   "metrics",
+  "analytics",
   "errors",
   "events",
 ] as const;

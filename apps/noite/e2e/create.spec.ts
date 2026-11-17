@@ -165,18 +165,23 @@ test("syncing an unchanged GitHub import is a no-op", async ({
   const id = appId ?? "";
   await waitForDeploy(request, id);
 
-  // The origin has not moved since the import, so the Overview's sync card
-  // answers "Up to date" with no new commit and no new deploy. A sync that
-  // lands a new deploy cannot run here: nothing in CI can push to the
-  // upstream repo, so the commit-and-deploy path stays with the runner
-  // tests (service/github_sync.rs).
+  // The origin has not moved since the import, so the header's tiny sync
+  // button syncs straight through to "Up to date" with no new commit and no
+  // new deploy. A sync that lands a new deploy cannot run here: nothing in
+  // CI can push to the upstream repo, so the commit-and-deploy path stays
+  // with the runner tests (service/github_sync.rs).
   await page.goto(`/apps/${id}`);
-  await expect(
-    page.getByRole("heading", { name: "Sync from GitHub" })
-  ).toBeVisible();
-  await expect(page.getByText("github.com/octocat/Hello-World")).toBeVisible();
   await page.getByRole("button", { name: "Sync from GitHub" }).click();
-  await expect(page.getByText(/Up to date with the origin/u)).toBeVisible();
+
+  const dialog = page.getByRole("dialog");
+
+  await expect(
+    dialog.getByRole("heading", { name: "Sync from GitHub" })
+  ).toBeVisible();
+  await expect(
+    dialog.getByText("github.com/octocat/Hello-World")
+  ).toBeVisible();
+  await expect(dialog.getByText(/Up to date with the origin/u)).toBeVisible();
 });
 
 test(
@@ -221,7 +226,7 @@ test(
 
     await waitForDeploy(request, id, 8 * 60_000, noiteSha);
 
-    // The card's Origin tip is the GitHub tip (beta.1 bug 2 showed the
+    // The dialog's Origin tip is the GitHub tip (beta.1 bug 2 showed the
     // local mirror's main here): it still names the imported head, not the
     // Noite-side commit above it.
     const [upstreamHead] = execFileSync(
@@ -240,23 +245,25 @@ test(
     expect(noiteSha).not.toBe(upstreamHead);
 
     await page.goto(`/apps/${id}`);
+    await page.getByRole("button", { name: "Sync from GitHub" }).click();
 
-    const card = page.locator("section", {
-      has: page.getByRole("heading", { name: "Sync from GitHub" }),
-    });
+    const dialog = page.getByRole("dialog");
+
+    await expect(
+      dialog.getByRole("heading", { name: "Sync from GitHub" })
+    ).toBeVisible();
 
     // "Last synced" names the same imported head, so read the Origin tip row.
-    const originTip = card.locator("dl > div", {
-      has: page.locator("dt", { hasText: /^Origin tip$/u }),
+    const originTip = dialog.locator("dl > div", {
+      has: dialog.locator("dt", { hasText: /^Origin tip$/u }),
     });
 
     await expect(originTip.getByText(upstreamHead.slice(0, 7))).toBeVisible();
-    await card.getByRole("button", { name: "Sync from GitHub" }).click();
     await expect(
-      card.getByText(/will be overwritten in the tree/u)
+      dialog.getByText(/will be overwritten in the tree/u)
     ).toBeVisible();
-    await card.getByRole("button", { name: "Sync anyway" }).click();
-    await expect(card.getByText(/Synced to/u)).toBeVisible();
+    await dialog.getByRole("button", { name: "Sync anyway" }).click();
+    await expect(dialog.getByText(/Synced to/u)).toBeVisible();
   }
 );
 

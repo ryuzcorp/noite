@@ -3,6 +3,7 @@ import { EnvPicker, StaleEnvNotice } from "$lib/app-detail/env-picker";
 import { ErrorsPanel, liveErrors } from "$lib/app-detail/errors";
 import { EventsPanel, liveEventCount } from "$lib/app-detail/events";
 import {
+  AnalyticsCard,
   DEFAULT_METRICS_HOURS,
   MetricsCard,
   MetricsRangePicker,
@@ -32,17 +33,18 @@ const TABS = [
   { id: "overview", label: "Overview" },
   { id: "deployments", label: "Deployments" },
   { id: "metrics", label: "Metrics" },
+  { id: "analytics", label: "Analytics" },
   { id: "errors", label: "Errors" },
   { id: "events", label: "Events" },
 ] as const;
 
 type TabId = AppTab;
 
-/** Metrics tab: the window lives in `?r=` (24 / 168 / 720 hours) and the
- * scope in `?env=` (production or one preview environment, the Deployments
- * tab's convention), so a refresh or shared link keeps both. The card is
- * keyed by both because its live feed opens one URL for the life of a
- * component. */
+/** Metrics tab: the charts for the window in `?r=` (24 / 168 / 720 hours)
+ * scoped to `?env=` (production or one preview environment, the Deployments
+ * tab's convention), so a refresh or shared link keeps both. The cards are
+ * keyed by both because their live feeds open one URL for the life of a
+ * component. No heading — the tab bar names the tab. */
 const MetricsTab = ({ appId }: { appId: string }) => {
   const range = searchParam("r", {
     default: DEFAULT_METRICS_HOURS,
@@ -55,28 +57,65 @@ const MetricsTab = ({ appId }: { appId: string }) => {
 
   return (
     <div class="flex flex-col gap-4">
-      <div class="flex flex-wrap items-center justify-between gap-2">
-        <h2 class="m-0 text-lg font-semibold">Metrics</h2>
-        <span class="flex flex-wrap items-center gap-2">
-          <EnvPicker
-            appId={appId}
-            value={environmentId}
-            onPick={(next) => {
-              env.set(next);
-            }}
-          />
-          <MetricsRangePicker
-            hours={range()}
-            onPick={(next) => {
-              range.set(next);
-            }}
-          />
-        </span>
+      <div class="flex flex-wrap items-center justify-end gap-2">
+        <EnvPicker
+          appId={appId}
+          value={environmentId}
+          onPick={(next) => {
+            env.set(next);
+          }}
+        />
+        <MetricsRangePicker
+          hours={range()}
+          onPick={(next) => {
+            range.set(next);
+          }}
+        />
       </div>
       <MetricsCard
         key={`${range()}:${environmentId}`}
         appId={appId}
         detail
+        environmentId={environmentId}
+        hours={range()}
+      />
+    </div>
+  );
+};
+
+/** Analytics tab: the same window and scope as Metrics, but the breakdown
+ * cards (browsers, operating systems, paths, referrers) instead of the
+ * charts. No heading — the tab bar names the tab. */
+const AnalyticsTab = ({ appId }: { appId: string }) => {
+  const range = searchParam("r", {
+    default: DEFAULT_METRICS_HOURS,
+    parse: toMetricsHours,
+  });
+
+  const env = searchParam("env", { default: "" });
+  const envs = resourceValue(environments(appId).state()) ?? [];
+  const environmentId = scopeId(parseScope(env(), envs).scope);
+
+  return (
+    <div class="flex flex-col gap-4">
+      <div class="flex flex-wrap items-center justify-end gap-2">
+        <EnvPicker
+          appId={appId}
+          value={environmentId}
+          onPick={(next) => {
+            env.set(next);
+          }}
+        />
+        <MetricsRangePicker
+          hours={range()}
+          onPick={(next) => {
+            range.set(next);
+          }}
+        />
+      </div>
+      <AnalyticsCard
+        key={`${range()}:${environmentId}`}
+        appId={appId}
         environmentId={environmentId}
         hours={range()}
       />
@@ -206,6 +245,7 @@ const AppPageBody = ({ appId }: { appId: string }) => {
           />
         ) : null}
         {route.tab === "metrics" ? <MetricsTab appId={appId} /> : null}
+        {route.tab === "analytics" ? <AnalyticsTab appId={appId} /> : null}
         {route.tab === "errors" ? <ErrorsPanel appId={appId} /> : null}
         {route.tab === "events" ? <EventsPanel appId={appId} /> : null}
       </DetailShell>

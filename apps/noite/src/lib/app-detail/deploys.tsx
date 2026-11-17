@@ -859,12 +859,6 @@ export const DeployList = ({
           />
         </EnvironmentGroup>
       ))}
-      {envs.length === 0 && resourceValue(res.state()) !== undefined ? (
-        <p class="m-0 text-sm opacity-70">
-          No environments yet — create one from a branch above, or open a pull
-          request from a new branch.
-        </p>
-      ) : null}
       <CreateEnvironmentDialog
         appId={appId}
         onCreated={(env) => {

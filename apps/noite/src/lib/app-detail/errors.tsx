@@ -229,12 +229,14 @@ const EmptyErrors = ({ status }: { status: ErrorStatus }) => {
 const ErrorList = ({
   appId,
   environmentId,
+  onEnv,
   onPick,
   onStatus,
   status,
 }: {
   appId: string;
   environmentId: string;
+  onEnv: (id: string) => void;
   onPick: (fingerprint: string) => void;
   onStatus: (status: ErrorStatus) => void;
   status: ErrorStatus;
@@ -255,25 +257,28 @@ const ErrorList = ({
               </span>
             ) : null}
           </h2>
-          <div role="tablist" class="tabs tabs-box tabs-sm w-fit flex-nowrap">
-            {STATUSES.map((s) => (
-              <button
-                type="button"
-                role="tab"
-                aria-selected={status === s.id ? "true" : "false"}
-                class={`tab ${status === s.id ? "tab-active" : ""}`}
-                onclick={() => {
-                  onStatus(s.id);
-                }}
-              >
-                {s.label}
-                {data ? (
-                  <span class="ml-1 tabular-nums opacity-60">
-                    {data.counts[s.id]}
-                  </span>
-                ) : null}
-              </button>
-            ))}
+          <div class="flex flex-wrap items-center gap-2">
+            <EnvPicker appId={appId} value={environmentId} onPick={onEnv} />
+            <div role="tablist" class="tabs tabs-box tabs-sm w-fit flex-nowrap">
+              {STATUSES.map((s) => (
+                <button
+                  type="button"
+                  role="tab"
+                  aria-selected={status === s.id ? "true" : "false"}
+                  class={`tab ${status === s.id ? "tab-active" : ""}`}
+                  onclick={() => {
+                    onStatus(s.id);
+                  }}
+                >
+                  {s.label}
+                  {data ? (
+                    <span class="ml-1 tabular-nums opacity-60">
+                      {data.counts[s.id]}
+                    </span>
+                  ) : null}
+                </button>
+              ))}
+            </div>
           </div>
         </div>
         {live.retrying() ? <StreamRetrying /> : null}
@@ -500,36 +505,18 @@ const ErrorDetailView = ({
   canTriage,
   environmentId,
   fingerprint,
-  onBack,
 }: {
   appId: string;
   canTriage: boolean;
   environmentId: string;
   fingerprint: string;
-  onBack: () => void;
 }) => {
   const res = errorDetail(appId, fingerprint, environmentId);
   const picked = atom(0);
   const data = resourceValue(res.state());
 
-  const back = (
-    <button
-      type="button"
-      class="link link-hover inline-flex w-fit items-center gap-1 text-sm opacity-70"
-      onclick={onBack}
-    >
-      <ArrowLeft />
-      All errors
-    </button>
-  );
-
   if (res.state()._tag === "Loading") {
-    return (
-      <div class="flex flex-col gap-3">
-        {back}
-        <SectionSkeleton lines={6} />
-      </div>
-    );
+    return <SectionSkeleton lines={6} />;
   }
 
   if (!data) {
@@ -538,7 +525,6 @@ const ErrorDetailView = ({
     // lookup again instead of stranding the visit on the error.
     return (
       <div class="flex flex-col gap-3">
-        {back}
         <LoadError error={resourceError(res.state())} />
         <div>
           <button
@@ -568,7 +554,6 @@ const ErrorDetailView = ({
 
   return (
     <div class="flex flex-col gap-4">
-      {back}
       <section class="card bg-base-100 dark:bg-base-200 border-base-300 w-full border shadow-md">
         <div class="card-body gap-4">
           <div class="flex flex-wrap items-start justify-between gap-3">
@@ -762,7 +747,17 @@ export const ErrorsPanel = ({
   if (selected()) {
     return (
       <div class="flex flex-col gap-4">
-        <div class="flex items-center justify-end gap-2">
+        <div class="flex flex-wrap items-center justify-between gap-2">
+          <button
+            type="button"
+            class="link link-hover inline-flex w-fit items-center gap-1 text-sm opacity-70"
+            onclick={() => {
+              selected.set("");
+            }}
+          >
+            <ArrowLeft />
+            All errors
+          </button>
           <EnvPicker
             appId={appId}
             value={environmentId}
@@ -778,37 +773,26 @@ export const ErrorsPanel = ({
           canTriage={canTriage}
           environmentId={environmentId}
           fingerprint={selected()}
-          onBack={() => {
-            selected.set("");
-          }}
         />
       </div>
     );
   }
 
   return (
-    <div class="flex flex-col gap-4">
-      <div class="flex items-center justify-end gap-2">
-        <EnvPicker
-          appId={appId}
-          value={environmentId}
-          onPick={(next) => {
-            env.set(next);
-          }}
-        />
-      </div>
-      <ErrorList
-        key={`${status()}:${environmentId}`}
-        appId={appId}
-        environmentId={environmentId}
-        status={status()}
-        onStatus={(next) => {
-          status.set(next);
-        }}
-        onPick={(fingerprint) => {
-          selected.set(fingerprint);
-        }}
-      />
-    </div>
+    <ErrorList
+      key={`${status()}:${environmentId}`}
+      appId={appId}
+      environmentId={environmentId}
+      status={status()}
+      onEnv={(next) => {
+        env.set(next);
+      }}
+      onStatus={(next) => {
+        status.set(next);
+      }}
+      onPick={(fingerprint) => {
+        selected.set(fingerprint);
+      }}
+    />
   );
 };
