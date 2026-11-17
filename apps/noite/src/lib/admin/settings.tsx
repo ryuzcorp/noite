@@ -1,9 +1,10 @@
-//! Settings tab of the control app (`/apps/_control?t=settings`): the
-//! instance-wide switches, in the one place every other admin surface lives.
-//! Three cards, one machine: the anonymous-telemetry opt-out, the release
-//! check (`./settings.machine.ts`, rendered by `./settings-section.tsx`)
-//! and the registration waitlist. All actions re-check instance admin
-//! server-side, so this page is presentation, not the gate.
+//! Settings section of the control app's Admin tab
+//! (`/apps/_control?t=admin`): the instance-wide switches, in the one place
+//! every other admin surface lives. Three cards, one machine: the
+//! anonymous-telemetry opt-out, the release check (`./settings.machine.ts`,
+//! rendered by `./settings-section.tsx`) and the registration waitlist. All
+//! actions re-check instance admin server-side, so this page is
+//! presentation, not the gate.
 
 import { atom } from "ilha";
 
@@ -294,8 +295,8 @@ const WaitlistCard = () => {
   );
 };
 
-/** The Settings tab: instance-wide switches, stacked like the app-detail
- * settings sections. Nothing here is per app. */
+/** The Admin tab's settings section: instance-wide switches, stacked like
+ * the app-detail settings sections. Nothing here is per app. */
 export const AdminSettingsPanel = () => (
   <div class="flex flex-col gap-4">
     <div>

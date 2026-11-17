@@ -1,5 +1,5 @@
-//! Apps tab of the control page (`/apps/_control?t=apps`): every app on the
-//! instance, whichever account owns it.
+//! Apps section of the control page's Admin tab (`/apps/_control?t=admin`):
+//! every app on the instance, whichever account owns it.
 
 import { Link } from "@ilha/void";
 import { atom, watch } from "ilha";

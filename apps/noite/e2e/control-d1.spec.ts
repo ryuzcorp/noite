@@ -135,7 +135,7 @@ test("a raw row links to the proper admin action", async ({ page }) => {
   await expect(manage).toBeVisible();
   await manage.click();
 
-  await expect(page).toHaveURL(/\/apps\/_control\?.*t=users/u);
+  await expect(page).toHaveURL(/\/apps\/_control\?.*t=admin/u);
   await expect(page.locator("#admin-user-search")).toHaveValue(/@/u);
 });
 

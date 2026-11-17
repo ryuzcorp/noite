@@ -48,9 +48,9 @@ test("the app list is in the shell on every page and highlights the open app", a
     slug: SLUG,
   });
 
-  // Off the apps pages (`/` resolves by session, and this run is signed in):
-  // the list is still there, and nothing in it claims to be the current page.
-  await page.goto("/");
+  // Off the apps pages: the list is still there, and nothing in it claims to
+  // be the current page.
+  await page.goto("/account");
   await expect(appRow(page, NAME)).toBeVisible();
   await expect(sidebarApps(page).locator('[aria-current="page"]')).toHaveCount(
     0
@@ -105,7 +105,7 @@ test("the phone drawer closes on every destination and on Esc", async ({
   ).toBeVisible();
   await expect(drawer(page)).toBeChecked();
   await profileMenu(page).getByRole("link", { name: "Account" }).click();
-  await expect(page).toHaveURL(/\/apps\/_control\?t=account/u);
+  await expect(page).toHaveURL(/\/account$/u);
   await expect(drawer(page)).not.toBeChecked();
 
   // Esc closes it and hands focus back to the toggle, so the keyboard user is

@@ -1,0 +1,6 @@
+### Changed
+
+- `/account` is back as the personal-settings page for every signed-in account (profile, passkeys, API keys, agent connect), linked from the sidebar user menu as before. The Account tab is gone from the Noite app's detail page: `/apps/_control?t=account` redirects to `/account`, and any other non-admin visit to `/apps/_control` lands there too. Update bookmarks pointing at the old tab.
+- The Noite app's Users, Apps and Settings tabs are merged into one **Admin** tab (`/apps/_control?t=admin`) with the three sections stacked — users (search `uq`, pages `up`), apps (search `aq`) and the instance switches — each keeping its own heading and URL search params. Old `?t=users|apps|settings|invites` links open the Admin tab. The sidebar and `/apps` list show the Noite card to instance admins only again.
+- The control page's header shows the running Noite version (`v0.1.0-beta.2` in a release image, `dev` for a source checkout, from the runner's update status) instead of the UI build id, and the "telemetry includes this dashboard's own polling and streams" note is gone.
+- The control Metrics tab's analytics breakdowns move to a standalone **Analytics** tab next to Metrics (same `?r=` window), matching the tenant app pages.

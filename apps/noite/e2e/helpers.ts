@@ -295,14 +295,14 @@ export interface KeyScopeOptions {
   expiry?: "1h" | "1d" | "7d" | "30d" | "never";
 }
 
-/** Mint an API key on the signed-in account's Account tab. The raw key is
+/** Mint an API key on the signed-in account's Account page. The raw key is
  * shown exactly once, so it is read from that one screen. */
 export const mintApiKey = async (
   page: Page,
   label: string,
   options: KeyScopeOptions = {}
 ): Promise<string> => {
-  await page.goto("/apps/_control?t=account");
+  await page.goto("/account");
   await page
     .locator('button[type="button"]', { hasText: "Create key" })
     .click();

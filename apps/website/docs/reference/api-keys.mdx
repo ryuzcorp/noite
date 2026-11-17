@@ -27,7 +27,7 @@ Beyond its scopes, a key can be narrowed three ways. All three are enforced by o
 | **Role ceiling** | Admin (no cap) | The key's effective role is the lower of **your role on that app** and this ceiling. A `push` key owned by an admin can push and open pull requests but cannot change variables or settings, force-push, delete a branch, or commit to a protected branch. |
 | **Expiry** | Never | `1 hour`, `1 day`, `7 days` or `30 days`. Once the instant passes the key is refused everywhere, and the next attempt deletes it. |
 
-The account page lists each key with its apps, ceiling, expiry and last use, so an old credential is visible before it is a problem.
+The Account page lists each key with its apps, ceiling, expiry and last use, so an old credential is visible before it is a problem.
 
 :::tip
 A key is at most as powerful as its owner: a ceiling never grants a role the owner does not hold, and an app-restricted key never reaches an app the owner cannot.
@@ -40,7 +40,7 @@ A key is at most as powerful as its owner: a ceiling never grants a role the own
 - **Every refusal is uniform.** A key scoped elsewhere, an app you cannot see and an app that does not exist answer the same way, so a key is never an existence oracle for apps it cannot reach. An expired key is the one exception: the caller holds it, so the answer says `API key expired`.
 - **A key whose stored scope cannot be read is refused**, never treated as account-wide.
 - **Bans win.** A banned account's keys stop working immediately and are deleted; unbanning does not restore them.
-- **Not a session.** A key cannot sign in, change the account, mint another key or open the Account tab; it only reaches the surfaces in the table above.
+- **Not a session.** A key cannot sign in, change the account, mint another key or read `/account`; it only reaches the surfaces in the table above.
 
 ## Attribution
 

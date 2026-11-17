@@ -124,21 +124,22 @@ export const controlTableCaps = (table: string): D1TableCaps => {
 };
 
 /** Per-table link from a raw grid row to the proper admin action: the admin
- * home's Users tab (invitations live there now), its search prefilled from
- * the row. Managed by the server so the policy (which table maps to which
- * tab and search) lives next to the write rules it mirrors. */
+ * home's Admin tab (the Users section — invitations live there now), its
+ * search prefilled from the row. Managed by the server so the policy (which
+ * table maps to which tab and search) lives next to the write rules it
+ * mirrors. */
 const ROW_ACTIONS = {
   email_invite: {
     column: "email",
     label: "Manage in Users",
     param: "uq",
-    tab: "users",
+    tab: "admin",
   },
   user: {
     column: "email",
     label: "Manage in Users",
     param: "uq",
-    tab: "users",
+    tab: "admin",
   },
 } satisfies Record<string, D1RowAction>;
 

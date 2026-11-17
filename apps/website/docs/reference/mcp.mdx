@@ -18,7 +18,7 @@ The server implements protocol revision `2025-06-18` and reports itself as `noit
 
 ## API key
 
-The key is a normal account API key created on the Account tab of the Noite app (`/apps/_control?t=account`) with the **App Management** scope (`apps: manage`) — the same scope `git push` uses. A key without it is refused. The key is shown once at creation; keep it secret, since anyone holding it can act as you.
+The key is a normal account API key created on `/account` with the **App Management** scope (`apps: manage`) — the same scope `git push` uses. A key without it is refused. The key is shown once at creation; keep it secret, since anyone holding it can act as you.
 
 For an agent, narrow the key when you mint it ([API keys](/reference/api-keys)): limit it to the apps it works on, cap it at the role it needs (a `push` ceiling keeps an agent out of variables, settings and protected branches), and give it an expiry. The restrictions apply to every tool below and to git with the same key.
 
@@ -28,7 +28,7 @@ Every tool takes `app` — an app slug or id — and resolves your role on that 
 
 ## Setup
 
-The **Connect an agent** card on the Account tab shows all three snippets, filled in with the key you just created and generated from the control UI's own origin. Paste the one for your client:
+The **Connect an agent** card on `/account` shows all three snippets, filled in with the key you just created and generated from the control UI's own origin. Paste the one for your client:
 
 **Claude Code** — one terminal command:
 

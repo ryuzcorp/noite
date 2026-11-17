@@ -162,7 +162,7 @@ export const Authed = ({
       invalidateSession();
       // Back where the admin started the impersonation (the admin home when
       // that is unknown), never a page they did not come from.
-      router.visit(takeImpersonationReturn("/apps/_control?t=users"));
+      router.visit(takeImpersonationReturn("/apps/_control?t=admin"));
     } catch (error) {
       returnError.set(errorMessage(error));
       returning.set(false);
