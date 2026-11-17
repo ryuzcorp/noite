@@ -139,36 +139,78 @@ pub fn collect_d1_bindings(deploy_root: &Path) -> anyhow::Result<Vec<TenantD1Bin
     Ok(Vec::new())
 }
 
-/// The binding's migrations directory on disk, relative to the deploy root.
-/// `None` when the directory is absent — a Worker with a D1 binding and no
-/// migration files deploys green with nothing to apply, exactly like a
-/// `migrations/` wrangler never wrote.
-pub fn migrations_dir_on_disk(deploy_root: &Path, binding: &TenantD1Binding) -> Option<PathBuf> {
-    let dir = deploy_root.join(&binding.migrations_dir);
-    if dir.is_dir() {
-        Some(dir)
-    } else {
-        None
+/// Resolve the binding's migrations directory against the deploy root:
+/// canonicalize the root and the joined dir (a missing dir is `Ok(None)` —
+/// a Worker with a D1 binding and no migration files deploys green with
+/// nothing to apply), then require the result to stay under the root. The dir
+/// itself may not be a symlink — not even one pointing inside the tree:
+/// celld follows it when reading, and the deploy must never execute SQL from
+/// outside the pushed tree (host paths, another tenant's checkout) with the
+/// results landing in the tenant-readable deploy log. A dir outside the root
+/// fails the deploy loudly, never a silent skip.
+pub fn resolve_migrations_dir(
+    deploy_root: &Path,
+    binding: &TenantD1Binding,
+) -> anyhow::Result<Option<PathBuf>> {
+    let root = deploy_root
+        .canonicalize()
+        .with_context(|| format!("canonicalize {}", deploy_root.display()))?;
+    let joined = root.join(&binding.migrations_dir);
+    // `symlink_metadata` follows nothing: a symlink reports as one here even
+    // when its target is a directory, where `is_dir` would say yes.
+    if std::fs::symlink_metadata(&joined).is_ok_and(|meta| meta.file_type().is_symlink()) {
+        anyhow::bail!(
+            "refusing D1 `{}` migrations_dir {:?}: is a symlink",
+            binding.database_name,
+            binding.migrations_dir
+        );
     }
+    let dir = match joined.canonicalize() {
+        Ok(dir) => dir,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e).with_context(|| format!("read {}", joined.display())),
+    };
+    if !dir.starts_with(&root) {
+        anyhow::bail!(
+            "d1 database {:?} `migrations_dir` {:?} escapes the project",
+            binding.database_name,
+            binding.migrations_dir
+        );
+    }
+    if !dir.is_dir() {
+        return Ok(None);
+    }
+    Ok(Some(dir))
 }
 
-/// Names of the `.sql` files celld would read, sorted as wrangler applies
-/// them — for the deploy log only (celld itself orders and tracks the apply).
-/// The match is the migration-file rule both use: a flat directory, ASCII
-/// case-insensitive `.sql`.
-pub fn migration_file_names(dir: &Path) -> Vec<String> {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return Vec::new();
-    };
+/// The migration file names in an already-vetted directory, sorted as
+/// wrangler applies them — a flat directory, ASCII case-insensitive `.sql`.
+/// Every `*.sql` entry must be a regular file and never a symlink (a
+/// symlinked, fifo, device or directory `*.sql` fails the deploy loudly
+/// instead of reaching celld, which would follow the link and execute
+/// out-of-tree SQL). Anything else in the directory is ignored.
+pub fn collect_migration_files(dir: &Path) -> anyhow::Result<Vec<String>> {
     let mut names: Vec<String> = Vec::new();
-    for entry in entries.flatten() {
+    let entries = std::fs::read_dir(dir).with_context(|| format!("read {}", dir.display()))?;
+    for entry in entries {
+        let entry = entry.with_context(|| format!("read {}", dir.display()))?;
         let name = entry.file_name().to_string_lossy().into_owned();
-        if name.len() >= 4 && name[name.len() - 4..].eq_ignore_ascii_case(".sql") {
-            names.push(name);
+        if !(name.len() >= 4 && name[name.len() - 4..].eq_ignore_ascii_case(".sql")) {
+            continue;
         }
+        // `DirEntry::file_type` traverses nothing: a symlink reports as one
+        // even when its target is a regular file.
+        let file_type = entry.file_type().with_context(|| format!("read {name}"))?;
+        if file_type.is_symlink() {
+            anyhow::bail!("refusing D1 migration {name}: is a symlink");
+        }
+        if !file_type.is_file() {
+            anyhow::bail!("refusing D1 migration {name}: not a regular file");
+        }
+        names.push(name);
     }
     names.sort();
-    names
+    Ok(names)
 }
 
 #[cfg(test)]
@@ -249,8 +291,9 @@ mod tests {
             migrations_dir: "migrations".to_string(),
             migrations_table: "d1_migrations".to_string(),
         };
-        assert!(migrations_dir_on_disk(dir.path(), &binding).is_none());
-        assert!(migration_file_names(&dir.path().join("migrations")).is_empty());
+        assert!(resolve_migrations_dir(dir.path(), &binding)
+            .unwrap()
+            .is_none());
     }
 
     #[test]
@@ -260,7 +303,85 @@ mod tests {
             ("migrations/0001_first.SQL", "x"),
             ("migrations/notes.txt", "x"),
         ]);
-        let names = migration_file_names(&dir.path().join("migrations"));
-        assert_eq!(names, vec!["0001_first.SQL", "0002_second.sql"]);
+        let resolved = resolve_migrations_dir(
+            dir.path(),
+            &TenantD1Binding {
+                database_name: "demo".to_string(),
+                migrations_dir: "migrations".to_string(),
+                migrations_table: "d1_migrations".to_string(),
+            },
+        )
+        .unwrap()
+        .expect("migrations dir resolves");
+        assert_eq!(
+            collect_migration_files(&resolved).unwrap(),
+            vec!["0001_first.SQL", "0002_second.sql"]
+        );
+    }
+
+    #[test]
+    fn symlinked_migrations_dir_is_refused() {
+        use std::os::unix::fs::symlink;
+        let outside = crate::testutil::TempDir::new("noite-tenant-d1-outside");
+        std::fs::write(
+            outside.path().join("evil.sql"),
+            "CREATE TABLE t (id INTEGER);",
+        )
+        .unwrap();
+        let dir = write_root(&[("wrangler.json", "{}")]);
+        symlink(outside.path(), dir.path().join("migrations")).expect("symlink");
+        let binding = TenantD1Binding {
+            database_name: "demo".to_string(),
+            migrations_dir: "migrations".to_string(),
+            migrations_table: "d1_migrations".to_string(),
+        };
+        let err = resolve_migrations_dir(dir.path(), &binding)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("is a symlink"), "{err}");
+    }
+
+    #[test]
+    fn symlinked_migration_file_is_refused() {
+        use std::os::unix::fs::symlink;
+        let dir = write_root(&[
+            ("migrations/0001_init.sql", "CREATE TABLE t (id INTEGER);"),
+            ("real.sql", "SELECT 1;"),
+        ]);
+        symlink(
+            dir.path().join("real.sql"),
+            dir.path().join("migrations/0002_link.sql"),
+        )
+        .expect("symlink");
+        let resolved = resolve_migrations_dir(
+            dir.path(),
+            &TenantD1Binding {
+                database_name: "demo".to_string(),
+                migrations_dir: "migrations".to_string(),
+                migrations_table: "d1_migrations".to_string(),
+            },
+        )
+        .unwrap()
+        .expect("migrations dir resolves");
+        let err = collect_migration_files(&resolved).unwrap_err().to_string();
+        assert!(err.contains("is a symlink"), "{err}");
+    }
+
+    #[test]
+    fn non_regular_migration_file_is_refused() {
+        let dir = write_root(&[("wrangler.json", "{}")]);
+        std::fs::create_dir_all(dir.path().join("migrations/0001_dir.sql")).expect("mkdir");
+        let resolved = resolve_migrations_dir(
+            dir.path(),
+            &TenantD1Binding {
+                database_name: "demo".to_string(),
+                migrations_dir: "migrations".to_string(),
+                migrations_table: "d1_migrations".to_string(),
+            },
+        )
+        .unwrap()
+        .expect("migrations dir resolves");
+        let err = collect_migration_files(&resolved).unwrap_err().to_string();
+        assert!(err.contains("not a regular file"), "{err}");
     }
 }

@@ -2395,10 +2395,17 @@ async fn migrate_tenant_d1(
         .await?;
     let mut any_dir = false;
     for binding in &bindings {
-        let Some(dir) = tenant_d1::migrations_dir_on_disk(deploy_root, binding) else {
+        // Vetted before celld ever reads it: the canonical dir stays under
+        // the deploy root and no entry is a symlink, so celld cannot be
+        // aimed at host or other-tenant SQL. The tree is runner-owned and
+        // immutable from stage through activate (tenant sandboxes are done,
+        // the uid reclaimed, and the deploy holds the per-app claim), so the
+        // vetted target cannot be swapped between this check and celld's own
+        // re-resolution of `PROJECT/migrations_dir`.
+        let Some(dir) = tenant_d1::resolve_migrations_dir(deploy_root, binding)? else {
             continue;
         };
-        if tenant_d1::migration_file_names(&dir).is_empty() {
+        if tenant_d1::collect_migration_files(&dir)?.is_empty() {
             continue;
         }
         any_dir = true;
