@@ -18,18 +18,21 @@ import { Cause } from "effect";
 import { ApiError } from "./api";
 
 /** Wrappers can nest (`tryPromise(() => tryPromise(…))`); bail out rather than
- * walk a cyclic cause chain forever. */
-const MAX_CAUSE_DEPTH = 4;
+ * walk a cyclic cause chain forever. Shared with the DB layer's
+ * `isMissingTableFailure`, which walks the same wrappers. */
+export const MAX_CAUSE_DEPTH = 4;
 
 /** Drizzle's query error, recognized by its own shape: the class is exported
- * only from `drizzle-orm/errors`, which this app does not depend on. */
+ * only from `drizzle-orm/errors`, which this app does not depend on. Shared
+ * with the DB layer's `isMissingTableFailure`, which descends past the same
+ * wrapper. */
 interface QueryError {
   params: unknown[];
   query: string;
 }
 
-// oxlint-disable-next-line anti-slop/no-unknown-parameters -- catch-site and wrapper values are unknown by construction; this is the one place that narrows them.
-const asQueryError = (error: unknown): (Error & QueryError) | null => {
+// oxlint-disable-next-line anti-slop/no-unknown-parameters -- catch-site and wrapper values are unknown by construction; this is the place that narrows wrapper shapes.
+export const asQueryError = (error: unknown): (Error & QueryError) | null => {
   if (!(error instanceof Error)) {
     return null;
   }
@@ -103,37 +106,6 @@ export const isQueryFailure = (error: unknown): boolean => {
     }
 
     if (!(Cause.isUnknownError(current) && current.cause !== undefined)) {
-      return false;
-    }
-
-    current = current.cause;
-  }
-
-  return false;
-};
-
-/** Whether the failure chain says a table is missing: the control database
- * has not finished its migrations (the runner is still retrying them), so
- * the caller answers 503 "migrating" instead of the 500 a half-migrated
- * schema would otherwise read as. Matched on the driver's own words, never
- * on the query text. */
-// oxlint-disable-next-line anti-slop/no-unknown-parameters -- catch-site boundary, same as errorMessage.
-export const isMissingTableFailure = (error: unknown): boolean => {
-  let current = error;
-
-  for (let depth = 0; depth < MAX_CAUSE_DEPTH; depth += 1) {
-    if (!(current instanceof Error)) {
-      return false;
-    }
-
-    if (/no such table/iu.test(current.message)) {
-      return true;
-    }
-
-    if (
-      asQueryError(current) === null &&
-      !(Cause.isUnknownError(current) && current.cause !== undefined)
-    ) {
       return false;
     }
 

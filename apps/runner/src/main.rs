@@ -150,8 +150,10 @@ pub struct AppState {
     /// (`host::sourcemaps::SourceMapCache`).
     pub source_maps: host::sourcemaps::SourceMapCache,
     /// Why the control fleet failed to come up (deploy or migrations), or
-    /// `None`: /ready reports it beside "fleet not healthy", so a red lane
-    /// names its cause instead of only failing.
+    /// `None`: /ready reports it whenever set — even when the fleet answers
+    /// its health probe, which it does through a migration outage — so a red
+    /// lane names its cause instead of only failing, and never reads green
+    /// while the UI serves its 503 "migrating" page.
     pub control_boot: Arc<std::sync::Mutex<Option<String>>>,
 }
 

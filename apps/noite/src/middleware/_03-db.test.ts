@@ -214,7 +214,7 @@ describe("control env stamp (dogfood D1)", () => {
       () => {
         next = true;
 
-        return Promise.reject(new Error("no such table: invite"));
+        return Promise.reject(new Error("no such table: email_invite"));
       }
     );
 
@@ -228,5 +228,16 @@ describe("control env stamp (dogfood D1)", () => {
 
     expect(answered.status).toBe(503);
     expect(answered.headers.get("retry-after")).toBe("5");
+  });
+
+  test("a wrong table name downstream still throws", async () => {
+    // A table the schema never declares is a code bug, not a pending
+    // migration: it propagates to the 500 path instead of 503 "migrating".
+    await expect(
+      dbMiddleware(
+        testRouteContext(new Request("http://localhost/app"), platformEnv()),
+        () => Promise.reject(new Error("no such table: typo_table"))
+      )
+    ).rejects.toThrow("no such table: typo_table");
   });
 });

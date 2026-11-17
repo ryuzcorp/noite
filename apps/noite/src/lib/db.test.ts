@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, test } from "bun:test";
 
+import { Cause } from "effect";
 import { sql } from "void/db";
 
 import { createTestD1 } from "../testing/d1";
@@ -10,6 +11,7 @@ import {
   DbUnavailableError,
   ensureDb,
   getDb,
+  isMissingTableFailure,
   setD1Binding,
   withDb,
 } from "./db";
@@ -130,5 +132,55 @@ describe("migration gate", () => {
     await expect(
       withDb(() => Promise.reject(new Error("boom")))
     ).rejects.toThrow("boom");
+  });
+
+  test("isMissingTableFailure names an unmigrated database", () => {
+    expect(isMissingTableFailure(new Error("no such table: user"))).toBe(true);
+    expect(
+      isMissingTableFailure(
+        new Error("SQLITE_ERROR: no such table: email_invite")
+      )
+    ).toBe(true);
+
+    // Through effect's wrapper, the shape withDb rejects with.
+    expect(
+      isMissingTableFailure(
+        new Cause.UnknownError(
+          new Error("no such table: user"),
+          "An error occurred in Effect.tryPromise"
+        )
+      )
+    ).toBe(true);
+
+    // Through drizzle's wrapper: the statement is the wrapper's own text, the
+    // driver names the missing table in the cause.
+    const wrapped = Object.assign(
+      new Error('Failed query: select * from "user"'),
+      {
+        cause: new Error("no such table: user"),
+        params: [],
+        query: 'select * from "user"',
+      }
+    );
+
+    expect(isMissingTableFailure(wrapped)).toBe(true);
+    expect(isMissingTableFailure(new Error("D1 is down"))).toBe(false);
+    expect(isMissingTableFailure(null)).toBe(false);
+  });
+
+  test("isMissingTableFailure lets a wrong table name 500", () => {
+    // A table the schema never declares is a code bug, not a pending
+    // migration: it must read as a 500, never as 503 "migrating" forever.
+    expect(isMissingTableFailure(new Error("no such table: typo_table"))).toBe(
+      false
+    );
+    expect(
+      isMissingTableFailure(
+        new Cause.UnknownError(
+          new Error("no such table: typo_table"),
+          "An error occurred in Effect.tryPromise"
+        )
+      )
+    ).toBe(false);
   });
 });

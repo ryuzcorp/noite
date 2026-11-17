@@ -1,13 +1,15 @@
 /* eslint-disable max-classes-per-file -- tagged Fail types for the DB layer */
 import type { D1Database } from "@cloudflare/workers-types";
 import { drizzleAdapter } from "better-auth/adapters/drizzle";
+import { Cause } from "effect";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 import { createDb, eq } from "void/db";
+import { getTableConfig } from "void/schema-d1";
 
 import { schema, userTable } from "../db/schema";
 import { controlEnv } from "./control-env";
-import { isMissingTableFailure } from "./errors";
+import { MAX_CAUSE_DEPTH, asQueryError } from "./errors";
 
 // D1 holds auth (better-auth tables) plus collaborator grants and their
 // pending invitations — the ONLY app-shaped state the UI owns. App rows and
@@ -48,6 +50,55 @@ export class DbUnavailableError extends Schema.TaggedError<DbUnavailableError>()
 
 export const dbUnavailable = () =>
   new DbUnavailableError({ message: DB_MIGRATING_BODY });
+
+/** Every table the control database must have once migrations applied,
+ * derived from the schema source of truth (not a hand-copied list, so a new
+ * migration's table joins the 503 gate with its schema entry). */
+const KNOWN_TABLES: ReadonlySet<string> = new Set(
+  Object.values(schema).map((table) => getTableConfig(table).name.toLowerCase())
+);
+
+/** The table a failure says is missing, if it names one. */
+const missingTableName = (message: string): string | null => {
+  const match = /no such table:\s*["']?(?<table>[^\s"';\]]+)/iu.exec(message);
+
+  return match?.groups?.table?.toLowerCase() ?? null;
+};
+
+/** Whether the failure chain says a known table is missing: the control
+ * database has not finished its migrations (the runner is still retrying
+ * them), so the caller answers 503 "migrating" instead of the 500 a
+ * half-migrated schema would otherwise read as. Only the schema's own tables
+ * read as "migrating": a wrong table name anywhere else is a code bug, and a
+ * bug must 500, never 503 forever. Matched on the driver's own words, never
+ * on the query text. */
+// oxlint-disable-next-line anti-slop/no-unknown-parameters -- catch-site boundary, same as errorMessage.
+export const isMissingTableFailure = (error: unknown): boolean => {
+  let current = error;
+
+  for (let depth = 0; depth < MAX_CAUSE_DEPTH; depth += 1) {
+    if (!(current instanceof Error)) {
+      return false;
+    }
+
+    const missing = missingTableName(current.message);
+
+    if (missing !== null) {
+      return KNOWN_TABLES.has(missing);
+    }
+
+    if (
+      asQueryError(current) === null &&
+      !(Cause.isUnknownError(current) && current.cause !== undefined)
+    ) {
+      return false;
+    }
+
+    current = current.cause;
+  }
+
+  return false;
+};
 
 /** Map a missing table to the 503 outage (the control migrations have not
  * applied yet); pass anything else through unchanged. */

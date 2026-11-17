@@ -13,7 +13,16 @@ describe("routeFailure", () => {
   });
 
   test("anything else stays a flat 500", () => {
-    const response = routeFailure("[test]", new Error("boom"));
+    expect(routeFailure("[test]", new Error("boom")).status).toBe(500);
+  });
+
+  test("a wrong table name stays a flat 500", () => {
+    // The 503 gate only knows the schema's own tables: a code bug naming
+    // any other table must 500 here, never "migrating" forever.
+    const response = routeFailure(
+      "[test]",
+      new Error("no such table: typo_table")
+    );
 
     expect(response.status).toBe(500);
   });

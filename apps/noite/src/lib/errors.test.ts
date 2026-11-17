@@ -6,7 +6,6 @@ import { ApiError } from "./api";
 import {
   errorLogText,
   errorMessage,
-  isMissingTableFailure,
   isQueryFailure,
   operationMessage,
 } from "./errors";
@@ -137,37 +136,4 @@ test("a query error with no driver cause never reads as its SQL", () => {
   });
 
   expect(errorMessage(bare)).toBe("Database query failed");
-});
-
-test("isMissingTableFailure names an unmigrated database", () => {
-  expect(isMissingTableFailure(new Error("no such table: user"))).toBe(true);
-  expect(
-    isMissingTableFailure(new Error("SQLITE_ERROR: no such table: invite"))
-  ).toBe(true);
-
-  // Through effect's wrapper, the shape withDb rejects with.
-  expect(
-    isMissingTableFailure(
-      new Cause.UnknownError(
-        new Error("no such table: user"),
-        "An error occurred in Effect.tryPromise"
-      )
-    )
-  ).toBe(true);
-
-  // Through drizzle's wrapper: the statement is the wrapper's own text, the
-  // driver names the missing table in the cause.
-  const wrapped = Object.assign(
-    new Error('Failed query: select * from "user"'),
-    {
-      cause: new Error("no such table: user"),
-      params: [],
-      query: 'select * from "user"',
-    }
-  );
-
-  expect(isMissingTableFailure(wrapped)).toBe(true);
-  expect(isMissingTableFailure(queryError())).toBe(false);
-  expect(isMissingTableFailure(new Error("D1 is down"))).toBe(false);
-  expect(isMissingTableFailure(null)).toBe(false);
 });

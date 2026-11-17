@@ -17,9 +17,9 @@ import {
   DB_MIGRATING_BODY,
   DbUnavailableError,
   ensureDb,
+  isMissingTableFailure,
   setD1Binding,
 } from "../lib/db";
-import { isMissingTableFailure } from "../lib/errors";
 
 export default defineMiddleware(async (c, next) => {
   // SAFETY: c.env carries the control keys the runner deployed as worker vars; the stamp copies every declared string key.

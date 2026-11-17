@@ -96,17 +96,25 @@ pub async fn ready(State(state): State<AppState>) -> impl IntoResponse {
             .send()
             .await
             .is_ok_and(|r| r.status().is_success());
-        if !healthy {
-            let cause = state
-                .control_boot
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .clone();
-            let detail = match cause {
-                Some(reason) => format!("fleet not healthy yet ({reason})"),
-                None => "fleet not healthy yet".into(),
-            };
-            failures.push(ReadyFailure::Control(detail));
+        // A boot failure (deploy or migrations) is reported even when the
+        // fleet answers its probe: during a migration outage the worker is
+        // up serving the 503 "migrating" page, so gating the cause on the
+        // probe would drop a real failure and /ready would read green.
+        let cause = state
+            .control_boot
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        match cause {
+            Some(reason) => {
+                failures.push(ReadyFailure::Control(format!(
+                    "fleet not healthy yet ({reason})"
+                )));
+            }
+            None if !healthy => {
+                failures.push(ReadyFailure::Control("fleet not healthy yet".into()));
+            }
+            None => {}
         }
     }
     {
@@ -414,5 +422,61 @@ mod tests {
             crate::Readiness::resolve(true, vec![crate::ReadyFailure::Reconcile]),
             crate::Readiness::Degraded { .. }
         ));
+    }
+
+    /// A migration outage fails /ready even while the control fleet answers
+    /// its health probe: the worker is up (serving the 503 "migrating"
+    /// page), so gating the recorded boot cause on the probe would read
+    /// green while the UI 503s.
+    #[tokio::test]
+    async fn ready_names_a_boot_cause_beside_a_healthy_probe() {
+        // Stub the fleet health gate: 200 on the probe, so the recorded
+        // cause below is what fails the gate, not the probe.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:8090")
+            .await
+            .expect("probe stub binds");
+        let probe = tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut request = vec![0u8; 4096];
+                let _ = tokio::io::AsyncReadExt::read(&mut socket, &mut request).await;
+                let _ = tokio::io::AsyncWriteExt::write_all(
+                    &mut socket,
+                    b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok",
+                )
+                .await;
+            }
+        });
+        let harness = crate::api::tests::Harness::with_config(|config| {
+            let bundle = std::env::temp_dir()
+                .join(format!("noite-ready-control-{}", crate::models::new_id()));
+            std::fs::create_dir_all(&bundle).expect("bundle dir");
+            config.control_bundle_dir = bundle.to_string_lossy().into_owned();
+        })
+        .await;
+        *harness
+            .state
+            .control_boot
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            Some("migrations failed: control migrate failed: migration m failed: boom".to_string());
+        let (status, body) = harness.rest("GET", "/ready", None).await;
+        probe.abort();
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        let failing = body["failing"]
+            .as_array()
+            .expect("failing array")
+            .iter()
+            .filter_map(|entry| entry.as_str())
+            .collect::<Vec<_>>();
+        assert!(
+            failing
+                .iter()
+                .any(|entry| entry.contains("migrations failed: control migrate failed")),
+            "the boot cause fails the gate: {failing:?}"
+        );
+        harness.finish().await;
     }
 }
