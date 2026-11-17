@@ -254,8 +254,10 @@ test(
     ).toBeVisible();
 
     // "Last synced" names the same imported head, so read the Origin tip row.
+    // (The `has` locator stays page-scoped: the dialog-scoped form never
+    // matches.)
     const originTip = dialog.locator("dl > div", {
-      has: dialog.locator("dt", { hasText: /^Origin tip$/u }),
+      has: page.locator("dt", { hasText: /^Origin tip$/u }),
     });
 
     await expect(originTip.getByText(upstreamHead.slice(0, 7))).toBeVisible();
