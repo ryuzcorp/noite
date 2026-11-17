@@ -91,17 +91,30 @@ run_with_timeout() {
 # differently (podman also reports `initialized`, `stopped`, `configured`).
 # Raw engine `ps`, once per engine's compose labels (`compose ps` output
 # differs between them).
+# The bundled store counts too whenever the install uses it: `noite`
+# declares rustfs `required: false`, so an `up` that leaves only the edge
+# running would otherwise pass. Detection is the engine itself: a project
+# container labelled `service=rustfs` means the bundled store is in play
+# (a BYO-S3 `--scale rustfs=0` install has none to query); every such
+# container must be `running`.
+# (Kept identical in backup.sh and restore.sh on purpose — keep the two
+# copies in sync. Sharing via lib.sh would churn both callers' covered
+# restart paths for no behaviour gain.)
 project_running() {
   states=""
   edge=""
+  store=""
   for label in com.docker.compose io.podman.compose; do
     states="$states $("$CLI" ps -a --filter "label=${label}.project=${PROJECT}" --format '{{.State}}' 2>/dev/null || true)"
     edge="$edge $("$CLI" ps -a --filter "label=${label}.project=${PROJECT}" --filter "label=${label}.service=noite" --format '{{.State}}' 2>/dev/null || true)"
+    store="$store $("$CLI" ps -a --filter "label=${label}.project=${PROJECT}" --filter "label=${label}.service=rustfs" --format '{{.State}}' 2>/dev/null || true)"
   done
   states="$(printf '%s' "$states" | tr ' ' '\n' | grep -v '^$' || true)"
   [ -n "$states" ] || return 1
   printf '%s' "$edge" | tr ' ' '\n' | grep -qx 'running' || return 1
-  ! printf '%s\n' "$states" | grep -qvx 'running'
+  ! printf '%s\n' "$states" | grep -qvx 'running' || return 1
+  store="$(printf '%s' "$store" | tr ' ' '\n' | grep -v '^$' || true)"
+  [ -z "$store" ] || ! printf '%s\n' "$store" | grep -qvx 'running'
 }
 
 # Set to 1 just before `ce stop`: the trap below restarts only a stack this

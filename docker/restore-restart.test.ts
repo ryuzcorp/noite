@@ -77,13 +77,24 @@ case "$1" in
     ;;
   ps)
     # project_running asks per engine's compose labels: every container's
-    # state, then the edge's (service=noite). Only the docker labels answer.
+    # state, then the edge's (service=noite), then the bundled store's
+    # (service=rustfs). Only the docker labels answer.
     # RS_EDGE_GONE: up removed the edge and failed to recreate it, so only
     # the dependency runs. RS_DEP_STATE: the dependency's state (podman
-    # reports initialized / stopped for down containers).
+    # reports initialized / stopped for down containers). RS_STORE_STATE:
+    # the rustfs service's own state, so a down store fails the restart
+    # even when the project query above still lists every container
+    # running. RS_STORE_GONE: a '--scale rustfs=0' install with no store
+    # container at all.
     case "$*" in
       *com.docker.compose.service=noite*)
         if [ "$(state)" = running ] && [ "$RS_EDGE_GONE" != 1 ]; then printf 'running\n'; fi
+        ;;
+      *com.docker.compose.service=rustfs*)
+        if [ "$RS_STORE_GONE" != 1 ]; then
+          if [ "$(state)" != running ]; then printf 'exited\n'
+          else store="$RS_STORE_STATE"; [ -n "$store" ] || store=running; printf '%s\n' "$store"; fi
+        fi
         ;;
       *com.docker.compose.project=*)
         if [ "$(state)" != running ]; then printf 'exited\nexited\n'
@@ -114,6 +125,8 @@ interface RestoreOpts {
   extraTars?: string[];
   tarSignal?: "INT" | "TERM";
   tenancy?: string;
+  storeGone?: boolean;
+  storeState?: string;
   tarFail?: boolean;
   upFail?: boolean;
   upWedge?: boolean;
@@ -182,6 +195,8 @@ const runRestore = (opts: RestoreOpts = {}): RunResult & { log: string } => {
     extraTars = [],
     tarSignal,
     tenancy,
+    storeGone,
+    storeState,
     tarFail,
     upFail,
     upWedge,
@@ -226,6 +241,8 @@ const runRestore = (opts: RestoreOpts = {}): RunResult & { log: string } => {
     RS_UP_WEDGE: upWedge === true ? "1" : undefined,
     RS_DEP_STATE: depState,
     RS_EDGE_GONE: edgeGone === true ? "1" : undefined,
+    RS_STORE_GONE: storeGone === true ? "1" : undefined,
+    RS_STORE_STATE: storeState,
   };
 
   const args =
@@ -364,6 +381,22 @@ describe("make restore restart", () => {
     expect(r.status).not.toBe(0);
     expect(r.stdout).not.toContain("restored.");
     expect(r.stderr).toContain("automatic restart failed");
+  });
+
+  test("a wedged up with the bundled store down fails loudly", () => {
+    const r = runRestore({ storeState: "exited", upWedge: true });
+
+    expect(r.status).not.toBe(0);
+    expect(r.stdout).not.toContain("restored.");
+    expect(r.stderr).toContain("automatic restart failed");
+  });
+
+  test("a wedged up with no bundled store still succeeds, with a note", () => {
+    const r = runRestore({ storeGone: true, upWedge: true });
+
+    expect(r.status).toBe(0);
+    expect(r.stdout).toContain("every container is running");
+    expect(r.stdout).toContain("restored.");
   });
 
   test("a direct run follows the .env base domain to the multi overlay", () => {

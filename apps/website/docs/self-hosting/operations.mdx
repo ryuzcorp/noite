@@ -104,6 +104,7 @@ Turn on versioning (or replication to a second bucket/region) at the provider: a
 :::danger
 Restoring replaces the live volumes: everything written since that backup is gone.
 Prefer `make restore FROM=backups/<stamp>` over the manual commands below: it stops the stack, replaces every volume in the backup, and always starts the stack again — even if the restore itself fails halfway (a bad archive, a tar error), in which case it exits nonzero without claiming success so you can fix the archive and re-run. A failed automatic restart also exits nonzero instead of leaving the stack silently stopped.
+:::
 
 ```bash
 cd /opt/noite

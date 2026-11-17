@@ -73,13 +73,24 @@ case "$1" in
     ;;
   ps)
     # project_running asks per engine's compose labels: every container's
-    # state, then the edge's (service=noite). Only the docker labels answer.
+    # state, then the edge's (service=noite), then the bundled store's
+    # (service=rustfs). Only the docker labels answer.
     # BK_EDGE_GONE: up removed the edge and failed to recreate it, so only
     # the dependency runs. BK_DEP_STATE: the dependency's state (podman
-    # reports initialized / stopped for down containers).
+    # reports initialized / stopped for down containers). BK_STORE_STATE:
+    # the rustfs service's own state, so a down store fails the restart
+    # even when the project query above still lists every container
+    # running. BK_STORE_GONE: a '--scale rustfs=0' install with no store
+    # container at all.
     case "$*" in
       *com.docker.compose.service=noite*)
         if [ "$(state)" = running ] && [ "$BK_EDGE_GONE" != 1 ]; then printf 'running\n'; fi
+        ;;
+      *com.docker.compose.service=rustfs*)
+        if [ "$BK_STORE_GONE" != 1 ]; then
+          if [ "$(state)" != running ]; then printf 'exited\n'
+          else store="$BK_STORE_STATE"; [ -n "$store" ] || store=running; printf '%s\n' "$store"; fi
+        fi
         ;;
       *com.docker.compose.project=*)
         if [ "$(state)" != running ]; then printf 'exited\nexited\n'
@@ -111,6 +122,8 @@ interface BackupOpts {
   edgeGone?: boolean;
   envFile?: string;
   tarSignal?: "INT" | "TERM";
+  storeGone?: boolean;
+  storeState?: string;
   tenancy?: string;
   tarFail?: boolean;
   upFail?: boolean;
@@ -127,6 +140,8 @@ const runBackup = (opts: BackupOpts = {}): RunResult & { log: string } => {
     tarSignal,
     tenancy,
     tarFail,
+    storeGone,
+    storeState,
     upFail,
     upWedge,
   } = opts;
@@ -184,6 +199,8 @@ const runBackup = (opts: BackupOpts = {}): RunResult & { log: string } => {
     BK_CURL_FAIL: curlFail === true ? "1" : undefined,
     BK_DEP_STATE: depState,
     BK_EDGE_GONE: edgeGone === true ? "1" : undefined,
+    BK_STORE_GONE: storeGone === true ? "1" : undefined,
+    BK_STORE_STATE: storeState,
   };
 
   const proc = Bun.spawnSync(
@@ -294,6 +311,22 @@ describe("make backup restart", () => {
     expect(r.status).not.toBe(0);
     expect(r.stdout).not.toContain("backup complete:");
     expect(r.stderr).toContain("automatic restart failed");
+  });
+
+  test("a wedged up with the bundled store down fails loudly", () => {
+    const r = runBackup({ storeState: "exited", upWedge: true });
+
+    expect(r.status).not.toBe(0);
+    expect(r.stdout).not.toContain("backup complete:");
+    expect(r.stderr).toContain("automatic restart failed");
+  });
+
+  test("a wedged up with no bundled store still succeeds, with a note", () => {
+    const r = runBackup({ storeGone: true, upWedge: true });
+
+    expect(r.status).toBe(0);
+    expect(r.stdout).toContain("every container is running");
+    expect(r.stdout).toContain("backup complete:");
   });
 
   test("a direct run follows the .env base domain to the multi overlay", () => {
