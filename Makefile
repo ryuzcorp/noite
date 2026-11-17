@@ -169,7 +169,7 @@ backup:
 
 restore:
 	@if [ -z "$(FROM)" ]; then echo "usage: make restore FROM=backups/<stamp>"; exit 1; fi
-	sh docker/restore.sh $(FROM)
+	sh docker/restore.sh "$(FROM)"
 
 doctor:
 	sh docker/doctor.sh
