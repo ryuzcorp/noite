@@ -50,6 +50,48 @@ pub fn base_env(work_tmp: &str, cache: &Path) -> Vec<(String, String)> {
     ]
 }
 
+/// Share of a build leaf's RAM cap given to V8's old space, in percent.
+/// Node sizes its default heap from the leaf's `memory.max` — about half —
+/// so a 613 MiB leaf gives a 397-package pnpm install ~306 MB and it aborts
+/// with `FATAL ERROR: Reached heap limit` after `added 397, done` (Ember,
+/// beta.4). Three quarters leaves native headroom (RSS, page cache) while
+/// the overflow swaps; a ceiling at or above the RAM cap would pin the leaf
+/// and trip the thrash watchdog on a healthy build (see
+/// `cgroups::build_thrash_pinned`).
+const NODE_HEAP_PCT: u64 = 75;
+
+/// V8 heap ceiling in MiB for a build leaf with `memory_mb` of RAM: `None`
+/// when builds run uncapped (`0` is the old behavior, no `NODE_OPTIONS`).
+/// Swap never counts toward the ceiling: heap past the RAM cap would pin the
+/// leaf and trip the thrash watchdog, so swap stays the overflow for native
+/// RSS and page cache. Runner-owned: tenant `NODE_OPTIONS` is dropped in
+/// `db::env`, so nothing the tenant sets can widen or narrow this.
+pub(crate) fn build_node_heap_max_mb(memory_mb: u64) -> Option<u64> {
+    if memory_mb == 0 {
+        return None;
+    }
+    Some(memory_mb * NODE_HEAP_PCT / 100)
+}
+
+/// The runner-owned `NODE_OPTIONS` for one build step (`None` when builds
+/// run uncapped): every Node in the step — jup, the package manager it
+/// runs, lifecycle scripts, the config converter — sizes its heap from the
+/// leaf's real budget instead of V8's default half-of-cgroup.
+pub(crate) fn node_heap_flag() -> Option<String> {
+    let heap = build_node_heap_max_mb(crate::host::cgroups::build_memory_mb()?)?;
+    Some(format!("--max-old-space-size={heap}"))
+}
+
+/// A V8 heap abort in a step's output: Node SIGABRTs, so the status has no
+/// code (`exit None`) and the raw dump names no knob. Matched against the
+/// step's combined output to turn it into the budget error below instead.
+fn v8_heap_oom(out: &str, err: &str) -> bool {
+    const MARKERS: &[&str] = &["JavaScript heap out of memory", "Reached heap limit"];
+    MARKERS
+        .iter()
+        .any(|marker| out.contains(marker) || err.contains(marker))
+}
+
 /// Subdirectories of a per-app build cache root.
 const CACHE_BUN: &str = "bun";
 const CACHE_JUP: &str = "jup";
@@ -320,6 +362,14 @@ pub async fn run_sandboxed(
     for (k, v) in sb.env {
         cmd.env(k, v);
     }
+    // The runner's own V8 ceiling (tenant `NODE_OPTIONS` is dropped in
+    // `db::env`, so this name is always the runner's to set): without it a
+    // 397-package pnpm install aborts after `added 397, done` on a small
+    // leaf, as SIGABRT (`exit None`) with a raw V8 dump. Set after the step
+    // env so nothing the step carries can narrow it.
+    if let Some(flag) = node_heap_flag() {
+        cmd.env("NODE_OPTIONS", flag);
+    }
     {
         let std_cmd = cmd.as_std_mut();
         std_cmd.process_group(0);
@@ -486,6 +536,20 @@ pub async fn run_sandboxed(
             if !output.status.success() {
                 let err = String::from_utf8_lossy(&output.stderr);
                 let out = String::from_utf8_lossy(&output.stdout);
+                // A V8 heap abort (SIGABRT, `exit None`) is the step
+                // outgrowing its JavaScript heap, not the leaf: name the
+                // ceiling and the two budgets instead of the raw dump alone.
+                if v8_heap_oom(&out, &err) {
+                    let memory = crate::host::cgroups::build_memory_mb().unwrap_or(0);
+                    let swap = crate::host::cgroups::build_swap_mb().unwrap_or(0);
+                    let heap = match build_node_heap_max_mb(memory) {
+                        Some(heap) => format!("{heap} MiB"),
+                        None => "unset".to_string(),
+                    };
+                    bail!(
+                        "the build step ran out of JavaScript heap (Node aborted with `FATAL ERROR: Reached heap limit`; the V8 ceiling is {heap} from a {memory} MiB RAM budget, RUNNER_BUILD_MEMORY_MB, plus {swap} MiB swap, RUNNER_BUILD_SWAP_MB). Raise the budget (if the box has the RAM for it) or deploy a prebuilt dist from CI; the runner and the apps kept serving\n{out}{err}"
+                    );
+                }
                 // stdout first: a build's progress goes there and its error to
                 // stderr, and the deploy log keeps the tail.
                 bail!(
@@ -969,5 +1033,67 @@ mod tests {
         std::fs::write(dir.path().join("a"), "12345").expect("seed file");
         assert_eq!(dir_bytes(dir.path()), 5);
         assert_eq!(dir_bytes(&dir.path().join("missing")), 0);
+    }
+
+    /// The build leaf's V8 ceiling is three quarters of its RAM cap: a 613
+    /// MiB leaf (a 1.6 GiB box) gives pnpm 459 MB, past the ~320 MB an Ember
+    /// install needs where V8's default half-of-cgroup (~306 MB) aborts it.
+    /// Uncapped builds (`0`) keep the old behavior: no `NODE_OPTIONS`.
+    #[test]
+    fn the_heap_ceiling_is_three_quarters_of_the_ram_cap() {
+        assert_eq!(build_node_heap_max_mb(0), None);
+        assert_eq!(build_node_heap_max_mb(613), Some(459));
+        assert_eq!(build_node_heap_max_mb(512), Some(384));
+        assert_eq!(build_node_heap_max_mb(1024), Some(768));
+        assert_eq!(build_node_heap_max_mb(4096), Some(3072));
+    }
+
+    /// The V8 signature matches the real abort (Ember's deploy log, beta.4:
+    /// `jup ["install"] exit None` over a `FATAL ERROR: Reached heap limit`
+    /// dump) and not an ordinary step failure, so only a heap abort earns
+    /// the budget error.
+    #[test]
+    fn the_heap_signature_matches_only_a_v8_abort() {
+        let out = "Progress: resolved 397, reused 397, downloaded 0, added 397, done\n";
+        let err = "<--- Last few GCs --->\n\
+             [22:0x26912000] 1288 ms: Mark-Compact 307.1 (436.4) -> 302.7 (433.1) MB, \
+             pooled: 3 MB, 15.83 / 0.00 ms allocation failure\n\
+             FATAL ERROR: Reached heap limit Allocation failed - JavaScript heap out of memory\n";
+        assert!(v8_heap_oom(out, err));
+        assert!(!v8_heap_oom(
+            "Progress: resolved 397, reused 397, downloaded 0, added 397, done\n",
+            "ERR_PNPM_NO_MATCHING_VERSION No matching version found for foo@^99\n"
+        ));
+        assert!(!v8_heap_oom("", ""));
+    }
+
+    /// The runner's own V8 ceiling reaches the step: with a 613 MiB build
+    /// budget the step sees `NODE_OPTIONS=--max-old-space-size=459`, and a
+    /// value under the name can never narrow the runner's — tenant
+    /// `NODE_OPTIONS` is dropped in `db::env`, so the runner owns it.
+    #[tokio::test]
+    async fn run_sandboxed_sets_the_runner_heap_ceiling() {
+        crate::host::cgroups::set_build_budgets_for_tests(613, 0);
+        let dir = crate::testutil::TempDir::new("noite-node-heap");
+        let sb = Sandbox {
+            uid: None,
+            gid: None,
+            env: &[("NODE_OPTIONS", "--max-old-space-size=128")],
+            cache: None,
+            cgroup: None,
+        };
+        let out = run_sandboxed(
+            "sh",
+            &["-c", "echo $NODE_OPTIONS"],
+            dir.path(),
+            &sb,
+            Duration::from_secs(30),
+        )
+        .await
+        .expect("echo the step env");
+        assert!(
+            out.trim_end().ends_with("--max-old-space-size=459"),
+            "the runner's ceiling wins, got {out:?}"
+        );
     }
 }

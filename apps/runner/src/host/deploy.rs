@@ -945,10 +945,17 @@ async fn deploy_inner(
                     .step("ci", DeployStatus::Building, CI_CONFIG_NAME)
                     .await?;
                 let cores = crate::host::memory::cores().max(1) as u64;
-                let ci_env: Vec<(String, String)> = step_env
+                let mut ci_env: Vec<(String, String)> = step_env
                     .iter()
                     .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
                     .collect();
+                // The runner's own V8 ceiling, like the built-in steps: a
+                // container sized from the same budget gets the same heap,
+                // never V8's default half-of-cgroup (tenant `NODE_OPTIONS`
+                // is dropped upstream, so this name is always the runner's).
+                if let Some(flag) = exec::node_heap_flag() {
+                    ci_env.push(("NODE_OPTIONS".to_string(), flag));
+                }
                 let settings = ryuz_workflow::Settings {
                     docker_bin: cfg.ci_docker_bin.clone(),
                     default_image: cfg.ci_default_image.clone(),

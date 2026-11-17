@@ -1,0 +1,3 @@
+### Fixed
+
+- Build steps now get the runner's own `NODE_OPTIONS=--max-old-space-size=N` (three quarters of the build leaf's RAM cap) on every install, build, convert and release step, including the Noite CI lane. Node otherwise sizes its heap at about half the cgroup limit, so a large `pnpm install` (Ember's 397 packages) aborted with `FATAL ERROR: Reached heap limit` after `added 397, done` on a 613 MiB leaf — as `SIGABRT` (`exit None`) with a raw V8 dump and no actionable line. A step that still outgrows its JavaScript heap now fails naming the V8 ceiling and both budgets (`RUNNER_BUILD_MEMORY_MB` / `RUNNER_BUILD_SWAP_MB`) instead of the dump alone. Tenant `NODE_OPTIONS` stays reserved and never reaches the build.
