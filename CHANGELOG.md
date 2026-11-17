@@ -10,6 +10,24 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 <!-- New entries go in changelog.d/<topic>.md; the release PR assembles them with `bun docker/changelog-release.ts`. -->
 
+## [0.1.0-beta.4] - 2026-11-17
+
+### Operator action required
+
+- None.
+
+### Changed
+
+- The tenant app Metrics and Analytics tabs show their **Metrics** / **Analytics** headings on the same row as the 24h/7d/1m range picker (heading left, pickers right, wrapping cleanly at 390 px), in the same heading style as the other cards.
+- The control page's Logs tab (`/apps/_control?t=logs`) renders inside the standard card with a **Logs** title row, like the Errors/Events cards; the shared log tail is unchanged, so deploy-row logs look the same.
+- The Admin user list's row actions (Impersonate, Make/Remove admin, Ban/Unban, Delete, Approve/Reject) collapse into one compact kebab menu per row at every width — the inline buttons spilled onto two lines at 390 px. The menu is keyboard-operable, Ban and Delete keep the destructive tone and their confirm dialogs.
+
+### Fixed
+
+- Every deploy now applies each D1 binding's `migrations_dir` (`migrations` by default) with `wrangler d1 migrations apply` semantics — ordered `NNNN_name.sql` files, each in its own transaction, tracked in a `d1_migrations` table (or the binding's `migrations_table`) so each file applies once — instead of leaving a Worker that expects migrations on an empty database. A redeploy runs them before the new generation takes traffic, so a failed migration fails the deploy and the previous generation keeps serving; a first deploy runs them after activation with nothing to protect. Rollbacks never un-apply (already-applied rows are skipped), previews migrate their own D1, and the deploy log names each applied migration.
+- The e2e plan now schedules the exact (lane, shard) matrix from Playwright's real per-lane distribution instead of a fixed 2 shards: a `--list` probe per lane shows when one large changed file would swallow a shard's share and strand the other shard with zero tests (#359 ran nothing on multi shard 2, then failed the lane's account-dependent post-checks). Such a lane runs one unsharded cell instead of a meaningless empty one; a lane with no tests at all fails the plan instead of passing vacuously. As a backstop, the lane itself fails loudly when its results file records zero tests, instead of tripping `recover` or passing silently.
+- **Migration and upgrade safety guardrails.** Migration files are now append-only by test: editing or deleting a shipped control migration (`apps/noite/src/db/migrations`) or runner step (`apps/runner/src/schema_version.rs`) fails `bun test` / `cargo test` instead of silently forking fresh installs from upgraded ones, and the control schema (`schema.ts`) must match the migrated shape (tables, columns, index names) or the suite fails. A new runner test replays every step from the v100 compacted baseline and proves the migrated database has the same tables, columns, indexes and triggers as a fresh one, so a step without its `schema.sql` change (or the reverse) fails before it ships; every migration still applies inside one transaction with the stamp untouched on failure, and an older binary still refuses a newer database with an actionable message. The upgrade lane now also proves the pre-upgrade API key still authenticates git after the restart, seeds from the oldest supported beta on demand (`E2E_FROM_OLDEST=1`) with a monthly oldest-beta lane, and the supported upgrade paths (beta to beta; fresh installs for alphas; no downgrades across schema changes) are documented under Operations.
+
 ## [0.1.0-beta.3] - 2026-11-17
 
 ### Operator action required

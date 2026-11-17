@@ -1,3 +1,0 @@
-### Fixed
-
-- Every deploy now applies each D1 binding's `migrations_dir` (`migrations` by default) with `wrangler d1 migrations apply` semantics — ordered `NNNN_name.sql` files, each in its own transaction, tracked in a `d1_migrations` table (or the binding's `migrations_table`) so each file applies once — instead of leaving a Worker that expects migrations on an empty database. A redeploy runs them before the new generation takes traffic, so a failed migration fails the deploy and the previous generation keeps serving; a first deploy runs them after activation with nothing to protect. Rollbacks never un-apply (already-applied rows are skipped), previews migrate their own D1, and the deploy log names each applied migration.
