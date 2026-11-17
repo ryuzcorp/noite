@@ -111,6 +111,67 @@ export const planE2E = (
   return { extraSpecs, runRelease, suite: runRelease ? "release" : "fast" };
 };
 
+export interface LaneShardCounts {
+  lane: string;
+  shard1: number;
+  shard2: number;
+  target: string;
+}
+
+export interface PlanCell {
+  lane: string;
+  round: number;
+  shard: number;
+  target: string;
+  total: number;
+}
+
+// Which (lane, shard) cells the e2e matrix runs. Playwright assigns whole
+// file-groups by start position, so one large changed file can swallow a
+// shard's entire share and leave the other shard with zero tests (#359:
+// a 10-test file took all of shard 1, shard 2 ran nothing, and the lane's
+// account-dependent post-checks failed). A shard the `--list` probe shows
+// as empty collapses to one unsharded cell instead of a meaningless empty
+// one; a lane with no tests at all fails the plan instead of passing
+// vacuously. File discovery is readdir-sorted, so the probe matches the
+// lane's actual distribution.
+export const planCells = (
+  lanes: LaneShardCounts[],
+  rounds: number[]
+): PlanCell[] => {
+  if (!rounds.every((round) => Number.isInteger(round))) {
+    throw new Error(`rounds must be integers, not ${JSON.stringify(rounds)}`);
+  }
+
+  return lanes.flatMap((lane) => {
+    const listed = lane.shard1 + lane.shard2;
+
+    if (listed === 0) {
+      throw new Error(
+        `lane ${lane.lane} lists no tests: refusing an empty plan`
+      );
+    }
+
+    const shards =
+      lane.shard1 > 0 && lane.shard2 > 0
+        ? [
+            { shard: 1, total: 2 },
+            { shard: 2, total: 2 },
+          ]
+        : [{ shard: 1, total: 1 }];
+
+    return shards.flatMap(({ shard, total }) =>
+      rounds.map((round) => ({
+        lane: lane.lane,
+        round,
+        shard,
+        target: lane.target,
+        total,
+      }))
+    );
+  });
+};
+
 const flag = (name: string, fallback: string): string => {
   const inline = process.argv.find((entry) => entry.startsWith(`${name}=`));
 
@@ -131,39 +192,94 @@ const flag = (name: string, fallback: string): string => {
   return fallback;
 };
 
-const main = (): void => {
-  const base = flag("--base", "");
+const LANE_TARGETS = {
+  multi: "e2e-isolation",
+  single: "e2e",
+} satisfies Record<string, string>;
 
-  if (!/^[0-9a-fA-F]+$/u.test(base)) {
-    console.error(
-      "usage: e2e-plan.ts --base <sha> [--head HEAD] [--suite fast]"
-    );
-    process.exit(1);
-  }
-
-  const head = flag("--head", "HEAD");
-
-  if (head !== "HEAD" && !/^[0-9a-fA-F]+$/u.test(head)) {
-    console.error("refusing unsafe --head (want a sha or HEAD)");
-    process.exit(1);
-  }
-
-  const suite = flag("--suite", "fast");
-
-  // Three-dot diffs against the merge base, so a branch that merged main
-  // mid-review only reports what the PR itself changed. Runs from the repo
-  // root (two levels above this script), never the caller's cwd.
-  const root = new URL("../..", import.meta.url);
-
-  const raw = execFileSync(
-    "git",
-    ["diff", "--name-only", "--diff-filter=AMR", "-z", `${base}...${head}`],
-    { cwd: root, encoding: "utf-8" }
+const listShardCount = (
+  tenancy: string,
+  suite: string,
+  extras: string,
+  shard: number
+): number => {
+  const out = execFileSync(
+    "bunx",
+    ["playwright", "test", "--list", `--shard=${shard}/2`],
+    {
+      cwd: new URL("../../apps/noite", import.meta.url),
+      encoding: "utf-8",
+      env: {
+        ...process.env,
+        E2E_CHANGED_SPECS: extras,
+        E2E_SUITE: suite,
+        E2E_TENANCY: tenancy,
+      },
+    }
   );
 
-  const changed = raw.split("\0").filter((entry) => entry.length > 0);
+  const match = /Total:\s*(?<count>\d+)\s*tests?\s*in\s*\d+\s*files?/u.exec(
+    out
+  );
 
-  const plan = planE2E(changed, suite);
+  const count = match?.groups?.count;
+
+  if (count === undefined) {
+    throw new Error(
+      `could not count --list tests for ${tenancy} shard ${shard}`
+    );
+  }
+
+  return Number(count);
+};
+
+const main = (): void => {
+  const base = flag("--base", "");
+  const head = flag("--head", "HEAD");
+  const requestedSuite = flag("--suite", "fast");
+  const roundsRaw = flag("--rounds", "[1]");
+
+  // SAFETY: rounds cross the matrix cells below; anything else fails here
+  // instead of silently planning the wrong rounds.
+  const rounds = JSON.parse(roundsRaw) as unknown;
+
+  if (
+    !Array.isArray(rounds) ||
+    !rounds.every((round) => Number.isInteger(round))
+  ) {
+    console.error("refusing unsafe --rounds (want a JSON array of integers)");
+    process.exit(1);
+  }
+
+  // No base outside pull requests (merge queue, schedule, dispatch): no PR
+  // diff to plan from, so the requested suite runs unchanged with no extras.
+  const root = new URL("../..", import.meta.url);
+  let changed: string[] = [];
+  let plan = planE2E([], requestedSuite);
+
+  if (base !== "") {
+    if (!/^[0-9a-fA-F]+$/u.test(base)) {
+      console.error("refusing unsafe --base (want a sha)");
+      process.exit(1);
+    }
+
+    if (head !== "HEAD" && !/^[0-9a-fA-F]+$/u.test(head)) {
+      console.error("refusing unsafe --head (want a sha or HEAD)");
+      process.exit(1);
+    }
+
+    // Three-dot diffs against the merge base, so a branch that merged main
+    // mid-review only reports what the PR itself changed. Runs from the repo
+    // root, never the caller's cwd.
+    const raw = execFileSync(
+      "git",
+      ["diff", "--name-only", "--diff-filter=AMR", "-z", `${base}...${head}`],
+      { cwd: root, encoding: "utf-8" }
+    );
+
+    changed = raw.split("\0").filter((entry) => entry.length > 0);
+    plan = planE2E(changed, requestedSuite);
+  }
 
   // The allowlist above admits no newlines, but these lines become
   // GITHUB_OUTPUT entries: assert single-line output instead of assuming it.
@@ -176,14 +292,33 @@ const main = (): void => {
     }
   }
 
+  // Probe the real distribution per lane: Playwright assigns whole
+  // file-groups by start position, so one large changed file can swallow a
+  // shard's share and strand the other shard empty (#359). A lane whose
+  // split leaves a shard empty runs one unsharded cell instead; a lane with
+  // no tests at all fails here (planCells throws) instead of passing
+  // vacuously downstream.
+  const extras = plan.extraSpecs.join(" ");
+
+  const lanes = ["single", "multi"].map((tenancy) => ({
+    lane: tenancy,
+    shard1: listShardCount(tenancy, plan.suite, extras, 1),
+    shard2: listShardCount(tenancy, plan.suite, extras, 2),
+    target: LANE_TARGETS[tenancy] ?? "e2e",
+  }));
+
+  // SAFETY: the guard above proved an array of integers.
+  const cells = planCells(lanes, rounds as number[]);
+
   console.log(`suite=${plan.suite}`);
-  console.log(`extra-specs=${plan.extraSpecs.join(" ")}`);
+  console.log(`extra-specs=${extras}`);
+  console.log(`cells=${JSON.stringify(cells)}`);
   console.error(
     `e2e plan: ${changed.length} changed file(s) -> suite ${plan.suite}${
       plan.extraSpecs.length > 0
         ? `, extra specs ${plan.extraSpecs.join(" ")}`
         : ""
-    }${plan.runRelease ? " (shared helper changed)" : ""}`
+    }${plan.runRelease ? " (shared helper changed)" : ""} -> ${JSON.stringify(cells)}`
   );
 };
 

@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 
-import { planE2E } from "./e2e-plan";
+import { planCells, planE2E } from "./e2e-plan";
 
 describe("planE2E", () => {
   test("a rewritten spec joins the fast run in full", () => {
@@ -117,5 +117,60 @@ describe("hostile diff paths fail closed", () => {
     const plan = planE2E(["apps/noite/src/pages/apps/[id].tsx"], "fast");
 
     expect(plan.suite).toBe("fast");
+  });
+});
+
+describe("planCells", () => {
+  const lanes = [
+    { lane: "single", shard1: 12, shard2: 12, target: "e2e" },
+    { lane: "multi", shard1: 5, shard2: 5, target: "e2e-isolation" },
+  ];
+
+  test("balanced shards keep both cells, crossed with rounds", () => {
+    const cells = planCells(lanes, [1, 2]);
+
+    expect(cells).toEqual([
+      { lane: "single", round: 1, shard: 1, target: "e2e", total: 2 },
+      { lane: "single", round: 2, shard: 1, target: "e2e", total: 2 },
+      { lane: "single", round: 1, shard: 2, target: "e2e", total: 2 },
+      { lane: "single", round: 2, shard: 2, target: "e2e", total: 2 },
+      { lane: "multi", round: 1, shard: 1, target: "e2e-isolation", total: 2 },
+      { lane: "multi", round: 2, shard: 1, target: "e2e-isolation", total: 2 },
+      { lane: "multi", round: 1, shard: 2, target: "e2e-isolation", total: 2 },
+      { lane: "multi", round: 2, shard: 2, target: "e2e-isolation", total: 2 },
+    ]);
+  });
+
+  test("an empty shard collapses to one unsharded cell (the #359 shape)", () => {
+    const cells = planCells(
+      [{ lane: "multi", shard1: 17, shard2: 0, target: "e2e-isolation" }],
+      [1]
+    );
+
+    expect(cells).toEqual([
+      { lane: "multi", round: 1, shard: 1, target: "e2e-isolation", total: 1 },
+    ]);
+  });
+
+  test("lanes decide independently", () => {
+    const cells = planCells(
+      [
+        { lane: "single", shard1: 12, shard2: 12, target: "e2e" },
+        { lane: "multi", shard1: 17, shard2: 0, target: "e2e-isolation" },
+      ],
+      [1]
+    );
+
+    expect(cells).toEqual([
+      { lane: "single", round: 1, shard: 1, target: "e2e", total: 2 },
+      { lane: "single", round: 1, shard: 2, target: "e2e", total: 2 },
+      { lane: "multi", round: 1, shard: 1, target: "e2e-isolation", total: 1 },
+    ]);
+  });
+
+  test("a lane with zero tests fails the plan instead of passing vacuously", () => {
+    expect(() =>
+      planCells([{ lane: "single", shard1: 0, shard2: 0, target: "e2e" }], [1])
+    ).toThrow(/no tests/iu);
   });
 });

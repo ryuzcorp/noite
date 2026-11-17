@@ -287,6 +287,20 @@ while [ "$attempt" -lt 100 ]; do
     else
       rc=$?
     fi
+    # A shard the plan stranded with zero tests exits 0 without a sound:
+    # fail loudly here instead of tripping the account-dependent
+    # post-checks below (or, worse, passing vacuously). The plan already
+    # collapses such shards to one unsharded cell, so this is the backstop,
+    # not the mechanism.
+    results="$E2E_REPORT_DIR/e2e-results.json"
+    ran=""
+    if [ -f "$results" ]; then
+      ran="$(grep -Eo '"(expected|skipped|unexpected|flaky)": ?[0-9]*' "$results" | grep -Eo '[0-9]*' | awk '{s+=$1} END {if (NR>0) print s+0}')"
+    fi
+    if [ "$rc" -eq 0 ] && [ "$ran" = "0" ]; then
+      echo "error: this shard ran zero tests (see e2e-results.json); the plan must not schedule empty shards"
+      rc=1
+    fi
     # Lane logs land in the report dir on every run, green or red, so green
     # runs can be compared with red ones (the e2e workflow uploads the dir
     # as an artifact). Runs before the teardown below, while the

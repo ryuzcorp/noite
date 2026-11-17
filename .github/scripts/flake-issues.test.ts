@@ -75,12 +75,17 @@ describe("collectFailures", () => {
 });
 
 describe("missingReports", () => {
+  const cells = [
+    { lane: "single", shard: 1 },
+    { lane: "single", shard: 2 },
+    { lane: "multi", shard: 1 },
+    { lane: "multi", shard: 2 },
+  ];
+
   test("every planned lane, round and shard must have reported", () => {
     const present = new Set(["single-r1-s1", "single-r1-s2", "multi-r1-s1"]);
 
-    expect(missingReports(present, ["single", "multi"], [1], 2)).toEqual([
-      "multi-r1-s2",
-    ]);
+    expect(missingReports(present, cells, [1])).toEqual(["multi-r1-s2"]);
   });
 
   test("a full matrix is complete", () => {
@@ -91,6 +96,16 @@ describe("missingReports", () => {
       "single-r2-s2",
     ]);
 
-    expect(missingReports(present, ["single"], [1, 2], 2)).toEqual([]);
+    const single = cells.filter((cell) => cell.lane === "single");
+
+    expect(missingReports(present, single, [1, 2])).toEqual([]);
+  });
+
+  test("an unsharded lane expects only its single cell", () => {
+    const present = new Set(["multi-r1-s1"]);
+
+    expect(missingReports(present, [{ lane: "multi", shard: 1 }], [1])).toEqual(
+      []
+    );
   });
 });
