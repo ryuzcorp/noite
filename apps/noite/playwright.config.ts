@@ -1,5 +1,7 @@
 import { defineConfig } from "@playwright/test";
 
+import { changedSpecPatterns } from "./e2e/changed-specs";
+
 // Raw-port lane locally (control UI through Caddy on noite.localhost:8090;
 // runner API direct on localhost:8080; tenants on their 81xx ports). No Caddy
 // site per app, no /etc/hosts entry: the lane's base is `*.localhost`, which
@@ -88,14 +90,14 @@ const suiteGrep = suite === "fast" ? SUITE_TAGS[tenancy] : undefined;
 // the whole file, with no double-run. Only in the fast suite with a
 // non-empty list — the release suite already runs everything, and an empty
 // list keeps today's plan identical. Sharding still balances: `--shard`
-// splits the run's full test list across every project.
-const escapeRegExp = (text: string): string =>
-  text.replaceAll(/[/\\^$*+?.()|[\]{}]/gu, "\\$&");
-
-const changedSpecs = (process.env.E2E_CHANGED_SPECS ?? "")
-  .split(/\s+/u)
-  .filter((entry) => entry.length > 0)
-  .map((spec) => new RegExp(`${escapeRegExp(spec)}$`, "u"));
+// splits the run's full test list across every project. Patterns anchor on
+// a path boundary (`changedSpecPatterns`), so `create.spec.ts` never
+// selects `delete-recreate.spec.ts` again (#359).
+const changedSpecs = changedSpecPatterns(
+  (process.env.E2E_CHANGED_SPECS ?? "")
+    .split(/\s+/u)
+    .filter((entry) => entry.length > 0)
+);
 
 export default defineConfig({
   expect: { timeout: 30_000 },
