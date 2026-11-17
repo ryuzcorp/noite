@@ -10,7 +10,7 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 <!-- New entries go in changelog.d/<topic>.md; the release PR assembles them with `bun docker/changelog-release.ts`. -->
 
-## [0.1.0-beta.2] - 2026-11-16
+## [0.1.0-beta.2] - 2026-11-17
 
 ### Operator action required
 
@@ -18,6 +18,7 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **Deleting a branch can no longer resurrect its preview fleet onto ports handed to another tenant.** Teardown stopped the environment's fleet first and deleted its row last, and a reconcile tick landing between the two respawned the fleet. After the row delete the allocator gave the same port pair to another environment, whose deploy then died at its health gate on the bind conflict (and whose reload answered from the leaked fleet). Teardown now marks the environment before its first stop, under the same lock every fleet start claims through, so reconcile, wake, deploy and restart all refuse a marked fleet; teardown also waits out any spawn already in flight before deleting the row. The same mark covers app delete and purge. The row delete still frees the ports, but only after the process holding them is dead and forgotten.
 - `make backup` always brings the stack back. The restart now runs in an `EXIT` trap instead of inline, so a mid-backup abort after the stop (a tar error, a full disk, a daemon hiccup, Ctrl-C or a SIGTERM from a CI timeout) still restarts the edge instead of leaving both containers `Exited (0)` until a manual `up -d`. A restart that reports failure counts as up only when the `noite` edge and every other container of the project are `running`, so a dependency left alone (rustfs) or podman's `initialized` state no longer passes. A failed restart exits nonzero without printing "backup complete" over a dead edge. Before, either failure mode ended silent and down.
 - The backup restart converges the same compose files the Makefile drives: on a multi install the restart keeps the `compose.multi.yaml` overlay instead of recreating the edge from the base file alone. A direct `sh docker/backup.sh` run computes the overlay with the same single/multi rule; under `make` the Makefile's file set is reused as is. The caller's `NOITE_TENANCY`/`BASE_DOMAIN` now win over `.env` for the snapshot Host header and the overlay, mirroring `PROJECT`.
 - `make backup` with a spaced `DEST` no longer word-splits the destination.
