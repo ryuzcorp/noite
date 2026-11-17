@@ -124,6 +124,12 @@ pub(crate) fn env_reserved(name: &str) -> bool {
         || name.starts_with("CADDY_")
         || name.starts_with("LD_")
         || name == "NODE_OPTIONS"
+        // pnpm's tarball-worker fan-out (`PNPM_MAX_WORKERS` is the exact
+        // count): the runner sizes it from the build leaf's budget, and a
+        // tenant override could OOM a small leaf in fetch (31 workers on a
+        // many-core box) or serialize every build. npm, Yarn and bun ignore
+        // the name.
+        || name == "PNPM_MAX_WORKERS"
         || (name.starts_with("BUN_") && name != "BUN_INSTALL_CACHE_DIR")
         // Engine selection is per-fleet proxy plumbing: a tenant override
         // would steer fleet celld at another engine than its own proxy
@@ -402,6 +408,10 @@ mod tests {
             "CADDY_ADMIN",
             "LD_PRELOAD",
             "NODE_OPTIONS",
+            // pnpm's tarball-worker fan-out is runner-sized (see
+            // `env_reserved`): a tenant row under this name must never reach
+            // build process env.
+            "PNPM_MAX_WORKERS",
             "BUN_BEACON",
             // Engine selection is per-fleet proxy plumbing: a tenant override
             // would steer fleet celld at another engine than its own proxy

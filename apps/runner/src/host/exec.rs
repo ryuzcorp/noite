@@ -82,6 +82,38 @@ pub(crate) fn node_heap_flag() -> Option<String> {
     Some(format!("--max-old-space-size={heap}"))
 }
 
+/// MiB of leaf RAM per pnpm tarball worker. pnpm's pool defaults to one
+/// worker per CPU minus one (31 on a 32-thread box, 1 on a 2-vCPU one), and
+/// every worker faults and extracts concurrently: 31 workers OOM a 613 MiB
+/// leaf in fetch within a second, while 1–2 survive (Ember, beta.4, measured
+/// at 2 and 32 CPUs). So each worker gets half a GiB of RAM to itself, capped
+/// by the leaf's CPU share — never more workers than cores, never fewer
+/// than one.
+const PNPM_WORKER_RAM_MB: u64 = 512;
+
+/// pnpm tarball-worker cap for a build leaf with `memory_mb` of RAM and
+/// `cpu_cores` of CPU share: `None` when builds run uncapped (`0` is the old
+/// behavior, no `PNPM_MAX_WORKERS`). Runner-owned: tenant `PNPM_MAX_WORKERS`
+/// is dropped in `db::env`, so nothing the tenant sets can widen this.
+/// npm, Yarn and bun ignore the name, so it is set unconditionally.
+pub(crate) fn build_pnpm_workers_max(memory_mb: u64, cpu_cores: u64) -> Option<u64> {
+    if memory_mb == 0 {
+        return None;
+    }
+    Some(1.max(cpu_cores.min(memory_mb / PNPM_WORKER_RAM_MB)))
+}
+
+/// The runner-owned `PNPM_MAX_WORKERS` for one build step (`None` when
+/// builds run uncapped): pnpm's exact worker count, sized from the leaf's
+/// real budget instead of the host's CPU count.
+pub(crate) fn pnpm_workers_flag() -> Option<String> {
+    let workers = build_pnpm_workers_max(
+        crate::host::cgroups::build_memory_mb()?,
+        crate::host::cgroups::build_cpu_cores(),
+    )?;
+    Some(workers.to_string())
+}
+
 /// A V8 heap abort in a step's output: Node SIGABRTs, so the status has no
 /// code (`exit None`) and the raw dump names no knob. Matched against the
 /// step's combined output to turn it into the budget error below instead.
@@ -370,6 +402,14 @@ pub async fn run_sandboxed(
     if let Some(flag) = node_heap_flag() {
         cmd.env("NODE_OPTIONS", flag);
     }
+    // The runner's own pnpm worker cap (tenant `PNPM_MAX_WORKERS` is dropped
+    // in `db::env`, so this name is always the runner's to set): pnpm sizes
+    // its tarball pool from the host's CPU count, and 31 workers OOM a small
+    // leaf in fetch before the heap ceiling ever matters. npm, Yarn and bun
+    // ignore the name. Set after the step env like the heap ceiling above.
+    if let Some(workers) = pnpm_workers_flag() {
+        cmd.env("PNPM_MAX_WORKERS", workers);
+    }
     {
         let std_cmd = cmd.as_std_mut();
         std_cmd.process_group(0);
@@ -525,8 +565,18 @@ pub async fn run_sandboxed(
             } else {
                 String::new()
             };
+            // Without host swap the leaf cannot overflow past RAM at all: an
+            // install that links hundreds of megabytes transiently (an
+            // Ember-size tree needs ~0.5 GiB of swap on a 613 MiB leaf at 2
+            // CPUs, measured) dies here even with the heap ceiling doing its
+            // job. Name the missing swap, not just the RAM budget.
+            let way_out = if swap > 0 {
+                "Raise the budget (if the box has the RAM for it) or deploy a prebuilt dist from CI"
+            } else {
+                "The leaf has no swap to overflow into — RUNNER_BUILD_SWAP_MB only splits existing host swap. Add host swap, raise the budget, or deploy a prebuilt dist from CI"
+            };
             bail!(
-                "the build exceeded its memory budget ({} MiB, RUNNER_BUILD_MEMORY_MB{swap_note}) and the kernel killed it inside its own cgroup. Raise the budget (if the box has the RAM for it) or deploy a prebuilt dist from CI; the runner and the apps kept serving",
+                "the build exceeded its memory budget ({} MiB, RUNNER_BUILD_MEMORY_MB{swap_note}) and the kernel killed it inside its own cgroup. {way_out}; the runner and the apps kept serving",
                 crate::host::cgroups::build_memory_mb().unwrap_or(0)
             );
         }
@@ -539,6 +589,9 @@ pub async fn run_sandboxed(
                 // A V8 heap abort (SIGABRT, `exit None`) is the step
                 // outgrowing its JavaScript heap, not the leaf: name the
                 // ceiling and the two budgets instead of the raw dump alone.
+                // The invocation line stays first, like the generic bail
+                // below: the convert step strips it (its argv carries the
+                // whole converter script), and the header must survive that.
                 if v8_heap_oom(&out, &err) {
                     let memory = crate::host::cgroups::build_memory_mb().unwrap_or(0);
                     let swap = crate::host::cgroups::build_swap_mb().unwrap_or(0);
@@ -547,7 +600,9 @@ pub async fn run_sandboxed(
                         None => "unset".to_string(),
                     };
                     bail!(
-                        "the build step ran out of JavaScript heap (Node aborted with `FATAL ERROR: Reached heap limit`; the V8 ceiling is {heap} from a {memory} MiB RAM budget, RUNNER_BUILD_MEMORY_MB, plus {swap} MiB swap, RUNNER_BUILD_SWAP_MB). Raise the budget (if the box has the RAM for it) or deploy a prebuilt dist from CI; the runner and the apps kept serving\n{out}{err}"
+                        "{program} {:?} exit {:?}\nthe build step ran out of JavaScript heap (Node aborted with `FATAL ERROR: Reached heap limit`; the V8 ceiling is {heap} from a {memory} MiB RAM budget, RUNNER_BUILD_MEMORY_MB, plus {swap} MiB swap, RUNNER_BUILD_SWAP_MB). Raise the budget (if the box has the RAM for it) or deploy a prebuilt dist from CI; the runner and the apps kept serving\n{out}{err}",
+                        args,
+                        output.status.code()
                     );
                 }
                 // stdout first: a build's progress goes there and its error to
@@ -1094,6 +1149,85 @@ mod tests {
         assert!(
             out.trim_end().ends_with("--max-old-space-size=459"),
             "the runner's ceiling wins, got {out:?}"
+        );
+    }
+
+    /// The pnpm worker cap follows RAM and the leaf's CPU share: 613 MiB
+    /// with 31 cores still gets 1 worker (half a GiB each), a 4096 MiB leaf
+    /// with room gets 8, and uncapped builds (`0`) keep the old behavior.
+    #[test]
+    fn the_worker_cap_follows_ram_and_cpu_share() {
+        assert_eq!(build_pnpm_workers_max(0, 31), None);
+        assert_eq!(build_pnpm_workers_max(613, 31), Some(1));
+        assert_eq!(build_pnpm_workers_max(613, 1), Some(1));
+        assert_eq!(build_pnpm_workers_max(1024, 3), Some(2));
+        assert_eq!(build_pnpm_workers_max(4096, 31), Some(8));
+        assert_eq!(build_pnpm_workers_max(4096, 1), Some(1));
+    }
+
+    /// The runner's own worker cap reaches the step: with a 613 MiB build
+    /// budget the step sees `PNPM_MAX_WORKERS=1` on any host, and a step
+    /// value under the name can never widen the runner's — tenant
+    /// `PNPM_MAX_WORKERS` is dropped in `db::env`, so the runner owns it.
+    #[tokio::test]
+    async fn run_sandboxed_sets_the_runner_worker_cap() {
+        crate::host::cgroups::set_build_budgets_for_tests(613, 0);
+        let dir = crate::testutil::TempDir::new("noite-pnpm-workers");
+        let sb = Sandbox {
+            uid: None,
+            gid: None,
+            env: &[("PNPM_MAX_WORKERS", "31")],
+            cache: None,
+            cgroup: None,
+        };
+        let out = run_sandboxed(
+            "sh",
+            &["-c", "echo $PNPM_MAX_WORKERS"],
+            dir.path(),
+            &sb,
+            Duration::from_secs(30),
+        )
+        .await
+        .expect("echo the step env");
+        assert_eq!(out.trim_end(), "1", "the runner's cap wins, got {out:?}");
+    }
+
+    /// A heap abort keeps the invocation line first: the convert step strips
+    /// it (its argv carries the whole converter script), so the header must
+    /// sit on line two to survive — first-line strippers then keep it too.
+    #[tokio::test]
+    async fn run_sandboxed_heap_abort_keeps_invocation_first() {
+        crate::host::cgroups::set_build_budgets_for_tests(613, 0);
+        let dir = crate::testutil::TempDir::new("noite-heap-shape");
+        let sb = Sandbox {
+            uid: None,
+            gid: None,
+            env: &[],
+            cache: None,
+            cgroup: None,
+        };
+        let err = run_sandboxed(
+            "sh",
+            &[
+                "-c",
+                "echo 'FATAL ERROR: Reached heap limit Allocation failed - JavaScript heap out of memory' >&2; exit 1",
+            ],
+            dir.path(),
+            &sb,
+            Duration::from_secs(30),
+        )
+        .await
+        .expect_err("a failing step is an error");
+        let message = err.to_string();
+        let mut lines = message.lines();
+        let first = lines.next().unwrap_or("");
+        assert!(
+            first.starts_with("sh "),
+            "invocation first, got {message:?}"
+        );
+        assert!(
+            message.contains("the build step ran out of JavaScript heap"),
+            "header survives, got {message:?}"
         );
     }
 }

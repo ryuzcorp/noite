@@ -638,6 +638,16 @@ fn failure_summary(step: &str, detail: &str) -> String {
     format!("{step} failed: {line}")
 }
 
+/// A convert-step failure without its first line: the invocation carries the
+/// whole converter script (`node --input-type=module -e <script>`), so the
+/// message drops that line and keeps the step output. The V8 heap header
+/// sits on line two (see `exec::node_heap_flag`), past the stripped line —
+/// never strip deeper, or a convert-step heap abort reports a raw V8 dump.
+fn convert_failure_detail(message: &str) -> String {
+    let detail = message.split_once('\n').map_or(message, |(_, rest)| rest);
+    format!("{CF_CONFIG}: {}", detail.trim())
+}
+
 #[allow(clippy::too_many_arguments)] // the deploy_app deps plus the trigger; same rationale as deploy_app
 async fn deploy_inner(
     pool: &SqlitePool,
@@ -956,6 +966,11 @@ async fn deploy_inner(
                 if let Some(flag) = exec::node_heap_flag() {
                     ci_env.push(("NODE_OPTIONS".to_string(), flag));
                 }
+                // The runner's own pnpm worker cap, like the heap ceiling
+                // above (tenant `PNPM_MAX_WORKERS` is dropped upstream).
+                if let Some(workers) = exec::pnpm_workers_flag() {
+                    ci_env.push(("PNPM_MAX_WORKERS".to_string(), workers));
+                }
                 let settings = ryuz_workflow::Settings {
                     docker_bin: cfg.ci_docker_bin.clone(),
                     default_image: cfg.ci_default_image.clone(),
@@ -1090,12 +1105,7 @@ async fn deploy_inner(
             Duration::from_secs(60),
         )
         .await
-        // The failure message starts with the argv, i.e. the whole script.
-        .map_err(|e| {
-            let msg = e.to_string();
-            let detail = msg.split_once('\n').map_or(msg.as_str(), |(_, rest)| rest);
-            anyhow::anyhow!("{CF_CONFIG}: {}", detail.trim())
-        })?;
+        .map_err(|e| anyhow::anyhow!("{}", convert_failure_detail(&e.to_string())))?;
     }
 
     // What the build produced outranks the source config (build_output.rs).
@@ -3150,13 +3160,35 @@ pub async fn deploy_tip(
 mod tests {
     use super::{
         activate_after_staged_migrate, ci_cache_volume, ci_cache_volume_install_prefix,
-        ci_cache_volume_prefix, contained_deploy_root, failure_summary, go_arch, has_build_script,
-        log_migrate_warnings, migrate_void_app, migrate_void_app_staged, parse_wrangler_build,
-        probe_staged_generation, quoted, route_live, translate_wrangler_config, wipe_worktree,
-        DeployTarget, MigrateInputs, Progress,
+        ci_cache_volume_prefix, contained_deploy_root, convert_failure_detail, failure_summary,
+        go_arch, has_build_script, log_migrate_warnings, migrate_void_app, migrate_void_app_staged,
+        parse_wrangler_build, probe_staged_generation, quoted, route_live,
+        translate_wrangler_config, wipe_worktree, DeployTarget, MigrateInputs, Progress,
     };
     use crate::models::DeployStatus;
     use serde_json::json;
+
+    /// A convert-step heap abort keeps its header: the mapper strips only
+    /// the invocation line (the whole converter script), and the V8 header
+    /// sits on line two — so the final message still names both budgets
+    /// instead of a raw V8 dump.
+    #[test]
+    fn convert_heap_abort_keeps_its_header() {
+        let message = "node [\"--input-type=module\", \"-e\", \"...\"] exit None\nthe build step ran out of JavaScript heap (Node aborted with `FATAL ERROR: Reached heap limit`; the V8 ceiling is 459 MiB from a 613 MiB RAM budget, RUNNER_BUILD_MEMORY_MB, plus 600 MiB swap, RUNNER_BUILD_SWAP_MB). Raise the budget (if the box has the RAM for it) or deploy a prebuilt dist from CI; the runner and the apps kept serving\n<--- Last few GCs --->\nFATAL ERROR: Reached heap limit Allocation failed - JavaScript heap out of memory\n";
+        let detail = convert_failure_detail(message);
+        assert!(
+            detail.contains("RUNNER_BUILD_MEMORY_MB"),
+            "header survives, got {detail:?}"
+        );
+        assert!(
+            detail.contains("RUNNER_BUILD_SWAP_MB"),
+            "header survives, got {detail:?}"
+        );
+        assert!(
+            !detail.contains("--input-type=module"),
+            "argv stripped, got {detail:?}"
+        );
+    }
 
     /// The CI cache volume is keyed by the app id, so a slug freed by a delete
     /// and taken by another app never mounts the departed tenant's package
