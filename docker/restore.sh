@@ -18,6 +18,9 @@ _PROJECT_ARG="${PROJECT:-}"
 # install the operator addressed.
 _TENANCY_ARG="${NOITE_TENANCY:-}"
 _BASE_ARG="${BASE_DOMAIN:-}"
+# Same for the store input below: whether project_running expects the
+# bundled rustfs must follow the addressed install, not the file.
+_S3_ARG="${S3_ENDPOINT:-}"
 load_env
 detect_engine
 
@@ -59,6 +62,9 @@ fi
 PROJECT="${_PROJECT_ARG:-${PROJECT:-${COMPOSE_PROJECT_NAME:-noite}}}"
 NOITE_TENANCY="${_TENANCY_ARG:-${NOITE_TENANCY:-}}"
 BASE_DOMAIN="${_BASE_ARG:-${BASE_DOMAIN:-}}"
+# Whether the bundled store is expected (see project_running below) follows
+# the addressed install too: the caller wins over `.env`, mirroring PROJECT.
+S3_ENDPOINT="${_S3_ARG:-${S3_ENDPOINT:-}}"
 
 # The file set the Makefile drives, so the restart converges the SAME stack
 # that was stopped: under `make` it arrives in the environment (the Makefile
@@ -102,12 +108,15 @@ run_with_timeout() {
 # differently (podman also reports `initialized`, `stopped`, `configured`).
 # Raw engine `ps`, once per engine's compose labels (`compose ps` output
 # differs between them).
-# The bundled store counts too whenever the install uses it: `noite`
-# declares rustfs `required: false`, so an `up` that leaves only the edge
-# running would otherwise pass. Detection is the engine itself: a project
-# container labelled `service=rustfs` means the bundled store is in play
-# (a BYO-S3 `--scale rustfs=0` install has none to query); every such
-# container must be `running`.
+# The bundled store is required whenever the install expects it: `noite`
+# declares rustfs `required: false`, so a failed `up -d` that leaves only
+# the edge running would otherwise pass. Container existence cannot decide:
+# `down --remove-orphans` deletes every container, so an `up` that dies
+# before creating rustfs leaves nothing to query. What decides is
+# configuration: the default S3_ENDPOINT is the bundled store
+# (`http://rustfs:9000`, the runner and compose.yaml default); a BYO-S3
+# install points S3_ENDPOINT elsewhere and scales rustfs to zero. When the
+# store is expected, a missing rustfs container counts as down, not absent.
 # (Kept identical in backup.sh and restore.sh on purpose — keep the two
 # copies in sync. Sharing via lib.sh would churn both callers' covered
 # restart paths for no behaviour gain.)
@@ -125,7 +134,12 @@ project_running() {
   printf '%s' "$edge" | tr ' ' '\n' | grep -qx 'running' || return 1
   ! printf '%s\n' "$states" | grep -qvx 'running' || return 1
   store="$(printf '%s' "$store" | tr ' ' '\n' | grep -v '^$' || true)"
-  [ -z "$store" ] || ! printf '%s\n' "$store" | grep -qvx 'running'
+  case "${S3_ENDPOINT:-http://rustfs:9000}" in
+  http://rustfs:9000 | http://rustfs:9000/)
+    [ -n "$store" ] || return 1
+    ! printf '%s\n' "$store" | grep -qvx 'running'
+    ;;
+  esac
 }
 
 # Set to 1 just before the stop: the trap below restarts only a stack this

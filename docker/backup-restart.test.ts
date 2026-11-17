@@ -54,6 +54,9 @@ case "$1" in
       stop) printf 'stopped' > "$BK_STATE" ;;
       up)
         if [ "$BK_UP_FAIL" = 1 ]; then exit 1; fi
+        # A partial up: the stop removed every container and up died
+        # after creating only the edge — no rustfs container exists.
+        if [ "$BK_UP_PARTIAL" = 1 ]; then printf 'partial' > "$BK_STATE"; exit 1; fi
         printf 'running' > "$BK_STATE"
         # A wedged up: the containers come up, the command still fails.
         if [ "$BK_UP_WEDGE" = 1 ]; then exit 1; fi
@@ -84,16 +87,17 @@ case "$1" in
     # container at all.
     case "$*" in
       *com.docker.compose.service=noite*)
-        if [ "$(state)" = running ] && [ "$BK_EDGE_GONE" != 1 ]; then printf 'running\n'; fi
+        if { [ "$(state)" = running ] || [ "$(state)" = partial ]; } && [ "$BK_EDGE_GONE" != 1 ]; then printf 'running\n'; fi
         ;;
       *com.docker.compose.service=rustfs*)
-        if [ "$BK_STORE_GONE" != 1 ]; then
+        if [ "$BK_STORE_GONE" != 1 ] && [ "$(state)" != partial ]; then
           if [ "$(state)" != running ]; then printf 'exited\n'
           else store="$BK_STORE_STATE"; [ -n "$store" ] || store=running; printf '%s\n' "$store"; fi
         fi
         ;;
       *com.docker.compose.project=*)
-        if [ "$(state)" != running ]; then printf 'exited\nexited\n'
+        if [ "$(state)" = partial ]; then printf 'running\n'
+        elif [ "$(state)" != running ]; then printf 'exited\nexited\n'
         elif [ "$BK_EDGE_GONE" = 1 ]; then printf 'running\n'
         else dep="$BK_DEP_STATE"; [ -n "$dep" ] || dep=running; printf 'running\n%s\n' "$dep"; fi
         ;;
@@ -124,10 +128,12 @@ interface BackupOpts {
   tarSignal?: "INT" | "TERM";
   storeGone?: boolean;
   storeState?: string;
+  s3Endpoint?: string | null;
   tenancy?: string;
   tarFail?: boolean;
   upFail?: boolean;
   upWedge?: boolean;
+  upPartial?: boolean;
 }
 
 const runBackup = (opts: BackupOpts = {}): RunResult & { log: string } => {
@@ -142,8 +148,10 @@ const runBackup = (opts: BackupOpts = {}): RunResult & { log: string } => {
     tarFail,
     storeGone,
     storeState,
+    s3Endpoint,
     upFail,
     upWedge,
+    upPartial,
   } = opts;
 
   mkdirSync(fakebin, { recursive: true });
@@ -196,11 +204,15 @@ const runBackup = (opts: BackupOpts = {}): RunResult & { log: string } => {
     BK_TAR_SIGNAL: tarSignal,
     BK_UP_FAIL: upFail === true ? "1" : undefined,
     BK_UP_WEDGE: upWedge === true ? "1" : undefined,
+    BK_UP_PARTIAL: upPartial === true ? "1" : undefined,
     BK_CURL_FAIL: curlFail === true ? "1" : undefined,
     BK_DEP_STATE: depState,
     BK_EDGE_GONE: edgeGone === true ? "1" : undefined,
     BK_STORE_GONE: storeGone === true ? "1" : undefined,
     BK_STORE_STATE: storeState,
+    // Unset by default so the scripts take the bundled-store path; an
+    // ambient S3_ENDPOINT must never leak into a run. null means the same.
+    S3_ENDPOINT: s3Endpoint ?? undefined,
   };
 
   const proc = Bun.spawnSync(
@@ -321,8 +333,39 @@ describe("make backup restart", () => {
     expect(r.stderr).toContain("automatic restart failed");
   });
 
-  test("a wedged up with no bundled store still succeeds, with a note", () => {
+  test("a missing bundled store container fails loudly", () => {
     const r = runBackup({ storeGone: true, upWedge: true });
+
+    expect(r.status).not.toBe(0);
+    expect(r.stdout).not.toContain("backup complete:");
+    expect(r.stderr).toContain("automatic restart failed");
+  });
+
+  test("an up that creates only the edge fails loudly on a bundled install", () => {
+    const r = runBackup({ upPartial: true });
+
+    expect(r.status).not.toBe(0);
+    expect(r.stdout).not.toContain("backup complete:");
+    expect(r.stderr).toContain("automatic restart failed");
+  });
+
+  test("a missing store is fine when the bucket is external", () => {
+    const r = runBackup({
+      s3Endpoint: "https://s3.example.com",
+      storeGone: true,
+      upWedge: true,
+    });
+
+    expect(r.status).toBe(0);
+    expect(r.stdout).toContain("every container is running");
+    expect(r.stdout).toContain("backup complete:");
+  });
+
+  test("an edge-only up succeeds when the bucket is external", () => {
+    const r = runBackup({
+      s3Endpoint: "https://s3.example.com",
+      upPartial: true,
+    });
 
     expect(r.status).toBe(0);
     expect(r.stdout).toContain("every container is running");

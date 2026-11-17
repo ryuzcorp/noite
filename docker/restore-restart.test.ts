@@ -58,6 +58,9 @@ case "$1" in
       down|stop) printf 'stopped' > "$RS_STATE" ;;
       up)
         if [ "$RS_UP_FAIL" = 1 ]; then exit 1; fi
+        # A partial up: down removed every container and up died after
+        # creating only the edge — no rustfs container exists.
+        if [ "$RS_UP_PARTIAL" = 1 ]; then printf 'partial' > "$RS_STATE"; exit 1; fi
         printf 'running' > "$RS_STATE"
         # A wedged up: the containers come up, the command still fails.
         if [ "$RS_UP_WEDGE" = 1 ]; then exit 1; fi
@@ -88,16 +91,17 @@ case "$1" in
     # container at all.
     case "$*" in
       *com.docker.compose.service=noite*)
-        if [ "$(state)" = running ] && [ "$RS_EDGE_GONE" != 1 ]; then printf 'running\n'; fi
+        if { [ "$(state)" = running ] || [ "$(state)" = partial ]; } && [ "$RS_EDGE_GONE" != 1 ]; then printf 'running\n'; fi
         ;;
       *com.docker.compose.service=rustfs*)
-        if [ "$RS_STORE_GONE" != 1 ]; then
+        if [ "$RS_STORE_GONE" != 1 ] && [ "$(state)" != partial ]; then
           if [ "$(state)" != running ]; then printf 'exited\n'
           else store="$RS_STORE_STATE"; [ -n "$store" ] || store=running; printf '%s\n' "$store"; fi
         fi
         ;;
       *com.docker.compose.project=*)
-        if [ "$(state)" != running ]; then printf 'exited\nexited\n'
+        if [ "$(state)" = partial ]; then printf 'running\n'
+        elif [ "$(state)" != running ]; then printf 'exited\nexited\n'
         elif [ "$RS_EDGE_GONE" = 1 ]; then printf 'running\n'
         else dep="$RS_DEP_STATE"; [ -n "$dep" ] || dep=running; printf 'running\n%s\n' "$dep"; fi
         ;;
@@ -127,9 +131,11 @@ interface RestoreOpts {
   tenancy?: string;
   storeGone?: boolean;
   storeState?: string;
+  s3Endpoint?: string | null;
   tarFail?: boolean;
   upFail?: boolean;
   upWedge?: boolean;
+  upPartial?: boolean;
 }
 
 const scrubEnv = () => {
@@ -197,9 +203,11 @@ const runRestore = (opts: RestoreOpts = {}): RunResult & { log: string } => {
     tenancy,
     storeGone,
     storeState,
+    s3Endpoint,
     tarFail,
     upFail,
     upWedge,
+    upPartial,
   } = opts;
 
   mkdirSync(fakebin, { recursive: true });
@@ -239,10 +247,14 @@ const runRestore = (opts: RestoreOpts = {}): RunResult & { log: string } => {
     RS_TAR_SIGNAL: tarSignal,
     RS_UP_FAIL: upFail === true ? "1" : undefined,
     RS_UP_WEDGE: upWedge === true ? "1" : undefined,
+    RS_UP_PARTIAL: upPartial === true ? "1" : undefined,
     RS_DEP_STATE: depState,
     RS_EDGE_GONE: edgeGone === true ? "1" : undefined,
     RS_STORE_GONE: storeGone === true ? "1" : undefined,
     RS_STORE_STATE: storeState,
+    // Unset by default so the scripts take the bundled-store path; an
+    // ambient S3_ENDPOINT must never leak into a run. null means the same.
+    S3_ENDPOINT: s3Endpoint ?? undefined,
   };
 
   const args =
@@ -391,8 +403,39 @@ describe("make restore restart", () => {
     expect(r.stderr).toContain("automatic restart failed");
   });
 
-  test("a wedged up with no bundled store still succeeds, with a note", () => {
+  test("a missing bundled store container fails loudly", () => {
     const r = runRestore({ storeGone: true, upWedge: true });
+
+    expect(r.status).not.toBe(0);
+    expect(r.stdout).not.toContain("restored.");
+    expect(r.stderr).toContain("automatic restart failed");
+  });
+
+  test("an up that creates only the edge fails loudly on a bundled install", () => {
+    const r = runRestore({ upPartial: true });
+
+    expect(r.status).not.toBe(0);
+    expect(r.stdout).not.toContain("restored.");
+    expect(r.stderr).toContain("automatic restart failed");
+  });
+
+  test("a missing store is fine when the bucket is external", () => {
+    const r = runRestore({
+      s3Endpoint: "https://s3.example.com",
+      storeGone: true,
+      upWedge: true,
+    });
+
+    expect(r.status).toBe(0);
+    expect(r.stdout).toContain("every container is running");
+    expect(r.stdout).toContain("restored.");
+  });
+
+  test("an edge-only up succeeds when the bucket is external", () => {
+    const r = runRestore({
+      s3Endpoint: "https://s3.example.com",
+      upPartial: true,
+    });
 
     expect(r.status).toBe(0);
     expect(r.stdout).toContain("every container is running");
