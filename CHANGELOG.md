@@ -10,6 +10,18 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 <!-- New entries go in changelog.d/<topic>.md; the release PR assembles them with `bun docker/changelog-release.ts`. -->
 
+## [0.1.0-beta.6] - 2026-11-17
+
+### Operator action required
+
+- None.
+
+### Fixed
+
+- PR CI now fails when a page-reachable module statically imports a Node builtin (`node:async_hooks`, a bare `fs`, …): the browser resolves those to stubs that throw at module load and kill the whole island chunk (the #371 storage-page outage, which the fast PR suite missed). The guard walks the source import graph from the pages — not the built output, where the incident's specifier was already stubbed away and a grep would have passed. The client build itself also fails when Vite externalizes a `node:` import for the browser (including one arriving through a dependency), naming the specifier and importer.
+- The upgrade lane no longer fails at teardown after going green: the runner's 30 s sandbox refresh loop now shares the shutdown flag — it never starts a tick after shutdown begins and its pacing sleep races the flag — and shutdown waits the loop out before removing the relay container, so a relay create still in flight finishes first and the removal takes it. The wait is bounded by the stop budget; if the bound fires (logged), the fallback abort can't cancel a create the engine already accepted, so a relay may survive that shutdown. `remove_project` therefore also reaps unlabeled sibling containers still mounting a project's volumes before the volume rm, which covers the e2e lanes either way.
+- The runner's own `NODE_OPTIONS=--max-old-space-size=N` on build steps is now three quarters of the leaf's RAM-plus-swap budget instead of RAM-only. A workload larger than RAM can never pass a RAM-only ceiling: Ember's `tsc -p .` needs ~630 MB on a 613 MiB leaf (fails at heap 620 and below, passes at 640 in ~16 s and at 900–1200 in ~10 s), while `vite build` passes at 459. With 1023 MiB of build swap the same leaf gets a 1227 MB ceiling and a full `pnpm -r build` passes in ~12 s. A bigger ceiling is not a bigger allocation — V8 only faults what the build touches — and a grower past the ceiling still aborts cleanly in seconds: the thrash watchdog only fires a leaf that is pinned and out of swap room, and the step timeout bounds the rest. CI containers get no swap, so their ceiling stays RAM-only.
+
 ## [0.1.0-beta.5] - 2026-11-17
 
 ### Operator action required
