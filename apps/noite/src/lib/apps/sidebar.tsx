@@ -7,6 +7,7 @@
 import { useLink } from "@ilha/void";
 import type { View } from "ilha";
 
+import { mayAdministerInstance, overviewAuthority } from "../authority";
 import { CONTROL_APP_ID, CONTROL_APP_NAME } from "../control-app";
 import {
   applistUrl,
@@ -17,7 +18,7 @@ import {
 } from "../feeds";
 import { OpenPrBadge } from "../prs/layout";
 import { resourceValue } from "../resource";
-import { session } from "../resources";
+import { adminStatus, session } from "../resources";
 import type { RunnerApp } from "../runner";
 import { Code, Cog, GitPullRequest, LayoutDashboard } from "../ui/icons";
 import { presenceTone } from "./identity";
@@ -170,12 +171,15 @@ export const SidebarApps = ({
   const feed = liveFeed(feedKeys.apps, applistUrl(), decodeApps);
   const user = resourceValue(session().state());
 
-  // The Noite row is listed for every signed-in account, never while
-  // impersonating — it is how non-admins reach their Account tab (admin tabs
-  // stay hidden on the page itself; the page re-checks the overview
-  // authority, so this is navigation, not the gate).
+  // The control plane is listed for instance admins, never while
+  // impersonating — `mayAdministerInstance` is the one predicate (the server
+  // folds the impersonation check into the overview's authority).
   const showControl =
-    user !== undefined && user !== null && user.session.impersonatedBy === null;
+    user !== undefined &&
+    user !== null &&
+    mayAdministerInstance(
+      overviewAuthority(resourceValue(adminStatus().state()))
+    );
 
   const apps = feedValue(feed.state()) ?? [];
 

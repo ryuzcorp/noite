@@ -1,14 +1,14 @@
 import { expect, test } from "@playwright/test";
 
-// Release-check toggle, on the control page's Settings tab
-// (`/apps/_control?t=settings`). The card explains exactly what the check
+// Release-check toggle, on the control page's Admin tab
+// (`/apps/_control?t=admin`). The card explains exactly what the check
 // fetches, and the opt-out persists. The banner itself is covered at the
 // runner/API level (a stub feed through the test-only base-URL override) and
 // by the banner unit test — the lane stays on the toggle.
 test("the release-check toggle explains itself and persists the opt-out", async ({
   page,
 }) => {
-  await page.goto("/apps/_control?t=settings");
+  await page.goto("/apps/_control?t=admin");
 
   // Both instance switches live here now.
   await expect(
@@ -50,9 +50,9 @@ test("the release-check toggle explains itself and persists the opt-out", async 
   ).toBeVisible();
   await expect(reloaded.getByRole("checkbox")).toBeChecked();
 
-  // The Account tab is personal settings only: no admin tabs name an Admin,
-  // and the instance switches are not rendered there.
-  await page.goto("/apps/_control?t=account");
+  // `/account` is personal settings only: no admin tabs, and the instance
+  // switches are not rendered there.
+  await page.goto("/account");
   await expect(page.getByRole("heading", { name: "Profile" })).toBeVisible();
   await expect(page.getByRole("tab", { name: "Admin" })).toHaveCount(0);
   await expect(

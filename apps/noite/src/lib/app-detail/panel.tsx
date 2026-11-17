@@ -330,7 +330,7 @@ const FirstPushCard = ({ appId }: { appId: string }) => {
         <p class="m-0 text-xs opacity-70">
           Git asks for credentials: username <code>{info.username}</code>,
           password an API key from{" "}
-          <Link href="/apps/_control?t=account" class="link">
+          <Link href="/account" class="link">
             Account
           </Link>
           .

@@ -665,3 +665,111 @@ export const MetricsCard = ({
     </>
   );
 };
+
+/** The Analytics breakdown alone (browsers, OSes, paths, referrers) over the
+ * window: the same feed and frame `MetricsCard` reads, so the two share one
+ * snapshot, but none of the charts. The tenant page mounts it on its
+ * standalone Analytics tab and the control page on the control Analytics tab;
+ * per-card titles stay (they name the tables), but there is no section
+ * heading — the tab bar already names it. */
+export const AnalyticsCard = ({
+  appId,
+  environmentId = "",
+  hours = DEFAULT_METRICS_HOURS,
+}: {
+  appId: string;
+  environmentId?: string;
+  hours?: number;
+}) => {
+  const feed = liveFeed(
+    feedKeys.metrics(appId, hours, environmentId),
+    metricsUrl(appId, hours, environmentId),
+    decodeMetrics,
+    {
+      initial: async () => {
+        const frame = await api<string | null>("/api/metrics/metricsFrame", {
+          appId,
+          environmentId,
+          hours,
+        });
+
+        if (frame === null) {
+          throw new Error("metrics frame unavailable");
+        }
+
+        return decodeMetrics(frame);
+      },
+    }
+  );
+
+  const frame: MetricsFrame["metrics"] = feedValue(feed.state())?.metrics ?? [];
+
+  const breakdown: MetricsFrame["breakdown"] = feedValue(feed.state())
+    ?.breakdown ?? {
+    browsers: [],
+    os: [],
+    paths: [],
+    referrers: [],
+  };
+
+  const loaded = (): boolean => feedLoaded(feed.state());
+
+  const loadError = (): string =>
+    feedRetrying(feed.state())
+      ? "Usage stream disconnected — retrying…"
+      : (feedProblem(feed.state()) ?? "");
+
+  if (loadError() !== "") {
+    return <p class="text-error m-0 text-sm">{loadError()}</p>;
+  }
+
+  if (!loaded()) {
+    return (
+      <div
+        role="status"
+        aria-label="Loading analytics"
+        class="flex flex-col gap-2"
+      >
+        <div class="skeleton h-4 w-64" />
+        <div class="skeleton h-16 w-full" />
+      </div>
+    );
+  }
+
+  if (frame.length === 0) {
+    return (
+      <p class="m-0 text-sm opacity-70">
+        No traffic recorded yet — hit the app URL to see the breakdown.
+      </p>
+    );
+  }
+
+  return (
+    <div class="grid grid-cols-1 gap-4 md:grid-cols-2">
+      <BreakdownSection
+        empty="No browser data in this window."
+        entries={breakdown.browsers}
+        head="Browser"
+        title="Browsers"
+      />
+      <BreakdownSection
+        empty="No OS data in this window."
+        entries={breakdown.os}
+        head="OS"
+        title="Operating systems"
+      />
+      <BreakdownSection
+        empty="No paths in this window."
+        entries={breakdown.paths}
+        head="Path"
+        title="Paths"
+      />
+      <BreakdownSection
+        empty="No referrer data in this window."
+        entries={breakdown.referrers}
+        head="Source"
+        title="Referrers"
+      />
+    </div>
+  );
+};

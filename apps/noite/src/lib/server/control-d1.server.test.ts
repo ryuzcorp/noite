@@ -148,7 +148,7 @@ describe("schema", () => {
       column: "email",
       label: "Manage in Users",
       param: "uq",
-      tab: "users",
+      tab: "admin",
     });
     expect(schema.sql).toContain("CREATE TABLE");
   });
@@ -165,7 +165,7 @@ describe("schema", () => {
       column: "email",
       label: "Manage in Users",
       param: "uq",
-      tab: "users",
+      tab: "admin",
     });
   });
 

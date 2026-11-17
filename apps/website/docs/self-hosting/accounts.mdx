@@ -7,15 +7,15 @@ Registration is by invitation once the instance is bootstrapped. The **first** a
 
 Setup codes are 20 characters in four-char groups (`ABCD-EFGH-JKLM-NPQR-STUV`) drawn from an unambiguous alphabet (2^100 codes); only the SHA-256 hash is stored, a code works once, and the claim spends it atomically with the admin grant, so one code admits exactly one account even under concurrent signups. A lost code is reissued on the server (`docker compose exec noite noite-runner setup-code` — the old code dies). Invitation links carry a single-use token (128 bits, URL-safe): only the SHA-256 hash is stored, each link is bound to one invited address and expires after 7 days, and the token is shown to the admin once, at creation. Registration has no mailbox proof, so the address alone never grants access — the token is the proof. A token that is used, revoked, expired, unknown, or presented with a different address is refused with a specific message before any account is created. Redemption is a single atomic claim, so one link admits exactly one account even under concurrent signups.
 
-- Admins invite an address from the Users tab of the admin home (the control app's detail page at `/apps/_control`): the one-time link is shown once for copying, and emailed when delivery is configured. Outstanding invitations are listed there with revoke.
-- With the registration waitlist on (Settings tab, off by default), an uninvited registration creates a `pending` account that holds no access until an admin approves it on the Users tab; approval optionally emails the new account. With the waitlist off, uninvited registration is refused and leaves no account behind.
+- Admins invite an address from the Users section of the Admin tab (`/apps/_control?t=admin`): the one-time link is shown once for copying, and emailed when delivery is configured. Outstanding invitations are listed there with revoke.
+- With the registration waitlist on (Admin tab › Instance settings, off by default), an uninvited registration creates a `pending` account that holds no access until an admin approves it on the Users section; approval optionally emails the new account. With the waitlist off, uninvited registration is refused and leaves no account behind.
 - The signup form shows the setup-code field on a fresh public install (in both modes — the reserved address must still present the code). Past the first account it accepts an optional invitation token: an invite link (`/login?invite=…`) pre-attaches it, and the server decides — invited or (with the waitlist on) queued, otherwise refused.
 
 `NOITE_ADMIN_EMAIL` reserves the first account by address — which must still present the setup code — and promotes the matching account to the admin role at startup; it is documented in [Environment variables](/reference/environment-variables).
 
 ## First-run onboarding
 
-A new account sees a one-time three-step tour the first time it reaches the dashboard: create an app and push to its Git remote, mint an API token (keys live on the Account tab of the Noite app — `/apps/_control?t=account` — used as the Git HTTPS password with username `git`, or as `NOITE_API_KEY` for the CLI), and where to follow the project. Finishing, skipping, or closing the modal marks the account done (`user.onboardedAt`) and it never returns. An account that signed in before this release sees the tour once and is then marked the same way; no operator action is needed.
+A new account sees a one-time three-step tour the first time it reaches the dashboard: create an app and push to its Git remote, mint an API token (keys live on `/account` — used as the Git HTTPS password with username `git`, or as `NOITE_API_KEY` for the CLI), and where to follow the project. Finishing, skipping, or closing the modal marks the account done (`user.onboardedAt`) and it never returns. An account that signed in before this release sees the tour once and is then marked the same way; no operator action is needed.
 
 ## Lost passkey
 
@@ -33,13 +33,13 @@ It prints a code and where to enter it. The code is the same kind the email carr
 
 ## The admin home
 
-Every signed-in account sees the control plane itself in `/apps`: the **Noite** card, which is not a user app but a link to a dedicated detail page. For an instance admin that page is the whole admin home — the control plane's telemetry tabs (Overview, Metrics, Errors, Logs) next to instance administration (Users, Apps) and the instance switches (**Settings**: anonymous telemetry, release check, the registration waitlist), with the control database linked from Overview. Any other account sees only its own **Account** tab there: profile, passkeys, API keys and agent connect. Every admin tab re-checks the same rule server-side: a real instance admin, never an impersonated session.
+An instance admin sees the control plane itself in `/apps`: the **Noite** card, which is not a user app but a link to a dedicated detail page. That page is the whole admin home — the control plane's telemetry tabs (Overview, Metrics, Analytics, Errors, Logs) next to one **Admin** tab (Users, Apps and the instance switches: anonymous telemetry, release check, the registration waitlist), with the control database linked from Overview. Every other account reaches its own settings on `/account` instead: profile, passkeys, API keys and agent connect. Every admin surface re-checks the same rule server-side: a real instance admin, never an impersonated session.
 
-**Ban** in the Users tab revokes the account's sessions and deletes its API keys, so `git push`, event ingest and `/mcp` stop immediately. The ban is checked on every request as well, so a key that somehow survived the deletion is still refused. Unbanning does not restore a deleted key: the account mints a new one.
+**Ban** in the Admin tab's Users section revokes the account's sessions and deletes its API keys, so `git push`, event ingest and `/mcp` stop immediately. The ban is checked on every request as well, so a key that somehow survived the deletion is still refused. Unbanning does not restore a deleted key: the account mints a new one.
 
 Pending accounts show with a badge plus **Approve** and **Reject**. Approving flips the account active (an approval notice is emailed when delivery is configured); rejecting deletes the account, its passkeys and its sessions. A pending account holds no access until approval: no page data, no API calls, no key use. Pending rows can never be made admin before approval, and an admin cannot approve or reject their own account.
 
-In `make dev` the control UI runs under vite and supervises no celld, so Metrics, Errors and Logs are hidden — there is no control fleet to record them — while the Users and Apps tabs and the control database still work.
+In `make dev` the control UI runs under vite and supervises no celld, so Metrics, Analytics, Errors and Logs are hidden — there is no control fleet to record them — while the Admin tab and the control database still work.
 
 ## Browsing the control database
 

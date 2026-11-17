@@ -284,7 +284,7 @@ const DropdownApp = defineApp({
             <p class="m-0 text-sm opacity-80">
               Stock Git over HTTP — push <code>main</code> to deploy. Auth:{" "}
               <code>username={props.username}</code>, password = API key from{" "}
-              <Link href="/apps/_control?t=account" class="link">
+              <Link href="/account" class="link">
                 Account
               </Link>
               .

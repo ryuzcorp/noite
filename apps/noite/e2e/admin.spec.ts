@@ -22,8 +22,8 @@ import {
   waitForDeploy,
 } from "./helpers";
 
-// Instance admin page (`/apps/_control?t=users|apps|invites|settings`): every
-// effect is
+// Instance admin page (`/apps/_control?t=admin`, with the telemetry tabs
+// beside it): every
 // verified for real — through the worker's own admin API, the runner API, or
 // the affected account's own session — never just that the UI renders. One
 // second account serves the whole file (tests are serial); the deployed sample
@@ -151,7 +151,7 @@ const confirmInDialog = async (page: Page, label: string): Promise<void> => {
 };
 
 const usersSearch = (email: string): string =>
-  `/apps/_control?t=users&uq=${encodeURIComponent(email)}`;
+  `/apps/_control?t=admin&uq=${encodeURIComponent(email)}`;
 
 const sessionOf = async (request: APIRequestContext): Promise<SessionBody> => {
   const res = await request.get("/api/auth/get-session");
@@ -182,7 +182,7 @@ test("email invites mint, revoke, and gate registration", async ({
   const revokedToken = inviteTokenOf(revokedLink);
   const liveToken = inviteTokenOf(liveLink);
 
-  await page.goto("/apps/_control?t=users");
+  await page.goto("/apps/_control?t=admin");
 
   const invites = page.getByRole("list", {
     exact: true,
@@ -256,23 +256,27 @@ test("email invites mint, revoke, and gate registration", async ({
   }).toPass({ timeout: 30_000 });
 });
 
-test("the users tab finds the second account and refuses it admin surfaces", async ({
+test("the Admin tab finds the second account and refuses it admin surfaces", async ({
   page,
 }) => {
   const { page: second } = secondOrThrow();
 
-  await page.goto("/apps/_control?t=users");
+  await page.goto("/apps/_control?t=admin");
   await expect(page.locator("#admin-user-search")).toBeVisible();
   await page.locator("#admin-user-search").fill(SECOND_EMAIL);
-  await page.getByRole("button", { name: "Search" }).click();
+  await page
+    .getByRole("list", { name: "Users" })
+    .getByRole("button", { name: "Search" })
+    .click();
   const row = userRow(page, SECOND_EMAIL);
   await expect(row).toBeVisible();
   await expect(row.getByText(`${SECOND_EMAIL} · user`)).toBeVisible();
 
-  // A non-admin lands on their own Account tab whatever `?t=` says: no Users
-  // panel, no instance switches — and the admin APIs behind those panels
-  // refuse the same session.
-  await second.goto("/apps/_control?t=users");
+  // A non-admin is redirected to their own `/account` page whatever `?t=`
+  // says: no Users section, no instance switches — and the admin APIs behind
+  // those sections refuse the same session.
+  await second.goto("/apps/_control?t=admin");
+  await expect(second).toHaveURL(/\/account$/u);
   await expect(second.getByRole("heading", { name: "Profile" })).toBeVisible();
   await expect(second.locator("#admin-user-search")).toHaveCount(0);
 
@@ -284,9 +288,10 @@ test("the users tab finds the second account and refuses it admin surfaces", asy
   expect(denied.status).toBe(422);
   expect(denied.body.errors?.form).toContain("Admin only");
 
-  // The Settings tab (the instance switches) is admin-only the same way, and
-  // so is the action behind its cards.
+  // A legacy admin `?t=` redirects the same way, and so does the action
+  // behind the instance switches.
   await second.goto("/apps/_control?t=settings");
+  await expect(second).toHaveURL(/\/account$/u);
   await expect(second.getByRole("heading", { name: "Profile" })).toBeVisible();
   await expect(
     second.getByRole("heading", { name: "Instance settings" })
@@ -326,18 +331,18 @@ test("make admin hands the second account a working admin gate", async ({
     expect(body.users.map((user) => user.email)).toContain(SECOND_EMAIL);
   }).toPass({ timeout: 30_000 });
 
-  await second.goto("/apps/_control?t=users");
+  await second.goto("/apps/_control?t=admin");
   await second.reload();
   await expect(second.locator("#admin-user-search")).toBeVisible();
 
   // The instance switches open for a real admin too.
-  await second.goto("/apps/_control?t=settings");
+  await second.goto("/apps/_control?t=admin");
   await expect(
     second.getByRole("heading", { name: "Instance settings" })
   ).toBeVisible();
 });
 
-test("the apps tab stops and starts another account's app", async ({
+test("the Admin tab stops and starts another account's app", async ({
   page,
   request,
 }) => {
@@ -360,7 +365,9 @@ test("the apps tab stops and starts another account's app", async ({
   const served = await readSampleApp(request, port);
   expect(Number.isInteger(served.n)).toBe(true);
 
-  await page.goto(`/apps/_control?t=apps&aq=${encodeURIComponent(PROBE_SLUG)}`);
+  await page.goto(
+    `/apps/_control?t=admin&aq=${encodeURIComponent(PROBE_SLUG)}`
+  );
   const row = appRow(page, PROBE_SLUG);
   await expect(row).toBeVisible();
   await expect(row.getByText(SECOND_EMAIL)).toBeVisible();
@@ -422,7 +429,7 @@ test("impersonation swaps the session, refuses admin surfaces, and returns clean
 
   // Admin-only surfaces refuse the impersonated session even though the
   // impersonated account is an admin.
-  await page.goto("/apps/_control?t=users");
+  await page.goto("/apps/_control?t=admin");
   await expect(page.getByText("App not found.")).toBeVisible();
 
   const denied = await adminPost(page.request, "/api/admin/listUsers", {
@@ -467,13 +474,15 @@ test("impersonation swaps the session, refuses admin surfaces, and returns clean
   }
 });
 
-test("the apps tab deletes another account's app", async ({
+test("the Admin tab deletes another account's app", async ({
   page,
   request,
 }) => {
   const { page: second } = secondOrThrow();
 
-  await page.goto(`/apps/_control?t=apps&aq=${encodeURIComponent(PROBE_SLUG)}`);
+  await page.goto(
+    `/apps/_control?t=admin&aq=${encodeURIComponent(PROBE_SLUG)}`
+  );
   const row = appRow(page, PROBE_SLUG);
   await expect(row).toBeVisible();
 
@@ -518,10 +527,11 @@ test("remove admin takes the gate back", async ({ page }) => {
 
     expect(denied.status).toBe(422);
   }).toPass({ timeout: 30_000 });
-  // Demoted back to a plain account: the admin tabs are gone, only the
-  // Account tab remains.
-  await second.goto("/apps/_control?t=users");
+  // Demoted back to a plain account: `/apps/_control` redirects to
+  // `/account`, which is personal settings only.
+  await second.goto("/apps/_control?t=admin");
   await second.reload();
+  await expect(second).toHaveURL(/\/account$/u);
   await expect(second.getByRole("heading", { name: "Profile" })).toBeVisible();
   await expect(second.locator("#admin-user-search")).toHaveCount(0);
 });
@@ -593,7 +603,7 @@ test("delete refuses the sole admin of an app, then removes the freed account", 
 
   // The admin deletes the app first (which drops its grants), then the user.
   await page.goto(
-    `/apps/_control?t=apps&aq=${encodeURIComponent(DOOMED_SLUG)}`
+    `/apps/_control?t=admin&aq=${encodeURIComponent(DOOMED_SLUG)}`
   );
   const doomed = appRow(page, DOOMED_SLUG);
   await expect(doomed).toBeVisible();
