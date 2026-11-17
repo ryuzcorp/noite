@@ -1,4 +1,5 @@
 import { ensureDb } from "../../lib/db";
+import { withRequestTimeout } from "../../lib/request-timeout";
 import { keyAppVerdict } from "../../lib/server/key-access.server";
 import { authenticateKey } from "../../lib/server/key-auth.server";
 import { MAX_BODY_BYTES, readBoundedText, tooLarge } from "../body";
@@ -91,7 +92,9 @@ export const forwardIngest: RouteHandler = async (request, env, params) => {
         "content-type": "application/json",
       },
       method: "POST",
-      signal: AbortSignal.timeout(10_000),
+      // The route bound, when this forward runs under one: after the
+      // middleware's 504 the signal is already aborted, so no ingest starts.
+      signal: withRequestTimeout(AbortSignal.timeout(10_000)),
     }
   );
 

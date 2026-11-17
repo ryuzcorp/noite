@@ -4,6 +4,7 @@ import {
   SOURCE_FORWARD_TIMEOUT_MS,
 } from "../../lib/commit-source";
 import { ensureDb } from "../../lib/db";
+import { withRequestTimeout } from "../../lib/request-timeout";
 import type {
   SourceCommitBody,
   SourceCommitFile,
@@ -270,7 +271,11 @@ const forwardSourceBody = async (
         "content-type": "application/json",
       },
       method: "POST",
-      signal: AbortSignal.timeout(SOURCE_FORWARD_TIMEOUT_MS),
+      // The route bound, when this forward runs under one: after the
+      // middleware's 504 the signal is already aborted, so no commit starts.
+      signal: withRequestTimeout(
+        AbortSignal.timeout(SOURCE_FORWARD_TIMEOUT_MS)
+      ),
     }
   );
 

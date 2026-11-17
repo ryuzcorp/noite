@@ -15,9 +15,15 @@ export const testRouteContext = (
   request: Request,
   env: KitEnv,
   params: Record<string, string> = {}
-): CloudContext =>
-  ({
+): CloudContext => {
+  // The per-request variable store stands in for Hono's: today the timeout
+  // middleware is the only writer and it stamps an AbortSignal, so the map
+  // is typed for exactly that.
+  const vars = new Map<string, AbortSignal>();
+
+  return {
     env,
+    get: (key: string): AbortSignal | undefined => vars.get(key),
     json: (data: TestJsonError, status?: number): Response =>
       Response.json(data, status === undefined ? undefined : { status }),
     req: {
@@ -26,5 +32,8 @@ export const testRouteContext = (
       path: new URL(request.url).pathname,
       raw: request,
     },
-    // SAFETY: handlers under test read only the stubbed members above; the rest of CloudContext is never touched.
-  }) as unknown as CloudContext;
+    set: (key: string, value: AbortSignal): void => {
+      vars.set(key, value);
+    },
+  } as unknown as CloudContext;
+};

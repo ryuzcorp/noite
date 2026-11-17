@@ -1,6 +1,11 @@
 import { SOURCE_FORWARD_TIMEOUT_MS } from "./commit-source";
 import { controlEnv, hydrateControlEnv } from "./control-env";
 import { errorMessage } from "./errors";
+import {
+  getRequestTimeoutSignal,
+  requestTimeoutCause,
+  withRequestTimeout,
+} from "./request-timeout";
 // Wire types, generated from the Rust structs in apps/runner into
 // ./runner-types (never edit those files by hand). Regenerate with `cargo
 // test` in apps/runner; CI fails on drift. The `Runner*` names are the UI's
@@ -355,12 +360,38 @@ export const runnerFetch = async <T = unknown>(
 
   const base = runnerBase();
   const started = Date.now();
+  // The route bound, when this call runs under one: after the middleware's
+  // 504 fires, this signal is already aborted, so the fetch below rejects
+  // without dispatching any I/O — no further outbound call starts — and an
+  // in-flight fetch rejects on the abort.
+  const requestSignal = getRequestTimeoutSignal();
 
-  const res = await fetch(`${base}${path}`, {
-    ...init,
-    headers,
-    signal: init.signal ?? AbortSignal.timeout(RUNNER_TIMEOUT_MS),
-  });
+  const signal = withRequestTimeout(
+    init.signal ?? AbortSignal.timeout(RUNNER_TIMEOUT_MS)
+  );
+
+  let res: Response;
+
+  try {
+    res = await fetch(`${base}${path}`, {
+      ...init,
+      headers,
+      signal,
+    });
+  } catch (error) {
+    // The route bound fired mid-flight: throw its typed reason (not a bare
+    // `AbortError`) so the action funnel answers the same quiet 504 the
+    // route already sent, instead of logging an "Internal error" for
+    // designed behavior. The route already answered, so this throw only
+    // ends the orphaned downstream run.
+    const cause = requestTimeoutCause(requestSignal);
+
+    if (cause !== undefined) {
+      throw cause;
+    }
+
+    throw error;
+  }
 
   const elapsed = Date.now() - started;
 

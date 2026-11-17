@@ -25,8 +25,31 @@
  * `/mcp` carries its own, longer bound: one `tools/call` may deliberately wait
  * (`wait_for_deploy`, capped at 60 s), so the action bound would cut a healthy
  * answer into a 504 the caller cannot read.
+ *
+ * The bound aborts the downstream work, not just the response: each bounded
+ * request gets an `AbortController` whose signal is stamped ambiently (see
+ * `lib/request-timeout.ts`) and aborted with a typed `RequestTimeoutError`
+ * when the bound fires. `runnerFetch` folds that signal into every runner
+ * call, so after the 504 no further outbound runner call starts for that
+ * request and in-flight ones reject. A slow write that already reached the
+ * runner still stands — the abort stops our side waiting, it cannot un-apply
+ * the runner's — which is why a retry after a 504 can double-apply a write
+ * the first attempt already committed; the bound narrows that window from
+ * "the whole stuck handler" to the bound itself. D1 needs no rollback: the
+ * control plane runs no interactive transactions, so every control write is
+ * one statement or one `db.batch`, and D1 applies each atomically. Exempt
+ * routes never get a controller and are unaffected. A client disconnect
+ * aborts through the same controller (the raw request signal is forwarded
+ * into it), so a gone client stops its downstream the same way.
  */
 import { defineMiddleware } from "void";
+
+import {
+  clearRequestTimeoutSignal,
+  REQUEST_TIMEOUT_SIGNAL_KEY,
+  RequestTimeoutError,
+  stampRequestTimeoutSignal,
+} from "../lib/request-timeout";
 
 /** Bound every bounded route: a hung handler fails fast, never hangs. */
 export const TIMEOUT_MS = 15_000;
@@ -77,7 +100,11 @@ export const routeTimeout = (
     : { kind: "exempt", why };
 };
 
-/** A timeout gate with an explicit bound (the default export uses {@link TIMEOUT_MS}). */
+/** A timeout gate with an explicit bound (the default export uses {@link TIMEOUT_MS}).
+ * A bounded request runs under its own `AbortController`: the signal is
+ * stamped ambiently for the downstream run (see `lib/request-timeout.ts`)
+ * and aborted with a typed reason when the bound fires, so the slow write
+ * behind the 504 stops instead of double-applying on retry. */
 export const timeoutMiddleware = (ms: number) =>
   defineMiddleware(async (c, next) => {
     const bound = routeTimeout(c.req.path, ms);
@@ -86,8 +113,30 @@ export const timeoutMiddleware = (ms: number) =>
       return next();
     }
 
+    const controller = new AbortController();
+    // SAFETY: CloudContextVariables carries an index signature; this key is written here and read nowhere else through the context (downstream reads the ambient stamp, which stays in lock-step for the whole run).
+    c.set(REQUEST_TIMEOUT_SIGNAL_KEY, controller.signal);
+
+    const raw = c.req.raw.signal;
+
+    const onDisconnect = (): void => {
+      controller.abort(raw.reason);
+    };
+
+    if (raw.aborted) {
+      controller.abort(raw.reason);
+    } else {
+      raw.addEventListener("abort", onDisconnect, { once: true });
+    }
+
+    stampRequestTimeoutSignal(controller.signal);
+
     const timeout = Promise.withResolvers<"timeout">();
-    const timer = setTimeout(() => timeout.resolve("timeout"), bound.ms);
+
+    const timer = setTimeout(() => {
+      controller.abort(new RequestTimeoutError(bound.ms));
+      timeout.resolve("timeout");
+    }, bound.ms);
 
     try {
       const winner = await Promise.race([
@@ -101,6 +150,8 @@ export const timeoutMiddleware = (ms: number) =>
       }
     } finally {
       clearTimeout(timer);
+      raw.removeEventListener("abort", onDisconnect);
+      clearRequestTimeoutSignal(controller.signal);
     }
   });
 

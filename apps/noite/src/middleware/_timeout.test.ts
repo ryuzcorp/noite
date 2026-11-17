@@ -11,6 +11,10 @@ import {
   metricsUrl,
   streamHubUrl,
 } from "../lib/feeds";
+import {
+  getRequestTimeoutSignal,
+  RequestTimeoutError,
+} from "../lib/request-timeout";
 import { testRouteContext } from "../testing/context";
 import defaultTimeoutMiddleware, {
   MCP_TIMEOUT_MS,
@@ -158,6 +162,75 @@ describe("timeout middleware", () => {
 
     expect(result?.status).toBe(504);
     expect(await result?.json()).toEqual({ error: "Request timed out" });
+  });
+
+  test("aborts the downstream work when the bound fires, so no write follows the 504", async () => {
+    // A slow handler: an outbound call that honors the request signal, then
+    // a write. The middleware's own 20 ms timer is the only clock (same as
+    // the stuck-route test above); the outbound answers only when the test
+    // releases it, after the 504 already went out.
+    let writeHappened = false;
+    let abortReason: unknown;
+    let releaseOutbound!: () => void;
+    let downstream!: Promise<void>;
+
+    const result = await withTimeout(20)(contextFor("/api/rollback"), () => {
+      const {
+        promise: outbound,
+        reject,
+        resolve,
+      } = Promise.withResolvers<undefined>();
+
+      const signal = getRequestTimeoutSignal();
+
+      releaseOutbound = resolve;
+
+      signal?.addEventListener(
+        "abort",
+        () => {
+          abortReason = signal.reason;
+          reject(signal.reason);
+        },
+        { once: true }
+      );
+
+      downstream = (async (): Promise<void> => {
+        await outbound;
+        writeHappened = true;
+      })();
+
+      return downstream;
+    });
+
+    expect(result?.status).toBe(504);
+    expect(await result?.json()).toEqual({ error: "Request timed out" });
+
+    // The slow upstream finally answers after the 504: without the abort
+    // this resolve flows into the write; with it the outbound already
+    // rejected and the write never runs.
+    releaseOutbound();
+    await downstream.catch(() => {});
+    expect(writeHappened).toBe(false);
+    expect(abortReason).toBeInstanceOf(RequestTimeoutError);
+  });
+
+  test("an exempt route stamps no signal, so its slow downstream is untouched", async () => {
+    let stamped: AbortSignal | undefined;
+    let writeHappened = false;
+
+    const result = await withTimeout(20)(
+      contextFor("/api/apps/a/logs/stream"),
+      () => {
+        stamped = getRequestTimeoutSignal();
+        writeHappened = true;
+
+        return Promise.resolve();
+      }
+    );
+
+    expect(result).toBeUndefined();
+    expect(stamped).toBeUndefined();
+    expect(writeHappened).toBe(true);
   });
 
   test("never races an exempt path", async () => {
