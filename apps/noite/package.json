@@ -7,7 +7,7 @@
     "prebuild": "rm -rf dist",
     "build": "vite build && bun ./scripts/emit-celld-config.ts",
     "preview": "vite preview",
-    "test": "bun test --isolate src",
+    "test": "bun test --isolate src ./e2e/changed-specs.test.ts",
     "test:e2e": "playwright test"
   },
   "dependencies": {
