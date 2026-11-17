@@ -5,7 +5,15 @@ import { sql } from "void/db";
 import { createTestD1 } from "../testing/d1";
 import type { TestD1 } from "../testing/d1";
 import { controlEnv } from "./control-env";
-import { ensureDb, getDb, setD1Binding, withDb } from "./db";
+import {
+  DB_MIGRATING_BODY,
+  DbUnavailableError,
+  ensureDb,
+  getDb,
+  setD1Binding,
+  withDb,
+} from "./db";
+import { errorMessage } from "./errors";
 
 let db: TestD1;
 
@@ -73,6 +81,52 @@ describe("withDb", () => {
   });
 
   test("propagates the work's failure", async () => {
+    await expect(
+      withDb(() => Promise.reject(new Error("boom")))
+    ).rejects.toThrow("boom");
+  });
+});
+
+describe("migration gate", () => {
+  test("ensureDb throws DbUnavailableError while tables are missing", async () => {
+    // A database whose migrations have not applied yet: the runner is still
+    // retrying them, so the bootstrap must read as "migrating", never as a
+    // broken schema. A fresh address avoids the isolate's promoted record.
+    db.raw.run(`DROP TABLE "user"`);
+    controlEnv.NOITE_ADMIN_EMAIL = "unmigrated@example.com";
+
+    let thrown;
+
+    try {
+      await ensureDb();
+      thrown = null;
+    } catch (error) {
+      thrown = error;
+    }
+
+    expect(thrown).toBeInstanceOf(DbUnavailableError);
+    expect(errorMessage(thrown)).toBe(DB_MIGRATING_BODY);
+  });
+
+  test("withDb maps a half-migrated work failure the same way", async () => {
+    db.raw.run(`DROP TABLE email_invite`);
+
+    let thrown;
+
+    try {
+      await withDb(() =>
+        getDb().all<{ email: string }>(sql`SELECT email FROM email_invite`)
+      );
+      thrown = null;
+    } catch (error) {
+      thrown = error;
+    }
+
+    expect(thrown).toBeInstanceOf(DbUnavailableError);
+    expect(errorMessage(thrown)).toBe(DB_MIGRATING_BODY);
+  });
+
+  test("other failures still propagate untouched", async () => {
     await expect(
       withDb(() => Promise.reject(new Error("boom")))
     ).rejects.toThrow("boom");

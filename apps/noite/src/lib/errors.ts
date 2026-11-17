@@ -112,6 +112,37 @@ export const isQueryFailure = (error: unknown): boolean => {
   return false;
 };
 
+/** Whether the failure chain says a table is missing: the control database
+ * has not finished its migrations (the runner is still retrying them), so
+ * the caller answers 503 "migrating" instead of the 500 a half-migrated
+ * schema would otherwise read as. Matched on the driver's own words, never
+ * on the query text. */
+// oxlint-disable-next-line anti-slop/no-unknown-parameters -- catch-site boundary, same as errorMessage.
+export const isMissingTableFailure = (error: unknown): boolean => {
+  let current = error;
+
+  for (let depth = 0; depth < MAX_CAUSE_DEPTH; depth += 1) {
+    if (!(current instanceof Error)) {
+      return false;
+    }
+
+    if (/no such table/iu.test(current.message)) {
+      return true;
+    }
+
+    if (
+      asQueryError(current) === null &&
+      !(Cause.isUnknownError(current) && current.cause !== undefined)
+    ) {
+      return false;
+    }
+
+    current = current.cause;
+  }
+
+  return false;
+};
+
 /** The server log's text: every link of the cause chain, so a wrapped driver
  * failure is never hidden behind the wrapper's stack alone. A query wrapper's
  * own stack and message are the SQL statement and its bound parameters (an

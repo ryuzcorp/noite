@@ -9,6 +9,7 @@
 //! The control D1 lives at `s3://{bucket}/control`; the worker reaches the
 //! runner at `http://127.0.0.1:8080`.
 
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicU32;
 use std::sync::Arc;
@@ -248,6 +249,111 @@ pub async fn migrate(cfg: &Config) -> anyhow::Result<()> {
         .unwrap_or_else(|_| "unknown".to_string());
     let rev = revision(&bundle_rev, &control_vars(cfg));
     migrate_control(cfg, &rev).await
+}
+
+/// Cap for the control-migration retry backoff: a failure every minute keeps
+/// the operator's log to one line per minute while the runner keeps trying.
+pub const MIGRATION_RETRY_MAX_DELAY: Duration = Duration::from_secs(60);
+
+/// Backoff after `failures` consecutive migration failures: 1 s, doubling to
+/// the 60 s cap. Pure so tests pin the sequence without a clock.
+pub fn migration_retry_delay(failures: u32) -> Duration {
+    let shift = failures.saturating_sub(1).min(6);
+    Duration::from_secs(1u64 << shift).min(MIGRATION_RETRY_MAX_DELAY)
+}
+
+/// Consecutive control-migration failures: the retry loop's in-memory state.
+/// The count only ever grows within a boot — a success ends the loop, so no
+/// reset path exists.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct MigrationRetries {
+    failures: u32,
+}
+
+impl MigrationRetries {
+    /// How many consecutive attempts have failed.
+    pub fn failures(&self) -> u32 {
+        self.failures
+    }
+
+    /// Record one failed attempt: the `/ready` cause plus the wait before the
+    /// next try. Pure (no clock, no log) so tests pin the permanent-failure
+    /// behaviour — every failure stays visible, with growing backoff —
+    /// without looping forever.
+    pub fn failed(&mut self, error: &anyhow::Error) -> (String, Duration) {
+        self.failures = self.failures.saturating_add(1);
+        let reason = format!("{error:#}");
+
+        (
+            format!("migrations failed: {reason}"),
+            migration_retry_delay(self.failures),
+        )
+    }
+}
+
+/// Drive control migrations to success: `attempt` runs one migration step,
+/// `sleep` waits the backoff, `report` records the visible state (the
+/// `/ready` cause while failing, cleared on success). The loop has no
+/// give-up path by construction — only a success returns — so a permanently
+/// broken migration keeps logging the failing migration and the error
+/// (rate-limited by the backoff) and `/ready` keeps naming the cause. The
+/// in-worker endpoint applies each file transactionally and stamps what
+/// applied, so a retry never applies a file twice or resumes one halfway.
+pub async fn drive_migration_retries<A, AFut, S, SFut, R>(
+    mut attempt: A,
+    mut sleep: S,
+    mut report: R,
+) where
+    A: FnMut() -> AFut + Send,
+    AFut: Future<Output = anyhow::Result<()>> + Send,
+    S: FnMut(Duration) -> SFut + Send,
+    SFut: Future<Output = ()> + Send,
+    R: FnMut(Option<String>) + Send,
+{
+    let mut retries = MigrationRetries::default();
+
+    loop {
+        match attempt().await {
+            Ok(()) => {
+                report(None);
+                tracing::info!("control migrations applied");
+                return;
+            }
+            Err(error) => {
+                let (cause, delay) = retries.failed(&error);
+
+                report(Some(cause));
+                tracing::warn!(attempt = retries.failures(), delay_secs = delay.as_secs(), error = %format!("{error:#}"), "control migrations failed; retrying");
+                sleep(delay).await;
+            }
+        }
+    }
+}
+
+/// Retry control migrations in the background until they apply: a transient
+/// DB/store outage at boot needs no operator restart. The boot caller runs
+/// one `migrate` first (the common case applies at once with no stray task);
+/// this takes over from the first failure on.
+pub fn spawn_migration_retries(
+    config: &Config,
+    control_boot: Arc<std::sync::Mutex<Option<String>>>,
+) {
+    let config = config.clone();
+    crate::service::detached::spawn("control:migrate".to_string(), async move {
+        drive_migration_retries(
+            || {
+                let config = config.clone();
+                async move { migrate(&config).await }
+            },
+            tokio::time::sleep,
+            move |cause| {
+                *control_boot
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = cause;
+            },
+        )
+        .await;
+    });
 }
 
 /// The migration driver behind [`migrate`]. A bundle built without
@@ -689,5 +795,138 @@ mod tests {
         std::fs::write(dir.join("wrangler.json"), "{}").expect("wrangler");
         assert!(bundle_present(&cfg));
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn migration_backoff_doubles_to_the_sixty_second_cap() {
+        let delays: Vec<u64> = (1u32..=9)
+            .map(|n| migration_retry_delay(n).as_secs())
+            .collect();
+        assert_eq!(delays, vec![1, 2, 4, 8, 16, 32, 60, 60, 60]);
+        assert_eq!(migration_retry_delay(0), Duration::from_secs(1));
+        assert_eq!(migration_retry_delay(u32::MAX), MIGRATION_RETRY_MAX_DELAY);
+    }
+
+    /// The M3 retry contract: transient failures keep the `/ready` cause set
+    /// and back off, then a success clears the cause — no restart. The clock
+    /// is injected (sleeps only record), so this runs with no wall-clock
+    /// wait.
+    #[tokio::test]
+    async fn migration_retries_recover_without_a_restart() {
+        let attempts = Arc::new(std::sync::Mutex::new(0u32));
+        let slept = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let reported = Arc::new(std::sync::Mutex::new(Vec::new()));
+        {
+            let attempts = attempts.clone();
+            let slept = slept.clone();
+            let reported = reported.clone();
+            drive_migration_retries(
+                move || {
+                    let attempts = attempts.clone();
+                    async move {
+                        let mut count = attempts
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        *count = count.saturating_add(1);
+
+                        if *count <= 3 {
+                            anyhow::bail!(
+                                "control migrate failed: migration 20261116120000_email_invites_waitlist failed: no such table: user"
+                            );
+                        }
+
+                        Ok(())
+                    }
+                },
+                move |delay: Duration| {
+                    let slept = slept.clone();
+                    async move {
+                        slept
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .push(delay);
+                    }
+                },
+                move |cause: Option<String>| {
+                    reported
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .push(cause);
+                },
+            )
+            .await;
+        }
+        assert_eq!(
+            *attempts
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+            4,
+            "three transient failures, then the success"
+        );
+        assert_eq!(
+            *slept
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+            vec![
+                Duration::from_secs(1),
+                Duration::from_secs(2),
+                Duration::from_secs(4),
+            ],
+            "capped exponential backoff between attempts, no wall-clock wait"
+        );
+        let reported = reported
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert_eq!(reported.len(), 4, "every attempt reports");
+        for cause in &reported[..3] {
+            let cause = cause.as_deref().unwrap_or_default();
+            assert!(
+                cause.contains("20261116120000_email_invites_waitlist"),
+                "the failing migration stays visible: {cause}"
+            );
+        }
+        assert_eq!(reported[3], None, "success clears the /ready cause");
+    }
+
+    /// A permanently broken migration never resolves: every failure decision
+    /// keeps naming the migration with a growing backoff, and the loop has
+    /// no give-up path (only a success returns). Pure step, no clock, no
+    /// spawned task — the aborted-task version of this test busy-spun and
+    /// OOM-killed the test binary.
+    #[test]
+    fn migration_failures_stay_visible_with_growing_backoff() {
+        let mut retries = MigrationRetries::default();
+        let mut causes = Vec::new();
+        let mut delays = Vec::new();
+
+        for _ in 0..7 {
+            let (cause, delay) = retries.failed(&anyhow::anyhow!(
+                "control migrate failed: migration 20261114120000_first_admin_setup_code failed: duplicate column name: status"
+            ));
+            causes.push(cause);
+            delays.push(delay);
+        }
+
+        assert_eq!(retries.failures(), 7, "every failure counts");
+        assert_eq!(
+            delays,
+            vec![
+                Duration::from_secs(1),
+                Duration::from_secs(2),
+                Duration::from_secs(4),
+                Duration::from_secs(8),
+                Duration::from_secs(16),
+                Duration::from_secs(32),
+                Duration::from_secs(60),
+            ],
+            "backoff grows to the cap and stays there"
+        );
+
+        for cause in &causes {
+            assert!(
+                cause.contains("20261114120000_first_admin_setup_code"),
+                "the broken migration stays named: {cause}"
+            );
+        }
     }
 }
