@@ -400,7 +400,7 @@ async fn reconcile_once(
             // rename) may have moved on since, and spawning from the stale row
             // would resurrect a fleet the delete already stopped — under a slug
             // it is about to free. Re-read immediately before the spawn.
-            if !still_wanted(pool, &app.id).await? {
+            if !still_wanted(pool, procs, &app.id).await? {
                 continue;
             }
             let cold = !supervisor::has_process(procs, &app.slug).await;
@@ -490,7 +490,7 @@ async fn reconcile_once(
         if env.listen_port.is_some() && env.is_deployed() && !env.is_asleep() {
             // Same stale-snapshot rule as the app branch: the row may be gone
             // (or being torn down) by the time this tick reaches it.
-            if !env_still_wanted(pool, env).await? {
+            if !env_still_wanted(pool, procs, env).await? {
                 continue;
             }
             let cold = !supervisor::has_process(procs, &fleet).await;
@@ -578,14 +578,14 @@ async fn reconcile_once(
 /// Whether the row this tick snapshotted still wants a fleet: the app exists,
 /// is not being deleted, and still desires to run. Re-read per spawn so a
 /// delete that landed mid-tick is not undone by a stale snapshot.
-async fn still_wanted(pool: &SqlitePool, app_id: &str) -> sqlx::Result<bool> {
+async fn still_wanted(pool: &SqlitePool, procs: &ProcMap, app_id: &str) -> sqlx::Result<bool> {
     if crate::service::apps::deleting(app_id) {
         return Ok(false);
     }
     // The delete marked the app before its first stop: a row still marked
     // running but already doomed must not spawn (the stopped mark lands just
     // after, and the row delete later).
-    if supervisor::app_teardown_began(app_id) {
+    if supervisor::app_teardown_began(procs, app_id).await {
         return Ok(false);
     }
     Ok(db::get_app(pool, app_id)
@@ -597,6 +597,7 @@ async fn still_wanted(pool: &SqlitePool, app_id: &str) -> sqlx::Result<bool> {
 /// the authority (a teardown removes it), and its app must still want a fleet.
 async fn env_still_wanted(
     pool: &SqlitePool,
+    procs: &ProcMap,
     env: &crate::models::Environment,
 ) -> sqlx::Result<bool> {
     if crate::service::apps::deleting(&env.app_id) {
@@ -606,7 +607,9 @@ async fn env_still_wanted(
     // row last: without this the tick respawns the fleet it just stopped
     // into the window where the row still reads as wanted (merge-queue
     // flake: the respawn lived past the row delete onto reused ports).
-    if supervisor::env_teardown_began(&env.id) || supervisor::app_teardown_began(&env.app_id) {
+    if supervisor::env_teardown_began(procs, &env.id).await
+        || supervisor::app_teardown_began(procs, &env.app_id).await
+    {
         return Ok(false);
     }
     Ok(db::get_environment(pool, &env.id)
@@ -865,19 +868,25 @@ mod tests {
         )
         .await
         .expect("app");
-        assert!(still_wanted(&pool, &app.id).await.expect("live row"));
+        assert!(still_wanted(&pool, &supervisor::new_procs(), &app.id)
+            .await
+            .expect("live row"));
 
         // A delete in progress (the row is still there for a moment).
         assert!(crate::service::apps::deleting_claim_for_test(&app.id));
         assert!(
-            !still_wanted(&pool, &app.id).await.expect("deleting"),
+            !still_wanted(&pool, &supervisor::new_procs(), &app.id)
+                .await
+                .expect("deleting"),
             "a deleting app wants no fleet"
         );
         crate::service::apps::deleting_release_for_test(&app.id);
 
         // The row is gone.
         db::delete_app(&pool, &app.id).await.expect("delete");
-        assert!(!still_wanted(&pool, &app.id).await.expect("gone"));
+        assert!(!still_wanted(&pool, &supervisor::new_procs(), &app.id)
+            .await
+            .expect("gone"));
 
         // An operator stop.
         let app = db::create_app(
@@ -897,7 +906,9 @@ mod tests {
         db::patch_app_desired(&pool, &app.id, DesiredState::Stopped)
             .await
             .expect("stop");
-        assert!(!still_wanted(&pool, &app.id).await.expect("stopped"));
+        assert!(!still_wanted(&pool, &supervisor::new_procs(), &app.id)
+            .await
+            .expect("stopped"));
     }
 
     /// The fallback tip sweep must not undo a rollback. A sha the history holds

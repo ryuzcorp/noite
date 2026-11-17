@@ -815,11 +815,12 @@ async fn delete_inner(state: &AppState, id: &str) -> Result<(), ApiError> {
         return Err(ApiError::internal(format!("delete {}: {step}", app.slug)));
     }
     // The generation check every spawn path honors (same contract as the
-    // environment teardown's mark): from here no deploy, wake, reconcile
-    // tick or restart may (re)start this app's fleets, so the row delete
-    // below hands the allocator port pairs no live process holds. After the
-    // stopped mark above, so a failed stop leaves no live app marked.
-    supervisor::mark_app_teardown(&app.id);
+    // environment teardown's mark, under the same proc-map lock the claim
+    // takes): from here no deploy, wake, reconcile tick or restart may
+    // (re)start this app's fleets, so the row delete below hands the allocator
+    // port pairs no live process holds. After the stopped mark above, so a
+    // failed stop leaves no live app marked.
+    supervisor::mark_app_teardown(&state.procs, &app.id).await;
     // Remember whether anything was running before the stops remove the map
     // entries: the background wipe must still settle when it killed a node,
     // and `any_fleet` inside it would see the map already empty.
@@ -830,6 +831,15 @@ async fn delete_inner(state: &AppState, id: &str) -> Result<(), ApiError> {
     supervisor::stop_fleet(&state.procs, &app.slug, supervisor::StopGrace::FOR_DELETE).await;
     supervisor::stop_environment_fleets(&state.procs, &app.slug, supervisor::StopGrace::FOR_DELETE)
         .await;
+    // A spawn that claimed before the mark can have its child outside the map
+    // when the stops above ran. Wait for every such claim to finish — adopted
+    // then stopped above, or refused at adoption and killed and reaped —
+    // before the row delete below frees the ports. Event-driven on the claim
+    // completion, not a settle sleep.
+    supervisor::wait_for_inflight_spawns(&app.slug).await;
+    for key in &env_keys {
+        supervisor::wait_for_inflight_spawns(key).await;
+    }
     logs::clear(&state.logs, &app.slug).await;
     crate::host::metrics::forget_fleet(&app.slug);
     for key in &env_keys {

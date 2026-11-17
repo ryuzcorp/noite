@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
-use tokio::sync::Mutex;
+use tokio::sync::{watch, Mutex};
 
 use crate::config::Config;
 use crate::db;
@@ -69,66 +69,214 @@ pub(crate) fn sigkill_tree(pid: u32) {
 /// the runner answers "is this fleet up?" — the map used to be plain
 /// `Child` presence, which could not tell a live child from an exited one,
 /// nor a fresh spawn from a crash-held or parked one.
-pub type ProcMap = Arc<Mutex<HashMap<String, FleetEntry>>>;
+pub type ProcMap = Arc<Mutex<ProcState>>;
 
-pub fn new_procs() -> ProcMap {
-    Arc::new(Mutex::new(HashMap::new()))
+/// Everything the proc-map lock guards: the supervised fleets plus the
+/// teardown marks. The marks live under this same lock — never a second
+/// mutex — so the check-and-claim in [`ensure_spawned`] is atomic against the
+/// mark-and-stop in teardown/app delete: one lock, one order, no ABBA. Method
+/// calls on the map (`get`, `entry`, `remove`, iteration) reach the fleets
+/// through the [`Deref`] impls below.
+#[derive(Default)]
+pub struct ProcState {
+    fleets: HashMap<String, FleetEntry>,
+    teardown_envs: HashSet<String>,
+    teardown_apps: HashSet<String>,
 }
 
-/// Fleets whose teardown has begun and must never spawn again: environments
-/// in `host::env_teardown` and apps in `service::apps::delete_inner` mark
-/// their id here **before** stopping the fleet, and every spawn path refuses
-/// them below. Keyed by the never-reused row id (not the fleet key or slug,
-/// both of which a later app or label reuses), and never cleared: a deploy
-/// holding a stale struct past the row delete must still refuse, and a retry
-/// of a failed teardown re-marks idempotently and completes the wipe it
-/// retries. A failed teardown leaves its row (and the mark) behind, which is
-/// fail-closed — the reconcile loop keeps refusing a fleet whose ref is gone
-/// until the retry removes the row.
-static TEARDOWN_ENVS: LazyLock<std::sync::Mutex<HashSet<String>>> =
-    LazyLock::new(|| std::sync::Mutex::new(HashSet::new()));
-static TEARDOWN_APPS: LazyLock<std::sync::Mutex<HashSet<String>>> =
-    LazyLock::new(|| std::sync::Mutex::new(HashSet::new()));
+impl std::ops::Deref for ProcState {
+    type Target = HashMap<String, FleetEntry>;
+    fn deref(&self) -> &Self::Target {
+        &self.fleets
+    }
+}
 
-/// Mark one environment's fleet unrestorable: teardown's first step. After
-/// this, `ensure_environment_fleet` (and the reconcile, wake and deploy paths
-/// that call it) refuse to (re)start the fleet, so the row delete at the end
-/// of the wipe hands the allocator a port pair no live process holds.
-pub fn mark_env_teardown(env_id: &str) {
-    TEARDOWN_ENVS
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .insert(env_id.to_string());
+impl std::ops::DerefMut for ProcState {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.fleets
+    }
+}
+
+pub fn new_procs() -> ProcMap {
+    Arc::new(Mutex::new(ProcState::default()))
+}
+
+/// Mark one environment's fleet unrestorable: teardown's first step, under the
+/// same lock the spawn paths claim under. After this, `ensure_environment_fleet`
+/// (and the reconcile, wake and deploy paths that call it) refuse to (re)start
+/// the fleet, so the row delete at the end of the wipe hands the allocator a
+/// port pair no live process holds. Keyed by the never-reused row id (not the
+/// fleet key or slug, both of which a later app or label reuses), and never
+/// cleared: a deploy holding a stale struct past the row delete must still
+/// refuse, and a retry of a failed teardown re-marks idempotently and completes
+/// the wipe it retries. A failed teardown leaves its row (and the mark) behind,
+/// which is fail-closed — the reconcile loop keeps refusing a fleet whose ref
+/// is gone until the retry removes the row.
+pub async fn mark_env_teardown(procs: &ProcMap, env_id: &str) {
+    procs.lock().await.teardown_envs.insert(env_id.to_string());
 }
 
 /// Whether the environment's teardown began: every spawn path for its fleet
-/// refuses these. Sync so the check runs before (and without) the proc-map
-/// lock; the adoption epoch guard still covers a claim taken just before the
-/// mark (a stop removes the entry, so the stale claim adopts nothing).
-pub fn env_teardown_began(env_id: &str) -> bool {
-    TEARDOWN_ENVS
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .contains(env_id)
+/// refuses these. The decisive check runs inside [`ensure_spawned`]'s locked
+/// critical section, atomically with the spawn claim (see there); this is the
+/// fail-fast for callers before their expensive awaits.
+pub async fn env_teardown_began(procs: &ProcMap, env_id: &str) -> bool {
+    procs.lock().await.teardown_envs.contains(env_id)
 }
 
 /// Mark one app's fleets unrestorable: app delete's step right after the row
 /// is marked stopped, before the first fleet stop. Covers the app fleet and
 /// every preview environment fleet (cascade-deleted with the app row).
-pub fn mark_app_teardown(app_id: &str) {
-    TEARDOWN_APPS
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .insert(app_id.to_string());
+pub async fn mark_app_teardown(procs: &ProcMap, app_id: &str) {
+    procs.lock().await.teardown_apps.insert(app_id.to_string());
 }
 
 /// Whether the app's delete began: every spawn path for its fleets refuses
 /// these, same contract as [`env_teardown_began`].
-pub fn app_teardown_began(app_id: &str) -> bool {
-    TEARDOWN_APPS
+pub async fn app_teardown_began(procs: &ProcMap, app_id: &str) -> bool {
+    procs.lock().await.teardown_apps.contains(app_id)
+}
+
+/// Spawn claims in flight, by fleet key: claimed but not yet finished
+/// (adopted, or refused at adoption and killed, or failed). Teardown and app
+/// delete wait on these before deleting the row that frees the fleet's ports:
+/// a spawn that claimed before the mark can have its child outside the
+/// [`ProcMap`] when the stop runs, and the stop cannot kill what is not there
+/// yet. State-based ([`watch`]), so a waiter can never miss the completion.
+///
+/// Lock order is fixed and documented here because this is a second mutex:
+/// [`claim`] takes it while holding the proc-map lock; the guard's [`Drop`]
+/// and [`wait_for_inflight_spawns`] take it alone. Nothing ever takes the
+/// proc-map lock while holding this one, so no ABBA cycle exists.
+static INFLIGHT: LazyLock<std::sync::Mutex<HashMap<String, InflightState>>> =
+    LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
+struct InflightState {
+    count: usize,
+    tx: watch::Sender<usize>,
+}
+
+/// RAII completion of one spawn claim: created with the claim under the
+/// proc-map lock, dropped when the spawn finishes on any path — adopted,
+/// refused at adoption and killed, or failed — including task abort, so a
+/// waiter can never hang on a dead task.
+struct InflightGuard {
+    key: Option<String>,
+}
+
+impl Drop for InflightGuard {
+    fn drop(&mut self) {
+        if let Some(key) = self.key.take() {
+            inflight_done(&key);
+        }
+    }
+}
+
+fn inflight_claimed(key: &str) -> InflightGuard {
+    let mut table = INFLIGHT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let state = table.entry(key.to_string()).or_insert_with(|| {
+        let (tx, _) = watch::channel(0);
+        InflightState { count: 0, tx }
+    });
+    state.count += 1;
+    let _ = state.tx.send(state.count);
+    InflightGuard {
+        key: Some(key.to_string()),
+    }
+}
+
+fn inflight_done(key: &str) {
+    let mut table = INFLIGHT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(state) = table.get_mut(key) {
+        state.count = state.count.saturating_sub(1);
+        // Send before removing: a waiter subscribed just before the removal
+        // still observes the zero.
+        let _ = state.tx.send(state.count);
+        if state.count == 0 {
+            table.remove(key);
+        }
+    }
+}
+
+/// Wait until no spawn holds a claim on `key` — every pre-mark claim has run
+/// to completion (adopted then stopped, or refused at adoption and killed and
+/// reaped). Teardown and app delete call this after their stop and before
+/// deleting the row that frees the fleet's ports. Event-driven, never a
+/// settle sleep: [`watch`] carries the count, so the completion cannot be
+/// missed between the check and the wait.
+pub async fn wait_for_inflight_spawns(key: &str) {
+    #[cfg(test)]
+    if let Some(gate) = test_gate_for(key) {
+        gate.wait_entered.notify_one();
+    }
+    let rx = INFLIGHT
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .contains(app_id)
+        .get(key)
+        .map(|state| state.tx.subscribe());
+    let Some(mut rx) = rx else {
+        return;
+    };
+    // `Ok` means the zero was observed; `Err` means the sender is gone, which
+    // only happens on removal after the zero was sent. Either way done.
+    let _ = rx.wait_for(|&count| count == 0).await;
+}
+
+/// Deterministic barriers for the teardown-race tests: pause a competing
+/// fleet start at exact await points (past the early mark check but before
+/// the claim; child spawned but before adoption) instead of timing a race
+/// window. Keyed by fleet key; tests use unique keys and remove their gate.
+#[cfg(test)]
+pub(crate) struct TestGate {
+    /// `ensure_spawned` signals here before claiming, then waits for release.
+    pub pre_claim_arrived: tokio::sync::Notify,
+    pub pre_claim_release: tokio::sync::Notify,
+    /// The spawn signals here with its child alive but unadopted, then waits.
+    pub pre_adopt_arrived: tokio::sync::Notify,
+    pub pre_adopt_release: tokio::sync::Notify,
+    /// [`wait_for_inflight_spawns`] signals here on entry.
+    pub wait_entered: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+static TEST_GATES: LazyLock<std::sync::Mutex<HashMap<String, std::sync::Arc<TestGate>>>> =
+    LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
+#[cfg(test)]
+pub(crate) fn test_gate_register(key: &str) -> std::sync::Arc<TestGate> {
+    let gate = std::sync::Arc::new(TestGate {
+        pre_claim_arrived: tokio::sync::Notify::new(),
+        pre_claim_release: tokio::sync::Notify::new(),
+        pre_adopt_arrived: tokio::sync::Notify::new(),
+        pre_adopt_release: tokio::sync::Notify::new(),
+        wait_entered: tokio::sync::Notify::new(),
+    });
+    TEST_GATES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(key.to_string(), gate.clone());
+    gate
+}
+
+#[cfg(test)]
+pub(crate) fn test_gate_for(key: &str) -> Option<std::sync::Arc<TestGate>> {
+    TEST_GATES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(key)
+        .cloned()
+}
+
+#[cfg(test)]
+pub(crate) fn test_gate_remove(key: &str) {
+    TEST_GATES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(key);
 }
 
 /// One fleet's supervised lifecycle. See the module docs on
@@ -988,6 +1136,9 @@ struct FleetSpec {
     key: String,
     /// The app that owns this fleet: the OOM-kill app event's owner.
     app_id: String,
+    /// The environment this fleet serves, if it is a preview: the teardown
+    /// mark the claim-time check reads.
+    env_id: Option<String>,
     /// The tenant scope whose key the fleet holds: the app's own prefix, or
     /// the environment's own when this fleet is a preview.
     scope: crate::host::credentials::Scope,
@@ -1048,8 +1199,10 @@ pub async fn ensure_fleet(
     // A delete in flight owns this fleet: it marked the app before its first
     // stop, and a spawn after the mark would hand the allocator's next owner
     // of these ports a live squatter (or serve one tenant's traffic on a
-    // deleted app's process). Refuse instead of racing the stop.
-    if app_teardown_began(&app.id) {
+    // deleted app's process). Refuse instead of racing the stop. Fail-fast
+    // only: the decisive check runs atomically with the claim in
+    // `ensure_spawned` below.
+    if app_teardown_began(procs, &app.id).await {
         anyhow::bail!("app {} is being deleted; not starting its fleet", app.id);
     }
     let (Some(listen), Some(internal)) = (app.listen_port, app.internal_port) else {
@@ -1058,6 +1211,7 @@ pub async fn ensure_fleet(
     let spec = FleetSpec {
         key: app.slug.clone(),
         app_id: app.id.clone(),
+        env_id: None,
         bucket: app.fleet_bucket.clone(),
         listen,
         internal,
@@ -1084,8 +1238,10 @@ pub async fn ensure_environment_fleet(
     // Teardown in flight owns this fleet: it marked the environment (and an
     // app delete marks the app) before its first stop, and a spawn after the
     // mark would come back to life on ports the row delete is about to hand
-    // to another tenant's fleet. Refuse instead of racing the stop.
-    if env_teardown_began(&env.id) || app_teardown_began(&env.app_id) {
+    // to another tenant's fleet. Refuse instead of racing the stop. Fail-fast
+    // only: the decisive check runs atomically with the claim in
+    // `ensure_spawned` below.
+    if env_teardown_began(procs, &env.id).await || app_teardown_began(procs, &env.app_id).await {
         anyhow::bail!(
             "environment {} is being torn down; not starting its fleet",
             env.id
@@ -1109,6 +1265,7 @@ pub async fn ensure_environment_fleet(
     let spec = FleetSpec {
         key: env_fleet_key(&env.app_slug, &env.label),
         app_id: env.app_id.clone(),
+        env_id: Some(env.id.clone()),
         bucket: env.fleet_bucket.clone(),
         listen,
         internal,
@@ -1343,12 +1500,45 @@ async fn ensure_spawned(
 ) -> anyhow::Result<()> {
     let key = spec.key.clone();
     let now = Instant::now();
+    // Test barrier only: pause a competing start after its early mark check
+    // but before the claim, so the race tests park the start at the exact
+    // await point instead of timing a window.
+    #[cfg(test)]
+    if let Some(gate) = test_gate_for(&key) {
+        gate.pre_claim_arrived.notify_one();
+        gate.pre_claim_release.notified().await;
+    }
     // One critical section decides everything the map can answer: expiry of a
     // crash/OOM hold, whether the child is still running, and — when it exited
     // — what that exit means. The OOM verdict is read while the baseline still
     // exists, so a same-key respawn cannot slip between consume and removal.
     let due = {
         let mut map = procs.lock().await;
+        // The decisive teardown check, read before the entry borrow below but
+        // under this same lock hold as the claim: a start that passed the
+        // early check before the mark can no longer claim after it. The mark
+        // precedes the stop, and the stop takes this same lock, so a start
+        // that reads no mark here claims before any later stop removes it
+        // (the adoption epoch then kills the stale child), and a stop that
+        // already ran implies the mark is read here. Checking anywhere
+        // earlier reopens the TOCTOU this closes.
+        let refused = if spec
+            .env_id
+            .as_deref()
+            .is_some_and(|id| map.teardown_envs.contains(id))
+        {
+            Some(format!(
+                "environment {} is being torn down; not starting its fleet",
+                spec.env_id.as_deref().unwrap_or("?")
+            ))
+        } else if map.teardown_apps.contains(&spec.app_id) {
+            Some(format!(
+                "app {} is being deleted; not starting its fleet",
+                spec.app_id
+            ))
+        } else {
+            None
+        };
         let entry = map
             .entry(key.clone())
             .or_insert_with(|| FleetEntry::new(None, FleetState::Absent));
@@ -1370,13 +1560,15 @@ async fn ensure_spawned(
             // epoch and moving to `Spawning` under this same lock, so no two
             // callers can spawn one fleet.
             None => {
-                if !spawn_due(entry.state, now) {
+                if let Some(reason) = refused {
+                    Due::Refused(reason)
+                } else if !spawn_due(entry.state, now) {
                     Due::Wait
                 } else {
                     if matches!(entry.state, FleetState::Spawning { .. }) {
                         tracing::warn!(fleet = %key, "spawn claim expired; taking it over");
                     }
-                    claim(entry, now)
+                    claim(&key, entry, now)
                 }
             }
             Some(why) => {
@@ -1396,7 +1588,10 @@ async fn ensure_spawned(
     };
     match due {
         Due::Wait => Ok(()),
-        Due::Spawn(epoch) => spawn_fleet(pool, cfg, procs, logs, spec, epoch).await,
+        Due::Refused(reason) => anyhow::bail!("{reason}"),
+        Due::Spawn { epoch, inflight } => {
+            spawn_fleet(pool, cfg, procs, logs, spec, epoch, inflight).await
+        }
         Due::Exited { oom, epoch } => {
             // The old process is gone: its proxy — and its containers — go
             // before a respawn serves a new socket, so the new fleet starts
@@ -1451,10 +1646,16 @@ fn spawn_due(state: FleetState, now: Instant) -> bool {
 /// Claim the right to spawn `key` for the caller: bump the epoch (the spawn's
 /// identity) and move the fleet to `Spawning`, which is what makes a second
 /// `ensure_fleet` for the same fleet wait instead of spawning a second child.
-fn claim(entry: &mut FleetEntry, now: Instant) -> Due {
+/// Registers the claim in the in-flight table under the same lock, so a
+/// teardown that waits after its stop observes every claim taken before that
+/// stop — including this one.
+fn claim(key: &str, entry: &mut FleetEntry, now: Instant) -> Due {
     entry.epoch = next_epoch();
     entry.state = entry.state.on(FleetEvent::Spawned { at: now });
-    Due::Spawn(entry.epoch)
+    Due::Spawn {
+        epoch: entry.epoch,
+        inflight: inflight_claimed(key),
+    }
 }
 
 /// What an [`ensure_spawned`] pass found under the proc-map lock.
@@ -1462,8 +1663,12 @@ enum Due {
     /// A live child, an unexpired hold, or a spawn another caller claimed:
     /// nothing spawns this pass.
     Wait,
-    /// No child, no hold, no claim: this caller owns epoch `u64` and spawns.
-    Spawn(u64),
+    /// The fleet is being torn down: refuse, decided atomically with the
+    /// claim (carries the refusal reason).
+    Refused(String),
+    /// No child, no hold, no claim, no teardown mark: this caller owns the
+    /// epoch and spawns, and `inflight` tracks the claim to completion.
+    Spawn { epoch: u64, inflight: InflightGuard },
     /// The child exited on its own and the state now holds the respawn.
     Exited {
         oom: Option<crate::host::cgroups::OomNote>,
@@ -1484,7 +1689,12 @@ async fn spawn_fleet(
     logs: &LogState,
     spec: FleetSpec,
     epoch: u64,
+    inflight: InflightGuard,
 ) -> anyhow::Result<()> {
+    // Held to the end of the spawn on every path: teardown's
+    // `wait_for_inflight_spawns` unblocks only once the child is adopted or
+    // refused and reaped.
+    let _inflight = inflight;
     let key = spec.key.clone();
     let result = spawn_fleet_inner(pool, cfg, procs, logs, spec, epoch).await;
     if result.is_err() {
@@ -1773,6 +1983,14 @@ async fn spawn_fleet_inner(
     // resurrecting a child then would leave a fleet nobody supervises — the
     // state machine's "a stop wins" rule has to hold across the spawn too.
     let mut child = Some(child);
+    // Test barrier only: pause with the child alive but unadopted, so the
+    // race tests park the spawn between the stop (which cannot kill what is
+    // not in the map yet) and the adoption that reaps it.
+    #[cfg(test)]
+    if let Some(gate) = test_gate_for(&key) {
+        gate.pre_adopt_arrived.notify_one();
+        gate.pre_adopt_release.notified().await;
+    }
     let adopted = {
         let mut map = procs.lock().await;
         match map.get_mut(&key) {
@@ -2374,9 +2592,10 @@ mod tests {
         let entry = map
             .entry(key.to_string())
             .or_insert_with(|| FleetEntry::new(None, FleetState::Absent));
-        match claim(entry, Instant::now()) {
-            Due::Spawn(epoch) => epoch,
+        match claim(key, entry, Instant::now()) {
+            Due::Spawn { epoch, .. } => epoch,
             Due::Wait => panic!("the fleet was not claimable"),
+            Due::Refused(reason) => panic!("the fleet was refused: {reason}"),
             Due::Exited { .. } => panic!("no child to exit"),
         }
     }

@@ -629,7 +629,7 @@ pub async fn wake_app(
     // A delete in flight owns this fleet (it marked the app before its first
     // stop): refuse the wake instead of respawning onto ports the row delete
     // is about to hand to another tenant.
-    if supervisor::app_teardown_began(app_id) {
+    if supervisor::app_teardown_began(procs, app_id).await {
         anyhow::bail!("app is being deleted");
     }
     let Some(port) = app.listen_port else {
@@ -818,7 +818,9 @@ pub async fn wake_environment(
     // Teardown in flight owns this fleet (it marked the environment before
     // its first stop): refuse the wake instead of respawning onto ports the
     // row delete is about to hand to another tenant.
-    if supervisor::env_teardown_began(env_id) || supervisor::app_teardown_began(&env.app_id) {
+    if supervisor::env_teardown_began(procs, env_id).await
+        || supervisor::app_teardown_began(procs, &env.app_id).await
+    {
         anyhow::bail!("environment is being torn down");
     }
     let Some(port) = env.listen_port else {
@@ -970,7 +972,9 @@ async fn park_after_failed_wake(
 pub async fn wake_environment_for_deploy(pool: &SqlitePool, procs: &ProcMap, env: &Environment) {
     // Teardown owns this fleet now: leave the entry alone instead of
     // unparking a fleet the deploy's own start step must refuse.
-    if supervisor::env_teardown_began(&env.id) || supervisor::app_teardown_began(&env.app_id) {
+    if supervisor::env_teardown_began(procs, &env.id).await
+        || supervisor::app_teardown_began(procs, &env.app_id).await
+    {
         return;
     }
     if !env.is_asleep() {
@@ -1004,7 +1008,7 @@ pub async fn wake_environment_for_deploy(pool: &SqlitePool, procs: &ProcMap, env
 pub async fn wake_for_deploy(pool: &SqlitePool, procs: &ProcMap, app: &App) {
     // A delete owns this fleet now: leave the entry alone instead of
     // unparking a fleet the deploy's own start step must refuse.
-    if supervisor::app_teardown_began(&app.id) {
+    if supervisor::app_teardown_began(procs, &app.id).await {
         return;
     }
     if !app.is_asleep() {

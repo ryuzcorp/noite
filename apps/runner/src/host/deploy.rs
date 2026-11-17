@@ -415,12 +415,13 @@ fn fleet_label(app: &App, target: &DeployTarget) -> String {
 /// other path right after its own stage-and-activate.
 async fn load_deploy_target(
     pool: &SqlitePool,
+    procs: &ProcMap,
     app: &App,
     target: &DeployTarget,
 ) -> anyhow::Result<Option<Environment>> {
     match target {
         DeployTarget::Production => {
-            if supervisor::app_teardown_began(&app.id) {
+            if supervisor::app_teardown_began(procs, &app.id).await {
                 anyhow::bail!("app {} is being deleted; skipping fleet start", app.id);
             }
             if db::get_app(pool, &app.id).await?.is_none() {
@@ -430,8 +431,8 @@ async fn load_deploy_target(
         }
         DeployTarget::Environment(env) => match db::get_environment(pool, &env.id).await? {
             Some(fresh) => {
-                if supervisor::env_teardown_began(&env.id)
-                    || supervisor::app_teardown_began(&env.app_id)
+                if supervisor::env_teardown_began(procs, &env.id).await
+                    || supervisor::app_teardown_began(procs, &env.app_id).await
                 {
                     anyhow::bail!(
                         "environment {} is being torn down; skipping fleet start",
@@ -1615,7 +1616,7 @@ async fn deploy_inner(
         // starts: for a preview, the environment's row (a delete raced
         // this build). The staged migrate below can (re)start the fleet,
         // so the check runs before it.
-        let environment = load_deploy_target(pool, app, target).await?;
+        let environment = load_deploy_target(pool, procs, app, target).await?;
         // A redeploy has a previous generation that could be serving: run
         // the migrations against the staged generation now, before the
         // activate moves traffic to it. A migrate failure fails the deploy
@@ -1702,7 +1703,7 @@ async fn deploy_inner(
         let stats =
             void_cohost::activate_staged(pool, &app.id, target.environment_id(), &celld, staged)
                 .await?;
-        let environment = load_deploy_target(pool, app, target).await?;
+        let environment = load_deploy_target(pool, procs, app, target).await?;
         (stats, environment)
     };
     // The activation above ran past the point of no return, so a stop from
