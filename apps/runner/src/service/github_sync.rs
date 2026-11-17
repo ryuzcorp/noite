@@ -499,9 +499,13 @@ async fn sync_into(
     };
     if current_tree.as_deref() == Some(origin_tree.as_str()) {
         import::drop_ref(&mirror, SYNC_REF).await?;
-        // Still the latest observation: record it, best effort.
-        if let Err(e) = crate::db::set_last_sync_sha(&state.pool, &app.id, &origin_sha).await {
-            tracing::warn!(app_id = %app.id, error = %format!("{e:#}"), "sync last-sync record");
+        // Still the latest observation: record the tip carrying it, best
+        // effort. The tip is what the next Noite-commit count is based from,
+        // so a base that already carries the origin never counts itself.
+        if let Some(tip_sha) = tip {
+            if let Err(e) = crate::db::set_last_sync_sha(&state.pool, &app.id, tip_sha).await {
+                tracing::warn!(app_id = %app.id, error = %format!("{e:#}"), "sync last-sync record");
+            }
         }
         note(
             state,
@@ -556,7 +560,9 @@ async fn sync_into(
     // Compare-and-swap on the branch tip: a push that raced the sync wins and
     // this move is refused with "tip moved" instead of losing the push.
     forge::publish_ref(state, app, forge::DEFAULT_BRANCH, tip, Some(&new_sha)).await?;
-    if let Err(e) = crate::db::set_last_sync_sha(&state.pool, &app.id, &origin_sha).await {
+    // The new commit carries the origin tree: it becomes the base the next
+    // Noite-commit count is measured from, so a sync never counts itself.
+    if let Err(e) = crate::db::set_last_sync_sha(&state.pool, &app.id, &new_sha).await {
         tracing::warn!(app_id = %app.id, error = %format!("{e:#}"), "sync last-sync record");
     }
     // A sync is a head move like any other: keep open PRs pointing at the
@@ -869,9 +875,10 @@ mod tests {
         // makes, which is what starts the deploy.
         let tip = current_tip(&mirror).await.expect("tip").expect("main");
         assert_eq!(tip, second.sha);
-        // The origin sha is recorded for the next confirmation count.
+        // The sync commit is recorded as the base for the next confirmation
+        // count, so the sync never counts itself.
         let row = app_or_404(&h.state, &app.id).await.expect("reload");
-        assert_eq!(row.last_sync_sha.as_deref(), Some(origin_v2.trim()));
+        assert_eq!(row.last_sync_sha.as_deref(), Some(second.sha.as_str()));
         h.finish().await;
     }
 
@@ -985,7 +992,8 @@ mod tests {
     }
 
     /// Without confirmation, a sync that would overwrite Noite commits names
-    /// the count and writes nothing; with it, the sync lands.
+    /// the count and writes nothing; with it, the sync lands. The sync's own
+    /// commit is the base, so only genuine Noite-side commits count.
     #[tokio::test]
     async fn sync_without_confirmation_names_the_overwritten_commits() {
         let h = SyncHarness::new().await;
@@ -995,6 +1003,26 @@ mod tests {
             .await
             .expect("first sync");
         assert!(matches!(first, GithubSyncOutcome::Synced(_)));
+
+        crate::host::web_commit::web_commit(
+            &h.state,
+            &app,
+            &git_identity::noreply(&h.state.config, "user_1", "User One"),
+            "noite-side edit",
+            crate::host::web_commit::WebChanges {
+                files: &[crate::host::web_commit::WebFile {
+                    path: "noite.txt".to_string(),
+                    content: crate::host::web_commit::WebContent::Text("mine".to_string()),
+                }],
+                moves: &[],
+                deletes: &[],
+            },
+            Some("main"),
+            None,
+            None,
+        )
+        .await
+        .expect("push");
 
         commit_all(&upstream, "v2", "two").await;
         let body = GithubSyncBody {
@@ -1008,12 +1036,12 @@ mod tests {
         assert!(matches!(err, ApiError::Conflict(_)), "{err:?}");
         let text = format!("{err:?}");
         assert!(
-            text.contains("will be overwritten in the tree; they stay in history"),
+            text.contains("1 Noite commit will be overwritten in the tree"),
             "{text}"
         );
 
         let mirror = mirror_of(&h.state, &app).await;
-        assert_eq!(rev_list_count(&mirror, "refs/heads/main").await, 1);
+        assert_eq!(rev_list_count(&mirror, "refs/heads/main").await, 2);
 
         let landed = sync_with(&h.state, &app.id, &confirm(None), file_protocols())
             .await
@@ -1022,7 +1050,7 @@ mod tests {
             panic!("a confirmed sync lands, got {landed:?}");
         };
         assert_eq!(landed.noite_overwritten, 1);
-        assert_eq!(rev_list_count(&mirror, "refs/heads/main").await, 2);
+        assert_eq!(rev_list_count(&mirror, "refs/heads/main").await, 3);
         h.finish().await;
     }
 
@@ -1136,13 +1164,74 @@ mod tests {
             .to_string();
         assert_eq!(status.current_tip.as_deref(), Some(pushed.as_str()));
         assert_eq!(status.origin_tip.as_deref(), Some(origin.as_str()));
-        // The sync commit itself plus the Noite-side commit: everything on
-        // the branch since the last sync is overwritten in the tree.
-        assert_eq!(status.noite_commits, 2);
-        assert_eq!(
-            status.last_sync_sha.as_deref(),
-            Some(first.origin_sha.as_str())
-        );
+        // Only the Noite-side commit: the sync records its own commit as the
+        // base, so it never counts itself toward the next confirmation.
+        assert_eq!(status.noite_commits, 1);
+        assert_eq!(status.last_sync_sha.as_deref(), Some(first.sha.as_str()));
+        h.finish().await;
+    }
+
+    /// Right after a sync nothing counts: the sync's own commit is the new
+    /// base, so a second click syncs straight through with no confirmation.
+    /// A real Noite-side commit after the sync counts again.
+    #[tokio::test]
+    async fn status_counts_no_noite_commits_right_after_a_sync() {
+        let h = SyncHarness::new().await;
+        let upstream = fixture(&h.dir, "upstream", "v1").await;
+        let app = seed_imported(&h, "sync-status-fresh", &upstream).await;
+        let first = sync_with(&h.state, &app.id, &confirm(None), file_protocols())
+            .await
+            .expect("first sync");
+        let GithubSyncOutcome::Synced(first) = first else {
+            panic!("a fresh app always syncs, got {first:?}");
+        };
+
+        let status = status_with(&h.state, &app.id, file_protocols())
+            .await
+            .expect("status");
+        assert_eq!(status.noite_commits, 0);
+        assert_eq!(status.last_sync_sha.as_deref(), Some(first.sha.as_str()));
+
+        // No confirmation needed: the origin has not moved and the tree
+        // already carries it, so the second sync is a no-op.
+        let second = sync_with(
+            &h.state,
+            &app.id,
+            &GithubSyncBody {
+                expected_tip: None,
+                confirm: false,
+                role: None,
+            },
+            file_protocols(),
+        )
+        .await
+        .expect("second sync needs no confirmation");
+        assert!(matches!(second, GithubSyncOutcome::UpToDate(_)));
+
+        crate::host::web_commit::web_commit(
+            &h.state,
+            &app,
+            &git_identity::noreply(&h.state.config, "user_1", "User One"),
+            "noite-side edit",
+            crate::host::web_commit::WebChanges {
+                files: &[crate::host::web_commit::WebFile {
+                    path: "noite.txt".to_string(),
+                    content: crate::host::web_commit::WebContent::Text("mine".to_string()),
+                }],
+                moves: &[],
+                deletes: &[],
+            },
+            Some("main"),
+            None,
+            None,
+        )
+        .await
+        .expect("push");
+
+        let status = status_with(&h.state, &app.id, file_protocols())
+            .await
+            .expect("status");
+        assert_eq!(status.noite_commits, 1);
         h.finish().await;
     }
 }

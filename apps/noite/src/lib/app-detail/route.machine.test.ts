@@ -54,6 +54,19 @@ describe("parseAppRoute", () => {
       "overview"
     );
   });
+
+  test("every tab id parses to itself, including the standalone Analytics tab", () => {
+    for (const tab of [
+      "overview",
+      "deployments",
+      "metrics",
+      "analytics",
+      "errors",
+      "events",
+    ] as const) {
+      expect(parseAppRoute({ env: "", panel: "", t: tab }, []).tab).toBe(tab);
+    }
+  });
 });
 
 describe("parseScope", () => {

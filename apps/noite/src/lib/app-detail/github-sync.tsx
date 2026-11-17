@@ -1,9 +1,12 @@
-//! Overview's Sync from GitHub card: for apps created by a GitHub import,
-//! when the caller holds the push role (a sync writes one commit and
-//! deploys — exactly what push already allows). It shows the stored origin,
-//! the ref, the last synced sha and the origin tip, and a button that force
-//! syncs the tree with the origin. The button's steps are the one
-//! `github-sync.machine` lifecycle; deploy state after a sync arrives
+//! Sync from GitHub: the tiny button next to the app's status line in the
+//! header, for apps created by a GitHub import when the caller holds the
+//! push role (a sync writes one commit and deploys — exactly what push
+//! already allows). A click syncs straight when the tree is clean, or opens
+//! the overwrite confirmation (a real modal dialog) when Noite-side commits
+//! would be overwritten in the tree. The dialog also carries the origin
+//! facts (origin, last synced, origin tip) and the result (`Synced to
+//! <sha>`, up-to-date, or the runner's refusal). The button's steps are the
+//! one `github-sync.machine` lifecycle; deploy state after a sync arrives
 //! through the existing feeds (the Deployments tab's stream), never a new
 //! EventSource here.
 
@@ -16,6 +19,7 @@ import { errorMessage } from "../errors";
 import { resourceError, resourceValue } from "../resource";
 import { appDetail, githubSync, invalidate, keys } from "../resources";
 import type { GithubSyncOutcome, GithubSyncStatus } from "../runner";
+import { Dialog } from "../ui/dialog";
 import { Refresh } from "../ui/icons";
 import { LoadError } from "../ui/load-error";
 import { capabilities } from "./capabilities";
@@ -31,15 +35,13 @@ import type { GithubSyncState } from "./github-sync.machine";
 
 const SHA_CHARS = 7;
 
-/** A sha shortened for the card ("never" before the first sync). */
+/** A sha shortened for the button ("never" before the first sync). */
 const shortSha = (sha: string | null): string =>
   sha === null ? "never" : sha.slice(0, SHA_CHARS);
 
-/** Per-instance card state, as reactive atoms (never a mutable box: box
- * writes do not repaint, so the confirmation never painted and the button
- * fired no request): the machine (null until the first click, when the
- * loaded status seeds `Idle`) and whether the component mounted — controls
- * stay disabled until mount, since the sync is a client fetch. */
+/** The tooltip on the tiny button: where a sync would go from. */
+const syncTitle = (status: GithubSyncStatus): string =>
+  `Origin github.com/${status.owner}/${status.repo}${status.ref ? `@${status.ref}` : ""} · last synced ${shortSha(status.lastSyncSha)} · origin tip ${status.originTip === null ? "unknown" : shortSha(status.originTip)}`;
 
 /** Run one sync against the runner, folding its answer into the machine. A
  * 409 for an unconfirmed overwrite re-opens the confirmation (the tree
@@ -71,30 +73,18 @@ const runSync = async (
 };
 
 const SyncButton = ({
-  appId,
-  machine,
-  mounted,
   label,
-  status,
+  mounted,
+  onSync,
 }: {
-  appId: string;
-  machine: AtomHandle<GithubSyncState | null>;
-  mounted: boolean;
   label: string;
-  status: GithubSyncStatus;
+  mounted: boolean;
+  onSync: () => void;
 }) => (
   <button
     class="btn btn-sm btn-primary"
     disabled={!mounted}
-    onclick={() => {
-      const next = requestSync(status);
-
-      if (next._tag === "Syncing") {
-        void runSync(appId, machine, status, false);
-      } else {
-        machine.set(next);
-      }
-    }}
+    onclick={onSync}
     type="button"
   >
     <span class="inline-flex items-center gap-1">
@@ -104,29 +94,54 @@ const SyncButton = ({
   </button>
 );
 
-/** The card body by machine state: an exhaustive switch, so a new state
+/** The origin facts the dialog carries: which origin, what the app last
+ * synced to, and where the origin's tip is now. */
+const SyncFacts = ({ status }: { status: GithubSyncStatus }) => (
+  <dl class="m-0 grid grid-cols-1 gap-x-4 gap-y-1 text-sm">
+    <div class="flex gap-2">
+      <dt class="opacity-70">Origin</dt>
+      <dd class="m-0 font-mono">
+        github.com/{status.owner}/{status.repo}
+        {status.ref ? `@${status.ref}` : null}
+        {status.path ? ` / ${status.path}` : null}
+      </dd>
+    </div>
+    <div class="flex gap-2">
+      <dt class="opacity-70">Last synced</dt>
+      <dd class="m-0 font-mono">{shortSha(status.lastSyncSha)}</dd>
+    </div>
+    <div class="flex gap-2">
+      <dt class="opacity-70">Origin tip</dt>
+      <dd class="m-0 font-mono">
+        {status.originTip === null ? "unknown" : shortSha(status.originTip)}
+      </dd>
+    </div>
+  </dl>
+);
+
+/** The dialog body by machine state: an exhaustive switch, so a new state
  * fails the build instead of painting nothing. */
 const SyncBody = ({
   appId,
+  idleLabel,
   machine,
   mounted,
+  onCancel,
   state,
+  syncNow,
 }: {
   appId: string;
+  idleLabel: string;
   machine: AtomHandle<GithubSyncState | null>;
   mounted: boolean;
+  onCancel: () => void;
   state: GithubSyncState;
+  syncNow: () => void;
 }) => {
   switch (state._tag) {
     case "Idle": {
       return (
-        <SyncButton
-          appId={appId}
-          machine={machine}
-          mounted={mounted}
-          label="Sync from GitHub"
-          status={state.status}
-        />
+        <SyncButton label={idleLabel} mounted={mounted} onSync={syncNow} />
       );
     }
 
@@ -135,14 +150,27 @@ const SyncBody = ({
         <div class="flex flex-col gap-2">
           <p class="m-0 text-sm font-medium">
             {state.status.noiteCommits}{" "}
-            {state.status.noiteCommits === 1 ? "Noite commit" : "Noite commits"}{" "}
-            will be overwritten in the tree; they stay in history.
+            {state.status.noiteCommits === 1 ? (
+              <>
+                Noite commit will be overwritten in the tree; it stays in
+                history.
+              </>
+            ) : (
+              <>
+                Noite commits will be overwritten in the tree; they stay in
+                history.
+              </>
+            )}
           </p>
           <div class="flex flex-wrap gap-2">
             <button
               class="btn btn-sm btn-warning"
               disabled={!mounted}
               onclick={() => {
+                // The confirmation names the tip it displayed: send that
+                // tip, never a refetched one, so a branch that moved under
+                // the dialog fails the runner's compare-and-set instead of
+                // silently overwriting the new commit.
                 void runSync(appId, machine, state.status, true);
               }}
               type="button"
@@ -154,6 +182,7 @@ const SyncBody = ({
               disabled={!mounted}
               onclick={() => {
                 machine.set(cancelConfirm(state.status));
+                onCancel();
               }}
               type="button"
             >
@@ -188,13 +217,7 @@ const SyncBody = ({
             <Link class="btn btn-sm" href={`/apps/${appId}?t=deployments`}>
               View deploy
             </Link>
-            <SyncButton
-              appId={appId}
-              machine={machine}
-              mounted={mounted}
-              label="Sync again"
-              status={state.status}
-            />
+            <SyncButton label="Sync again" mounted={mounted} onSync={syncNow} />
           </div>
         </div>
       );
@@ -208,13 +231,7 @@ const SyncBody = ({
             <code>{state.sha.slice(0, SHA_CHARS)}</code>.
           </p>
           <div>
-            <SyncButton
-              appId={appId}
-              machine={machine}
-              mounted={mounted}
-              label="Sync again"
-              status={state.status}
-            />
+            <SyncButton label="Sync again" mounted={mounted} onSync={syncNow} />
           </div>
         </div>
       );
@@ -225,13 +242,7 @@ const SyncBody = ({
         <div class="flex flex-col gap-2">
           <p class="text-error m-0 text-sm">{state.message}</p>
           <div>
-            <SyncButton
-              appId={appId}
-              machine={machine}
-              mounted={mounted}
-              label="Retry sync"
-              status={state.status}
-            />
+            <SyncButton label="Retry sync" mounted={mounted} onSync={syncNow} />
           </div>
         </div>
       );
@@ -245,29 +256,98 @@ const SyncBody = ({
   }
 };
 
-/** Sync from GitHub, on the Overview for GitHub-imported apps when the
- * caller can push. Anything else (blank apps, templates without a stored
- * origin, viewers) paints nothing. */
-export const GithubSyncCard = ({ appId }: { appId: string }) => {
-  const info = resourceValue(appDetail(appId).state());
+/** The dialog the tiny button opens: the origin facts plus the machine body.
+ * The machine survives closes, so reopening re-reads the last result; every
+ * button click still decides fresh from the latest status (a sync
+ * invalidates it, so the facts never go stale). */
+const SyncDialog = ({
+  appId,
+  machine,
+  mounted,
+  onCancel,
+  open,
+  resFailed,
+  snapshot,
+  syncError,
+  syncNow,
+}: {
+  appId: string;
+  machine: AtomHandle<GithubSyncState | null>;
+  mounted: boolean;
+  onCancel: () => void;
+  open: AtomHandle<boolean>;
+  resFailed: boolean;
+  snapshot: GithubSyncStatus | undefined;
+  syncError: unknown;
+  syncNow: () => void;
+}) => {
+  const failed = snapshot === undefined && resFailed;
+  const loading = snapshot === undefined && !resFailed;
 
-  if (!info || !info.app.imported || !capabilities(info.myRole).push) {
-    return null;
-  }
+  const state =
+    machine() ?? (snapshot ? GithubSync.Idle({ status: snapshot }) : null);
 
-  return <GithubSyncIsland appId={appId} />;
+  return (
+    <Dialog open={open} class="modal" labelledBy="github-sync-title">
+      <div class="modal-box bg-base-100 dark:bg-base-200">
+        <h2 id="github-sync-title" class="m-0 text-lg font-bold">
+          Sync from GitHub
+        </h2>
+        <div class="flex flex-col gap-3 py-4">
+          {snapshot ? <SyncFacts status={snapshot} /> : null}
+          {loading ? (
+            <p class="m-0 text-sm opacity-70">Loading the origin…</p>
+          ) : null}
+          {failed ? (
+            <LoadError
+              error={syncError}
+              label="Could not load the sync status"
+            />
+          ) : null}
+          {state ? (
+            <SyncBody
+              appId={appId}
+              idleLabel="Sync now"
+              machine={machine}
+              mounted={mounted}
+              onCancel={onCancel}
+              state={state}
+              syncNow={syncNow}
+            />
+          ) : null}
+        </div>
+        {/* One dismiss action only: the overwrite confirmation dismisses
+            with Cancel next to "Sync anyway"; every other state closes
+            here. */}
+        {state?._tag === "Confirming" ? null : (
+          <div class="modal-action m-0">
+            <button
+              type="button"
+              class="btn btn-sm"
+              onclick={() => {
+                open.set(false);
+              }}
+            >
+              Close
+            </button>
+          </div>
+        )}
+      </div>
+    </Dialog>
+  );
 };
 
-/** The island owns the card's atoms and resource, every call unconditional
- * in one slot order. The outer gate must not call `githubSync` itself: a
- * `tracked` resource creates its atom on call, so calling it after the
- * gate's early return (or skipping it on some renders) scrambles ilha's
- * slots — the ILHA002 warning behind the dead button. A mutable
- * `atom.lazy` box is no substitute either: box writes do not repaint, so
- * the confirmation the click assigned never painted. */
+/** The island owns the button's atoms and the sync-status resource, every
+ * call unconditional in one slot order. The atoms are reactive (never a
+ * mutable box: box writes do not repaint, so the confirmation the click
+ * assigned never painted). The outer gate must not call `githubSync`
+ * itself: a `tracked` resource creates its atom on call, so calling it
+ * after the gate's early return (or skipping it on some renders) scrambles
+ * ilha's slots — the ILHA002 warning behind the dead button. */
 const GithubSyncIsland = ({ appId }: { appId: string }) => {
   const machine = atom<GithubSyncState | null>(null);
   const mounted = atom(false);
+  const open = atom(false);
 
   watch.once(() => {
     mounted.set(true);
@@ -275,80 +355,120 @@ const GithubSyncIsland = ({ appId }: { appId: string }) => {
 
   const res = githubSync(appId);
   const snapshot = resourceValue(res.state());
+  const resFailed = res.state()._tag === "Failed";
 
-  if (!snapshot) {
-    if (res.state()._tag === "Loading") {
-      return (
-        <section class="card bg-base-100 dark:bg-base-200 border-base-300 border">
-          <div class="card-body gap-3">
-            <h2 class="card-title m-0 text-base">Sync from GitHub</h2>
-            <p class="m-0 text-sm opacity-70">Loading the origin…</p>
-            <div>
-              <button class="btn btn-sm btn-primary" disabled type="button">
-                <span class="inline-flex items-center gap-1">
-                  <Refresh />
-                  Sync from GitHub
-                </span>
-              </button>
-            </div>
-          </div>
-        </section>
-      );
+  /** Sync from the latest status, never the snapshot the dialog opened with:
+   * a refetch first, so a click after the tree moved (or Retry after a
+   * tip-moved refusal) decides from the moved tree instead of looping on
+   * the stale one. The dialog opens immediately; the decision lands when
+   * the refetch does. The machine moves to Syncing synchronously first, so
+   * a second click while the refetch runs is refused instead of firing a
+   * second request. */
+  const syncNow = (): void => {
+    if (machine()?._tag === "Syncing") {
+      return;
     }
 
-    return (
-      <section class="card bg-base-100 dark:bg-base-200 border-base-300 border">
-        <div class="card-body gap-3">
-          <h2 class="card-title m-0 text-base">Sync from GitHub</h2>
-          <LoadError
-            error={resourceError(res.state())}
-            label="Could not load the sync status"
-          />
-        </div>
-      </section>
-    );
+    const cached = resourceValue(res.state());
+
+    if (cached) {
+      machine.set(GithubSync.Syncing({ confirm: false, status: cached }));
+    }
+
+    void (async () => {
+      let status: GithubSyncStatus | undefined;
+
+      try {
+        status = await res.refetch();
+      } catch {
+        status = undefined;
+      }
+
+      const current = status ?? resourceValue(res.state());
+
+      if (!current) {
+        machine.set(null);
+
+        return;
+      }
+
+      const next = requestSync(current);
+
+      if (next._tag !== "Syncing") {
+        machine.set(next);
+
+        return;
+      }
+
+      void runSync(appId, machine, current, false);
+    })();
+  };
+
+  /** One click does the whole decision: a clean tree syncs straight (the
+   * dialog opens on the progress), a tree with Noite-side commits opens on
+   * the overwrite confirmation instead. */
+  const start = () => {
+    open.set(true);
+    syncNow();
+  };
+
+  /** Cancel dismisses the dialog, back to a fresh Idle. */
+  const onCancel = () => {
+    open.set(false);
+    machine.set(null);
+  };
+
+  let title = "Loading the origin…";
+
+  if (snapshot) {
+    title = syncTitle(snapshot);
+  } else if (resFailed) {
+    title =
+      "Sync from GitHub: the origin status failed to load — open for the error";
   }
 
-  if (!snapshot.imported || !snapshot.owner || !snapshot.repo) {
+  return (
+    <>
+      <button
+        type="button"
+        class="btn btn-xs"
+        disabled={
+          !mounted() ||
+          res.state()._tag === "Loading" ||
+          machine()?._tag === "Syncing"
+        }
+        title={title}
+        onclick={start}
+      >
+        <span class="inline-flex items-center gap-1">
+          <Refresh />
+          Sync from GitHub
+        </span>
+      </button>
+      <SyncDialog
+        appId={appId}
+        machine={machine}
+        mounted={mounted()}
+        onCancel={onCancel}
+        open={open}
+        resFailed={resFailed}
+        snapshot={snapshot}
+        syncError={resourceError(res.state())}
+        syncNow={syncNow}
+      />
+    </>
+  );
+};
+
+/** Sync from GitHub, as the tiny header button next to the app's status
+ * line. Anything else (blank apps, templates without a stored origin,
+ * viewers) paints nothing. */
+export const GithubSyncButton = ({ appId }: { appId: string }) => {
+  const info = resourceValue(appDetail(appId).state());
+
+  if (!info || !info.app.imported || !capabilities(info.myRole).push) {
     return null;
   }
 
-  const state = machine() ?? GithubSync.Idle({ status: snapshot });
-  const status = snapshot;
-
-  return (
-    <section class="card bg-base-100 dark:bg-base-200 border-base-300 border">
-      <div class="card-body gap-3">
-        <h2 class="card-title m-0 text-base">Sync from GitHub</h2>
-        <dl class="m-0 grid grid-cols-1 gap-x-4 gap-y-1 text-sm">
-          <div class="flex gap-2">
-            <dt class="opacity-70">Origin</dt>
-            <dd class="m-0 font-mono">
-              github.com/{status.owner}/{status.repo}
-              {status.ref ? `@${status.ref}` : null}
-              {status.path ? ` / ${status.path}` : null}
-            </dd>
-          </div>
-          <div class="flex gap-2">
-            <dt class="opacity-70">Last synced</dt>
-            <dd class="m-0 font-mono">{shortSha(status.lastSyncSha)}</dd>
-          </div>
-          <div class="flex gap-2">
-            <dt class="opacity-70">Origin tip</dt>
-            <dd class="m-0 font-mono">
-              {status.originTip === null
-                ? "unknown"
-                : shortSha(status.originTip)}
-            </dd>
-          </div>
-        </dl>
-        <SyncBody
-          appId={appId}
-          machine={machine}
-          mounted={mounted()}
-          state={state}
-        />
-      </div>
-    </section>
-  );
+  return <GithubSyncIsland appId={appId} />;
 };

@@ -1,7 +1,8 @@
 //! Usage charts: request / error / latency / memory / CPU bars over a chosen
-//! window (24h / 7d / 1m), from the runner's hourly counters, plus the
-//! Analytics breakdown (browsers, OSes, paths, referrers) over the same
-//! window.
+//! window (24h / 7d / 1m), from the runner's hourly counters. The Analytics
+//! breakdown (browsers, OSes, paths, referrers) over the same window lives in
+//! the standalone `AnalyticsCard` below, so the Metrics tab and the Analytics
+//! tab (and the control page) can mount either surface alone.
 import { Link } from "@ilha/void";
 
 import { api } from "../api";
@@ -313,7 +314,6 @@ const BreakdownSection = ({
 };
 
 const MetricsDetailCards = ({
-  breakdown,
   cpus,
   errs,
   hours,
@@ -323,7 +323,6 @@ const MetricsDetailCards = ({
   p95s,
   reqs,
 }: {
-  breakdown: MetricsFrame["breakdown"];
   cpus: number[];
   errs: number[];
   hours: number;
@@ -374,7 +373,91 @@ const MetricsDetailCards = ({
           </section>
         ))}
       </div>
-      <h3 class="m-0 text-lg font-semibold">Analytics</h3>
+    </>
+  );
+};
+
+/** The Analytics tab's cards: the same window's breakdown by browser, OS,
+ * path and referrer. Own component (not part of `MetricsCard detail`) so the
+ * tenant Analytics tab and the control page mount it alone; the feed and its
+ * snapshot are shared with `MetricsCard`, so mounting both opens no second
+ * stream. No section heading — the tab owns its label, like Metrics. */
+export const AnalyticsCard = ({
+  appId,
+  environmentId = "",
+  hours = DEFAULT_METRICS_HOURS,
+}: {
+  appId: string;
+  environmentId?: string;
+  hours?: number;
+}) => {
+  const feed = liveFeed(
+    feedKeys.metrics(appId, hours, environmentId),
+    metricsUrl(appId, hours, environmentId),
+    decodeMetrics,
+    {
+      initial: async () => {
+        const frame = await api<string | null>("/api/metrics/metricsFrame", {
+          appId,
+          environmentId,
+          hours,
+        });
+
+        if (frame === null) {
+          throw new Error("metrics frame unavailable");
+        }
+
+        return decodeMetrics(frame);
+      },
+    }
+  );
+
+  const breakdown: MetricsFrame["breakdown"] = feedValue(feed.state())
+    ?.breakdown ?? {
+    browsers: [],
+    os: [],
+    paths: [],
+    referrers: [],
+  };
+
+  const hasRows = (feedValue(feed.state())?.metrics ?? []).length > 0;
+
+  const loadError = (): string =>
+    feedRetrying(feed.state())
+      ? "Usage stream disconnected — retrying…"
+      : (feedProblem(feed.state()) ?? "");
+
+  // A reconnect keeps the last frame: the retry line paints above the
+  // retained tables (like the Metrics detail view), and only a panel with
+  // no frame at all fails or skeletons.
+  if (!hasRows) {
+    if (loadError()) {
+      return <p class="text-error m-0 text-sm">{loadError()}</p>;
+    }
+
+    if (!feedLoaded(feed.state())) {
+      return (
+        <div
+          role="status"
+          aria-label="Loading analytics"
+          class="flex flex-col gap-2"
+        >
+          <div class="skeleton h-4 w-64" />
+          <div class="skeleton h-16 w-full" />
+        </div>
+      );
+    }
+
+    return (
+      <p class="m-0 text-sm opacity-70">
+        No traffic recorded yet — hit the app URL to see the breakdown.
+      </p>
+    );
+  }
+
+  return (
+    <>
+      {loadError() ? <p class="text-error m-0 text-sm">{loadError()}</p> : null}
       <div class="grid grid-cols-1 gap-4 md:grid-cols-2">
         <BreakdownSection
           empty="No browser data in this window."
@@ -406,7 +489,6 @@ const MetricsDetailCards = ({
 };
 
 const MetricsDetailView = ({
-  breakdown,
   cpus,
   errs,
   hasRows,
@@ -419,7 +501,6 @@ const MetricsDetailView = ({
   p95s,
   reqs,
 }: {
-  breakdown: MetricsFrame["breakdown"];
   cpus: number[];
   errs: number[];
   hasRows: boolean;
@@ -455,7 +536,6 @@ const MetricsDetailView = ({
     ) : null}
     {loaded && hasRows && !loadError ? (
       <MetricsDetailCards
-        breakdown={breakdown}
         cpus={cpus}
         errs={errs}
         hours={hours}
@@ -559,14 +639,6 @@ export const MetricsCard = ({
   // so a revisit paints the last numbers in the very first render.
   const frame: MetricsFrame["metrics"] = feedValue(feed.state())?.metrics ?? [];
 
-  const breakdown: MetricsFrame["breakdown"] = feedValue(feed.state())
-    ?.breakdown ?? {
-    browsers: [],
-    os: [],
-    paths: [],
-    referrers: [],
-  };
-
   const loaded = (): boolean => feedLoaded(feed.state());
 
   const loadError = (): string =>
@@ -593,7 +665,6 @@ export const MetricsCard = ({
     <>
       {detail ? (
         <MetricsDetailView
-          breakdown={breakdown}
           cpus={cpus}
           errs={errs}
           hasRows={frame.length > 0}
@@ -663,113 +734,5 @@ export const MetricsCard = ({
         </section>
       )}
     </>
-  );
-};
-
-/** The Analytics breakdown alone (browsers, OSes, paths, referrers) over the
- * window: the same feed and frame `MetricsCard` reads, so the two share one
- * snapshot, but none of the charts. The tenant page mounts it on its
- * standalone Analytics tab and the control page on the control Analytics tab;
- * per-card titles stay (they name the tables), but there is no section
- * heading — the tab bar already names it. */
-export const AnalyticsCard = ({
-  appId,
-  environmentId = "",
-  hours = DEFAULT_METRICS_HOURS,
-}: {
-  appId: string;
-  environmentId?: string;
-  hours?: number;
-}) => {
-  const feed = liveFeed(
-    feedKeys.metrics(appId, hours, environmentId),
-    metricsUrl(appId, hours, environmentId),
-    decodeMetrics,
-    {
-      initial: async () => {
-        const frame = await api<string | null>("/api/metrics/metricsFrame", {
-          appId,
-          environmentId,
-          hours,
-        });
-
-        if (frame === null) {
-          throw new Error("metrics frame unavailable");
-        }
-
-        return decodeMetrics(frame);
-      },
-    }
-  );
-
-  const frame: MetricsFrame["metrics"] = feedValue(feed.state())?.metrics ?? [];
-
-  const breakdown: MetricsFrame["breakdown"] = feedValue(feed.state())
-    ?.breakdown ?? {
-    browsers: [],
-    os: [],
-    paths: [],
-    referrers: [],
-  };
-
-  const loaded = (): boolean => feedLoaded(feed.state());
-
-  const loadError = (): string =>
-    feedRetrying(feed.state())
-      ? "Usage stream disconnected — retrying…"
-      : (feedProblem(feed.state()) ?? "");
-
-  if (loadError() !== "") {
-    return <p class="text-error m-0 text-sm">{loadError()}</p>;
-  }
-
-  if (!loaded()) {
-    return (
-      <div
-        role="status"
-        aria-label="Loading analytics"
-        class="flex flex-col gap-2"
-      >
-        <div class="skeleton h-4 w-64" />
-        <div class="skeleton h-16 w-full" />
-      </div>
-    );
-  }
-
-  if (frame.length === 0) {
-    return (
-      <p class="m-0 text-sm opacity-70">
-        No traffic recorded yet — hit the app URL to see the breakdown.
-      </p>
-    );
-  }
-
-  return (
-    <div class="grid grid-cols-1 gap-4 md:grid-cols-2">
-      <BreakdownSection
-        empty="No browser data in this window."
-        entries={breakdown.browsers}
-        head="Browser"
-        title="Browsers"
-      />
-      <BreakdownSection
-        empty="No OS data in this window."
-        entries={breakdown.os}
-        head="OS"
-        title="Operating systems"
-      />
-      <BreakdownSection
-        empty="No paths in this window."
-        entries={breakdown.paths}
-        head="Path"
-        title="Paths"
-      />
-      <BreakdownSection
-        empty="No referrer data in this window."
-        entries={breakdown.referrers}
-        head="Source"
-        title="Referrers"
-      />
-    </div>
   );
 };
