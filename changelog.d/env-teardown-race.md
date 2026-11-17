@@ -1,3 +1,0 @@
-### Fixed
-
-- **Deleting a branch can no longer resurrect its preview fleet onto ports handed to another tenant.** Teardown stopped the environment's fleet first and deleted its row last, and a reconcile tick landing between the two respawned the fleet — after the row delete the allocator gave the same port pair to another environment, whose deploy then died at its health gate on the bind conflict (and whose reload answered from the leaked fleet). Teardown now marks the environment before its first stop, and every fleet start — reconcile, wake, deploy, restart — refuses a marked fleet; the same mark covers app delete and purge. The row delete still frees the ports, but only after the process holding them is dead and forgotten.

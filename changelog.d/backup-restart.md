@@ -1,5 +1,0 @@
-### Fixed
-
-- `make backup` always brings the stack back. The restart now runs in an `EXIT` trap instead of inline, so a mid-backup abort after the stop (a tar error, a full disk, a daemon hiccup) still restarts the edge instead of leaving both containers `Exited (0)` until a manual `up -d`. A restart that reports failure is verified against the running containers before it counts (the old `|| echo note` leniency for a wedged `up -d`), and a genuinely failed restart exits nonzero without printing "backup complete" over a dead edge. Before, either failure mode ended silent and down.
-- The backup restart converges the same compose files the Makefile drives: on a multi install the restart keeps the `compose.multi.yaml` overlay instead of recreating the edge from the base file alone. A direct `sh docker/backup.sh` run computes the overlay with the same single/multi rule; under `make` the Makefile's file set is reused as is. The caller's `NOITE_TENANCY`/`BASE_DOMAIN` now win over `.env` for the snapshot Host header and the overlay, mirroring `PROJECT`.
-- `make backup` with a spaced `DEST` no longer word-splits the destination.
