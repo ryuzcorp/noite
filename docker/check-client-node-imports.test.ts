@@ -98,6 +98,20 @@ describe("parseStaticImports", () => {
 
     expect(parseStaticImports(source)).toEqual([]);
   });
+
+  test("a generic arrow parses under the ts loader", () => {
+    // `tsx` reads `<T>` as JSX and throws on the `.ts` files that use it,
+    // so the graph passes each file's own extension.
+    const source = [
+      "const tracked = <T>(key: string): string => key;",
+      'import { x } from "node:fs";',
+      "",
+    ].join("\n");
+
+    expect(parseStaticImports(source, "ts")).toEqual([
+      { line: 2, specifier: "node:fs" },
+    ]);
+  });
 });
 
 describe("isNodeSpecifier", () => {
@@ -240,6 +254,17 @@ describe("checkClientGraph", () => {
 
     expect(violations).toHaveLength(1);
     expect(violations[0]?.specifier).toBe("crypto");
+  });
+
+  test("an unparseable module fails closed naming the file", () => {
+    const sources = new Map([
+      ["apps/noite/src/pages/index.tsx", 'import { x } from "$lib/broken";\n'],
+      ["apps/noite/src/lib/broken.ts", "const x = {{{;\n"],
+    ]);
+
+    expect(() =>
+      checkClientGraph(["apps/noite/src/pages/index.tsx"], sources)
+    ).toThrow(/apps\/noite\/src\/lib\/broken\.ts/u);
   });
 });
 

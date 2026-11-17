@@ -97,7 +97,8 @@ const lineOf = (source: string, index: number): number => {
   return line;
 };
 
-const transpiler = new Bun.Transpiler({ loader: "tsx" });
+const tsTranspiler = new Bun.Transpiler({ loader: "ts" });
+const tsxTranspiler = new Bun.Transpiler({ loader: "tsx" });
 
 /**
  * Line of the next quoted occurrence of `specifier` at or after `from`
@@ -130,13 +131,21 @@ const specifierLine = (source: string, specifier: string, from: number) => {
  * (`Transpiler.scanImports`) instead of a regex. A quote inside a comment
  * in the import's middle defeated the old middle-matcher (the edge vanished
  * entirely), and import text inside a template string faked an edge the
- * stripTs check could not always see. The parser handles comments, strings
- * and type-only edges (`import type`, `export type`, `export { type … }`
+ * stripTs check let through. The parser handles comments, strings and
+ * type-only edges (`import type`, `export type`, `export { type … }`
  * are erased before the bundle and dropped here); only `import-statement`
  * edges count, so dynamic `import()` stays out of scope (lazy boundary,
  * and the incident shape is a static edge).
+ *
+ * `loader` must match the file: `tsx` parses a generic arrow's `<T>` as
+ * JSX and throws on the `.ts` files that use them, so the graph passes the
+ * file's own extension (`ts` is the default for extension-less snippets).
  */
-export const parseStaticImports = (source: string): ClientImport[] => {
+export const parseStaticImports = (
+  source: string,
+  loader: "ts" | "tsx" = "ts"
+): ClientImport[] => {
+  const transpiler = loader === "tsx" ? tsxTranspiler : tsTranspiler;
   const offsets = new Map<string, number>();
   const imports: ClientImport[] = [];
 
@@ -146,6 +155,7 @@ export const parseStaticImports = (source: string): ClientImport[] => {
     }
 
     const found = specifierLine(source, edge.path, offsets.get(edge.path) ?? 0);
+
     offsets.set(edge.path, found.end);
     imports.push({ line: found.line, specifier: edge.path });
   }
@@ -230,7 +240,20 @@ export const checkClientGraph = (
       continue;
     }
 
-    for (const edge of parseStaticImports(source)) {
+    let edges: ClientImport[];
+
+    try {
+      edges = parseStaticImports(
+        source,
+        current.file.endsWith(".tsx") ? "tsx" : "ts"
+      );
+    } catch {
+      throw new Error(
+        `check-client-node-imports: cannot parse ${current.file} — Bun.Transpiler rejects syntax the bundler accepts; extend the loader selection above`
+      );
+    }
+
+    for (const edge of edges) {
       if (isNodeSpecifier(edge.specifier)) {
         violations.push({
           chain: [...current.chain, current.file],
