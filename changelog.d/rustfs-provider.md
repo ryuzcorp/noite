@@ -1,0 +1,3 @@
+### Fixed
+
+- **A BYO RustFS store on any endpoint now gets scoped tenant keys.** `NOITE_CREDENTIAL_PROVIDER=auto` used to pick the RustFS policy only when the endpoint was literally `http://rustfs:9000`; any other RustFS host got the MinIO policy, whose fleet-key mint RustFS 1.0.x rejects (`s3:CompleteMultipartUpload`), so every tenant deploy failed. `auto` now identifies RustFS by the evidence it gives (`GET /minio/health/live` answers `{"service":"rustfs-endpoint",…}`) instead of the hostname, and there is an explicit `NOITE_CREDENTIAL_PROVIDER=rustfs` value for any RustFS endpoint. Unidentified stores keep the previous behaviour (MinIO admin probe, else root keys) with a boot warning naming the explicit setting.

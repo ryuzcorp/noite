@@ -1,6 +1,6 @@
 //! Prefix-scoped keys through the MinIO admin API (MinIO and RustFS).
 //!
-//! Verified against the real `rustfs:1.0.3` image (and 1.0.0): it answers
+//! Verified against the real `rustfs:1.0.5` image (and 1.0.0/1.0.3): it answers
 //! the MinIO admin paths with SigV4 `s3`-service signatures, encrypts and
 //! decrypts admin payloads with the madmin scheme (argon2id KDF + sio-DARE
 //! stream framing), and enforces the attached policy on S3 calls. Adding a
@@ -46,7 +46,12 @@ impl MinioAdmin {
         }
     }
 
-    /// Any other MinIO-family store (MinIO itself, another RustFS).
+    /// Any other MinIO-family store: MinIO itself, or a store `auto` could
+    /// not confirm is RustFS (explicit `rustfs`, or a positive health
+    /// identification, takes the RustFS label instead). Keeps
+    /// `s3:CompleteMultipartUpload` in the policy, which RustFS 1.0.x
+    /// rejects — a store that is really RustFS fails loudly at mint time
+    /// rather than running tenants on the wrong policy.
     pub fn minio(store: StoreAccess, bucket: &str) -> Self {
         Self {
             tag: super::install_tag(&store.identity_endpoint, bucket, &store.region),
@@ -90,15 +95,18 @@ impl MinioAdmin {
         anyhow::anyhow!("{op}: HTTP {status} {}", String::from_utf8_lossy(body))
     }
 
-    /// One signed admin call. `query` is the raw (unsorted) query string;
-    /// the signer sorts it. Returns the raw body on 200.
-    async fn call(
+    /// One signed admin call, returning the raw response: the caller decides
+    /// how much body to read. [`call`] buffers it whole (mint, revoke and
+    /// listing need every byte); [`probe`] caps what it reads (it only needs
+    /// the status) so a hostile store cannot make detection buffer forever.
+    /// `query` is the raw (unsorted) query string; the signer sorts it.
+    async fn send(
         &self,
         method: &str,
         path: &str,
         query: &str,
         body: &[u8],
-    ) -> anyhow::Result<(u16, Vec<u8>)> {
+    ) -> anyhow::Result<reqwest::Response> {
         let payload_hash = super::hex_encode(Sha256::digest(body).as_slice());
         let (amz_date, date_stamp) = sigv4_now();
         let host = self.host();
@@ -122,7 +130,7 @@ impl MinioAdmin {
         } else {
             format!("{url}?{query}")
         };
-        let resp = self
+        Ok(self
             .client
             .request(method.parse()?, &url)
             .header("x-amz-date", amz_date)
@@ -130,43 +138,65 @@ impl MinioAdmin {
             .header("authorization", auth)
             .body(body.to_vec())
             .send()
-            .await?;
+            .await?)
+    }
+
+    /// One signed admin call. `query` is the raw (unsorted) query string;
+    /// the signer sorts it. Returns the raw body on 200.
+    async fn call(
+        &self,
+        method: &str,
+        path: &str,
+        query: &str,
+        body: &[u8],
+    ) -> anyhow::Result<(u16, Vec<u8>)> {
+        let resp = self.send(method, path, query, body).await?;
         let status = resp.status().as_u16();
         let bytes = resp.bytes().await?.to_vec();
         Ok((status, bytes))
     }
 
     /// Does this store speak the MinIO admin API with these keys? `Ok(())`
-    /// on any answer the API itself gives (200 with an encrypted body).
-    /// A 401/403 is the API answering that the keys are wrong: that fails
-    /// the boot with a credential error rather than silently downgrading
-    /// every fleet to root keys. Anything else (404, 501, transport) means
-    /// no admin API here: `Ok(Err(..))`, and the caller runs root.
+    /// on any answer the API itself gives (200 — the body is discarded
+    /// unread, so a hostile store cannot make the probe buffer forever).
+    /// A 401/403 is the API answering that the keys are wrong (its body is
+    /// read bounded, for the message alone): that fails the boot with a
+    /// credential error rather than silently downgrading every fleet to root
+    /// keys. Anything else (404, 501, transport) means no admin API here:
+    /// `Ok(Err(..))`, and the caller runs root.
     pub async fn probe(&self) -> anyhow::Result<Result<(), String>> {
         // `info` is the current name; older MinIO answers `server-info`.
         for path in ["/minio/admin/v3/info", "/minio/admin/v3/server-info"] {
-            match self.call("GET", path, "", b"").await {
-                Ok((200, _)) => return Ok(Ok(())),
-                Ok((status, body)) if status == 401 || status == 403 => {
-                    return Err(anyhow::anyhow!(
-                        "store refused the admin credentials (HTTP {status} {}): check the S3 keys",
-                        String::from_utf8_lossy(&body)
-                    ));
-                }
-                // Anything else (404, 501): try the next path. A transport
-                // failure (timeout, refused) is not a definitive "no admin
-                // API": fail the probe so `auto` retries or fails the boot
-                // instead of silently minting root keys for every fleet.
-                Ok(_) => continue,
+            let resp = match self.send("GET", path, "", b"").await {
+                Ok(resp) => resp,
+                // A transport failure (timeout, refused) is not a definitive
+                // "no admin API": fail the probe so `auto` retries or fails
+                // the boot instead of silently minting root keys for every
+                // fleet.
                 Err(e) => return Err(e.context(format!("probe {path} failed"))),
+            };
+            let status = resp.status().as_u16();
+            if status == 200 {
+                return Ok(Ok(()));
             }
+            if status == 401 || status == 403 {
+                let body = super::bounded_body(resp, super::BODY_READ_CAP)
+                    .await
+                    .unwrap_or_default();
+                return Err(anyhow::anyhow!(
+                    "store refused the admin credentials (HTTP {status} {}): check the S3 keys",
+                    String::from_utf8_lossy(&body)
+                ));
+            }
+            // Anything else (404, 501): try the next path.
+            continue;
         }
         Ok(Err("no MinIO admin API".into()))
     }
     /// The policy this provider attaches: the shared prefix policy, except
     /// on RustFS, whose 1.0.x policy engine rejects the
     /// `s3:CompleteMultipartUpload` name at create time (verified against
-    /// 1.0.0 and 1.0.3). RustFS maps completion onto `s3:PutObject` instead,
+    /// 1.0.5, and 1.0.0/1.0.3). RustFS maps completion onto `s3:PutObject` instead,
     /// so its keys complete multipart uploads without the action; MinIO and
     /// AWS get the full policy.
     fn policy(&self, bucket: &str, prefix: &str) -> String {

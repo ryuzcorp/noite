@@ -178,11 +178,18 @@ pub fn prefix_policy(bucket: &str, prefix: &str) -> String {
 /// `NOITE_CREDENTIAL_PROVIDER`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ProviderSetting {
-    /// The bundled RustFS is scoped; any other store is probed at boot for
-    /// the MinIO admin API (MinIO, RustFS); AWS and R2 stay on root keys.
+    /// The bundled RustFS is scoped; any other store is identified at boot —
+    /// RustFS by its health endpoint, anything else by the MinIO admin probe
+    /// ([`detect`]) — and AWS and R2 stay on root keys.
     Auto,
     Root,
     Minio,
+    /// A RustFS at any endpoint: the RustFS policy (the MinIO policy minus
+    /// `s3:CompleteMultipartUpload`, which RustFS 1.0.x rejects at create
+    /// time). Prefer it over `minio` for RustFS: the `minio` label mints the
+    /// full policy the store refuses, so every tenant scope fails at its
+    /// first spawn or deploy.
+    Rustfs,
     Aws,
 }
 
@@ -193,10 +200,11 @@ impl ProviderSetting {
             None | Some("auto") => Self::Auto,
             Some("root") => Self::Root,
             Some("minio") => Self::Minio,
+            Some("rustfs") => Self::Rustfs,
             Some("aws") => Self::Aws,
             Some(other) => {
                 problems.push(format!(
-                    "NOITE_CREDENTIAL_PROVIDER must be auto, minio, aws or root, got {other:?}"
+                    "NOITE_CREDENTIAL_PROVIDER must be auto, minio, rustfs, aws or root, got {other:?}"
                 ));
                 Self::Auto
             }
@@ -272,6 +280,9 @@ impl Credentials {
             ProviderSetting::Minio => {
                 Self::Scoped(Arc::new(MinioAdmin::minio(store.clone(), bucket)))
             }
+            ProviderSetting::Rustfs => {
+                Self::Scoped(Arc::new(MinioAdmin::rustfs(store.clone(), bucket)))
+            }
             ProviderSetting::Aws => Self::Scoped(Arc::new(AwsIam::new(store.clone(), bucket))),
             ProviderSetting::Auto if store.endpoint.trim_end_matches('/') == BUNDLED_ENDPOINT => {
                 Self::Scoped(Arc::new(MinioAdmin::rustfs(store.clone(), bucket)))
@@ -308,12 +319,38 @@ impl Credentials {
     }
 }
 
-/// `auto` against an unknown store: does it speak the MinIO admin API with
-/// these keys? Yes → scoped through it; a definite no → root with the
-/// reason. Keys the store refuses fail the boot instead of silently
-/// downgrading every fleet to root, because the answer decides what every
-/// fleet holds.
+/// `auto` against an unknown store: a RustFS at any endpoint gets the
+/// RustFS policy, identified by the evidence it gives rather than its
+/// hostname (the literal-`rustfs:9000` shortcut in [`Credentials::configure`]
+/// only skips this hop for the bundled store, which is known without I/O).
+/// Anything else falls through to the MinIO admin probe: the store speaks
+/// it → scoped with the MinIO policy; a definite no → root with the reason.
+/// Keys the store refuses fail the boot instead of silently downgrading
+/// every fleet to root, because the answer decides what every fleet holds.
+///
+/// Fail-safe in both directions: an inconclusive identification keeps the
+/// previous behaviour (the admin probe) with a warning naming the explicit
+/// `rustfs` setting, and a store that merely *claims* RustFS can only narrow
+/// tenant keys — the RustFS policy is the MinIO policy minus
+/// `s3:CompleteMultipartUpload` ([`prefix_policy`]), so the spoofed policy
+/// grants strictly less, never more.
 pub async fn detect(store: &StoreAccess, bucket: &str) -> anyhow::Result<Credentials> {
+    if identify_rustfs(store).await {
+        tracing::info!(
+            endpoint = %store.endpoint,
+            "store identifies as RustFS; scoping tenant keys with the RustFS policy"
+        );
+        return Ok(Credentials::Scoped(Arc::new(MinioAdmin::rustfs(
+            store.clone(),
+            bucket,
+        ))));
+    }
+    tracing::warn!(
+        endpoint = %store.endpoint,
+        "could not confirm the store is RustFS; probing the MinIO admin API — \
+         if this store is RustFS, set NOITE_CREDENTIAL_PROVIDER=rustfs so tenant \
+         keys mint with the RustFS policy"
+    );
     let admin = MinioAdmin::minio(store.clone(), bucket);
     match admin.probe().await? {
         Ok(()) => Ok(Credentials::Scoped(Arc::new(admin))),
@@ -321,6 +358,77 @@ pub async fn detect(store: &StoreAccess, bucket: &str) -> anyhow::Result<Credent
             reason: format!("{} answers no MinIO admin API ({why})", store.endpoint),
         }),
     }
+}
+
+/// Cap for response bodies the runner reads only for identification or
+/// diagnostics (never for data it needs whole): the health body is a few
+/// hundred bytes. Anything past the cap is not evidence, and the read must
+/// not stream forever on a hostile or broken endpoint — only the request
+/// timeout would stop it.
+pub(crate) const BODY_READ_CAP: usize = 64 * 1024;
+
+/// The health path every MinIO-family store answers without credentials;
+/// RustFS names itself in the JSON body (`{"service":"rustfs-endpoint",…}`,
+/// recorded from the pinned image), MinIO answers `{}`.
+const RUSTFS_HEALTH_PATH: &str = "/minio/health/live";
+
+/// Whether a health-endpoint body identifies a RustFS: the `service` field
+/// names it. Pure so tests pin the shape without a server.
+pub(crate) fn is_rustfs_health_body(body: &[u8]) -> bool {
+    serde_json::from_slice::<serde_json::Value>(body)
+        .ok()
+        .and_then(|v| v.get("service")?.as_str().map(str::to_string))
+        .is_some_and(|service| service.to_ascii_lowercase().contains("rustfs"))
+}
+
+/// Read at most `cap` body bytes. Rejects up front when `content-length`
+/// exceeds the cap, then stops a chunked stream once the accumulated bytes
+/// pass it — a post-read length check would not bound chunked streaming.
+pub(crate) async fn bounded_body(
+    mut resp: reqwest::Response,
+    cap: usize,
+) -> anyhow::Result<Vec<u8>> {
+    if let Some(len) = resp.content_length() {
+        if len > cap as u64 {
+            anyhow::bail!("response body declares {len} bytes (cap {cap})");
+        }
+    }
+    let mut out = Vec::new();
+    while let Some(chunk) = resp.chunk().await? {
+        out.extend_from_slice(&chunk);
+        if out.len() > cap {
+            anyhow::bail!("response body exceeds {cap} bytes");
+        }
+    }
+    Ok(out)
+}
+
+/// Identify a RustFS at any endpoint by the evidence it gives: the
+/// unauthenticated health endpoint names the server in its body. Bounded
+/// (five seconds and [`BODY_READ_CAP`] bytes — detection runs once at boot
+/// and must neither stall it nor buffer a hostile stream), deterministic,
+/// and `false` on anything unexpected — a transport failure, a non-2xx
+/// status, an over-cap or unreadable body, an unmarked body — so
+/// identification fails safe into the MinIO admin probe.
+async fn identify_rustfs(store: &StoreAccess) -> bool {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new());
+    let url = format!(
+        "{}{RUSTFS_HEALTH_PATH}",
+        store.endpoint.trim_end_matches('/')
+    );
+    let Ok(resp) = client.get(&url).send().await else {
+        return false;
+    };
+    if !resp.status().is_success() {
+        return false;
+    }
+    let Ok(body) = bounded_body(resp, BODY_READ_CAP).await else {
+        return false;
+    };
+    is_rustfs_health_body(&body)
 }
 
 /// One tenant scope: what a key is minted for.
