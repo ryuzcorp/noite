@@ -60,7 +60,22 @@ pub async fn teardown(
     env: EnvTarget<'_>,
     strict_credentials: bool,
 ) -> anyhow::Result<()> {
+    // The generation check every spawn path honors: from here no deploy,
+    // wake, reconcile tick or restart may (re)start this fleet, so the row
+    // delete at the end hands the allocator a port pair no live process
+    // holds. Marked under the same proc-map lock the claim takes (see
+    // `supervisor::ProcState`), before the first stop — the stop removes the
+    // supervisor entry, and without the mark a tick landing between the stop
+    // and the row delete would respawn onto ports about to be reused.
+    supervisor::mark_env_teardown(procs, env.id).await;
     supervisor::stop_environment_fleet(procs, env.app_slug, env.label).await;
+    // A spawn that claimed before the mark can have its child outside the map
+    // when the stop above ran, and the stop cannot kill what is not there
+    // yet. Wait for every such claim to finish — adopted then stopped above,
+    // or refused at adoption and killed and reaped — before anything below
+    // frees the ports. Event-driven on the claim completion, not a settle
+    // sleep.
+    supervisor::wait_for_inflight_spawns(&supervisor::env_fleet_key(env.app_slug, env.label)).await;
     // Brief settle, same as purge: don't clear a dying node's prefix.
     tokio::time::sleep(Duration::from_millis(500)).await;
     crate::host::logs::clear(
@@ -684,6 +699,298 @@ mod tests {
         )
         .await
         .expect("env")
+    }
+
+    /// A state with a fake celld and root credentials for the teardown-race
+    /// tests: the spawn path mints credentials and forks the binary, so the
+    /// harness points it at an executable that stays alive and skips the
+    /// store's IAM (same reason as the sleep wake tests). The label is unique
+    /// per test: the barrier gates are process-global and keyed by fleet key.
+    async fn race_harness(
+        dir: &std::path::Path,
+        label: &str,
+        listen: i64,
+    ) -> (crate::AppState, Config, App, Environment) {
+        let (state, app) = ref_teardown_state(dir, &crate::testutil::spawn_s3_stub().await).await;
+        let fake = dir.join("celld");
+        std::fs::write(&fake, "#!/bin/sh\nsleep 60\n").expect("write fake celld");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        }
+        let mut cfg = (*state.config).clone();
+        cfg.celld_bin = fake.to_string_lossy().into_owned();
+        cfg.credentials = crate::host::credentials::Credentials::Root {
+            reason: "test".into(),
+        };
+        let git_ref = format!("refs/heads/{label}");
+        let env = ref_teardown_env(&state, &app, label, &git_ref, listen).await;
+        (state, cfg, app, env)
+    }
+
+    /// The merge-queue flake: teardown stops the fleet first and deletes the
+    /// row last, and a reconcile tick landing between the two respawned the
+    /// fleet (`started celld` 93 ms after the stop) onto ports the row delete
+    /// then handed to another tenant's fleet — whose deploy died at its
+    /// health gate on the bind conflict after its reload answered from the
+    /// leaked fleet. Teardown marks the environment before its first stop
+    /// now, and every spawn path refuses a marked fleet, so the row delete
+    /// frees a port pair no live process holds. Deterministic: the racing
+    /// start runs exactly where the tick's `ensure_environment_fleet` ran —
+    /// after the stop, before the row delete, while the row still reads as
+    /// wanted.
+    #[tokio::test]
+    async fn teardown_refuses_a_fleet_start_that_races_it() {
+        let dir = std::env::temp_dir().join(format!("noite-env-race-{}", new_id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        // A stand-in celld: the spawn path only needs an executable that
+        // stays alive (the sleep wake tests use the same stand-in).
+        let fake = dir.join("celld");
+        std::fs::write(&fake, "#!/bin/sh\nsleep 60\n").expect("write fake celld");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        }
+        let (state, app) = ref_teardown_state(&dir, &crate::testutil::spawn_s3_stub().await).await;
+        let mut cfg = (*state.config).clone();
+        cfg.celld_bin = fake.to_string_lossy().into_owned();
+        // Root keys: the spawn mints credentials, and this test is about the
+        // spawn race, not the store's IAM (same reason as the wake tests).
+        cfg.credentials = crate::host::credentials::Credentials::Root {
+            reason: "test".into(),
+        };
+        let env = ref_teardown_env(&state, &app, "gone", "refs/heads/gone", 30110).await;
+        let fleet = supervisor::env_fleet_key(&env.app_slug, &env.label);
+
+        // The fleet is up before the ref disappears.
+        supervisor::ensure_environment_fleet(&state.pool, &cfg, &state.procs, &state.logs, &env)
+            .await
+            .expect("fleet starts");
+        assert!(supervisor::has_process(&state.procs, &fleet).await);
+
+        // Teardown's first two steps: mark, then stop. The row still reads as
+        // wanted here — exactly what the tick's `env_still_wanted` saw.
+        supervisor::mark_env_teardown(&state.procs, &env.id).await;
+        supervisor::stop_environment_fleet(&state.procs, &env.app_slug, &env.label).await;
+        assert!(
+            db::get_environment(&state.pool, &env.id)
+                .await
+                .unwrap()
+                .is_some(),
+            "the row outlives the stop; the race window is open"
+        );
+
+        // The competing start (the tick's `ensure_environment_fleet`): it
+        // must refuse instead of respawning onto ports about to be reused.
+        let raced = supervisor::ensure_environment_fleet(
+            &state.pool,
+            &cfg,
+            &state.procs,
+            &state.logs,
+            &env,
+        )
+        .await;
+        assert!(
+            raced.is_err(),
+            "a start racing teardown must refuse (it respawned the fleet instead)"
+        );
+        assert!(
+            supervisor::live_keys(&state.procs).await.is_empty(),
+            "nothing was spawned for the race"
+        );
+
+        // Teardown runs to completion: the row (and with it the port pair)
+        // goes, with no live fleet left behind to squat on it.
+        teardown(
+            &cfg,
+            &state.pool,
+            &state.procs,
+            &state.logs,
+            (&env).into(),
+            false,
+        )
+        .await
+        .expect("teardown completes");
+        assert!(
+            db::get_environment(&state.pool, &env.id)
+                .await
+                .unwrap()
+                .is_none(),
+            "the row is gone"
+        );
+        assert!(
+            !supervisor::has_process(&state.procs, &fleet).await,
+            "teardown leaves no live fleet behind"
+        );
+
+        // The freed pair is claimable again — with no live holder, so the
+        // next environment binds it cleanly.
+        let claim = crate::db::alloc::claim_ports_in(&state.pool, 30110, 30111)
+            .await
+            .expect("the torn-down pair returns to the allocator");
+        assert_eq!((claim.listen, claim.internal), (30110, 30111));
+        state.pool.clone().close().await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// CodeRabbit round 1, hole 1: the early tombstone check in
+    /// `ensure_environment_fleet` runs before awaits (DB reads, dir setup),
+    /// and without the atomic re-check at claim time a start that passed it
+    /// before the mark could still claim after teardown's stop. The competing
+    /// start parks at the exact await point (past the early check, before the
+    /// claim) instead of timing a window; the mark and stop land while it
+    /// waits, and it must refuse instead of spawning.
+    #[tokio::test]
+    async fn teardown_refuses_a_start_that_passed_the_check_before_the_mark() {
+        let dir = std::env::temp_dir().join(format!("noite-env-claim-{}", new_id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let (state, cfg, _app, env) = race_harness(&dir, "race-claim", 30210).await;
+        let fleet = supervisor::env_fleet_key(&env.app_slug, &env.label);
+        supervisor::ensure_environment_fleet(&state.pool, &cfg, &state.procs, &state.logs, &env)
+            .await
+            .expect("fleet starts");
+
+        // Park the competing start past its early check but before its claim.
+        let gate = supervisor::test_gate_register(&fleet);
+        let competing = {
+            let (pool, cfg, procs, logs, env) = (
+                state.pool.clone(),
+                cfg.clone(),
+                state.procs.clone(),
+                state.logs.clone(),
+                env.clone(),
+            );
+            tokio::spawn(async move {
+                supervisor::ensure_environment_fleet(&pool, &cfg, &procs, &logs, &env).await
+            })
+        };
+        gate.pre_claim_arrived.notified().await;
+        // Teardown's first two steps land while the start waits.
+        supervisor::mark_env_teardown(&state.procs, &env.id).await;
+        supervisor::stop_environment_fleet(&state.procs, &env.app_slug, &env.label).await;
+        gate.pre_claim_release.notify_one();
+        // Pre-release the adoption barrier too: without the atomic re-check
+        // the start below claims and spawns (proving the respawn), and must
+        // not park at adoption instead. With the fix the start never gets
+        // there, so the permit is harmless.
+        gate.pre_adopt_release.notify_one();
+        let raced = tokio::time::timeout(Duration::from_secs(10), competing)
+            .await
+            .expect("spawn task joins")
+            .expect("spawn task");
+        assert!(
+            raced.is_err(),
+            "a start that passed the early check before the mark must still refuse at claim time"
+        );
+        assert!(
+            supervisor::live_keys(&state.procs).await.is_empty(),
+            "nothing was spawned for the race"
+        );
+        supervisor::test_gate_remove(&fleet);
+        state.pool.clone().close().await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// CodeRabbit round 1, hole 2: a spawn that claimed before the mark can
+    /// have its child outside the ProcMap when the stop runs, and the stop
+    /// cannot kill what is not there yet. Teardown must wait for the
+    /// in-flight spawn to finish — refused at adoption and killed and reaped
+    /// — before deleting the row that frees the ports. The spawn parks with
+    /// its child alive but unadopted; teardown must block in its wait (never
+    /// reach the row delete) until the test releases it.
+    #[tokio::test]
+    async fn teardown_waits_for_an_in_flight_spawn_before_freeing_ports() {
+        let dir = std::env::temp_dir().join(format!("noite-env-adopt-{}", new_id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let (state, cfg, _app, env) = race_harness(&dir, "race-adopt", 30220).await;
+        let fleet = supervisor::env_fleet_key(&env.app_slug, &env.label);
+
+        // The in-flight spawn: past the early check, claimed, child alive but
+        // not yet adopted.
+        let gate = supervisor::test_gate_register(&fleet);
+        let spawning = {
+            let (pool, cfg, procs, logs, env) = (
+                state.pool.clone(),
+                cfg.clone(),
+                state.procs.clone(),
+                state.logs.clone(),
+                env.clone(),
+            );
+            tokio::spawn(async move {
+                supervisor::ensure_environment_fleet(&pool, &cfg, &procs, &logs, &env).await
+            })
+        };
+        gate.pre_claim_arrived.notified().await;
+        gate.pre_claim_release.notify_one();
+        gate.pre_adopt_arrived.notified().await;
+        // Teardown's mark and stop land while the child is outside the map:
+        // the entry is gone, the child survives.
+        supervisor::mark_env_teardown(&state.procs, &env.id).await;
+        supervisor::stop_environment_fleet(&state.procs, &env.app_slug, &env.label).await;
+
+        // Full teardown in its own task: it must block in the in-flight wait
+        // and never reach the row delete while the spawn is parked.
+        let mut wiping = {
+            let (cfg, pool, procs, logs, env) = (
+                cfg.clone(),
+                state.pool.clone(),
+                state.procs.clone(),
+                state.logs.clone(),
+                env.clone(),
+            );
+            tokio::spawn(
+                async move { teardown(&cfg, &pool, &procs, &logs, (&env).into(), false).await },
+            )
+        };
+        tokio::select! {
+            _ = gate.wait_entered.notified() => {}
+            r = &mut wiping => panic!(
+                "teardown finished while a spawn was still in flight: {r:?}"
+            ),
+        }
+        // Blocked before the row delete (structural: the wait precedes it).
+        assert!(
+            db::get_environment(&state.pool, &env.id)
+                .await
+                .unwrap()
+                .is_some(),
+            "the row must survive while a spawn is in flight"
+        );
+        gate.pre_adopt_release.notify_one();
+
+        let spawned = tokio::time::timeout(Duration::from_secs(15), spawning)
+            .await
+            .expect("spawn task joins")
+            .expect("spawn task");
+        assert!(
+            spawned.is_ok(),
+            "the parked spawn finishes once released (refused at adoption): {spawned:?}"
+        );
+        tokio::time::timeout(Duration::from_secs(15), wiping)
+            .await
+            .expect("teardown joins")
+            .expect("teardown task")
+            .expect("teardown completes");
+        assert!(
+            db::get_environment(&state.pool, &env.id)
+                .await
+                .unwrap()
+                .is_none(),
+            "the row is gone"
+        );
+        assert!(
+            !supervisor::has_process(&state.procs, &fleet).await,
+            "teardown leaves no live fleet behind"
+        );
+        let claim = crate::db::alloc::claim_ports_in(&state.pool, 30220, 30221)
+            .await
+            .expect("the torn-down pair returns to the allocator");
+        assert_eq!((claim.listen, claim.internal), (30220, 30221));
+        supervisor::test_gate_remove(&fleet);
+        state.pool.clone().close().await;
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The wipe must not hold the ref move: `prs.merge`'s `deleteBranch`
