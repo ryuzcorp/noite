@@ -13,7 +13,13 @@ import type { D1Database } from "@cloudflare/workers-types";
 import { defineMiddleware } from "void";
 
 import { stampControlEnv } from "../lib/control-env";
-import { ensureDb, setD1Binding } from "../lib/db";
+import {
+  DB_MIGRATING_BODY,
+  DbUnavailableError,
+  ensureDb,
+  isMissingTableFailure,
+  setD1Binding,
+} from "../lib/db";
 
 export default defineMiddleware(async (c, next) => {
   // SAFETY: c.env carries the control keys the runner deployed as worker vars; the stamp copies every declared string key.
@@ -29,8 +35,23 @@ export default defineMiddleware(async (c, next) => {
   // starter's pending work, so a pass cached across requests would leave its
   // waiters on an orphan (see `docker/check-worker-rules.ts`). Schema
   // migrations are the runner's job (Void's migration endpoint), never a
-  // request's.
-  await ensureDb();
+  // request's. While they have not applied, every database touch fails with
+  // a missing table — the bootstrap above, a page loader, an action — so
+  // the whole downstream answers 503 here and the visitor waits instead of
+  // seeing a broken UI. (The `await` on `next()` matters: without it a
+  // downstream rejection skips the catch.)
+  try {
+    await ensureDb();
 
-  return next();
+    return await next();
+  } catch (error) {
+    if (error instanceof DbUnavailableError || isMissingTableFailure(error)) {
+      return new Response(DB_MIGRATING_BODY, {
+        headers: { "retry-after": "5" },
+        status: 503,
+      });
+    }
+
+    throw error;
+  }
 });

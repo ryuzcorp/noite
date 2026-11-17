@@ -11,7 +11,12 @@ import {
   PendingApprovalError,
   UnauthorizedError,
 } from "../../lib/auth";
-import { ensureDb, setD1Binding } from "../../lib/db";
+import {
+  DB_MIGRATING_BODY,
+  dbUnavailable,
+  ensureDb,
+  setD1Binding,
+} from "../../lib/db";
 import {
   actionErrorResponse,
   apiAction,
@@ -127,6 +132,14 @@ describe("actionErrorResponse", () => {
     expect(await response.json()).toEqual({
       error: "The session store did not answer — retry in a moment.",
     });
+  });
+
+  test("a half-migrated database is a retryable 503, never 500", async () => {
+    const response = actionErrorResponse(dbUnavailable());
+
+    expect(response.status).toBe(503);
+    expect(response.headers.get("retry-after")).toBe("5");
+    expect(await response.json()).toEqual({ error: DB_MIGRATING_BODY });
   });
 
   test("anything else is masked as 500 Internal error", async () => {

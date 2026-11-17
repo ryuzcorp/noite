@@ -1,0 +1,3 @@
+### Fixed
+
+- A failed control-database migration at boot no longer needs an operator restart. The runner retries the control D1 migrations in the background with capped backoff (1 s, doubling to 60 s), logging the failing migration and the error on every attempt, until they apply. While they have not applied, the control UI answers `503 Control database is migrating; retry shortly` (with `retry-after`) instead of serving a broken UI, and `/ready` keeps naming the `control` cause; `/health` still only reports the runner process itself. A permanently broken migration stays visible in the log and in `/ready` instead of silently looping, and a retry never applies a file twice (each file still applies transactionally with its journal stamp).

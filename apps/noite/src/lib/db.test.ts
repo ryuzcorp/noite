@@ -1,11 +1,21 @@
 import { beforeEach, describe, expect, test } from "bun:test";
 
+import { Cause } from "effect";
 import { sql } from "void/db";
 
 import { createTestD1 } from "../testing/d1";
 import type { TestD1 } from "../testing/d1";
 import { controlEnv } from "./control-env";
-import { ensureDb, getDb, setD1Binding, withDb } from "./db";
+import {
+  DB_MIGRATING_BODY,
+  DbUnavailableError,
+  ensureDb,
+  getDb,
+  isMissingTableFailure,
+  setD1Binding,
+  withDb,
+} from "./db";
+import { errorMessage } from "./errors";
 
 let db: TestD1;
 
@@ -76,5 +86,101 @@ describe("withDb", () => {
     await expect(
       withDb(() => Promise.reject(new Error("boom")))
     ).rejects.toThrow("boom");
+  });
+});
+
+describe("migration gate", () => {
+  test("ensureDb throws DbUnavailableError while tables are missing", async () => {
+    // A database whose migrations have not applied yet: the runner is still
+    // retrying them, so the bootstrap must read as "migrating", never as a
+    // broken schema. A fresh address avoids the isolate's promoted record.
+    db.raw.run(`DROP TABLE "user"`);
+    controlEnv.NOITE_ADMIN_EMAIL = "unmigrated@example.com";
+
+    let thrown;
+
+    try {
+      await ensureDb();
+      thrown = null;
+    } catch (error) {
+      thrown = error;
+    }
+
+    expect(thrown).toBeInstanceOf(DbUnavailableError);
+    expect(errorMessage(thrown)).toBe(DB_MIGRATING_BODY);
+  });
+
+  test("withDb maps a half-migrated work failure the same way", async () => {
+    db.raw.run(`DROP TABLE email_invite`);
+
+    let thrown;
+
+    try {
+      await withDb(() =>
+        getDb().all<{ email: string }>(sql`SELECT email FROM email_invite`)
+      );
+      thrown = null;
+    } catch (error) {
+      thrown = error;
+    }
+
+    expect(thrown).toBeInstanceOf(DbUnavailableError);
+    expect(errorMessage(thrown)).toBe(DB_MIGRATING_BODY);
+  });
+
+  test("other failures still propagate untouched", async () => {
+    await expect(
+      withDb(() => Promise.reject(new Error("boom")))
+    ).rejects.toThrow("boom");
+  });
+
+  test("isMissingTableFailure names an unmigrated database", () => {
+    expect(isMissingTableFailure(new Error("no such table: user"))).toBe(true);
+    expect(
+      isMissingTableFailure(
+        new Error("SQLITE_ERROR: no such table: email_invite")
+      )
+    ).toBe(true);
+
+    // Through effect's wrapper, the shape withDb rejects with.
+    expect(
+      isMissingTableFailure(
+        new Cause.UnknownError(
+          new Error("no such table: user"),
+          "An error occurred in Effect.tryPromise"
+        )
+      )
+    ).toBe(true);
+
+    // Through drizzle's wrapper: the statement is the wrapper's own text, the
+    // driver names the missing table in the cause.
+    const wrapped = Object.assign(
+      new Error('Failed query: select * from "user"'),
+      {
+        cause: new Error("no such table: user"),
+        params: [],
+        query: 'select * from "user"',
+      }
+    );
+
+    expect(isMissingTableFailure(wrapped)).toBe(true);
+    expect(isMissingTableFailure(new Error("D1 is down"))).toBe(false);
+    expect(isMissingTableFailure(null)).toBe(false);
+  });
+
+  test("isMissingTableFailure lets a wrong table name 500", () => {
+    // A table the schema never declares is a code bug, not a pending
+    // migration: it must read as a 500, never as 503 "migrating" forever.
+    expect(isMissingTableFailure(new Error("no such table: typo_table"))).toBe(
+      false
+    );
+    expect(
+      isMissingTableFailure(
+        new Cause.UnknownError(
+          new Error("no such table: typo_table"),
+          "An error occurred in Effect.tryPromise"
+        )
+      )
+    ).toBe(false);
   });
 });

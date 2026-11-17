@@ -1,11 +1,15 @@
+/* eslint-disable max-classes-per-file -- tagged Fail types for the DB layer */
 import type { D1Database } from "@cloudflare/workers-types";
 import { drizzleAdapter } from "better-auth/adapters/drizzle";
+import { Cause } from "effect";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 import { createDb, eq } from "void/db";
+import { getTableConfig } from "void/schema-d1";
 
 import { schema, userTable } from "../db/schema";
 import { controlEnv } from "./control-env";
+import { MAX_CAUSE_DEPTH, asQueryError } from "./errors";
 
 // D1 holds auth (better-auth tables) plus collaborator grants and their
 // pending invitations — the ONLY app-shaped state the UI owns. App rows and
@@ -32,6 +36,80 @@ export const missingDb = () =>
   new MissingDbError({
     message: "noite: D1 database binding is missing (DB)",
   });
+
+/** 503 body while the control migrations have not applied: the runner is
+ * still retrying them in the background, so the visitor waits and reloads
+ * instead of reading a broken UI as their account state. */
+export const DB_MIGRATING_BODY = "Control database is migrating; retry shortly";
+
+// oxlint-disable-next-line unicorn/throw-new-error -- Schema.TaggedError factory
+export class DbUnavailableError extends Schema.TaggedError<DbUnavailableError>()(
+  "DbUnavailableError",
+  { message: Schema.String }
+) {}
+
+export const dbUnavailable = () =>
+  new DbUnavailableError({ message: DB_MIGRATING_BODY });
+
+/** Every table the control database must have once migrations applied,
+ * derived from the schema source of truth (not a hand-copied list, so a new
+ * migration's table joins the 503 gate with its schema entry). */
+const KNOWN_TABLES: ReadonlySet<string> = new Set(
+  Object.values(schema).map((table) => getTableConfig(table).name.toLowerCase())
+);
+
+/** The table a failure says is missing, if it names one. */
+const missingTableName = (message: string): string | null => {
+  const match = /no such table:\s*["']?(?<table>[^\s"';\]]+)/iu.exec(message);
+
+  return match?.groups?.table?.toLowerCase() ?? null;
+};
+
+/** Whether the failure chain says a known table is missing: the control
+ * database has not finished its migrations (the runner is still retrying
+ * them), so the caller answers 503 "migrating" instead of the 500 a
+ * half-migrated schema would otherwise read as. Only the schema's own tables
+ * read as "migrating": a wrong table name anywhere else is a code bug, and a
+ * bug must 500, never 503 forever. Matched on the driver's own words, never
+ * on the query text. */
+// oxlint-disable-next-line anti-slop/no-unknown-parameters -- catch-site boundary, same as errorMessage.
+export const isMissingTableFailure = (error: unknown): boolean => {
+  let current = error;
+
+  for (let depth = 0; depth < MAX_CAUSE_DEPTH; depth += 1) {
+    if (!(current instanceof Error)) {
+      return false;
+    }
+
+    const missing = missingTableName(current.message);
+
+    if (missing !== null) {
+      return KNOWN_TABLES.has(missing);
+    }
+
+    if (
+      asQueryError(current) === null &&
+      !(Cause.isUnknownError(current) && current.cause !== undefined)
+    ) {
+      return false;
+    }
+
+    current = current.cause;
+  }
+
+  return false;
+};
+
+/** Map a missing table to the 503 outage (the control migrations have not
+ * applied yet); pass anything else through unchanged. */
+// oxlint-disable-next-line anti-slop/no-unknown-parameters, anti-slop/no-unknown-returns -- catch-site values are unknown by construction; this narrows them once, and both call sites throw the result immediately instead of reading it as a value.
+const toDbError = (error: unknown): unknown => {
+  if (error instanceof DbUnavailableError || isMissingTableFailure(error)) {
+    return error instanceof DbUnavailableError ? error : dbUnavailable();
+  }
+
+  return error;
+};
 
 let d1Binding: D1Database | undefined;
 
@@ -125,7 +203,11 @@ const runDbSetup = async (): Promise<void> => {
  * requests, so a pass can never outlive its request or pin the isolate to a
  * stale binding; only the "already promoted" fact is remembered. */
 export const ensureDb = async (): Promise<void> => {
-  await runDbSetup();
+  try {
+    await runDbSetup();
+  } catch (error) {
+    throw toDbError(error);
+  }
 };
 
 /** Bound on one `withDb` unit of work. A D1 read that never answers fails
@@ -135,14 +217,18 @@ const DB_CALL_TIMEOUT = "10 seconds";
 /** Run one database unit of work: the admin bootstrap first, then the
  * caller's Drizzle work, bounded so a stuck D1 call cannot hang a request. */
 export const withDb = async <A>(work: () => Promise<A>): Promise<A> => {
-  await ensureDb();
+  try {
+    await ensureDb();
 
-  const bounded = Effect.tryPromise({
-    catch: (error) => error,
-    try: work,
-  }).pipe(Effect.timeout(DB_CALL_TIMEOUT));
+    const bounded = Effect.tryPromise({
+      catch: (error) => error,
+      try: work,
+    }).pipe(Effect.timeout(DB_CALL_TIMEOUT));
 
-  // SAFETY: timeout only narrows the error channel to TimeoutException,
-  // which runPromise throws; the success value is exactly A.
-  return await Effect.runPromise(bounded as Effect.Effect<A, never>);
+    // SAFETY: timeout only narrows the error channel to TimeoutException,
+    // which runPromise throws; the success value is exactly A.
+    return await Effect.runPromise(bounded as Effect.Effect<A, never>);
+  } catch (error) {
+    throw toDbError(error);
+  }
 };

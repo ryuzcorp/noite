@@ -150,8 +150,10 @@ pub struct AppState {
     /// (`host::sourcemaps::SourceMapCache`).
     pub source_maps: host::sourcemaps::SourceMapCache,
     /// Why the control fleet failed to come up (deploy or migrations), or
-    /// `None`: /ready reports it beside "fleet not healthy", so a red lane
-    /// names its cause instead of only failing.
+    /// `None`: /ready reports it whenever set — even when the fleet answers
+    /// its health probe, which it does through a migration outage — so a red
+    /// lane names its cause instead of only failing, and never reads green
+    /// while the UI serves its 503 "migrating" page.
     pub control_boot: Arc<std::sync::Mutex<Option<String>>>,
 }
 
@@ -733,25 +735,21 @@ async fn main() -> anyhow::Result<()> {
             let child =
                 host::control::supervise(&config, control_pid.clone(), logs.clone(), control_token);
             // The migration endpoints are served by the control worker, so
-            // this waits for the fleet to adopt the pointer first. Retried:
-            // a refused move or a slow celld start is transient; a schema
-            // that still will not apply leaves the UI erroring (loudly).
-            for attempt in 1..=3 {
-                match host::control::migrate(&config).await {
-                    Ok(()) => {
-                        tracing::info!("control migrations applied");
-                        break;
-                    }
-                    Err(e) if attempt < 3 => {
-                        tracing::warn!(attempt, error = %format!("{e:#}"), "control migrations failed; retrying");
-                        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                    }
-                    Err(e) => {
-                        let reason = format!("{e:#}");
-                        tracing::error!(error = %reason, "control migrations not applied; the control UI will error until they apply");
-                        *control_boot.lock().unwrap_or_else(|p| p.into_inner()) =
-                            Some(format!("migrations failed: {reason}"));
-                    }
+            // the first attempt waits for the fleet to adopt the pointer. A
+            // failure retries in the background with capped backoff (a slow
+            // celld start or a briefly unreachable store needs no operator
+            // restart); while it fails the control UI answers 503 and
+            // /ready names the cause.
+            match host::control::migrate(&config).await {
+                Ok(()) => {
+                    tracing::info!("control migrations applied");
+                }
+                Err(e) => {
+                    let reason = format!("{e:#}");
+                    tracing::warn!(error = %reason, "control migrations failed; retrying in the background");
+                    *control_boot.lock().unwrap_or_else(|p| p.into_inner()) =
+                        Some(format!("migrations failed: {reason}"));
+                    host::control::spawn_migration_retries(&config, control_boot.clone());
                 }
             }
             tracing::info!(ms = boot.elapsed().as_millis(), "control bundle ready");

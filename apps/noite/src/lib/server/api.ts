@@ -15,6 +15,9 @@
  * - the session store could not answer (`SessionStoreUnavailableError`) → 503
  *   `{error: message}`: an outage is retryable and must never read as "signed
  *   out" (401) nor as a bug (500).
+ * - the control migrations have not applied yet (`DbUnavailableError`) → 503
+ *   `{error: message}` with `retry-after`: the runner is still retrying them,
+ *   so the UI waits instead of painting a broken schema as account state.
  * - anything else (a bug, an unmapped throw) → 500 `{error: "Internal
  *   error"}`: a plain throw never leaks an implementation message to the
  *   browser (the old Oxide masking, kept).
@@ -66,6 +69,16 @@ export const actionErrorResponse = (error: unknown): Response => {
   }
 
   if (tag === "SessionStoreUnavailableError") {
+    return Response.json(
+      { error: errorMessage(error) },
+      {
+        headers: { "retry-after": "5" },
+        status: 503,
+      }
+    );
+  }
+
+  if (tag === "DbUnavailableError") {
     return Response.json(
       { error: errorMessage(error) },
       {

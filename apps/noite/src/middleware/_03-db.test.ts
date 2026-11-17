@@ -6,6 +6,7 @@ import {
   controlEnv,
   hydrateControlEnv,
 } from "../lib/control-env";
+import { DB_MIGRATING_BODY } from "../lib/db";
 import { signupPolicy } from "../lib/server/email-invites.server";
 import { checkFirstAdminProof } from "../lib/server/setup-code.server";
 import { testRouteContext } from "../testing/context";
@@ -163,5 +164,80 @@ describe("control env stamp (dogfood D1)", () => {
         globals.__CONTROL_BUILD__ = previous;
       }
     }
+  });
+
+  test("a half-migrated database answers 503 so the visitor waits", async () => {
+    // A database whose migrations have not applied yet: the bootstrap reads
+    // a missing table, and the request must wait (503) instead of seeing a
+    // broken UI. The unmigrated binding is stamped by the middleware itself,
+    // exactly like the worker's; the next test re-stamps the good one.
+    const unmigrated = createTestD1();
+
+    unmigrated.raw.run(`DROP TABLE "user"`);
+
+    // SAFETY: platform values plus the unmigrated test binding, the same shape the worker injects.
+    const env = {
+      ...platformEnv(),
+      DB: unmigrated.d1,
+      NOITE_ADMIN_EMAIL: "unmigrated@example.com",
+    } as KitEnv;
+
+    let next = false;
+
+    const answered: unknown = await dbMiddleware(
+      testRouteContext(new Request("http://localhost/app"), env),
+      () => {
+        next = true;
+
+        return Promise.resolve();
+      }
+    );
+
+    expect(next).toBe(false);
+
+    if (!(answered instanceof Response)) {
+      throw new TypeError(
+        "the middleware did not answer the unmigrated request"
+      );
+    }
+
+    expect(answered.status).toBe(503);
+    expect(answered.headers.get("retry-after")).toBe("5");
+    expect(await answered.text()).toBe(DB_MIGRATING_BODY);
+  });
+
+  test("a downstream missing-table failure answers 503 too", async () => {
+    let next = false;
+
+    const answered: unknown = await dbMiddleware(
+      testRouteContext(new Request("http://localhost/app"), platformEnv()),
+      () => {
+        next = true;
+
+        return Promise.reject(new Error("no such table: email_invite"));
+      }
+    );
+
+    expect(next).toBe(true);
+
+    if (!(answered instanceof Response)) {
+      throw new TypeError(
+        "the middleware did not answer the downstream failure"
+      );
+    }
+
+    expect(answered.status).toBe(503);
+    expect(answered.headers.get("retry-after")).toBe("5");
+  });
+
+  test("a wrong table name downstream still throws", async () => {
+    // A table the schema never declares is a code bug, not a pending
+    // migration: it propagates to the 500 path instead of 503 "migrating".
+    await expect(
+      dbMiddleware(
+        testRouteContext(new Request("http://localhost/app"), platformEnv()),
+        () => Promise.reject(new Error("no such table: typo_table"))
+      )
+    ).rejects.toThrow("no such table: typo_table");
   });
 });
