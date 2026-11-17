@@ -215,14 +215,27 @@ jobs:
       - name: load lane image
         if: inputs.image_artifact != ''
         run: zstd -d -c /tmp/noite-image/noite-ci.tar.zst | docker load
-      # The plan's effective suite (a changed shared helper escalates fast
-      # to release) and the PR's rewritten specs, which the lane runs in full
+      # The plan's effective suite (a changed shared helper escalates fast to
+      # release) and the PR's rewritten specs, which the lane runs in full
       # beside the tagged gate. Both are empty outside pull requests, where
-      # the lane keeps the requested suite exactly as before.
+      # the lane keeps the requested suite exactly as before. Plan-controlled
+      # values travel through `env:` and are referenced quoted — never
+      # interpolated into `run:` — and the suite is checked against its
+      # explicit set here (the selection script already fails closed on
+      # anything outside its path allowlist and only emits fast|release).
+      # Remaining `${{ }}` in this step is repo-controlled: the matrix shard,
+      # target and image choice are workflow literals, never PR content.
       - name: e2e lane
         env:
           E2E_CHANGED_SPECS: ${{ needs.plan.outputs.extra-specs }}
-        run: E2E_IMAGE=${{ inputs.image_artifact == '' && 'noite:e2e' || 'noite:ci' }} E2E_SUITE=${{ needs.plan.outputs.suite || inputs.suite || 'release' }} E2E_SHARD=${{ matrix.shard }}/2 make ${{ matrix.target }}
+          E2E_SUITE: ${{ needs.plan.outputs.suite || inputs.suite || 'release' }}
+          E2E_IMAGE: ${{ inputs.image_artifact == '' && 'noite:e2e' || 'noite:ci' }}
+        run: |
+          case "$E2E_SUITE" in
+            fast|release) ;;
+            *) echo "::error::unknown e2e suite: $E2E_SUITE"; exit 1 ;;
+          esac
+          E2E_SHARD="${{ matrix.shard }}/2" make "${{ matrix.target }}"
       - name: upload playwright report
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7

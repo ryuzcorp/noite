@@ -24,6 +24,14 @@
 // (`--diff-filter=AMR`: added, modified, renamed — renames list the new path).
 import { execFileSync } from "node:child_process";
 
+// Changed paths are PR-controlled input whose values flow into GITHUB_OUTPUT
+// and the lane, so anything outside this allowlist throws: no whitespace,
+// control characters, quotes, `$`, backticks or shell metacharacters.
+// Brackets stay — file-routed pages (`apps/noite/src/pages/apps/[id].tsx`)
+// are legitimate tracked paths. Parsing stays NUL-separated (`-z`), so an
+// embedded newline can never split one entry into two output lines either.
+const SAFE_PATH = /^[A-Za-z0-9./@_+[\]-]+$/u;
+
 const E2E_DIR = "apps/noite/e2e/";
 const CONFIG_PATH = "apps/noite/playwright.config.ts";
 
@@ -68,11 +76,17 @@ export const planE2E = (
   let runRelease = false;
 
   for (const raw of changedFiles) {
-    const path = raw.trim();
-
-    if (path.length === 0) {
+    // The trailing NUL of `-z` output splits into one empty entry; anything
+    // else outside the allowlist fails the plan instead of shaping it.
+    if (raw.length === 0) {
       continue;
     }
+
+    if (!SAFE_PATH.test(raw)) {
+      throw new Error(`refusing unsafe path from diff: ${JSON.stringify(raw)}`);
+    }
+
+    const path = raw;
 
     // A non-spec file under e2e/ (helpers, fixtures, setup, page objects) is
     // shared by every spec, so it escalates instead of selecting. Specs the
@@ -120,7 +134,7 @@ const flag = (name: string, fallback: string): string => {
 const main = (): void => {
   const base = flag("--base", "");
 
-  if (base.length === 0) {
+  if (!/^[0-9a-fA-F]+$/u.test(base)) {
     console.error(
       "usage: e2e-plan.ts --base <sha> [--head HEAD] [--suite fast]"
     );
@@ -128,6 +142,12 @@ const main = (): void => {
   }
 
   const head = flag("--head", "HEAD");
+
+  if (head !== "HEAD" && !/^[0-9a-fA-F]+$/u.test(head)) {
+    console.error("refusing unsafe --head (want a sha or HEAD)");
+    process.exit(1);
+  }
+
   const suite = flag("--suite", "fast");
 
   // Three-dot diffs against the merge base, so a branch that merged main
@@ -144,6 +164,17 @@ const main = (): void => {
   const changed = raw.split("\0").filter((entry) => entry.length > 0);
 
   const plan = planE2E(changed, suite);
+
+  // The allowlist above admits no newlines, but these lines become
+  // GITHUB_OUTPUT entries: assert single-line output instead of assuming it.
+  for (const [label, value] of [
+    ["suite", plan.suite],
+    ["extra-specs", plan.extraSpecs.join(" ")],
+  ]) {
+    if (/[\r\n]/u.test(value)) {
+      throw new Error(`refusing multi-line ${label} output`);
+    }
+  }
 
   console.log(`suite=${plan.suite}`);
   console.log(`extra-specs=${plan.extraSpecs.join(" ")}`);

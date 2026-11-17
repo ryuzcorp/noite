@@ -87,3 +87,35 @@ describe("planE2E", () => {
     expect(plan.extraSpecs).toEqual(["admin.spec.ts", "deploy.spec.ts"]);
   });
 });
+
+describe("hostile diff paths fail closed", () => {
+  test("an embedded newline throws instead of forging an output line", () => {
+    expect(() => planE2E(["apps/noite/e2e/ad\nmin.spec.ts"], "fast")).toThrow(
+      /unsafe path/u
+    );
+  });
+
+  test("command substitution in a filename throws", () => {
+    expect(() =>
+      planE2E(["apps/noite/e2e/$(touch pwned).spec.ts"], "fast")
+    ).toThrow(/unsafe path/u);
+  });
+
+  test("quotes, backticks and whitespace throw", () => {
+    for (const hostile of [
+      "apps/noite/e2e/ad'min.spec.ts",
+      'apps/noite/e2e/ad"min.spec.ts',
+      "apps/noite/e2e/`id`.spec.ts",
+      "apps/noite/e2e/ad min.spec.ts",
+      "apps/noite/e2e/\tadmin.spec.ts",
+    ]) {
+      expect(() => planE2E([hostile], "fast")).toThrow(/unsafe path/u);
+    }
+  });
+
+  test("bracketed file-routed pages stay allowed", () => {
+    const plan = planE2E(["apps/noite/src/pages/apps/[id].tsx"], "fast");
+
+    expect(plan.suite).toBe("fast");
+  });
+});
