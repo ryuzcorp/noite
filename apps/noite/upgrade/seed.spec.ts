@@ -17,6 +17,7 @@ import {
   pendingInvitationId,
   readInviteCodeApi,
   registerAccount,
+  waitForDeploySuccess,
 } from "./lane";
 
 /** Seed the upgrade lane without touching version-skewed UI: after the one
@@ -43,11 +44,6 @@ const KEY_PATH =
   nodePath.join(nodePath.dirname(STATE_PATH), "upgrade-api-key");
 
 const tenant = (port: number): string => `http://localhost:${port}`;
-
-const DeployRow = Schema.Struct({
-  sha: Schema.NullOr(Schema.String),
-  status: Schema.String,
-});
 
 // The lane runs this file twice (seed against the old image, verify against
 // the new one); it only seeds in its own phase.
@@ -91,35 +87,12 @@ test("seed the previous release with app, env, deploy, domain and people", async
 
     expect(setEnv.status).toBe(200);
 
-    // The sample worker: D1 `demo`, R2 `uploads`, the Counter object.
+    // The sample worker: D1 `demo` (plus a `migrations/` dir the previous
+    // release never applies — the verify redeploys prove the tree does),
+    // R2 `uploads`, the Counter object.
     const sha = pushAppDir(key, new URL("../test", import.meta.url), SLUG);
 
-    // Poll the pushed revision's own row (never a clock): the deploy takes
-    // minutes (bun install + celld deploy + fleet boot).
-    let deployStatus = "";
-    let deploySha: string | null = null;
-    await expect
-      .poll(
-        async () => {
-          const deploys = await runnerCall(
-            request,
-            `/v1/apps/${appId}/deploys`
-          );
-
-          const rows = Schema.decodeUnknownSync(Schema.Array(DeployRow))(
-            deploys.body
-          );
-
-          const row = rows.find((candidate) => candidate.sha === sha);
-          deployStatus = row?.status ?? "no-row";
-          deploySha = row?.sha ?? null;
-
-          return deployStatus;
-        },
-        { intervals: [2000], timeout: 8 * 60_000 }
-      )
-      .toBe("success");
-    expect(deploySha).toBe(sha);
+    await waitForDeploySuccess(request, appId, sha);
 
     const port = await appListenPort(request, appId);
 

@@ -2,9 +2,12 @@
 # Upgrade lane (`make e2e-upgrade`): prove the tree upgrades the previous
 # release's data in place. Boots the previous release's published image,
 # seeds it through the public surface (app + env var, deploy, custom domain
-# claim, collaborator, worker-written D1/R2 state), stops it, restarts the
-# tree image on the SAME volumes and bucket, and verifies the seed reads
-# back and the app still serves.
+# claim, collaborator, worker-written D1/R2 state — the sample worker ships
+# a D1 `migrations/` dir the old release never applies), stops it, restarts
+# the tree image on the SAME volumes and bucket, verifies the seed reads
+# back and the app still serves, then redeploys twice on the tree: once with
+# a new migration file (every pending file applies exactly once) and once
+# more (nothing applies again).
 #
 # Previous tag: the newest `v*` reachable before HEAD (a HEAD tag's
 # predecessor on a tag build), else `gh release list`. Override with

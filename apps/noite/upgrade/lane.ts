@@ -1,5 +1,6 @@
 import { expect } from "@playwright/test";
 import type {
+  APIRequestContext,
   APIResponse,
   Browser,
   BrowserContext,
@@ -7,7 +8,12 @@ import type {
 } from "@playwright/test";
 import * as Schema from "effect/Schema";
 
-import { E2E_EMAIL, E2E_NAME, addVirtualAuthenticator } from "../e2e/helpers";
+import {
+  E2E_EMAIL,
+  E2E_NAME,
+  addVirtualAuthenticator,
+  runnerCall,
+} from "../e2e/helpers";
 
 /** POST a control JSON action with the page's session cookies and answer the
  * raw response. Playwright's request context sends no Origin or
@@ -329,4 +335,38 @@ export const createEmailInvite = async (
   }
 
   return token;
+};
+
+const DeployRow = Schema.Struct({
+  sha: Schema.NullOr(Schema.String),
+  status: Schema.String,
+});
+
+/** Poll the pushed revision's own deploy row (never a clock) until it
+ * succeeds: a deploy takes minutes (bun install + celld deploy + fleet
+ * boot). */
+export const waitForDeploySuccess = async (
+  request: APIRequestContext,
+  appId: string,
+  sha: string
+): Promise<void> => {
+  let deployStatus = "";
+
+  await expect
+    .poll(
+      async () => {
+        const deploys = await runnerCall(request, `/v1/apps/${appId}/deploys`);
+
+        const rows = Schema.decodeUnknownSync(Schema.Array(DeployRow))(
+          deploys.body
+        );
+
+        const row = rows.find((candidate) => candidate.sha === sha);
+        deployStatus = row?.status ?? "no-row";
+
+        return deployStatus;
+      },
+      { intervals: [2000], timeout: 8 * 60_000 }
+    )
+    .toBe("success");
 };
