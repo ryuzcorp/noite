@@ -43,7 +43,7 @@ ARG CADDY_VERSION=2.11.9
 # The builder image is digest-pinned like every other FROM below: the
 # multi-arch index digest comes from
 # `docker buildx imagetools inspect --format '{{.Manifest.Digest}}'`.
-ARG CADDY_DIGEST=sha256:345264d8c6b50f44f4a4d507d4e6b6bcae40eef2f210d70f76e717fd8cc31baf
+ARG CADDY_DIGEST=sha256:f9beaa5ddbe7df6f26ebbcf9cbf44e05a1917b9bba464f0c3229038d7e2e6e13
 ARG NODE_VERSION=24.22.3
 # The Node tarballs' sha256, per arch, from the release's signed
 # SHASUMS256.txt (nodejs.org/download/release/v${NODE_VERSION}/); the install
