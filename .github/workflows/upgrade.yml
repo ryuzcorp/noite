@@ -19,7 +19,19 @@ on:
         description: Run-local artifact holding the tree image (docker save piped to zstd). When set, the lane loads it instead of building.
         required: false
         type: string
+      from_oldest:
+        default: "0"
+        description: Seed from the oldest supported release (the first beta) instead of the previous one.
+        required: false
+        type: string
   workflow_dispatch:
+    inputs:
+      from_oldest:
+        default: "0"
+        description: Seed from the oldest supported release (the first beta) instead of the previous one.
+        required: false
+        type: choice
+        options: ["0", "1"]
   # Nightly on main: the tag gate only runs on `v*`, so this is what catches
   # a slow main-branch schema regression outside a release.
   schedule:
@@ -82,6 +94,8 @@ jobs:
         if: inputs.image_artifact != ''
         run: zstd -d -c /tmp/noite-image/noite-ci.tar.zst | docker load
       - name: upgrade lane
+        env:
+          E2E_FROM_OLDEST: ${{ inputs.from_oldest }}
         run: E2E_IMAGE=${{ inputs.image_artifact == '' && 'noite:upgrade' || 'noite:ci' }} sh docker/e2e-upgrade.sh
       - name: upload upgrade report
         if: always()

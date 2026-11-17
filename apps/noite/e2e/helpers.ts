@@ -43,6 +43,36 @@ export const execGit = (
     timeout: CHILD_PROC_TIMEOUT_MS,
   });
 
+/** Redact embedded git credentials from text before it reaches logs or
+ * errors: lane remotes carry the API key as userinfo
+ * (`http://git:KEY@host/slug`), and a failing command quotes the full argv.
+ * Redacts every `scheme://userinfo@` occurrence; clean URLs pass through.
+ */
+export const redactGitSecrets = (text: string): string =>
+  text.replaceAll(/:\/\/[^/\s@]+@/gu, "://***@");
+
+/** `execGit` with embedded credentials redacted from failures: the remote
+ * URL carries the API key, and the thrown error quotes the full argv, which
+ * the lane prints and uploads. The redacted error keeps the command and
+ * stderr, only the userinfo is masked.
+ */
+export const execGitRedacted = (
+  args: string[],
+  options: { cwd?: string; env?: Record<string, string> } = {}
+): string => {
+  try {
+    return execGit(args, options);
+  } catch (error) {
+    // SAFETY: execFileSync only ever throws Error (message, status, output).
+    const original = error as Error;
+
+    // The remote URL carries the API key and the message quotes the full
+    // argv: mask it in place and rethrow, keeping the type and stack.
+    original.message = redactGitSecrets(original.message);
+    throw original;
+  }
+};
+
 const uiBaseURL = process.env.E2E_BASE_URL ?? "http://noite.localhost:8090";
 const apiBase = process.env.E2E_API_BASE ?? "http://localhost:8080";
 const gitBase = process.env.E2E_GIT_BASE ?? "http://localhost:8080/v1/git";
@@ -574,7 +604,7 @@ export const pushAppDir = (
     const git = (
       args: string[],
       extraEnv: Record<string, string> = {}
-    ): string => execGit(args, { cwd: dir, env: extraEnv });
+    ): string => execGitRedacted(args, { cwd: dir, env: extraEnv });
 
     git(["init", "-b", "main"]);
     git([
@@ -601,6 +631,17 @@ export const pushAppDir = (
 /** Push the sample app (apps/noite/test) to the e2e slug. */
 export const pushSampleApp = (apiKey: string): string =>
   pushAppDir(apiKey, new URL("../test", import.meta.url), E2E_SLUG);
+
+/** The refs a git credential can still read: a pre-upgrade API key proves
+ * the credential store and the git mirror survived when it lists the seed
+ * push's commit after the restart. Read-only; `ls-remote` writes nothing.
+ * Failures are redacted: the remote URL carries the key.
+ */
+export const gitRefs = (apiKey: string, slug: string): string =>
+  execGitRedacted([
+    "ls-remote",
+    `http://git:${apiKey}@${gitBase.replace(/^https?:\/\//u, "")}/${slug}`,
+  ]);
 
 /** Read-only probe of the deployed sample (counter `?read=1` never advances). */
 export const readSampleApp = async (

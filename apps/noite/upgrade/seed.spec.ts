@@ -35,6 +35,13 @@ const STATE_PATH =
   process.env.UPGRADE_STATE ??
   `${process.env.E2E_AUTH_DIR ?? "upgrade/.auth"}/upgrade-state.json`;
 
+// The seed API key lives beside the state, never inside it: the lane prints
+// the state file into the CI log for debugging, and the key must not ride
+// along. The script exports an override; the default tracks STATE_PATH.
+const KEY_PATH =
+  process.env.UPGRADE_KEY ??
+  nodePath.join(nodePath.dirname(STATE_PATH), "upgrade-api-key");
+
 const tenant = (port: number): string => `http://localhost:${port}`;
 
 const DeployRow = Schema.Struct({
@@ -201,6 +208,7 @@ test("seed the previous release with app, env, deploy, domain and people", async
 
     mkdirSync(nodePath.dirname(STATE_PATH), { recursive: true });
     writeFileSync(STATE_PATH, `${JSON.stringify(state, null, 2)}\n`);
+    writeFileSync(KEY_PATH, key);
   } catch (error) {
     await runnerCall(request, `/v1/apps/${appId}`, { method: "DELETE" });
     throw error;

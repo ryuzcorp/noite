@@ -13,6 +13,8 @@
 # (never pulled; the daemon must already hold the tag). The new side builds
 # from the tree by default; E2E_IMAGE=<tag> tests a prebuilt image instead
 # (CI hands over its one shared build this way).
+# `E2E_FROM_OLDEST=1` seeds from the oldest supported release (the first
+# beta tag) instead of the previous one — the monthly oldest-beta lane.
 #
 # Knobs (mirroring docker/e2e-local.sh, own project/bucket/ports):
 #   E2E_SLOT=<n>          parallel lane <n> (default 0 = today's ports);
@@ -46,6 +48,17 @@ resolve_prev_tag() {
 }
 
 PREV_TAG_RESOLVED="$(resolve_prev_tag || true)"
+if [ "${E2E_FROM_OLDEST:-0}" = 1 ]; then
+  # The oldest supported release (the first beta), not the previous one:
+  # proves a beta.1 -> tree jump. An explicit PREV_TAG still wins. No tag
+  # means no lane: falling through to the previous-release fallback would
+  # pass without testing the first beta.
+  PREV_TAG_RESOLVED="${PREV_TAG:-$(git tag --list 'v0.1.0-beta.*' --sort=v:refname | head -n 1)}"
+  if [ -z "$PREV_TAG_RESOLVED" ]; then
+    echo "error: E2E_FROM_OLDEST=1 but no v0.1.0-beta.* tag is reachable; pass PREV_TAG=<tag>" >&2
+    exit 1
+  fi
+fi
 if [ -z "$PREV_TAG_RESOLVED" ] && command -v gh >/dev/null 2>&1; then
   PREV_TAG_RESOLVED="$(gh release list --limit 5 --json tagName -q '.[1].tagName' 2>/dev/null || true)"
 fi
@@ -162,6 +175,7 @@ export E2E_REPORT_DIR="$REPORT_DIR"
 export E2E_TEST_DIR="$TEST_OUT_DIR"
 export E2E_FLEET_RANGE="$FLEET_RANGE" E2E_BUCKET="$BUCKET"
 export UPGRADE_STATE="${UPGRADE_STATE:-${E2E_AUTH_DIR}/upgrade-state.json}"
+export UPGRADE_KEY="${UPGRADE_KEY:-${E2E_AUTH_DIR}/upgrade-api-key}"
 export E2E_FLEET_PORTS="${FLEET_PORTS:-}"
 CE2E="$COMPOSE -p $PROJECT $FILES"
 
@@ -213,7 +227,7 @@ fail_down() {
 LANE_START="$(date +%s)"
 echo "==> upgrade slot ${SLOT}: project ${PROJECT}, api :${API_PORT}, caddy :${LANE_HTTP_PORT}, store :${STORE_PORT}"
 echo "==> old side: ${PREV_IMAGE} (tag ${PREV_TAG_RESOLVED})"
-rm -rf "$E2E_AUTH_DIR/user.json" "$E2E_AUTH_DIR/invite.lock" "$UPGRADE_STATE"
+rm -rf "$E2E_AUTH_DIR/user.json" "$E2E_AUTH_DIR/invite.lock" "$UPGRADE_STATE" "$UPGRADE_KEY"
 # shellcheck disable=SC2086
 $CE2E down -v --remove-orphans >/dev/null 2>&1 || true
 remove_project "$PROJECT"
@@ -236,6 +250,11 @@ echo "==> seed through the old image"
 if [ ! -f "$UPGRADE_STATE" ]; then
   fail_down "seed phase wrote no state file ($UPGRADE_STATE)"
 fi
+if [ ! -f "$UPGRADE_KEY" ]; then
+  fail_down "seed phase wrote no api key file ($UPGRADE_KEY)"
+fi
+# The state file is keyless by construction (the key lives in UPGRADE_KEY),
+# so printing it for debugging leaks nothing.
 ls -la "$UPGRADE_STATE" && cat "$UPGRADE_STATE"
 
 echo "==> stop the old stack (volumes and bucket stay)"

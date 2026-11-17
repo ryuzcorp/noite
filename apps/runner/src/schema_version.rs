@@ -207,6 +207,7 @@ pub async fn apply(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sha2::{Digest, Sha256};
     use sqlx::{Connection, SqliteConnection};
 
     const BASELINE: &str = "CREATE TABLE IF NOT EXISTS app (id TEXT PRIMARY KEY, slug TEXT);";
@@ -529,5 +530,343 @@ mod tests {
                 .await
                 .expect("column");
         assert_eq!(has_column, 1);
+    }
+
+    /// Every beta change appends exactly one step: versions run without gaps
+    /// from the first step above the baseline to `SCHEMA_VERSION`, so
+    /// `plan` can never skip a step and renumbering a shipped step fails
+    /// here instead of stranding upgraded installs.
+    #[test]
+    fn migration_steps_are_append_only_and_contiguous() {
+        /// sha256 of one step's SQL, hex-encoded: the manifest below pins
+        /// every shipped step's statements.
+        fn step_hash(sql: &str) -> String {
+            let mut hasher = Sha256::new();
+            hasher.update(sql.as_bytes());
+            hasher
+                .finalize()
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect()
+        }
+        // A shipped step's SQL is frozen: a stamped database skips the step,
+        // so editing it reaches fresh installs only. Register the new step's
+        // hash when appending; never touch an existing entry.
+        const STEP_HASHES: &[(i64, &str)] = &[
+            (
+                101,
+                "2c069c3485da1120d45d4911121ef5d3438fe24b7efacf6e5553e7656f1f10bb",
+            ),
+            (
+                102,
+                "994f2b70792a0d1d911067d9a5e666af207e050af79c0c6e949b005eb7ca2ab3",
+            ),
+            (
+                103,
+                "9542a7de46e0df9253f62467ecb9bdf80c485fc04dcbb7f3527ea8436806b88a",
+            ),
+            (
+                104,
+                "c1622889f209e430226a12687fe8166721dfeff4a0bb1a4be1184b40aae04412",
+            ),
+            (
+                105,
+                "fd8ab2aabb7e57b7b3b1383a97600141f28770ad751a05a21b407b1c3d3861e0",
+            ),
+            (
+                106,
+                "50064f8124222b6d10a8af2cec6ea4a4145e0776c9fc2eb8ea5fa684bcd89120",
+            ),
+            (
+                107,
+                "36f9987c272364f252dde407c42c64da2b515eb76b9aa453444b57dbfd50adea",
+            ),
+        ];
+        let mut expected = FIRST_COMPACTED_VERSION + 1;
+        for step in MIGRATIONS {
+            assert_eq!(
+                step.version, expected,
+                "migration steps must be contiguous and ascending: append, never renumber"
+            );
+            let (_, hash) = STEP_HASHES
+                .iter()
+                .find(|(version, _)| *version == step.version)
+                .expect("every shipped step is registered");
+            assert_eq!(&step_hash(step.sql), hash);
+            expected += 1;
+        }
+        assert_eq!(
+            SCHEMA_VERSION,
+            expected - 1,
+            "SCHEMA_VERSION must be the last step: bump it when appending"
+        );
+    }
+
+    /// `connect` runs `apply` inside one transaction: a step that fails
+    /// mid-chain rolls back with the stamp and the shape untouched, so the
+    /// next boot retries the same chain instead of resuming past a partial
+    /// step.
+    #[tokio::test]
+    async fn a_failing_step_leaves_the_database_untouched() {
+        let mut conn = memory().await;
+        sqlx::raw_sql(
+            "CREATE TABLE main.app (id TEXT PRIMARY KEY, slug TEXT); \
+             PRAGMA main.user_version = 100;",
+        )
+        .execute(&mut conn)
+        .await
+        .expect("seed a baseline database");
+        let steps = [
+            Migration {
+                version: FIRST_COMPACTED_VERSION + 1,
+                sql: "ALTER TABLE main.app ADD COLUMN note TEXT;",
+            },
+            Migration {
+                version: FIRST_COMPACTED_VERSION + 2,
+                sql: "THIS IS NOT SQL;",
+            },
+        ];
+        let mut tx = conn.begin().await.expect("transaction");
+        apply(&mut tx, BASELINE, FIRST_COMPACTED_VERSION + 2, &steps)
+            .await
+            .expect_err("the bad step fails the chain");
+        tx.rollback().await.expect("rollback");
+        assert_eq!(version(&mut conn).await, 100);
+        let partial: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM pragma_table_info('app') WHERE name = 'note'")
+                .fetch_one(&mut conn)
+                .await
+                .expect("column lookup");
+        assert_eq!(partial, 0, "the first step's column rolled back too");
+    }
+
+    /// The v100 compacted baseline for exactly the tables the post-compaction
+    /// steps touch, plus the tables they reference: verbatim `CREATE TABLE`
+    /// text from the compaction commit (`8354e97c:apps/runner/schema.sql`),
+    /// indexes omitted (current `schema.sql` recreates every kept index on
+    /// both sides). A future step that touches another table extends this
+    /// fixture with that table's v100-or-later shape; a step whose SQL needs
+    /// a column the fixture lacks fails here, not on an install. Tables no
+    /// step ever touched are not pinned: a `schema.sql`-only change to one
+    /// is invisible to this replay and stays a review-time check.
+    const V100_TOUCHED_TABLES: &str = "
+        CREATE TABLE IF NOT EXISTS app (
+          id TEXT PRIMARY KEY NOT NULL,
+          slug TEXT NOT NULL UNIQUE,
+          name TEXT NOT NULL,
+          user_id TEXT NOT NULL DEFAULT 'local',
+          status TEXT NOT NULL DEFAULT 'pending',
+          subdomain TEXT NOT NULL,
+          git_prefix TEXT NOT NULL,
+          fleet_bucket TEXT NOT NULL,
+          listen_port INTEGER,
+          internal_port INTEGER,
+          last_deploy_sha TEXT,
+          last_error TEXT,
+          desired_state TEXT NOT NULL DEFAULT 'running',
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL,
+          asleep_since TEXT,
+          woke_at TEXT,
+          deployed_config TEXT,
+          build_uid INTEGER,
+          import_source TEXT
+        );
+        CREATE TABLE IF NOT EXISTS deploy (
+          id TEXT PRIMARY KEY NOT NULL,
+          app_id TEXT NOT NULL REFERENCES app(id) ON DELETE CASCADE,
+          environment_id TEXT REFERENCES environment(id) ON DELETE CASCADE,
+          sha TEXT,
+          status TEXT NOT NULL DEFAULT 'queued',
+          log TEXT NOT NULL DEFAULT '',
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS environment (
+          id TEXT PRIMARY KEY NOT NULL,
+          app_id TEXT NOT NULL REFERENCES app(id) ON DELETE CASCADE,
+          label TEXT NOT NULL,
+          kind TEXT NOT NULL CHECK (kind IN ('branch','workspace')),
+          git_ref TEXT NOT NULL,
+          created_by TEXT NOT NULL DEFAULT '',
+          fleet_bucket TEXT NOT NULL,
+          listen_port INTEGER,
+          internal_port INTEGER,
+          status TEXT NOT NULL DEFAULT 'pending',
+          desired_state TEXT NOT NULL DEFAULT 'running',
+          asleep_since TEXT,
+          woke_at TEXT,
+          last_deploy_sha TEXT,
+          last_deployed_at TEXT,
+          public INTEGER NOT NULL DEFAULT 0,
+          last_error TEXT,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL,
+          UNIQUE (app_id, label)
+        );
+        CREATE TABLE IF NOT EXISTS pull_request (
+          id TEXT PRIMARY KEY NOT NULL,
+          app_id TEXT NOT NULL REFERENCES app(id) ON DELETE CASCADE,
+          number INTEGER NOT NULL,
+          title TEXT NOT NULL,
+          body TEXT NOT NULL DEFAULT '',
+          author_id TEXT NOT NULL,
+          base TEXT NOT NULL DEFAULT 'main',
+          head TEXT NOT NULL,
+          state TEXT NOT NULL CHECK (state IN ('open','closed','merged')),
+          head_sha TEXT NOT NULL,
+          merge_sha TEXT,
+          merged_by TEXT,
+          closed_by TEXT,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL,
+          closed_at TEXT,
+          merged_at TEXT,
+          UNIQUE (app_id, number)
+        );
+        CREATE TABLE IF NOT EXISTS pr_comment (
+          id TEXT PRIMARY KEY NOT NULL,
+          pr_id TEXT NOT NULL REFERENCES pull_request(id) ON DELETE CASCADE,
+          author_id TEXT NOT NULL,
+          body TEXT NOT NULL,
+          path TEXT,
+          line INTEGER,
+          side TEXT CHECK (side IN ('old','new')),
+          commit_sha TEXT,
+          created_at TEXT NOT NULL,
+          edited_at TEXT
+        );
+        CREATE TABLE IF NOT EXISTS pr_review (
+          id TEXT PRIMARY KEY NOT NULL,
+          pr_id TEXT NOT NULL REFERENCES pull_request(id) ON DELETE CASCADE,
+          reviewer_id TEXT NOT NULL,
+          state TEXT NOT NULL CHECK (state IN ('approved','changes_requested')),
+          commit_sha TEXT NOT NULL,
+          created_at TEXT NOT NULL,
+          dismissed_at TEXT
+        );";
+
+    /// One table's comparable shape: columns with type, default and
+    /// nullability, plus every index as (uniqueness, origin, column list).
+    /// Auto-indexes (UNIQUE constraints, primary keys) drop their generated
+    /// names — only the column sets matter — while `CREATE INDEX` indexes
+    /// keep theirs, so a renamed index fails. Explicit indexes also carry
+    /// their normalized definition, so a partial-index predicate, sort
+    /// direction or collation change fails instead of comparing equal.
+    async fn table_shape(conn: &mut SqliteConnection, table: &str) -> Vec<String> {
+        let mut shape: Vec<String> = sqlx::query_scalar(
+            "SELECT name || ':' || type || ':' || [notnull] || ':' || \
+             IFNULL(dflt_value, 'NULL') || ':' || pk FROM pragma_table_info(?)",
+        )
+        .bind(table)
+        .fetch_all(&mut *conn)
+        .await
+        .expect("columns");
+        let indexes: Vec<(String, i64, String)> =
+            sqlx::query_as("SELECT name, [unique], origin FROM pragma_index_list(?) ORDER BY name")
+                .bind(table)
+                .fetch_all(&mut *conn)
+                .await
+                .expect("indexes");
+        for (name, unique, origin) in indexes {
+            let columns: Vec<String> =
+                sqlx::query_scalar("SELECT name FROM pragma_index_info(?) ORDER BY seqno")
+                    .bind(&name)
+                    .fetch_all(&mut *conn)
+                    .await
+                    .expect("index columns");
+            let key = if origin == "c" {
+                name.clone()
+            } else {
+                String::new()
+            };
+            let mut part = format!("index:{unique}:{origin}:{key}:{}", columns.join(","));
+            if origin == "c" {
+                let sql: String = sqlx::query_scalar(
+                    "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ?",
+                )
+                .bind(&name)
+                .fetch_one(&mut *conn)
+                .await
+                .expect("index definition");
+                // SQLite stores the statement as written: steps qualify
+                // `main.idx_…` while schema.sql does not, and layout differs.
+                // Strip the qualifier and collapse whitespace so both sides
+                // compare by meaning.
+                let normalized = sql
+                    .replace("main.", "")
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                part.push_str(&format!(":{normalized}"));
+            }
+            shape.push(part);
+        }
+        // Column order is intentionally ignored: SQLite appends `ALTER TABLE
+        // ... ADD COLUMN` steps after the baseline columns, while a fresh
+        // `schema.sql` interleaves them. Every query in `db/` names its
+        // columns, so only the sets (with types, defaults and nullability)
+        // must agree. Within-index column order is preserved via `seqno`.
+        shape.sort();
+        shape
+    }
+
+    /// The likeliest beta mistake — a step without its `schema.sql` change,
+    /// or the reverse — must fail here: a database replayed from the v100
+    /// baseline through every step has the same tables, columns, indexes
+    /// and triggers as a fresh database built from this build's schema.
+    #[tokio::test]
+    async fn migrated_baseline_plus_steps_equals_fresh_schema() {
+        let schema_sql = include_str!("../schema.sql");
+        let mut migrated = memory().await;
+        sqlx::raw_sql(V100_TOUCHED_TABLES)
+            .execute(&mut migrated)
+            .await
+            .expect("v100 fixture");
+        sqlx::raw_sql("PRAGMA main.user_version = 100;")
+            .execute(&mut migrated)
+            .await
+            .expect("stamp the baseline");
+        apply(&mut migrated, schema_sql, SCHEMA_VERSION, MIGRATIONS)
+            .await
+            .expect("migrate forward");
+        let mut fresh = memory().await;
+        sqlx::raw_sql(schema_sql)
+            .execute(&mut fresh)
+            .await
+            .expect("fresh schema");
+        async fn table_names(conn: &mut SqliteConnection) -> Vec<String> {
+            sqlx::query_scalar::<_, String>(
+                "SELECT name FROM sqlite_master WHERE type = 'table' \
+                 AND name NOT LIKE 'sqlite_%' ORDER BY name",
+            )
+            .fetch_all(conn)
+            .await
+            .expect("tables")
+        }
+        async fn trigger_shapes(conn: &mut SqliteConnection) -> Vec<String> {
+            sqlx::query_scalar::<_, String>(
+                "SELECT name || '|' || tbl_name || '|' || sql FROM sqlite_master \
+                 WHERE type = 'trigger' ORDER BY name",
+            )
+            .fetch_all(conn)
+            .await
+            .expect("triggers")
+        }
+        assert_eq!(
+            table_names(&mut migrated).await,
+            table_names(&mut fresh).await
+        );
+        for table in table_names(&mut fresh).await {
+            assert_eq!(
+                table_shape(&mut migrated, &table).await,
+                table_shape(&mut fresh, &table).await,
+                "table {table} differs between migrated and fresh",
+            );
+        }
+        assert_eq!(
+            trigger_shapes(&mut migrated).await,
+            trigger_shapes(&mut fresh).await
+        );
     }
 }

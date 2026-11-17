@@ -1,9 +1,10 @@
 import { readFileSync } from "node:fs";
+import nodePath from "node:path";
 
 import { expect, test } from "@playwright/test";
 import * as Schema from "effect/Schema";
 
-import { appListenPort, runnerCall } from "../e2e/helpers";
+import { appListenPort, gitRefs, runnerCall } from "../e2e/helpers";
 import { hasCollaborator } from "./lane";
 
 /** Prove the tree image serves the previous release's seed back: the app
@@ -16,6 +17,12 @@ import { hasCollaborator } from "./lane";
 const STATE_PATH =
   process.env.UPGRADE_STATE ??
   `${process.env.E2E_AUTH_DIR ?? "upgrade/.auth"}/upgrade-state.json`;
+
+// The seed API key's sidecar (never in the printed state file): the lane
+// keeps the state debug output keyless.
+const KEY_PATH =
+  process.env.UPGRADE_KEY ??
+  nodePath.join(nodePath.dirname(STATE_PATH), "upgrade-api-key");
 
 const UpgradeState = Schema.Struct({
   appId: Schema.String,
@@ -145,6 +152,14 @@ test("the tree image serves the previous release's data back", async ({
   );
 
   expect(counter.n).toEqual(expect.any(Number));
+
+  // The seed's API key still authenticates git: the credential store and
+  // the git mirror survived the upgrade, and the seed push's commit is
+  // still the tip. The key comes from its sidecar file, never the printed
+  // state.
+  expect(gitRefs(readFileSync(KEY_PATH, "utf-8").trim(), state.slug)).toContain(
+    state.deploySha
+  );
 
   // The collaborator the control plane recorded is still on the app.
   expect(await hasCollaborator(page, state.appId, state.inviteeEmail)).toBe(

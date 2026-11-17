@@ -238,6 +238,8 @@ jobs:
               - 'apps/runner/schema*.sql'
               - 'apps/runner/src/schema_version.rs'
               - 'apps/noite/src/db/migrations/**'
+              - 'apps/noite/src/db/schema.ts'
+              - 'apps/noite/src/db/migrations.test.ts'
               - 'docker/**'
 
   # Fast on code pull requests, release on the `e2e` label or by hand from the
