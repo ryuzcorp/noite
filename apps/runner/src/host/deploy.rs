@@ -64,6 +64,20 @@ pub fn ci_cache_volume_install_prefix(cfg: &Config) -> String {
     )
 }
 
+/// Effective budgets for one Noite CI container: its memory cap in MiB and
+/// its CPU share in cores, sized from config whether or not cgroup
+/// containment is active (without containment the cgroup globals stay unset,
+/// so the globals-based flags would silently vanish in the lane). `0` keeps
+/// the old 1024 MiB fallback, matching the container's `memory_mb`.
+fn ci_container_budgets(build_memory_mb: u64, cores: u64) -> (u64, u64) {
+    let memory_mb = if build_memory_mb == 0 {
+        1024
+    } else {
+        build_memory_mb
+    };
+    (memory_mb, cores.saturating_sub(1).max(1))
+}
+
 /// Per-app exclusive lock shared by deploy and purge/delete so S3 fleets/git
 /// never see overlapping writers (ghost LTX / RestoreFailed after partial wipe).
 /// A plain mutex: every critical section below is brief and never held across
@@ -580,12 +594,10 @@ impl Progress<'_> {
                 .await?;
             return Ok(());
         }
-        let detail = lifecycle::strip_ansi(&format!("{err:#}")).into_owned();
-        let detail = lifecycle::tail_utf8(detail.trim_end(), FAILURE_TAIL);
-        // The summary is the row's own one-line error (the same sentence the
-        // app used to repeat) and the first line of its log; the detail below
-        // it is the evidence behind "View logs".
-        let summary = failure_summary(self.step, detail);
+        let owned = lifecycle::strip_ansi(&format!("{err:#}")).into_owned();
+        let full = owned.trim_end();
+        let summary = failure_summary(self.step, full);
+        let detail = lifecycle::tail_utf8(full, FAILURE_TAIL);
         self.close(
             DeployStatus::Failed,
             &format!("ERROR: {summary}\n{detail}\n"),
@@ -955,20 +967,29 @@ async fn deploy_inner(
                     .step("ci", DeployStatus::Building, CI_CONFIG_NAME)
                     .await?;
                 let cores = crate::host::memory::cores().max(1) as u64;
+                // Effective budgets for this container: it is sized from
+                // these whether or not cgroup containment is active (without
+                // containment the cgroup globals stay unset, so the
+                // globals-based flags would silently vanish here).
+                let (ci_memory_mb, ci_cpu_cores) = ci_container_budgets(cfg.build_memory_mb, cores);
                 let mut ci_env: Vec<(String, String)> = step_env
                     .iter()
                     .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
                     .collect();
                 // The runner's own V8 ceiling, like the built-in steps: a
                 // container sized from the same budget gets the same heap,
-                // never V8's default half-of-cgroup (tenant `NODE_OPTIONS`
-                // is dropped upstream, so this name is always the runner's).
-                if let Some(flag) = exec::node_heap_flag() {
+                // never V8's default half-of-cgroup. CI config
+                // (workflow/job/step) env applies over this default
+                // downstream, so a step may still override it inside its own
+                // memory-capped container; tenant `NODE_OPTIONS` rows are
+                // dropped upstream, so this default is always the runner's.
+                if let Some(flag) = exec::node_heap_flag_for(ci_memory_mb) {
                     ci_env.push(("NODE_OPTIONS".to_string(), flag));
                 }
                 // The runner's own pnpm worker cap, like the heap ceiling
-                // above (tenant `PNPM_MAX_WORKERS` is dropped upstream).
-                if let Some(workers) = exec::pnpm_workers_flag() {
+                // above (a CI step may likewise override it; tenant
+                // `PNPM_MAX_WORKERS` rows are dropped upstream).
+                if let Some(workers) = exec::pnpm_workers_flag_for(ci_memory_mb, ci_cpu_cores) {
                     ci_env.push(("PNPM_MAX_WORKERS".to_string(), workers));
                 }
                 let settings = ryuz_workflow::Settings {
@@ -976,12 +997,8 @@ async fn deploy_inner(
                     default_image: cfg.ci_default_image.clone(),
                     allowed_images: cfg.ci_allowed_images.clone(),
                     network: cfg.ci_network.clone(),
-                    memory_mb: if cfg.build_memory_mb == 0 {
-                        1024
-                    } else {
-                        cfg.build_memory_mb
-                    },
-                    cpus: cores.saturating_sub(1).max(1) as f64,
+                    memory_mb: ci_memory_mb,
+                    cpus: ci_cpu_cores as f64,
                     uid: sandbox_id.unwrap_or(0),
                     gid: sandbox_id.unwrap_or(0),
                     cache_volume: Some(ci_cache_volume(cfg, &app.id)),
@@ -3160,13 +3177,43 @@ pub async fn deploy_tip(
 mod tests {
     use super::{
         activate_after_staged_migrate, ci_cache_volume, ci_cache_volume_install_prefix,
-        ci_cache_volume_prefix, contained_deploy_root, convert_failure_detail, failure_summary,
-        go_arch, has_build_script, log_migrate_warnings, migrate_void_app, migrate_void_app_staged,
-        parse_wrangler_build, probe_staged_generation, quoted, route_live,
-        translate_wrangler_config, wipe_worktree, DeployTarget, MigrateInputs, Progress,
+        ci_cache_volume_prefix, ci_container_budgets, contained_deploy_root,
+        convert_failure_detail, failure_summary, go_arch, has_build_script, log_migrate_warnings,
+        migrate_void_app, migrate_void_app_staged, parse_wrangler_build, probe_staged_generation,
+        quoted, route_live, translate_wrangler_config, wipe_worktree, DeployTarget, MigrateInputs,
+        Progress,
     };
     use crate::models::DeployStatus;
     use serde_json::json;
+
+    /// The CI lane sizes its flags from the container's own budget, never the
+    /// cgroup globals: a capped leaf on a 32-thread box gets heap 459 and 1
+    /// worker, and an uncapped install keeps the old 1024 MiB fallback —
+    /// even where containment is unavailable and the globals stay unset.
+    #[test]
+    fn the_ci_lane_sizes_flags_from_its_own_container() {
+        let (memory, cpus) = ci_container_budgets(613, 32);
+        assert_eq!((memory, cpus), (613, 31));
+        assert_eq!(
+            crate::host::exec::node_heap_flag_for(memory),
+            Some("--max-old-space-size=459".to_string())
+        );
+        assert_eq!(
+            crate::host::exec::pnpm_workers_flag_for(memory, cpus),
+            Some("1".to_string())
+        );
+        // Uncapped builds keep the old 1024 MiB fallback.
+        let (memory, cpus) = ci_container_budgets(0, 8);
+        assert_eq!((memory, cpus), (1024, 7));
+        assert_eq!(
+            crate::host::exec::node_heap_flag_for(memory),
+            Some("--max-old-space-size=768".to_string())
+        );
+        assert_eq!(
+            crate::host::exec::pnpm_workers_flag_for(memory, cpus),
+            Some("2".to_string())
+        );
+    }
 
     /// A convert-step heap abort keeps its header: the mapper strips only
     /// the invocation line (the whole converter script), and the V8 header
@@ -3187,6 +3234,57 @@ mod tests {
         assert!(
             !detail.contains("--input-type=module"),
             "argv stripped, got {detail:?}"
+        );
+    }
+
+    /// A 30 KiB log ending in a V8 abort still persists the budget header:
+    /// the summary reads the whole message, not the 24 KiB tail the detail
+    /// keeps — so the row's `ERROR:` line names the budgets even when the
+    /// header itself falls outside the tail.
+    #[tokio::test]
+    async fn fail_persists_the_heap_header_past_a_long_tail() {
+        let pool = crate::db::connect("sqlite::memory:").await.unwrap();
+        let cfg = crate::config::config_for_tests();
+        let app = crate::db::create_app(
+            &pool,
+            &cfg,
+            crate::db::NewApp {
+                name: "failhead",
+                slug: "failhead",
+                user_id: "local",
+                subdomain: "failhead.localhost",
+                listen: 0,
+                internal: 30103,
+            },
+        )
+        .await
+        .unwrap();
+        let mut progress = Progress {
+            pool: &pool,
+            app_id: &app.id,
+            cancel: None,
+            environment_id: None,
+            sha: Some("abc123".to_string()),
+            id: None,
+            step: "install",
+        };
+        let filler = "x".repeat(30 * 1024);
+        let err = anyhow::anyhow!(
+            "jup [\"install\"] exit None\nthe build step ran out of JavaScript heap (Node aborted with `FATAL ERROR: Reached heap limit`; the V8 ceiling is 459 MiB from a 613 MiB RAM budget, RUNNER_BUILD_MEMORY_MB, plus 600 MiB swap, RUNNER_BUILD_SWAP_MB). Raise the budget (if the box has the RAM for it) or deploy a prebuilt dist from CI; the runner and the apps kept serving\n{filler}\nFATAL ERROR: Reached heap limit Allocation failed - JavaScript heap out of memory\n"
+        );
+        progress.fail(&err).await.unwrap();
+        let log: String = sqlx::query_scalar("SELECT log FROM deploy WHERE id = ?")
+            .bind(progress.id.clone().unwrap_or_default())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert!(
+            log.contains("RUNNER_BUILD_MEMORY_MB"),
+            "header survives the tail cut"
+        );
+        assert!(
+            log.contains("RUNNER_BUILD_SWAP_MB"),
+            "header survives the tail cut"
         );
     }
 

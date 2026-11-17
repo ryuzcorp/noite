@@ -78,8 +78,15 @@ pub(crate) fn build_node_heap_max_mb(memory_mb: u64) -> Option<u64> {
 /// runs, lifecycle scripts, the config converter — sizes its heap from the
 /// leaf's real budget instead of V8's default half-of-cgroup.
 pub(crate) fn node_heap_flag() -> Option<String> {
-    let heap = build_node_heap_max_mb(crate::host::cgroups::build_memory_mb()?)?;
-    Some(format!("--max-old-space-size={heap}"))
+    node_heap_flag_for(crate::host::cgroups::build_memory_mb()?)
+}
+
+/// The runner-owned `NODE_OPTIONS` for an explicit budget (`None` when `0`):
+/// the CI lane sizes its container from config whether or not cgroup
+/// containment is active (without containment the globals above stay unset,
+/// so the globals-based flag would silently vanish there).
+pub(crate) fn node_heap_flag_for(memory_mb: u64) -> Option<String> {
+    build_node_heap_max_mb(memory_mb).map(|heap| format!("--max-old-space-size={heap}"))
 }
 
 /// MiB of leaf RAM per pnpm tarball worker. pnpm's pool defaults to one
@@ -107,11 +114,17 @@ pub(crate) fn build_pnpm_workers_max(memory_mb: u64, cpu_cores: u64) -> Option<u
 /// builds run uncapped): pnpm's exact worker count, sized from the leaf's
 /// real budget instead of the host's CPU count.
 pub(crate) fn pnpm_workers_flag() -> Option<String> {
-    let workers = build_pnpm_workers_max(
+    pnpm_workers_flag_for(
         crate::host::cgroups::build_memory_mb()?,
         crate::host::cgroups::build_cpu_cores(),
-    )?;
-    Some(workers.to_string())
+    )
+}
+
+/// The runner-owned `PNPM_MAX_WORKERS` for an explicit budget (`None` when
+/// `0`): like [`node_heap_flag_for`], for lanes sized from config instead of
+/// the cgroup globals.
+pub(crate) fn pnpm_workers_flag_for(memory_mb: u64, cpu_cores: u64) -> Option<String> {
+    build_pnpm_workers_max(memory_mb, cpu_cores).map(|workers| workers.to_string())
 }
 
 /// A V8 heap abort in a step's output: Node SIGABRTs, so the status has no
