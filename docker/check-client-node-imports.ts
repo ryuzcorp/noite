@@ -17,6 +17,13 @@
  * a builtin. `bun run build` in ci.yml's `worker` job still proves
  * workerd-compat; this proves the browser half.
  *
+ * Second layer (`--dist`, after `bun run build`): fail when a built client
+ * chunk contains Vite's inlined stub factory for an externalized builtin.
+ * The source walk drops bare specifiers, so a page-reachable dependency
+ * importing `node:fs` builds and binds to the same stub invisibly — the
+ * dist scan catches it with Vite's real resolution (no false positives on
+ * node-only export branches, which a `node_modules` source walk would hit).
+ * Only `dist/client` is read; the worker bundle legitimately keeps `node:`.
  * Scope: static ESM edges only (`import … from`, side-effect `import`,
  * `export … from`). `import type` / `export type` are erased before the
  * bundle and ignored, as is dynamic `import()` (a lazy boundary that may
@@ -294,6 +301,64 @@ export const checkClientGraph = (
   });
 };
 
+/**
+ * Fail closed: an empty page set means the entry scan found nothing (a moved
+ * pages directory, a broken walk), not a clean tree — without this,
+ * `checkClientGraph` over zero entries reports zero violations and the gate
+ * prints `clean (0 pages)` with exit 0. Exported for tests; `main` turns
+ * the throw into the failure below.
+ */
+export const requireClientEntries = (entries: readonly string[]): void => {
+  if (entries.length === 0) {
+    throw new Error(
+      "check-client-node-imports: no client pages found under apps/noite/src/pages/ — the entry scan is broken, failing closed"
+    );
+  }
+};
+
+/** A built client chunk that bundles a stubbed Node builtin. */
+export interface ClientDistViolation {
+  /** The chunk path relative to the repo root. */
+  file: string;
+}
+
+/**
+ * Vite 8 (Rolldown) inlines an externalized browser builtin as a stub
+ * factory passed to the CJS interop helper — e.g.
+ * `(0,e(((e,t)=>{t.exports={}}))().readFileSync)(...)` for a bundled
+ * `node:fs` (captured from vite 8.3.8 output; re-capture the fixture in
+ * `check-client-node-imports.test.ts` when Vite is bumped). The parameter
+ * names are minified per chunk, so only the shape is matched: an arrow
+ * factory whose whole body assigns `{}` to `.exports`, passed as a call
+ * argument. The worker/SSR bundles keep real `node:` imports (workerd
+ * supports them), so only `dist/client` is scanned — `.js` only, since
+ * sourcemaps carry the original specifiers in `sourcesContent`.
+ */
+export const DIST_STUB_PATTERN =
+  /\(\(\([\w$]+,[\w$]+\)=>\{[\w$]+\.exports=\{\}\}\)\)/u;
+
+/**
+ * Built client chunks (`files` is chunk path → content) that bundle a
+ * stubbed builtin. Pure for tests; the repo scan reads `dist/client`.
+ */
+export const checkBuiltClient = (
+  files: ReadonlyMap<string, string>
+): ClientDistViolation[] => {
+  const violations: ClientDistViolation[] = [];
+
+  for (const [file, content] of files) {
+    if (!file.endsWith(".js")) {
+      continue;
+    }
+
+    if (DIST_STUB_PATTERN.test(content)) {
+      violations.push({ file });
+    }
+  }
+
+  return violations.toSorted((a, b) => (a.file < b.file ? -1 : 1));
+};
+
 const TS_EXT = {
   ".ts": true,
   ".tsx": true,
@@ -338,13 +403,21 @@ const walkSources = (
   }
 };
 
-const main = (): void => {
+const checkSources = (): void => {
   const root = new URL("../", import.meta.url).pathname;
   const sources = new Map<string, string>();
 
   walkSources(path.join(root, "apps/noite/src"), root, sources);
 
   const entries = [...sources.keys()].filter((file) => isClientEntry(file));
+
+  try {
+    requireClientEntries(entries);
+  } catch (error) {
+    console.log(error instanceof Error ? error.message : String(error));
+    process.exit(1);
+  }
+
   const violations = checkClientGraph(entries, sources);
 
   for (const violation of violations) {
@@ -363,6 +436,89 @@ const main = (): void => {
   console.log(
     `check-client-node-imports: clean (${entries.length} pages, ${sources.size} modules)`
   );
+};
+
+/**
+ * The `bun run build` half of the guard: fail when a built client chunk
+ * bundles a stubbed builtin. This is what catches builtins arriving through
+ * a dependency — the source walk drops bare specifiers, so a
+ * page-reachable `node_modules` package importing `node:fs` builds and
+ * binds to the same stub. Vite uses its real (browser-condition) resolution
+ * here, so unlike a `node_modules` source walk this cannot false-positive
+ * on node-only export branches. Run with `--dist` after the build; only
+ * `dist/client` is read (the worker bundle legitimately keeps `node:`
+ * imports).
+ */
+const checkDist = (): void => {
+  const root = new URL("../", import.meta.url).pathname;
+  const distClient = path.join(root, "apps/noite/dist/client");
+  const chunks = new Map<string, string>();
+
+  const readChunks = (dir: string): void => {
+    let names: string[];
+
+    try {
+      names = readdirSync(dir).toSorted();
+    } catch {
+      console.log(
+        "check-client-node-imports --dist: apps/noite/dist/client is missing — run `bun run build` in apps/noite first"
+      );
+      process.exit(1);
+    }
+
+    for (const name of names) {
+      const full = path.join(dir, name);
+      const stat = statSync(full, { throwIfNoEntry: false });
+
+      if (!stat) {
+        continue;
+      }
+
+      if (stat.isDirectory()) {
+        readChunks(full);
+      } else if (name.endsWith(".js")) {
+        chunks.set(path.relative(root, full), readFileSync(full, "utf-8"));
+      }
+    }
+  };
+
+  readChunks(distClient);
+
+  if (chunks.size === 0) {
+    console.log(
+      "check-client-node-imports --dist: no client chunks found under apps/noite/dist/client — the build emitted nothing, failing closed"
+    );
+    process.exit(1);
+  }
+
+  const violations = checkBuiltClient(chunks);
+
+  for (const violation of violations) {
+    console.log(
+      `${violation.file}: built client chunk bundles a stubbed node builtin (an externalized browser import) — find it via the build warning \`Module ... has been externalized for browser compatibility, imported by ...\` or the source walk above; move the builtin behind a server-only module`
+    );
+  }
+
+  if (violations.length > 0) {
+    console.log(
+      `check-client-node-imports --dist: ${violations.length} violation(s) in ${chunks.size} chunk(s)`
+    );
+    process.exit(1);
+  }
+
+  console.log(
+    `check-client-node-imports --dist: clean (${chunks.size} chunks)`
+  );
+};
+
+const main = (): void => {
+  if (process.argv.includes("--dist")) {
+    checkDist();
+
+    return;
+  }
+
+  checkSources();
 };
 
 if (import.meta.main) {
