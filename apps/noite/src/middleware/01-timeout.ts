@@ -25,8 +25,37 @@
  * `/mcp` carries its own, longer bound: one `tools/call` may deliberately wait
  * (`wait_for_deploy`, capped at 60 s), so the action bound would cut a healthy
  * answer into a 504 the caller cannot read.
+ *
+ * The bound aborts the downstream work, not just the response: each bounded
+ * request gets an `AbortController`, and the whole downstream pipeline runs
+ * inside that signal's `AsyncLocalStorage` store (see
+ * `lib/request-timeout.ts`) — strictly per request, so overlapping requests
+ * never observe each other's bound. The signal is aborted with a typed
+ * `RequestTimeoutError` when the bound fires. `runnerFetch` folds that
+ * signal into every runner call, so after the 504 no further outbound runner
+ * call starts for that request and in-flight ones reject. A slow write that
+ * already reached the runner still stands — the abort stops our side
+ * waiting, it cannot un-apply the runner's — which is why a retry after a
+ * 504 can double-apply a write the first attempt already committed; the
+ * bound narrows that window from "the whole stuck handler" to the bound
+ * itself. D1 needs no rollback: the control plane runs no interactive
+ * transactions, so every control write is one statement or one `db.batch`,
+ * and D1 applies each atomically. Exempt routes never get a controller and
+ * are unaffected. A client disconnect aborts through the same controller
+ * with a typed `ClientDisconnectError`, so a gone client stops its
+ * downstream the same way — and quietly, not as an "Internal error".
  */
 import { defineMiddleware } from "void";
+
+// The per-request AsyncLocalStorage backend (server-only): registering it
+// here keeps `node:async_hooks` out of the browser bundle that includes
+// `request-timeout.ts` via `lib/runner.ts`.
+import "../lib/request-timeout-node";
+import {
+  ClientDisconnectError,
+  RequestTimeoutError,
+  runWithRequestTimeout,
+} from "../lib/request-timeout";
 
 /** Bound every bounded route: a hung handler fails fast, never hangs. */
 export const TIMEOUT_MS = 15_000;
@@ -77,7 +106,13 @@ export const routeTimeout = (
     : { kind: "exempt", why };
 };
 
-/** A timeout gate with an explicit bound (the default export uses {@link TIMEOUT_MS}). */
+/** A timeout gate with an explicit bound (the default export uses {@link TIMEOUT_MS}).
+ * A bounded request runs under its own `AbortController`: the whole
+ * downstream pipeline runs inside the request's `AsyncLocalStorage` store
+ * (see `lib/request-timeout.ts`) and the signal is aborted with a typed
+ * reason when the bound fires, so the slow write behind the 504 stops
+ * instead of double-applying on retry. A client disconnect aborts with a
+ * typed reason through the same controller. */
 export const timeoutMiddleware = (ms: number) =>
   defineMiddleware(async (c, next) => {
     const bound = routeTimeout(c.req.path, ms);
@@ -86,21 +121,41 @@ export const timeoutMiddleware = (ms: number) =>
       return next();
     }
 
+    const controller = new AbortController();
+    const raw = c.req.raw.signal;
+
+    const onDisconnect = (): void => {
+      controller.abort(new ClientDisconnectError());
+    };
+
+    if (raw.aborted) {
+      onDisconnect();
+    } else {
+      raw.addEventListener("abort", onDisconnect, { once: true });
+    }
+
     const timeout = Promise.withResolvers<"timeout">();
-    const timer = setTimeout(() => timeout.resolve("timeout"), bound.ms);
+
+    const timer = setTimeout(() => {
+      controller.abort(new RequestTimeoutError(bound.ms));
+      timeout.resolve("timeout");
+    }, bound.ms);
 
     try {
-      const winner = await Promise.race([
-        // oxlint-disable-next-line node/callback-return -- Hono's next() resolves the downstream pipeline (not a Node callback); the race — not a return — settles the response.
-        next().then((): "done" => "done"),
-        timeout.promise,
-      ]);
+      const winner = await runWithRequestTimeout(controller.signal, () =>
+        Promise.race([
+          // oxlint-disable-next-line node/callback-return -- Hono's next() resolves the downstream pipeline (not a Node callback); the race — not a return — settles the response.
+          next().then((): "done" => "done"),
+          timeout.promise,
+        ])
+      );
 
       if (winner === "timeout") {
         return c.json({ error: "Request timed out" }, 504);
       }
     } finally {
       clearTimeout(timer);
+      raw.removeEventListener("abort", onDisconnect);
     }
   });
 

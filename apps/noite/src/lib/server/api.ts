@@ -24,6 +24,12 @@
  * - unreadable input → 400 `{error: "Invalid JSON"}` (oversize bodies reuse
  *   the HTTP layer's 413), a schema decode failure → 422
  *   `{errors: {form: "Invalid input"}}`.
+ * - the route bound fired (`RequestTimeoutError`) → 504 `{error: "Request
+ *   timed out"}`: the timeout middleware already answered, so this only
+ *   ends the orphaned downstream run quietly (no "Internal error" log for
+ *   designed behavior).
+ * - the caller disconnected (`ClientDisconnectError`) → 499 `{error:
+ *   "Client disconnected"}`: same quiet ending for a gone caller.
  */
 import * as Schema from "effect/Schema";
 import { defineHandler } from "void";
@@ -32,6 +38,7 @@ import type { TypedHandler } from "void";
 import { MAX_BODY_BYTES, readBoundedText, tooLarge } from "../../http/body";
 import { isSameOriginAction } from "../../http/origin";
 import { errorLogText, errorMessage } from "../errors";
+import { ClientDisconnectError, RequestTimeoutError } from "../request-timeout";
 
 // oxlint-disable-next-line unicorn/throw-new-error -- Schema.TaggedError factory (same pattern as lib/auth.ts)
 export class ActionFailure extends Schema.TaggedError<ActionFailure>()(
@@ -54,6 +61,21 @@ export interface ActionContext {
  * unit test; the handler below is the only other caller). */
 // oxlint-disable-next-line anti-slop/no-unknown-parameters -- catch-site values are unknown by construction; this maps them to wire responses.
 export const actionErrorResponse = (error: unknown): Response => {
+  // The route bound fired mid-action: the timeout middleware already
+  // answered the 504, so this only ends the orphaned downstream run with
+  // the same body — and, crucially, without the "Internal error" log below
+  // (a designed timeout is not a bug to page on).
+  if (error instanceof RequestTimeoutError) {
+    return Response.json({ error: "Request timed out" }, { status: 504 });
+  }
+
+  // The caller went away mid-action: the response is already moot, so this
+  // only ends the orphaned downstream run quietly — a disconnect is not a
+  // bug to page on, and never an "Internal error".
+  if (error instanceof ClientDisconnectError) {
+    return Response.json({ error: "Client disconnected" }, { status: 499 });
+  }
+
   const tag =
     error instanceof Error && "_tag" in error ? error._tag : undefined;
 

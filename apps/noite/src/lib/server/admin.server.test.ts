@@ -1,17 +1,20 @@
 /* oxlint-disable anti-slop/no-chained-type-assertions, anti-slop/require-safety-comment-for-type-assertion -- test doubles: a minimal KitEnv stands in for the Worker env; row reads mirror the better-auth tables */
-import { beforeEach, describe, expect, spyOn, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 
 import type { TypedHandler } from "void";
 
 import { testRouteContext } from "../../testing/context";
 import { createTestD1 } from "../../testing/d1";
 import type { TestD1 } from "../../testing/d1";
+import { installRunnerMock, makeApp } from "../../testing/runner-mock";
+import type { RunnerMock } from "../../testing/runner-mock";
 import { authFromEnv } from "../auth";
 import { controlEnv } from "../control-env";
 import { ensureDb, setD1Binding } from "../db";
 import { registrationStatus } from "./account.server";
 import {
   adminCreateEmailInvite,
+  adminDeleteApp,
   adminListEmailInvites,
   approveUser,
   ensureAdminAccount,
@@ -449,5 +452,77 @@ describe("waitlist moderation", () => {
     );
 
     expect(signedOut.status).toBe(401);
+  });
+});
+
+/** One grant plus one pending invitation for the app under test. */
+const seedGrants = (appId: string, userId: string): void => {
+  db.raw.run(
+    `INSERT INTO app_collaborator (id, appId, userId, role) VALUES (?, ?, ?, ?)`,
+    [`grant-${appId}`, appId, userId, "admin"]
+  );
+  db.raw.run(
+    `INSERT INTO collaborator_invite (id, appId, appName, email, invitedBy, role) VALUES (?, ?, ?, ?, ?, ?)`,
+    [`invite-${appId}`, appId, "Gone", "gone@example.com", userId, "view"]
+  );
+};
+
+/** Grants plus invitations still held for the app. */
+const grantsLeft = (appId: string): number => {
+  // SAFETY: the seed above holds exactly these rows; the counts below drop to zero with them.
+  const rows = db.raw
+    .query(`SELECT id FROM app_collaborator WHERE appId = ?`)
+    .all(appId) as unknown[];
+
+  const invites = db.raw
+    .query(`SELECT id FROM collaborator_invite WHERE appId = ?`)
+    .all(appId) as unknown[];
+
+  return rows.length + invites.length;
+};
+
+describe("adminDeleteApp", () => {
+  let runner: RunnerMock | undefined;
+
+  afterEach(() => {
+    runner?.restore();
+    runner = undefined;
+  });
+
+  test("a runner 404 still drops the grants and answers ok", async () => {
+    const cookie = await mintCookie("admin-1", "admin@example.com", "admin");
+    seedGrants("app-gone", "admin-1");
+    // The app is already gone runner-side: DELETE answers 404.
+    runner = installRunnerMock([]);
+
+    const result = await authedPost(
+      adminDeleteApp,
+      "/api/admin/adminDeleteApp",
+      "app-gone",
+      cookie
+    );
+
+    expect(result.status).toBe(200);
+    expect(await result.json()).toEqual({ ok: true });
+    expect(runner.calls).toEqual(["DELETE /v1/apps/app-gone"]);
+    expect(grantsLeft("app-gone")).toBe(0);
+  });
+
+  test("a present app deletes and drops its grants", async () => {
+    const cookie = await mintCookie("admin-1", "admin@example.com", "admin");
+    seedGrants("app-there", "admin-1");
+    runner = installRunnerMock([makeApp({ id: "app-there", slug: "there" })]);
+
+    const result = await authedPost(
+      adminDeleteApp,
+      "/api/admin/adminDeleteApp",
+      "app-there",
+      cookie
+    );
+
+    expect(result.status).toBe(200);
+    expect(await result.json()).toEqual({ ok: true });
+    expect(runner.calls).toEqual(["DELETE /v1/apps/app-there"]);
+    expect(grantsLeft("app-there")).toBe(0);
   });
 });
