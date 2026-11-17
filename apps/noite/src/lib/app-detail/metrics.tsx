@@ -427,24 +427,27 @@ export const AnalyticsCard = ({
       ? "Usage stream disconnected — retrying…"
       : (feedProblem(feed.state()) ?? "");
 
-  if (loadError()) {
-    return <p class="text-error m-0 text-sm">{loadError()}</p>;
-  }
-
-  if (!feedLoaded(feed.state())) {
-    return (
-      <div
-        role="status"
-        aria-label="Loading analytics"
-        class="flex flex-col gap-2"
-      >
-        <div class="skeleton h-4 w-64" />
-        <div class="skeleton h-16 w-full" />
-      </div>
-    );
-  }
-
+  // A reconnect keeps the last frame: the retry line paints above the
+  // retained tables (like the Metrics detail view), and only a panel with
+  // no frame at all fails or skeletons.
   if (!hasRows) {
+    if (loadError()) {
+      return <p class="text-error m-0 text-sm">{loadError()}</p>;
+    }
+
+    if (!feedLoaded(feed.state())) {
+      return (
+        <div
+          role="status"
+          aria-label="Loading analytics"
+          class="flex flex-col gap-2"
+        >
+          <div class="skeleton h-4 w-64" />
+          <div class="skeleton h-16 w-full" />
+        </div>
+      );
+    }
+
     return (
       <p class="m-0 text-sm opacity-70">
         No traffic recorded yet — hit the app URL to see the breakdown.
@@ -453,32 +456,35 @@ export const AnalyticsCard = ({
   }
 
   return (
-    <div class="grid grid-cols-1 gap-4 md:grid-cols-2">
-      <BreakdownSection
-        empty="No browser data in this window."
-        entries={breakdown.browsers}
-        head="Browser"
-        title="Browsers"
-      />
-      <BreakdownSection
-        empty="No OS data in this window."
-        entries={breakdown.os}
-        head="OS"
-        title="Operating systems"
-      />
-      <BreakdownSection
-        empty="No paths in this window."
-        entries={breakdown.paths}
-        head="Path"
-        title="Paths"
-      />
-      <BreakdownSection
-        empty="No referrer data in this window."
-        entries={breakdown.referrers}
-        head="Source"
-        title="Referrers"
-      />
-    </div>
+    <>
+      {loadError() ? <p class="text-error m-0 text-sm">{loadError()}</p> : null}
+      <div class="grid grid-cols-1 gap-4 md:grid-cols-2">
+        <BreakdownSection
+          empty="No browser data in this window."
+          entries={breakdown.browsers}
+          head="Browser"
+          title="Browsers"
+        />
+        <BreakdownSection
+          empty="No OS data in this window."
+          entries={breakdown.os}
+          head="OS"
+          title="Operating systems"
+        />
+        <BreakdownSection
+          empty="No paths in this window."
+          entries={breakdown.paths}
+          head="Path"
+          title="Paths"
+        />
+        <BreakdownSection
+          empty="No referrer data in this window."
+          entries={breakdown.referrers}
+          head="Source"
+          title="Referrers"
+        />
+      </div>
+    </>
   );
 };
 
