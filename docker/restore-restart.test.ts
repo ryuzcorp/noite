@@ -109,6 +109,7 @@ interface RestoreOpts {
   edgeGone?: boolean;
   envFile?: string;
   from?: string | null;
+  noTars?: boolean;
   noManifest?: boolean;
   extraTars?: string[];
   tarSignal?: "INT" | "TERM";
@@ -139,6 +140,7 @@ const scrubEnv = () => {
 const prepareFromDir = (
   from: string | null,
   noManifest: boolean | undefined,
+  noTars: boolean | undefined,
   extraTars: string[]
 ): string | undefined => {
   if (from === null) {
@@ -157,7 +159,9 @@ const prepareFromDir = (
     writeFileSync(path.join(bk, "MANIFEST"), "noite backup\n");
   }
 
-  writeFileSync(path.join(bk, "noite-data.tar"), "fake-tar\n");
+  if (!noTars) {
+    writeFileSync(path.join(bk, "noite-data.tar"), "fake-tar\n");
+  }
 
   for (const name of extraTars) {
     writeFileSync(path.join(bk, name), "fake-tar\n");
@@ -174,6 +178,7 @@ const runRestore = (opts: RestoreOpts = {}): RunResult & { log: string } => {
     envFile,
     from = "auto",
     noManifest,
+    noTars,
     extraTars = [],
     tarSignal,
     tenancy,
@@ -201,7 +206,7 @@ const runRestore = (opts: RestoreOpts = {}): RunResult & { log: string } => {
   writeFileSync(logFile, "");
   writeFileSync(stateFile, "running");
 
-  const fromArg = prepareFromDir(from, noManifest, extraTars);
+  const fromArg = prepareFromDir(from, noManifest, noTars, extraTars);
 
   const clean = scrubEnv();
 
@@ -325,6 +330,16 @@ describe("make restore restart", () => {
       expect(composeLines(r.log, "down")).toHaveLength(0);
       expect(composeLines(r.log, "up")).toHaveLength(0);
     }
+  });
+
+  test("a backup directory with no tars fails before the stop", () => {
+    const r = runRestore({ noTars: true });
+
+    expect(r.status).not.toBe(0);
+    expect(r.stdout).not.toContain("restored.");
+    expect(r.stderr).toContain("no .tar files");
+    expect(composeLines(r.log, "down")).toHaveLength(0);
+    expect(composeLines(r.log, "up")).toHaveLength(0);
   });
 
   test("an up that fails with every container running still succeeds, with a note", () => {

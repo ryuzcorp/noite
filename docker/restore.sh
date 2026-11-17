@@ -39,6 +39,17 @@ if [ ! -f "${FROM_DIR}/MANIFEST" ]; then
   echo "error: ${FROM_DIR} has no MANIFEST — is it a 'make backup' directory?"
   exit 1
 fi
+# A MANIFEST with zero tars restores nothing: refuse before the stop, so a
+# typo'd or half-copied directory neither stops the stack nor prints success.
+tars=0
+for _tar in "${FROM_DIR}"/*.tar; do
+  [ -f "$_tar" ] || continue
+  tars=$((tars + 1))
+done
+if [ "$tars" = 0 ]; then
+  echo "error: ${FROM_DIR} has no .tar files — nothing to restore" >&2
+  exit 1
+fi
 
 # Same project the Makefile drives (`make restore PROJECT=x`); a direct run
 # follows COMPOSE_PROJECT_NAME, else the default install. Always `-p`: the
