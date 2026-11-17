@@ -863,6 +863,10 @@ fn provider_setting_parses_with_problems() {
         ProviderSetting::Minio
     );
     assert_eq!(
+        ProviderSetting::parse(Some("rustfs"), &mut problems),
+        ProviderSetting::Rustfs
+    );
+    assert_eq!(
         ProviderSetting::parse(Some("aws"), &mut problems),
         ProviderSetting::Aws
     );
@@ -918,10 +922,345 @@ fn auto_resolution_matrix() {
     );
     assert!(Credentials::configure(ProviderSetting::Minio, &other, "noite").is_scoped());
     assert!(Credentials::configure(ProviderSetting::Aws, &other, "noite").is_scoped());
+    assert_eq!(
+        Credentials::configure(ProviderSetting::Minio, &store, "noite").summary(),
+        "scoped (minio)",
+        "explicit minio wins even on the bundled endpoint"
+    );
+    assert_eq!(
+        Credentials::configure(ProviderSetting::Rustfs, &other, "noite").summary(),
+        "scoped (rustfs)",
+        "explicit rustfs resolves on any endpoint, no probe needed"
+    );
 }
 
-/// The store really enforces the minted key: against `rustfs:1.0.3` (the
-/// image pin) a scoped key reads and writes its own prefix and is refused
+/// The health body is what identifies a RustFS: the pinned image answers
+/// `{"service":"rustfs-endpoint",…}` on `/minio/health/live` (recorded
+/// below); MinIO answers the same path with `{}`. Anything else is not a
+/// RustFS — identification fails safe into the admin probe.
+#[test]
+fn rustfs_health_body_identifies_rustfs() {
+    // Recorded from the pinned image: `curl $RUSTFS/minio/health/live`.
+    let recorded = br#"{"service":"rustfs-endpoint","status":"ok","timestamp":"2026-11-17T06:01:07Z[Etc/Unknown]","version":"1.0.5"}"#;
+    assert!(super::is_rustfs_health_body(recorded));
+    assert!(super::is_rustfs_health_body(
+        br#"{"service":"RustFS-Endpoint","status":"ok"}"#
+    ));
+    for unmarked in [
+        &b"{}"[..],
+        b"not json",
+        b"",
+        br#"{"service":"minio"}"#,
+        br#"{"service":42}"#,
+    ] {
+        assert!(!super::is_rustfs_health_body(unmarked), "{unmarked:?}");
+    }
+}
+
+/// A stub store answering per path: the health endpoint with `health_body`
+/// and every admin path with `admin_status`.
+async fn routing_stub(
+    health_body: &'static str,
+    admin_status: u16,
+) -> (tokio::task::JoinHandle<()>, String) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind stub");
+    let addr = listener.local_addr().expect("stub addr");
+    let handle = tokio::spawn(async move {
+        loop {
+            let Ok((mut sock, _)) = listener.accept().await else {
+                break;
+            };
+            tokio::spawn(async move {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut buf = vec![0u8; 4096];
+                let n = sock.read(&mut buf).await.unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]).into_owned();
+                let line = req.lines().next().unwrap_or_default().to_string();
+                let (status, body): (u16, Vec<u8>) = if line.contains("/minio/health/live") {
+                    (200, health_body.as_bytes().to_vec())
+                } else {
+                    (admin_status, b"<Error><Code>Denied</Code></Error>".to_vec())
+                };
+                let head = format!(
+                    "HTTP/1.1 {status}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = sock.write_all(head.as_bytes()).await;
+                let _ = sock.write_all(&body).await;
+            });
+        }
+    });
+    (handle, format!("http://127.0.0.1:{}", addr.port()))
+}
+
+fn detect_store(endpoint: &str) -> StoreAccess {
+    StoreAccess {
+        endpoint: endpoint.into(),
+        identity_endpoint: endpoint.into(),
+        region: "us-east-1".into(),
+        access_key: "a".into(),
+        secret_key: "b".into(),
+    }
+}
+
+/// Fail-before: a RustFS behind any other hostname used to resolve to the
+/// MinIO provider, whose fleet-key policy RustFS 1.0.x rejects
+/// (`s3:CompleteMultipartUpload`) — every tenant deploy failed. The health
+/// endpoint now identifies it before the admin probe runs, so even a store
+/// answering the admin API gets the RustFS policy.
+#[tokio::test]
+async fn detect_prefers_rustfs_policy_when_health_claims_rustfs() {
+    let (_handle, endpoint) = routing_stub(
+        r#"{"service":"rustfs-endpoint","status":"ok","version":"1.0.5"}"#,
+        200,
+    )
+    .await;
+    let creds = super::detect(&detect_store(&endpoint), "noite")
+        .await
+        .expect("detect");
+    assert_eq!(creds.summary(), "scoped (rustfs)");
+}
+
+/// Unknown identity keeps the previous behaviour: the MinIO admin probe
+/// decides, and a store without it stays on root keys with the reason.
+#[tokio::test]
+async fn detect_falls_back_when_identity_unknown() {
+    let (_handle, endpoint) = routing_stub("{}", 404).await;
+    let creds = super::detect(&detect_store(&endpoint), "noite")
+        .await
+        .expect("detect");
+    let summary = creds.summary();
+    assert!(summary.starts_with("root ("), "{summary}");
+    assert!(summary.contains("no MinIO admin API"), "{summary}");
+}
+
+/// Signed S3 call with an arbitrary key pair (proves enforcement, not
+/// just minting): PUT/GET bodies are small, LIST is one page. Returns the
+/// status, body, and the ETag / version-id response headers multipart
+/// and versioning assertions need.
+async fn s3(
+    client: &reqwest::Client,
+    endpoint: &str,
+    keys: (&str, &str),
+    method: &str,
+    path_qs: &str,
+    headers: &[(&str, &str)],
+    body: &[u8],
+) -> (u16, String, Option<String>, Option<String>) {
+    use sha2::{Digest, Sha256};
+    let (path, qs) = path_qs.split_once('?').unwrap_or((path_qs, ""));
+    // SigV4 signs `name=` for valueless subresources (`?uploads`,
+    // `?versioning`): the raw form signs a different string than the
+    // store verifies. Normalize before signing and sending.
+    let qs: String = {
+        let mut parts: Vec<&str> = qs.split('&').filter(|p| !p.is_empty()).collect();
+        parts.sort_unstable();
+        parts
+            .iter()
+            .map(|p| {
+                if p.contains('=') {
+                    (*p).to_string()
+                } else {
+                    format!("{p}=")
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("&")
+    };
+    let path_qs = if qs.is_empty() {
+        path.to_string()
+    } else {
+        format!("{path}?{qs}")
+    };
+    let payload_hash = super::hex_encode(Sha256::digest(body).as_slice());
+    let (amz_date, date_stamp) = super::sigv4_now();
+    let url = reqwest::Url::parse(endpoint).expect("endpoint");
+    let host = match url.port() {
+        Some(port) => format!("{}:{port}", url.host_str().expect("host")),
+        None => url.host_str().expect("host").to_string(),
+    };
+    let auth = super::SigV4 {
+        method,
+        uri: path,
+        query: qs.as_str(),
+        host: &host,
+        region: "us-east-1",
+        service: "s3",
+        access_key: keys.0,
+        secret_key: keys.1,
+        payload_hash: &payload_hash,
+        amz_date: &amz_date,
+        date_stamp: &date_stamp,
+    }
+    .authorization();
+    let mut req = client
+        .request(
+            method.parse().expect("method"),
+            format!("{endpoint}{path_qs}"),
+        )
+        .header("x-amz-date", amz_date)
+        .header("x-amz-content-sha256", payload_hash)
+        .header("authorization", auth);
+    for (k, v) in headers {
+        req = req.header(*k, *v);
+    }
+    let resp = req.body(body.to_vec()).send().await.expect("s3 call");
+    let status = resp.status().as_u16();
+    let etag = resp
+        .headers()
+        .get("etag")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    let version = resp
+        .headers()
+        .get("x-amz-version-id")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    let text = resp.text().await.unwrap_or_default();
+    (status, text, etag, version)
+}
+
+fn tag(text: &str, name: &str) -> Option<String> {
+    let open = format!("<{name}>");
+    let close = format!("</{name}>");
+    let start = text.find(&open)? + open.len();
+    let end = text[start..].find(&close)?;
+    Some(text[start..start + end].to_string())
+}
+
+/// `auto` identifies a real RustFS behind a non-`rustfs` hostname, and the
+/// detected provider mints a key the store enforces: the BYO-S3 path end
+/// to end (detect → mint → scoped write/read → revoke). Gated like the
+/// other real-rustfs tests; skips when the endpoint is the bundled one,
+/// which never reaches `detect`.
+#[tokio::test]
+async fn detect_scopes_real_rustfs_on_any_endpoint() {
+    let Some(endpoint) = std::env::var("NOITE_TEST_RUSTFS_ENDPOINT")
+        .ok()
+        .filter(|v| !v.is_empty())
+    else {
+        eprintln!("skip: NOITE_TEST_RUSTFS_ENDPOINT unset (CI provides the rustfs service)");
+        return;
+    };
+    if endpoint.trim_end_matches('/') == super::BUNDLED_ENDPOINT {
+        eprintln!("skip: the bundled endpoint never reaches detect; run against a BYO hostname");
+        return;
+    }
+    let (root_access, root_secret) = match std::env::var("NOITE_TEST_RUSTFS_KEYS").ok() {
+        Some(pair) => {
+            let (a, s) = pair
+                .split_once(':')
+                .expect("NOITE_TEST_RUSTFS_KEYS is access:secret");
+            (a.to_string(), s.to_string())
+        }
+        None => (
+            "noiteaccess".to_string(),
+            "noitesecretnoitesecretnoite12".to_string(),
+        ),
+    };
+    let store = StoreAccess {
+        endpoint: endpoint.clone(),
+        identity_endpoint: endpoint.clone(),
+        region: "us-east-1".into(),
+        access_key: root_access.clone(),
+        secret_key: root_secret.clone(),
+    };
+    // A non-bundled endpoint leaves `auto` to the boot probe …
+    assert_eq!(
+        Credentials::configure(ProviderSetting::Auto, &store, "noite").summary(),
+        "undetected"
+    );
+    // … which identifies the RustFS by evidence, not hostname.
+    let creds = super::detect(&store, "noite").await.expect("detect");
+    assert_eq!(creds.summary(), "scoped (rustfs)");
+    let Credentials::Scoped(provider) = creds else {
+        panic!("detect resolved scoped");
+    };
+    assert_eq!(provider.name(), "rustfs");
+    // The detected provider mints a key that reaches only its own prefix.
+    let bucket = format!("noite-detect-test-{}", std::process::id());
+    let client = reqwest::Client::new();
+    let (status, ..) = s3(
+        &client,
+        &endpoint,
+        (&root_access, &root_secret),
+        "PUT",
+        &format!("/{bucket}"),
+        &[],
+        b"",
+    )
+    .await;
+    assert!((200..300).contains(&status), "mkbucket: {status}");
+    let minted = provider.mint(&bucket, "fleets/probe/").await.expect("mint");
+    let (status, body, ..) = s3(
+        &client,
+        &endpoint,
+        (&minted.access_key, &minted.secret_key),
+        "PUT",
+        &format!("/{bucket}/fleets/probe/a.txt"),
+        &[],
+        b"hi",
+    )
+    .await;
+    assert_eq!(status, 200, "detected key writes its own prefix: {body}");
+    let (status, body, ..) = s3(
+        &client,
+        &endpoint,
+        (&minted.access_key, &minted.secret_key),
+        "GET",
+        &format!("/{bucket}/fleets/probe/a.txt"),
+        &[],
+        b"",
+    )
+    .await;
+    assert_eq!(
+        (status, body.as_str()),
+        (200, "hi"),
+        "detected key reads it back"
+    );
+    let (status, ..) = s3(
+        &client,
+        &endpoint,
+        (&minted.access_key, &minted.secret_key),
+        "PUT",
+        &format!("/{bucket}/fleets/other/e.txt"),
+        &[],
+        b"hi",
+    )
+    .await;
+    assert_eq!(status, 403, "detected key cannot write another prefix");
+    provider.revoke(&minted.handle).await.expect("revoke");
+    let (status, ..) = s3(
+        &client,
+        &endpoint,
+        (&root_access, &root_secret),
+        "DELETE",
+        &format!("/{bucket}/fleets/probe/a.txt"),
+        &[],
+        b"",
+    )
+    .await;
+    assert!(
+        (200..300).contains(&status) || status == 404,
+        "cleanup object: {status}"
+    );
+    let (status, ..) = s3(
+        &client,
+        &endpoint,
+        (&root_access, &root_secret),
+        "DELETE",
+        &format!("/{bucket}"),
+        &[],
+        b"",
+    )
+    .await;
+    assert!((200..300).contains(&status), "cleanup bucket: {status}");
+}
+
+/// The store really enforces the minted key: against the pinned RustFS
+/// image a scoped key reads and writes its own prefix and is refused
 /// another app's prefix and the environment/production cross-prefixes.
 /// Runs only with `NOITE_TEST_RUSTFS_ENDPOINT` (a rustfs whose root keys are
 /// `NOITE_TEST_RUSTFS_KEYS=access:secret`, defaulting to the compose dev
@@ -956,99 +1295,6 @@ async fn scoped_key_enforced_by_rustfs() {
         secret_key: root_secret.clone(),
     };
     let client = reqwest::Client::new();
-    // Signed S3 call with an arbitrary key pair (proves enforcement, not
-    // just minting): PUT/GET bodies are small, LIST is one page. Returns the
-    // status, body, and the ETag / version-id response headers multipart
-    // and versioning assertions need.
-    async fn s3(
-        client: &reqwest::Client,
-        endpoint: &str,
-        keys: (&str, &str),
-        method: &str,
-        path_qs: &str,
-        headers: &[(&str, &str)],
-        body: &[u8],
-    ) -> (u16, String, Option<String>, Option<String>) {
-        use sha2::{Digest, Sha256};
-        let (path, qs) = path_qs.split_once('?').unwrap_or((path_qs, ""));
-        // SigV4 signs `name=` for valueless subresources (`?uploads`,
-        // `?versioning`): the raw form signs a different string than the
-        // store verifies. Normalize before signing and sending.
-        let qs: String = {
-            let mut parts: Vec<&str> = qs.split('&').filter(|p| !p.is_empty()).collect();
-            parts.sort_unstable();
-            parts
-                .iter()
-                .map(|p| {
-                    if p.contains('=') {
-                        (*p).to_string()
-                    } else {
-                        format!("{p}=")
-                    }
-                })
-                .collect::<Vec<_>>()
-                .join("&")
-        };
-        let path_qs = if qs.is_empty() {
-            path.to_string()
-        } else {
-            format!("{path}?{qs}")
-        };
-        let payload_hash = super::hex_encode(Sha256::digest(body).as_slice());
-        let (amz_date, date_stamp) = super::sigv4_now();
-        let url = reqwest::Url::parse(endpoint).expect("endpoint");
-        let host = match url.port() {
-            Some(port) => format!("{}:{port}", url.host_str().expect("host")),
-            None => url.host_str().expect("host").to_string(),
-        };
-        let auth = super::SigV4 {
-            method,
-            uri: path,
-            query: qs.as_str(),
-            host: &host,
-            region: "us-east-1",
-            service: "s3",
-            access_key: keys.0,
-            secret_key: keys.1,
-            payload_hash: &payload_hash,
-            amz_date: &amz_date,
-            date_stamp: &date_stamp,
-        }
-        .authorization();
-        let mut req = client
-            .request(
-                method.parse().expect("method"),
-                format!("{endpoint}{path_qs}"),
-            )
-            .header("x-amz-date", amz_date)
-            .header("x-amz-content-sha256", payload_hash)
-            .header("authorization", auth);
-        for (k, v) in headers {
-            req = req.header(*k, *v);
-        }
-        let resp = req.body(body.to_vec()).send().await.expect("s3 call");
-        let status = resp.status().as_u16();
-        let etag = resp
-            .headers()
-            .get("etag")
-            .and_then(|v| v.to_str().ok())
-            .map(str::to_string);
-        let version = resp
-            .headers()
-            .get("x-amz-version-id")
-            .and_then(|v| v.to_str().ok())
-            .map(str::to_string);
-        let text = resp.text().await.unwrap_or_default();
-        (status, text, etag, version)
-    }
-
-    fn tag(text: &str, name: &str) -> Option<String> {
-        let open = format!("<{name}>");
-        let close = format!("</{name}>");
-        let start = text.find(&open)? + open.len();
-        let end = text[start..].find(&close)?;
-        Some(text[start..start + end].to_string())
-    }
     let bucket = format!("noite-scope-test-{}", std::process::id());
     let (status, ..) = s3(
         &client,

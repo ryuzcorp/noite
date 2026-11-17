@@ -1,6 +1,6 @@
 //! Prefix-scoped keys through the MinIO admin API (MinIO and RustFS).
 //!
-//! Verified against the real `rustfs:1.0.3` image (and 1.0.0): it answers
+//! Verified against the real `rustfs:1.0.5` image (and 1.0.0/1.0.3): it answers
 //! the MinIO admin paths with SigV4 `s3`-service signatures, encrypts and
 //! decrypts admin payloads with the madmin scheme (argon2id KDF + sio-DARE
 //! stream framing), and enforces the attached policy on S3 calls. Adding a
@@ -46,7 +46,12 @@ impl MinioAdmin {
         }
     }
 
-    /// Any other MinIO-family store (MinIO itself, another RustFS).
+    /// Any other MinIO-family store: MinIO itself, or a store `auto` could
+    /// not confirm is RustFS (explicit `rustfs`, or a positive health
+    /// identification, takes the RustFS label instead). Keeps
+    /// `s3:CompleteMultipartUpload` in the policy, which RustFS 1.0.x
+    /// rejects — a store that is really RustFS fails loudly at mint time
+    /// rather than running tenants on the wrong policy.
     pub fn minio(store: StoreAccess, bucket: &str) -> Self {
         Self {
             tag: super::install_tag(&store.identity_endpoint, bucket, &store.region),
