@@ -207,6 +207,7 @@ pub async fn apply(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sha2::{Digest, Sha256};
     use sqlx::{Connection, SqliteConnection};
 
     const BASELINE: &str = "CREATE TABLE IF NOT EXISTS app (id TEXT PRIMARY KEY, slug TEXT);";
@@ -537,12 +538,61 @@ mod tests {
     /// here instead of stranding upgraded installs.
     #[test]
     fn migration_steps_are_append_only_and_contiguous() {
+        /// sha256 of one step's SQL, hex-encoded: the manifest below pins
+        /// every shipped step's statements.
+        fn step_hash(sql: &str) -> String {
+            let mut hasher = Sha256::new();
+            hasher.update(sql.as_bytes());
+            hasher
+                .finalize()
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect()
+        }
+        // A shipped step's SQL is frozen: a stamped database skips the step,
+        // so editing it reaches fresh installs only. Register the new step's
+        // hash when appending; never touch an existing entry.
+        const STEP_HASHES: &[(i64, &str)] = &[
+            (
+                101,
+                "2c069c3485da1120d45d4911121ef5d3438fe24b7efacf6e5553e7656f1f10bb",
+            ),
+            (
+                102,
+                "994f2b70792a0d1d911067d9a5e666af207e050af79c0c6e949b005eb7ca2ab3",
+            ),
+            (
+                103,
+                "9542a7de46e0df9253f62467ecb9bdf80c485fc04dcbb7f3527ea8436806b88a",
+            ),
+            (
+                104,
+                "c1622889f209e430226a12687fe8166721dfeff4a0bb1a4be1184b40aae04412",
+            ),
+            (
+                105,
+                "fd8ab2aabb7e57b7b3b1383a97600141f28770ad751a05a21b407b1c3d3861e0",
+            ),
+            (
+                106,
+                "50064f8124222b6d10a8af2cec6ea4a4145e0776c9fc2eb8ea5fa684bcd89120",
+            ),
+            (
+                107,
+                "36f9987c272364f252dde407c42c64da2b515eb76b9aa453444b57dbfd50adea",
+            ),
+        ];
         let mut expected = FIRST_COMPACTED_VERSION + 1;
         for step in MIGRATIONS {
             assert_eq!(
                 step.version, expected,
                 "migration steps must be contiguous and ascending: append, never renumber"
             );
+            let (_, hash) = STEP_HASHES
+                .iter()
+                .find(|(version, _)| *version == step.version)
+                .expect("every shipped step is registered");
+            assert_eq!(&step_hash(step.sql), hash);
             expected += 1;
         }
         assert_eq!(
@@ -591,12 +641,14 @@ mod tests {
     }
 
     /// The v100 compacted baseline for exactly the tables the post-compaction
-    /// steps touch: verbatim `CREATE TABLE` text from the compaction commit
-    /// (`8354e97c:apps/runner/schema.sql`), indexes omitted (current
-    /// `schema.sql` recreates every kept index on both sides). A future step
-    /// that touches another table extends this fixture with that table's
-    /// v100-or-later shape; a step whose SQL needs a column the fixture
-    /// lacks fails here, not on an install.
+    /// steps touch, plus the tables they reference: verbatim `CREATE TABLE`
+    /// text from the compaction commit (`8354e97c:apps/runner/schema.sql`),
+    /// indexes omitted (current `schema.sql` recreates every kept index on
+    /// both sides). A future step that touches another table extends this
+    /// fixture with that table's v100-or-later shape; a step whose SQL needs
+    /// a column the fixture lacks fails here, not on an install. Tables no
+    /// step ever touched are not pinned: a `schema.sql`-only change to one
+    /// is invisible to this replay and stays a review-time check.
     const V100_TOUCHED_TABLES: &str = "
         CREATE TABLE IF NOT EXISTS app (
           id TEXT PRIMARY KEY NOT NULL,
@@ -629,6 +681,28 @@ mod tests {
           log TEXT NOT NULL DEFAULT '',
           created_at TEXT NOT NULL,
           updated_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS environment (
+          id TEXT PRIMARY KEY NOT NULL,
+          app_id TEXT NOT NULL REFERENCES app(id) ON DELETE CASCADE,
+          label TEXT NOT NULL,
+          kind TEXT NOT NULL CHECK (kind IN ('branch','workspace')),
+          git_ref TEXT NOT NULL,
+          created_by TEXT NOT NULL DEFAULT '',
+          fleet_bucket TEXT NOT NULL,
+          listen_port INTEGER,
+          internal_port INTEGER,
+          status TEXT NOT NULL DEFAULT 'pending',
+          desired_state TEXT NOT NULL DEFAULT 'running',
+          asleep_since TEXT,
+          woke_at TEXT,
+          last_deploy_sha TEXT,
+          last_deployed_at TEXT,
+          public INTEGER NOT NULL DEFAULT 0,
+          last_error TEXT,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL,
+          UNIQUE (app_id, label)
         );
         CREATE TABLE IF NOT EXISTS pull_request (
           id TEXT PRIMARY KEY NOT NULL,
@@ -676,7 +750,9 @@ mod tests {
     /// nullability, plus every index as (uniqueness, origin, column list).
     /// Auto-indexes (UNIQUE constraints, primary keys) drop their generated
     /// names — only the column sets matter — while `CREATE INDEX` indexes
-    /// keep theirs, so a renamed index fails.
+    /// keep theirs, so a renamed index fails. Explicit indexes also carry
+    /// their normalized definition, so a partial-index predicate, sort
+    /// direction or collation change fails instead of comparing equal.
     async fn table_shape(conn: &mut SqliteConnection, table: &str) -> Vec<String> {
         let mut shape: Vec<String> = sqlx::query_scalar(
             "SELECT name || ':' || type || ':' || [notnull] || ':' || \
@@ -699,11 +775,32 @@ mod tests {
                     .fetch_all(&mut *conn)
                     .await
                     .expect("index columns");
-            let key = if origin == "c" { name } else { String::new() };
-            shape.push(format!(
-                "index:{unique}:{origin}:{key}:{}",
-                columns.join(",")
-            ));
+            let key = if origin == "c" {
+                name.clone()
+            } else {
+                String::new()
+            };
+            let mut part = format!("index:{unique}:{origin}:{key}:{}", columns.join(","));
+            if origin == "c" {
+                let sql: String = sqlx::query_scalar(
+                    "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ?",
+                )
+                .bind(&name)
+                .fetch_one(&mut *conn)
+                .await
+                .expect("index definition");
+                // SQLite stores the statement as written: steps qualify
+                // `main.idx_…` while schema.sql does not, and layout differs.
+                // Strip the qualifier and collapse whitespace so both sides
+                // compare by meaning.
+                let normalized = sql
+                    .replace("main.", "")
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                part.push_str(&format!(":{normalized}"));
+            }
+            shape.push(part);
         }
         // Column order is intentionally ignored: SQLite appends `ALTER TABLE
         // ... ADD COLUMN` steps after the baseline columns, while a fresh

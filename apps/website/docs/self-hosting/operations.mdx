@@ -29,11 +29,12 @@ To roll back, set `NOITE_IMAGE` to the previous version tag. That works across r
 Supported upgrade paths: beta to beta, forward — every
 release proves the previous release's data upgrades in place before its
 image ships, and a monthly lane proves the first beta's data upgrades to
-the current tree. Alpha installs predate the migration baseline and need a
-fresh install (the runner refuses them loudly instead of migrating). A
-release's notes name any operator action; downgrades across a schema change
-are refused, never silently applied — restore a [backup](#backups) taken
-before the upgrade instead. Renamed settings keep the old name working
+the current tree. Installs predating the 2026-11-09 schema compaction
+(alpha.27 and earlier) need a fresh install; the runner refuses them loudly
+instead of migrating. Compacted alphas (alpha.28+) and betas upgrade
+forward. A release's notes name any operator action; downgrades across a
+schema change are refused, never silently applied — restore a [backup](#backups)
+taken before the upgrade instead. Renamed settings keep the old name working
 through a compatibility shim — a rename that silently falls back to a
 default is a bug, not an upgrade path.
 

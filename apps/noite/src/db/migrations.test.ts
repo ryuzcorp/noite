@@ -301,16 +301,17 @@ describe("control migrations", () => {
     for (const name of files) {
       const entry = Object.entries(manifest).find(([file]) => file === name);
 
-      expect(
-        entry,
-        `unregistered migration ${name}: ship it as a new file and register its sha256 here`
-      ).toBeDefined();
+      if (entry === undefined) {
+        throw new Error(
+          `unregistered migration ${name}: ship it as a new file and register its sha256 here`
+        );
+      }
 
       const actual = createHash("sha256")
         .update(readFileSync(path.join(dir, name)))
         .digest("hex");
 
-      expect(actual).toBe(entry?.[1]);
+      expect(actual).toBe(entry[1]);
     }
 
     for (const name of Object.keys(manifest).toSorted()) {
@@ -324,13 +325,16 @@ describe("control migrations", () => {
   test("schema.ts matches the migrated shape", () => {
     // Fresh installs build from schema.ts while upgraded installs replay
     // the migrations: a drift between them is a silent fork. Every declared
-    // table must exist after the replay with the same columns and index
-    // names, and no replayed table may lack a declaration.
+    // table must exist after the replay with the same columns (names, types,
+    // nullability, default presence) and index names, and no replayed table
+    // may lack a declaration.
     const raw = new Database(":memory:");
     raw.run("PRAGMA foreign_keys = ON");
     applyShippedMigrations(raw);
 
-    const declared = Object.values(schema).filter(
+    // SAFETY: widening to unknown for the instanceof narrow below; every
+    // export of ./schema is a drizzle sqlite table.
+    const declared = (Object.values(schema) as unknown[]).filter(
       (table): table is SQLiteTable => table instanceof SQLiteTable
     );
 
@@ -350,15 +354,21 @@ describe("control migrations", () => {
     for (const table of declared) {
       const config = getTableConfig(table);
 
-      // SAFETY: the pragma selects exactly the column names of one table.
+      // SAFETY: the pragma selects exactly one signature row per column.
       const columns = raw
         .query(
-          `SELECT name FROM pragma_table_info("${config.name}") ORDER BY name`
+          `SELECT name || ':' || type || ':' || [notnull] || ':' || (dflt_value IS NOT NULL) AS signature FROM pragma_table_info("${config.name}") ORDER BY name`
         )
-        .all() as { name: string }[];
+        .all() as { signature: string }[];
 
-      expect(columns.map((column) => column.name)).toEqual(
-        config.columns.map((column) => column.name).toSorted()
+      expect(
+        columns.map((column) => column.signature.toLowerCase()).toSorted()
+      ).toEqual(
+        config.columns
+          .map((column) =>
+            `${column.name}:${column.getSQLType()}:${column.notNull ? 1 : 0}:${column.default === undefined ? 0 : 1}`.toLowerCase()
+          )
+          .toSorted()
       );
 
       // SAFETY: the query selects exactly the name column of every index.
@@ -371,7 +381,9 @@ describe("control migrations", () => {
       const declaredIndexes = [
         ...config.indexes.map((index) => index.config.name),
         ...config.uniqueConstraints.map((unique) => unique.name),
-      ].toSorted();
+      ]
+        .filter((name): name is string => name !== undefined)
+        .toSorted();
 
       expect(indexes.map((index) => index.name)).toEqual(declaredIndexes);
     }
