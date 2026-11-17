@@ -17,6 +17,7 @@ use crate::host::package_manager;
 use crate::host::s3;
 use crate::host::source;
 use crate::host::supervisor::{self, ProcMap};
+use crate::host::tenant_d1;
 use crate::host::tips::TipBundle;
 use crate::host::void_cohost;
 use crate::host::void_deploy;
@@ -1598,6 +1599,7 @@ async fn deploy_inner(
         read_root: Some(&src_dir),
     };
     let mut migrated_staged = false;
+    let mut migrated_tenant_staged = false;
     // Void apps split the ordered deploy around their migrations: every
     // script staged first, the migrations driven against that staged
     // generation, then the one activate serving it. Every other app stages
@@ -1679,12 +1681,12 @@ async fn deploy_inner(
             activate_after_staged_migrate(pool, app, target, &celld, staged, progress).await?;
         (stats, environment)
     } else {
-        // Non-Void apps stage the same ordered generation, then prove it
-        // with the canary before the one activate serves it — no D1
-        // migrations ride along, so the probe is the only thing between
-        // stage and activate. A failed probe fails the deploy with nothing
-        // activated, so the previous generation keeps serving. There is no
-        // proxy token on a non-Void fleet, so none rides along.
+        // Non-Void apps stage the same ordered generation. A redeploy runs
+        // the tenant D1 migrations between stage and activate — a failed
+        // migration fails the deploy with nothing activated, so the previous
+        // generation keeps serving. A first deploy has no previous
+        // generation to protect, so it migrates after activation below.
+        // There is no proxy token on a non-Void fleet, so none rides along.
         let staged = void_cohost::stage_fleet_in_order(
             pool,
             &app.id,
@@ -1694,6 +1696,39 @@ async fn deploy_inner(
             &app_side,
         )
         .await?;
+        let environment_before_activate = load_deploy_target(pool, procs, app, target).await?;
+        let previously_deployed = match target.environment() {
+            Some(env) => env.is_deployed(),
+            None => app.is_deployed(),
+        };
+        if previously_deployed {
+            match ensure_prior_fleet_healthy(
+                pool,
+                cfg,
+                procs,
+                logs,
+                app,
+                environment_before_activate.as_ref(),
+            )
+            .await
+            {
+                Ok(()) => {
+                    migrate_tenant_d1(cfg, &celld, &scope_key, &deploy_root, &mut *progress)
+                        .await?;
+                    migrated_tenant_staged = true;
+                }
+                Err(error) => {
+                    progress
+                        .log(
+                            DeployStatus::Deploying,
+                            &format!(
+                                "migrate: staged fleet unavailable ({error:#}); migrating after activation\n"
+                            ),
+                        )
+                        .await?;
+                }
+            }
+        }
         probe_staged_generation(cfg, &celld, &staged, None, &mut *progress).await?;
         // A stop in the probe window must not activate: the staged pointer is
         // the last irreversible step before the fleet serves it. The commit
@@ -1805,6 +1840,24 @@ async fn deploy_inner(
         })
         .await?;
     } else if void_app && !migrated_staged {
+        progress
+            .log(
+                DeployStatus::Deploying,
+                "migrate: skipped (the fleet stopped before its health gate; redeploy to run migrations)\n",
+            )
+            .await?;
+    }
+
+    // D1 migrations for non-Void apps: a redeploy already ran them between
+    // stage and activate above, so only a first deploy — or a redeploy whose
+    // prior fleet could not boot — runs them here, against the adopted fleet,
+    // before the deploy is marked success. A stop in the window skips them
+    // like it skips the gate (redeploy to run them); anything else failing
+    // fails the deploy. A rollback to an older sha never un-applies: celld
+    // skips already-applied rows and only applies what is pending.
+    if !void_app && !migrated_tenant_staged && !fleet_stopped_early {
+        migrate_tenant_d1(cfg, &celld, &scope_key, &deploy_root, &mut *progress).await?;
+    } else if !void_app && !migrated_tenant_staged {
         progress
             .log(
                 DeployStatus::Deploying,
@@ -2286,6 +2339,225 @@ async fn migrate_void_app(inputs: MigrateInputs<'_, '_, '_>) -> anyhow::Result<(
         &deployment_id,
     )
     .await
+}
+
+/// Run a non-Void app's D1 `migrations_dir` through celld's own migrator
+/// (`celld d1 migrations apply`, wrangler semantics: ordered `NNNN_name.sql`
+/// files from `migrations_dir` — default `migrations` — tracked in a
+/// `d1_migrations` table so each file applies once, each file in its own
+/// transaction), once per D1 binding in the deploy root's config. Runs
+/// against this target's own fleet — the deploy's bucket (the environment's
+/// own bucket for a preview, the app's for production) with the target's
+/// scoped store credentials — so a preview migrates its own D1 and never
+/// production's, and never another tenant's or the control D1. Migration SQL
+/// comes from the pushed tree only, and only `celld d1` ever runs it.
+/// Every failure fails the deploy: call this between stage and activate on a
+/// redeploy (nothing activates, so the previous generation keeps serving),
+/// or after adoption on a first deploy (no previous generation to protect).
+/// Applied migrations stay applied (forward-only): a rollback to an older sha
+/// never un-applies or re-applies — already-applied rows are skipped — it
+/// only applies what is pending. The deploy log names each applied migration.
+async fn migrate_tenant_d1(
+    cfg: &Config,
+    celld: &void_cohost::CelldDeploy<'_>,
+    scope_key: &str,
+    deploy_root: &Path,
+    progress: &mut Progress<'_>,
+) -> anyhow::Result<()> {
+    // Fresh store env at migration time, not the deploy's pre-stage one: the
+    // fleet's operator token is minted while the fleet starts (after the
+    // stage), and `celld d1` authenticates to the node with it — a pre-stage
+    // env has no token and the node refuses with "operator authentication
+    // required". Extras the stage carries (the container platform) ride
+    // along; the fresh token wins over the stale one. The
+    // bucket/endpoint/region ride the staged invocation shape as before, so
+    // the SQL still lands in the tenant's own D1 only.
+    let env_owned = s3::celld_cli_env(cfg, scope_key);
+    let mut env: Vec<(&str, &str)> = env_owned.iter().map(|(k, v)| (*k, v.as_str())).collect();
+    for (key, value) in celld.env {
+        if !env.iter().any(|(existing, _)| existing == key) {
+            env.push((key, value));
+        }
+    }
+    let root = deploy_root.to_path_buf();
+    let bindings = tokio::task::spawn_blocking(move || tenant_d1::collect_d1_bindings(&root))
+        .await
+        .map_err(|e| anyhow::anyhow!("migration collection failed: {}", e))??;
+    if bindings.is_empty() {
+        return Ok(());
+    }
+    progress
+        .step(
+            "migrate",
+            DeployStatus::Deploying,
+            "D1 migrations via celld",
+        )
+        .await?;
+    let mut any_dir = false;
+    for binding in &bindings {
+        let Some(dir) = tenant_d1::migrations_dir_on_disk(deploy_root, binding) else {
+            continue;
+        };
+        if tenant_d1::migration_file_names(&dir).is_empty() {
+            continue;
+        }
+        any_dir = true;
+        let before = tenant_d1_applied_names(celld, &env, deploy_root, binding)
+            .await
+            .unwrap_or_default();
+        tenant_d1_apply(celld, &env, deploy_root, binding).await?;
+        let after = tenant_d1_applied_names(celld, &env, deploy_root, binding)
+            .await
+            .unwrap_or_default();
+        let before_set: std::collections::HashSet<&str> =
+            before.iter().map(String::as_str).collect();
+        let mut applied: Vec<&str> = after
+            .iter()
+            .map(String::as_str)
+            .filter(|name| !before_set.contains(name))
+            .collect();
+        applied.sort();
+        if applied.is_empty() {
+            progress
+                .log(
+                    DeployStatus::Deploying,
+                    &format!(
+                        "migrate: D1 `{}`: no pending migrations\n",
+                        binding.database_name
+                    ),
+                )
+                .await?;
+        } else {
+            let names = applied
+                .iter()
+                .map(|name| format!("{:?}", name))
+                .collect::<Vec<_>>()
+                .join(", ");
+            progress
+                .log(
+                    DeployStatus::Deploying,
+                    &format!(
+                        "migrate: D1 `{}`: applied {}\n",
+                        binding.database_name, names
+                    ),
+                )
+                .await?;
+        }
+    }
+    if !any_dir {
+        progress
+            .log(DeployStatus::Deploying, "migrate: no migrations to run\n")
+            .await?;
+    }
+    Ok(())
+}
+
+/// One `celld d1 migrations apply DATABASE PROJECT` against this target's own
+/// fleet. The project is the deploy root celld just staged (its config
+/// carries the binding's `migrations_dir`); the bucket/endpoint/region and
+/// store credentials ride the same invocation shape as the stage, so the SQL
+/// lands in the tenant's own D1 only. A missing migrations directory is the
+/// caller's to skip (never invoked); anything celld refuses — bad SQL, a
+/// numeric-prefix violation, an escaping `migrations_dir` — fails the deploy
+/// here with celld's own message.
+async fn tenant_d1_apply(
+    celld: &void_cohost::CelldDeploy<'_>,
+    env: &[(&str, &str)],
+    deploy_root: &Path,
+    binding: &tenant_d1::TenantD1Binding,
+) -> anyhow::Result<()> {
+    let Some(project) = deploy_root.to_str() else {
+        anyhow::bail!("deploy root is not valid UTF-8: {}", deploy_root.display());
+    };
+    let args = [
+        "d1",
+        "migrations",
+        "apply",
+        binding.database_name.as_str(),
+        project,
+        "--bucket",
+        celld.bucket,
+        "--endpoint",
+        celld.endpoint,
+        "--region",
+        celld.region,
+    ];
+    crate::host::exec::run_cmd(
+        celld.celld_bin,
+        &args,
+        None,
+        env,
+        std::time::Duration::from_secs(120),
+    )
+    .await
+    .map(|_| ())
+    .map_err(|e| anyhow::anyhow!("D1 `{}` migrations failed: {:#}", binding.database_name, e))
+}
+
+/// Names already recorded in the binding's bookkeeping table (empty when the
+/// table or database does not exist yet — a first deploy, not a failure).
+async fn tenant_d1_applied_names(
+    celld: &void_cohost::CelldDeploy<'_>,
+    env: &[(&str, &str)],
+    deploy_root: &Path,
+    binding: &tenant_d1::TenantD1Binding,
+) -> anyhow::Result<Vec<String>> {
+    if !tenant_d1::is_plain_identifier(&binding.migrations_table) {
+        anyhow::bail!(
+            "d1 database {:?} has a `migrations_table` that is not a plain identifier: {:?}",
+            binding.database_name,
+            binding.migrations_table
+        );
+    }
+    let Some(project) = deploy_root.to_str() else {
+        anyhow::bail!("deploy root is not valid UTF-8: {}", deploy_root.display());
+    };
+    let sql = format!(
+        "SELECT \"name\" FROM \"{}\" ORDER BY \"name\"",
+        binding.migrations_table
+    );
+    let args = [
+        "d1",
+        "execute",
+        binding.database_name.as_str(),
+        "--command",
+        sql.as_str(),
+        "--json",
+        project,
+        "--bucket",
+        celld.bucket,
+        "--endpoint",
+        celld.endpoint,
+        "--region",
+        celld.region,
+    ];
+    let out = match crate::host::exec::run_cmd(
+        celld.celld_bin,
+        &args,
+        None,
+        env,
+        std::time::Duration::from_secs(30),
+    )
+    .await
+    {
+        Ok(out) => out,
+        Err(_) => return Ok(Vec::new()),
+    };
+    let mut names = Vec::new();
+    for line in out.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if let Some(name) = value.get("name").and_then(serde_json::Value::as_str) {
+            names.push(name.to_string());
+        }
+    }
+    names.sort();
+    Ok(names)
 }
 
 /// The fleet the staged migrations need: the previous generation must be
@@ -3413,7 +3685,166 @@ mod tests {
         assert!(log.contains("migrate: no migrations to run"), "{}", log);
     }
 
-    // --- staged migrate sequencing ------------------------------------------
+    // --- tenant D1 migrations -------------------------------------------------
+
+    /// One tenant `migrate` step against the fake celld: a deploy root with
+    /// the config and migration files, canned `execute` rows before/after,
+    /// and an optional `apply.fail`. Returns the step outcome, the deploy
+    /// log, and the fake's argv log.
+    async fn run_tenant_migrate_once(
+        tag: &str,
+        wrangler_json: &str,
+        files: &[(&str, &str)],
+        before: &str,
+        after: &str,
+        apply_fail: Option<&str>,
+    ) -> (Result<(), String>, String, String) {
+        let pool = crate::db::connect("sqlite::memory:").await.unwrap();
+        let mut cfg = crate::config::config_for_tests();
+        let dir = crate::testutil::TempDir::new(&format!("noite-tenant-d1-{tag}"));
+        let fixture = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/fake-celld-tenant-d1.sh");
+        std::os::unix::fs::symlink(&fixture, dir.path().join("celld")).unwrap();
+        cfg.celld_bin = dir.path().join("celld").to_string_lossy().into_owned();
+        std::fs::write(dir.path().join("execute-before"), before).unwrap();
+        std::fs::write(dir.path().join("execute-after"), after).unwrap();
+        if let Some(message) = apply_fail {
+            std::fs::write(dir.path().join("apply.fail"), message).unwrap();
+        }
+        let app = crate::db::create_app(
+            &pool,
+            &cfg,
+            crate::db::NewApp {
+                name: "tenant-d1",
+                slug: "tenant-d1",
+                user_id: "local",
+                subdomain: "tenant-d1.localhost",
+                listen: 30300,
+                internal: 30301,
+            },
+        )
+        .await
+        .unwrap();
+        let base = std::env::temp_dir().join(format!(
+            "noite-tenant-mig-{tag}-{}",
+            crate::models::new_id()
+        ));
+        let root = base.join("root");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("wrangler.json"), wrangler_json).unwrap();
+        for (rel, contents) in files {
+            let path = root.join(rel);
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).unwrap();
+            }
+            std::fs::write(&path, contents).unwrap();
+        }
+        let log_path = dir.path().join("argv.log");
+        let _ = std::fs::write(&log_path, "");
+        let log_env = log_path.to_string_lossy().into_owned();
+        let dir_env = dir.path().to_string_lossy().into_owned();
+        let celld_bin = cfg.celld_bin.clone();
+        let env: Vec<(&str, &str)> = vec![
+            ("FAKE_CELLD_LOG", log_env.as_str()),
+            ("FAKE_CELLD_DIR", dir_env.as_str()),
+        ];
+        let celld = crate::host::void_cohost::CelldDeploy {
+            celld_bin: celld_bin.as_str(),
+            env: &env,
+            bucket: "s3://noite/fleets/tenant-d1",
+            endpoint: "http://rustfs:9000",
+            region: "us-east-1",
+            timeout: std::time::Duration::from_secs(30),
+            sourcemap: None,
+        };
+        let mut progress = Progress {
+            pool: &pool,
+            app_id: &app.id,
+            cancel: None,
+            environment_id: None,
+            sha: Some("abc123".to_string()),
+            id: None,
+            step: "deploy",
+        };
+        let scope_key = crate::host::credentials::Scope::app(&app).key();
+        let outcome = super::migrate_tenant_d1(&cfg, &celld, &scope_key, &root, &mut progress)
+            .await
+            .map_err(|e| e.to_string());
+        let log: String = sqlx::query_scalar("SELECT log FROM deploy WHERE id = ?")
+            .bind(progress.id.clone().unwrap_or_default())
+            .fetch_one(&pool)
+            .await
+            .unwrap_or_default();
+        let argv = std::fs::read_to_string(&log_path).unwrap_or_default();
+        let _ = std::fs::remove_dir_all(&base);
+        (outcome, log, argv)
+    }
+
+    /// A deploy with a `migrations_dir` applies it through celld and names
+    /// the migration in the log. Before this step existed the same deploy
+    /// left the table missing (celld recorded the declaration but nothing
+    /// applied it).
+    #[tokio::test]
+    async fn tenant_d1_apply_runs_per_binding_and_names_each() {
+        let (outcome, log, argv) = run_tenant_migrate_once(
+            "apply",
+            r#"{"name": "a", "d1_databases": [{"binding": "DB", "database_name": "demo"}]}"#,
+            &[("migrations/0001_init.sql", "CREATE TABLE t (id INTEGER);")],
+            "",
+            "{\"name\":\"0001_init.sql\"}\n",
+            None,
+        )
+        .await;
+        outcome.expect("apply succeeds");
+        assert!(
+            argv.contains("migrations") && argv.contains("apply") && argv.contains("demo"),
+            "{}",
+            argv
+        );
+        assert!(
+            log.contains("migrate: D1 `demo`: applied \"0001_init.sql\""),
+            "{}",
+            log
+        );
+    }
+
+    /// A failing migration fails the deploy (the caller runs this before
+    /// activate on a redeploy, so the previous generation keeps serving).
+    #[tokio::test]
+    async fn tenant_d1_failing_migration_fails_the_deploy() {
+        let (outcome, _, _) = run_tenant_migrate_once(
+            "fail",
+            r#"{"name": "a", "d1_databases": [{"binding": "DB", "database_name": "demo"}]}"#,
+            &[("migrations/0001_init.sql", "BAD SQL")],
+            "",
+            "",
+            Some("near \"BAD\": syntax error"),
+        )
+        .await;
+        let err = outcome.unwrap_err();
+        assert!(
+            err.contains("demo") && err.contains("migrations failed"),
+            "{}",
+            err
+        );
+    }
+
+    /// A binding with no migration files skips quietly.
+    #[tokio::test]
+    async fn tenant_d1_no_files_skips_quietly() {
+        let (outcome, log, argv) = run_tenant_migrate_once(
+            "empty",
+            r#"{"name": "a", "d1_databases": [{"binding": "DB", "database_name": "demo"}]}"#,
+            &[],
+            "",
+            "",
+            None,
+        )
+        .await;
+        outcome.expect("empty dir skips");
+        assert!(!argv.contains("apply"), "{}", argv);
+        assert!(log.contains("migrate: no migrations to run"), "{}", log);
+    }
 
     /// One cohosted script render for the staged-migrate seam: the proxy
     /// stages beside the app, so the invoke pins prove the cohosted

@@ -47,6 +47,7 @@ pub mod stats;
 pub mod storage;
 pub mod supervisor;
 pub mod telemetry_report;
+pub mod tenant_d1;
 pub mod tips;
 pub mod update_check;
 pub mod void_cohost;
