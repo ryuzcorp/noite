@@ -15,8 +15,9 @@
 # Speed shape: `ci.yml` builds the image once per run (its `image` job) and
 # hands it over as an artifact; each lane below downloads and `docker load`s
 # it instead of rebuilding (every lane paid ~280 s for its own build before).
-# Playwright then runs each lane's spec files sharded across 2 jobs
-# (E2E_SHARD) against their own stacks, 3 workers per shard as before.
+# Playwright then runs each lane's spec files sharded across the plan's cells
+# (E2E_SHARD, usually 2 shards per lane; 1 where a split would strand a shard
+# empty) against their own stacks, 3 workers per shard as before.
 # Without the artifact input (the tag gate, the nightly schedule, dispatch),
 # each lane builds exactly as before.
 name: e2e
@@ -67,13 +68,19 @@ permissions:
 jobs:
   # Which rounds to run: 3 on the nightly schedule, the `rounds` input on
   # dispatch, 1 for every reusable caller — plus, on a pull request asking
-  # for the fast suite, which spec files the PR rewrote. A rewritten spec
-  # used to first run in the merge queue's release suite and fail there
-  # (Candidate 10): the lane runs those files in full beside the tagged gate
-  # (both tenancy lanes, like the gate itself). A changed shared helper
+  # for the fast suite, which spec files the PR rewrote (a rewritten spec
+  # used to first run in the merge queue's release suite and fail there) and
+  # exactly which (lane, shard) cells to run. A changed shared helper
   # (`e2e/helpers.ts`, fixtures, the setup ceremony, the Playwright config)
   # escalates to the release suite — its blast radius is every spec.
-  # Merge-queue, dispatch and schedule runs keep their requested suite.
+  # Playwright assigns whole file-groups by start position, so one large
+  # changed file can swallow a shard's share and strand the other shard
+  # with zero tests (#359: shard 2 ran nothing, then the lane's
+  # account-dependent post-checks failed). The plan `--list`s each lane's
+  # real distribution and collapses such a lane to one unsharded cell
+  # instead of a meaningless empty one; a lane with no tests at all fails
+  # the plan instead of passing vacuously. Merge-queue, dispatch and
+  # schedule runs get the same treatment for their requested suite.
   # A job (not an inline expression) so the lane matrix below stays clean
   # instead of scattering skipped cells.
   plan:
@@ -84,6 +91,7 @@ jobs:
       rounds: ${{ steps.rounds.outputs.json }}
       suite: ${{ steps.specs.outputs.suite }}
       extra-specs: ${{ steps.specs.outputs.extra-specs }}
+      cells: ${{ steps.specs.outputs.cells }}
     steps:
       - id: rounds
         run: |
@@ -95,15 +103,21 @@ jobs:
             *) echo 'json=[1,2,3]' >> "$GITHUB_OUTPUT" ;;
           esac
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        if: github.event_name == 'pull_request'
         with:
           fetch-depth: 0
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
-        if: github.event_name == 'pull_request'
         timeout-minutes: 3
+      # UI deps for the `--list` distribution probe below (no browsers: the
+      # probe never launches one).
+      - name: install UI deps
+        working-directory: apps/noite
+        timeout-minutes: 5
+        run: bun install --frozen-lockfile
+      # `--base` is empty outside pull requests (merge queue, dispatch,
+      # schedule): the script then skips the PR diff and plans the requested
+      # suite with no extras.
       - id: specs
-        if: github.event_name == 'pull_request'
-        run: bun .github/scripts/e2e-plan.ts --base '${{ github.event.pull_request.base.sha }}' --suite '${{ inputs.suite }}' >> "$GITHUB_OUTPUT"
+        run: bun .github/scripts/e2e-plan.ts --base '${{ github.event.pull_request.base.sha }}' --suite '${{ inputs.suite }}' --rounds '${{ steps.rounds.outputs.json }}' >> "$GITHUB_OUTPUT"
 
   e2e:
     name: e2e (${{ matrix.lane }} round ${{ matrix.round }} shard ${{ matrix.shard }})
@@ -119,21 +133,14 @@ jobs:
     # The lanes boot their own stack from the same image and share nothing,
     # so shards and lanes run side by side: the gate takes as long as the
     # slowest shard instead of everything in a row. `fail-fast: false` keeps
-    # the other cells' verdicts (and their reports) when one fails.
+    # the other cells' verdicts (and their reports) when one fails. The
+    # cells come from the plan, which `--list`s each lane's real Playwright
+    # distribution: a lane whose split would strand a shard empty runs one
+    # unsharded cell instead of a meaningless empty one.
     strategy:
       fail-fast: false
       matrix:
-        lane: [single, multi]
-        round: ${{ fromJSON(needs.plan.outputs.rounds) }}
-        shard: [1, 2]
-        include:
-          - lane: single
-            target: e2e
-          # Multi-tenant mode with the image's capabilities: the
-          # hostile-tenant spec proves builds and fleets cannot reach secrets
-          # or internal APIs.
-          - lane: multi
-            target: e2e-isolation
+        include: ${{ fromJSON(needs.plan.outputs.cells) }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
@@ -235,7 +242,7 @@ jobs:
             fast|release) ;;
             *) echo "::error::unknown e2e suite: $E2E_SUITE"; exit 1 ;;
           esac
-          E2E_SHARD="${{ matrix.shard }}/2" make "${{ matrix.target }}"
+          E2E_SHARD="${{ matrix.shard }}/${{ matrix.total }}" make "${{ matrix.target }}"
       - name: upload playwright report
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
@@ -269,11 +276,13 @@ jobs:
         with:
           pattern: playwright-report-*
           path: /tmp/e2e-reports
-      # `--lanes`/`--shards` mirror the e2e matrix above and `--rounds` is the
-      # plan's output: a planned cell without a result file fails this job.
+      # `--cells` is the plan's exact matrix (lane, shard, total per lane)
+      # and `--rounds` is the plan's output: a planned cell without a result
+      # file fails this job.
       - name: open or update flake issues
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CELLS: ${{ needs.plan.outputs.cells }}
           ROUNDS: ${{ needs.plan.outputs.rounds }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-        run: bun .github/scripts/flake-issues.ts --reports /tmp/e2e-reports --run-url "$RUN_URL" --lanes single,multi --rounds "$ROUNDS" --shards 2
+        run: bun .github/scripts/flake-issues.ts --reports /tmp/e2e-reports --run-url "$RUN_URL" --cells "$CELLS" --rounds "$ROUNDS"

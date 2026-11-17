@@ -85,19 +85,23 @@ interface OpenIssue {
 
 const usage = (): never => {
   console.error(
-    "usage: flake-issues.ts --reports DIR --run-url URL --lanes a,b --rounds '[1,2]' --shards N"
+    "usage: flake-issues.ts --reports DIR --run-url URL --cells '[{\"lane\":...,\"shard\":...}]' --rounds '[1,2]'"
   );
 
   process.exit(2);
 };
 
 const FLAGS = {
-  "--lanes": "lanes",
+  "--cells": "cells",
   "--reports": "reports",
   "--rounds": "rounds",
   "--run-url": "runUrl",
-  "--shards": "shards",
 } satisfies Record<string, string>;
+
+interface PlannedCell {
+  lane: string;
+  shard: number;
+}
 
 const parseArgs = (argv: string[]) => {
   const out: Record<string, string> = {};
@@ -115,39 +119,58 @@ const parseArgs = (argv: string[]) => {
     }
   }
 
-  const { lanes, reports, rounds, runUrl, shards } = out;
+  const { cells, reports, rounds, runUrl } = out;
 
   if (
-    lanes === undefined ||
+    cells === undefined ||
     reports === undefined ||
     rounds === undefined ||
-    runUrl === undefined ||
-    shards === undefined
+    runUrl === undefined
   ) {
     return usage();
   }
 
-  // SAFETY: the plan job emits `rounds` as a JSON array of round numbers;
+  // SAFETY: the plan job emits `rounds` as a JSON array of round numbers and
+  // `cells` as the exact matrix (lane, target, shard, total, round);
   // anything else fails the check below instead of shrinking the matrix.
   const roundList = JSON.parse(rounds) as unknown;
-  const shardCount = Number(shards);
+  // SAFETY: validated as { lane, shard } cells by the predicate below.
+  const cellList = JSON.parse(cells) as unknown;
 
   if (
     !Array.isArray(roundList) ||
     !roundList.every((round) => Number.isInteger(round)) ||
-    !Number.isInteger(shardCount) ||
-    shardCount < 1
+    !Array.isArray(cellList) ||
+    !cellList.every((cell): cell is PlannedCell => {
+      if (typeof cell !== "object" || cell === null) {
+        return false;
+      }
+
+      if (!("lane" in cell) || !("shard" in cell)) {
+        return false;
+      }
+
+      const { lane, shard } = cell;
+
+      return (
+        typeof lane === "string" &&
+        lane.length > 0 &&
+        typeof shard === "number" &&
+        Number.isInteger(shard) &&
+        shard >= 1
+      );
+    })
   ) {
     return usage();
   }
 
   return {
-    lanes: lanes.split(",").filter((lane) => lane !== ""),
+    // SAFETY: the check above proved an array of { lane, shard } cells.
+    cells: cellList as PlannedCell[],
     reports,
     // SAFETY: the check above proved an array of integers.
     rounds: roundList as number[],
     runUrl,
-    shards: shardCount,
   };
 };
 
@@ -216,23 +239,21 @@ export const collectFailures = (
   return out;
 };
 
-// Every planned (lane, round, shard) cell must have uploaded its results: a
-// shard that died before Playwright wrote them (a lane that never booted, a
-// cancelled job) would otherwise shrink the hunt silently.
+// Every planned cell (from the plan's exact matrix) crossed with every round
+// must have uploaded its results: a shard that died before Playwright wrote
+// them (a lane that never booted, a cancelled job) would otherwise shrink
+// the hunt silently.
 export const missingReports = (
   present: ReadonlySet<string>,
-  lanes: readonly string[],
-  rounds: readonly number[],
-  shards: number
+  cells: readonly PlannedCell[],
+  rounds: readonly number[]
 ): string[] =>
-  lanes.flatMap((lane) =>
-    rounds.flatMap((round) =>
-      Array.from({ length: shards }, (_, index) => {
-        const cell = `${lane}-r${round}-s${index + 1}`;
+  cells.flatMap((cell) =>
+    rounds.flatMap((round) => {
+      const name = `${cell.lane}-r${round}-s${cell.shard}`;
 
-        return present.has(cell) ? [] : [cell];
-      }).flat()
-    )
+      return present.has(name) ? [] : [name];
+    })
   );
 
 const errorSnippet = (error: string): string => {
@@ -357,9 +378,7 @@ const fileIssues = (
 };
 
 const main = (): void => {
-  const { lanes, reports, rounds, runUrl, shards } = parseArgs(
-    process.argv.slice(2)
-  );
+  const { cells, reports, rounds, runUrl } = parseArgs(process.argv.slice(2));
 
   const dirs = readdirSync(reports, { withFileTypes: true })
     .filter((entry) => entry.isDirectory())
@@ -412,7 +431,7 @@ const main = (): void => {
     }
   }
 
-  const missing = missingReports(present, lanes, rounds, shards);
+  const missing = missingReports(present, cells, rounds);
 
   console.log(
     `read ${present.size} result file(s), ${bySpec.size} failing spec(s), ${missing.length} missing`

@@ -22,10 +22,12 @@ const baseURL = process.env.E2E_BASE_URL ?? "http://noite.localhost:8090";
 // each deploy keeps its 8-minute budget, and 3 workers leave headroom on a
 // 4-vCPU GitHub runner.
 // Sharding across CI jobs (E2E_SHARD="<current>/<total>", set by e2e.yml):
-// each shard still runs the setup and policy dependency projects in full
-// (verified: Playwright repeats project dependencies on every shard), so
-// every shard signs up and probes policy beside its half of the bulk. Unset
-// locally means today's behaviour: one unsharded run.
+// a shard with tests still runs the setup and policy dependency projects in
+// full beside its share of the bulk — but a shard Playwright assigns zero
+// tests runs nothing at all, dependencies included (#359). The plan avoids
+// scheduling such shards (one unsharded cell instead), and the lane fails
+// loudly if one ever runs zero tests. Unset locally means today's
+// behaviour: one unsharded run.
 const shardValue = process.env.E2E_SHARD;
 let shard: { current: number; total: number } | undefined;
 
