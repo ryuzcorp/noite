@@ -78,6 +78,26 @@ describe("parseStaticImports", () => {
 
     expect(parseStaticImports(source)).toEqual([]);
   });
+
+  test("a comment holding a quote inside the import still counts", () => {
+    const source = [
+      'import /* "x" */ { readFileSync } from "node:fs";',
+      "",
+    ].join("\n");
+
+    expect(parseStaticImports(source)).toEqual([
+      { line: 1, specifier: "node:fs" },
+    ]);
+  });
+
+  test("import text inside a template string is not code", () => {
+    const source = [
+      'export const help = `import { readFileSync } from "node:fs"`;',
+      "",
+    ].join("\n");
+
+    expect(parseStaticImports(source)).toEqual([]);
+  });
 });
 
 describe("isNodeSpecifier", () => {

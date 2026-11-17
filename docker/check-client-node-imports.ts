@@ -13,9 +13,9 @@
  * replaced `node:async_hooks` with its stub, so the specifier is gone from
  * `dist` and an output grep passes on the exact tree that broke the pages.
  * The walk sees the real edge, names the module chain, needs no build, and
- * (via `stripTs`) cannot trip on a comment or string that merely mentions
- * a builtin. `bun run build` in ci.yml's `worker` job still proves
- * workerd-compat; this proves the browser half.
+ * uses Bun's own parser (`Transpiler.scanImports`), so a comment or string
+ * that merely mentions a builtin never counts. `bun run build` in ci.yml's
+ * `worker` job still proves workerd-compat; this proves the browser half.
  *
  * Second layer (the build itself): `apps/noite/vite.config.ts`
  * (`failOnExternalizedBuiltin`) turns Vite's `has been externalized for
@@ -49,13 +49,11 @@ import { readdirSync, readFileSync, statSync } from "node:fs";
 import { builtinModules } from "node:module";
 import path from "node:path";
 
-import { stripTs } from "./check-tests";
-
 /** One static import edge out of a module. */
 export interface ClientImport {
   /** The specifier as written (`node:async_hooks`, `./detail`, `$lib/x`). */
   readonly specifier: string;
-  /** 1-based line of the `import`/`export` keyword. */
+  /** 1-based line of the quoted specifier (first occurrence per edge). */
   readonly line: number;
 }
 
@@ -99,99 +97,57 @@ const lineOf = (source: string, index: number): number => {
   return line;
 };
 
-/** A braced only-type item list (`{ type A, type B }`): erased, ignorable. */
-const isTypeOnlyMiddle = (middle: string): boolean => {
-  if (/^\s*type\b/u.test(middle)) {
-    return true;
-  }
-
-  const braced = /^\s*\{(?<body>[\s\S]*)\}\s*$/u.exec(middle);
-
-  if (!braced) {
-    return false;
-  }
-
-  const items = (braced.groups?.body ?? "")
-    .split(",")
-    .map((item) => item.trim())
-    .filter((item) => item.length > 0);
-
-  return items.length > 0 && items.every((item) => /^\s*type\b/u.test(item));
-};
-
-interface RawEdge {
-  keyword: string;
-  keywordStart: number;
-  line: number;
-  middle: string;
-  specifier: string;
-}
+const transpiler = new Bun.Transpiler({ loader: "tsx" });
 
 /**
- * Candidate static edges from the raw source. The middle (between the
- * keyword and `from`) excludes quotes and semicolons, so a match can never
- * span statements; each candidate is then validated against the
- * comment/string/regex-blanked source, where a match inside a comment or a
- * string has no literal keyword left to stand on.
+ * Line of the next quoted occurrence of `specifier` at or after `from`
+ * (either quote style), plus the offset just past it so a repeated
+ * specifier attributes each occurrence in order. The edge itself already
+ * comes from the parser below — this only locates it for the report, so a
+ * first-occurrence search is enough. Unreachable in practice (the parser
+ * saw the quoted specifier in this same source): falls back to the last
+ * line rather than throwing the scan away.
  */
-const rawEdges = (source: string): RawEdge[] => {
-  const edges: RawEdge[] = [];
+const specifierLine = (source: string, specifier: string, from: number) => {
+  const hits = [`"${specifier}"`, `'${specifier}'`].flatMap((quoted) => {
+    const at = source.indexOf(quoted, from);
 
-  const fromPattern =
-    /\b(?<keyword>import|export)\b(?<middle>[^;'"]*?)\bfrom\s*(?<quote>['"])(?<specifier>(?:(?!\k<quote>)[^\\\n]|\\.)*)\k<quote>/gu;
+    return at === -1 ? [] : [at];
+  });
 
-  const barePattern =
-    /\bimport\s*(?<quote>['"])(?<specifier>(?:(?!\k<quote>)[^\\\n]|\\.)*)\k<quote>/gu;
-
-  for (const match of source.matchAll(fromPattern)) {
-    edges.push({
-      keyword: match.groups?.keyword ?? "",
-      keywordStart: match.index,
-      line: lineOf(source, match.index),
-      middle: match.groups?.middle ?? "",
-      specifier: match.groups?.specifier ?? "",
-    });
+  if (hits.length === 0) {
+    return { end: source.length, line: lineOf(source, source.length) };
   }
 
-  for (const match of source.matchAll(barePattern)) {
-    edges.push({
-      keyword: "import",
-      keywordStart: match.index,
-      line: lineOf(source, match.index),
-      middle: "",
-      specifier: match.groups?.specifier ?? "",
-    });
-  }
+  const at = Math.min(...hits);
 
-  return edges;
+  return { end: at + specifier.length + 2, line: lineOf(source, at) };
 };
 
 /**
- * Every static value-level import edge out of `source`: `import … from`,
- * side-effect `import "…"`, `export … from`. Type-only edges
- * (`import type`, `export { type X } from`) are erased before the bundle.
- * Dynamic `import()` is deliberately out of scope (lazy boundary, and the
- * incident shape is a static edge).
+ * Every static value-level import edge out of `source` — `import … from`,
+ * side-effect `import "…"`, `export … from` — via Bun's own parser
+ * (`Transpiler.scanImports`) instead of a regex. A quote inside a comment
+ * in the import's middle defeated the old middle-matcher (the edge vanished
+ * entirely), and import text inside a template string faked an edge the
+ * stripTs check could not always see. The parser handles comments, strings
+ * and type-only edges (`import type`, `export type`, `export { type … }`
+ * are erased before the bundle and dropped here); only `import-statement`
+ * edges count, so dynamic `import()` stays out of scope (lazy boundary,
+ * and the incident shape is a static edge).
  */
 export const parseStaticImports = (source: string): ClientImport[] => {
-  const stripped = stripTs(source);
+  const offsets = new Map<string, number>();
   const imports: ClientImport[] = [];
 
-  for (const edge of rawEdges(source)) {
-    if (
-      stripped.slice(
-        edge.keywordStart,
-        edge.keywordStart + edge.keyword.length
-      ) !== edge.keyword
-    ) {
+  for (const edge of transpiler.scanImports(source)) {
+    if (edge.kind !== "import-statement") {
       continue;
     }
 
-    if (edge.middle !== "" && isTypeOnlyMiddle(edge.middle)) {
-      continue;
-    }
-
-    imports.push({ line: edge.line, specifier: edge.specifier });
+    const found = specifierLine(source, edge.path, offsets.get(edge.path) ?? 0);
+    offsets.set(edge.path, found.end);
+    imports.push({ line: found.line, specifier: edge.path });
   }
 
   return imports.toSorted((a, b) => a.line - b.line);
