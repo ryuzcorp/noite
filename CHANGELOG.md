@@ -10,6 +10,21 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 <!-- New entries go in changelog.d/<topic>.md; the release PR assembles them with `bun docker/changelog-release.ts`. -->
 
+## [0.1.0-beta.5] - 2026-11-17
+
+### Operator action required
+
+- None.
+
+### Fixed
+
+- A failed control-database migration at boot no longer needs an operator restart. The runner retries the control D1 migrations in the background with capped backoff (1 s, doubling to 60 s), logging the failing migration and the error on every attempt, until they apply. While they have not applied, the control UI answers `503 Control database is migrating; retry shortly` (with `retry-after`) instead of serving a broken UI, and `/ready` keeps naming the `control` cause; `/health` still only reports the runner process itself. A permanently broken migration stays visible in the log and in `/ready` instead of silently looping, and a retry never applies a file twice (each file still applies transactionally with its journal stamp).
+- The upgrade lane now covers tenant D1 migrations: the seeded sample Worker ships a `migrations/` dir (ignored by releases before the deploy-time apply), and after the upgrade the lane redeploys on the tree with a new migration file — proving every pending file applies exactly once (one `d1_migrations` row each, served back by the Worker) — then redeploys again and proves nothing applies twice.
+- Build steps now get the runner's own `NODE_OPTIONS=--max-old-space-size=N` (three quarters of the build leaf's RAM cap) on every install, build, convert and release step, including the Noite CI lane. Node otherwise sizes its heap at about half the leaf, so a large `pnpm install` (Ember's 397 packages) aborted with `FATAL ERROR: Reached heap limit` after `added 397, done` on a 613 MiB leaf — as `SIGABRT` (`exit None`) with a raw V8 dump and no actionable line. A step that still outgrows its JavaScript heap now fails with the invocation line first and the header naming the V8 ceiling and both budgets (`RUNNER_BUILD_MEMORY_MB` / `RUNNER_BUILD_SWAP_MB`), so the convert step (which strips the invocation line) keeps the header too. Tenant `NODE_OPTIONS` stays reserved and never reaches the build.
+- Build steps also get the runner's own `PNPM_MAX_WORKERS` (leaf RAM per 512 MiB, capped by the leaf's CPU share, at least 1): pnpm's tarball pool defaults to host CPUs minus one, and dozens of workers OOM a small leaf in fetch before the heap ceiling ever matters. A tenant value is dropped. Linking still needs transient room — an Ember-size install needs on the order of half a GiB of build swap on a 613 MiB leaf at 2 CPUs (measured, warm store) — and a leaf the kernel kills now says to add host swap when there is none, since `RUNNER_BUILD_SWAP_MB` only splits existing host swap.
+- **The route timeout now aborts the downstream work, not just the response.** The 15 s action bound (`/mcp`: 65 s) used to answer its JSON 504 while the stuck handler kept running, so a slow write or action continued after the caller saw an error and a retry could double-apply it (source commits guard the retry with `expectedTip`, the compare-and-set precondition). Each bounded request now runs under its own `AsyncLocalStorage` signal, aborted with a typed reason when the bound fires, and the runner calls fold that signal in — after the 504 no further outbound runner call starts for that request and in-flight ones reject. The store is strictly per request, so overlapping requests can never observe or abort each other's bound. D1 needs no rollback: the control plane runs no interactive transactions, so every control write is one statement or one `db.batch`, which D1 applies atomically. Exempt routes (streams, downloads, static) are unaffected, and a client disconnect aborts through the same controller with its own typed reason, ending quietly instead of logging an "Internal error".
+- **Retrying an admin app delete after the runner row is already gone no longer strands grants.** A 404 from the runner delete is treated as already gone: the grants and pending invitations still drop, and the delete answers ok instead of stranding rows a retry would 404 on again.
+
 ## [0.1.0-beta.4] - 2026-11-17
 
 ### Operator action required
