@@ -256,13 +256,7 @@ jobs:
         with:
           node-version: 24
           registry-url: "https://registry.npmjs.org"
-      - name: cache bun packages
-        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
-        with:
-          key: bun-${{ runner.os }}-${{ hashFiles('bun.lock', 'apps/noite/bun.lock') }}
-          restore-keys: |
-            bun-${{ runner.os }}-
-          path: ~/.bun/install/cache
+      # No package cache on the publish path: install straight from the registry.
       - name: install root deps
         timeout-minutes: 5
         run: sh .github/scripts/bun-install.sh
