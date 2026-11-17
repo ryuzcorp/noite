@@ -3,7 +3,7 @@ import { readFileSync } from "node:fs";
 import { expect, test } from "@playwright/test";
 import * as Schema from "effect/Schema";
 
-import { appListenPort, runnerCall } from "../e2e/helpers";
+import { appListenPort, gitRefs, runnerCall } from "../e2e/helpers";
 import { hasCollaborator } from "./lane";
 
 /** Prove the tree image serves the previous release's seed back: the app
@@ -19,6 +19,7 @@ const STATE_PATH =
 
 const UpgradeState = Schema.Struct({
   appId: Schema.String,
+  apiKey: Schema.String,
   deploySha: Schema.String,
   fileBody: Schema.String,
   hostname: Schema.String,
@@ -145,6 +146,11 @@ test("the tree image serves the previous release's data back", async ({
   );
 
   expect(counter.n).toEqual(expect.any(Number));
+
+  // The seed's API key still authenticates git: the credential store and
+  // the git mirror survived the upgrade, and the seed push's commit is
+  // still the tip.
+  expect(gitRefs(state.apiKey, state.slug)).toContain(state.deploySha);
 
   // The collaborator the control plane recorded is still on the app.
   expect(await hasCollaborator(page, state.appId, state.inviteeEmail)).toBe(

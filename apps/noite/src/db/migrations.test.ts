@@ -1,7 +1,12 @@
 import { Database } from "bun:sqlite";
 import { describe, expect, test } from "bun:test";
+import { createHash } from "node:crypto";
 import { readdirSync, readFileSync } from "node:fs";
 import path from "node:path";
+
+import { getTableConfig, SQLiteTable } from "void/schema-d1";
+
+import * as schema from "./schema";
 
 /** The control schema as every install before the Void/Drizzle swap created
  * it (paranorm's DDL: TEXT timestamps, table-level unique constraints). The
@@ -271,5 +276,104 @@ describe("control migrations", () => {
       "user",
       "verification",
     ]);
+  });
+
+  test("migrations are append-only: shipped files never change", () => {
+    // A shipped migration is already recorded as applied in every upgraded
+    // install's journal, so editing it reaches fresh installs only — the
+    // worst divergence. Register a new file's hash when it ships; never
+    // touch an existing entry.
+    const manifest = {
+      "20261109122217_talented_lady_bullseye.sql":
+        "49de0debe6d730c6c721ac1015ac62d77cfb72c3df9931a7e5e4112ccb9be5db",
+      "20261114120000_first_admin_setup_code.sql":
+        "41a92a9f9fd3a777805bcaea7d85ae5323a9aa03bedfee60cde93c71178da6a9",
+      "20261116120000_email_invites_waitlist.sql":
+        "4e7f6d4856143eb9a96c50a957b9f48735c9095bd12516302dfdec8a29314559",
+    } satisfies Record<string, string>;
+
+    const dir = path.join(import.meta.dir, "migrations");
+
+    const files = readdirSync(dir)
+      .filter((name) => name.endsWith(".sql"))
+      .toSorted();
+
+    for (const name of files) {
+      const entry = Object.entries(manifest).find(([file]) => file === name);
+
+      expect(
+        entry,
+        `unregistered migration ${name}: ship it as a new file and register its sha256 here`
+      ).toBeDefined();
+
+      const actual = createHash("sha256")
+        .update(readFileSync(path.join(dir, name)))
+        .digest("hex");
+
+      expect(actual).toBe(entry?.[1]);
+    }
+
+    for (const name of Object.keys(manifest).toSorted()) {
+      expect(
+        files.includes(name),
+        `shipped migration ${name} is gone: migrations are append-only, never delete one`
+      ).toBe(true);
+    }
+  });
+
+  test("schema.ts matches the migrated shape", () => {
+    // Fresh installs build from schema.ts while upgraded installs replay
+    // the migrations: a drift between them is a silent fork. Every declared
+    // table must exist after the replay with the same columns and index
+    // names, and no replayed table may lack a declaration.
+    const raw = new Database(":memory:");
+    raw.run("PRAGMA foreign_keys = ON");
+    applyShippedMigrations(raw);
+
+    const declared = Object.values(schema).filter(
+      (table): table is SQLiteTable => table instanceof SQLiteTable
+    );
+
+    expect(declared.length).toBeGreaterThan(0);
+
+    // SAFETY: the query selects exactly the name column of every table.
+    const migratedNames = raw
+      .query(
+        `SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name`
+      )
+      .all() as { name: string }[];
+
+    expect(migratedNames.map((table) => table.name).toSorted()).toEqual(
+      declared.map((table) => getTableConfig(table).name).toSorted()
+    );
+
+    for (const table of declared) {
+      const config = getTableConfig(table);
+
+      // SAFETY: the pragma selects exactly the column names of one table.
+      const columns = raw
+        .query(
+          `SELECT name FROM pragma_table_info("${config.name}") ORDER BY name`
+        )
+        .all() as { name: string }[];
+
+      expect(columns.map((column) => column.name)).toEqual(
+        config.columns.map((column) => column.name).toSorted()
+      );
+
+      // SAFETY: the query selects exactly the name column of every index.
+      const indexes = raw
+        .query(
+          `SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = '${config.name}' AND sql IS NOT NULL ORDER BY name`
+        )
+        .all() as { name: string }[];
+
+      const declaredIndexes = [
+        ...config.indexes.map((index) => index.config.name),
+        ...config.uniqueConstraints.map((unique) => unique.name),
+      ].toSorted();
+
+      expect(indexes.map((index) => index.name)).toEqual(declaredIndexes);
+    }
   });
 });

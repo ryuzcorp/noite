@@ -13,6 +13,8 @@
 # (never pulled; the daemon must already hold the tag). The new side builds
 # from the tree by default; E2E_IMAGE=<tag> tests a prebuilt image instead
 # (CI hands over its one shared build this way).
+# `E2E_FROM_OLDEST=1` seeds from the oldest supported release (the first
+# beta tag) instead of the previous one — the monthly oldest-beta lane.
 #
 # Knobs (mirroring docker/e2e-local.sh, own project/bucket/ports):
 #   E2E_SLOT=<n>          parallel lane <n> (default 0 = today's ports);
@@ -46,6 +48,11 @@ resolve_prev_tag() {
 }
 
 PREV_TAG_RESOLVED="$(resolve_prev_tag || true)"
+if [ "${E2E_FROM_OLDEST:-0}" = 1 ]; then
+  # The oldest supported release (the first beta), not the previous one:
+  # proves a beta.1 -> tree jump. An explicit PREV_TAG still wins.
+  PREV_TAG_RESOLVED="${PREV_TAG:-$(git tag --list 'v0.1.0-beta.*' --sort=v:refname | head -n 1)}"
+fi
 if [ -z "$PREV_TAG_RESOLVED" ] && command -v gh >/dev/null 2>&1; then
   PREV_TAG_RESOLVED="$(gh release list --limit 5 --json tagName -q '.[1].tagName' 2>/dev/null || true)"
 fi

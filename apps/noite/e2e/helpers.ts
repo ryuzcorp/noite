@@ -602,6 +602,15 @@ export const pushAppDir = (
 export const pushSampleApp = (apiKey: string): string =>
   pushAppDir(apiKey, new URL("../test", import.meta.url), E2E_SLUG);
 
+/** The refs a git credential can still read: a pre-upgrade API key proves
+ * the credential store and the git mirror survived when it lists the seed
+ * push's commit after the restart. Read-only; `ls-remote` writes nothing. */
+export const gitRefs = (apiKey: string, slug: string): string =>
+  execGit([
+    "ls-remote",
+    `http://git:${apiKey}@${gitBase.replace(/^https?:\/\//u, "")}/${slug}`,
+  ]);
+
 /** Read-only probe of the deployed sample (counter `?read=1` never advances). */
 export const readSampleApp = async (
   request: APIRequestContext,

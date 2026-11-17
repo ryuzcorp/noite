@@ -191,6 +191,7 @@ test("seed the previous release with app, env, deploy, domain and people", async
 
     const state = {
       appId,
+      apiKey: key,
       deploySha: sha,
       fileBody: FILE_BODY,
       hostname,
