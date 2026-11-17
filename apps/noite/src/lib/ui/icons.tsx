@@ -109,6 +109,14 @@ export const Menu = (p: IconProps) => (
   </svg>
 );
 
+export const Ellipsis = (p: IconProps) => (
+  <svg {...base(p, 16)}>
+    <circle cx="12" cy="5" r="1" />
+    <circle cx="12" cy="12" r="1" />
+    <circle cx="12" cy="19" r="1" />
+  </svg>
+);
+
 export const Pause = (p: IconProps) => (
   <svg {...base(p, 16)}>
     <rect width="4" height="16" x="6" y="4" />

@@ -15,12 +15,14 @@ import { authClient } from "../auth-client";
 import { rememberImpersonationReturn } from "../auth/impersonation";
 import { invalidateSession } from "../auth/session";
 import { errorMessage } from "../errors";
+import { collectRef, liveEl, newLiveRef } from "../live-ref";
 import { resourceValue, resourceError } from "../resource";
 import { adminListEmailInvites, listUsers } from "../resources";
 import { searchParam } from "../search-param";
 import { Avatar } from "../ui/avatar";
 import { confirmDialog } from "../ui/confirm";
 import { CopyButton } from "../ui/copy-button";
+import { Ellipsis } from "../ui/icons";
 import {
   ACTION,
   AdminRow,
@@ -30,7 +32,6 @@ import {
   Problems,
   SearchForm,
   SkeletonRows,
-  W_LG,
   W_SM,
   toPageIndex,
 } from "./shared";
@@ -70,10 +71,78 @@ const INVITE_TONE: Record<EmailInviteWire, string> = {
   used: "badge-success",
 };
 
-/** The action buttons for one user row: nothing for the admin themself,
+/** One entry in a user row's action menu. */
+interface RowMenuItem {
+  danger: boolean;
+  disabled: boolean;
+  label: string;
+  onPick: () => void;
+}
+
+/** One user row's actions behind a single compact menu: four inline buttons
+ * spill onto two lines at 390 px, so every row collapses to one kebab. The
+ * same menu at every width — one code path, no breakpoint duplication (a
+ * CSS-only swap would keep two button trees in the DOM, twice the tab stops
+ * and twice the selectors). A native `<details>` keeps the toggle
+ * keyboard-operable; the shell closes it on an outside press or Esc.
+ * Destructive entries keep the error tone and their confirm dialogs. */
+const RowActionMenu = ({
+  items,
+  label,
+}: {
+  items: RowMenuItem[];
+  label: string;
+}) => {
+  const menu = atom.lazy(newLiveRef<HTMLDetailsElement>)();
+
+  const close = () => {
+    const element = liveEl(menu);
+
+    if (element) {
+      element.open = false;
+    }
+  };
+
+  return (
+    <details
+      class="dropdown dropdown-end"
+      data-morph-preserve="open"
+      ref={(el) => {
+        collectRef(menu, el);
+      }}
+    >
+      <summary class="btn btn-sm btn-ghost" aria-label={label} title={label}>
+        <Ellipsis />
+      </summary>
+      <ul
+        class="dropdown-content menu bg-base-100 dark:bg-base-200 rounded-box z-50 w-52 p-2 shadow"
+        aria-label="Row actions"
+      >
+        {items.map((item) => (
+          <li key={item.label}>
+            <button
+              type="button"
+              class={`btn btn-sm btn-ghost w-full justify-start ${item.danger ? "text-error" : ""}`}
+              disabled={item.disabled}
+              onclick={() => {
+                close();
+                item.onPick();
+              }}
+            >
+              {item.label}
+            </button>
+          </li>
+        ))}
+      </ul>
+    </details>
+  );
+};
+
+/** The action menu for one user row: nothing for the admin themself,
  * Approve/Reject for a waiting account, the full set otherwise. */
 const rowActionsView = (props: AdminUserRowItemProps): View => {
   const { row } = props;
+  const busy = props.pending !== null;
 
   if (row.self) {
     return null;
@@ -81,81 +150,70 @@ const rowActionsView = (props: AdminUserRowItemProps): View => {
 
   if (row.status === "pending") {
     return (
-      <>
-        <button
-          type="button"
-          class={`${ACTION} ${W_SM}`}
-          disabled={props.pending !== null}
-          onclick={() => {
-            props.onApprove(row);
-          }}
-        >
-          Approve
-        </button>
-        <button
-          type="button"
-          class={`${DANGER} ${W_SM}`}
-          disabled={props.pending !== null}
-          onclick={() => {
-            props.onReject(row);
-          }}
-        >
-          Reject
-        </button>
-      </>
+      <RowActionMenu
+        label={`Actions for ${row.email}`}
+        items={[
+          {
+            danger: false,
+            disabled: busy,
+            label: "Approve",
+            onPick: () => {
+              props.onApprove(row);
+            },
+          },
+          {
+            danger: true,
+            disabled: busy,
+            label: "Reject",
+            onPick: () => {
+              props.onReject(row);
+            },
+          },
+        ]}
+      />
     );
   }
 
   return (
-    <>
-      <button
-        type="button"
-        class={`${ACTION} ${W_LG}`}
-        disabled={props.pending !== null}
-        onclick={() => {
-          props.onImpersonate(row);
-        }}
-      >
-        Impersonate
-      </button>
-      <button
-        type="button"
-        class={`${ACTION} ${W_LG}`}
-        // A stored role outside {admin, user} cannot be reasoned about:
-        // toggling it would rewrite a value nobody understands.
-        disabled={props.pending !== null || !row.roleKnown}
-        title={
-          row.roleKnown
-            ? undefined
-            : "This account's stored role is not admin or user"
-        }
-        onclick={() => {
-          props.onRole(row);
-        }}
-      >
-        {row.role === "admin" ? "Remove admin" : "Make admin"}
-      </button>
-      <button
-        type="button"
-        class={`${ACTION} ${W_SM}`}
-        disabled={props.pending !== null}
-        onclick={() => {
-          props.onToggle(row);
-        }}
-      >
-        {row.banned ? "Unban" : "Ban"}
-      </button>
-      <button
-        type="button"
-        class={`${DANGER} ${W_SM}`}
-        disabled={props.pending !== null}
-        onclick={() => {
-          props.onDelete(row);
-        }}
-      >
-        Delete
-      </button>
-    </>
+    <RowActionMenu
+      label={`Actions for ${row.email}`}
+      items={[
+        {
+          danger: false,
+          disabled: busy,
+          label: "Impersonate",
+          onPick: () => {
+            props.onImpersonate(row);
+          },
+        },
+        {
+          danger: false,
+          // A stored role outside {admin, user} cannot be reasoned about:
+          // toggling it would rewrite a value nobody understands.
+          disabled: busy || !row.roleKnown,
+          label: row.role === "admin" ? "Remove admin" : "Make admin",
+          onPick: () => {
+            props.onRole(row);
+          },
+        },
+        {
+          danger: !row.banned,
+          disabled: busy,
+          label: row.banned ? "Unban" : "Ban",
+          onPick: () => {
+            props.onToggle(row);
+          },
+        },
+        {
+          danger: true,
+          disabled: busy,
+          label: "Delete",
+          onPick: () => {
+            props.onDelete(row);
+          },
+        },
+      ]}
+    />
   );
 };
 

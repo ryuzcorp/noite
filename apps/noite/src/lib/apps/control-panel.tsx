@@ -142,7 +142,8 @@ export const activeControlTab = (
 
 /** Metrics tab: the window lives in `?r=` (24 / 168 / 720 hours), like a
  * tenant app. The card is keyed by the window because its live feed opens one
- * URL for the life of a component. */
+ * URL for the life of a component. The heading sits left of the picker
+ * (card-title style, like Errors/Events), wrapping above it at 390 px. */
 const ControlMetricsTab = () => {
   const range = searchParam("r", {
     default: DEFAULT_METRICS_HOURS,
@@ -151,7 +152,7 @@ const ControlMetricsTab = () => {
 
   return (
     <div class="flex flex-col gap-4">
-      <div class="flex items-center justify-between gap-2">
+      <div class="flex flex-wrap items-center justify-between gap-2">
         <h2 class="m-0 text-lg font-semibold">Metrics</h2>
         <MetricsRangePicker
           hours={range()}
@@ -172,7 +173,8 @@ const ControlMetricsTab = () => {
 
 /** Analytics tab: the same `?r=` window as Metrics (switching tabs keeps the
  * window), one card per breakdown. Shares the metrics snapshot — no new
- * endpoint — through the exported `AnalyticsCard`. */
+ * endpoint — through the exported `AnalyticsCard`. Same heading row as
+ * Metrics: the title left, the picker right, wrapping sanely at 390 px. */
 const ControlAnalyticsTab = () => {
   const range = searchParam("r", {
     default: DEFAULT_METRICS_HOURS,
@@ -181,7 +183,7 @@ const ControlAnalyticsTab = () => {
 
   return (
     <div class="flex flex-col gap-4">
-      <div class="flex items-center justify-between gap-2">
+      <div class="flex flex-wrap items-center justify-between gap-2">
         <h2 class="m-0 text-lg font-semibold">Analytics</h2>
         <MetricsRangePicker
           hours={range()}
@@ -372,7 +374,20 @@ const ControlAppDetailBody = ({ fleet }: { fleet: FleetState }) => {
       {active === "errors" ? (
         <ErrorsPanel appId={CONTROL_APP_ID} canTriage />
       ) : null}
-      {active === "logs" ? <RuntimeLogs appId={CONTROL_APP_ID} /> : null}
+      {/* The Logs tab in the standard card (title row like the Errors/Events
+          cards, same component and classes). The tail itself stays the shared
+          `RuntimeLogs`: the deploy rows mount it bare inside the Deployments
+          list, so the card lives here, not in it. */}
+      {active === "logs" ? (
+        <section class="card bg-base-100 dark:bg-base-200 border-base-300 w-full border shadow-md">
+          <div class="card-body gap-4">
+            <div class="flex flex-wrap items-center justify-between gap-2">
+              <h2 class="m-0 text-lg font-semibold">Logs</h2>
+            </div>
+            <RuntimeLogs appId={CONTROL_APP_ID} />
+          </div>
+        </section>
+      ) : null}
       {/* One Admin tab, three stacked sections with their own headings. The
           admin panels keep their searches in the URL (`uq`/`up`, `aq` — none
           collide with the control page's `t`/`e`/`r`). */}
