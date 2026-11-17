@@ -385,14 +385,16 @@ async fn main() -> anyhow::Result<()> {
         Ok(Err(e)) => tracing::warn!(error = %e, "sandbox boot sweep failed"),
         Err(_) => tracing::warn!("sandbox boot sweep timed out"),
     }
-    if !config.sandbox_disabled {
+    // The refresh task's handle: shutdown aborts it before removing the
+    // relay (below), so no tick can recreate the relay mid-shutdown.
+    let sandbox_refresh = if !config.sandbox_disabled {
         let fleet_ids = config
             .fleet_uid
             .map(|uid| (uid, config.fleet_gid.unwrap_or(uid)));
         // Only single tenancy without per-fleet cgroups may take the
         // gateway's degraded unattributed-allow path; multi refuses.
         let single = config.tenancy == crate::config::Tenancy::Single;
-        tokio::spawn(async move {
+        Some(tokio::spawn(async move {
             let first = host::sandbox::plane::ensure_networks().await;
             if first.engine {
                 tracing::info!(subnets = ?first.subnets, "sandbox plane ensured");
@@ -427,8 +429,10 @@ async fn main() -> anyhow::Result<()> {
                 let relay_healthy = relay_ok && host::sandbox::relay::healthy().await;
                 host::sandbox::plane::record(true, nets.subnets, relay_healthy, table_ok);
             }
-        });
-    }
+        }))
+    } else {
+        None
+    };
     // Per-fleet cgroups before any child is spawned: setup drains the
     // runner's own cgroup (tini stays reaped, cgroups do not affect that)
     // into a leaf, so children spawned after it inherit the leaf and tenant
@@ -804,6 +808,18 @@ async fn main() -> anyhow::Result<()> {
             }
         })
         .await?;
+    // The 30 s sandbox refresh loop outlives the shutdown flag: a tick
+    // landing after the relay removal below recreates the relay
+    // mid-shutdown, and the orphan holds the data volume so a lane
+    // teardown's volume rm fails ("volume is in use"). Abort the loop first
+    // and wait it out — an in-flight `docker run -d` already created its
+    // container by the time the abort lands — so nothing can recreate the
+    // relay after it is removed.
+    if let Some(handle) = sandbox_refresh {
+        handle.abort();
+        let _ = handle.await;
+    }
+
     // Reconcile loop observes the flag and stops spawning. Tenant fleets and
     // the control fleet stop together under the one budget; Caddy goes last
     // so requests already in flight drain through it.

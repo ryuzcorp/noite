@@ -72,6 +72,20 @@ remove_project() {
       [ -z "$ids" ] || "$CLI" rm -f $ids >/dev/null
     done
     vols="$("$CLI" volume ls -q 2>/dev/null | grep "^${p}_" || true)"
+    # Sibling containers the stack spawned through the engine socket carry
+    # no compose labels (the sandbox relay mounts the data volume with only
+    # a `noite.relay` label), so the loop above never reaps them — and one
+    # left holding a volume fails the rm below with "volume is in use"
+    # (the upgrade lane died at teardown after going green). Reap whatever
+    # still mounts the project's volumes first; the names are
+    # project-scoped, so only this stack's strays can match. Best-effort
+    # (a concurrent sweep may win the race): the volume rm stays strict.
+    # shellcheck disable=SC2086
+    for v in $vols; do
+      holders="$("$CLI" ps -aq --filter "volume=$v" 2>/dev/null || true)"
+      # shellcheck disable=SC2086
+      [ -z "$holders" ] || "$CLI" rm -f $holders >/dev/null 2>&1 || true
+    done
     # shellcheck disable=SC2086
     [ -z "$vols" ] || "$CLI" volume rm -f $vols >/dev/null
   done
