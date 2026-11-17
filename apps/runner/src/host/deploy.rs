@@ -976,14 +976,14 @@ async fn deploy_inner(
                     .iter()
                     .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
                     .collect();
-                // The runner's own V8 ceiling, like the built-in steps: a
-                // container sized from the same budget gets the same heap,
-                // never V8's default half-of-cgroup. CI config
-                // (workflow/job/step) env applies over this default
+                // The runner's own V8 ceiling, like the built-in steps — but
+                // RAM-only: CI containers run with `--memory-swap` equal to
+                // `--memory`, so there is no swap allowance to extend into.
+                // CI config (workflow/job/step) env applies over this default
                 // downstream, so a step may still override it inside its own
                 // memory-capped container; tenant `NODE_OPTIONS` rows are
                 // dropped upstream, so this default is always the runner's.
-                if let Some(flag) = exec::node_heap_flag_for(ci_memory_mb) {
+                if let Some(flag) = exec::node_heap_flag_for(ci_memory_mb, 0) {
                     ci_env.push(("NODE_OPTIONS".to_string(), flag));
                 }
                 // The runner's own pnpm worker cap, like the heap ceiling
@@ -3195,7 +3195,7 @@ mod tests {
         let (memory, cpus) = ci_container_budgets(613, 32);
         assert_eq!((memory, cpus), (613, 31));
         assert_eq!(
-            crate::host::exec::node_heap_flag_for(memory),
+            crate::host::exec::node_heap_flag_for(memory, 0),
             Some("--max-old-space-size=459".to_string())
         );
         assert_eq!(
@@ -3206,7 +3206,7 @@ mod tests {
         let (memory, cpus) = ci_container_budgets(0, 8);
         assert_eq!((memory, cpus), (1024, 7));
         assert_eq!(
-            crate::host::exec::node_heap_flag_for(memory),
+            crate::host::exec::node_heap_flag_for(memory, 0),
             Some("--max-old-space-size=768".to_string())
         );
         assert_eq!(

@@ -50,27 +50,40 @@ pub fn base_env(work_tmp: &str, cache: &Path) -> Vec<(String, String)> {
     ]
 }
 
-/// Share of a build leaf's RAM cap given to V8's old space, in percent.
+/// Share of a build leaf's budget given to V8's old space, in percent.
 /// Node sizes its default heap from the leaf's `memory.max` — about half —
 /// so a 613 MiB leaf gives a 397-package pnpm install ~306 MB and it aborts
 /// with `FATAL ERROR: Reached heap limit` after `added 397, done` (Ember,
-/// beta.4). Three quarters leaves native headroom (RSS, page cache) while
-/// the overflow swaps; a ceiling at or above the RAM cap would pin the leaf
-/// and trip the thrash watchdog on a healthy build (see
-/// `cgroups::build_thrash_pinned`).
+/// beta.4). Worse, a heap capped at RAM cannot build at all once the
+/// workload needs more than RAM: `tsc -p .` on Ember needs ~630 MB on a 613
+/// MiB leaf, so the ceiling must extend into swap — measured with 1023 MiB
+/// of swap (tsc needs ~630, passes with ~640 in 16 s, with 900–1200 in 10 s;
+/// a full `pnpm -r build` passes at 1200 in 12 s) while a synthetic grower
+/// past the ceiling still aborts cleanly in seconds (never the step timeout).
+/// Three quarters leaves native headroom (RSS, page cache) while the rest
+/// of the leaf — RAM and swap alike — absorbs the working set. A ceiling
+/// past RAM is safe to run: the thrash watchdog only fires a leaf that is
+/// both pinned and out of swap room (`cgroups::build_thrash_pinned`), and a
+/// runaway still meets the oom-kill budget error or the step timeout.
 const NODE_HEAP_PCT: u64 = 75;
 
-/// V8 heap ceiling in MiB for a build leaf with `memory_mb` of RAM: `None`
-/// when builds run uncapped (`0` is the old behavior, no `NODE_OPTIONS`).
-/// Swap never counts toward the ceiling: heap past the RAM cap would pin the
-/// leaf and trip the thrash watchdog, so swap stays the overflow for native
-/// RSS and page cache. Runner-owned: tenant `NODE_OPTIONS` is dropped in
-/// `db::env`, so nothing the tenant sets can widen or narrow this.
-pub(crate) fn build_node_heap_max_mb(memory_mb: u64) -> Option<u64> {
+/// V8 heap ceiling in MiB for a build leaf with `memory_mb` of RAM and
+/// `swap_mb` of swap: `None` when builds run uncapped (`0` is the old
+/// behavior, no `NODE_OPTIONS`). The ceiling is three quarters of the whole
+/// leaf budget: without swap this is three quarters of RAM, as before; with
+/// swap it extends into the allowance by the same share, because a workload
+/// larger than RAM (Ember's `tsc`, ~630 MB on a 613 MiB leaf) can never pass
+/// a RAM-only ceiling. A bigger ceiling is not a bigger allocation — V8 only
+/// faults what the build touches, spilling the excess into swap — so an
+/// oversized ceiling costs nothing until a build genuinely fills it, and then
+/// it meets the budget errors or the step timeout like any other overrun.
+/// Runner-owned: tenant `NODE_OPTIONS` is dropped in `db::env`, so nothing
+/// the tenant sets can widen or narrow this.
+pub(crate) fn build_node_heap_max_mb(memory_mb: u64, swap_mb: u64) -> Option<u64> {
     if memory_mb == 0 {
         return None;
     }
-    Some(memory_mb * NODE_HEAP_PCT / 100)
+    Some((memory_mb + swap_mb) * NODE_HEAP_PCT / 100)
 }
 
 /// The runner-owned `NODE_OPTIONS` for one build step (`None` when builds
@@ -78,15 +91,20 @@ pub(crate) fn build_node_heap_max_mb(memory_mb: u64) -> Option<u64> {
 /// runs, lifecycle scripts, the config converter — sizes its heap from the
 /// leaf's real budget instead of V8's default half-of-cgroup.
 pub(crate) fn node_heap_flag() -> Option<String> {
-    node_heap_flag_for(crate::host::cgroups::build_memory_mb()?)
+    node_heap_flag_for(
+        crate::host::cgroups::build_memory_mb()?,
+        crate::host::cgroups::build_swap_mb().unwrap_or(0),
+    )
 }
 
-/// The runner-owned `NODE_OPTIONS` for an explicit budget (`None` when `0`):
-/// the CI lane sizes its container from config whether or not cgroup
-/// containment is active (without containment the globals above stay unset,
-/// so the globals-based flag would silently vanish there).
-pub(crate) fn node_heap_flag_for(memory_mb: u64) -> Option<String> {
-    build_node_heap_max_mb(memory_mb).map(|heap| format!("--max-old-space-size={heap}"))
+/// The runner-owned `NODE_OPTIONS` for an explicit budget (`None` when the
+/// RAM cap is `0`): the CI lane sizes its container from config whether or
+/// not cgroup containment is active (without containment the globals above
+/// stay unset, so the globals-based flag would silently vanish there). CI
+/// containers get no swap (`--memory-swap` equals `--memory`), so the lane
+/// passes `0` and keeps the old RAM-only share.
+pub(crate) fn node_heap_flag_for(memory_mb: u64, swap_mb: u64) -> Option<String> {
+    build_node_heap_max_mb(memory_mb, swap_mb).map(|heap| format!("--max-old-space-size={heap}"))
 }
 
 /// MiB of leaf RAM per pnpm tarball worker. pnpm's pool defaults to one
@@ -608,7 +626,7 @@ pub async fn run_sandboxed(
                 if v8_heap_oom(&out, &err) {
                     let memory = crate::host::cgroups::build_memory_mb().unwrap_or(0);
                     let swap = crate::host::cgroups::build_swap_mb().unwrap_or(0);
-                    let heap = match build_node_heap_max_mb(memory) {
+                    let heap = match build_node_heap_max_mb(memory, swap) {
                         Some(heap) => format!("{heap} MiB"),
                         None => "unset".to_string(),
                     };
@@ -1103,17 +1121,22 @@ mod tests {
         assert_eq!(dir_bytes(&dir.path().join("missing")), 0);
     }
 
-    /// The build leaf's V8 ceiling is three quarters of its RAM cap: a 613
-    /// MiB leaf (a 1.6 GiB box) gives pnpm 459 MB, past the ~320 MB an Ember
-    /// install needs where V8's default half-of-cgroup (~306 MB) aborts it.
-    /// Uncapped builds (`0`) keep the old behavior: no `NODE_OPTIONS`.
+    /// The build leaf's V8 ceiling is three quarters of its whole budget: a
+    /// swapless 613 MiB leaf (a 1.6 GiB box) gives pnpm 459 MB, past the ~320
+    /// MB an Ember install needs where V8's default half-of-cgroup (~306 MB)
+    /// aborts it — and with 1023 MiB of swap the same leaf gives 1227 MB, past
+    /// the ~630 MB Ember's `tsc` needs. Uncapped builds (`0`) keep the old
+    /// behavior: no `NODE_OPTIONS`.
     #[test]
-    fn the_heap_ceiling_is_three_quarters_of_the_ram_cap() {
-        assert_eq!(build_node_heap_max_mb(0), None);
-        assert_eq!(build_node_heap_max_mb(613), Some(459));
-        assert_eq!(build_node_heap_max_mb(512), Some(384));
-        assert_eq!(build_node_heap_max_mb(1024), Some(768));
-        assert_eq!(build_node_heap_max_mb(4096), Some(3072));
+    fn the_heap_ceiling_is_three_quarters_of_the_leaf_budget() {
+        assert_eq!(build_node_heap_max_mb(0, 0), None);
+        assert_eq!(build_node_heap_max_mb(0, 1024), None);
+        assert_eq!(build_node_heap_max_mb(613, 0), Some(459));
+        assert_eq!(build_node_heap_max_mb(512, 0), Some(384));
+        assert_eq!(build_node_heap_max_mb(1024, 0), Some(768));
+        assert_eq!(build_node_heap_max_mb(4096, 0), Some(3072));
+        assert_eq!(build_node_heap_max_mb(613, 1023), Some(1227));
+        assert_eq!(build_node_heap_max_mb(613, 600), Some(909));
     }
 
     /// The V8 signature matches the real abort (Ember's deploy log, beta.4:
