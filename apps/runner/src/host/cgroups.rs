@@ -142,6 +142,16 @@ pub fn build_swap_mb() -> Option<u64> {
     BUILD_SWAP_MB.get().copied()
 }
 
+/// Fix the remembered build budgets for tests (a `run_sandboxed` heap test):
+/// the real [`setup_build`] needs a writable cgroupfs, so tests set the
+/// budgets directly. Once per test process (the `OnceLock` never clears) —
+/// keep to one value per suite.
+#[cfg(test)]
+pub(crate) fn set_build_budgets_for_tests(memory_mb: u64, swap_mb: u64) {
+    let _ = BUILD_MEMORY_MB.set(memory_mb);
+    let _ = BUILD_SWAP_MB.set(swap_mb);
+}
+
 /// Configure build containment once after [`setup`], before any child
 /// spawns: remember the budget and (best-effort) enable the CPU controller on
 /// the way down so each build leaf can take a small share. No leaf is created
