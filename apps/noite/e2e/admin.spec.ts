@@ -3,6 +3,7 @@ import type {
   APIRequestContext,
   APIResponse,
   BrowserContext,
+  Locator,
   Page,
 } from "@playwright/test";
 
@@ -137,6 +138,18 @@ const userRow = (page: Page, email: string) =>
 
 const appRow = (page: Page, slug: string) =>
   page.locator("li.list-row", { hasText: slug });
+
+/** A user row's actions live behind its menu toggle: open it, then pick the
+ * entry. Opening through the property (rather than clicking the summary)
+ * never toggles an already-open menu shut. */
+const pickRowAction = async (row: Locator, name: string): Promise<void> => {
+  await row.locator("details.dropdown").evaluate((el) => {
+    // SAFETY: this locator only ever selects the row's `details.dropdown`,
+    // which is always an HTMLDetailsElement; only `open` is written.
+    (el as HTMLDetailsElement).open = true;
+  });
+  await row.getByRole("button", { exact: true, name }).click();
+};
 
 /** An app card on the main /apps list (the sidebar repeats every app name in
  * plain `li`s, so the `.list-row` scope is what picks the main card). */
@@ -315,7 +328,7 @@ test("make admin hands the second account a working admin gate", async ({
   await page.goto(usersSearch(SECOND_EMAIL));
   const row = userRow(page, SECOND_EMAIL);
   await expect(row).toBeVisible();
-  await row.getByRole("button", { name: "Make admin" }).click();
+  await pickRowAction(row, "Make admin");
   await confirmInDialog(page, "Make admin");
   await expect(row.getByText(`${SECOND_EMAIL} · admin`)).toBeVisible();
 
@@ -413,7 +426,7 @@ test("impersonation swaps the session, refuses admin surfaces, and returns clean
   await page.goto(usersSearch(SECOND_EMAIL));
   const row = userRow(page, SECOND_EMAIL);
   await expect(row).toBeVisible();
-  await row.getByRole("button", { name: "Impersonate" }).click();
+  await pickRowAction(row, "Impersonate");
   await expect(page.getByText(`Impersonating ${SECOND_EMAIL}`)).toBeVisible();
   await page.reload();
   await expect(page.getByText(`Impersonating ${SECOND_EMAIL}`)).toBeVisible();
@@ -515,7 +528,7 @@ test("remove admin takes the gate back", async ({ page }) => {
   await page.goto(usersSearch(SECOND_EMAIL));
   const row = userRow(page, SECOND_EMAIL);
   await expect(row).toBeVisible();
-  await row.getByRole("button", { name: "Remove admin" }).click();
+  await pickRowAction(row, "Remove admin");
   await confirmInDialog(page, "Remove admin");
   await expect(row.getByText(`${SECOND_EMAIL} · user`)).toBeVisible();
 
@@ -544,7 +557,7 @@ test("ban freezes the session and sign-in; unban restores both", async ({
   await page.goto(usersSearch(SECOND_EMAIL));
   const row = userRow(page, SECOND_EMAIL);
   await expect(row).toBeVisible();
-  await row.getByRole("button", { name: "Ban" }).click();
+  await pickRowAction(row, "Ban");
   await expect(row.getByText("banned", { exact: true })).toBeVisible();
 
   // The existing session stops working: the worker no longer sees a user,
@@ -567,7 +580,7 @@ test("ban freezes the session and sign-in; unban restores both", async ({
   const stillBanned = await sessionOf(second.request);
   expect(stillBanned.user ?? null).toBeNull();
 
-  await row.getByRole("button", { name: "Unban" }).click();
+  await pickRowAction(row, "Unban");
   await expect(row.getByText("banned", { exact: true })).toBeHidden();
 
   await second.getByRole("button", { name: "Sign in with passkey" }).click();
@@ -594,7 +607,7 @@ test("delete refuses the sole admin of an app, then removes the freed account", 
   await page.goto(usersSearch(SECOND_EMAIL));
   const row = userRow(page, SECOND_EMAIL);
   await expect(row).toBeVisible();
-  await row.getByRole("button", { name: "Delete" }).click();
+  await pickRowAction(row, "Delete");
   await confirmInDialog(page, "Delete");
   await expect(page.getByText(/only admin of 1 app/u)).toBeVisible();
   await expect(userRow(page, SECOND_EMAIL)).toBeVisible();
@@ -627,7 +640,7 @@ test("delete refuses the sole admin of an app, then removes the freed account", 
   await page.goto(usersSearch(SECOND_EMAIL));
   const freed = userRow(page, SECOND_EMAIL);
   await expect(freed).toBeVisible();
-  await freed.getByRole("button", { name: "Delete" }).click();
+  await pickRowAction(freed, "Delete");
   await confirmInDialog(page, "Delete");
   await expect(page.getByText("No users match that search.")).toBeVisible();
 

@@ -44,7 +44,8 @@ type TabId = AppTab;
  * scoped to `?env=` (production or one preview environment, the Deployments
  * tab's convention), so a refresh or shared link keeps both. The cards are
  * keyed by both because their live feeds open one URL for the life of a
- * component. No heading — the tab bar names the tab. */
+ * component. The heading sits left of the pickers (heading style matches the
+ * cards'), wrapping above them at 390 px. */
 const MetricsTab = ({ appId }: { appId: string }) => {
   const range = searchParam("r", {
     default: DEFAULT_METRICS_HOURS,
@@ -57,20 +58,23 @@ const MetricsTab = ({ appId }: { appId: string }) => {
 
   return (
     <div class="flex flex-col gap-4">
-      <div class="flex flex-wrap items-center justify-end gap-2">
-        <EnvPicker
-          appId={appId}
-          value={environmentId}
-          onPick={(next) => {
-            env.set(next);
-          }}
-        />
-        <MetricsRangePicker
-          hours={range()}
-          onPick={(next) => {
-            range.set(next);
-          }}
-        />
+      <div class="flex flex-wrap items-center justify-between gap-2">
+        <h2 class="m-0 text-lg font-semibold">Metrics</h2>
+        <div class="flex flex-wrap items-center justify-end gap-2">
+          <EnvPicker
+            appId={appId}
+            value={environmentId}
+            onPick={(next) => {
+              env.set(next);
+            }}
+          />
+          <MetricsRangePicker
+            hours={range()}
+            onPick={(next) => {
+              range.set(next);
+            }}
+          />
+        </div>
       </div>
       <MetricsCard
         key={`${range()}:${environmentId}`}
@@ -85,7 +89,8 @@ const MetricsTab = ({ appId }: { appId: string }) => {
 
 /** Analytics tab: the same window and scope as Metrics, but the breakdown
  * cards (browsers, operating systems, paths, referrers) instead of the
- * charts. No heading — the tab bar names the tab. */
+ * charts. Same heading row as Metrics: the title left, the pickers right,
+ * wrapping sanely at 390 px. */
 const AnalyticsTab = ({ appId }: { appId: string }) => {
   const range = searchParam("r", {
     default: DEFAULT_METRICS_HOURS,
@@ -98,20 +103,23 @@ const AnalyticsTab = ({ appId }: { appId: string }) => {
 
   return (
     <div class="flex flex-col gap-4">
-      <div class="flex flex-wrap items-center justify-end gap-2">
-        <EnvPicker
-          appId={appId}
-          value={environmentId}
-          onPick={(next) => {
-            env.set(next);
-          }}
-        />
-        <MetricsRangePicker
-          hours={range()}
-          onPick={(next) => {
-            range.set(next);
-          }}
-        />
+      <div class="flex flex-wrap items-center justify-between gap-2">
+        <h2 class="m-0 text-lg font-semibold">Analytics</h2>
+        <div class="flex flex-wrap items-center justify-end gap-2">
+          <EnvPicker
+            appId={appId}
+            value={environmentId}
+            onPick={(next) => {
+              env.set(next);
+            }}
+          />
+          <MetricsRangePicker
+            hours={range()}
+            onPick={(next) => {
+              range.set(next);
+            }}
+          />
+        </div>
       </div>
       <AnalyticsCard
         key={`${range()}:${environmentId}`}
