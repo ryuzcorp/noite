@@ -154,8 +154,17 @@ const SyncBody = ({
         <div class="flex flex-col gap-2">
           <p class="m-0 text-sm font-medium">
             {state.status.noiteCommits}{" "}
-            {state.status.noiteCommits === 1 ? "Noite commit" : "Noite commits"}{" "}
-            will be overwritten in the tree; they stay in history.
+            {state.status.noiteCommits === 1 ? (
+              <>
+                Noite commit will be overwritten in the tree; it stays in
+                history.
+              </>
+            ) : (
+              <>
+                Noite commits will be overwritten in the tree; they stay in
+                history.
+              </>
+            )}
           </p>
           <div class="flex flex-wrap gap-2">
             <button
