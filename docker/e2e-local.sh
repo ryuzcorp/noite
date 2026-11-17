@@ -389,13 +389,16 @@ while [ "$attempt" -lt 100 ]; do
         echo "error: $restarts container restarts during the lane"
         rc=1
       fi
-      # Since the reconcile tick pushes only when the table changed (#262),
-      # pushes track route changes, not time: the boot push, then one per
-      # deployed app/route change. A shard that deployed something must show
-      # a push after boot (two pushes, generation 2) without a reload; a
-      # shard whose apps never deployed has no route to add, so the boot
-      # push alone proves the push path ran.
-      want=1
+      # Since the reconcile tick pushes only when the table changed (#262)
+      # and the edge only logs newly applied generations, a shard whose apps
+      # never deployed has no table change to push: the boot table reaches
+      # the edge through the file Caddy loads in Provision ("edge static
+      # config written", asserted exactly once above), and re-pushes of that
+      # identical generation stay at debug. Pushes are required only when a
+      # deploy happened (the boot table plus one route change: generation 2)
+      # without a reload; the reload/restart checks above still pin the edge
+      # on every shard.
+      want=0
       if printf '%s\n' "$edge_log" | grep -q "deploy ok"; then
         want=2
       fi
@@ -405,11 +408,16 @@ while [ "$attempt" -lt 100 ]; do
         rc=1
       fi
       # The module logs through Caddy's zap logger: "generation":N (JSON),
-      # not generation=N.
-      maxgen="$(printf '%s\n' "$edge_log" | grep -o '"generation":[0-9]*' | grep -o "[0-9]*" | sort -n | tail -1)"
-      if [ -z "$maxgen" ] || [ "$maxgen" -lt "$want" ]; then
-        echo "error: route-table generation never reached $want (max ${maxgen:-none})"
-        rc=1
+      # not generation=N. Only checked when pushes are expected: with no
+      # deploy there are no push lines at all.
+      if [ "$want" -gt 0 ]; then
+        maxgen="$(printf '%s\n' "$edge_log" | grep -o '"generation":[0-9]*' | grep -o "[0-9]*" | sort -n | tail -1)"
+        if [ -z "$maxgen" ] || [ "$maxgen" -lt "$want" ]; then
+          echo "error: route-table generation never reached $want (max ${maxgen:-none})"
+          rc=1
+        fi
+      else
+        maxgen="none expected (nothing deployed)"
       fi
       if [ "$rc" -eq 0 ]; then
         echo "==> edge did not reload after boot ($pushes pushes, generation $maxgen)"
