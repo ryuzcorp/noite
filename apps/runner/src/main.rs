@@ -157,6 +157,23 @@ pub struct AppState {
     pub control_boot: Arc<std::sync::Mutex<Option<String>>>,
 }
 
+/// Sleep `duration`, waking early when `shutdown` fires: true when the full
+/// sleep elapsed (the caller may tick), false when shutdown fired first.
+/// The sandbox refresh loop paces itself through this so shutdown never
+/// waits out a full 30 s sleep — and, with the flag checks around it, so no
+/// tick starts after shutdown begins.
+async fn sleep_unless_shutdown(duration: std::time::Duration, shutdown: &AtomicBool) -> bool {
+    tokio::select! {
+        biased;
+        _ = async {
+            while !shutdown.load(std::sync::atomic::Ordering::Relaxed) {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+        } => false,
+        _ = tokio::time::sleep(duration) => true,
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // Operator subcommands run in the same container as the daemon and exit:
@@ -385,14 +402,20 @@ async fn main() -> anyhow::Result<()> {
         Ok(Err(e)) => tracing::warn!(error = %e, "sandbox boot sweep failed"),
         Err(_) => tracing::warn!("sandbox boot sweep timed out"),
     }
-    if !config.sandbox_disabled {
+    // The refresh task's handle: shutdown waits it out before removing the
+    // relay (below), so no tick can recreate the relay mid-shutdown. The
+    // task shares the shutdown flag: it never starts a tick after the flag
+    // fires, and its pacing sleep races the flag instead of sleeping out a
+    // full 30 s into shutdown.
+    let sandbox_shutdown = shutdown.clone();
+    let sandbox_refresh = if !config.sandbox_disabled {
         let fleet_ids = config
             .fleet_uid
             .map(|uid| (uid, config.fleet_gid.unwrap_or(uid)));
         // Only single tenancy without per-fleet cgroups may take the
         // gateway's degraded unattributed-allow path; multi refuses.
         let single = config.tenancy == crate::config::Tenancy::Single;
-        tokio::spawn(async move {
+        Some(tokio::spawn(async move {
             let first = host::sandbox::plane::ensure_networks().await;
             if first.engine {
                 tracing::info!(subnets = ?first.subnets, "sandbox plane ensured");
@@ -411,8 +434,18 @@ async fn main() -> anyhow::Result<()> {
                 host::sandbox::plane::record(false, Vec::new(), false, false);
             }
             loop {
+                if sandbox_shutdown.load(std::sync::atomic::Ordering::Relaxed) {
+                    break;
+                }
                 let jitter = rand::random::<u64>() % 5;
-                tokio::time::sleep(std::time::Duration::from_secs(30 + jitter)).await;
+                let paced = sleep_unless_shutdown(
+                    std::time::Duration::from_secs(30 + jitter),
+                    &sandbox_shutdown,
+                )
+                .await;
+                if !paced || sandbox_shutdown.load(std::sync::atomic::Ordering::Relaxed) {
+                    break;
+                }
                 let nets = host::sandbox::plane::ensure_networks().await;
                 if !nets.engine {
                     host::sandbox::plane::record(false, Vec::new(), false, false);
@@ -427,8 +460,10 @@ async fn main() -> anyhow::Result<()> {
                 let relay_healthy = relay_ok && host::sandbox::relay::healthy().await;
                 host::sandbox::plane::record(true, nets.subnets, relay_healthy, table_ok);
             }
-        });
-    }
+        }))
+    } else {
+        None
+    };
     // Per-fleet cgroups before any child is spawned: setup drains the
     // runner's own cgroup (tini stays reaped, cgroups do not affect that)
     // into a leaf, so children spawned after it inherit the leaf and tenant
@@ -804,6 +839,33 @@ async fn main() -> anyhow::Result<()> {
             }
         })
         .await?;
+    // Stop the sandbox refresh loop before removing the relay. The loop
+    // shares the shutdown flag (already set: the server future above only
+    // resolves through it), never starts a tick after the flag fires, and
+    // races its pacing sleep against the flag — so awaiting the task means
+    // waiting out at most an in-flight tick, never a 30 s sleep. That closes
+    // the mid-shutdown recreation that orphaned the relay holding the data
+    // volume (the lane teardown's "volume is in use"): by the time the relay
+    // is removed below, no relay create can still be running — the create is
+    // a `docker run -d` CLI call inside the awaited tick, and the daemon
+    // either created the container before this wait ended (then the removal
+    // takes it) or the CLI never sent the create (then nothing exists).
+    // The wait is bounded by the stop budget: a wedged engine call cannot
+    // hang shutdown, and a fired bound is logged — the fallback abort then
+    // races a create the old way, and the lane's volume-aware teardown
+    // covers the leftover.
+    if let Some(mut handle) = sandbox_refresh {
+        let stopped = tokio::select! {
+            _ = &mut handle => true,
+            _ = tokio::time::sleep(budget) => false,
+        };
+        if !stopped {
+            tracing::warn!("sandbox refresh loop did not stop within the stop budget; aborting");
+            handle.abort();
+            let _ = handle.await;
+        }
+    }
+
     // Reconcile loop observes the flag and stops spawning. Tenant fleets and
     // the control fleet stop together under the one budget; Caddy goes last
     // so requests already in flight drain through it.
@@ -824,4 +886,28 @@ async fn main() -> anyhow::Result<()> {
     caddy_child.stop(std::time::Duration::from_secs(5)).await;
     host::state::final_snapshot(&state_sync, &pool, &config).await;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sleep_unless_shutdown;
+    use std::sync::{atomic::AtomicBool, Arc};
+
+    /// A set shutdown flag breaks the pacing sleep at once: the refresh loop
+    /// never starts a tick after shutdown begins. Paused time: no wall clock.
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_set_skips_the_sleep() {
+        let shutdown = Arc::new(AtomicBool::new(true));
+
+        assert!(!sleep_unless_shutdown(std::time::Duration::from_secs(30), &shutdown).await);
+    }
+
+    /// An unset flag sleeps the whole pacing interval, then ticks. Paused
+    /// time: no wall clock.
+    #[tokio::test(start_paused = true)]
+    async fn unset_flag_sleeps_the_whole_interval() {
+        let shutdown = Arc::new(AtomicBool::new(false));
+
+        assert!(sleep_unless_shutdown(std::time::Duration::from_secs(30), &shutdown).await);
+    }
 }

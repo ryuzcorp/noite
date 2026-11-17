@@ -187,7 +187,8 @@ down:
 # Explicit nuke: every volume of this project and the e2e lane, plus local
 # vite/wrangler/void state. The extra container/volume sweep lives in
 # `remove_project` (docker/lib.sh): podman-compose's `down -v` is only
-# best-effort, so remove what it leaves behind by project label and name.
+# best-effort, so remove what it leaves behind by project label, name, and
+# volume mount (an unlabeled sibling container holding a volume fails its rm).
 # pi-lens-ignore: shellcheck-14-1091
 nuke:
 	@echo "project $(PROJECT)"

@@ -1,0 +1,3 @@
+### Fixed
+
+- The upgrade lane no longer fails at teardown after going green: the runner's 30 s sandbox refresh loop now shares the shutdown flag — it never starts a tick after shutdown begins and its pacing sleep races the flag — and shutdown waits the loop out (bounded by the stop budget, logged on fire) before removing the relay container. No relay create can be in flight when the removal runs, so no orphan holds the data volume (`volume is in use`); `remove_project` additionally reaps unlabeled sibling containers still mounting a project's volumes before the volume rm, covering the e2e lanes the same way.
