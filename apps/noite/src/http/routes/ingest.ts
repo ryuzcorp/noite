@@ -93,7 +93,9 @@ export const forwardIngest: RouteHandler = async (request, env, params) => {
       },
       method: "POST",
       // The route bound, when this forward runs under one: after the
-      // middleware's 504 the signal is already aborted, so no ingest starts.
+      // middleware's 504 the signal is already aborted, so a forward that
+      // has not reached the runner yet never starts. An ingest the runner
+      // already accepted still completes (no runner-side cancellation).
       signal: withRequestTimeout(AbortSignal.timeout(10_000)),
     }
   );
