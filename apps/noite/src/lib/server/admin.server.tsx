@@ -19,6 +19,7 @@ import { errorLogText } from "../errors";
 import {
   runnerControlFleet,
   runnerDeleteApp,
+  runnerFailureOf,
   runnerListApps,
   runnerPatchApp,
 } from "../runner";
@@ -379,7 +380,10 @@ export const adminSetAppState = apiAction(
 );
 
 /** Delete any app, whoever owns it (admin only): the runner drops the app,
- * then its grants and pending invitations go with it. */
+ * then its grants and pending invitations go with it. A 404 from the runner
+ * means a previous attempt already deleted the app but died before dropping
+ * its grants (a retry after the route bound fired, or a double submit): the
+ * app is already gone, so the grants still go, and the delete answers ok. */
 export const adminDeleteApp = apiAction(
   Schema.String,
   async (id: string, { env, request }) => {
@@ -390,7 +394,16 @@ export const adminDeleteApp = apiAction(
     }
 
     try {
-      await runnerDeleteApp(id);
+      try {
+        await runnerDeleteApp(id);
+      } catch (error) {
+        const failure = runnerFailureOf(error);
+
+        if (failure.kind !== "http" || failure.status !== 404) {
+          throw error;
+        }
+      }
+
       await dropAppCollaborators(id);
 
       return { ok: true as const };

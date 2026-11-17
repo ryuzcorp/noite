@@ -165,6 +165,13 @@ export const installRunnerMock = (
       }
 
       if (method === "DELETE") {
+        // The runner 404s a row that is already gone (a retry after a
+        // first attempt deleted it): answer the same, so the control UI's
+        // already-gone path is exercisable.
+        if (!app) {
+          return notFound();
+        }
+
         mock.apps = mock.apps.filter((row) => row.id !== id);
 
         return new Response(null, { status: 204 });

@@ -214,7 +214,136 @@ describe("timeout middleware", () => {
     expect(abortReason).toBeInstanceOf(RequestTimeoutError);
   });
 
-  test("an exempt route stamps no signal, so its slow downstream is untouched", async () => {
+  test("overlapping requests keep their own bound: A's call after B settles is still aborted by A's bound", async () => {
+    // A waits on a gate while B runs fully and settles. With a shared slot
+    // B's settle clears the stamp, so A's later call observes no signal and
+    // A's bound never aborts it; with a per-request store A's call still
+    // carries A's signal. The middleware's own timers are the only clocks.
+    let entrySignal: AbortSignal | undefined;
+    let callSignal: AbortSignal | undefined;
+    let abortReason: unknown;
+    let releaseA!: () => void;
+
+    const slowA = withTimeout(20)(contextFor("/api/a"), () => {
+      const gate = Promise.withResolvers<undefined>();
+      const { promise: neverSettles } = Promise.withResolvers<never>();
+      entrySignal = getRequestTimeoutSignal();
+      releaseA = () => gate.resolve(undefined);
+
+      return (async (): Promise<void> => {
+        await gate.promise;
+
+        // A's runner call starts only after B settled below.
+        const atCall = getRequestTimeoutSignal();
+        callSignal = atCall;
+
+        if (atCall === undefined) {
+          // No bound visible: dangle so the middleware's own timer still
+          // settles the race with a 504.
+          await neverSettles;
+
+          return;
+        }
+
+        const aborted = Promise.withResolvers<undefined>();
+
+        atCall.addEventListener(
+          "abort",
+          () => {
+            abortReason = atCall.reason;
+            aborted.resolve(undefined);
+          },
+          { once: true }
+        );
+
+        await aborted.promise;
+      })();
+    });
+
+    // B runs fully and settles while A waits.
+    const resultB = await withTimeout(20)(contextFor("/api/b"), () =>
+      Promise.resolve()
+    );
+
+    expect(resultB).toBeUndefined();
+
+    releaseA();
+
+    const resultA = await slowA;
+
+    expect(resultA?.status).toBe(504);
+    expect(await resultA?.json()).toEqual({ error: "Request timed out" });
+    expect(callSignal).toBe(entrySignal);
+    expect(abortReason).toBeInstanceOf(RequestTimeoutError);
+  });
+
+  test("overlapping requests are isolated: B's abort never aborts A's call", async () => {
+    // B's bound fires while A's call is in flight. With a shared slot A's
+    // call observes B's stamp and B's abort kills it; with a per-request
+    // store A's call carries A's signal and B's abort cannot touch it.
+    let aCallSignal: AbortSignal | undefined;
+    let aAborted = false;
+    let aResolved = false;
+    let releaseA!: () => void;
+    let releaseCall!: () => void;
+
+    const slowA = withTimeout(200)(contextFor("/api/a"), () => {
+      const gate = Promise.withResolvers<undefined>();
+      releaseA = () => gate.resolve(undefined);
+
+      return (async (): Promise<void> => {
+        await gate.promise;
+
+        const atCall = getRequestTimeoutSignal();
+        aCallSignal = atCall;
+
+        if (atCall === undefined) {
+          const { promise: neverSettles } = Promise.withResolvers<never>();
+          await neverSettles;
+
+          return;
+        }
+
+        const callGate = Promise.withResolvers<undefined>();
+        releaseCall = () => callGate.resolve(undefined);
+
+        atCall.addEventListener(
+          "abort",
+          () => {
+            aAborted = true;
+          },
+          { once: true }
+        );
+
+        await callGate.promise;
+        aResolved = true;
+      })();
+    });
+
+    // B never answers: its bound fires while A's call is in flight.
+    const slowB = withTimeout(20)(
+      contextFor("/api/b"),
+      // oxlint-disable-next-line promise/avoid-new -- a never-settling next() is the stuck route under test
+      () => new Promise<void>(() => {})
+    );
+
+    releaseA();
+
+    const resultB = await slowB;
+
+    expect(resultB?.status).toBe(504);
+    expect(aCallSignal).toBeDefined();
+
+    releaseCall();
+
+    const resultA = await slowA;
+
+    expect(aAborted).toBe(false);
+    expect(aResolved).toBe(true);
+    expect(resultA).toBeUndefined();
+  });
+
+  test("an exempt route runs outside any bound, so its slow downstream is untouched", async () => {
     let stamped: AbortSignal | undefined;
     let writeHappened = false;
 

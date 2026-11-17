@@ -28,6 +28,8 @@
  *   timed out"}`: the timeout middleware already answered, so this only
  *   ends the orphaned downstream run quietly (no "Internal error" log for
  *   designed behavior).
+ * - the caller disconnected (`ClientDisconnectError`) → 499 `{error:
+ *   "Client disconnected"}`: same quiet ending for a gone caller.
  */
 import * as Schema from "effect/Schema";
 import { defineHandler } from "void";
@@ -36,7 +38,7 @@ import type { TypedHandler } from "void";
 import { MAX_BODY_BYTES, readBoundedText, tooLarge } from "../../http/body";
 import { isSameOriginAction } from "../../http/origin";
 import { errorLogText, errorMessage } from "../errors";
-import { RequestTimeoutError } from "../request-timeout";
+import { ClientDisconnectError, RequestTimeoutError } from "../request-timeout";
 
 // oxlint-disable-next-line unicorn/throw-new-error -- Schema.TaggedError factory (same pattern as lib/auth.ts)
 export class ActionFailure extends Schema.TaggedError<ActionFailure>()(
@@ -65,6 +67,13 @@ export const actionErrorResponse = (error: unknown): Response => {
   // (a designed timeout is not a bug to page on).
   if (error instanceof RequestTimeoutError) {
     return Response.json({ error: "Request timed out" }, { status: 504 });
+  }
+
+  // The caller went away mid-action: the response is already moot, so this
+  // only ends the orphaned downstream run quietly — a disconnect is not a
+  // bug to page on, and never an "Internal error".
+  if (error instanceof ClientDisconnectError) {
+    return Response.json({ error: "Client disconnected" }, { status: 499 });
   }
 
   const tag =

@@ -27,28 +27,30 @@
  * answer into a 504 the caller cannot read.
  *
  * The bound aborts the downstream work, not just the response: each bounded
- * request gets an `AbortController` whose signal is stamped ambiently (see
- * `lib/request-timeout.ts`) and aborted with a typed `RequestTimeoutError`
- * when the bound fires. `runnerFetch` folds that signal into every runner
- * call, so after the 504 no further outbound runner call starts for that
- * request and in-flight ones reject. A slow write that already reached the
- * runner still stands — the abort stops our side waiting, it cannot un-apply
- * the runner's — which is why a retry after a 504 can double-apply a write
- * the first attempt already committed; the bound narrows that window from
- * "the whole stuck handler" to the bound itself. D1 needs no rollback: the
- * control plane runs no interactive transactions, so every control write is
- * one statement or one `db.batch`, and D1 applies each atomically. Exempt
- * routes never get a controller and are unaffected. A client disconnect
- * aborts through the same controller (the raw request signal is forwarded
- * into it), so a gone client stops its downstream the same way.
+ * request gets an `AbortController`, and the whole downstream pipeline runs
+ * inside that signal's `AsyncLocalStorage` store (see
+ * `lib/request-timeout.ts`) — strictly per request, so overlapping requests
+ * never observe each other's bound. The signal is aborted with a typed
+ * `RequestTimeoutError` when the bound fires. `runnerFetch` folds that
+ * signal into every runner call, so after the 504 no further outbound runner
+ * call starts for that request and in-flight ones reject. A slow write that
+ * already reached the runner still stands — the abort stops our side
+ * waiting, it cannot un-apply the runner's — which is why a retry after a
+ * 504 can double-apply a write the first attempt already committed; the
+ * bound narrows that window from "the whole stuck handler" to the bound
+ * itself. D1 needs no rollback: the control plane runs no interactive
+ * transactions, so every control write is one statement or one `db.batch`,
+ * and D1 applies each atomically. Exempt routes never get a controller and
+ * are unaffected. A client disconnect aborts through the same controller
+ * with a typed `ClientDisconnectError`, so a gone client stops its
+ * downstream the same way — and quietly, not as an "Internal error".
  */
 import { defineMiddleware } from "void";
 
 import {
-  clearRequestTimeoutSignal,
-  REQUEST_TIMEOUT_SIGNAL_KEY,
+  ClientDisconnectError,
   RequestTimeoutError,
-  stampRequestTimeoutSignal,
+  runWithRequestTimeout,
 } from "../lib/request-timeout";
 
 /** Bound every bounded route: a hung handler fails fast, never hangs. */
@@ -101,10 +103,12 @@ export const routeTimeout = (
 };
 
 /** A timeout gate with an explicit bound (the default export uses {@link TIMEOUT_MS}).
- * A bounded request runs under its own `AbortController`: the signal is
- * stamped ambiently for the downstream run (see `lib/request-timeout.ts`)
- * and aborted with a typed reason when the bound fires, so the slow write
- * behind the 504 stops instead of double-applying on retry. */
+ * A bounded request runs under its own `AbortController`: the whole
+ * downstream pipeline runs inside the request's `AsyncLocalStorage` store
+ * (see `lib/request-timeout.ts`) and the signal is aborted with a typed
+ * reason when the bound fires, so the slow write behind the 504 stops
+ * instead of double-applying on retry. A client disconnect aborts with a
+ * typed reason through the same controller. */
 export const timeoutMiddleware = (ms: number) =>
   defineMiddleware(async (c, next) => {
     const bound = routeTimeout(c.req.path, ms);
@@ -114,22 +118,17 @@ export const timeoutMiddleware = (ms: number) =>
     }
 
     const controller = new AbortController();
-    // SAFETY: CloudContextVariables carries an index signature; this key is written here and read nowhere else through the context (downstream reads the ambient stamp, which stays in lock-step for the whole run).
-    c.set(REQUEST_TIMEOUT_SIGNAL_KEY, controller.signal);
-
     const raw = c.req.raw.signal;
 
     const onDisconnect = (): void => {
-      controller.abort(raw.reason);
+      controller.abort(new ClientDisconnectError());
     };
 
     if (raw.aborted) {
-      controller.abort(raw.reason);
+      onDisconnect();
     } else {
       raw.addEventListener("abort", onDisconnect, { once: true });
     }
-
-    stampRequestTimeoutSignal(controller.signal);
 
     const timeout = Promise.withResolvers<"timeout">();
 
@@ -139,11 +138,13 @@ export const timeoutMiddleware = (ms: number) =>
     }, bound.ms);
 
     try {
-      const winner = await Promise.race([
-        // oxlint-disable-next-line node/callback-return -- Hono's next() resolves the downstream pipeline (not a Node callback); the race — not a return — settles the response.
-        next().then((): "done" => "done"),
-        timeout.promise,
-      ]);
+      const winner = await runWithRequestTimeout(controller.signal, () =>
+        Promise.race([
+          // oxlint-disable-next-line node/callback-return -- Hono's next() resolves the downstream pipeline (not a Node callback); the race — not a return — settles the response.
+          next().then((): "done" => "done"),
+          timeout.promise,
+        ])
+      );
 
       if (winner === "timeout") {
         return c.json({ error: "Request timed out" }, 504);
@@ -151,7 +152,6 @@ export const timeoutMiddleware = (ms: number) =>
     } finally {
       clearTimeout(timer);
       raw.removeEventListener("abort", onDisconnect);
-      clearRequestTimeoutSignal(controller.signal);
     }
   });
 
