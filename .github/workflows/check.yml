@@ -104,6 +104,13 @@ jobs:
       # registration, no unbounded store reads (flake H).
       - name: worker rules (no shared orphans, no unbounded reads)
         run: bun docker/check-worker-rules.ts
+      # Client/server split: no page-reachable module may statically import
+      # a Node builtin — the browser resolves those to stubs that throw at
+      # module load and kill the island chunk (the #371 storage outage).
+      # A source-graph walk, not a dist grep: the incident bundle built
+      # fine, the specifier already stubbed away.
+      - name: client bundle has no node imports
+        run: bun docker/check-client-node-imports.ts
       # `config` needs no daemon, so a broken compose file fails here instead
       # of on someone's server. Every variant, including the test overlays.
       - name: render compose (prod, build, dev, e2e, multi)
