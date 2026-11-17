@@ -1,7 +1,6 @@
 import { describe, expect, test } from "bun:test";
 
 import {
-  checkBuiltClient,
   checkClientGraph,
   isNodeSpecifier,
   parseStaticImports,
@@ -233,63 +232,5 @@ describe("requireClientEntries", () => {
     expect(() =>
       requireClientEntries(["apps/noite/src/pages/index.tsx"])
     ).not.toThrow();
-  });
-});
-
-describe("checkBuiltClient", () => {
-  // Verbatim vite 8.3.8 client output for a bundled `node:fs`: the `node:fs`
-  // specifier is gone (only the accessed property survives), replaced by
-  // the inlined stub factory. Re-capture from a real build when Vite bumps.
-  const stubbed =
-    'import{t as e}from"./rolldown-runtime-XKyaHtl9.js";(0,e(((e,t)=>{t.exports={}}))().readFileSync)(`/etc/hostname`,`utf-8`).length;';
-
-  const clean =
-    'import{t as e}from"./dates-abc.js";var t=new Intl.DateTimeFormat(void 0,{day:`numeric`});';
-
-  const bundledCjs = 'var x=__commonJS({"dep.js":(e,t)=>{e.exports=r;}});';
-
-  test("a stubbed builtin chunk fails with its chunk path", () => {
-    expect(
-      checkBuiltClient(
-        new Map([["apps/noite/dist/client/assets/dates-x.js", stubbed]])
-      )
-    ).toEqual([{ file: "apps/noite/dist/client/assets/dates-x.js" }]);
-  });
-
-  test("clean chunks, sourcemaps and bundled CJS pass", () => {
-    expect(
-      checkBuiltClient(
-        new Map([
-          ["apps/noite/dist/client/assets/dates-abc.js", clean],
-          // Sourcemaps carry the original specifiers in sourcesContent —
-          // never scanned (`.js` only).
-          [
-            "apps/noite/dist/client/assets/dates-abc.js.map",
-            '{"sourcesContent":["import { x } from \\"node:fs\\";"]}',
-          ],
-          // A real bundled CJS module assigns `.exports`, but never as a
-          // lone `{}` factory passed to the interop helper.
-          ["apps/noite/dist/client/assets/dep-y.js", bundledCjs],
-        ])
-      )
-    ).toEqual([]);
-  });
-
-  test("a builtin through a dependency fails: the source walk is blind to it", () => {
-    // SecRev50's shape: the page reaches a package, the package reaches
-    // `node:fs`. The source walk drops the bare specifier, so it reports
-    // clean — the dist scan is the layer that sees the stub.
-    const sources = new Map([
-      ["apps/noite/src/pages/index.tsx", 'import { x } from "probe-dep";\n'],
-    ]);
-
-    expect(
-      checkClientGraph(["apps/noite/src/pages/index.tsx"], sources)
-    ).toEqual([]);
-    expect(
-      checkBuiltClient(
-        new Map([["apps/noite/dist/client/assets/index-z.js", stubbed]])
-      )
-    ).toEqual([{ file: "apps/noite/dist/client/assets/index-z.js" }]);
   });
 });
