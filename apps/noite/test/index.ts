@@ -52,6 +52,27 @@ export default {
       return Response.json({ key: "test.txt", stored: true });
     }
 
+    // Tenant D1 migration probe: tables the deploy's `migrations/` dir owns
+    // (see migrations/0001_*.sql). The upgrade lane asserts the deploy
+    // applied them: the bookkeeping rows (hidden from the runner's D1
+    // editor) plus the migrated schema itself. Releases before the
+    // deploy-time apply never created these tables, so this route 500s
+    // there — the seed never calls it.
+    if (url.pathname === "/migration-probe" && request.method === "GET") {
+      const probe = await env.DB.prepare(
+        "SELECT id, note, applied FROM migration_probe WHERE id = 1"
+      ).first<{ applied: string | null; id: number; note: string }>();
+
+      const { results } = await env.DB.prepare(
+        "SELECT name FROM d1_migrations ORDER BY id"
+      ).all<{ name: string }>();
+
+      return Response.json({
+        applied: results.map((row) => row.name),
+        probe,
+      });
+    }
+
     // Visiting /d1-many-tables creates six tables. The storage e2e uses it
     // to prove the D1 editor lists a database past SQLite's five-term
     // compound-SELECT budget, which celld applies to every cell.
