@@ -1,3 +1,0 @@
-### Fixed
-
-- The e2e plan now schedules the exact (lane, shard) matrix from Playwright's real per-lane distribution instead of a fixed 2 shards: a `--list` probe per lane shows when one large changed file would swallow a shard's share and strand the other shard with zero tests (#359 ran nothing on multi shard 2, then failed the lane's account-dependent post-checks). Such a lane runs one unsharded cell instead of a meaningless empty one; a lane with no tests at all fails the plan instead of passing vacuously. As a backstop, the lane itself fails loudly when its results file records zero tests, instead of tripping `recover` or passing silently.
