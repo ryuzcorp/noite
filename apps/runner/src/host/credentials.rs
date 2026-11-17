@@ -360,6 +360,13 @@ pub async fn detect(store: &StoreAccess, bucket: &str) -> anyhow::Result<Credent
     }
 }
 
+/// Cap for response bodies the runner reads only for identification or
+/// diagnostics (never for data it needs whole): the health body is a few
+/// hundred bytes. Anything past the cap is not evidence, and the read must
+/// not stream forever on a hostile or broken endpoint — only the request
+/// timeout would stop it.
+pub(crate) const BODY_READ_CAP: usize = 64 * 1024;
+
 /// The health path every MinIO-family store answers without credentials;
 /// RustFS names itself in the JSON body (`{"service":"rustfs-endpoint",…}`,
 /// recorded from the pinned image), MinIO answers `{}`.
@@ -374,12 +381,35 @@ pub(crate) fn is_rustfs_health_body(body: &[u8]) -> bool {
         .is_some_and(|service| service.to_ascii_lowercase().contains("rustfs"))
 }
 
+/// Read at most `cap` body bytes. Rejects up front when `content-length`
+/// exceeds the cap, then stops a chunked stream once the accumulated bytes
+/// pass it — a post-read length check would not bound chunked streaming.
+pub(crate) async fn bounded_body(
+    mut resp: reqwest::Response,
+    cap: usize,
+) -> anyhow::Result<Vec<u8>> {
+    if let Some(len) = resp.content_length() {
+        if len > cap as u64 {
+            anyhow::bail!("response body declares {len} bytes (cap {cap})");
+        }
+    }
+    let mut out = Vec::new();
+    while let Some(chunk) = resp.chunk().await? {
+        out.extend_from_slice(&chunk);
+        if out.len() > cap {
+            anyhow::bail!("response body exceeds {cap} bytes");
+        }
+    }
+    Ok(out)
+}
+
 /// Identify a RustFS at any endpoint by the evidence it gives: the
 /// unauthenticated health endpoint names the server in its body. Bounded
-/// (five seconds — detection runs once at boot and must not stall it),
-/// deterministic, and `false` on anything unexpected — a transport failure,
-/// a non-2xx status, an unreadable or unmarked body — so identification
-/// fails safe into the MinIO admin probe.
+/// (five seconds and [`BODY_READ_CAP`] bytes — detection runs once at boot
+/// and must neither stall it nor buffer a hostile stream), deterministic,
+/// and `false` on anything unexpected — a transport failure, a non-2xx
+/// status, an over-cap or unreadable body, an unmarked body — so
+/// identification fails safe into the MinIO admin probe.
 async fn identify_rustfs(store: &StoreAccess) -> bool {
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(5))
@@ -395,7 +425,7 @@ async fn identify_rustfs(store: &StoreAccess) -> bool {
     if !resp.status().is_success() {
         return false;
     }
-    let Ok(body) = resp.bytes().await else {
+    let Ok(body) = bounded_body(resp, BODY_READ_CAP).await else {
         return false;
     };
     is_rustfs_health_body(&body)

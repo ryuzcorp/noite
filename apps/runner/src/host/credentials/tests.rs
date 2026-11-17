@@ -1036,6 +1036,95 @@ async fn detect_falls_back_when_identity_unknown() {
     assert!(summary.contains("no MinIO admin API"), "{summary}");
 }
 
+/// A stub answering the health path with a crafted raw response (`head`
+/// plus `body` bytes), every admin path with `admin_status`.
+async fn raw_health_stub(
+    head: String,
+    body: Vec<u8>,
+    admin_status: u16,
+) -> (tokio::task::JoinHandle<()>, String) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind stub");
+    let addr = listener.local_addr().expect("stub addr");
+    let handle = tokio::spawn(async move {
+        loop {
+            let Ok((mut sock, _)) = listener.accept().await else {
+                break;
+            };
+            let (head, body) = (head.clone(), body.clone());
+            tokio::spawn(async move {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut buf = vec![0u8; 4096];
+                let n = sock.read(&mut buf).await.unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]).into_owned();
+                let line = req.lines().next().unwrap_or_default().to_string();
+                if line.contains("/minio/health/live") {
+                    let _ = sock.write_all(head.as_bytes()).await;
+                    let _ = sock.write_all(&body).await;
+                } else {
+                    let denied = b"<Error><Code>Denied</Code></Error>";
+                    let resp = format!(
+                        "HTTP/1.1 {admin_status}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                        denied.len()
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                    let _ = sock.write_all(denied).await;
+                }
+            });
+        }
+    });
+    (handle, format!("http://127.0.0.1:{}", addr.port()))
+}
+
+/// A health body past the cap is not evidence, however it is framed: a
+/// declared `content-length` over the cap rejects before reading, and a
+/// chunked stream stops once the accumulated bytes pass it. Either way
+/// detection returns false and the boot probe decides.
+#[tokio::test]
+async fn detect_rejects_health_body_over_cap() {
+    // Declared length over the cap: rejected before a byte is read (the
+    // server closes after a short body, which the client never waits for).
+    let (_handle, endpoint) = raw_health_stub(
+        "HTTP/1.1 200 OK\r\ncontent-length: 100000\r\nconnection: close\r\n\r\n".into(),
+        br#"{"service":"rustfs-endpoint"}"#.to_vec(),
+        404,
+    )
+    .await;
+    let summary = super::detect(&detect_store(&endpoint), "noite")
+        .await
+        .expect("detect")
+        .summary();
+    assert!(summary.starts_with("root ("), "{summary}");
+    assert!(summary.contains("no MinIO admin API"), "{summary}");
+}
+
+#[tokio::test]
+async fn detect_stops_chunked_health_stream_over_cap() {
+    // Chunked with no declared length: the read stops past the cap, long
+    // before the stream ends.
+    let mut stream = Vec::new();
+    for _ in 0..20 {
+        let chunk = vec![b'x'; 4096];
+        stream.extend_from_slice(format!("{:x}\r\n", chunk.len()).as_bytes());
+        stream.extend_from_slice(&chunk);
+        stream.extend_from_slice(b"\r\n");
+    }
+    stream.extend_from_slice(b"0\r\n\r\n");
+    let (_handle, endpoint) = raw_health_stub(
+        "HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\nconnection: close\r\n\r\n".into(),
+        stream,
+        404,
+    )
+    .await;
+    let summary = super::detect(&detect_store(&endpoint), "noite")
+        .await
+        .expect("detect")
+        .summary();
+    assert!(summary.starts_with("root ("), "{summary}");
+    assert!(summary.contains("no MinIO admin API"), "{summary}");
+}
+
 /// Signed S3 call with an arbitrary key pair (proves enforcement, not
 /// just minting): PUT/GET bodies are small, LIST is one page. Returns the
 /// status, body, and the ETag / version-id response headers multipart
