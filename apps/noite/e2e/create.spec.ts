@@ -266,6 +266,12 @@ test(
     ).toBeVisible();
     await dialog.getByRole("button", { name: "Sync anyway" }).click();
     await expect(dialog.getByText(/Synced to/u)).toBeVisible();
+    await dialog.getByRole("button", { name: "Close" }).click();
+
+    // The sync recorded its own commit as the base, so the next click syncs
+    // straight through to up-to-date with no second confirmation.
+    await page.getByRole("button", { name: "Sync from GitHub" }).click();
+    await expect(dialog.getByText(/Up to date with the origin/u)).toBeVisible();
   }
 );
 

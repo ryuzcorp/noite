@@ -6,4 +6,4 @@
 ### Fixed
 
 - **The Errors tab's top spacing matches the Events tab.** The environment picker moved into the Errors card's header row (next to the status tabs) instead of its own right-aligned row above the card, and the error detail's back link shares its row with the picker — the same container/gap/header pattern as Events.
-- The Deployments tab no longer paints the "No environments yet — …" line when the app has no preview environments; the section just lists production deploys and the create-environment dialog.
+- **A sync no longer counts itself as a Noite-side commit.** A successful sync records its own commit (not the origin sha) as the base for the next Noite-commit count, so clicking Sync right after a sync goes straight to up-to-date instead of demanding confirmation for the sync's own commit. Genuine Noite-side commits after the sync still count and still require "Sync anyway". Every sync action also refetches the status first, so the dialog's count and its straight-vs-confirm decision are never made from a stale snapshot (previously a click after a Noite-side commit could claim "0 Noite commits will be overwritten" or fail with "the branch moved").
