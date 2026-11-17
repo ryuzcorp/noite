@@ -102,13 +102,58 @@ const WORKER_DEPS = [
   "scule",
 ] as const;
 
+/**
+ * Client-bundle node-builtin gate (build half). Vite externalizes a
+ * client-bundled `node:` import to an empty browser stub with only a
+ * warning (`Module "node:X" has been externalized for browser
+ * compatibility, imported by "<file>"`) and exit 0 — the #371 outage
+ * shipped exactly that way, and a dependency's `node:fs` does the same
+ * invisibly to the source-graph walk (bare specifiers). Recording the
+ * warning here and throwing in `buildEnd` turns it into a build error that
+ * names the specifier and importer, locally and in CI. (Throwing directly
+ * in `onLog` does not fail the build — the log pipeline swallows it.)
+ * Only browser-consumer environments externalize; the worker bundle keeps
+ * real `node:` imports (workerd supports them) and never warns.
+ */
+const externalizedBuiltins: string[] = [];
+
+const failOnExternalizedBuiltin = (): Plugin => ({
+  buildEnd: (): void => {
+    if (externalizedBuiltins.length > 0) {
+      throw new Error(
+        `client bundle externalized a node builtin for browser compatibility (empty browser stub — throws at module load, killing the island chunk):\n${externalizedBuiltins.join("\n")}\nMove the builtin behind a server-only module (like lib/request-timeout-node.ts, imported only from middleware/routes/http/lib/server) and keep the shared contract client-safe.`
+      );
+    }
+  },
+  name: "noite-fail-on-externalized-builtin",
+});
+
 export default defineConfig({
+  build: {
+    rolldownOptions: {
+      onLog: (level, log, defaultHandler): void => {
+        if (
+          level === "warn" &&
+          log.message.includes(
+            "has been externalized for browser compatibility"
+          )
+        ) {
+          externalizedBuiltins.push(log.message);
+        }
+
+        defaultHandler(level, log);
+      },
+    },
+  },
   define: { __CONTROL_BUILD__: JSON.stringify(controlBuild()) },
   environments: {
     void_worker: { optimizeDeps: { include: [...WORKER_DEPS] } },
   },
   optimizeDeps: { include: [...LATE_DEPS] },
   plugins: [
+    // Build-half of the client/server split (see above): the build fails
+    // when a client chunk would ship a stubbed node builtin.
+    failOnExternalizedBuiltin(),
     curatedShikiLangs(),
     // Void owns the worker entry (middleware → routes → pages → static
     // assets), generated from `src/middleware/` + `src/routes/` plus
