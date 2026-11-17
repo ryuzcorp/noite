@@ -29,6 +29,9 @@ _PROJECT_ARG="${PROJECT:-}"
 # multi overlay must follow the install the operator addressed.
 _TENANCY_ARG="${NOITE_TENANCY:-}"
 _BASE_ARG="${BASE_DOMAIN:-}"
+# Same for the store input below: whether project_running expects the
+# bundled rustfs must follow the addressed install, not the file.
+_S3_ARG="${S3_ENDPOINT:-}"
 load_env
 detect_engine
 
@@ -38,6 +41,9 @@ PORT="${HTTP_PORT:-9080}"
 # operator addressed, not the file.
 NOITE_TENANCY="${_TENANCY_ARG:-${NOITE_TENANCY:-}}"
 BASE_DOMAIN="${_BASE_ARG:-${BASE_DOMAIN:-}}"
+# Whether the bundled store is expected (see project_running below) follows
+# the addressed install too: the caller wins over `.env`, mirroring PROJECT.
+S3_ENDPOINT="${_S3_ARG:-${S3_ENDPOINT:-}}"
 TOKEN="${RUNNER_TOKEN:-dev-runner-token}"
 # Behind the edge the runner is reached by Host, not by port (raw-port lanes
 # set NOITE_API_URL and skip this).
@@ -91,17 +97,38 @@ run_with_timeout() {
 # differently (podman also reports `initialized`, `stopped`, `configured`).
 # Raw engine `ps`, once per engine's compose labels (`compose ps` output
 # differs between them).
+# The bundled store is required whenever the install expects it: `noite`
+# declares rustfs `required: false`, so a failed `up -d` that leaves only
+# the edge running would otherwise pass. Container existence cannot decide:
+# `down --remove-orphans` deletes every container, so an `up` that dies
+# before creating rustfs leaves nothing to query. What decides is
+# configuration: the default S3_ENDPOINT is the bundled store
+# (`http://rustfs:9000`, the runner and compose.yaml default); a BYO-S3
+# install points S3_ENDPOINT elsewhere and scales rustfs to zero. When the
+# store is expected, a missing rustfs container counts as down, not absent.
+# (Kept identical in backup.sh and restore.sh on purpose — keep the two
+# copies in sync. Sharing via lib.sh would churn both callers' covered
+# restart paths for no behaviour gain.)
 project_running() {
   states=""
   edge=""
+  store=""
   for label in com.docker.compose io.podman.compose; do
     states="$states $("$CLI" ps -a --filter "label=${label}.project=${PROJECT}" --format '{{.State}}' 2>/dev/null || true)"
     edge="$edge $("$CLI" ps -a --filter "label=${label}.project=${PROJECT}" --filter "label=${label}.service=noite" --format '{{.State}}' 2>/dev/null || true)"
+    store="$store $("$CLI" ps -a --filter "label=${label}.project=${PROJECT}" --filter "label=${label}.service=rustfs" --format '{{.State}}' 2>/dev/null || true)"
   done
   states="$(printf '%s' "$states" | tr ' ' '\n' | grep -v '^$' || true)"
   [ -n "$states" ] || return 1
   printf '%s' "$edge" | tr ' ' '\n' | grep -qx 'running' || return 1
-  ! printf '%s\n' "$states" | grep -qvx 'running'
+  ! printf '%s\n' "$states" | grep -qvx 'running' || return 1
+  store="$(printf '%s' "$store" | tr ' ' '\n' | grep -v '^$' || true)"
+  case "${S3_ENDPOINT:-http://rustfs:9000}" in
+  http://rustfs:9000 | http://rustfs:9000/)
+    [ -n "$store" ] || return 1
+    ! printf '%s\n' "$store" | grep -qvx 'running'
+    ;;
+  esac
 }
 
 # Set to 1 just before `ce stop`: the trap below restarts only a stack this
