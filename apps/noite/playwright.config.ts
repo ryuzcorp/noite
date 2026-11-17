@@ -43,14 +43,17 @@ const workers = Number(process.env.E2E_WORKERS ?? 3);
 
 // Two suites over the same specs (E2E_SUITE, set by docker/e2e-local.sh):
 // `release` (the default) runs everything; `fast` is the pull-request gate,
-// the tests tagged for this lane's tenancy. `@fast` marks the single lane's
-// critical user paths (create, push and deploy, live logs, Code mode push, PR
-// merge, auth and invite gates, template deploy, rollback, environments,
-// error ingest); `@isolation` marks the multi lane's set, the paths
-// `NOITE_TENANCY=multi` changes (the hostile tenant, a sandboxed deploy, domain
-// verification). A tag is opt-in on purpose: a new test joins the release
-// suite, and joining the gate every pull request waits on is a decision. The
-// setup and policy projects run in both suites (every other test needs them).
+// the tests tagged for this lane's tenancy — plus every spec file the PR
+// rewrote in full (E2E_CHANGED_SPECS, from e2e.yml's plan job), so a
+// rewritten spec first runs on the PR instead of in the merge queue.
+// `@fast` marks the single lane's critical user paths (create, push and
+// deploy, live logs, Code mode push, PR merge, auth and invite gates,
+// template deploy, rollback, environments, error ingest); `@isolation` marks
+// the multi lane's set, the paths `NOITE_TENANCY=multi` changes (the hostile
+// tenant, a sandboxed deploy, domain verification). A tag is opt-in on
+// purpose: a new test joins the release suite, and joining the gate every
+// pull request waits on is a decision. The setup and policy projects run in
+// both suites (every other test needs them).
 const SUITE_TAGS = {
   multi: /@isolation/u,
   single: /@fast/u,
@@ -77,6 +80,22 @@ const authFile = process.env.E2E_AUTH_DIR
   : "e2e/.auth/user.json";
 
 const suiteGrep = suite === "fast" ? SUITE_TAGS[tenancy] : undefined;
+
+// Spec files the PR rewrote (E2E_CHANGED_SPECS, set by e2e.yml's plan job
+// from the PR diff): they run in full on the PR, not just their tagged
+// tests. The `e2e` project above already runs those files' tagged tests, so
+// `e2e-changed` runs the rest (the suite tag inverted); together they are
+// the whole file, with no double-run. Only in the fast suite with a
+// non-empty list — the release suite already runs everything, and an empty
+// list keeps today's plan identical. Sharding still balances: `--shard`
+// splits the run's full test list across every project.
+const escapeRegExp = (text: string): string =>
+  text.replaceAll(/[/\\^$*+?.()|[\]{}]/gu, "\\$&");
+
+const changedSpecs = (process.env.E2E_CHANGED_SPECS ?? "")
+  .split(/\s+/u)
+  .filter((entry) => entry.length > 0)
+  .map((spec) => new RegExp(`${escapeRegExp(spec)}$`, "u"));
 
 export default defineConfig({
   expect: { timeout: 30_000 },
@@ -113,6 +132,20 @@ export default defineConfig({
       // Deploy tests reuse the registered session, not the browser context.
       use: { storageState: authFile },
     },
+    // The PR's rewritten specs, minus their tagged tests (those ran in `e2e`
+    // above). Absent outside the fast suite with changed specs.
+    ...(suite === "fast" && changedSpecs.length > 0
+      ? [
+          {
+            dependencies: ["policy"],
+            grepInvert: suiteGrep,
+            name: "e2e-changed",
+            testIgnore: [/a-invite\.spec\.ts/u, /auth\.setup\.ts/u],
+            testMatch: changedSpecs,
+            use: { storageState: authFile },
+          },
+        ]
+      : []),
   ],
   reporter: [
     ["list"],

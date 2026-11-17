@@ -4,10 +4,12 @@
 #
 # Two suites over the same specs (`inputs.suite`, `E2E_SUITE` in the lane):
 # `fast` runs the tagged PR gate (@fast single, @isolation multi — the
-# critical paths plus the policy probe); `release` runs every spec. `ci.yml`
-# runs `fast` on pull requests that touch runtime code and `release` on the
-# `e2e` label; `images.yml` gates every `v*` tag on `release`; a nightly
-# schedule runs `release` on main. Locally: `make e2e`,
+# critical paths plus the policy probe) plus every spec file the PR rewrote in
+# full (the `plan` job selects them from the PR diff, `E2E_CHANGED_SPECS` in
+# the lane; a changed shared helper escalates to `release` instead); `release`
+# runs every spec. `ci.yml` runs `fast` on pull requests that touch runtime
+# code and `release` on the `e2e` label; `images.yml` gates every `v*` tag on
+# `release`; a nightly schedule runs `release` on main. Locally: `make e2e`,
 # `E2E_SUITE=fast make e2e`, and `make e2e-isolation`.
 #
 # Speed shape: `ci.yml` builds the image once per run (its `image` job) and
@@ -64,14 +66,24 @@ permissions:
 
 jobs:
   # Which rounds to run: 3 on the nightly schedule, the `rounds` input on
-  # dispatch, 1 for every reusable caller. A job (not an inline expression)
-  # so the lane matrix below stays clean instead of scattering skipped cells.
+  # dispatch, 1 for every reusable caller — plus, on a pull request asking
+  # for the fast suite, which spec files the PR rewrote. A rewritten spec
+  # used to first run in the merge queue's release suite and fail there
+  # (Candidate 10): the lane runs those files in full beside the tagged gate
+  # (both tenancy lanes, like the gate itself). A changed shared helper
+  # (`e2e/helpers.ts`, fixtures, the setup ceremony, the Playwright config)
+  # escalates to the release suite — its blast radius is every spec.
+  # Merge-queue, dispatch and schedule runs keep their requested suite.
+  # A job (not an inline expression) so the lane matrix below stays clean
+  # instead of scattering skipped cells.
   plan:
     runs-on: ubuntu-latest
     # ~3x the 0.1 min p95 (25 runs, 2026-11-11), floor 10.
     timeout-minutes: 10
     outputs:
       rounds: ${{ steps.rounds.outputs.json }}
+      suite: ${{ steps.specs.outputs.suite }}
+      extra-specs: ${{ steps.specs.outputs.extra-specs }}
     steps:
       - id: rounds
         run: |
@@ -82,6 +94,16 @@ jobs:
             2) echo 'json=[1,2]' >> "$GITHUB_OUTPUT" ;;
             *) echo 'json=[1,2,3]' >> "$GITHUB_OUTPUT" ;;
           esac
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        if: github.event_name == 'pull_request'
+        with:
+          fetch-depth: 0
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        if: github.event_name == 'pull_request'
+        timeout-minutes: 3
+      - id: specs
+        if: github.event_name == 'pull_request'
+        run: bun .github/scripts/e2e-plan.ts --base '${{ github.event.pull_request.base.sha }}' --suite '${{ inputs.suite }}' >> "$GITHUB_OUTPUT"
 
   e2e:
     name: e2e (${{ matrix.lane }} round ${{ matrix.round }} shard ${{ matrix.shard }})
@@ -193,8 +215,27 @@ jobs:
       - name: load lane image
         if: inputs.image_artifact != ''
         run: zstd -d -c /tmp/noite-image/noite-ci.tar.zst | docker load
+      # The plan's effective suite (a changed shared helper escalates fast to
+      # release) and the PR's rewritten specs, which the lane runs in full
+      # beside the tagged gate. Both are empty outside pull requests, where
+      # the lane keeps the requested suite exactly as before. Plan-controlled
+      # values travel through `env:` and are referenced quoted — never
+      # interpolated into `run:` — and the suite is checked against its
+      # explicit set here (the selection script already fails closed on
+      # anything outside its path allowlist and only emits fast|release).
+      # Remaining `${{ }}` in this step is repo-controlled: the matrix shard,
+      # target and image choice are workflow literals, never PR content.
       - name: e2e lane
-        run: E2E_IMAGE=${{ inputs.image_artifact == '' && 'noite:e2e' || 'noite:ci' }} E2E_SUITE=${{ inputs.suite || 'release' }} E2E_SHARD=${{ matrix.shard }}/2 make ${{ matrix.target }}
+        env:
+          E2E_CHANGED_SPECS: ${{ needs.plan.outputs.extra-specs }}
+          E2E_SUITE: ${{ needs.plan.outputs.suite || inputs.suite || 'release' }}
+          E2E_IMAGE: ${{ inputs.image_artifact == '' && 'noite:e2e' || 'noite:ci' }}
+        run: |
+          case "$E2E_SUITE" in
+            fast|release) ;;
+            *) echo "::error::unknown e2e suite: $E2E_SUITE"; exit 1 ;;
+          esac
+          E2E_SHARD="${{ matrix.shard }}/2" make "${{ matrix.target }}"
       - name: upload playwright report
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
