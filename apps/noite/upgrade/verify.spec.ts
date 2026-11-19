@@ -1,22 +1,28 @@
-import { readFileSync, writeFileSync } from "node:fs";
+import { readFileSync } from "node:fs";
 import nodePath from "node:path";
 
 import { expect, test } from "@playwright/test";
 import * as Schema from "effect/Schema";
 
-import { appListenPort, gitRefs, pushAppDir, runnerCall } from "../e2e/helpers";
-import { hasCollaborator, waitForDeploySuccess } from "./lane";
+import { appListenPort, gitRefs, runnerCall } from "../e2e/helpers";
+import { hasCollaborator } from "./lane";
 
-/** Prove the tree image serves the previous release's seed back: the app
- * row, its env var, its successful deploy, its verified domain, the D1 rows
- * the worker wrote, the R2 object, a live tenant response — and the
- * collaborator the control plane recorded. Then redeploy on the tree with a
- * new D1 migration file and prove the pending migrations applied exactly
- * once (one `d1_migrations` row each, served back by the worker) and a
- * second redeploy applies nothing again. Reads the state file the seed
- * phase wrote (`UPGRADE_STATE`); every assertion hits the restarted stack.
+/** Prove the old image still serves its seed after the tree refused it: the
+ * app row, its env var, its successful deploy, its verified domain, the D1
+ * rows the worker wrote, the R2 object, a live tenant response — and the
+ * collaborator the control plane recorded. The lane boots the tree on the
+ * seed's volumes first and asserts the refusal (never-ready plus the reset
+ * message); then it reboots the old image and runs this file against it, so
+ * every assertion below proves the refusal reshaped nothing. Reads the state
+ * file the seed phase wrote (`UPGRADE_STATE`).
+ *
+ * This is the one-cycle shape across the 0.2.0 beta reset (no upgrade path).
+ * After the first post-reset release ships, the lane returns to proving
+ * previous-release -> tree upgrades, and this file returns to asserting
+ * against the tree image — including the redeploy-twice D1 migration
+ * coverage that was cut for the refusal cycle (nothing migrates now).
  * The collaborator read goes through the control API, so no UI locator can
- * skew between the release that seeded and the tree that serves. */
+ * skew between the release that seeded and the image that serves. */
 const STATE_PATH =
   process.env.UPGRADE_STATE ??
   `${process.env.E2E_AUTH_DIR ?? "upgrade/.auth"}/upgrade-state.json`;
@@ -74,7 +80,7 @@ test.skip(
   "verify runs in the verify phase only"
 );
 
-test("the tree image serves the previous release's data back", async ({
+test("the old image still serves its seed after the tree refused it", async ({
   page,
   request,
 }) => {
@@ -179,86 +185,4 @@ test("the tree image serves the previous release's data back", async ({
   )(await sessionRes.json());
 
   expect(session.user.email).toBe("e2e@noite.local");
-});
-
-const SECOND_MIGRATION = "0002_probe_applied.sql";
-
-const SECOND_MIGRATION_SQL =
-  "ALTER TABLE migration_probe ADD COLUMN applied TEXT NOT NULL DEFAULT '0002';\n";
-
-const APPLIED_MIGRATIONS = [
-  "0001_migration_probe.sql",
-  "0002_probe_applied.sql",
-];
-
-const MigrationProbe = Schema.Struct({
-  applied: Schema.Array(Schema.String),
-  probe: Schema.NullOr(
-    Schema.Struct({
-      applied: Schema.String,
-      id: Schema.Number,
-      note: Schema.String,
-    })
-  ),
-});
-
-/** Push the sample worker plus the second migration file: `pushAppDir` copies
- * the tree first, so the repo itself keeps only the seed migration. */
-const pushWithSecondMigration = (key: string, slug: string): string =>
-  pushAppDir(key, new URL("../test", import.meta.url), slug, (dir) => {
-    writeFileSync(
-      nodePath.join(dir, "migrations", SECOND_MIGRATION),
-      SECOND_MIGRATION_SQL
-    );
-  });
-
-test("a redeploy on the tree applies the pending D1 migrations once", async ({
-  request,
-}) => {
-  const state = readState();
-  const key = readFileSync(KEY_PATH, "utf-8").trim();
-
-  // The seed deployed with a `migrations/` dir the previous release never
-  // applied, and the upgrade itself runs no deploy. Redeploy on the tree
-  // with a new migration file: the pending files apply exactly once — one
-  // bookkeeping row each, in order — and the worker serves the migrated
-  // schema.
-  const migratedSha = pushWithSecondMigration(key, state.slug);
-  await waitForDeploySuccess(request, state.appId, migratedSha);
-
-  const port = await appListenPort(request, state.appId);
-  const probe = await request.get(`http://localhost:${port}/migration-probe`);
-  expect(probe.ok()).toBe(true);
-
-  const served = Schema.decodeUnknownSync(MigrationProbe)(await probe.json());
-  expect(served.applied).toEqual(APPLIED_MIGRATIONS);
-  expect(served.probe).toEqual({
-    applied: "0002",
-    id: 1,
-    note: "seeded-by-0001",
-  });
-
-  // A second redeploy of the same tree applies nothing again: the deploy
-  // succeeds and the bookkeeping rows are unchanged.
-  const replaySha = pushWithSecondMigration(key, state.slug);
-  await waitForDeploySuccess(request, state.appId, replaySha);
-
-  const replayPort = await appListenPort(request, state.appId);
-
-  const replay = await request.get(
-    `http://localhost:${replayPort}/migration-probe`
-  );
-
-  expect(replay.ok()).toBe(true);
-
-  const reserved = Schema.decodeUnknownSync(MigrationProbe)(
-    await replay.json()
-  );
-
-  expect(reserved.applied).toEqual(APPLIED_MIGRATIONS);
-  expect(reserved.probe).toEqual({
-    applied: "0002",
-    id: 1,
-    note: "seeded-by-0001",
-  });
 });

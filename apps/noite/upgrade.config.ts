@@ -1,12 +1,14 @@
 import { defineConfig } from "@playwright/test";
 
-// The upgrade lane's specs (`sh docker/e2e-upgrade.sh`): seed the previous
-// release's image, restart on the tree image, verify the seed survived.
-// Separate from `playwright.config.ts` (whose `e2e` project would otherwise
-// run these against the wrong stack, in the wrong phase): this config runs
-// one file per phase — `seed.spec.ts` against the old image, `verify.spec.ts`
-// against the new one — with the same environment knobs as the e2e lane
-// (E2E_BASE_URL, E2E_API_BASE, E2E_AUTH_DIR, E2E_REPORT_DIR, E2E_TEST_DIR).
+// The upgrade lane's specs (`sh docker/e2e-upgrade.sh`): seed the last
+// pre-reset release's image, assert the tree refuses it, reboot the old
+// image and verify the seed survived untouched. Separate from
+// `playwright.config.ts` (whose `e2e` project would otherwise run these
+// against the wrong stack, in the wrong phase): this config runs one file
+// per phase — `seed.spec.ts` against the old image, `verify.spec.ts`
+// against the rebooted old image — with the same environment knobs as the
+// e2e lane (E2E_BASE_URL, E2E_API_BASE, E2E_AUTH_DIR, E2E_REPORT_DIR,
+// E2E_TEST_DIR).
 const authFile = process.env.E2E_AUTH_DIR
   ? `${process.env.E2E_AUTH_DIR}/user.json`
   : "upgrade/.auth/user.json";

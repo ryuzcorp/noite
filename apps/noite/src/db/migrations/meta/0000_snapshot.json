@@ -1,8 +1,8 @@
 {
   "version": "6",
   "dialect": "sqlite",
-  "id": "ac88565a-d7e6-4228-a494-38d4823344f3",
-  "prevId": "844536a4-2cb9-43a0-b571-74e5b15ab6cd",
+  "id": "02b5a11f-60c8-4a26-a175-44640b83ae6a",
+  "prevId": "00000000-0000-0000-0000-000000000000",
   "tables": {
     "account": {
       "name": "account",
@@ -503,16 +503,9 @@
       "uniqueConstraints": {},
       "checkConstraints": {}
     },
-    "invite": {
-      "name": "invite",
+    "email_invite": {
+      "name": "email_invite",
       "columns": {
-        "code": {
-          "name": "code",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false
-        },
         "createdAt": {
           "name": "createdAt",
           "type": "text",
@@ -528,18 +521,25 @@
           "notNull": true,
           "autoincrement": false
         },
+        "email": {
+          "name": "email",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "expiresAt": {
+          "name": "expiresAt",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
         "id": {
           "name": "id",
           "type": "text",
           "primaryKey": true,
           "notNull": true,
-          "autoincrement": false
-        },
-        "note": {
-          "name": "note",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": false,
           "autoincrement": false
         },
         "revoked": {
@@ -549,6 +549,13 @@
           "notNull": true,
           "autoincrement": false,
           "default": false
+        },
+        "tokenHash": {
+          "name": "tokenHash",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
         },
         "usedAt": {
           "name": "usedAt",
@@ -566,17 +573,54 @@
         }
       },
       "indexes": {
-        "idx_invite_createdBy": {
-          "name": "idx_invite_createdBy",
+        "idx_email_invite_email": {
+          "name": "idx_email_invite_email",
+          "columns": ["email"],
+          "isUnique": false
+        },
+        "idx_email_invite_createdBy": {
+          "name": "idx_email_invite_createdBy",
           "columns": ["createdBy"],
           "isUnique": false
         },
-        "uq_invite_code": {
-          "name": "uq_invite_code",
-          "columns": ["code"],
+        "uq_email_invite_tokenHash": {
+          "name": "uq_email_invite_tokenHash",
+          "columns": ["tokenHash"],
           "isUnique": true
         }
       },
+      "foreignKeys": {},
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "checkConstraints": {}
+    },
+    "instance_setting": {
+      "name": "instance_setting",
+      "columns": {
+        "key": {
+          "name": "key",
+          "type": "text",
+          "primaryKey": true,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "updatedAt": {
+          "name": "updatedAt",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": "CURRENT_TIMESTAMP"
+        },
+        "value": {
+          "name": "value",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        }
+      },
+      "indexes": {},
       "foreignKeys": {},
       "compositePrimaryKeys": {},
       "uniqueConstraints": {},
@@ -870,6 +914,14 @@
           "notNull": true,
           "autoincrement": false,
           "default": "'user'"
+        },
+        "status": {
+          "name": "status",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": "'active'"
         },
         "updatedAt": {
           "name": "updatedAt",

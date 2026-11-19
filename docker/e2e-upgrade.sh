@@ -1,33 +1,39 @@
 #!/bin/sh
-# Upgrade lane (`make e2e-upgrade`): prove the tree upgrades the previous
-# release's data in place. Boots the previous release's published image,
-# seeds it through the public surface (app + env var, deploy, custom domain
-# claim, collaborator, worker-written D1/R2 state — the sample worker ships
-# a D1 `migrations/` dir the old release never applies), stops it, restarts
-# the tree image on the SAME volumes and bucket, verifies the seed reads
-# back and the app still serves, then redeploys twice on the tree: once with
-# a new migration file (every pending file applies exactly once) and once
-# more (nothing applies again).
+# Refusal lane (`make e2e-upgrade`): prove the tree refuses pre-reset data.
+# Seeds the last pre-reset release's published image (`v0.1.0-beta.6`)
+# through the public surface (app + env var, deploy, custom domain claim,
+# collaborator, worker-written D1/R2 state), stops it, restarts the tree
+# image on the SAME volumes and bucket, and asserts the tree REFUSES to
+# boot: the stack never becomes ready and the container logs carry the reset
+# message. A successful boot that serves the seed back is a lane FAILURE.
+# The old image then reboots on the untouched volumes and the seed is
+# verified against it, proving the refusal reshaped nothing.
+#
+# This is the one-cycle shape across the 0.2.0 beta reset (which has no
+# upgrade path: pre-reset installs reinstall, see
+# apps/website/docs/self-hosting/operations.mdx). After the first post-reset
+# release (`v0.2.0-beta.1`) ships, this lane returns to proving
+# previous-release -> tree upgrades in place (seed on the previous release,
+# restart on the tree, verify the seed reads back and the app still serves).
+# Keep the refusal assertion simple and robust: never-ready plus the reset
+# message in the logs, then the old-image reboot proving untouched data.
 #
 # The old side boots and is probed with the previous release's own lane
 # files (compose + doctor, via `old_lane_files` in docker/lib.sh), never the
 # tree's: a rename between releases leaves the old stack failing the tree's
 # readiness probes for a healthy seed.
 #
-# Previous tag: the newest `v*` reachable before HEAD (a HEAD tag's
-# predecessor on a tag build), else `gh release list`. Override with
+# Previous tag: the last pre-reset release (`v0.1.0-beta.6`). Override with
 # PREV_TAG=<tag> (the image is `ghcr.io/ryuzcorp/noite:<tag without v>`)
 # or PREV_IMAGE=<ref> outright — a local image for proving a branch
 # (never pulled; the daemon must already hold the tag). The new side builds
 # from the tree by default; E2E_IMAGE=<tag> tests a prebuilt image instead
 # (CI hands over its one shared build this way).
-# `E2E_FROM_OLDEST=1` seeds from the oldest supported release (the first
-# beta tag) instead of the previous one — the monthly oldest-beta lane.
 #
 # Knobs (mirroring docker/e2e-local.sh, own project/bucket/ports):
 #   E2E_SLOT=<n>          parallel lane <n> (default 0 = today's ports);
 #                         `auto` takes the first free slot (1-8).
-#   E2E_KEEP=1            leave the upgraded stack up afterwards (debug).
+#   E2E_KEEP=1            leave the refused stack up afterwards (debug).
 #   PREV_TAG / PREV_IMAGE pick the old side; E2E_IMAGE picks the new side.
 #   sh docker/e2e-upgrade.sh down (with an explicit E2E_SLOT) stops the lane.
 set -eu
@@ -47,29 +53,11 @@ resolve_prev_tag() {
     printf '%s\n' "$PREV_TAG"
     return 0
   fi
-  current="$(git describe --tags --match 'v*' --exact-match HEAD 2>/dev/null || true)"
-  if [ -n "$current" ]; then
-    git describe --tags --match 'v*' --abbrev=0 "${current}^" 2>/dev/null || true
-  else
-    git describe --tags --match 'v*' --abbrev=0 HEAD 2>/dev/null || true
-  fi
+  # The refusal cycle has exactly one old side: the last pre-reset release.
+  printf '%s\n' "v0.1.0-beta.6"
 }
 
 PREV_TAG_RESOLVED="$(resolve_prev_tag || true)"
-if [ "${E2E_FROM_OLDEST:-0}" = 1 ]; then
-  # The oldest supported release (the first beta), not the previous one:
-  # proves a beta.1 -> tree jump. An explicit PREV_TAG still wins. No tag
-  # means no lane: falling through to the previous-release fallback would
-  # pass without testing the first beta.
-  PREV_TAG_RESOLVED="${PREV_TAG:-$(git tag --list 'v0.1.0-beta.*' --sort=v:refname | head -n 1)}"
-  if [ -z "$PREV_TAG_RESOLVED" ]; then
-    echo "error: E2E_FROM_OLDEST=1 but no v0.1.0-beta.* tag is reachable; pass PREV_TAG=<tag>" >&2
-    exit 1
-  fi
-fi
-if [ -z "$PREV_TAG_RESOLVED" ] && command -v gh >/dev/null 2>&1; then
-  PREV_TAG_RESOLVED="$(gh release list --limit 5 --json tagName -q '.[1].tagName' 2>/dev/null || true)"
-fi
 if [ -z "$PREV_TAG_RESOLVED" ]; then
   echo "error: no previous v* tag reachable; pass PREV_TAG=<tag>"
   exit 1
@@ -242,6 +230,32 @@ wait_ready() {
   return 1
 }
 
+# wait_refusal: the tree must never become ready on pre-reset data. Poll up
+# to 5 min: a ready stack is an immediate failure (return 1); the reset
+# message in the container logs is the expected refusal (return 0). The
+# refusal wording is owned by apps/runner/src/schema_version.rs; match it
+# loosely ("refusing to start" plus "cannot be upgraded"/reset) so a reword
+# there degrades to a timeout failure, never to a false pass.
+wait_refusal() {
+  _ref_attempt=0
+  while [ "$_ref_attempt" -lt 60 ]; do
+    if sh docker/doctor.sh >/dev/null 2>&1; then
+      echo "error: the tree image became ready on pre-reset data (expected a refusal)"
+      return 1
+    fi
+    # shellcheck disable=SC2086
+    if $CE2E logs --tail=200 noite 2>&1 | grep -qi "refusing to start" && \
+      $CE2E logs --tail=2000 noite 2>&1 | grep -qi "cannot be upgraded\|reset\|0\.1\.0-beta"; then
+      return 0
+    fi
+    _ref_attempt=$((_ref_attempt + 1))
+    sleep 5
+  done
+  # shellcheck disable=SC2086
+  $CE2E logs --tail=200 noite 2>&1 || true
+  return 1
+}
+
 fail_down() {
   echo "error: $1"
   # shellcheck disable=SC2086
@@ -297,25 +311,27 @@ else
   # shellcheck disable=SC2086
   $CE2E -f docker/compose.build.yaml up -d --build || fail_down "tree image failed to start"
 fi
-echo "==> wait for the upgraded stack (5 min)"
-if ! wait_ready "docker/doctor.sh"; then
-  # shellcheck disable=SC2086
-  $CE2E logs --tail=200 noite 2>&1 | grep -i "refusing to start" || true
-  fail_down "upgraded stack never became ready"
+echo "==> assert the tree refuses the pre-reset data (5 min)"
+if ! wait_refusal; then
+  fail_down "tree image did not refuse the pre-reset data (it booted, or never printed the reset message)"
 fi
-# A schema refusal fails the wait above; name it outright so the lane's
-# verdict says what the tree refused, not just that doctor stayed red.
-if $CE2E logs --tail=5000 noite 2>&1 | grep -qi "refusing to start"; then
-  $CE2E logs --tail=200 noite 2>&1 | grep -i "refusing to start" || true
-  fail_down "tree image refused the previous release's data"
-fi
-echo "==> verify the seed reads back on the tree image"
+# shellcheck disable=SC2086
+$CE2E logs --tail=20 noite 2>&1 | grep -i "refusing to start" || true
+echo "==> tree refused as expected; stop it and reboot the old image on the untouched volumes"
+# shellcheck disable=SC2086
+$CE2E down --remove-orphans >/dev/null 2>&1 || true
+export NOITE_IMAGE="$PREV_IMAGE"
+# shellcheck disable=SC2086
+$OLD_CE2E up -d $PREV_PULL || fail_down "old image failed to restart after the refusal"
+echo "==> wait for the old stack (5 min)"
+wait_ready "$OLD_DOCTOR" || fail_down "old stack never became ready after the refusal (the tree reshaped its data)"
+echo "==> verify the seed still reads back on the old image"
 (
   cd apps/noite && UPGRADE_PHASE=verify npx playwright test -c upgrade.config.ts
-) || fail_down "verify phase failed"
+) || fail_down "verify phase failed (the tree reshaped pre-reset data it should have refused)"
 
 LANE_END="$(date +%s)"
-echo "==> upgrade lane green in $((LANE_END - LANE_START))s: ${PREV_TAG_RESOLVED} -> tree serves the seed back"
+echo "==> upgrade lane green in $((LANE_END - LANE_START))s: ${PREV_TAG_RESOLVED} seed refused by the tree, old image still serves it back"
 if [ "${E2E_KEEP:-0}" = 1 ]; then
   echo "$$" > "$KEEP_FILE"
   echo "==> kept: E2E_SLOT=${SLOT} sh docker/e2e-upgrade.sh down frees it"

@@ -7,12 +7,12 @@
 # The end-to-end lanes (`make e2e`, `make e2e-isolation`) need a container
 # engine plus a few minutes, so the pull-request default is the fast suite:
 # PRs that touch runtime code run the tagged gate automatically, PRs that
-# touch schema or migration paths also run the upgrade lane (`make
-# e2e-upgrade`: the previous release seeds data, the tree must serve it
-# back), and the `e2e` label upgrades the run to the release suite (every
-# spec). Dispatch from the Actions tab runs the chosen suite. They are the
-# release gate too: `images.yml` runs the release suite plus the upgrade
-# lane on every `v*` tag before pushing an image.
+# touch schema or migration paths also run the refusal lane (`make
+# e2e-upgrade`: the last pre-reset release seeds data, the tree must refuse
+# it and leave it untouched), and the `e2e` label upgrades the run to the
+# release suite (every spec). Dispatch from the Actions tab runs the chosen
+# suite. They are the release gate too: `images.yml` runs the release suite
+# plus the refusal lane on every `v*` tag before pushing an image.
 #
 # Labels never start this workflow: `pull_request` has no `labeled`/`unlabeled`
 # trigger on purpose. A label change (security labels, `e2e`) neither starts
@@ -267,11 +267,11 @@ jobs:
       suite: ${{ (github.event_name == 'merge_group' || contains(github.event.pull_request.labels.*.name, 'e2e')) && 'release' || inputs.suite || 'fast' }}
       image_artifact: noite-ci-image
 
-  # The previous-release -> tree lane, on pull requests that touch schema
-  # or migration paths only (`docker/**` overlaps `code`, so a compose or
-  # lane change alone runs it too — the lane owns those files). The tag
-  # gate (`images.yml`) and the nightly schedule (upgrade.yml) cover the
-  # rest; the merge queue inherits the PR run.
+  # The refusal lane (pre-reset data -> tree refuses), on pull requests that
+  # touch schema or migration paths only (`docker/**` overlaps `code`, so a
+  # compose or lane change alone runs it too — the lane owns those files).
+  # The tag gate (`images.yml`) and the nightly schedule (upgrade.yml) cover
+  # the rest; the merge queue inherits the PR run.
   upgrade:
     needs: [changes, image]
     if: always() && needs.image.result == 'success' && github.event_name == 'pull_request' && needs.changes.outputs.schema == 'true'

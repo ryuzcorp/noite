@@ -1,10 +1,6 @@
 // The control D1 schema, defined once for Void's Drizzle layer (`void/db`).
-//
-// Column names and types mirror the database every install already has: the
-// timestamp columns stay TEXT (`CURRENT_TIMESTAMP` defaults included) rather
-// than Drizzle's integer modes, so an install created before this schema
-// keeps its rows and dates through the upgrade. The initial migration is
-// idempotent for the same reason (see db/migrations).
+// The baseline migration (`db/migrations/001_baseline.sql`) builds exactly
+// this shape on an empty database.
 //
 // Auth tables match better-auth 1.7.x with the admin, api-key, passkey and
 // email-OTP plugins. `user.onboardedAt` is server-set only (the onboarding
@@ -34,8 +30,7 @@ export const userTable = sqliteTable(
     onboardedAt: text("onboardedAt"),
     role: text("role").notNull().default("user"),
     /** Registration state: `active` holds full access, `pending` holds none
-     * until an instance admin approves the account (the waitlist). Existing
-     * rows read `active` (see the migration default). */
+     * until an instance admin approves the account (the waitlist). */
     status: text("status").notNull().default("active"),
     updatedAt: timestamp("updatedAt"),
   },
