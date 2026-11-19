@@ -370,25 +370,64 @@ async fn reconcile_once(
         .filter(|a| a.desired() == DesiredState::Stopped)
         .map(|a| a.id.clone())
         .collect();
+    let environments = db::list_all_environments(pool).await?;
+    // Stop phase: every fleet whose desired state is stopped — apps and
+    // previews together — concurrently. Each stop drains its own SIGTERM
+    // grace (up to 15 s) while holding no lock, but awaiting the stops one by
+    // one serialized the whole tick behind N slow drains: a start for an
+    // unrelated fleet waited behind stops it had nothing to do with
+    // (head-of-line) until its health-gate budget expired. All stops in this
+    // pass complete before any spawn in the loops below, and each key is
+    // stopped at most once per tick (one row per key), so the tick never
+    // starts a fleet while its own previous process is still draining, with
+    // no double stop or start. (A wake racing the stop phase can still spawn
+    // concurrently; that pre-existing race is settled by the spawn epoch.)
+    let mut stop_keys: Vec<String> = apps
+        .iter()
+        .filter(|a| a.desired() == DesiredState::Stopped)
+        .map(|a| a.slug.clone())
+        .collect();
+    stop_keys.extend(
+        environments
+            .iter()
+            .filter(|e| e.is_stopped() || stopped_apps.contains(&e.app_id))
+            .map(|e| supervisor::env_fleet_key(&e.app_slug, &e.label)),
+    );
+    supervisor::stop_fleets(procs, &stop_keys, supervisor::StopGrace::NORMAL).await;
+    for app in &apps {
+        if app.desired() == DesiredState::Stopped && app.status != AppStatus::Stopped {
+            db::write_app_status(
+                pool,
+                &app.id,
+                AppStatus::Stopped,
+                None,
+                None,
+                crate::models::WriteGuard::Table,
+            )
+            .await?;
+        }
+    }
+    for env in &environments {
+        if env.is_stopped() && env.status != AppStatus::Stopped {
+            db::write_environment_status(
+                pool,
+                &env.id,
+                AppStatus::Stopped,
+                None,
+                crate::models::WriteGuard::Table,
+            )
+            .await?;
+        }
+    }
     // Cold starts per pass (`RUNNER_FLEET_SPAWN_BATCH`): a boot or upgrade
     // must not stack every celld's initialization at once. Restarts of an
     // already-registered child are never batched — those wait on their own
     // backoff and deserve the next tick.
     let mut cold_starts: u32 = 0;
     for app in &apps {
+        // Stopped fleets left in the stop phase above: their drains all
+        // completed before this loop, so nothing here may start one again.
         if app.desired() == DesiredState::Stopped {
-            supervisor::stop_fleet(procs, &app.slug, supervisor::StopGrace::NORMAL).await;
-            if app.status != AppStatus::Stopped {
-                db::write_app_status(
-                    pool,
-                    &app.id,
-                    AppStatus::Stopped,
-                    None,
-                    None,
-                    crate::models::WriteGuard::Table,
-                )
-                .await?;
-            }
             continue;
         }
         // Spawn celld only after a successful deploy — a fleet whose bucket
@@ -469,22 +508,11 @@ async fn reconcile_once(
     }
 
     // Preview environments are fleets of their own: same desired_state rule,
-    // same wake-aware parking, and their own ref drives their deploys.
-    let environments = db::list_all_environments(pool).await?;
+    // same wake-aware parking, and their own ref drives their deploys. Stops
+    // ran in the stop phase above, so this loop only skips them.
     for env in &environments {
         let fleet = format!("{}.{}", env.app_slug, env.label);
         if env.is_stopped() || stopped_apps.contains(&env.app_id) {
-            supervisor::stop_environment_fleet(procs, &env.app_slug, &env.label).await;
-            if env.is_stopped() && env.status != AppStatus::Stopped {
-                db::write_environment_status(
-                    pool,
-                    &env.id,
-                    AppStatus::Stopped,
-                    None,
-                    crate::models::WriteGuard::Table,
-                )
-                .await?;
-            }
             continue;
         }
         if env.listen_port.is_some() && env.is_deployed() && !env.is_asleep() {
