@@ -401,27 +401,40 @@ env_secret() {
 # refuses to boot with a stale `CELLD_*` still set. An upgrade re-run
 # renames the keys an older install may carry so the new image boots: a
 # `CELLO_*` value the operator already set wins, and the stale line is
-# dropped then.
+# dropped then. Every legacy assignment is renamed in order (never folded),
+# so with duplicate keys the last value still wins, exactly as `env_get`
+# reads it. A migrated `CELLD_BIN` pointing at a `celld` binary becomes its
+# `cello` sibling (that name is gone from the image); any other migrated or
+# kept binary path is left alone, with a warning to verify it.
 migrate_cello_env() {
-  local file="$NOITE_DIR/.env" tmp before had key suffix msg
+  local file="$NOITE_DIR/.env" tmp before had key suffix msg old_bin new_bin bin_now bin_base
   [[ -f "$file" ]] || return 0
   before=$(grep -oE '^CELLD_[A-Za-z0-9_]+=' "$file" | tr -d '=' | sort -u || true)
   [[ -z "$before" ]] && return 0
   had=$(grep -oE '^CELLO_[A-Za-z0-9_]+=' "$file" | tr -d '=' | sort -u || true)
+  # The last pre-migration value, for the rename report below. Captured now:
+  # the rewrite below turns every legacy line into its `CELLO_*` spelling.
+  old_bin=""
+  if printf '%s\n' "$before" | grep -qx CELLD_BIN; then
+    old_bin=$(grep -E '^CELLD_BIN=' "$file" | tail -n 1 | cut -d= -f2-)
+  fi
   tmp=$(mktemp)
   awk '
     FNR == NR {
       if ($0 ~ /^CELLO_[A-Za-z0-9_]+=/) {
-        key = $0; sub(/=.*/, "", key); new[key] = 1
+        key = $0; sub(/=.*/, "", key); orig[key] = 1
       }
       next
     }
     /^CELLD_[A-Za-z0-9_]+=/ {
-      old = $0; sub(/=.*/, "", old)
+      line = $0; eq = index(line, "=")
+      old = substr(line, 1, eq - 1); val = substr(line, eq + 1)
       cello = old; sub(/^CELLD_/, "CELLO_", cello)
-      if (!(cello in new)) {
-        sub(/^CELLD_/, "CELLO_"); new[cello] = 1
-        print
+      if (!(cello in orig)) {
+        if (old == "CELLD_BIN" && (val == "celld" || val ~ /\/celld$/)) {
+          sub(/celld$/, "cello", val)
+        }
+        print cello "=" val
       }
       next
     }
@@ -434,11 +447,27 @@ migrate_cello_env() {
     suffix=${key#CELLD_}
     if printf '%s\n' "$had" | grep -qx "CELLO_${suffix}"; then
       msg="${msg}kept CELLO_${suffix} (dropped stale ${key}); "
+    elif [[ "$key" == "CELLD_BIN" && ("$old_bin" == "celld" || "$old_bin" == */celld) ]]; then
+      new_bin=$(env_get CELLO_BIN)
+      msg="${msg}renamed ${key} to CELLO_${suffix} (${old_bin} -> ${new_bin}); "
     else
       msg="${msg}renamed ${key} to CELLO_${suffix}; "
     fi
   done
   info "Cello 0.1.0 renamed every CELLD_* setting to CELLO_*: ${msg}"
+  # A binary path that does not end in `cello` stays exactly as migrated or
+  # kept: flag it so the operator verifies it before the next fleet launch.
+  bin_now=$(env_get CELLO_BIN)
+  if [[ -n "$bin_now" ]]; then
+    bin_base="$bin_now"
+    if [[ "$bin_base" == \"*\" || "$bin_base" == \'*\' ]]; then
+      bin_base="${bin_base:1:${#bin_base}-2}"
+    fi
+    bin_base="${bin_base##*/}"
+    if [[ "$bin_base" != "cello" ]]; then
+      warn "CELLO_BIN=${bin_now} kept as-is; verify it points at the cello binary"
+    fi
+  fi
 }
 
 # Everything the runner needs to boot on a real domain, with the defaults a

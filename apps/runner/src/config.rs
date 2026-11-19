@@ -51,6 +51,28 @@ fn bare_host_ok(host: &str) -> bool {
     })
 }
 
+/// Boot problems for stale pre-0.1.0 `CELLD_*` settings among the given env
+/// names, each naming the `CELLO_*` spelling it was renamed to. Pure over its
+/// input: `validate` is also called without `ENV_LOCK` (e.g. by tests
+/// building a literal `Config`), so reading the process env there raced with
+/// any live `CELLD_*` var another test had set. `from_env` collects the live
+/// names once (under the caller's lock in tests) into `env_problems`, and
+/// `validate` just reports them.
+pub(crate) fn stale_celld_problems(keys: impl IntoIterator<Item = String>) -> Vec<String> {
+    let mut stale: Vec<String> = keys
+        .into_iter()
+        .filter(|key| key.starts_with("CELLD_"))
+        .map(|key| {
+            format!(
+                "{key} was renamed to {renamed} and is no longer read",
+                renamed = key.replacen("CELLD_", "CELLO_", 1)
+            )
+        })
+        .collect();
+    stale.sort();
+    stale
+}
+
 fn parse_auto_https(raw: Option<&str>, base_domain: &str) -> bool {
     // An empty value means "not configured" (compose renders
     // `CADDY_AUTO_HTTPS: ""` when the operator leaves it unset), so trim and
@@ -1337,6 +1359,12 @@ impl Config {
             format!("sqlite:{db}?mode=rwc")
         };
         let mut env_problems: Vec<String> = Vec::new();
+        // Cello 0.1.0 renamed every `CELLD_*` setting: collect the stale names
+        // here so `validate` stays pure and never races a lock-free caller
+        // while another test holds a stale `CELLD_*` var.
+        env_problems.extend(stale_celld_problems(
+            std::env::vars_os().filter_map(|(key, _)| key.into_string().ok()),
+        ));
         let http_port: u16 = env_num("HTTP_PORT", 9080, "a port number", &mut env_problems);
         let https_port: u16 = env_num("HTTPS_PORT", 9443, "a port number", &mut env_problems);
         let git_public_base = env::var("GIT_PUBLIC_BASE").unwrap_or_else(|_| {
@@ -1725,21 +1753,9 @@ impl Config {
         // records each one (var, value, expected form) and the boot fails
         // here naming them all, before any range complaint below.
         let mut problems: Vec<String> = self.env_problems.clone();
-        // Cello 0.1.0 renamed every `CELLD_*` setting and refuses to start
-        // with one set: a stale name would otherwise silently fall back to
-        // its default, so the boot fails here naming the `CELLO_*` spelling.
-        let mut stale: Vec<String> = std::env::vars_os()
-            .filter_map(|(key, _)| key.into_string().ok())
-            .filter(|key| key.starts_with("CELLD_"))
-            .map(|key| {
-                format!(
-                    "{key} was renamed to {renamed} and is no longer read",
-                    renamed = key.replacen("CELLD_", "CELLO_", 1)
-                )
-            })
-            .collect();
-        stale.sort();
-        problems.extend(stale);
+        // Stale `CELLD_*` names arrive in `env_problems` (collected by
+        // `from_env`): `validate` reads no env itself, so a lock-free caller
+        // can never observe a stale var another test set.
         let dev_token = self.runner_token == "dev-runner-token";
         let dev_auth = std::env::var("BETTER_AUTH_SECRET")
             .map(|v| v.trim().is_empty() || v.starts_with("dev-"))
@@ -2743,22 +2759,47 @@ mod tests {
             assert!(cfg.deploy_probe_path.is_empty());
         });
     }
-    /// A stale pre-0.1.0 `CELLD_*` setting refuses the boot and names its
+    /// Stale pre-0.1.0 `CELLD_*` names become boot problems naming the
     /// `CELLO_*` spelling: warn-and-ignore would let a renamed knob silently
-    /// fall back to its default.
+    /// fall back to its default. Pure over its input, so no test touches the
+    /// process env for this: `validate` is also called without `ENV_LOCK`
+    /// (e.g. `configured_hosts_are_canonical`), and a direct env read there
+    /// raced with any live `CELLD_*` var another test had set.
     #[test]
-    fn stale_celld_settings_refuse_the_boot() {
-        with_env(&[("CELLD_BIN", "/usr/local/bin/cello")], || {
-            let err = Config::from_env().expect_err("a stale CELLD_* setting must refuse the boot");
-            assert!(
-                err.to_string().contains("CELLO_BIN"),
-                "refusal names the new spelling: {err:#}"
-            );
-            std::env::remove_var("CELLD_BIN");
-        });
-        with_env(&[], || {
-            Config::from_env().expect("no stale settings must boot");
-        });
+    fn stale_celld_names_become_boot_problems_naming_the_cello_spelling() {
+        let problems = stale_celld_problems([
+            "CELLD_BIN".to_string(),
+            "PATH".to_string(),
+            "CELLD_ADVERTISE".to_string(),
+        ]);
+        assert_eq!(
+            problems,
+            vec![
+                "CELLD_ADVERTISE was renamed to CELLO_ADVERTISE and is no longer read",
+                "CELLD_BIN was renamed to CELLO_BIN and is no longer read",
+            ]
+        );
+        assert!(
+            stale_celld_problems(["CELLO_BIN".to_string(), "PATH".to_string()]).is_empty(),
+            "the new spelling and unrelated vars stay quiet"
+        );
+    }
+
+    #[test]
+    fn stale_celld_env_problems_refuse_the_boot() {
+        let mut cfg = config_for_tests();
+        cfg.env_problems = stale_celld_problems(["CELLD_BIN".to_string()]);
+        let err = cfg
+            .validate()
+            .expect_err("a stale CELLD_* setting must refuse the boot");
+        assert!(
+            err.to_string().contains("CELLO_BIN"),
+            "refusal names the new spelling: {err:#}"
+        );
+        assert!(
+            config_for_tests().validate().is_ok(),
+            "no stale settings must boot"
+        );
     }
 
     #[test]
