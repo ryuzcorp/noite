@@ -152,19 +152,19 @@ fn normalize_prefix(prefix: &str) -> String {
 }
 
 /// Run one `cello` subcommand against the fleet's own bucket.
-async fn run_celld(
+async fn run_cello(
     cfg: &Config,
     app: &App,
     args: &[&str],
     timeout: Duration,
 ) -> anyhow::Result<String> {
     let scope_key = crate::host::credentials::Scope::app(app).key();
-    let env_owned = s3::celld_cli_env(cfg, &scope_key);
+    let env_owned = s3::cello_cli_env(cfg, &scope_key);
     let env: Vec<(&str, &str)> = env_owned
         .iter()
         .map(|(key, value)| (*key, value.as_str()))
         .collect();
-    exec::run_cmd(&cfg.celld_bin, args, None, &env, timeout).await
+    exec::run_cmd(&cfg.cello_bin, args, None, &env, timeout).await
 }
 
 /// Run one `cello` subcommand and return its output however it exited. An
@@ -173,7 +173,7 @@ async fn run_celld(
 /// input when present (`r2 get` passes an empty one to close the pipe —
 /// `cello r2 get` never reads stdin, so the closed pipe is never observed);
 /// `None` leaves stdin inherited.
-async fn run_celld_output(
+async fn run_cello_output(
     cfg: &Config,
     app: &App,
     args: &[&str],
@@ -181,12 +181,12 @@ async fn run_celld_output(
     timeout: Duration,
 ) -> anyhow::Result<exec::CmdOutput> {
     let scope_key = crate::host::credentials::Scope::app(app).key();
-    let env_owned = s3::celld_cli_env(cfg, &scope_key);
+    let env_owned = s3::cello_cli_env(cfg, &scope_key);
     let env: Vec<(&str, &str)> = env_owned
         .iter()
         .map(|(key, value)| (*key, value.as_str()))
         .collect();
-    exec::run_cmd_output_stdin(&cfg.celld_bin, args, stdin, None, &env, timeout).await
+    exec::run_cmd_output_stdin(&cfg.cello_bin, args, stdin, None, &env, timeout).await
 }
 
 /// The absent-key object `cello r2 head|get --json` prints on stdout with
@@ -248,7 +248,7 @@ fn r2_argv<'a>(
 /// the browser; the other headers stay unread rather than unparsed.
 #[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct CelldHttp {
+struct CelloHttp {
     content_type: Option<String>,
 }
 
@@ -256,14 +256,14 @@ struct CelldHttp {
 /// minus `version`, `checksums` and `storageClass`.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct CelldPageObject {
+struct CelloPageObject {
     key: String,
     size: u64,
     etag: Option<String>,
     /// Milliseconds since the epoch, as R2 spells it.
     uploaded: i64,
     #[serde(default)]
-    http_metadata: CelldHttp,
+    http_metadata: CelloHttp,
 }
 
 /// One `cello r2 list --page` answer: the files in the folder, the prefixes
@@ -271,8 +271,8 @@ struct CelldPageObject {
 /// truncated page (absent when the listing is complete).
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct CelldPage {
-    objects: Vec<CelldPageObject>,
+struct CelloPage {
+    objects: Vec<CelloPageObject>,
     delimited_prefixes: Vec<String>,
     truncated: bool,
     cursor: Option<String>,
@@ -283,7 +283,7 @@ struct CelldPage {
 /// zero-byte marker that makes an empty folder visible answers as an object
 /// whose key is the folder itself and is dropped — the folder comes back as
 /// a prefix. Pure so the shape rules stay unit-testable without a store.
-fn shape_page(app: &App, bucket: &str, prefix: &str, page: CelldPage) -> anyhow::Result<R2Preview> {
+fn shape_page(app: &App, bucket: &str, prefix: &str, page: CelloPage) -> anyhow::Result<R2Preview> {
     let mut folders: Vec<R2Folder> = page
         .delimited_prefixes
         .into_iter()
@@ -312,7 +312,7 @@ fn shape_page(app: &App, bucket: &str, prefix: &str, page: CelldPage) -> anyhow:
         }
         let name = object.key.rsplit('/').next().unwrap_or("").to_string();
         let uploaded = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(object.uploaded)
-            .context("celld r2 list answered an out-of-range upload time")?;
+            .context("cello r2 list answered an out-of-range upload time")?;
         objects.push(R2Object {
             key: object.key,
             name,
@@ -362,8 +362,8 @@ pub async fn r2_list(
         options.push(token);
     }
     let args = r2_argv("list", bucket, &[], &options, &fleet)?;
-    let out = run_celld(cfg, app, &args, CELD_TIMEOUT).await?;
-    let page: CelldPage = serde_json::from_str(&out).context("parse celld r2 list --page")?;
+    let out = run_cello(cfg, app, &args, CELD_TIMEOUT).await?;
+    let page: CelloPage = serde_json::from_str(&out).context("parse cello r2 list --page")?;
     shape_page(app, bucket, &prefix, page)
 }
 
@@ -376,10 +376,10 @@ struct R2Head {
 }
 
 #[derive(Debug, Deserialize)]
-struct CelldHead {
+struct CelloHead {
     size: u64,
     #[serde(default)]
-    http: CelldHttp,
+    http: CelloHttp,
 }
 
 /// The record for one key, or the not-found bail the service maps to 404.
@@ -389,10 +389,10 @@ struct CelldHead {
 async fn r2_head(cfg: &Config, app: &App, bucket: &str, key: &str) -> anyhow::Result<R2Head> {
     let fleet = fleet_args(app, cfg);
     let args = r2_argv("head", bucket, &[key], &["--json"], &fleet)?;
-    let output = run_celld_output(cfg, app, &args, None, CELD_TIMEOUT).await?;
+    let output = run_cello_output(cfg, app, &args, None, CELD_TIMEOUT).await?;
     if output.status.success() {
         let out = String::from_utf8_lossy(&output.stdout);
-        let head: CelldHead = serde_json::from_str(&out).context("parse celld r2 head --json")?;
+        let head: CelloHead = serde_json::from_str(&out).context("parse cello r2 head --json")?;
         return Ok(R2Head {
             size: head.size,
             content_type: head.http.content_type,
@@ -405,7 +405,7 @@ async fn r2_head(cfg: &Config, app: &App, bucket: &str, key: &str) -> anyhow::Re
     let out = String::from_utf8_lossy(&output.stdout);
     anyhow::bail!(
         "{} {:?} exit {:?}\n{err}{out}",
-        cfg.celld_bin,
+        cfg.cello_bin,
         args,
         output.status.code()
     )
@@ -417,7 +417,7 @@ async fn r2_head(cfg: &Config, app: &App, bucket: &str, key: &str) -> anyhow::Re
 async fn r2_get_bytes(cfg: &Config, app: &App, bucket: &str, key: &str) -> anyhow::Result<Vec<u8>> {
     let fleet = fleet_args(app, cfg);
     let args = r2_argv("get", bucket, &[key], &["--json"], &fleet)?;
-    let output = run_celld_output(cfg, app, &args, Some(&[]), CELD_UPLOAD_TIMEOUT).await?;
+    let output = run_cello_output(cfg, app, &args, Some(&[]), CELD_UPLOAD_TIMEOUT).await?;
     if output.status.success() {
         return Ok(output.stdout);
     }
@@ -428,7 +428,7 @@ async fn r2_get_bytes(cfg: &Config, app: &App, bucket: &str, key: &str) -> anyho
     let out = String::from_utf8_lossy(&output.stdout);
     anyhow::bail!(
         "{} {:?} exit {:?}\n{err}{out}",
-        cfg.celld_bin,
+        cfg.cello_bin,
         args,
         output.status.code()
     )
@@ -494,7 +494,7 @@ pub async fn r2_put(
         options.push(value);
     }
     let args = r2_argv("put", bucket, &[key], &options, &fleet)?;
-    run_celld(cfg, app, &args, CELD_UPLOAD_TIMEOUT).await?;
+    run_cello(cfg, app, &args, CELD_UPLOAD_TIMEOUT).await?;
     Ok(())
 }
 
@@ -511,7 +511,7 @@ pub async fn r2_delete_many(
     let fleet = fleet_args(app, cfg);
     let key_refs: Vec<&str> = keys.iter().map(String::as_str).collect();
     let args = r2_argv("delete", bucket, &key_refs, &[], &fleet)?;
-    run_celld(cfg, app, &args, CELD_TIMEOUT).await?;
+    run_cello(cfg, app, &args, CELD_TIMEOUT).await?;
     Ok(keys.len())
 }
 
@@ -555,19 +555,19 @@ mod tests {
     /// otherwise answers `list`/`head` from `<verb>.json` and `get` from
     /// `body.bin`. Fixtures live next to the script so no env injection is
     /// needed — the runner clears the environment it spawns with.
-    struct FakeCelld {
+    struct FakeCello {
         dir: PathBuf,
     }
 
     /// The committed fake script every R2 seam test links to.
     fn fixture() -> PathBuf {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-celld-r2.sh")
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-cello-r2.sh")
     }
 
-    impl FakeCelld {
+    impl FakeCello {
         fn spawn() -> Self {
             let dir = std::env::temp_dir()
-                .join(format!("noite-fake-r2-celld-{}", crate::models::new_id()));
+                .join(format!("noite-fake-r2-cello-{}", crate::models::new_id()));
             std::fs::create_dir_all(&dir).unwrap();
             // A symlink to the committed script, never a fresh file:
             // exec'ing freshly-written files under parallel load
@@ -575,18 +575,18 @@ mod tests {
             // stays stable.
             #[cfg(unix)]
             {
-                std::os::unix::fs::symlink(fixture(), dir.join("celld")).unwrap();
+                std::os::unix::fs::symlink(fixture(), dir.join("cello")).unwrap();
             }
             #[cfg(not(unix))]
             {
-                std::fs::copy(fixture(), dir.join("celld")).unwrap();
+                std::fs::copy(fixture(), dir.join("cello")).unwrap();
             }
             Self { dir }
         }
 
         fn cfg(&self) -> Config {
             let mut cfg = crate::config::config_for_tests();
-            cfg.celld_bin = self.dir.join("celld").to_string_lossy().into_owned();
+            cfg.cello_bin = self.dir.join("cello").to_string_lossy().into_owned();
             cfg
         }
 
@@ -611,7 +611,7 @@ mod tests {
         }
     }
 
-    impl Drop for FakeCelld {
+    impl Drop for FakeCello {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.dir);
         }
@@ -623,7 +623,7 @@ mod tests {
     /// dropped, and a complete page carries no cursor.
     #[test]
     fn page_shapes_folders_files_and_content_types() {
-        let page: CelldPage = serde_json::from_str(
+        let page: CelloPage = serde_json::from_str(
             r#"{"delimitedPrefixes":["photos/","dir/","a/"],"objects":[
 {"key":"top.txt","size":6,"etag":"\"abc\"","uploaded":1767225600000,"httpMetadata":{"contentType":"text/plain"},"customMetadata":{}},
 {"key":"photos/","size":0,"etag":"\"d41\"","uploaded":1767225600000,"httpMetadata":{},"customMetadata":{}},
@@ -663,7 +663,7 @@ mod tests {
     /// cursor is in-band only while the page is truncated.
     #[test]
     fn truncated_page_carries_its_cursor() {
-        let page: CelldPage = serde_json::from_str(
+        let page: CelloPage = serde_json::from_str(
             r#"{"delimitedPrefixes":["a/","dir/"],"objects":[],"truncated":true,"cursor":"dir/hello.txt"}"#,
         )
         .unwrap();
@@ -675,7 +675,7 @@ mod tests {
     /// which keeps its old label.
     #[test]
     fn empty_segment_prefix_browses_as_empty() {
-        let page: CelldPage =
+        let page: CelloPage =
             serde_json::from_str(r#"{"delimitedPrefixes":["a//"],"objects":[],"truncated":false}"#)
                 .unwrap();
         let preview = shape_page(&test_app(), "uploads", "a/", page).unwrap();
@@ -690,8 +690,8 @@ mod tests {
     /// limit and prefix, with the fleet's bucket and endpoint — and the
     /// answered page shapes into folders, files and no cursor.
     #[tokio::test]
-    async fn list_shells_out_to_celld_r2_list() {
-        let fake = FakeCelld::spawn();
+    async fn list_shells_out_to_cello_r2_list() {
+        let fake = FakeCello::spawn();
         fake.write(
             "list.json",
             br#"{"delimitedPrefixes":["dir/"],"objects":[{"key":"top.txt","size":6,"etag":null,"uploaded":1767225600000,"httpMetadata":{"contentType":"text/plain"}}],"truncated":false}"#,
@@ -722,7 +722,7 @@ mod tests {
     /// second page is asked for the cursor the first one answered.
     #[tokio::test]
     async fn list_pages_with_prefix_and_cursor() {
-        let fake = FakeCelld::spawn();
+        let fake = FakeCello::spawn();
         fake.write(
             "list.json",
             br#"{"delimitedPrefixes":[],"objects":[{"key":"dir/a.txt","size":1,"etag":null,"uploaded":1767225600000,"httpMetadata":{}}],"truncated":true,"cursor":"dir/a.txt"}"#,
@@ -757,7 +757,7 @@ mod tests {
 
     #[tokio::test]
     async fn invalid_prefix_bails_before_spawning() {
-        let fake = FakeCelld::spawn();
+        let fake = FakeCello::spawn();
         let error = r2_list(&fake.cfg(), &test_app(), "uploads", "../", None, 100)
             .await
             .unwrap_err();
@@ -768,7 +768,7 @@ mod tests {
     /// A preview is a head for the record plus a get for the bytes.
     #[tokio::test]
     async fn get_returns_preview_and_content_type() {
-        let fake = FakeCelld::spawn();
+        let fake = FakeCello::spawn();
         fake.write(
             "head.json",
             br#"{"key":"dir/a.txt","size":6,"etag":"\"abc\"","uploaded":1767225600000,"http":{"contentType":"text/plain"},"custom":{}}"#,
@@ -799,7 +799,7 @@ mod tests {
 
     #[tokio::test]
     async fn get_reports_binary_bodies_as_no_text() {
-        let fake = FakeCelld::spawn();
+        let fake = FakeCello::spawn();
         fake.write("head.json", br#"{"key":"bin.dat","size":3,"http":{}}"#);
         fake.write("body.bin", &[0xff, 0xfe, 0x00]);
         let file = r2_get(&fake.cfg(), &test_app(), "uploads", "bin.dat")
@@ -812,7 +812,7 @@ mod tests {
 
     #[tokio::test]
     async fn raw_serves_bytes_and_refuses_over_the_cap() {
-        let fake = FakeCelld::spawn();
+        let fake = FakeCello::spawn();
         fake.write(
             "head.json",
             br#"{"key":"logo.png","size":4,"http":{"contentType":"image/png"}}"#,
@@ -846,7 +846,7 @@ mod tests {
     /// is gone from the matching entirely.
     #[tokio::test]
     async fn missing_keys_read_as_not_found() {
-        let fake = FakeCelld::spawn();
+        let fake = FakeCello::spawn();
         fake.fail_next_stdout(br#"{"error":"not_found","bucket":"uploads","key":"gone.txt"}"#);
         let error = r2_get(&fake.cfg(), &test_app(), "uploads", "gone.txt")
             .await
@@ -870,7 +870,7 @@ mod tests {
     /// instead of reading as absent.
     #[tokio::test]
     async fn non_not_found_failures_propagate() {
-        let fake = FakeCelld::spawn();
+        let fake = FakeCello::spawn();
         fake.fail_next("Error: transport blew up");
         let error = r2_get(&fake.cfg(), &test_app(), "uploads", "gone.txt")
             .await
@@ -953,7 +953,7 @@ mod tests {
     /// key would otherwise redirect the call onto another fleet bucket.
     #[tokio::test]
     async fn option_like_delete_keys_never_spawn() {
-        let fake = FakeCelld::spawn();
+        let fake = FakeCello::spawn();
         for keys in [
             vec![
                 "--bucket".to_string(),
@@ -978,7 +978,7 @@ mod tests {
     /// verbs that never validated it at all.
     #[tokio::test]
     async fn option_like_buckets_never_spawn() {
-        let fake = FakeCelld::spawn();
+        let fake = FakeCello::spawn();
         let error = r2_list(&fake.cfg(), &test_app(), "--bucket", "", None, 100)
             .await
             .unwrap_err();
@@ -1001,7 +1001,7 @@ mod tests {
     /// binding names pass, and anything that would parse as an option —
     /// or that Cello would refuse — fails here instead of at the spawn.
     #[test]
-    fn buckets_match_celld_resource_names() {
+    fn buckets_match_cello_resource_names() {
         assert!(r2_bucket_ok("uploads"));
         assert!(r2_bucket_ok("_private"));
         assert!(r2_bucket_ok("a-b_c9"));

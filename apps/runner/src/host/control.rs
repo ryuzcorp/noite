@@ -140,7 +140,7 @@ pub fn bundle_present(cfg: &Config) -> bool {
     // `dist/wrangler.json` (or `.jsonc`) at the bundle root is what
     // `cello deploy` reads; a build that only emits `dist/ssr/wrangler.json`
     // is not deployable, and `main` says so on `/ready` instead of skipping.
-    // `apps/noite/scripts/emit-celld-config.ts` derives that root manifest
+    // `apps/noite/scripts/emit-cello-config.ts` derives that root manifest
     // after `vite build` (it must run outside Vite: a `closeBundle` hook
     // races Void's own emit).
     let dir = Path::new(&cfg.control_bundle_dir);
@@ -188,13 +188,13 @@ pub async fn ensure_deployed(cfg: &Config) -> anyhow::Result<serde_json::Value> 
     }
     tokio::fs::write(&wrangler, serde_json::to_string_pretty(&doc)?).await?;
     let bucket = format!("s3://{}/control", cfg.s3_bucket);
-    let env_owned = s3::celld_cli_env(cfg, crate::host::credentials::CONTROL_OPERATOR_SCOPE);
+    let env_owned = s3::cello_cli_env(cfg, crate::host::credentials::CONTROL_OPERATOR_SCOPE);
     let env: Vec<(&str, &str)> = env_owned.iter().map(|(k, v)| (*k, v.as_str())).collect();
     // Retry: S3 can flip 503 mid-deploy (rustfs restart); give up loudly.
     let mut last = anyhow::anyhow!("not attempted");
     for attempt in 1..=5 {
         match exec::run_cmd(
-            &cfg.celld_bin,
+            &cfg.cello_bin,
             &[
                 "deploy",
                 work.to_str().unwrap_or("."),
@@ -496,7 +496,7 @@ pub fn supervise(
     operator_token: String,
 ) -> Supervised {
     let args = spawn_args(config);
-    let celld = config.celld_bin.clone();
+    let cello = config.cello_bin.clone();
     let work_dir = config.work_dir.clone();
     let fleet_cfg = config.clone();
     // Fleet #0 is a resident like any tenant fleet: give it its own leaf and
@@ -567,7 +567,7 @@ pub fn supervise(
             } else {
                 write_operator_token_file(&work_dir, &operator_token);
             }
-            let mut cmd = tokio::process::Command::new(&celld);
+            let mut cmd = tokio::process::Command::new(&cello);
             cmd.args(&args)
                 // Piped so the supervisor captures the node's own log into the
                 // shared buffer (the OTel ring carries the worker's console).

@@ -50,17 +50,17 @@ pub async fn do_instances(cfg: &Config, app: &App, class_name: &str) -> anyhow::
     }
     let bucket = app.fleet_bucket.clone();
     let scope_key = crate::host::credentials::Scope::app(app).key();
-    let env_owned = s3::celld_cli_env(cfg, &scope_key);
+    let env_owned = s3::cello_cli_env(cfg, &scope_key);
     let env: Vec<(&str, &str)> = env_owned.iter().map(|(k, v)| (*k, v.as_str())).collect();
     let out = exec::run_cmd(
-        &cfg.celld_bin,
+        &cfg.cello_bin,
         &["cell", "list", class_name, "--json", "--bucket", &bucket],
         None,
         &env,
         Duration::from_secs(30),
     )
     .await
-    .with_context(|| format!("celld cell list {class_name}"))?;
+    .with_context(|| format!("cello cell list {class_name}"))?;
 
     let mut instances = Vec::new();
     for line in out.split('\n') {

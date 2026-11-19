@@ -1183,7 +1183,7 @@ async fn deploy_inner(
     };
 
     if db::get_app(pool, &app.id).await?.is_none() {
-        anyhow::bail!("app {} deleted during build; aborting celld deploy", app.id);
+        anyhow::bail!("app {} deleted during build; aborting cello deploy", app.id);
     }
 
     // One-shot release command (`"release": "bun run db:migrate"` in the
@@ -1293,7 +1293,7 @@ async fn deploy_inner(
             .log(
                 DeployStatus::Building,
                 &format!(
-                    "config: ignoring Cloudflare-only keys celld does not support: {}\n",
+                    "config: ignoring Cloudflare-only keys cello does not support: {}\n",
                     dropped.join(", ")
                 ),
             )
@@ -1311,7 +1311,7 @@ async fn deploy_inner(
         .step(
             "deploy",
             DeployStatus::Deploying,
-            &format!("celld deploy → {bucket}"),
+            &format!("cello deploy → {bucket}"),
         )
         .await?;
 
@@ -1536,7 +1536,7 @@ async fn deploy_inner(
         Some(env) => crate::host::credentials::Scope::environment(env).key(),
         None => crate::host::credentials::Scope::app(app).key(),
     };
-    let env_owned = s3::celld_cli_env(cfg, &scope_key);
+    let env_owned = s3::cello_cli_env(cfg, &scope_key);
     let mut env: Vec<(&str, &str)> = env_owned.iter().map(|(k, v)| (*k, v.as_str())).collect();
     env.push(("CELLO_CONTAINER_PLATFORM", container_platform.as_str()));
     // The ordered fleet deploy (SPEC, Void platform proxy): every script
@@ -1592,8 +1592,8 @@ async fn deploy_inner(
     } else {
         Vec::new()
     };
-    let celld = void_cohost::CelldDeploy {
-        celld_bin: cfg.celld_bin.as_str(),
+    let cello = void_cohost::CelloDeploy {
+        cello_bin: cfg.cello_bin.as_str(),
         env: &env,
         bucket: bucket.as_str(),
         endpoint: cfg.s3_endpoint.as_str(),
@@ -1643,7 +1643,7 @@ async fn deploy_inner(
             pool,
             &app.id,
             target.environment_id(),
-            &celld,
+            &cello,
             &cohosted,
             &app_side,
         )
@@ -1680,7 +1680,7 @@ async fn deploy_inner(
                             commit_sha: &commit_sha,
                             progress: &mut *progress,
                         },
-                        &celld,
+                        &cello,
                         &staged,
                     )
                     .await?;
@@ -1705,14 +1705,14 @@ async fn deploy_inner(
         // activated, so the previous generation keeps serving.
         probe_staged_generation(
             cfg,
-            &celld,
+            &cello,
             &staged,
             void_proxy_token.as_deref(),
             &mut *progress,
         )
         .await?;
         let stats =
-            activate_after_staged_migrate(pool, app, target, &celld, staged, progress).await?;
+            activate_after_staged_migrate(pool, app, target, &cello, staged, progress).await?;
         (stats, environment)
     } else {
         // Non-Void apps stage the same ordered generation. A redeploy runs
@@ -1725,7 +1725,7 @@ async fn deploy_inner(
             pool,
             &app.id,
             target.environment_id(),
-            &celld,
+            &cello,
             &cohosted,
             &app_side,
         )
@@ -1747,7 +1747,7 @@ async fn deploy_inner(
             .await
             {
                 Ok(()) => {
-                    migrate_tenant_d1(cfg, &celld, &scope_key, &deploy_root, &mut *progress)
+                    migrate_tenant_d1(cfg, &cello, &scope_key, &deploy_root, &mut *progress)
                         .await?;
                     migrated_tenant_staged = true;
                 }
@@ -1763,14 +1763,14 @@ async fn deploy_inner(
                 }
             }
         }
-        probe_staged_generation(cfg, &celld, &staged, None, &mut *progress).await?;
+        probe_staged_generation(cfg, &cello, &staged, None, &mut *progress).await?;
         // A stop in the probe window must not activate: the staged pointer is
         // the last irreversible step before the fleet serves it. The commit
         // and the stop check are one atomic step, so a 200 answer for a stop
         // always means this activation does not happen.
         progress.commit_cancel()?;
         let stats =
-            void_cohost::activate_staged(pool, &app.id, target.environment_id(), &celld, staged)
+            void_cohost::activate_staged(pool, &app.id, target.environment_id(), &cello, staged)
                 .await?;
         let environment = load_deploy_target(pool, procs, app, target).await?;
         (stats, environment)
@@ -1784,7 +1784,7 @@ async fn deploy_inner(
     // The deploy succeeded, so Cello's map (when it wrote one) is final:
     // read it now, chained through the build's own entry map when one
     // exists. The bytes upload with the rest of the maps below.
-    let worker_map = crate::host::sourcemaps::read_celld_worker_map(&deploy_root, &worker_map_path)
+    let worker_map = crate::host::sourcemaps::read_cello_worker_map(&deploy_root, &worker_map_path)
         .await
         .map_err(|e| format!("{e:#}"));
 
@@ -1849,7 +1849,7 @@ async fn deploy_inner(
                     fleet_stopped_early = true;
                 }
                 supervisor::FleetFate::Exited(why) => {
-                    anyhow::bail!("celld exited before answering its health gate: {why}");
+                    anyhow::bail!("cello exited before answering its health gate: {why}");
                 }
             },
         }
@@ -1890,7 +1890,7 @@ async fn deploy_inner(
     // fails the deploy. A rollback to an older sha never un-applies: Cello
     // skips already-applied rows and only applies what is pending.
     if !void_app && !migrated_tenant_staged && !fleet_stopped_early {
-        migrate_tenant_d1(cfg, &celld, &scope_key, &deploy_root, &mut *progress).await?;
+        migrate_tenant_d1(cfg, &cello, &scope_key, &deploy_root, &mut *progress).await?;
     } else if !void_app && !migrated_tenant_staged {
         progress
             .log(
@@ -2168,13 +2168,13 @@ async fn drive_migration_protocol(
 /// serving; applied migrations stay applied (forward-only).
 async fn migrate_void_app_staged(
     inputs: MigrateInputs<'_, '_, '_>,
-    celld: &void_cohost::CelldDeploy<'_>,
+    cello: &void_cohost::CelloDeploy<'_>,
     staged: &void_cohost::StagedFleet,
 ) -> anyhow::Result<()> {
     let mut inputs = inputs;
     let setup = begin_migrate(&mut inputs, "D1 migrations via the staged worker").await?;
     let client = void_migrate::MigrationClient::staged(
-        staged_invoke_target(celld, staged),
+        staged_invoke_target(cello, staged),
         setup.proxy_token,
     );
     let fleet = fleet_label(inputs.app, inputs.target);
@@ -2201,20 +2201,20 @@ async fn migrate_void_app_staged(
 /// One constructor, so the probe's `--target`/pins/bucket shape cannot
 /// drift from the migrate's.
 fn staged_invoke_target(
-    celld: &void_cohost::CelldDeploy<'_>,
+    cello: &void_cohost::CelloDeploy<'_>,
     staged: &void_cohost::StagedFleet,
 ) -> void_migrate::StagedTarget {
-    let env: Vec<(String, String)> = celld
+    let env: Vec<(String, String)> = cello
         .env
         .iter()
         .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
         .collect();
     void_migrate::StagedTarget {
-        celld_bin: celld.celld_bin.to_string(),
+        cello_bin: cello.cello_bin.to_string(),
         env,
-        bucket: celld.bucket.to_string(),
-        endpoint: celld.endpoint.to_string(),
-        region: celld.region.to_string(),
+        bucket: cello.bucket.to_string(),
+        endpoint: cello.endpoint.to_string(),
+        region: cello.region.to_string(),
         pins: staged.generation.clone(),
         target: staged.primary.clone(),
     }
@@ -2232,7 +2232,7 @@ fn staged_invoke_target(
 /// and the deploy activates unprobed, as before.
 async fn probe_staged_generation(
     cfg: &Config,
-    celld: &void_cohost::CelldDeploy<'_>,
+    cello: &void_cohost::CelloDeploy<'_>,
     staged: &void_cohost::StagedFleet,
     proxy_token: Option<&str>,
     progress: &mut Progress<'_>,
@@ -2249,7 +2249,7 @@ async fn probe_staged_generation(
         )
         .await?;
     let client = void_migrate::MigrationClient::staged(
-        staged_invoke_target(celld, staged),
+        staged_invoke_target(cello, staged),
         proxy_token.unwrap_or_default().to_string(),
     );
     let timeout = Duration::from_secs(cfg.deploy_probe_timeout_s.max(1));
@@ -2310,15 +2310,15 @@ async fn activate_after_staged_migrate(
     pool: &SqlitePool,
     app: &App,
     target: &DeployTarget,
-    celld: &void_cohost::CelldDeploy<'_>,
+    cello: &void_cohost::CelloDeploy<'_>,
     staged: void_cohost::StagedFleet,
     progress: &mut Progress<'_>,
 ) -> anyhow::Result<void_cohost::FleetDeployStats> {
     progress
-        .step("deploy", DeployStatus::Deploying, "celld activate")
+        .step("deploy", DeployStatus::Deploying, "cello activate")
         .await?;
     progress.commit_cancel()?;
-    void_cohost::activate_staged(pool, &app.id, target.environment_id(), celld, staged).await
+    void_cohost::activate_staged(pool, &app.id, target.environment_id(), cello, staged).await
 }
 
 /// Run a Void app's D1 migrations through the new generation's in-worker
@@ -2393,7 +2393,7 @@ async fn migrate_void_app(inputs: MigrateInputs<'_, '_, '_>) -> anyhow::Result<(
 /// only applies what is pending. The deploy log names each applied migration.
 async fn migrate_tenant_d1(
     cfg: &Config,
-    celld: &void_cohost::CelldDeploy<'_>,
+    cello: &void_cohost::CelloDeploy<'_>,
     scope_key: &str,
     deploy_root: &Path,
     progress: &mut Progress<'_>,
@@ -2406,9 +2406,9 @@ async fn migrate_tenant_d1(
     // along; the fresh token wins over the stale one. The
     // bucket/endpoint/region ride the staged invocation shape as before, so
     // the SQL still lands in the tenant's own D1 only.
-    let env_owned = s3::celld_cli_env(cfg, scope_key);
+    let env_owned = s3::cello_cli_env(cfg, scope_key);
     let mut env: Vec<(&str, &str)> = env_owned.iter().map(|(k, v)| (*k, v.as_str())).collect();
-    for (key, value) in celld.env {
+    for (key, value) in cello.env {
         if !env.iter().any(|(existing, _)| existing == key) {
             env.push((key, value));
         }
@@ -2424,7 +2424,7 @@ async fn migrate_tenant_d1(
         .step(
             "migrate",
             DeployStatus::Deploying,
-            "D1 migrations via celld",
+            "D1 migrations via cello",
         )
         .await?;
     let mut any_dir = false;
@@ -2443,11 +2443,11 @@ async fn migrate_tenant_d1(
             continue;
         }
         any_dir = true;
-        let before = tenant_d1_applied_names(celld, &env, deploy_root, binding)
+        let before = tenant_d1_applied_names(cello, &env, deploy_root, binding)
             .await
             .unwrap_or_default();
-        tenant_d1_apply(celld, &env, deploy_root, binding).await?;
-        let after = tenant_d1_applied_names(celld, &env, deploy_root, binding)
+        tenant_d1_apply(cello, &env, deploy_root, binding).await?;
+        let after = tenant_d1_applied_names(cello, &env, deploy_root, binding)
             .await
             .unwrap_or_default();
         let before_set: std::collections::HashSet<&str> =
@@ -2502,7 +2502,7 @@ async fn migrate_tenant_d1(
 /// numeric-prefix violation, an escaping `migrations_dir` — fails the deploy
 /// here with Cello's own message.
 async fn tenant_d1_apply(
-    celld: &void_cohost::CelldDeploy<'_>,
+    cello: &void_cohost::CelloDeploy<'_>,
     env: &[(&str, &str)],
     deploy_root: &Path,
     binding: &tenant_d1::TenantD1Binding,
@@ -2517,14 +2517,14 @@ async fn tenant_d1_apply(
         binding.database_name.as_str(),
         project,
         "--bucket",
-        celld.bucket,
+        cello.bucket,
         "--endpoint",
-        celld.endpoint,
+        cello.endpoint,
         "--region",
-        celld.region,
+        cello.region,
     ];
     crate::host::exec::run_cmd(
-        celld.celld_bin,
+        cello.cello_bin,
         &args,
         None,
         env,
@@ -2538,7 +2538,7 @@ async fn tenant_d1_apply(
 /// Names already recorded in the binding's bookkeeping table (empty when the
 /// table or database does not exist yet — a first deploy, not a failure).
 async fn tenant_d1_applied_names(
-    celld: &void_cohost::CelldDeploy<'_>,
+    cello: &void_cohost::CelloDeploy<'_>,
     env: &[(&str, &str)],
     deploy_root: &Path,
     binding: &tenant_d1::TenantD1Binding,
@@ -2566,14 +2566,14 @@ async fn tenant_d1_applied_names(
         "--json",
         project,
         "--bucket",
-        celld.bucket,
+        cello.bucket,
         "--endpoint",
-        celld.endpoint,
+        cello.endpoint,
         "--region",
-        celld.region,
+        cello.region,
     ];
     let out = match crate::host::exec::run_cmd(
-        celld.celld_bin,
+        cello.cello_bin,
         &args,
         None,
         env,
@@ -3540,7 +3540,7 @@ mod tests {
     }
 
     #[test]
-    fn cloudflare_only_keys_are_translated_away_before_celld_deploy() {
+    fn cloudflare_only_keys_are_translated_away_before_cello_deploy() {
         // Ember's shape: deployment-target metadata plus bindings Noite does
         // not provide. Cello refuses every one, so the runner translates them
         // away and the deploy succeeds with the bindings reading as missing.
@@ -3626,7 +3626,7 @@ mod tests {
     /// then a name with none of `* ? . / \ [ {`). The injected defaults land
     /// in every rule-less config, so one bad glob fails every such deploy.
     #[test]
-    fn injected_module_rule_globs_are_celld_extension_matches() {
+    fn injected_module_rule_globs_are_cello_extension_matches() {
         let rules = super::wrangler_default_module_rules();
         let globs: Vec<&str> = rules
             .as_array()
@@ -3642,7 +3642,7 @@ mod tests {
             });
             assert!(
                 !ext.is_empty() && !ext.contains(['*', '?', '.', '/', '\\', '[', '{']),
-                "celld refuses {glob:?}"
+                "cello refuses {glob:?}"
             );
         }
     }
@@ -3710,8 +3710,8 @@ mod tests {
         );
         // No error line: the error's own first line.
         assert_eq!(
-            failure_summary("deploy", "celld deploy timed out\nsomething"),
-            "deploy failed: celld deploy timed out"
+            failure_summary("deploy", "cello deploy timed out\nsomething"),
+            "deploy failed: cello deploy timed out"
         );
     }
 
@@ -3847,9 +3847,9 @@ mod tests {
         let mut cfg = crate::config::config_for_tests();
         let dir = crate::testutil::TempDir::new(&format!("noite-tenant-d1-{tag}"));
         let fixture = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/fixtures/fake-celld-tenant-d1.sh");
-        std::os::unix::fs::symlink(&fixture, dir.path().join("celld")).unwrap();
-        cfg.celld_bin = dir.path().join("celld").to_string_lossy().into_owned();
+            .join("tests/fixtures/fake-cello-tenant-d1.sh");
+        std::os::unix::fs::symlink(&fixture, dir.path().join("cello")).unwrap();
+        cfg.cello_bin = dir.path().join("cello").to_string_lossy().into_owned();
         std::fs::write(dir.path().join("execute-before"), before).unwrap();
         std::fs::write(dir.path().join("execute-after"), after).unwrap();
         if let Some(message) = apply_fail {
@@ -3887,13 +3887,13 @@ mod tests {
         let _ = std::fs::write(&log_path, "");
         let log_env = log_path.to_string_lossy().into_owned();
         let dir_env = dir.path().to_string_lossy().into_owned();
-        let celld_bin = cfg.celld_bin.clone();
+        let cello_bin = cfg.cello_bin.clone();
         let env: Vec<(&str, &str)> = vec![
-            ("FAKE_CELLD_LOG", log_env.as_str()),
-            ("FAKE_CELLD_DIR", dir_env.as_str()),
+            ("FAKE_CELLO_LOG", log_env.as_str()),
+            ("FAKE_CELLO_DIR", dir_env.as_str()),
         ];
-        let celld = crate::host::void_cohost::CelldDeploy {
-            celld_bin: celld_bin.as_str(),
+        let cello = crate::host::void_cohost::CelloDeploy {
+            cello_bin: cello_bin.as_str(),
             env: &env,
             bucket: "s3://noite/fleets/tenant-d1",
             endpoint: "http://rustfs:9000",
@@ -3911,7 +3911,7 @@ mod tests {
             step: "deploy",
         };
         let scope_key = crate::host::credentials::Scope::app(&app).key();
-        let outcome = super::migrate_tenant_d1(&cfg, &celld, &scope_key, &root, &mut progress)
+        let outcome = super::migrate_tenant_d1(&cfg, &cello, &scope_key, &root, &mut progress)
             .await
             .map_err(|e| e.to_string());
         let log: String = sqlx::query_scalar("SELECT log FROM deploy WHERE id = ?")
@@ -4039,11 +4039,11 @@ mod tests {
             // A symlink to the committed script, never a fresh file: the
             // cohost seam's rule (ETXTBSY under parallel load).
             let fixture = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("tests/fixtures/fake-celld-cohost.sh");
-            std::os::unix::fs::symlink(&fixture, dir.path().join("celld")).unwrap();
+                .join("tests/fixtures/fake-cello-cohost.sh");
+            std::os::unix::fs::symlink(&fixture, dir.path().join("cello")).unwrap();
             let mut cfg = crate::config::config_for_tests();
-            let bin = dir.path().join("celld").to_string_lossy().into_owned();
-            cfg.celld_bin = bin.clone();
+            let bin = dir.path().join("cello").to_string_lossy().into_owned();
+            cfg.cello_bin = bin.clone();
             let app = crate::db::create_app(
                 &pool,
                 &cfg,
@@ -4091,12 +4091,12 @@ mod tests {
         /// The `cello` invocation shape the stage and the staged migrate
         /// share: the fake's log and dir ride the env, like the operator
         /// token and bucket credentials ride `CELLO_*` in production.
-        fn celld<'x>(
+        fn cello<'x>(
             &'x self,
             env: &'x [(&'x str, &'x str)],
-        ) -> crate::host::void_cohost::CelldDeploy<'x> {
-            crate::host::void_cohost::CelldDeploy {
-                celld_bin: &self.bin,
+        ) -> crate::host::void_cohost::CelloDeploy<'x> {
+            crate::host::void_cohost::CelloDeploy {
+                cello_bin: &self.bin,
                 env,
                 bucket: "s3://noite/fleets/staged-mig",
                 endpoint: "http://rustfs:9000",
@@ -4189,10 +4189,10 @@ mod tests {
             .into_owned();
         let dir = seam.dir.path().to_string_lossy().into_owned();
         let env = vec![
-            ("FAKE_CELLD_LOG", log.as_str()),
-            ("FAKE_CELLD_DIR", dir.as_str()),
+            ("FAKE_CELLO_LOG", log.as_str()),
+            ("FAKE_CELLO_DIR", dir.as_str()),
         ];
-        let celld = seam.celld(&env);
+        let cello = seam.cello(&env);
         let target = DeployTarget::Production;
         let app_side = crate::host::void_cohost::FleetApp {
             dir: seam.root.path(),
@@ -4205,7 +4205,7 @@ mod tests {
             &seam.pool,
             &seam.app.id,
             None,
-            &celld,
+            &cello,
             &[staged_proxy()],
             &app_side,
         )
@@ -4238,7 +4238,7 @@ mod tests {
                 commit_sha: "abc123",
                 progress: &mut progress,
             },
-            &celld,
+            &cello,
             &staged,
         )
         .await
@@ -4295,10 +4295,10 @@ mod tests {
             .into_owned();
         let dir = seam.dir.path().to_string_lossy().into_owned();
         let env = vec![
-            ("FAKE_CELLD_LOG", log.as_str()),
-            ("FAKE_CELLD_DIR", dir.as_str()),
+            ("FAKE_CELLO_LOG", log.as_str()),
+            ("FAKE_CELLO_DIR", dir.as_str()),
         ];
-        let celld = seam.celld(&env);
+        let cello = seam.cello(&env);
         let target = DeployTarget::Production;
         let app_side = crate::host::void_cohost::FleetApp {
             dir: seam.root.path(),
@@ -4311,7 +4311,7 @@ mod tests {
             &seam.pool,
             &seam.app.id,
             None,
-            &celld,
+            &cello,
             &[staged_proxy()],
             &app_side,
         )
@@ -4337,7 +4337,7 @@ mod tests {
                 commit_sha: "abc123",
                 progress: &mut progress,
             },
-            &celld,
+            &cello,
             &staged,
         )
         .await
@@ -4353,7 +4353,7 @@ mod tests {
             &seam.pool,
             &seam.app.id,
             None,
-            &celld,
+            &cello,
             staged,
         )
         .await
@@ -4396,10 +4396,10 @@ mod tests {
             .into_owned();
         let dir = seam.dir.path().to_string_lossy().into_owned();
         let env = vec![
-            ("FAKE_CELLD_LOG", log.as_str()),
-            ("FAKE_CELLD_DIR", dir.as_str()),
+            ("FAKE_CELLO_LOG", log.as_str()),
+            ("FAKE_CELLO_DIR", dir.as_str()),
         ];
-        let celld = seam.celld(&env);
+        let cello = seam.cello(&env);
         let target = DeployTarget::Production;
         let app_side = crate::host::void_cohost::FleetApp {
             dir: seam.root.path(),
@@ -4412,7 +4412,7 @@ mod tests {
             &seam.pool,
             &seam.app.id,
             None,
-            &celld,
+            &cello,
             &[staged_proxy()],
             &app_side,
         )
@@ -4438,7 +4438,7 @@ mod tests {
                 commit_sha: "abc123",
                 progress: &mut progress,
             },
-            &celld,
+            &cello,
             &staged,
         )
         .await
@@ -4458,7 +4458,7 @@ mod tests {
             &seam.pool,
             &seam.app,
             &target,
-            &celld,
+            &cello,
             staged,
             &mut progress,
         )
@@ -4496,10 +4496,10 @@ mod tests {
             .into_owned();
         let dir = seam.dir.path().to_string_lossy().into_owned();
         let env = vec![
-            ("FAKE_CELLD_LOG", log.as_str()),
-            ("FAKE_CELLD_DIR", dir.as_str()),
+            ("FAKE_CELLO_LOG", log.as_str()),
+            ("FAKE_CELLO_DIR", dir.as_str()),
         ];
-        let celld = seam.celld(&env);
+        let cello = seam.cello(&env);
         let target = DeployTarget::Production;
         let app_side = crate::host::void_cohost::FleetApp {
             dir: seam.root.path(),
@@ -4512,7 +4512,7 @@ mod tests {
             &seam.pool,
             &seam.app.id,
             None,
-            &celld,
+            &cello,
             &[],
             &app_side,
         )
@@ -4538,7 +4538,7 @@ mod tests {
                 commit_sha: "abc123",
                 progress: &mut progress,
             },
-            &celld,
+            &cello,
             &staged,
         )
         .await
@@ -4562,7 +4562,7 @@ mod tests {
         token: Option<&str>,
         progress: &mut Progress<'a>,
     ) -> (crate::host::void_cohost::StagedFleet, anyhow::Result<()>) {
-        let celld = seam.celld(env);
+        let cello = seam.cello(env);
         let app_side = crate::host::void_cohost::FleetApp {
             dir: seam.root.path(),
             cwd: None,
@@ -4574,13 +4574,13 @@ mod tests {
             &seam.pool,
             &seam.app.id,
             None,
-            &celld,
+            &cello,
             &[staged_proxy()],
             &app_side,
         )
         .await
         .expect("stage");
-        let outcome = probe_staged_generation(&seam.cfg, &celld, &staged, token, progress).await;
+        let outcome = probe_staged_generation(&seam.cfg, &cello, &staged, token, progress).await;
         (staged, outcome)
     }
 
@@ -4607,8 +4607,8 @@ mod tests {
         seam.write_invoke("invoke-probe", 200, "");
         let (log, dir) = seam.fake_env();
         let env = vec![
-            ("FAKE_CELLD_LOG", log.as_str()),
-            ("FAKE_CELLD_DIR", dir.as_str()),
+            ("FAKE_CELLO_LOG", log.as_str()),
+            ("FAKE_CELLO_DIR", dir.as_str()),
         ];
         let mut progress = probe_progress(&seam);
         let (staged, outcome) =
@@ -4649,12 +4649,12 @@ mod tests {
             log.contains("probe: staged generation answered HEAD / with 200"),
             "{log}"
         );
-        let celld = seam.celld(&env);
+        let cello = seam.cello(&env);
         let stats = crate::host::void_cohost::activate_staged(
             &seam.pool,
             &seam.app.id,
             None,
-            &celld,
+            &cello,
             staged,
         )
         .await
@@ -4681,8 +4681,8 @@ mod tests {
         seam.write_invoke("invoke-probe", 500, "broken");
         let (log, dir) = seam.fake_env();
         let env = vec![
-            ("FAKE_CELLD_LOG", log.as_str()),
-            ("FAKE_CELLD_DIR", dir.as_str()),
+            ("FAKE_CELLO_LOG", log.as_str()),
+            ("FAKE_CELLO_DIR", dir.as_str()),
         ];
         let mut progress = probe_progress(&seam);
         let (_staged, outcome) = stage_and_probe(&seam, &env, None, &mut progress).await;
@@ -4712,8 +4712,8 @@ mod tests {
         seam.fail_invoke("invoke-probe", "invoke blew up");
         let (log, dir) = seam.fake_env();
         let env = vec![
-            ("FAKE_CELLD_LOG", log.as_str()),
-            ("FAKE_CELLD_DIR", dir.as_str()),
+            ("FAKE_CELLO_LOG", log.as_str()),
+            ("FAKE_CELLO_DIR", dir.as_str()),
         ];
         let mut progress = probe_progress(&seam);
         let (_staged, outcome) = stage_and_probe(&seam, &env, None, &mut progress).await;
@@ -4739,22 +4739,22 @@ mod tests {
         let seam = StagedSeam::spawn("probe-no-fleet").await;
         seam.fail_invoke(
             "invoke-probe",
-            "no node leases in the bucket; celld invoke needs a running fleet",
+            "no node leases in the bucket; cello invoke needs a running fleet",
         );
         let (log, dir) = seam.fake_env();
         let env = vec![
-            ("FAKE_CELLD_LOG", log.as_str()),
-            ("FAKE_CELLD_DIR", dir.as_str()),
+            ("FAKE_CELLO_LOG", log.as_str()),
+            ("FAKE_CELLO_DIR", dir.as_str()),
         ];
         let mut progress = probe_progress(&seam);
         let (staged, outcome) = stage_and_probe(&seam, &env, None, &mut progress).await;
         outcome.expect("no live fleet skips the probe");
-        let celld = seam.celld(&env);
+        let cello = seam.cello(&env);
         let stats = crate::host::void_cohost::activate_staged(
             &seam.pool,
             &seam.app.id,
             None,
-            &celld,
+            &cello,
             staged,
         )
         .await
@@ -4775,8 +4775,8 @@ mod tests {
         seam.cfg.deploy_probe_path = String::new();
         let (log, dir) = seam.fake_env();
         let env = vec![
-            ("FAKE_CELLD_LOG", log.as_str()),
-            ("FAKE_CELLD_DIR", dir.as_str()),
+            ("FAKE_CELLO_LOG", log.as_str()),
+            ("FAKE_CELLO_DIR", dir.as_str()),
         ];
         let mut progress = probe_progress(&seam);
         let (staged, outcome) = stage_and_probe(&seam, &env, None, &mut progress).await;
@@ -4786,12 +4786,12 @@ mod tests {
             !calls.iter().any(|call| call.contains("--method HEAD")),
             "no probe call when disabled: {calls:?}"
         );
-        let celld = seam.celld(&env);
+        let cello = seam.cello(&env);
         let stats = crate::host::void_cohost::activate_staged(
             &seam.pool,
             &seam.app.id,
             None,
-            &celld,
+            &cello,
             staged,
         )
         .await

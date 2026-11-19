@@ -266,20 +266,6 @@ pub async fn sweep_boot() -> anyhow::Result<()> {
     for id in list_labelled(&upstream, &install).await {
         delete_container(&upstream, &id).await;
     }
-    // Containers from before install labels (alpha.14 and older) are no
-    // install's provably, so they are never removed automatically: say so.
-    let labelled = list_labelled(&upstream, INSTALL_LABEL).await;
-    let unlabelled = list_labelled(&upstream, "celld.cell")
-        .await
-        .into_iter()
-        .filter(|id| !labelled.contains(id))
-        .count();
-    if unlabelled > 0 {
-        tracing::warn!(
-            count = unlabelled,
-            "celld containers without a noite.install label (from before alpha.15, or another celld on this engine) are left running; remove stale ones with `docker ps -aq --filter label=celld.cell`"
-        );
-    }
     Ok(())
 }
 

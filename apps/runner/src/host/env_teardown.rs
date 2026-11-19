@@ -720,7 +720,7 @@ mod tests {
             std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).expect("chmod");
         }
         let mut cfg = (*state.config).clone();
-        cfg.celld_bin = fake.to_string_lossy().into_owned();
+        cfg.cello_bin = fake.to_string_lossy().into_owned();
         cfg.credentials = crate::host::credentials::Credentials::Root {
             reason: "test".into(),
         };
@@ -755,7 +755,7 @@ mod tests {
         }
         let (state, app) = ref_teardown_state(&dir, &crate::testutil::spawn_s3_stub().await).await;
         let mut cfg = (*state.config).clone();
-        cfg.celld_bin = fake.to_string_lossy().into_owned();
+        cfg.cello_bin = fake.to_string_lossy().into_owned();
         // Root keys: the spawn mints credentials, and this test is about the
         // spawn race, not the store's IAM (same reason as the wake tests).
         cfg.credentials = crate::host::credentials::Credentials::Root {

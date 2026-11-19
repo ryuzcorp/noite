@@ -415,7 +415,6 @@ async fn main() -> anyhow::Result<()> {
                     fleet_ids.map(|(uid, _)| uid),
                 )
                 .await;
-                host::sandbox::plane::cleanup_legacy().await;
                 let relay_healthy = relay_ok && host::sandbox::relay::healthy().await;
                 host::sandbox::plane::record(true, first.subnets, relay_healthy, table_ok);
             } else {

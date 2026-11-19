@@ -263,8 +263,8 @@ impl RenderedCohost {
 /// and the env. One value serves the staged deploys and the one activate
 /// alike — same binary, same bucket, same invocation shape.
 #[derive(Clone, Copy)]
-pub struct CelldDeploy<'a> {
-    pub celld_bin: &'a str,
+pub struct CelloDeploy<'a> {
+    pub cello_bin: &'a str,
     pub env: &'a [(&'a str, &'a str)],
     pub bucket: &'a str,
     pub endpoint: &'a str,
@@ -356,19 +356,19 @@ fn parse_staged_version(stdout: &str) -> anyhow::Result<StagedVersion> {
 /// errors. The stages and the activate share this — one classification, one
 /// retry.
 async fn run_with_infra_retry(
-    celld: &CelldDeploy<'_>,
+    cello: &CelloDeploy<'_>,
     args: &[&str],
     cwd: Option<&Path>,
 ) -> anyhow::Result<(u32, String)> {
     let subcommand = args.first().copied().unwrap_or("cello");
-    match exec::run_cmd(celld.celld_bin, args, cwd, celld.env, celld.timeout).await {
+    match exec::run_cmd(cello.cello_bin, args, cwd, cello.env, cello.timeout).await {
         Ok(stdout) => Ok((1, stdout)),
         Err(first) => {
             if is_tenant_error(&format!("{:#}", first)) {
                 return Err(first);
             }
             tracing::warn!("cello {subcommand} failed (infra); retrying once");
-            match exec::run_cmd(celld.celld_bin, args, cwd, celld.env, celld.timeout).await {
+            match exec::run_cmd(cello.cello_bin, args, cwd, cello.env, cello.timeout).await {
                 Ok(stdout) => Ok((2, stdout)),
                 Err(second) => Err(anyhow::anyhow!(
                     "cello {subcommand} failed twice (one infra retry):\nfirst: {:#}\nsecond: {:#}",
@@ -387,8 +387,8 @@ async fn run_with_infra_retry(
 /// the attempt count and the staged version. `read_root` names the one
 /// directory beyond `project_dir` that build inputs may come from (Cello's
 /// `--read-root`); every other project read stays inside `project_dir`.
-pub async fn celld_stage(
-    celld: &CelldDeploy<'_>,
+pub async fn cello_stage(
+    cello: &CelloDeploy<'_>,
     project_dir: &Path,
     cwd: Option<&Path>,
     read_root: Option<&Path>,
@@ -400,15 +400,15 @@ pub async fn celld_stage(
         "deploy",
         dir,
         "--bucket",
-        celld.bucket,
+        cello.bucket,
         "--endpoint",
-        celld.endpoint,
+        cello.endpoint,
         "--region",
-        celld.region,
+        cello.region,
         "--no-activate",
         "--json",
     ];
-    if let Some(path) = celld.sourcemap {
+    if let Some(path) = cello.sourcemap {
         let Some(map) = path.to_str() else {
             anyhow::bail!("source map path is not valid UTF-8: {}", path.display());
         };
@@ -422,7 +422,7 @@ pub async fn celld_stage(
         args.push("--read-root");
         args.push(root);
     }
-    let (attempts, stdout) = run_with_infra_retry(celld, &args, cwd).await?;
+    let (attempts, stdout) = run_with_infra_retry(cello, &args, cwd).await?;
     Ok((attempts, parse_staged_version(&stdout)?))
 }
 
@@ -437,8 +437,8 @@ pub async fn celld_stage(
 /// stranded cohosted deploy left behind. Cello's own stdout is discarded —
 /// the generation is known from the inputs — and the attempt count is
 /// returned for the log.
-pub async fn celld_activate(
-    celld: &CelldDeploy<'_>,
+pub async fn cello_activate(
+    cello: &CelloDeploy<'_>,
     staged: &[(String, String)],
     primary: &str,
 ) -> anyhow::Result<u32> {
@@ -453,15 +453,15 @@ pub async fn celld_activate(
     }
     args.extend([
         "--bucket",
-        celld.bucket,
+        cello.bucket,
         "--endpoint",
-        celld.endpoint,
+        cello.endpoint,
         "--region",
-        celld.region,
+        cello.region,
         "--primary",
         primary,
     ]);
-    Ok(run_with_infra_retry(celld, &args, None).await?.0)
+    Ok(run_with_infra_retry(cello, &args, None).await?.0)
 }
 
 /// `cello deploy` failures that come from the project itself: bundling a
@@ -540,11 +540,11 @@ impl CohostOutcome {
 
 /// One render's stage timeout: the shared default, stretched over a
 /// first image pull for scripts declaring containers.
-fn render_timeout(celld: &CelldDeploy<'_>, render: &RenderedCohost) -> Duration {
+fn render_timeout(cello: &CelloDeploy<'_>, render: &RenderedCohost) -> Duration {
     if render.declares_containers {
         CONTAINER_DEPLOY_TIMEOUT
     } else {
-        celld.timeout
+        cello.timeout
     }
 }
 
@@ -565,7 +565,7 @@ pub async fn stage_cohosted(
     pool: &SqlitePool,
     app_id: &str,
     environment_id: Option<&str>,
-    celld: &CelldDeploy<'_>,
+    cello: &CelloDeploy<'_>,
     renders: &[RenderedCohost],
 ) -> anyhow::Result<Vec<CohostOutcome>> {
     let mut ordered: Vec<&RenderedCohost> = renders.iter().collect();
@@ -600,13 +600,13 @@ pub async fn stage_cohosted(
                 .create(&dir)?;
         }
         render.write_project(&dir)?;
-        let render_celld = CelldDeploy {
-            timeout: render_timeout(celld, render),
+        let render_cello = CelloDeploy {
+            timeout: render_timeout(cello, render),
             sourcemap: None,
-            ..*celld
+            ..*cello
         };
         let (attempts, staged) =
-            match celld_stage(&render_celld, &dir, None, render.read_root.as_deref()).await {
+            match cello_stage(&render_cello, &dir, None, render.read_root.as_deref()).await {
                 Ok(staged) => staged,
                 Err(e) => {
                     let _ = std::fs::remove_dir_all(&dir);
@@ -736,18 +736,18 @@ pub async fn stage_fleet_in_order(
     pool: &SqlitePool,
     app_id: &str,
     environment_id: Option<&str>,
-    celld: &CelldDeploy<'_>,
+    cello: &CelloDeploy<'_>,
     cohosted: &[RenderedCohost],
     app: &FleetApp<'_>,
 ) -> anyhow::Result<StagedFleet> {
-    let outcomes = stage_cohosted(pool, app_id, environment_id, celld, cohosted).await?;
-    let app_celld = CelldDeploy {
+    let outcomes = stage_cohosted(pool, app_id, environment_id, cello, cohosted).await?;
+    let app_cello = CelloDeploy {
         timeout: app.timeout,
         sourcemap: app.sourcemap,
-        ..*celld
+        ..*cello
     };
     let (app_attempts, app_staged) =
-        celld_stage(&app_celld, app.dir, app.cwd, app.read_root).await?;
+        cello_stage(&app_cello, app.dir, app.cwd, app.read_root).await?;
     let mut generation: Vec<(String, String)> = Vec::with_capacity(outcomes.len() + 1);
     for outcome in &outcomes {
         if let Some(version) = outcome.version.as_ref() {
@@ -775,10 +775,10 @@ pub async fn activate_staged(
     pool: &SqlitePool,
     app_id: &str,
     environment_id: Option<&str>,
-    celld: &CelldDeploy<'_>,
+    cello: &CelloDeploy<'_>,
     staged: StagedFleet,
 ) -> anyhow::Result<FleetDeployStats> {
-    let activate_attempts = celld_activate(celld, &staged.generation, &staged.primary).await?;
+    let activate_attempts = cello_activate(cello, &staged.generation, &staged.primary).await?;
     for outcome in &staged.cohosted {
         if !outcome.skipped {
             db::set_cohost_hash(pool, app_id, environment_id, outcome.script, &outcome.hash)
@@ -807,13 +807,13 @@ mod tests {
         pool: &SqlitePool,
         app_id: &str,
         environment_id: Option<&str>,
-        celld: &CelldDeploy<'_>,
+        cello: &CelloDeploy<'_>,
         cohosted: &[RenderedCohost],
         app: &FleetApp<'_>,
     ) -> anyhow::Result<FleetDeployStats> {
         let staged =
-            stage_fleet_in_order(pool, app_id, environment_id, celld, cohosted, app).await?;
-        activate_staged(pool, app_id, environment_id, celld, staged).await
+            stage_fleet_in_order(pool, app_id, environment_id, cello, cohosted, app).await?;
+        activate_staged(pool, app_id, environment_id, cello, staged).await
     }
 
     const SOURCES: &[CohostSource] = &[
@@ -1073,8 +1073,8 @@ mod tests {
     /// first image pull); anything else keeps the shared default.
     #[test]
     fn container_scripts_get_the_container_timeout() {
-        let celld = CelldDeploy {
-            celld_bin: "celld",
+        let cello = CelloDeploy {
+            cello_bin: "cello",
             env: &[],
             bucket: "s3://noite/fleets/x",
             endpoint: "http://rustfs:9000",
@@ -1083,13 +1083,13 @@ mod tests {
             sourcemap: None,
         };
         assert_eq!(
-            render_timeout(&celld, &render("tok")),
+            render_timeout(&cello, &render("tok")),
             Duration::from_secs(120)
         );
         let mut containers = render("tok");
         containers.declares_containers = true;
         assert_eq!(
-            render_timeout(&celld, &containers),
+            render_timeout(&cello, &containers),
             CONTAINER_DEPLOY_TIMEOUT
         );
         assert_eq!(CONTAINER_DEPLOY_TIMEOUT, Duration::from_secs(600));
@@ -1205,9 +1205,9 @@ mod tests {
         .is_err());
     }
 
-    /// A fake `cello` (`tests/fixtures/fake-celld-cohost.sh`): appends its
-    /// argv to `$FAKE_CELLD_LOG`, then fails invocation `n` (zero-based)
-    /// when `$FAKE_CELLD_DIR/fail-<n>` exists (file content to stderr, exit
+    /// A fake `cello` (`tests/fixtures/fake-cello-cohost.sh`): appends its
+    /// argv to `$FAKE_CELLO_LOG`, then fails invocation `n` (zero-based)
+    /// when `$FAKE_CELLO_DIR/fail-<n>` exists (file content to stderr, exit
     /// 1). A `deploy` answers like `cello deploy --no-activate --json` — one
     /// JSON object whose worker is the project dir's `wrangler.json` name
     /// and whose version is the invocation index as 16-hex, deterministic
@@ -1215,27 +1215,27 @@ mod tests {
     /// discards. The control files and the deterministic versions make
     /// order, skip, retry and the generation the activate names observable
     /// without sleeps.
-    struct FakeCelld {
+    struct FakeCello {
         dir: PathBuf,
     }
 
-    impl FakeCelld {
+    impl FakeCello {
         fn spawn() -> Self {
             let dir =
-                std::env::temp_dir().join(format!("noite-fake-celld-{}", crate::models::new_id()));
+                std::env::temp_dir().join(format!("noite-fake-cello-{}", crate::models::new_id()));
             std::fs::create_dir_all(&dir).unwrap();
             // A symlink to the committed script, never a fresh file: exec'ing
             // a just-written file while another test thread forks fails
             // with ETXTBSY, which the infra retry then hides as a second
             // attempt.
             let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("tests/fixtures/fake-celld-cohost.sh");
-            std::os::unix::fs::symlink(fixture, dir.join("celld")).unwrap();
+                .join("tests/fixtures/fake-cello-cohost.sh");
+            std::os::unix::fs::symlink(fixture, dir.join("cello")).unwrap();
             Self { dir }
         }
 
         fn bin(&self) -> String {
-            self.dir.join("celld").to_string_lossy().into_owned()
+            self.dir.join("cello").to_string_lossy().into_owned()
         }
 
         fn log(&self) -> String {
@@ -1259,7 +1259,7 @@ mod tests {
         }
     }
 
-    impl Drop for FakeCelld {
+    impl Drop for FakeCello {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.dir);
         }
@@ -1312,16 +1312,16 @@ mod tests {
     async fn ordered_deploy_runs_cohosted_before_the_app() {
         let pool = crate::db::connect("sqlite::memory:").await.expect("boot");
         let app = seed(&pool).await;
-        let fake = FakeCelld::spawn();
+        let fake = FakeCello::spawn();
         let log = fake.log();
         let dir = fake.dir.to_string_lossy().into_owned();
         let env = vec![
-            ("FAKE_CELLD_LOG", log.as_str()),
-            ("FAKE_CELLD_DIR", dir.as_str()),
+            ("FAKE_CELLO_LOG", log.as_str()),
+            ("FAKE_CELLO_DIR", dir.as_str()),
         ];
         let bin = fake.bin();
-        let celld = CelldDeploy {
-            celld_bin: &bin,
+        let cello = CelloDeploy {
+            cello_bin: &bin,
             env: &env,
             bucket: "s3://noite/fleets/cohost-app",
             endpoint: "http://rustfs:9000",
@@ -1336,7 +1336,7 @@ mod tests {
             &pool,
             &app.id,
             None,
-            &celld,
+            &cello,
             &[render("tok")],
             &FleetApp {
                 dir: &app_dir,
@@ -1411,16 +1411,16 @@ mod tests {
     async fn two_cohosted_scripts_deploy_lowest_order_first() {
         let pool = crate::db::connect("sqlite::memory:").await.expect("boot");
         let app = seed(&pool).await;
-        let fake = FakeCelld::spawn();
+        let fake = FakeCello::spawn();
         let log = fake.log();
         let dir = fake.dir.to_string_lossy().into_owned();
         let env = vec![
-            ("FAKE_CELLD_LOG", log.as_str()),
-            ("FAKE_CELLD_DIR", dir.as_str()),
+            ("FAKE_CELLO_LOG", log.as_str()),
+            ("FAKE_CELLO_DIR", dir.as_str()),
         ];
         let bin = fake.bin();
-        let celld = CelldDeploy {
-            celld_bin: &bin,
+        let cello = CelloDeploy {
+            cello_bin: &bin,
             env: &env,
             bucket: "s3://noite/fleets/cohost-app",
             endpoint: "http://rustfs:9000",
@@ -1447,7 +1447,7 @@ mod tests {
             &pool,
             &app.id,
             None,
-            &celld,
+            &cello,
             &[render("tok"), early],
             &FleetApp {
                 dir: &app_dir,
@@ -1505,16 +1505,16 @@ mod tests {
     async fn unchanged_cohost_is_skipped_rotation_redeploys() {
         let pool = crate::db::connect("sqlite::memory:").await.expect("boot");
         let app = seed(&pool).await;
-        let fake = FakeCelld::spawn();
+        let fake = FakeCello::spawn();
         let log = fake.log();
         let dir = fake.dir.to_string_lossy().into_owned();
         let env = vec![
-            ("FAKE_CELLD_LOG", log.as_str()),
-            ("FAKE_CELLD_DIR", dir.as_str()),
+            ("FAKE_CELLO_LOG", log.as_str()),
+            ("FAKE_CELLO_DIR", dir.as_str()),
         ];
         let bin = fake.bin();
-        let celld = CelldDeploy {
-            celld_bin: &bin,
+        let cello = CelloDeploy {
+            cello_bin: &bin,
             env: &env,
             bucket: "s3://noite/fleets/cohost-app",
             endpoint: "http://rustfs:9000",
@@ -1533,14 +1533,14 @@ mod tests {
         };
 
         let first =
-            deploy_fleet_in_order(&pool, &app.id, None, &celld, &[render("tok")], &app_side)
+            deploy_fleet_in_order(&pool, &app.id, None, &cello, &[render("tok")], &app_side)
                 .await
                 .unwrap();
         assert!(!first.cohosted[0].skipped);
         assert_eq!(fake.invocations().len(), 3);
 
         let second =
-            deploy_fleet_in_order(&pool, &app.id, None, &celld, &[render("tok")], &app_side)
+            deploy_fleet_in_order(&pool, &app.id, None, &cello, &[render("tok")], &app_side)
                 .await
                 .unwrap();
         assert!(second.cohosted[0].skipped);
@@ -1571,7 +1571,7 @@ mod tests {
 
         // A rotation flips the hash: the proxy stages again beside the app.
         let third =
-            deploy_fleet_in_order(&pool, &app.id, None, &celld, &[render("tok-2")], &app_side)
+            deploy_fleet_in_order(&pool, &app.id, None, &cello, &[render("tok-2")], &app_side)
                 .await
                 .unwrap();
         assert!(!third.cohosted[0].skipped);
@@ -1594,7 +1594,7 @@ mod tests {
     async fn app_deploy_retries_once_on_infra() {
         let pool = crate::db::connect("sqlite::memory:").await.expect("boot");
         let app = seed(&pool).await;
-        let fake = FakeCelld::spawn();
+        let fake = FakeCello::spawn();
         // Invocation 1 is the app's first attempt (0 is the cohosted one).
         fake.fail(
             1,
@@ -1603,12 +1603,12 @@ mod tests {
         let log = fake.log();
         let dir = fake.dir.to_string_lossy().into_owned();
         let env = vec![
-            ("FAKE_CELLD_LOG", log.as_str()),
-            ("FAKE_CELLD_DIR", dir.as_str()),
+            ("FAKE_CELLO_LOG", log.as_str()),
+            ("FAKE_CELLO_DIR", dir.as_str()),
         ];
         let bin = fake.bin();
-        let celld = CelldDeploy {
-            celld_bin: &bin,
+        let cello = CelloDeploy {
+            cello_bin: &bin,
             env: &env,
             bucket: "s3://noite/fleets/cohost-app",
             endpoint: "http://rustfs:9000",
@@ -1623,7 +1623,7 @@ mod tests {
             &pool,
             &app.id,
             None,
-            &celld,
+            &cello,
             &[render("tok")],
             &FleetApp {
                 dir: &app_dir,
@@ -1673,17 +1673,17 @@ mod tests {
     async fn tenant_failures_fail_fast_twice_failed_carries_both() {
         let pool = crate::db::connect("sqlite::memory:").await.expect("boot");
         let app = seed(&pool).await;
-        let fake = FakeCelld::spawn();
+        let fake = FakeCello::spawn();
         fake.fail(1, "esbuild failed:\nERROR: Could not resolve \"x\"");
         let log = fake.log();
         let dir = fake.dir.to_string_lossy().into_owned();
         let env = vec![
-            ("FAKE_CELLD_LOG", log.as_str()),
-            ("FAKE_CELLD_DIR", dir.as_str()),
+            ("FAKE_CELLO_LOG", log.as_str()),
+            ("FAKE_CELLO_DIR", dir.as_str()),
         ];
         let bin = fake.bin();
-        let celld = CelldDeploy {
-            celld_bin: &bin,
+        let cello = CelloDeploy {
+            cello_bin: &bin,
             env: &env,
             bucket: "s3://noite/fleets/cohost-app",
             endpoint: "http://rustfs:9000",
@@ -1701,7 +1701,7 @@ mod tests {
             read_root: None,
         };
 
-        let err = deploy_fleet_in_order(&pool, &app.id, None, &celld, &[render("tok")], &app_side)
+        let err = deploy_fleet_in_order(&pool, &app.id, None, &cello, &[render("tok")], &app_side)
             .await
             .unwrap_err();
         assert!(format!("{:#}", err).contains("esbuild failed"), "{:#}", err);
@@ -1712,18 +1712,18 @@ mod tests {
         // Both app attempts fail on infra: one retry, then both errors.
         // A fresh token keeps the cohosted stage (invocation 0) so the
         // app's attempts stay 1 and 2.
-        let fake = FakeCelld::spawn();
+        let fake = FakeCello::spawn();
         fake.fail(1, "first: connection refused");
         fake.fail(2, "second: 503 SlowDown");
         let log = fake.log();
         let dir = fake.dir.to_string_lossy().into_owned();
         let env = vec![
-            ("FAKE_CELLD_LOG", log.as_str()),
-            ("FAKE_CELLD_DIR", dir.as_str()),
+            ("FAKE_CELLO_LOG", log.as_str()),
+            ("FAKE_CELLO_DIR", dir.as_str()),
         ];
         let bin = fake.bin();
-        let celld = CelldDeploy {
-            celld_bin: &bin,
+        let cello = CelloDeploy {
+            cello_bin: &bin,
             env: &env,
             bucket: "s3://noite/fleets/cohost-app",
             endpoint: "http://rustfs:9000",
@@ -1732,7 +1732,7 @@ mod tests {
             sourcemap: None,
         };
         let err =
-            deploy_fleet_in_order(&pool, &app.id, None, &celld, &[render("tok-2")], &app_side)
+            deploy_fleet_in_order(&pool, &app.id, None, &cello, &[render("tok-2")], &app_side)
                 .await
                 .unwrap_err();
         let text = format!("{:#}", err);
@@ -1753,17 +1753,17 @@ mod tests {
     async fn cohost_failure_fails_before_the_app() {
         let pool = crate::db::connect("sqlite::memory:").await.expect("boot");
         let app = seed(&pool).await;
-        let fake = FakeCelld::spawn();
+        let fake = FakeCello::spawn();
         fake.fail(0, "config `services` must be an array");
         let log = fake.log();
         let dir = fake.dir.to_string_lossy().into_owned();
         let env = vec![
-            ("FAKE_CELLD_LOG", log.as_str()),
-            ("FAKE_CELLD_DIR", dir.as_str()),
+            ("FAKE_CELLO_LOG", log.as_str()),
+            ("FAKE_CELLO_DIR", dir.as_str()),
         ];
         let bin = fake.bin();
-        let celld = CelldDeploy {
-            celld_bin: &bin,
+        let cello = CelloDeploy {
+            cello_bin: &bin,
             env: &env,
             bucket: "s3://noite/fleets/cohost-app",
             endpoint: "http://rustfs:9000",
@@ -1781,7 +1781,7 @@ mod tests {
             read_root: None,
         };
 
-        let err = deploy_fleet_in_order(&pool, &app.id, None, &celld, &[render("tok")], &app_side)
+        let err = deploy_fleet_in_order(&pool, &app.id, None, &cello, &[render("tok")], &app_side)
             .await
             .unwrap_err();
         let text = format!("{:#}", err);
@@ -1814,7 +1814,7 @@ mod tests {
     async fn cohosted_deploy_retries_once_on_infra() {
         let pool = crate::db::connect("sqlite::memory:").await.expect("boot");
         let app = seed(&pool).await;
-        let fake = FakeCelld::spawn();
+        let fake = FakeCello::spawn();
         // Invocation 0 is the cohosted script's first attempt.
         fake.fail(
             0,
@@ -1823,12 +1823,12 @@ mod tests {
         let log = fake.log();
         let dir = fake.dir.to_string_lossy().into_owned();
         let env = vec![
-            ("FAKE_CELLD_LOG", log.as_str()),
-            ("FAKE_CELLD_DIR", dir.as_str()),
+            ("FAKE_CELLO_LOG", log.as_str()),
+            ("FAKE_CELLO_DIR", dir.as_str()),
         ];
         let bin = fake.bin();
-        let celld = CelldDeploy {
-            celld_bin: &bin,
+        let cello = CelloDeploy {
+            cello_bin: &bin,
             env: &env,
             bucket: "s3://noite/fleets/cohost-app",
             endpoint: "http://rustfs:9000",
@@ -1847,7 +1847,7 @@ mod tests {
         };
 
         let stats =
-            deploy_fleet_in_order(&pool, &app.id, None, &celld, &[render("tok")], &app_side)
+            deploy_fleet_in_order(&pool, &app.id, None, &cello, &[render("tok")], &app_side)
                 .await
                 .unwrap();
         assert!(!stats.cohosted[0].skipped);
@@ -1890,18 +1890,18 @@ mod tests {
         // Both cohosted attempts fail on infra: one retry, then both
         // errors — before the app stages anything. A fresh token keeps
         // the cohosted stage (invocations 0 and 1).
-        let fake = FakeCelld::spawn();
+        let fake = FakeCello::spawn();
         fake.fail(0, "first: connection refused");
         fake.fail(1, "second: 503 SlowDown");
         let log = fake.log();
         let dir = fake.dir.to_string_lossy().into_owned();
         let env = vec![
-            ("FAKE_CELLD_LOG", log.as_str()),
-            ("FAKE_CELLD_DIR", dir.as_str()),
+            ("FAKE_CELLO_LOG", log.as_str()),
+            ("FAKE_CELLO_DIR", dir.as_str()),
         ];
         let bin = fake.bin();
-        let celld = CelldDeploy {
-            celld_bin: &bin,
+        let cello = CelloDeploy {
+            cello_bin: &bin,
             env: &env,
             bucket: "s3://noite/fleets/cohost-app",
             endpoint: "http://rustfs:9000",
@@ -1910,7 +1910,7 @@ mod tests {
             sourcemap: None,
         };
         let err =
-            deploy_fleet_in_order(&pool, &app.id, None, &celld, &[render("tok-2")], &app_side)
+            deploy_fleet_in_order(&pool, &app.id, None, &cello, &[render("tok-2")], &app_side)
                 .await
                 .unwrap_err();
         let text = format!("{:#}", err);
@@ -1944,17 +1944,17 @@ mod tests {
     async fn failed_deploy_stores_nothing_and_runs_no_activate() {
         let pool = crate::db::connect("sqlite::memory:").await.expect("boot");
         let app = seed(&pool).await;
-        let fake = FakeCelld::spawn();
+        let fake = FakeCello::spawn();
         fake.fail(1, "esbuild failed:\nERROR: Could not resolve \"x\"");
         let log = fake.log();
         let dir = fake.dir.to_string_lossy().into_owned();
         let env = vec![
-            ("FAKE_CELLD_LOG", log.as_str()),
-            ("FAKE_CELLD_DIR", dir.as_str()),
+            ("FAKE_CELLO_LOG", log.as_str()),
+            ("FAKE_CELLO_DIR", dir.as_str()),
         ];
         let bin = fake.bin();
-        let celld = CelldDeploy {
-            celld_bin: &bin,
+        let cello = CelloDeploy {
+            cello_bin: &bin,
             env: &env,
             bucket: "s3://noite/fleets/cohost-app",
             endpoint: "http://rustfs:9000",
@@ -1972,7 +1972,7 @@ mod tests {
             read_root: None,
         };
 
-        let err = deploy_fleet_in_order(&pool, &app.id, None, &celld, &[render("tok")], &app_side)
+        let err = deploy_fleet_in_order(&pool, &app.id, None, &cello, &[render("tok")], &app_side)
             .await
             .unwrap_err();
         assert!(format!("{:#}", err).contains("esbuild failed"), "{:#}", err);
@@ -1988,16 +1988,16 @@ mod tests {
 
         // The retry stages the cohosted script again (nothing was stored)
         // and activates the generation.
-        let fake = FakeCelld::spawn();
+        let fake = FakeCello::spawn();
         let log = fake.log();
         let dir = fake.dir.to_string_lossy().into_owned();
         let env = vec![
-            ("FAKE_CELLD_LOG", log.as_str()),
-            ("FAKE_CELLD_DIR", dir.as_str()),
+            ("FAKE_CELLO_LOG", log.as_str()),
+            ("FAKE_CELLO_DIR", dir.as_str()),
         ];
         let bin = fake.bin();
-        let celld = CelldDeploy {
-            celld_bin: &bin,
+        let cello = CelloDeploy {
+            cello_bin: &bin,
             env: &env,
             bucket: "s3://noite/fleets/cohost-app",
             endpoint: "http://rustfs:9000",
@@ -2006,7 +2006,7 @@ mod tests {
             sourcemap: None,
         };
         let stats =
-            deploy_fleet_in_order(&pool, &app.id, None, &celld, &[render("tok")], &app_side)
+            deploy_fleet_in_order(&pool, &app.id, None, &cello, &[render("tok")], &app_side)
                 .await
                 .unwrap();
         assert!(!stats.cohosted[0].skipped);
@@ -2030,16 +2030,16 @@ mod tests {
     async fn app_without_cohosted_scripts_activates_alone() {
         let pool = crate::db::connect("sqlite::memory:").await.expect("boot");
         let app = seed(&pool).await;
-        let fake = FakeCelld::spawn();
+        let fake = FakeCello::spawn();
         let log = fake.log();
         let dir = fake.dir.to_string_lossy().into_owned();
         let env = vec![
-            ("FAKE_CELLD_LOG", log.as_str()),
-            ("FAKE_CELLD_DIR", dir.as_str()),
+            ("FAKE_CELLO_LOG", log.as_str()),
+            ("FAKE_CELLO_DIR", dir.as_str()),
         ];
         let bin = fake.bin();
-        let celld = CelldDeploy {
-            celld_bin: &bin,
+        let cello = CelloDeploy {
+            cello_bin: &bin,
             env: &env,
             bucket: "s3://noite/fleets/cohost-app",
             endpoint: "http://rustfs:9000",
@@ -2054,7 +2054,7 @@ mod tests {
             &pool,
             &app.id,
             None,
-            &celld,
+            &cello,
             &[],
             &FleetApp {
                 dir: &app_dir,
@@ -2100,16 +2100,16 @@ mod tests {
     async fn app_stage_passes_sourcemap_while_cohosted_and_activate_skip_it() {
         let pool = crate::db::connect("sqlite::memory:").await.expect("boot");
         let app = seed(&pool).await;
-        let fake = FakeCelld::spawn();
+        let fake = FakeCello::spawn();
         let log = fake.log();
         let dir = fake.dir.to_string_lossy().into_owned();
         let env = vec![
-            ("FAKE_CELLD_LOG", log.as_str()),
-            ("FAKE_CELLD_DIR", dir.as_str()),
+            ("FAKE_CELLO_LOG", log.as_str()),
+            ("FAKE_CELLO_DIR", dir.as_str()),
         ];
         let bin = fake.bin();
-        let celld = CelldDeploy {
-            celld_bin: &bin,
+        let cello = CelloDeploy {
+            cello_bin: &bin,
             env: &env,
             bucket: "s3://noite/fleets/cohost-app",
             endpoint: "http://rustfs:9000",
@@ -2125,7 +2125,7 @@ mod tests {
             &pool,
             &app.id,
             None,
-            &celld,
+            &cello,
             &[render("tok")],
             &FleetApp {
                 dir: &app_dir,
@@ -2164,16 +2164,16 @@ mod tests {
     async fn each_stage_passes_only_its_own_read_root() {
         let pool = crate::db::connect("sqlite::memory:").await.expect("boot");
         let app = seed(&pool).await;
-        let fake = FakeCelld::spawn();
+        let fake = FakeCello::spawn();
         let log = fake.log();
         let dir = fake.dir.to_string_lossy().into_owned();
         let env = vec![
-            ("FAKE_CELLD_LOG", log.as_str()),
-            ("FAKE_CELLD_DIR", dir.as_str()),
+            ("FAKE_CELLO_LOG", log.as_str()),
+            ("FAKE_CELLO_DIR", dir.as_str()),
         ];
         let bin = fake.bin();
-        let celld = CelldDeploy {
-            celld_bin: &bin,
+        let cello = CelloDeploy {
+            cello_bin: &bin,
             env: &env,
             bucket: "s3://noite/fleets/cohost-read-root",
             endpoint: "http://rustfs:9000",
@@ -2192,7 +2192,7 @@ mod tests {
             &pool,
             &app.id,
             None,
-            &celld,
+            &cello,
             &[cohosted],
             &FleetApp {
                 dir: &app_dir,

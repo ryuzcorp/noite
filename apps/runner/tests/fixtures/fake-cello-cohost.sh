@@ -1,14 +1,14 @@
 #!/bin/sh
-# Fake `celld` for the runner's Void cohost seam tests (`host/void_cohost.rs`,
+# Fake `cello` for the runner's Void cohost seam tests (`host/void_cohost.rs`,
 # `host/deploy.rs` staged-migrate sequencing, `host/void_migrate.rs` staged
 # transport). One committed copy serves every test: each test symlinks it
 # into its own fixture dir, so the executed file is never freshly written
 # (exec'ing a freshly-written file under parallel load spuriously fails with
 # ETXTBSY).
 n=0
-if [ -f "$FAKE_CELLD_LOG" ]; then n=$(wc -l < "$FAKE_CELLD_LOG"); fi
-printf '%s\n' "$*" >> "$FAKE_CELLD_LOG"
-fail="$FAKE_CELLD_DIR/fail-$n"
+if [ -f "$FAKE_CELLO_LOG" ]; then n=$(wc -l < "$FAKE_CELLO_LOG"); fi
+printf '%s\n' "$*" >> "$FAKE_CELLO_LOG"
+fail="$FAKE_CELLO_DIR/fail-$n"
 if [ -f "$fail" ]; then cat "$fail" >&2; exit 1; fi
 if [ "$1" = "deploy" ]; then
   name=$(sed -n 's/.*"name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$2/wrangler.json" 2>/dev/null | head -n 1)
@@ -16,7 +16,7 @@ if [ "$1" = "deploy" ]; then
   version=$(printf '%016x' "$((n + 1))")
   printf '{"worker": "%s", "version": "%s", "location": "s3://fake/%s", "dry_run": false, "staged": true}\n' "$name" "$version" "$version"
 elif [ "$1" = "invoke" ]; then
-  # A staged `celld invoke --json` answer: the request's `--path` selects
+  # A staged `cello invoke --json` answer: the request's `--path` selects
   # the fixture file holding the full result envelope
   # (`{"status":N,"headers":{...},"body":"base64..."}`), and a sibling
   # `<name>.fail` file fails the call with its content on stderr and no
@@ -33,9 +33,9 @@ elif [ "$1" = "invoke" ]; then
   done
   # The secret header and the body never ride argv: record what arrived
   # through the environment (`--header-env`) and stdin, one line per call.
-  printf '%s\n' "${NOITE_VOID_PROXY_TOKEN:-<unset>}" >> "$FAKE_CELLD_DIR/invoke-token.log"
+  printf '%s\n' "${NOITE_VOID_PROXY_TOKEN:-<unset>}" >> "$FAKE_CELLO_DIR/invoke-token.log"
   if [ -n "$stdin_body" ]; then
-    { cat; printf '\n'; } >> "$FAKE_CELLD_DIR/invoke-body.log"
+    { cat; printf '\n'; } >> "$FAKE_CELLO_DIR/invoke-body.log"
   fi
   case "$path" in
     /__void/migrate/capabilities) name="invoke-capabilities";;
@@ -44,14 +44,14 @@ elif [ "$1" = "invoke" ]; then
     /__void/migrate/app/attempt/*) name="invoke-attempt";;
     /__void/migrate) name="invoke-legacy";;
     # Any other path is the pre-activation canary probe (`HEAD <path>`
-    # through `celld invoke`): the probe path is operator-configured, so
+    # through `cello invoke`): the probe path is operator-configured, so
     # the fake cannot enumerate it — one fixture answers them all. A
     # missing fixture (or a `<name>.fail` file, like the migrate
     # endpoints) fails the call with no envelope: a transport failure.
     *) name="invoke-probe";;
   esac
-  if [ -f "$FAKE_CELLD_DIR/$name.fail" ]; then cat "$FAKE_CELLD_DIR/$name.fail" >&2; exit 1; fi
-  cat "$FAKE_CELLD_DIR/$name"
+  if [ -f "$FAKE_CELLO_DIR/$name.fail" ]; then cat "$FAKE_CELLO_DIR/$name.fail" >&2; exit 1; fi
+  cat "$FAKE_CELLO_DIR/$name"
 else
   echo "Activated generation: $2 (primary test-app)"
 fi

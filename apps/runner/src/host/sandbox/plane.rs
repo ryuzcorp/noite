@@ -1,6 +1,5 @@
 //! The sandbox plane on the host engine: Cello's bridges, this
-//! container's own identity, the one-time cleanup of the alpha.12–14 host
-//! legs, and the `/ready` sandbox status.
+//! container's own identity, and the `/ready` sandbox status.
 //!
 //! Everything here goes through the `docker` CLI (argv only, bounded
 //! timeouts), never the Engine API: the runner holds the real socket and
@@ -9,7 +8,7 @@
 //! subnets are known before any fleet dials — Cello finds bridges with
 //! matching options and keeps them, subnets included.
 
-use super::{LEGACY_NETWORKS, NETWORKS};
+use super::NETWORKS;
 use std::os::unix::fs::PermissionsExt;
 use std::sync::Mutex;
 use std::time::Duration;
@@ -17,15 +16,6 @@ use std::time::Duration;
 /// Cello's bridge options (`container.rs`: `ICC_OPTION`, `BRIDGE_NAME_OPTION`).
 const ICC_OPTION: &str = "com.docker.network.bridge.enable_icc";
 const BRIDGE_NAME_OPTION: &str = "com.docker.network.bridge.name";
-/// nft in this image (Debian path; the cleanup helper overrides its entrypoint).
-const NFT_PATH: &str = "/usr/sbin/nft";
-/// iptables in this image: the cleanup deletes alpha.14's `DOCKER-USER`
-/// rules with the same tool (and so the same backend) that inserted them.
-const IPTABLES_PATH: &str = "/usr/sbin/iptables";
-/// What alpha.12/13 left behind: an ACCEPT in its own table can never preempt
-/// Docker's later DROP, so it never worked; alpha.14 deleted `inet` on sight
-/// but a host that never ran the new code still carries it.
-const STALE_TABLE: &str = "noite_sandbox";
 /// Noite's own uid/gid max for the relay dir check (nobody:nogroup).
 const RELAY_UID: u32 = 65534;
 
@@ -98,9 +88,6 @@ struct NetworkInspect {
     #[serde(default)]
     #[serde(rename = "IPAM")]
     ipam: Ipam,
-    #[serde(default)]
-    #[serde(rename = "Containers")]
-    containers: std::collections::HashMap<String, serde_json::Value>,
 }
 
 #[derive(serde::Deserialize, Default)]
@@ -289,58 +276,10 @@ fn create_args(name: &str, internal: bool, bridge: &str) -> Vec<String> {
     args
 }
 
-/// Whether a legacy (pre-Cello) network in a `docker network inspect`
-/// answer carries no containers and so may be removed. `None` when the
-/// network is absent or the answer is unparseable. Pure so the upgrade
-/// removal rule is pinned without an engine.
-pub fn legacy_network_orphaned(json: &str, name: &str) -> Option<bool> {
-    let Ok(networks) = serde_json::from_str::<Vec<NetworkInspect>>(json) else {
-        return None;
-    };
-    networks
-        .iter()
-        .find(|n| n.name == name)
-        .map(|n| n.containers.is_empty())
-}
-
-/// Remove the orphaned pre-Cello networks (`celld`, `celld-internal`) left
-/// by an upgrade: Cello never joins them, so an empty one only risks a
-/// fleet→container dial that bypasses the ownership-checking gateway. A
-/// network with containers still attached is logged and left: removing it
-/// would break those containers.
-async fn remove_legacy_networks() {
-    for name in LEGACY_NETWORKS {
-        let out = docker(&["network", "inspect", name], Duration::from_secs(10)).await;
-        let Some(out) = out else {
-            continue;
-        };
-        if !out.status.success() {
-            continue;
-        }
-        let text = stdout_text(&out).unwrap_or_default();
-        match legacy_network_orphaned(&text, name) {
-            Some(true) => {
-                let removed = docker(&["network", "rm", name], Duration::from_secs(30)).await;
-                if removed.is_some_and(|out| out.status.success()) {
-                    tracing::info!(network = name, "removed orphaned pre-Cello network");
-                }
-            }
-            Some(false) => {
-                tracing::warn!(
-                    network = name,
-                    "pre-Cello network still has containers attached; leaving it"
-                );
-            }
-            None => {}
-        }
-    }
-}
-
 /// Make sure Cello's bridges exist, creating only the missing ones (never
 /// deleting: a bridge with stale options keeps serving until Cello itself
-/// replaces it idle), and remove the orphaned pre-Cello networks. Returns
-/// the validated subnets, so the gateway table and `/ready` know the plane
-/// before any fleet dials.
+/// replaces it idle). Returns the validated subnets, so the gateway table
+/// and `/ready` know the plane before any fleet dials.
 pub async fn ensure_networks() -> PlaneNets {
     let mut nets = PlaneNets::default();
     for (name, internal, bridge) in NETWORKS {
@@ -385,9 +324,6 @@ pub async fn ensure_networks() -> PlaneNets {
             "engine unreachable; no sandbox plane"
         );
     }
-    nets.subnets.sort();
-    nets.subnets.dedup();
-    remove_legacy_networks().await;
     nets
 }
 
@@ -458,111 +394,6 @@ pub fn sandbox_status(sandbox_disabled: bool) -> serde_json::Value {
     })
 }
 
-/// A one-shot host helper: this same image on the host netns, `NET_ADMIN`,
-/// entrypoint overridden to a firewall tool. Argv only, like every engine
-/// call here. `None` unless the tool exits 0.
-async fn helper(image: &str, tool: &str, tool_args: &[&str]) -> Option<String> {
-    let mut cmd = vec![
-        "run".to_string(),
-        "--rm".to_string(),
-        "--network".to_string(),
-        "host".to_string(),
-        "--cap-add".to_string(),
-        "NET_ADMIN".to_string(),
-        "--entrypoint".to_string(),
-        tool.to_string(),
-        image.to_string(),
-    ];
-    cmd.extend(tool_args.iter().map(|s| s.to_string()));
-    let refs: Vec<&str> = cmd.iter().map(String::as_str).collect();
-    let out = docker(&refs, Duration::from_secs(30)).await?;
-    if !out.status.success() {
-        return None;
-    }
-    stdout_text(&out)
-}
-
-/// alpha.14's `DOCKER-USER` rules in `iptables -S DOCKER-USER` output, as
-/// the argv that deletes each (`-D DOCKER-USER …`). alpha.14 inserted them
-/// with this image's `iptables` (`afb31be`): per install subnet
-/// `-s <cidr> -o <celld0|celld1> -p tcp -j ACCEPT`, plus
-/// `-i <celld0|celld1> -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT`.
-/// `-S` prints rules canonically, so only those exact lines qualify; any
-/// other rule (Docker's, the operator's, one with an extra match) stays. A
-/// duplicated rule yields one delete per copy.
-pub fn legacy_rule_deletes(listing: &str) -> Vec<Vec<String>> {
-    let mut deletes = Vec::new();
-    for line in listing.lines() {
-        let words: Vec<&str> = line.split_whitespace().collect();
-        let ours = match words.as_slice() {
-            ["-A", "DOCKER-USER", "-s", cidr, "-o", iface, "-p", "tcp", "-j", "ACCEPT"] => {
-                valid_cidr(cidr) && matches!(*iface, "celld0" | "celld1")
-            }
-            ["-A", "DOCKER-USER", "-i", iface, "-m", "conntrack", "--ctstate", "RELATED,ESTABLISHED", "-j", "ACCEPT"] =>
-            {
-                matches!(*iface, "celld0" | "celld1")
-            }
-            _ => false,
-        };
-        if ours {
-            let mut argv: Vec<String> = words.iter().map(|w| w.to_string()).collect();
-            argv[0] = "-D".to_string();
-            deletes.push(argv);
-        }
-    }
-    deletes
-}
-
-/// Which stale `noite_sandbox` tables a `nft list tables` output carries:
-/// `(family, name)` pairs for `ip`/`inet`, the families alpha.12/13 used.
-pub fn stale_tables(listing: &str) -> Vec<(String, String)> {
-    let mut tables = Vec::new();
-    for line in listing.lines() {
-        let words: Vec<&str> = line.split_whitespace().collect();
-        if words.len() == 3
-            && words[0] == "table"
-            && matches!(words[1], "ip" | "inet")
-            && words[2] == STALE_TABLE
-        {
-            tables.push((words[1].to_string(), words[2].to_string()));
-        }
-    }
-    tables.sort();
-    tables.dedup();
-    tables
-}
-
-/// One-time-per-boot cleanup of what alpha.12–14 left on the host: our own
-/// old `DOCKER-USER` rules (exact specs only) and the stale `noite_sandbox`
-/// tables. Lists first; deletion helpers run only when there is something
-/// to delete. Never touches Docker's rules or the `raw` rules the old sweep
-/// wrongly deleted (Docker re-creates those with its containers).
-pub async fn cleanup_legacy() {
-    let Some(own) = own_container().await else {
-        return;
-    };
-    let chain = helper(&own.image, IPTABLES_PATH, &["-S", "DOCKER-USER"]).await;
-    let tables = helper(&own.image, NFT_PATH, &["list", "tables"]).await;
-    for argv in chain
-        .as_deref()
-        .map(legacy_rule_deletes)
-        .unwrap_or_default()
-    {
-        let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
-        if helper(&own.image, IPTABLES_PATH, &refs).await.is_some() {
-            tracing::info!(rule = ?argv, "deleted legacy sandbox DOCKER-USER rule");
-        }
-    }
-    for (family, name) in tables.as_deref().map(stale_tables).unwrap_or_default() {
-        if helper(&own.image, NFT_PATH, &["delete", "table", &family, &name])
-            .await
-            .is_some()
-        {
-            tracing::info!(table = %name, family = %family, "deleted stale sandbox host table");
-        }
-    }
-}
-
 /// Ensure the relay socket directory exists for the relay uid: owned
 /// 65534:65534, mode 0700, so fleets cannot even traverse it.
 pub fn ensure_relay_dir() -> bool {
@@ -586,8 +417,8 @@ mod tests {
         BRIDGE_IFACES, INTERNAL_BRIDGE, INTERNAL_NETWORK, OPEN_BRIDGE, OPEN_NETWORK,
     };
     use super::{
-        bridge_matches, create_args, legacy_network_orphaned, legacy_rule_deletes,
-        parse_network_inspect, parse_own_container, stale_tables, valid_cidr, DataMount,
+        bridge_matches, create_args, parse_network_inspect, parse_own_container, valid_cidr,
+        DataMount,
     };
 
     #[test]
@@ -653,22 +484,6 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn legacy_networks_are_removed_only_when_orphaned() {
-        let empty = r#"[{"Name": "celld", "Internal": false,
-          "Options": {"com.docker.network.bridge.enable_icc": "false",
-                      "com.docker.network.bridge.name": "celld0"},
-          "IPAM": {"Config": [{"Subnet": "172.19.0.0/16"}]}}]"#;
-        assert_eq!(legacy_network_orphaned(empty, "celld"), Some(true));
-        let attached = r#"[{"Name": "celld", "Internal": false,
-          "Options": {"com.docker.network.bridge.enable_icc": "false",
-                      "com.docker.network.bridge.name": "celld0"},
-          "Containers": {"abc123": {"Name": "old"}},
-          "IPAM": {"Config": [{"Subnet": "172.19.0.0/16"}]}}]"#;
-        assert_eq!(legacy_network_orphaned(attached, "celld"), Some(false));
-        assert_eq!(legacy_network_orphaned(empty, "celld-internal"), None);
-        assert_eq!(legacy_network_orphaned("bogus", "celld"), None);
-    }
     #[test]
     fn network_inspect_parses_subnets_and_drops_garbage() {
         let json = r#"[
@@ -771,54 +586,5 @@ mod tests {
         assert_eq!(parse_own_container("9f2c4b1a8e03", noimage), None);
         assert_eq!(parse_own_container("", json), None);
         assert_eq!(parse_own_container("9f2c4b1a8e03", "bogus"), None);
-    }
-
-    #[test]
-    fn cleanup_deletes_only_our_old_rules() {
-        // `iptables -S DOCKER-USER` on a Docker 29 host that ran alpha.14
-        // (captured in the lab), plus Docker's and foreign rules.
-        let listing = "-N DOCKER-USER
--A DOCKER-USER -i celld1 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
--A DOCKER-USER -i celld0 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
--A DOCKER-USER -s 172.18.0.0/16 -o celld1 -p tcp -j ACCEPT
--A DOCKER-USER -s 172.18.0.0/16 -o celld0 -p tcp -j ACCEPT
--A DOCKER-USER -s 172.18.0.0/16 -o celld0 -p tcp -j ACCEPT
--A DOCKER-USER -s 172.18.0.0/16 -o celld0 -p tcp -m tcp --dport 443 -j ACCEPT
--A DOCKER-USER -i docker0 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
--A DOCKER-USER -s 10.0.0.1/8 -o celld0 -p tcp -j ACCEPT
--A DOCKER-USER -j RETURN
-";
-        let deletes: Vec<String> = legacy_rule_deletes(listing)
-            .iter()
-            .map(|argv| argv.join(" "))
-            .collect();
-        assert_eq!(
-            deletes,
-            vec![
-                "-D DOCKER-USER -i celld1 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT",
-                "-D DOCKER-USER -i celld0 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT",
-                "-D DOCKER-USER -s 172.18.0.0/16 -o celld1 -p tcp -j ACCEPT",
-                "-D DOCKER-USER -s 172.18.0.0/16 -o celld0 -p tcp -j ACCEPT",
-                // A duplicate (alpha.14's refresh raced itself) is deleted per copy.
-                "-D DOCKER-USER -s 172.18.0.0/16 -o celld0 -p tcp -j ACCEPT",
-            ]
-        );
-        assert!(legacy_rule_deletes("").is_empty());
-        assert!(legacy_rule_deletes("-N DOCKER-USER\n-A DOCKER-USER -j RETURN\n").is_empty());
-    }
-
-    #[test]
-    fn stale_table_detection_covers_both_families() {
-        let listing =
-            "table ip filter\ntable ip noite_sandbox\ntable inet noite_sandbox\ntable inet celld\n";
-        assert_eq!(
-            stale_tables(listing),
-            vec![
-                ("inet".to_string(), "noite_sandbox".to_string()),
-                ("ip".to_string(), "noite_sandbox".to_string()),
-            ]
-        );
-        assert!(stale_tables("table ip filter\n").is_empty());
-        assert!(stale_tables("").is_empty());
     }
 }

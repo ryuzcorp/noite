@@ -12,7 +12,7 @@ use super::apps::list_all_apps;
 /// reads the lowest free pair from the app + environment rows, so two
 /// concurrent creates — two environments, or an app and an environment —
 /// can read the same free pair and start two fleets on one port; the loser
-/// then dies at bind with "celld exited before answering its health gate".
+/// then dies at bind with "cello exited before answering its health gate".
 /// A claim holds this lock from the pick until the row insert commits, so a
 /// concurrent claim always sees the earlier claim's ports. Single-process
 /// invariant: an app create holds its slug's push guard across purge → insert
@@ -184,7 +184,7 @@ pub async fn ensure_app_build_uid(
 /// ephemeral ports.
 ///
 /// Both fleets are read: an app's pair **and** every preview environment's,
-/// because an environment is its own celld process with its own pair on the
+/// because an environment is its own cello process with its own pair on the
 /// same range and two fleets on one port crash-loop.
 pub async fn next_ports_in(
     pool: &SqlitePool,

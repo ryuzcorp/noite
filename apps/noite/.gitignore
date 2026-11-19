@@ -1,6 +1,6 @@
-# Generated router types, celld/wrangler/void local state and dev vars
+# Generated router types, cello/wrangler/void local state and dev vars
 .ilha
-.celld
+.cello
 .void
 .cloudflare
 .void-wrangler.jsonc
@@ -24,5 +24,5 @@ upgrade-report-*/
 upgrade-results/
 upgrade-results-*/
 
-# local celld/wrangler data
+# local cello/wrangler data
 data/

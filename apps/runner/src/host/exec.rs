@@ -666,7 +666,7 @@ fn kill_group(pid: u32) {
     }
 }
 
-/// Runner-owned command (git, celld): explicit env, piped output, and
+/// Runner-owned command (git, cello): explicit env, piped output, and
 /// — like [`run_sandboxed`] — its own process group, so a timed-out step's
 /// grandchildren die with it instead of keeping its port or lock.
 pub async fn run_cmd(
@@ -713,9 +713,9 @@ pub async fn run_cmd_stdin(
 
 /// One finished child process: its exit status plus both captured streams.
 /// Unlike [`run_cmd`], a nonzero exit is data rather than an error: some
-/// commands print their verdict on stdout however they exit (`celld invoke
+/// commands print their verdict on stdout however they exit (`cello invoke
 /// --json` prints the result envelope before its nonzero exit on a non-2xx
-/// answer; `celld r2 get|head --json` prints the `not_found` object for an
+/// answer; `cello r2 get|head --json` prints the `not_found` object for an
 /// absent key), so the caller — not the spawn — decides what the status
 /// means.
 pub struct CmdOutput {
@@ -739,7 +739,7 @@ pub async fn run_cmd_output(
 }
 
 /// [`run_cmd_output`] with the child's stdin fed, then closed: for commands
-/// that answer bytes — `celld r2 get` never reads stdin, so the closed pipe
+/// that answer bytes — `cello r2 get` never reads stdin, so the closed pipe
 /// is never observed (the same reason [`run_cmd_stdin`] exists). `None`
 /// leaves stdin inherited, as [`run_cmd`] does.
 pub async fn run_cmd_output_stdin(

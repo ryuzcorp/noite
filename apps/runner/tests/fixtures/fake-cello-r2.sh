@@ -1,5 +1,5 @@
 #!/bin/sh
-# Fake `celld` for the runner's R2 seam tests (`host/storage/r2.rs`). One
+# Fake `cello` for the runner's R2 seam tests (`host/storage/r2.rs`). One
 # committed copy serves every test: each test symlinks it into its own
 # fixture dir, so the executed file is never freshly written (exec'ing a
 # freshly-written file under parallel load spuriously fails with ETXTBSY).
@@ -7,7 +7,7 @@
 dir=$(dirname "$0")
 printf '%s\n' "$*" >> "$dir/invocations.log"
 if [ -f "$dir/fail-next" ]; then cat "$dir/fail-next" >&2; rm "$dir/fail-next"; exit 1; fi
-# A failing answer carried on stdout (`celld r2 head|get --json` prints the
+# A failing answer carried on stdout (`cello r2 head|get --json` prints the
 # not_found object there with exit 1): no stderr, just the fixture's bytes.
 if [ -f "$dir/fail-next-stdout" ]; then cat "$dir/fail-next-stdout"; rm "$dir/fail-next-stdout"; exit 1; fi
 case "$2" in
