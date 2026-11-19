@@ -6,14 +6,15 @@
  * required` subsection, even when it only says "None": an operator upgrading
  * reads that first, so a release that forgot it must fail here, not in prod.
  *
- * Since fragments landed, `## [Unreleased]` stays empty: new notes go in
- * `changelog.d/<unique-topic>.md` (the CHANGELOG's own `### <Section>`
- * headings with `- ` bullets), so concurrent PRs stop conflicting on one
- * section. The release PR assembles them with
+ * Since the 0.2.0 beta reset the pending release notes live directly in
+ * `## [Unreleased]` (its `### <Section>` headings validate like a
+ * fragment); new notes may still go in `changelog.d/<unique-topic>.md`
+ * (same headings with `- ` bullets), so concurrent PRs stop conflicting on
+ * one section. The release PR assembles both with
  * `bun docker/changelog-release.ts <version> [date]`.
  *
- *   bun docker/check-changelog.ts            released sections + fragments + empty Unreleased
- *   bun docker/check-changelog.ts 0.1.0-alpha.1
+ *   bun docker/check-changelog.ts            released sections + pending notes + fragments
+ *   bun docker/check-changelog.ts 0.2.0-beta.1
  *                                            ...and that version has a dated section
  *
  * `images.yml` runs the second form on a `v*` tag before anything is pushed.

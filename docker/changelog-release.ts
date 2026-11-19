@@ -39,9 +39,17 @@ const date = dateArg ?? new Date().toISOString().slice(0, 10);
 
 const dir = path.join(root, "changelog.d");
 
-const entries = readdirSync(dir)
-  .filter((name) => name.endsWith(".md"))
-  .toSorted();
+let entries: string[] = [];
+
+try {
+  entries = readdirSync(dir)
+    .filter((name) => name.endsWith(".md"))
+    .toSorted();
+} catch {
+  // No changelog.d/ yet (the reset deleted the fragments): the pending
+  // notes in ## [Unreleased] release on their own.
+  entries = [];
+}
 
 const changelogPath = path.join(root, "CHANGELOG.md");
 const changelog = readFileSync(changelogPath, "utf-8");

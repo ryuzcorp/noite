@@ -42,21 +42,22 @@ describe("spliceRelease", () => {
     ).toThrow("Unreleased");
   });
 
-  test("refuses a non-empty Unreleased section", () => {
+  test("releases notes pending in Unreleased with no fragments", () => {
     const dirty = BASE.replace(
       "<!-- Release notes live in changelog.d/ -->",
       "<!-- Release notes live in changelog.d/ -->\n\n### Added\n\n- Stray.\n"
     );
 
-    expect(() =>
-      spliceRelease(dirty, "0.1.0-alpha.9", "2026-10-22", [])
-    ).toThrow("changelog.d/");
+    const out = spliceRelease(dirty, "0.1.0-alpha.9", "2026-10-22", []);
+    expect(out).toContain("## [0.1.0-alpha.9] - 2026-10-22");
+    expect(out).toContain("- Stray.");
+    expect(out).not.toContain("### Added\n\n- Stray.\n\n## [0.1.0-alpha.9]");
   });
 
-  test("refuses an empty fragment set", () => {
+  test("refuses when fragments and Unreleased are both empty", () => {
     expect(() =>
       spliceRelease(BASE, "0.1.0-alpha.9", "2026-10-22", [])
-    ).toThrow("no fragments");
+    ).toThrow("nothing to release");
   });
 
   test("refuses a bad version or date", () => {

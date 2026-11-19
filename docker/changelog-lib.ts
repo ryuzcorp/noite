@@ -1,10 +1,13 @@
 /**
- * Shared changelog-fragment logic for `check-changelog.ts` (the gate) and
+ * Shared changelog logic for `check-changelog.ts` (the gate) and
  * `changelog-release.ts` (the release assembler).
  *
- * Fragments live in `changelog.d/<unique-topic>.md`, one per PR. The body
- * uses the CHANGELOG's own `### <Section>` headings with `- ` bullets;
- * multi-line bullets keep their continuation lines verbatim.
+ * Since the 0.2.0 beta reset the pending release notes live directly in
+ * `## [Unreleased]` (the reset entry was folded there and the `changelog.d/`
+ * fragments deleted). New fragments in `changelog.d/<unique-topic>.md`
+ * still validate when present and release alongside the Unreleased notes.
+ * The body uses the CHANGELOG's own `### <Section>` headings with
+ * `- ` bullets; multi-line bullets keep their continuation lines verbatim.
  */
 
 export const OPERATOR_SECTION = "Operator action required";
@@ -189,13 +192,21 @@ export const checkChangelog = (
     (section) => section.name === "Unreleased"
   );
 
-  if (!unreleased) {
+  if (unreleased) {
+    const pending = unreleased.body.replaceAll(COMMENT_BLOCK, "").trim();
+
+    if (pending !== "") {
+      try {
+        parseFragment("CHANGELOG.md [Unreleased]", pending);
+      } catch (error) {
+        errors.push(
+          `CHANGELOG.md [Unreleased]: ${error instanceof Error ? error.message : String(error)}`
+        );
+      }
+    }
+  } else {
     errors.push(
-      "CHANGELOG.md: needs an (empty) ## [Unreleased] section; new notes go in changelog.d/<topic>.md"
-    );
-  } else if (unreleased.body.replaceAll(COMMENT_BLOCK, "").trim() !== "") {
-    errors.push(
-      "CHANGELOG.md: [Unreleased] has entries; put new notes in changelog.d/<topic>.md instead"
+      "CHANGELOG.md: needs a ## [Unreleased] section; pending release notes live there directly"
     );
   }
 
@@ -263,16 +274,18 @@ export const buildReleaseSection = (
   return `${lines.join("\n").trimEnd()}\n`;
 };
 
-/** Pointer left in `## [Unreleased]` so editors find the fragments. */
+/** Pointer left in an emptied `## [Unreleased]` so editors find where pending notes live. */
 export const UNRELEASED_POINTER =
-  "<!-- New entries go in changelog.d/<topic>.md; the release PR assembles them with `bun docker/changelog-release.ts`. -->";
+  "<!-- Pending release notes live in ## [Unreleased] directly; new notes go in changelog.d/<topic>.md and the release PR assembles both with `bun docker/changelog-release.ts`. -->";
 
 const UNRELEASED_HEADER = /^## \[Unreleased\]\s*$/mu;
 
 /**
- * Splice the assembled section into the changelog right after the (empty)
- * `## [Unreleased]` block. Throws when there is nothing to release, the
- * version/date is bad, or Unreleased still holds entries.
+ * Splice the assembled section into the changelog right after the
+ * `## [Unreleased]` block. Notes pending in Unreleased release alongside
+ * `changelog.d/` fragments (name sorts with them); the block is emptied
+ * back to the pointer. Throws when there is nothing to release, or the
+ * version/date is bad.
  */
 export const spliceRelease = (
   changelog: string,
@@ -300,26 +313,30 @@ export const spliceRelease = (
   const bodyEnd =
     bodyStart + (next?.index === undefined ? changelog.length : next.index);
 
-  if (
-    changelog.slice(bodyStart, bodyEnd).replaceAll(COMMENT_BLOCK, "").trim() !==
-    ""
-  ) {
+  const pending = changelog
+    .slice(bodyStart, bodyEnd)
+    .replaceAll(COMMENT_BLOCK, "")
+    .trim();
+
+  const inputs: FragmentInput[] =
+    pending === ""
+      ? [...fragments]
+      : [...fragments, { name: "CHANGELOG.md [Unreleased]", text: pending }];
+
+  if (inputs.length === 0) {
     throw new Error(
-      "[Unreleased] still has entries; move them to changelog.d/ first"
+      "no fragments in changelog.d/ and [Unreleased] is empty; nothing to release"
     );
   }
 
-  if (fragments.length === 0) {
-    throw new Error("no fragments in changelog.d/; nothing to release");
-  }
-
-  const parsed = fragments.map(({ name, text }) => parseFragment(name, text));
+  const parsed = inputs.map(({ name, text }) => parseFragment(name, text));
   const section = buildReleaseSection(version, date, parsed);
   const block = changelog.slice(bodyStart, bodyEnd);
 
-  const pointer = block.includes("changelog.d/")
-    ? block
-    : `\n\n${UNRELEASED_POINTER}\n\n`;
+  const pointer =
+    pending === "" && block.includes("changelog.d/")
+      ? block
+      : `\n\n${UNRELEASED_POINTER}\n\n`;
 
   return `${changelog.slice(0, bodyStart)}${pointer}${section}\n${changelog.slice(bodyEnd)}`;
 };
