@@ -371,62 +371,19 @@ async fn reconcile_once(
         .map(|a| a.id.clone())
         .collect();
     let environments = db::list_all_environments(pool).await?;
-    // Stop phase: every fleet whose desired state is stopped — apps and
-    // previews together — concurrently. Each stop drains its own SIGTERM
-    // grace (up to 15 s) while holding no lock, but awaiting the stops one by
-    // one serialized the whole tick behind N slow drains: a start for an
-    // unrelated fleet waited behind stops it had nothing to do with
-    // (head-of-line) until its health-gate budget expired. All stops in this
-    // pass complete before any spawn in the loops below, and each key is
-    // stopped at most once per tick (one row per key), so the tick never
-    // starts a fleet while its own previous process is still draining, with
-    // no double stop or start. (A wake racing the stop phase can still spawn
-    // concurrently; that pre-existing race is settled by the spawn epoch.)
-    let mut stop_keys: Vec<String> = apps
-        .iter()
-        .filter(|a| a.desired() == DesiredState::Stopped)
-        .map(|a| a.slug.clone())
-        .collect();
-    stop_keys.extend(
-        environments
-            .iter()
-            .filter(|e| e.is_stopped() || stopped_apps.contains(&e.app_id))
-            .map(|e| supervisor::env_fleet_key(&e.app_slug, &e.label)),
-    );
-    supervisor::stop_fleets(procs, &stop_keys, supervisor::StopGrace::NORMAL).await;
-    for app in &apps {
-        if app.desired() == DesiredState::Stopped && app.status != AppStatus::Stopped {
-            db::write_app_status(
-                pool,
-                &app.id,
-                AppStatus::Stopped,
-                None,
-                None,
-                crate::models::WriteGuard::Table,
-            )
-            .await?;
-        }
-    }
-    for env in &environments {
-        if env.is_stopped() && env.status != AppStatus::Stopped {
-            db::write_environment_status(
-                pool,
-                &env.id,
-                AppStatus::Stopped,
-                None,
-                crate::models::WriteGuard::Table,
-            )
-            .await?;
-        }
-    }
+    // Spawn loops run before the stop phase below so a start never waits
+    // behind an unrelated fleet's drain. A spawn failure must not skip the
+    // safety-critical stops: the pass captures the spawn result, always
+    // runs the stop phase, then propagates the first error.
+    let spawn_result: anyhow::Result<()> = async {
     // Cold starts per pass (`RUNNER_FLEET_SPAWN_BATCH`): a boot or upgrade
     // must not stack every celld's initialization at once. Restarts of an
     // already-registered child are never batched — those wait on their own
     // backoff and deserve the next tick.
     let mut cold_starts: u32 = 0;
     for app in &apps {
-        // Stopped fleets left in the stop phase above: their drains all
-        // completed before this loop, so nothing here may start one again.
+        // Desired stopped rows never spawn: the stop phase below stops them
+        // in this same pass.
         if app.desired() == DesiredState::Stopped {
             continue;
         }
@@ -508,8 +465,8 @@ async fn reconcile_once(
     }
 
     // Preview environments are fleets of their own: same desired_state rule,
-    // same wake-aware parking, and their own ref drives their deploys. Stops
-    // ran in the stop phase above, so this loop only skips them.
+    // same wake-aware parking, and their own ref drives their deploys. The
+    // stop phase below stops the parked ones; this loop only skips them.
     for env in &environments {
         let fleet = format!("{}.{}", env.app_slug, env.label);
         if env.is_stopped() || stopped_apps.contains(&env.app_id) {
@@ -581,6 +538,65 @@ async fn reconcile_once(
             Err(e) => tracing::warn!(fleet = %fleet, error = %e, "list tip"),
         }
     }
+        Ok(())
+    }
+    .await;
+    let stop_result: anyhow::Result<()> = async {
+        // Stop phase, after the spawn loops above: every fleet whose desired
+        // state is stopped — apps and previews together — concurrently. Each
+        // stop drains its own SIGTERM grace (up to 15 s) while holding no lock.
+        // Spawns used to wait behind these drains in the same pass: a start for
+        // an unrelated fleet waited behind stops it had nothing to do with
+        // (head-of-line) until its health-gate budget expired (e2e
+        // deploy.spec.ts Stop→Start flake). Stops still complete within this
+        // pass before the next tick's spawns, and each key is stopped at most
+        // once per tick (one row per key), so the tick never starts a fleet
+        // while its own previous process is still draining, with no double
+        // stop or start. (A wake racing the stop phase can still spawn
+        // concurrently; that pre-existing race is settled by the spawn epoch.)
+        let mut stop_keys: Vec<String> = apps
+            .iter()
+            .filter(|a| a.desired() == DesiredState::Stopped)
+            .map(|a| a.slug.clone())
+            .collect();
+        stop_keys.extend(
+            environments
+                .iter()
+                .filter(|e| e.is_stopped() || stopped_apps.contains(&e.app_id))
+                .map(|e| supervisor::env_fleet_key(&e.app_slug, &e.label)),
+        );
+        supervisor::stop_fleets(procs, &stop_keys, supervisor::StopGrace::NORMAL).await;
+        for app in &apps {
+            if app.desired() == DesiredState::Stopped && app.status != AppStatus::Stopped {
+                db::write_app_status(
+                    pool,
+                    &app.id,
+                    AppStatus::Stopped,
+                    None,
+                    None,
+                    crate::models::WriteGuard::Table,
+                )
+                .await?;
+            }
+        }
+        for env in &environments {
+            if env.is_stopped() && env.status != AppStatus::Stopped {
+                db::write_environment_status(
+                    pool,
+                    &env.id,
+                    AppStatus::Stopped,
+                    None,
+                    crate::models::WriteGuard::Table,
+                )
+                .await?;
+            }
+        }
+        Ok(())
+    }
+    .await;
+    // First error wins: a spawn failure is never hidden by (and never hides)
+    // a stop failure.
+    spawn_result.and(stop_result)?;
 
     // Best-effort on the tick: a failed push must not abort the
     // reconcile (orphan sweeps, metrics) every tick while it persists.
@@ -1304,6 +1320,343 @@ mod tests {
             crate::models::AutoDeploy::Stopped { sha: "sha3".into() }
         );
 
+        pool.close().await;
+    }
+
+    /// A slow stop must not head-of-line-block an unrelated start. The stop
+    /// phase used to await every SIGTERM drain before any spawn in the same
+    /// pass, so a start waited behind stops it had nothing to do with until
+    /// its health-gate budget expired (e2e deploy.spec.ts Stop→Start flake:
+    /// the start spawned a full slow drain after the stop instead of on the
+    /// next tick). Park one fleet's stop mid-drain and require an unrelated
+    /// fleet's spawn claim in the same pass; fails on the old order via its
+    /// deadline.
+    /// Removes its temp DB file on drop, so a failed assert cannot leak it.
+    struct TempDb {
+        path: std::path::PathBuf,
+    }
+
+    impl Drop for TempDb {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unrelated_start_does_not_wait_behind_a_slow_stop() {
+        let mut cfg = crate::config::config_for_tests();
+        // Hermetic spawn: the binary can never exec, so the released claim
+        // fails fast on the spawn-error path instead of parking (or, with
+        // celld installed, leaking) a fleet child.
+        cfg.celld_bin = "/nonexistent/noite-test-no-celld".into();
+        // A temp file, not `:memory:`: the pool holds five connections and
+        // every `:memory:` connection is its own empty database, so the
+        // spawned reconcile would see none of these rows.
+        let _temp_db = TempDb {
+            path: std::env::temp_dir().join(format!("hol-start-order-{}.db", std::process::id())),
+        };
+        let _ = std::fs::remove_file(&_temp_db.path);
+        let db_url = format!("sqlite:{}?mode=rwc", _temp_db.path.to_string_lossy());
+        let pool = db::connect(&db_url).await.expect("temp db");
+        let procs = supervisor::new_procs();
+        // Fleet A is stopped: its stop parks mid-drain for the whole pass.
+        let stopped = db::create_app(
+            &pool,
+            &cfg,
+            db::NewApp {
+                name: "hol-stop",
+                slug: "hol-stop",
+                user_id: "local",
+                subdomain: "hol-stop.localhost",
+                listen: 30510,
+                internal: 30511,
+            },
+        )
+        .await
+        .expect("stopped app");
+        db::patch_app_desired(&pool, &stopped.id, DesiredState::Stopped)
+            .await
+            .expect("stop");
+        let stop_gate = supervisor::stop_gate_register("hol-stop");
+        // Fleet B wants to run and is deployed: its spawn claim must land
+        // while A's drain is still parked. The claim is released at once and
+        // the spawn then fails fast on the missing binary (asserted below),
+        // so no fleet process is ever spawned.
+        let starting = db::create_app(
+            &pool,
+            &cfg,
+            db::NewApp {
+                name: "hol-start",
+                slug: "hol-start",
+                user_id: "local",
+                subdomain: "hol-start.localhost",
+                listen: 30512,
+                internal: 30513,
+            },
+        )
+        .await
+        .expect("starting app");
+        db::upsert_deploy(
+            &pool,
+            None,
+            &starting.id,
+            None,
+            DeployStatus::Success,
+            Some("sha1"),
+            "",
+        )
+        .await
+        .expect("success deploy");
+        let spawn_gate = supervisor::test_gate_register("hol-start");
+        // Order recording: a watcher per gate pushes as its gate fires and
+        // releases it at once, so the pass keeps moving and the test observes
+        // the true order. Waiters first: a `notify_one` before `notified()`
+        // is lost, so both watchers are armed before the pass is spawned.
+        let order = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let claimed_watcher = tokio::spawn({
+            let (gate, order) = (spawn_gate.clone(), order.clone());
+            async move {
+                gate.pre_claim_arrived.notified().await;
+                order
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push("claim");
+                gate.pre_claim_release.notify_one();
+            }
+        });
+        let entered_watcher = tokio::spawn({
+            let (gate, order) = (stop_gate.clone(), order.clone());
+            async move {
+                gate.entered.notified().await;
+                order
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push("enter");
+                gate.release.notify_one();
+            }
+        });
+
+        // Belt and suspenders for the hermetic spawn above: adoption parks
+        // only on a path the missing binary never reaches, but a park there
+        // must release rather than wedge the pass or leak a child. Never
+        // joined — it fires only on that unreachable path — and aborted in
+        // cleanup below.
+        let adopt_releaser = tokio::spawn({
+            let gate = spawn_gate.clone();
+            async move {
+                gate.pre_adopt_arrived.notified().await;
+                gate.pre_adopt_release.notify_one();
+            }
+        });
+        // test does not have, so hold a fake claim and skip it.
+        let deploying = crate::host::deploy::new_deploying();
+        deploying
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert("hol-block-metrics".to_string());
+        let recon = tokio::spawn({
+            let (pool, cfg, procs, deploying) =
+                (pool.clone(), cfg.clone(), procs.clone(), deploying.clone());
+            async move {
+                let (_tip_tx, mut tip_rx) = tokio::sync::mpsc::unbounded_channel();
+                let (log_tx, _log_rx) = tokio::sync::watch::channel(0u64);
+                let mut metrics = crate::host::metrics::new_state();
+                let mut last_sweep = Some(Instant::now());
+                reconcile_once(
+                    &pool,
+                    &cfg,
+                    &procs,
+                    0,
+                    &crate::host::logs::new_state(),
+                    &deploying,
+                    &mut metrics,
+                    &mut tip_rx,
+                    &mut last_sweep,
+                    &log_tx,
+                )
+                .await
+            }
+        });
+        // Both gates must fire: the pass must reach both the spawn and the
+        // stop. The releases above already unblocked the pass, so a timeout
+        // here means the pass never got there at all.
+        let fired = tokio::time::timeout(Duration::from_secs(10), async {
+            let _ = tokio::join!(claimed_watcher, entered_watcher);
+        })
+        .await;
+        // No parked task outlives the test, and a failure still cleans the
+        // static gate maps. `_temp_db` removes the temp file on drop.
+        adopt_releaser.abort();
+        supervisor::stop_gate_remove("hol-stop");
+        supervisor::test_gate_remove("hol-start");
+        assert!(fired.is_ok(), "the pass never reached both gates");
+        // Three layers, unwrapped separately: the timeout, the task join,
+        // and the pass result. The expected spawn error (missing binary) is
+        // absorbed by the loop's error branch, so a pass `Err` here is a
+        // real defect, not the injected failure.
+        let recon_joined = tokio::time::timeout(Duration::from_secs(30), recon)
+            .await
+            .expect("the pass did not finish after the gates released");
+        let recon_result = recon_joined.expect("the pass task panicked");
+        recon_result.expect("the pass returned an error");
+        assert_eq!(
+            *order
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            vec!["claim", "enter"],
+            "the unrelated start's spawn claim waited behind the parked stop's drain"
+        );
+        let b = db::get_app(&pool, &starting.id)
+            .await
+            .expect("reread")
+            .expect("row");
+        assert!(
+            b.last_error.is_some(),
+            "the unblocked spawn must fail fast on the missing binary instead of parking a child"
+        );
+        pool.close().await;
+    }
+
+    /// A spawn-loop failure must not skip the stop phase. The spawn loops
+    /// run inline before the stops, so a `?` up there used to return out of
+    /// the pass before a single desired-stopped fleet drained. B's spawn
+    /// claim breaks the pool — every later spawn-loop write fails — while
+    /// the stop's drain owns no pool connection and must still run. Fails
+    /// without the always-run stop phase: the pass returns first and the
+    /// stop gate never fires.
+    #[tokio::test]
+    async fn a_spawn_loop_error_does_not_skip_the_stop_phase() {
+        let mut cfg = crate::config::config_for_tests();
+        // Hermetic spawn, as above: the claim fails fast instead of parking
+        // (or leaking) a child.
+        cfg.celld_bin = "/nonexistent/noite-test-no-celld".into();
+        // Temp file, not `:memory:`: the pool holds five connections and
+        // every `:memory:` connection is its own empty database.
+        let _temp_db = TempDb {
+            path: std::env::temp_dir().join(format!("hol-stop-on-error-{}.db", std::process::id())),
+        };
+        let _ = std::fs::remove_file(&_temp_db.path);
+        let db_url = format!("sqlite:{}?mode=rwc", _temp_db.path.to_string_lossy());
+        let pool = db::connect(&db_url).await.expect("temp db");
+        let procs = supervisor::new_procs();
+        // Fleet A is stopped: its stop must run even though the spawn loops
+        // below fail first.
+        let stopped = db::create_app(
+            &pool,
+            &cfg,
+            db::NewApp {
+                name: "hol-err-stop",
+                slug: "hol-err-stop",
+                user_id: "local",
+                subdomain: "hol-err-stop.localhost",
+                listen: 30520,
+                internal: 30521,
+            },
+        )
+        .await
+        .expect("stopped app");
+        db::patch_app_desired(&pool, &stopped.id, DesiredState::Stopped)
+            .await
+            .expect("stop");
+        let stop_gate = supervisor::stop_gate_register("hol-err-stop");
+        // Fleet B is deployed and wants to run. Its spawn claim breaks the
+        // pool — every later spawn-loop write fails — and releases at once,
+        // so the pass continues into the stop phase instead of wedging.
+        let starting = db::create_app(
+            &pool,
+            &cfg,
+            db::NewApp {
+                name: "hol-err-start",
+                slug: "hol-err-start",
+                user_id: "local",
+                subdomain: "hol-err-start.localhost",
+                listen: 30522,
+                internal: 30523,
+            },
+        )
+        .await
+        .expect("starting app");
+        db::upsert_deploy(
+            &pool,
+            None,
+            &starting.id,
+            None,
+            DeployStatus::Success,
+            Some("sha1"),
+            "",
+        )
+        .await
+        .expect("success deploy");
+        let spawn_gate = supervisor::test_gate_register("hol-err-start");
+        // Waiters first: a `notify_one` before `notified()` is lost.
+        let claimed = spawn_gate.pre_claim_arrived.notified();
+        let entered = stop_gate.entered.notified();
+        // The metrics tick runs at the end of a pass; it needs a store the
+        // test does not have, so hold a fake claim and skip it.
+        let deploying = crate::host::deploy::new_deploying();
+        deploying
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert("hol-block-metrics".to_string());
+        let recon = tokio::spawn({
+            let (pool, cfg, procs, deploying) =
+                (pool.clone(), cfg.clone(), procs.clone(), deploying.clone());
+            async move {
+                let (_tip_tx, mut tip_rx) = tokio::sync::mpsc::unbounded_channel();
+                let (log_tx, _log_rx) = tokio::sync::watch::channel(0u64);
+                let mut metrics = crate::host::metrics::new_state();
+                let mut last_sweep = Some(Instant::now());
+                reconcile_once(
+                    &pool,
+                    &cfg,
+                    &procs,
+                    0,
+                    &crate::host::logs::new_state(),
+                    &deploying,
+                    &mut metrics,
+                    &mut tip_rx,
+                    &mut last_sweep,
+                    &log_tx,
+                )
+                .await
+            }
+        });
+        // B's claim breaks the pool, failing every later spawn-loop write;
+        // the release lets the pass continue instead of wedging on the claim.
+        let injected = tokio::time::timeout(Duration::from_secs(10), async {
+            claimed.await;
+            pool.close().await;
+            spawn_gate.pre_claim_release.notify_one();
+        })
+        .await;
+        // The stop must still run: its drain owns no pool connection, so a
+        // broken pool must not skip it. The release lets the pass finish
+        // instead of wedging on the drain.
+        let stopped_ran = tokio::time::timeout(Duration::from_secs(10), async {
+            entered.await;
+            stop_gate.release.notify_one();
+        })
+        .await;
+        // No parked task outlives the test. The gates stay registered until
+        // here: removing A's gate any earlier unregisters the stop the pass
+        // has not reached yet.
+        supervisor::stop_gate_remove("hol-err-stop");
+        supervisor::test_gate_remove("hol-err-start");
+        assert!(injected.is_ok(), "the pass never reached B's spawn claim");
+        assert!(
+            stopped_ran.is_ok(),
+            "the stop never ran: a spawn-loop error skipped the stop phase"
+        );
+        // The broken pool must still fail the pass: silence here would mean
+        // the injection broke, not that the stop was saved.
+        let recon_joined = tokio::time::timeout(Duration::from_secs(30), recon)
+            .await
+            .expect("the pass did not finish after the stop released");
+        let recon_result = recon_joined.expect("the pass task panicked");
+        assert!(
+            recon_result.is_err(),
+            "the broken pool should have failed the pass"
+        );
         pool.close().await;
     }
 }
