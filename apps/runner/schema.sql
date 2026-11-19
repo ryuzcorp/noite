@@ -2,11 +2,11 @@
 -- every boot (`db::connect`) and idempotent: every statement is CREATE ... IF
 -- NOT EXISTS.
 --
--- Alpha builds do not migrate between versions: a database stamped by another
--- alpha is refused in `schema_version.rs` (version in `PRAGMA user_version`),
--- never reshaped. A shape change therefore only edits the CREATE below.
--- Nothing in this file ALTERs or DROPs (a bare `DROP` would resolve into the
--- ATTACHed metrics.sqlite).
+-- The single post-reset baseline (stamped 200 in `schema_version.rs`): any
+-- other stamp — or an unstamped database that already has tables — is
+-- refused, never reshaped. A shape change therefore only edits the CREATE
+-- below. Nothing in this file ALTERs or DROPs (a bare `DROP` would resolve
+-- into the ATTACHed metrics.sqlite).
 
 -- Apps: one row per tenant app. Hard DELETE is the only remove path.
 CREATE TABLE IF NOT EXISTS app (
