@@ -1,3 +1,26 @@
+-- The single post-reset baseline (0.2.0 beta reset): the only migration the
+-- worker applies to a fresh control database, and the only name its ledger
+-- may hold. The statements below refuse a pre-reset database before any
+-- shape lands: when legacy ledger/pool tables exist, or the migration ledger
+-- names anything but this baseline, the sentinel insert violates its named
+-- CHECK and the migration fails with the reset message (the same text the
+-- runner answers for its own database). SQLite's RAISE cannot carry a custom
+-- message outside a trigger, so the message rides on the constraint's name.
+CREATE TABLE IF NOT EXISTS `_void_migrations` (
+	`name` TEXT PRIMARY KEY NOT NULL,
+	`applied_at` TEXT NOT NULL
+);
+--> statement-breakpoint
+CREATE TABLE IF NOT EXISTS `_void_lineage_guard` (
+	`id` INTEGER PRIMARY KEY NOT NULL CONSTRAINT "refusing to start: this database was written by a Noite release before the 0.2.0 beta reset and cannot be upgraded. Back it up if you need it, wipe the data volume and the bucket prefix (or use an empty bucket), then install fresh." CHECK (`id` > 0)
+);
+--> statement-breakpoint
+INSERT INTO `_void_lineage_guard` (`id`) SELECT CASE WHEN EXISTS (
+	SELECT 1 FROM `sqlite_master` WHERE type = 'table' AND name IN ('_migrations', 'invite', 'paranorm_idempotency', 'paranorm_migrations')
+) OR EXISTS (
+	SELECT 1 FROM `_void_migrations` WHERE name != '001_baseline'
+) THEN -1 ELSE 1 END WHERE NOT EXISTS (SELECT 1 FROM `_void_lineage_guard`);
+--> statement-breakpoint
 CREATE TABLE IF NOT EXISTS `account` (
 	`id` text PRIMARY KEY NOT NULL,
 	`accountId` text NOT NULL,
@@ -69,19 +92,6 @@ CREATE TABLE IF NOT EXISTS `collaborator_invite` (
 CREATE INDEX IF NOT EXISTS `idx_collaborator_invite_email` ON `collaborator_invite` (`email`);--> statement-breakpoint
 CREATE INDEX IF NOT EXISTS `idx_collaborator_invite_appId` ON `collaborator_invite` (`appId`);--> statement-breakpoint
 CREATE UNIQUE INDEX IF NOT EXISTS `uq_collaborator_invite_appId_email` ON `collaborator_invite` (`appId`,`email`);--> statement-breakpoint
-CREATE TABLE IF NOT EXISTS `invite` (
-	`id` text PRIMARY KEY NOT NULL,
-	`code` text NOT NULL,
-	`createdBy` text NOT NULL,
-	`usedBy` text,
-	`usedAt` text,
-	`revoked` integer DEFAULT false NOT NULL,
-	`note` text,
-	`createdAt` text DEFAULT CURRENT_TIMESTAMP NOT NULL
-);
---> statement-breakpoint
-CREATE INDEX IF NOT EXISTS `idx_invite_createdBy` ON `invite` (`createdBy`);--> statement-breakpoint
-CREATE UNIQUE INDEX IF NOT EXISTS `uq_invite_code` ON `invite` (`code`);--> statement-breakpoint
 CREATE TABLE IF NOT EXISTS `passkey` (
 	`id` text PRIMARY KEY NOT NULL,
 	`name` text,
@@ -125,6 +135,7 @@ CREATE TABLE IF NOT EXISTS `user` (
 	`banReason` text,
 	`banExpires` text,
 	`onboardedAt` text,
+	`status` text DEFAULT 'active' NOT NULL,
 	`createdAt` text DEFAULT CURRENT_TIMESTAMP NOT NULL,
 	`updatedAt` text DEFAULT CURRENT_TIMESTAMP NOT NULL
 );
@@ -139,4 +150,32 @@ CREATE TABLE IF NOT EXISTS `verification` (
 	`updatedAt` text DEFAULT CURRENT_TIMESTAMP NOT NULL
 );
 --> statement-breakpoint
-CREATE INDEX IF NOT EXISTS `idx_verification_identifier` ON `verification` (`identifier`);
+CREATE INDEX IF NOT EXISTS `idx_verification_identifier` ON `verification` (`identifier`);--> statement-breakpoint
+CREATE TABLE IF NOT EXISTS `bootstrap_setup` (
+	`codeHash` text NOT NULL,
+	`consumedAt` text,
+	`consumedBy` text,
+	`createdAt` text DEFAULT CURRENT_TIMESTAMP NOT NULL,
+	`id` text PRIMARY KEY NOT NULL
+);
+--> statement-breakpoint
+CREATE TABLE IF NOT EXISTS `email_invite` (
+	`id` text PRIMARY KEY NOT NULL,
+	`email` text NOT NULL,
+	`tokenHash` text NOT NULL,
+	`createdBy` text NOT NULL,
+	`expiresAt` text NOT NULL,
+	`usedAt` text,
+	`usedBy` text,
+	`revoked` integer DEFAULT false NOT NULL,
+	`createdAt` text DEFAULT CURRENT_TIMESTAMP NOT NULL
+);
+--> statement-breakpoint
+CREATE UNIQUE INDEX IF NOT EXISTS `uq_email_invite_tokenHash` ON `email_invite` (`tokenHash`);--> statement-breakpoint
+CREATE INDEX IF NOT EXISTS `idx_email_invite_email` ON `email_invite` (`email`);--> statement-breakpoint
+CREATE INDEX IF NOT EXISTS `idx_email_invite_createdBy` ON `email_invite` (`createdBy`);--> statement-breakpoint
+CREATE TABLE IF NOT EXISTS `instance_setting` (
+	`key` text PRIMARY KEY NOT NULL,
+	`value` text NOT NULL,
+	`updatedAt` text DEFAULT CURRENT_TIMESTAMP NOT NULL
+);

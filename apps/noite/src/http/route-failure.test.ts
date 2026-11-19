@@ -1,15 +1,18 @@
 import { describe, expect, test } from "bun:test";
 
-import { DB_MIGRATING_BODY, dbUnavailable } from "../lib/db";
+import { dbUnavailable } from "../lib/db";
 import { routeFailure } from "./route-failure";
 
 describe("routeFailure", () => {
-  test("a half-migrated database answers 503 with retry-after", async () => {
+  test("a database outage stays a flat 500 with no retry", async () => {
+    // The half-migrated 503 is gone with the pre-reset lineages: a database
+    // failure retries nothing, so the visitor never waits on a database that
+    // refuses to migrate.
     const response = routeFailure("[test]", dbUnavailable());
 
-    expect(response.status).toBe(503);
-    expect(response.headers.get("retry-after")).toBe("5");
-    expect(await response.text()).toBe(DB_MIGRATING_BODY);
+    expect(response.status).toBe(500);
+    expect(response.headers.get("retry-after")).toBeNull();
+    expect(await response.text()).toBe("");
   });
 
   test("anything else stays a flat 500", () => {
@@ -17,8 +20,6 @@ describe("routeFailure", () => {
   });
 
   test("a wrong table name stays a flat 500", () => {
-    // The 503 gate only knows the schema's own tables: a code bug naming
-    // any other table must 500 here, never "migrating" forever.
     const response = routeFailure(
       "[test]",
       new Error("no such table: typo_table")
