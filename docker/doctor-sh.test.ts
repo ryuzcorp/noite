@@ -16,7 +16,7 @@ const PRE_RESET_REFUSAL =
   "refusing to start: this database was written by a Noite release before the 0.2.0 beta reset and cannot be upgraded. Back it up if you need it, wipe the data volume and the bucket prefix (or use an empty bucket), then install fresh.";
 
 const TOO_NEW_REFUSAL =
-  "refusing to start: this database was written by a newer Noite release (schema version 201; this image only understands up to 200) and cannot be upgraded or downgraded across releases. Back it up if you need it, wipe the data volume and the bucket prefix (or use an empty bucket), then install fresh.";
+  "refusing to start: this database was written by a newer Noite release (schema version 201; this image only understands up to 200). Install the image matching that schema version, or restore a backup taken before the upgrade. Downgrading across a schema change is not supported.";
 
 let dir: string;
 

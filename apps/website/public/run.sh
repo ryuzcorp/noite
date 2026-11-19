@@ -40,7 +40,7 @@ if [[ "$name" == install ]]; then
   reset_env="${NOITE_DIR:-/opt/noite}/.env"
   if [[ -f "$reset_env" ]] && { grep -qE '^CELLD_[A-Za-z0-9_]+=' "$reset_env" 2>/dev/null || grep -qE '^NOITE_IMAGE=.*:0\.1\.0-' "$reset_env" 2>/dev/null; }; then
     cat >&2 <<EOF
-error pre-reset install: this install was written by Noite 0.1.0 (alpha/beta) before the 0.2.0 beta reset and cannot be upgraded. Across the 0.2.0 beta reset: reinstall, no upgrade. To start fresh: (1) optionally back up first (https://noite.now/self-hosting/operations#backups); (2) cd ${NOITE_DIR:-/opt/noite} && docker compose down -v (multi installs add -f compose.yaml -f compose.multi.yaml); (3) move the old .env aside (the installer refuses a .env with CELLD_* or a 0.1.0 image pin); (4) empty the bucket, or point the fresh install at an empty bucket or prefix; (5) re-run this installer.
+error pre-reset install: this install was written by Noite 0.1.0 (alpha/beta) before the 0.2.0 beta reset and cannot be upgraded. Across the 0.2.0 beta reset: reinstall, no upgrade. To start fresh: (1) optionally back up first (https://noite.now/self-hosting/operations#backups); (2) cd ${NOITE_DIR:-/opt/noite} && docker compose down -v (multi installs add -f compose.yaml -f compose.multi.yaml); (3) move the old .env aside (the installer refuses a .env with CELLD_* or a 0.1.0 image pin); (4) empty the bucket, or point the fresh install at an empty bucket or prefix; (5) re-run this installer. The moved-aside .env still holds secrets: keep it chmod 600 and delete it securely once the reinstall works.
 EOF
     exit 1
   fi

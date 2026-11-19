@@ -328,9 +328,9 @@ main`;
     expect(result.stderr).toContain("cannot be upgraded");
     expect(result.stderr).toContain("before the 0.2.0 beta reset");
     expect(result.stderr).toContain("down -v");
-    // The reinstall only works when the stale .env is moved aside first:
-    // `down -v` leaves the file behind and the next run refuses again.
+    // The moved-aside file keeps working secrets until it is deleted.
     expect(result.stderr).toContain("move the old .env aside");
+    expect(result.stderr).toContain("chmod 600");
     expect(result.stderr).toContain("re-run");
     expect(readEnv()).toBe(before);
     expect(stepsRan()).toBe(false);

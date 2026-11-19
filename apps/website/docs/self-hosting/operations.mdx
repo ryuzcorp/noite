@@ -37,7 +37,9 @@ you need anything it holds, `docker compose down -v` (multi installs add
 installer refuses a `.env` with `CELLD_*` or a `0.1.0` image pin, so
 re-running it against the old file refuses again), empty the bucket or point
 the fresh install at an empty bucket or prefix, re-run the installer, and
-re-create your apps.
+re-create your apps. The moved-aside `.env` still holds secrets
+(`RUNNER_TOKEN`, `BETTER_AUTH_SECRET`, the RustFS keys): keep it
+`chmod 600` and delete it securely once the reinstall works.
 
 Once the first post-reset release ships, upgrades resume on the new
 lineage: every release proves the previous release's data upgrades in
