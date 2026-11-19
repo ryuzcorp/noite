@@ -200,9 +200,7 @@ describe("control baseline", () => {
     // `drizzle-kit generate` diffs the declared schema against the newest
     // snapshot: with no snapshot it emits CREATE for every table, and that
     // next migration then fails against the already-created baseline. The
-    // snapshot must name every declared table so a regeneration stays empty
-    // (CI also runs `generate` into a scratch copy and fails on any new
-    // file: `.github/workflows/check.yml`, "drizzle baseline snapshot").
+    // snapshot must name every declared table so a regeneration stays empty.
     const dir = path.join(import.meta.dir, "migrations", "meta");
 
     // SAFETY: _journal.json is a repo-controlled drizzle journal; the test

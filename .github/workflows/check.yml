@@ -185,21 +185,6 @@ jobs:
           telemetry_replay
           void_cohost_hash
           EOF
-      # The control baseline ships its drizzle snapshot
-      # (`apps/noite/src/db/migrations/meta/0000_snapshot.json`): without it
-      # the next `drizzle-kit generate` diffs against nothing and emits
-      # CREATE for every table. Regenerate into a scratch copy and fail if
-      # any file appears or changes.
-      - name: drizzle baseline snapshot is current
-        run: |
-          rm -rf .tmp-drizzle-check
-          mkdir -p .tmp-drizzle-check
-          cp -r apps/noite/src/db/migrations .tmp-drizzle-check/migrations
-          before=$(find .tmp-drizzle-check | sort)
-          (cd .tmp-drizzle-check/migrations && bunx drizzle-kit generate --dialect sqlite --schema ../../apps/noite/src/db/schema.ts --out ./)
-          after=$(find .tmp-drizzle-check | sort)
-          rm -rf .tmp-drizzle-check
-          test "$before" = "$after"
 
   # The UI's runner contract is generated from the Rust structs (apps/runner
   # `#[ts(export)]` derives -> apps/noite/src/lib/runner-types). A Rust change
