@@ -28,7 +28,7 @@ import { watch } from "ilha";
 
 import type { AppDetail } from "../api-types";
 import { appStateUrl, decodeAppState, feedKeys, liveFeed } from "../feeds";
-import { invalidate } from "../resource";
+import { invalidate, isLoadInFlight, supersede } from "../resource";
 import { keys } from "../resources";
 import type { AppRole } from "../roles";
 import type { RunnerAppState, RunnerEnvironment } from "../runner";
@@ -163,6 +163,16 @@ const AppStateSync = ({ appId }: { appId: string }) => {
 
     for (const key of stale) {
       invalidate(key);
+    }
+
+    // A frame that agrees with the cache may still be newer than an
+    // in-flight load: that load read before this frame arrived, so whatever
+    // it resolves with is older truth. Supersede it — end it and refetch —
+    // so its stale result cannot settle over this frame.
+    for (const key of [keys.appDetail(appId), keys.environments(appId)]) {
+      if (!stale.includes(key) && isLoadInFlight(key)) {
+        supersede(key);
+      }
     }
   });
 

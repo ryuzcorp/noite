@@ -277,6 +277,10 @@ interface KeySub {
 const fetchers = new Map<string, ResourceFetcher<unknown>>();
 const generations = new Map<string, number>();
 
+/** Latest settled generation per key: a load is in flight while the newest
+ * generation has not settled (success or failure both end it). */
+const settledGenerations = new Map<string, number>();
+
 /** Keys whose snapshots stay in memory only (`tracked(..., { persist: false
  * })`): bulky entries that would crowd the small sessionStorage quota. */
 const memoryOnly = new Set<string>();
@@ -375,6 +379,8 @@ const settleKey = (
     return;
   }
 
+  settledGenerations.set(key, generation);
+
   const readers = subs.get(key);
 
   if (readers === undefined) {
@@ -384,6 +390,21 @@ const settleKey = (
   for (const sub of readers) {
     sub.settle(outcome);
   }
+};
+
+/** Whether `key` has a load in flight: the newest generation started but
+ * none settled since. A frame that lands while this is true is newer than
+ * whatever the load will resolve with, so the sync supersedes the load
+ * instead of letting its stale result settle. */
+export const isLoadInFlight = (key: string): boolean =>
+  (generations.get(key) ?? 0) > (settledGenerations.get(key) ?? 0);
+
+/** End the in-flight load for `key`, if any, and start a fresh one: a frame
+ * that arrived mid-load carries newer truth than the load will resolve
+ * with, so the load must not settle over it. */
+export const supersede = (key: string): void => {
+  abortKey(key);
+  invalidate(key);
 };
 
 /** Drop the cache entry and reload every mounted reader. The promise settles

@@ -16,7 +16,7 @@ import {
   tracked,
   withRetry,
 } from "./resource";
-import type { Resource, ResourceState } from "./resource";
+import type { Resource, ResourceFetcher, ResourceState } from "./resource";
 import { appDetail, environments, errorDetail } from "./resources";
 import type { RunnerErrorDetail } from "./runner";
 import { clearSwrStore, readSwr, writeSwr } from "./swr-store";
@@ -176,7 +176,7 @@ let probeKey = "";
 let probeFetch: () => Promise<string[]> = () => Promise.resolve([]);
 
 let probeWrap:
-  | ((fetch: () => Promise<string[]>) => () => Promise<string[]>)
+  | ((fetch: () => Promise<string[]>) => ResourceFetcher<string[]>)
   | undefined;
 
 /** A mounted `tracked` reader reporting its paint and failure as signals. */
@@ -1059,7 +1059,12 @@ describe("app state recovery", () => {
 
       let calls = 0;
 
-      globalThis.fetch = (() => {
+      // SAFETY: the test only needs the (url, init) call shape, like the
+      // fetch doubles in http/recovery and routes/envelope.
+      globalThis.fetch = ((
+        _url: string | URL | Request,
+        _init?: RequestInit
+      ) => {
         calls += 1;
 
         if (calls === 1) {
@@ -1069,7 +1074,8 @@ describe("app state recovery", () => {
         }
 
         return Promise.resolve(Response.json(body, { status: 200 }));
-      }) as typeof fetch;
+        // oxlint-disable-next-line anti-slop/no-chained-type-assertions -- test double for the global fetch, matching the repo's established stubs.
+      }) as unknown as typeof fetch;
 
       let capturedDetail:
         | Resource<{ app: unknown; myRole: string }>
@@ -1132,7 +1138,12 @@ describe("app state recovery", () => {
       const body = [{ appId: id, id: "env-retry", status: "running" }];
       let calls = 0;
 
-      globalThis.fetch = (() => {
+      // SAFETY: the test only needs the (url, init) call shape, like the
+      // fetch doubles in http/recovery and routes/envelope.
+      globalThis.fetch = ((
+        _url: string | URL | Request,
+        _init?: RequestInit
+      ) => {
         calls += 1;
 
         if (calls === 1) {
@@ -1142,7 +1153,8 @@ describe("app state recovery", () => {
         }
 
         return Promise.resolve(Response.json(body, { status: 200 }));
-      }) as typeof fetch;
+        // oxlint-disable-next-line anti-slop/no-chained-type-assertions -- test double for the global fetch, matching the repo's established stubs.
+      }) as unknown as typeof fetch;
 
       let capturedList: Resource<{ appId: string; id: string }[]> | undefined;
 
