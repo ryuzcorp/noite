@@ -94,10 +94,16 @@ const ingest = (key: string, appId = "demo"): Promise<Response> =>
     { appId, kind: "events" }
   ) as Promise<Response>;
 
+let cookieCount = 0;
+
 /** A real better-auth session cookie for an existing account, through the
  * same OTP flow the login panel uses (localhost delivery goes to the
  * console). */
 const signInCookie = async (email: string): Promise<string> => {
+  // One client IP per mint: better-auth budgets sign-ins per IP (a shared
+  // bucket when unknown), and that budget is process-wide.
+  cookieCount += 1;
+  const headers = { "x-forwarded-for": `10.204.0.${cookieCount}` };
   const lines: unknown[][] = [];
 
   const log = spyOn(console, "log").mockImplementation((...args: unknown[]) => {
@@ -109,6 +115,7 @@ const signInCookie = async (email: string): Promise<string> => {
   try {
     await auth.api.sendVerificationOTP({
       body: { email, type: "sign-in" },
+      headers: new Headers(headers),
     });
   } finally {
     log.mockRestore();
@@ -127,7 +134,7 @@ const signInCookie = async (email: string): Promise<string> => {
   const signedIn = await auth.handler(
     new Request(`${ENV.BETTER_AUTH_URL}/api/auth/sign-in/email-otp`, {
       body: JSON.stringify({ email, otp }),
-      headers: { "content-type": "application/json" },
+      headers: { "content-type": "application/json", ...headers },
       method: "POST",
     })
   );

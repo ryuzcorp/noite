@@ -16,6 +16,8 @@ const ENV = {
 
 const auth = () => createAuth(ENV, ENV.BETTER_AUTH_URL);
 
+let ipCount = 0;
+
 beforeAll(async () => {
   db = createTestD1();
   setD1Binding(db.d1);
@@ -193,6 +195,11 @@ describe("a failing auth database write never logs its SQL or parameters", () =>
       // better-auth rethrows a non-API failure (`onAPIError.throw`) so
       // better-call's raw `# SERVER_ERROR` log never runs; `handleAuth` logs
       // the cause chain and answers a generic 500.
+      // One client IP per handler request: better-auth budgets handler calls
+      // per IP (a shared bucket when unknown), and that budget is
+      // process-wide, so a shared bucket throttles later files in a run.
+      ipCount += 1;
+
       const response = await handleAuth(
         new Request(
           `${ENV.BETTER_AUTH_URL}/api/auth/email-otp/send-verification-otp`,
@@ -201,6 +208,7 @@ describe("a failing auth database write never logs its SQL or parameters", () =>
             headers: {
               "content-type": "application/json",
               origin: ENV.BETTER_AUTH_URL,
+              "x-forwarded-for": `10.203.0.${ipCount}`,
             },
             method: "POST",
           }
@@ -243,12 +251,15 @@ describe("better-auth's own error logging is redacted", () => {
     );
     const code = await requestCode("session@example.com");
 
+    ipCount += 1;
+
     const signIn = await auth().handler(
       new Request(`${ENV.BETTER_AUTH_URL}/api/auth/sign-in/email-otp`, {
         body: JSON.stringify({ email: "session@example.com", otp: code }),
         headers: {
           "content-type": "application/json",
           origin: ENV.BETTER_AUTH_URL,
+          "x-forwarded-for": `10.203.0.${ipCount}`,
         },
         method: "POST",
       })

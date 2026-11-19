@@ -219,8 +219,11 @@ jobs:
   # (alpha.6 shipped without the logs stream route because `.gitignore` hid
   # it, and only a git checkout shows that). `apps/noite` has its own
   # lockfile, installed standalone like the image does. `bun run test` runs
-  # each file isolated: a `mock.module` is process-wide otherwise, and the
-  # checkout's file order decided which later file saw it.
+  # the files in one shared process (no `--isolate`): module singletons and
+  # the rate-limit stores are order-dependent there by design, and
+  # `docker/check-tests.ts` forbids the `mock.module` doubles that used to
+  # leak across files, so a newly leaking pattern fails here instead of
+  # hiding behind per-file isolation.
   ui:
     runs-on: ubuntu-latest
     # ~3x the 0.9 min p95 (50 runs, 2026-11-11), floor 10.

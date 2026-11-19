@@ -25,12 +25,20 @@ beforeEach(async () => {
   await ensureDb();
 });
 
+let mintCount = 0;
+
 /** A real better-auth session cookie: the OTP flow mints it exactly as the
  * login panel does (console delivery on localhost), so the read below
  * exercises the production D1 round trip, not a double. The code travels
  * through this test's own console spy — the delivery channel the product
- * itself uses on localhost. */
+ * itself uses on localhost. One client IP per mint: better-auth budgets
+ * sign-ins per IP (a shared bucket when unknown), and that budget is
+ * process-wide, so a shared bucket throttles later files in a full run. */
 const mintSessionCookie = async (email: string): Promise<string> => {
+  // One address per mint keeps this file's mints from throttling each other
+  // or the files around it (the `admin`/`api-keys` mints do the same).
+  mintCount += 1;
+  const headers = { "x-forwarded-for": `10.202.0.${mintCount}` };
   db.raw.run(
     `INSERT INTO "user" (id, name, email, emailVerified) VALUES (?, ?, ?, ?)`,
     [`user-${email}`, email, email, 1]
@@ -44,7 +52,10 @@ const mintSessionCookie = async (email: string): Promise<string> => {
 
   try {
     const auth = authFromEnv(ENV as unknown as KitEnv, ENV.BETTER_AUTH_URL);
-    await auth.api.sendVerificationOTP({ body: { email, type: "sign-in" } });
+    await auth.api.sendVerificationOTP({
+      body: { email, type: "sign-in" },
+      headers: new Headers(headers),
+    });
   } finally {
     log.mockRestore();
   }
@@ -64,7 +75,7 @@ const mintSessionCookie = async (email: string): Promise<string> => {
   const signedIn = await auth.handler(
     new Request(`${ENV.BETTER_AUTH_URL}/api/auth/sign-in/email-otp`, {
       body: JSON.stringify({ email, otp }),
-      headers: { "content-type": "application/json" },
+      headers: { "content-type": "application/json", ...headers },
       method: "POST",
     })
   );
