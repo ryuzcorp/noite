@@ -4,8 +4,11 @@
 --
 -- The single post-reset baseline (stamped 200 in `schema_version.rs`): any
 -- other stamp — or an unstamped database that already has tables — is
--- refused, never reshaped. A shape change therefore only edits the CREATE
--- below. Nothing in this file ALTERs or DROPs (a bare `DROP` would resolve
+-- refused, never reshaped. A shape change needs all three steps, or old
+-- installs boot without the new shape: edit the CREATE below for fresh
+-- databases, append a `(version, sql)` step to `MIGRATIONS` for existing
+-- ones, and bump `SCHEMA_VERSION` past them (see `schema_version.rs`).
+-- Nothing in this file ALTERs or DROPs (a bare `DROP` would resolve
 -- into the ATTACHed metrics.sqlite).
 
 -- Apps: one row per tenant app. Hard DELETE is the only remove path.

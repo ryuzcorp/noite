@@ -195,4 +195,39 @@ describe("control baseline", () => {
       expect(indexes.map((index) => index.name)).toEqual(declaredIndexes);
     }
   });
+
+  test("the baseline snapshot matches the journal and the declared schema", () => {
+    // `drizzle-kit generate` diffs the declared schema against the newest
+    // snapshot: with no snapshot it emits CREATE for every table, and that
+    // next migration then fails against the already-created baseline. The
+    // snapshot must name every declared table so a regeneration stays empty
+    // (CI also runs `generate` into a scratch copy and fails on any new
+    // file: `.github/workflows/check.yml`, "drizzle baseline snapshot").
+    const dir = path.join(import.meta.dir, "migrations", "meta");
+
+    // SAFETY: _journal.json is a repo-controlled drizzle journal; the test
+    // asserts its exact entry list below, so a shape drift fails loudly.
+    const journal = JSON.parse(
+      readFileSync(path.join(dir, "_journal.json"), "utf-8")
+    ) as { entries: { idx: number; tag: string }[] };
+
+    expect(journal.entries.map((entry) => entry.tag)).toEqual(["001_baseline"]);
+
+    // SAFETY: 0000_snapshot.json is a repo-controlled drizzle snapshot; the
+    // test asserts its dialect and full table list below.
+    const snapshot = JSON.parse(
+      readFileSync(path.join(dir, "0000_snapshot.json"), "utf-8")
+    ) as { dialect: string; tables: Record<string, { name: string }> };
+
+    expect(snapshot.dialect).toBe("sqlite");
+
+    // SAFETY: every export of ./schema is a drizzle sqlite table.
+    const declared = (Object.values(schema) as unknown[]).filter(
+      (table): table is SQLiteTable => table instanceof SQLiteTable
+    );
+
+    expect(Object.keys(snapshot.tables).toSorted()).toEqual(
+      declared.map((table) => getTableConfig(table).name).toSorted()
+    );
+  });
 });
