@@ -3,7 +3,7 @@
   "version": "0.1.0-beta.6",
   "description": "Noite CLI: deploy CI-built dist over Git smart-HTTP (no server build needed)",
   "keywords": [
-    "celld",
+    "cello",
     "cli",
     "deploy",
     "git",

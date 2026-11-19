@@ -108,7 +108,7 @@ export class FakeKv implements IsrKvNamespace, MailKvNamespace {
       .filter((k) => k.startsWith(prefix))
       .toSorted();
 
-    // Keyset cursor like the real platforms (celld encodes the last key name):
+    // Keyset cursor like the real platforms (Cello encodes the last key name):
     // deleting already-returned keys never shifts the resume point.
     const decoded: unknown = options.cursor
       ? JSON.parse(Buffer.from(options.cursor, "base64").toString())

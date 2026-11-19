@@ -1,6 +1,6 @@
 //! The control D1 as a browsable table editor, served IN-PROCESS from the
 //! worker's own D1 binding (never via the runner, and never via
-//! `celld d1 execute` — see SPEC "Do not write to a live D1 with the celld d1
+//! `cello d1 execute` — see SPEC "Do not write to a live D1 with the cello d1
 //! CLI"). One module owns the security policy so read (redaction) and write
 //! (refusal) can never drift:
 //!
@@ -165,7 +165,7 @@ const lockedFor = (table: string) =>
     ...redactedColumnsFor(table).map((name) => [name, REDACTED_NOTE] as const),
   ]);
 
-/** Table names the browser never lists: SQLite/celld internals and Wrangler's
+/** Table names the browser never lists: SQLite/Cello internals and Wrangler's
  * migration bookkeeping — mirrors the runner's filter (host/storage/d1.rs). */
 export const isVisibleTable = (name: string): boolean => {
   if (name.startsWith("_") || name.startsWith("sqlite_")) {

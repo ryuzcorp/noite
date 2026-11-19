@@ -9,7 +9,7 @@ description: Quotas, fleet bounds, rate limits, and the scale-to-zero sleep mech
 | --- | --- | --- |
 | `RUNNER_MAX_APPS_PER_USER` | `10` | Per-account app quota, enforced in the runner on create — API keys cannot bypass it |
 | `RUNNER_MAX_ENVIRONMENTS_PER_APP` | `5` | [Preview environments](/apps/environments) per app, enforced at create |
-| `RUNNER_MAX_ENVIRONMENTS` | `25` | Preview environments per instance, enforced at create; each one is a celld fleet and one on-demand certificate |
+| `RUNNER_MAX_ENVIRONMENTS` | `25` | Preview environments per instance, enforced at create; each one is a Cello fleet and one on-demand certificate |
 | `RUNNER_BUILD_MAX_MB` | `2048` | Builds refused past this worktree size (MiB) |
 | `RUNNER_BUILD_TIMEOUT_S` | `300` | Each install and build step is killed past this (seconds) |
 | `RUNNER_BUILD_CACHE_MB` | `512` | Per-app build cache cap (Bun, npm, pnpm, Yarn and their jup-managed releases); over it, whole caches are dropped, largest first; `0` disables |
@@ -17,25 +17,25 @@ description: Quotas, fleet bounds, rate limits, and the scale-to-zero sleep mech
 
 ## Fleet bounds
 
-Every app is its own celld fleet on one host, each in its own cgroup with its own `memory.max`. The bounds stop one account — or one busy app — from owning the machine. A fleet that hits its cap is OOM-killed inside its own group and restarted, and the kill records a tenant-visible `fleet` event and fleet log line (`fleet restarted: memory limit … MiB exceeded (Settings → Limits)`). The cgroups need the multi-only grant (`docker/compose.multi.yaml`); without it fleets share the container cgroup and `multi` stays at 503.
+Every app is its own Cello fleet on one host, each in its own cgroup with its own `memory.max`. The bounds stop one account — or one busy app — from owning the machine. A fleet that hits its cap is OOM-killed inside its own group and restarted, and the kill records a tenant-visible `fleet` event and fleet log line (`fleet restarted: memory limit … MiB exceeded (Settings → Limits)`). The cgroups need the multi-only grant (`docker/compose.multi.yaml`); without it fleets share the container cgroup and `multi` stays at 503.
 
 :::warning
-`RUNNER_FLEET_MAX_RSS_MB` is a container-wide shed threshold, never a per-fleet cap: celld measures the greater of its own RSS and the container-scale cgroup working set, so a per-fleet-sized value closes every fleet's admission gate as soon as the container as a whole passes it. With per-fleet cgroups, leave `0` for celld's default (80% of the fleet's own `memory.max`). Without them every fleet shares the container cgroup, so `0` now means a runner-derived container-wide threshold (75% of the detected memory, clamped 256–8192 MiB) — celld answers `503` + `Retry-After` before the kernel OOM-killer acts. An explicit value always wins. Per-fleet containment comes from the kernel's `memory.max`, not from this knob.
+`RUNNER_FLEET_MAX_RSS_MB` is a container-wide shed threshold, never a per-fleet cap: Cello measures the greater of its own RSS and the container-scale cgroup working set, so a per-fleet-sized value closes every fleet's admission gate as soon as the container as a whole passes it. With per-fleet cgroups, leave `0` for Cello's default (80% of the fleet's own `memory.max`). Without them every fleet shares the container cgroup, so `0` now means a runner-derived container-wide threshold (75% of the detected memory, clamped 256–8192 MiB) — Cello answers `503` + `Retry-After` before the kernel OOM-killer acts. An explicit value always wins. Per-fleet containment comes from the kernel's `memory.max`, not from this knob.
 :::
 
 | Knob | Default | Effect |
 | --- | --- | --- |
 | `RUNNER_FLEET_MEMORY_MB` | `512` | Per-fleet `memory.max` in MiB (own cgroup per fleet, plus `pids.max`); overridable per app in Settings → Limits → Fleet memory (applies on next spawn) |
 | `RUNNER_FLEET_MAX_RSS_MB` | `0` | Shed threshold in MiB; over it, fleets refuse cells with `503` + `Retry-After` instead of OOM-ing |
-| `RUNNER_CONTROL_MEMORY_MB` | 1/4 of detected memory, clamped `256`–`1024` | Fleet #0's cap; its own cgroup leaf (and `CELLD_MEMORY_SCOPE=self`) where available, else the container-wide shed threshold |
-| `RUNNER_FLEET_LOCAL_CACHE_MB` | 1/16 of detected memory, clamped `64`–`512` | Per-fleet celld hibernated-DB cache (`CELLD_LOCAL_CACHE_MAX_BYTES`); celld's own default is 2 GiB per node |
+| `RUNNER_CONTROL_MEMORY_MB` | 1/4 of detected memory, clamped `256`–`1024` | Fleet #0's cap; its own cgroup leaf (and `CELLO_MEMORY_SCOPE=self`) where available, else the container-wide shed threshold |
+| `RUNNER_FLEET_LOCAL_CACHE_MB` | 1/16 of detected memory, clamped `64`–`512` | Per-fleet Cello hibernated-DB cache (`CELLO_LOCAL_CACHE_MAX_BYTES`); Cello's own default is 2 GiB per node |
 | `RUNNER_FLEET_SPAWN_BATCH` | `1` on ≤ 2 cores, else `2` | Cold fleets started per reconcile pass; restarts are never batched |
-| `RUNNER_BUILD_CONCURRENCY` | `1` on ≤ 2 cores, else `2` | Concurrent tenant deploys (one slot covers install, build, release and `celld deploy`) |
+| `RUNNER_BUILD_CONCURRENCY` | `1` on ≤ 2 cores, else `2` | Concurrent tenant deploys (one slot covers install, build, release and `cello deploy`) |
 | `RUNNER_FLEET_IDLE_EVICT_S` | `120` | Idle seconds before a fleet hibernates cells and returns memory |
 | `RUNNER_FLEET_LEASE_TTL_MS` | `60000` | Node lease lifetime; a storage stall longer than two thirds of it restarts every app (minimum `10000`) |
-| `RUNNER_FLEET_ASSET_CACHE_MB` | `64` | Per-fleet on-disk asset cache (celld default is 512) |
+| `RUNNER_FLEET_ASSET_CACHE_MB` | `64` | Per-fleet on-disk asset cache (Cello default is 512) |
 | `RUNNER_FLEET_DEPLOY_POLL_S` | `300` | Fleet self-poll for deploys; the runner also POSTs `/reload`, so this covers misses only |
-| `RUNNER_FLEET_LOG` | `error,celld=warn` | Fleet log filter; celld warnings reach the per-app log view |
+| `RUNNER_FLEET_LOG` | `error,cello=warn` | Fleet log filter; Cello warnings reach the per-app log view |
 
 ## Rate limits
 
@@ -74,11 +74,11 @@ An app idle past its threshold stops costing anything; the next request brings i
 1. Resolves the app from `X-Forwarded-Host` (tenant slug or custom domain).
 2. Clears the flag, sets `woke_at`.
 3. Spawns the fleet immediately.
-4. Waits for `/.well-known/celld/health` 200, bounded by `RUNNER_WAKE_TIMEOUT_S` (default 120).
+4. Waits for `/.well-known/cello/health` 200, bounded by `RUNNER_WAKE_TIMEOUT_S` (default 120).
 5. Rewrites the Caddyfile back to the plain proxy.
 6. Answers 200; Caddy proxies the held request as if the app never slept.
 
-Concurrent requests share one wake (per-app lock), and at most `RUNNER_WAKE_CONCURRENCY` apps (default 4) cold-start at once; the rest queue within the same timeout. Only a failed wake answers `503` — and records a tenant-visible `wake failed` fleet event plus the `wake_failed` sleep counter. A deploy, rollback, or web commit to an asleep app wakes it first; TLS ask treats asleep apps as live so certificates renew. First-request cost after a quiet day: one cold fleet start (celld boot + ready gate, typically seconds).
+Concurrent requests share one wake (per-app lock), and at most `RUNNER_WAKE_CONCURRENCY` apps (default 4) cold-start at once; the rest queue within the same timeout. Only a failed wake answers `503` — and records a tenant-visible `wake failed` fleet event plus the `wake_failed` sleep counter. A deploy, rollback, or web commit to an asleep app wakes it first; TLS ask treats asleep apps as live so certificates renew. First-request cost after a quiet day: one cold fleet start (Cello boot + ready gate, typically seconds).
 
 ## Memory pressure
 

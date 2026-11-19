@@ -107,7 +107,7 @@ export const STEPS = [
 
 export const FEATURES = [
   {
-    body: "Many Cloudflare Workers apps move over as they are: deploy with the wrangler.jsonc you already have, or a cloudflare.config.ts. Durable Objects, D1, R2 and static assets run on celld, and its docs list every supported API.",
+    body: "Many Cloudflare Workers apps move over as they are: deploy with the wrangler.jsonc you already have, or a cloudflare.config.ts. Durable Objects, D1, R2 and static assets run on Cello, and its docs list every supported API.",
     title: "Bring your Workers app",
   },
   {
@@ -174,7 +174,7 @@ export const INSTALL_TABS = [
 export const FAQ = [
   {
     answer:
-      "Often, yes, with some limits. Noite runs apps on celld, which supports fetch handlers, Durable Objects, D1, R2, KV, Queues, Workflows, Cron and static assets, and reads your existing wrangler.jsonc. Bindings outside that list won't work, and Wrangler config keys celld doesn't accept have to be removed. celld's docs list the supported APIs in detail.",
+      "Often, yes, with some limits. Noite runs apps on Cello, which supports fetch handlers, Durable Objects, D1, R2, KV, Queues, Workflows, Cron and static assets, and reads your existing wrangler.jsonc. Bindings outside that list won't work, and Wrangler config keys Cello doesn't accept have to be removed. Cello's docs list the supported APIs in detail.",
     question: "Can I migrate an app from Cloudflare Workers?",
   },
   {

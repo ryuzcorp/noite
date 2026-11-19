@@ -28,7 +28,7 @@ import {
 // errors (production never sees them), the telemetry tabs scope by `?env=`,
 // and the head branch's pull request shows the environment card.
 //
-// Timing follows worker-errors.spec.ts: celld flushes OTel to the bucket
+// Timing follows worker-errors.spec.ts: Cello flushes OTel to the bucket
 // every RUNNER_OTEL_FLUSH_MS (30 s), the runner ingests at most once per
 // flush interval, and the ingest window stops agg_lag (flush + 10 s = 40 s)
 // behind now — so a throw/request surfaces after ~100 s steady-state. 300 s
@@ -86,7 +86,7 @@ const asJson = <T>(
 
 /** Push the vite sample with a throwing `/api/env-boom` route carrying
  * `token` in the thrown message, so each branch's issue is unambiguous.
- * Same anchors as worker-errors.spec.ts (async fetch: celld's bucket OTel
+ * Same anchors as worker-errors.spec.ts (async fetch: Cello's bucket OTel
  * sink only exports a span for an async handler's rejection). Without
  * `branch` the push lands on main, else on `refs/heads/<branch>`. */
 const pushBoomRevision = (

@@ -1,5 +1,5 @@
 // Controller: the DO-stub service shape, the tenant-reachable method gate,
-// the celld start/exec adaptation, signal passthrough, the shim probe, fetch
+// the Cello start/exec adaptation, signal passthrough, the shim probe, fetch
 // activity, and the admission wiring. The classes under test are the real
 // bundle classes over the real `void/_sandbox-container` base.
 /* oxlint-disable anti-slop/no-chained-type-assertions, anti-slop/require-safety-comment-for-type-assertion, anti-slop/no-known-value-widening -- tests narrow unknown RPC results and reach white-box seams; every cast is asserted immediately. */
@@ -225,7 +225,7 @@ const rig = (
   return { admission, container, controller, namespace, storage };
 };
 
-describe("celld start", () => {
+describe("cello start", () => {
   test("start drops the Cloudflare-only instance arg", async () => {
     const { container, controller } = rig();
     succeedExec(container);
@@ -293,7 +293,7 @@ describe("signal passthrough", () => {
     expect(user.kills).toEqual([]);
     expect(wire.isPty).toBe(false);
 
-    // celld owns abort delivery (0010/0015): the signal crosses to the
+    // Cello owns abort delivery (0010/0015): the signal crosses to the
     // native exec, and the controller itself never kills.
     const userCall = container.execCalls.find(
       (call) => call.argv[0] === "sleep"
@@ -310,7 +310,7 @@ describe("signal passthrough", () => {
     await expect(wire.capability.invoke("exitCode", [])).resolves.toBe(0);
   });
 
-  test("an already-aborted signal is forwarded for celld to refuse", async () => {
+  test("an already-aborted signal is forwarded for Cello to refuse", async () => {
     const { container, controller } = rig();
     const seen: FakeProcess[] = [];
     container.execImpl = (): FakeProcess => {
@@ -326,8 +326,8 @@ describe("signal passthrough", () => {
     const before = seen.length;
 
     // SAFETY: white-box call into the protected override to pin the
-    // already-aborted forwarding (celld 0010 refuses it with its reason
-    // before spawning; the fake is not celld and just records the call).
+    // already-aborted forwarding (Cello 0010 refuses it with its reason
+    // before spawning; the fake is not Cello and just records the call).
     const execProcess = controller as unknown as {
       execProcess: (
         argv: string[],
@@ -375,7 +375,7 @@ describe("process kill", () => {
 describe("pty", () => {
   test("pty forwards to the native exec and isPty reflects the native value", async () => {
     const { container, controller } = rig();
-    // The fake mints a PTY exactly when one is requested, like celld.
+    // The fake mints a PTY exactly when one is requested, like Cello.
     container.execImpl = (_argv: string[], options): FakeProcess => {
       const process = new FakeProcess();
       process.isPty = options.pty !== undefined && options.pty !== false;

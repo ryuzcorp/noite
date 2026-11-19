@@ -167,7 +167,7 @@ export default defineConfig({
     voidPlugin({ persistTo: ".wrangler/state" }),
     voidIlha(),
     tailwindcss(),
-    // Deploy-root celld config + `.dev.vars` stripping, after Void's emit.
+    // Deploy-root Cello config + `.dev.vars` stripping, after Void's emit.
   ],
   resolve: {
     tsconfigPaths: true,

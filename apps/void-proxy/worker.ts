@@ -1,12 +1,12 @@
 /**
- * Noite Void-compatibility proxy worker (celld `main` entry).
+ * Noite Void-compatibility proxy worker (Cello `main` entry).
  *
- * One runner-owned script cohosted in each Void app's fleet (celld `services`).
+ * One runner-owned script cohosted in each Void app's fleet (Cello `services`).
  * Serves `POST /revalidate`, `POST /email/send` and `POST /ai/*` to the tenant
  * app over its in-fleet `__VOID_PROXY` service binding. The proxy is never
  * publicly routable.
  *
- * Deploy: this file is the celld `main` entry; celld bundles the `.ts` entry
+ * Deploy: this file is the Cello `main` entry; Cello bundles the `.ts` entry
  * with esbuild at deploy, so no build step is needed. It imports `./src/*`,
  * which the runner copies alongside it verbatim and renders the `Env` vars
  * documented in SPEC.md ("Void platform proxy"). Tests and test helpers
@@ -22,7 +22,7 @@
  * relay tombstone), a 405, or a 404 — decided before the body is read.
  *
  * Globals used: `fetch`, `crypto`, KV bindings, `cloudflare:sockets`, and
- * `caches.default` for the ISR edge purge (`CELLD_CACHE_SCOPE=deployment`
+ * `caches.default` for the ISR edge purge (`CELLO_CACHE_SCOPE=deployment`
  * shares one cache across the fleet's deployment, like a Cloudflare zone, so
  * the proxy deletes the app's L1 entries alongside the KV keys). The proxy
  * only ever deletes edge entries — it never `put`s, `match`es or `open`s,

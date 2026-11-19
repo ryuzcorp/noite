@@ -6,7 +6,7 @@
 
 **The app platform you own.**
 
-A tiny, self-hostable PaaS for [celld](https://celld.dev) apps: `git push` deploys, with Durable Objects, SQL databases and object storage included.<br /> One command installs it, one image runs it, and your data lives in a bucket you own.
+A tiny, self-hostable PaaS for [Cello](https://cello.ryuz.eu) apps: `git push` deploys, with Durable Objects, SQL databases and object storage included.<br /> One command installs it, one image runs it, and your data lives in a bucket you own.
 
 <a href="https://github.com/ryuzcorp/noite/actions/workflows/ci.yml"><img alt="CI" src="https://img.shields.io/github/actions/workflow/status/ryuzcorp/noite/ci.yml?branch=main&style=flat-square&label=ci" /></a> <a href="https://github.com/ryuzcorp/noite/tags"><img alt="Release" src="https://img.shields.io/github/v/tag/ryuzcorp/noite?include_prereleases&sort=semver&style=flat-square&label=release" /></a> <a href="https://github.com/ryuzcorp/noite/pkgs/container/noite"><img alt="Image" src="https://img.shields.io/badge/ghcr.io-ryuzcorp%2Fnoite-2496ED?style=flat-square&logo=docker&logoColor=white" /></a> <a href="LICENSE"><img alt="License" src="https://img.shields.io/github/license/ryuzcorp/noite?style=flat-square" /></a> <a href="https://discord.gg/WnVTMCTz74"><img alt="Discord" src="https://img.shields.io/badge/discord-join-5865F2?style=flat-square&logo=discord&logoColor=white" /></a>
 
@@ -33,7 +33,7 @@ curl -fsSL https://noite.now/run.sh | bash -s install
 ## Why Noite
 
 - **Own the whole stack.** Your server, your bucket, your bill. Noite is open source (Apache-2.0); you pay for a VPS and storage, nothing else.
-- **Bring your Workers app.** Many Cloudflare Workers apps move over as they are: deploy with the `wrangler.jsonc` you already have. Durable Objects, D1, R2, KV, Queues, Workflows, Cron and static assets run on celld ([supported APIs](https://celld.dev/docs/)).
+- **Bring your Workers app.** Many Cloudflare Workers apps move over as they are: deploy with the `wrangler.jsonc` you already have. Durable Objects, D1, R2, KV, Queues, Workflows, Cron and static assets run on Cello ([supported APIs](https://cello.ryuz.eu/cloudflare-compat)).
 - **`git push` and it's live.** Every push to `main` installs, builds, runs your release command and deploys to `https://<slug>.<your-domain>`.
 - **Scale to zero.** Apps idle for a day go to sleep and free their memory. The next request waits a few seconds while the app wakes, then is served normally: no splash page, no dropped request.
 - **One bucket holds everything.** Git history, app storage and Noite's own state live in one S3 bucket. Lose the server and a fresh install restores itself from it.
@@ -117,8 +117,8 @@ flowchart LR
   subgraph noite["noite container"]
     caddy["Caddy edge<br/>TLS · routing · compression · rate limits"]
     runner["noite-runner (Rust)<br/>API · Git · builds · telemetry"]
-    control["Control UI<br/>celld fleet #0"]
-    fleets["Tenant apps<br/>one celld fleet per app"]
+    control["Control UI<br/>Cello fleet #0"]
+    fleets["Tenant apps<br/>one Cello fleet per app"]
     caddy --> control
     caddy --> runner
     caddy --> fleets
@@ -133,8 +133,8 @@ flowchart LR
 
 - **Runner** ([`apps/runner`](apps/runner)): Git smart-HTTP, builds, deploys, the API, telemetry aggregation from the fleet's Parquet objects, and the edge configuration. Its SQLite state is snapshotted into the bucket.
 - **Caddy**: TLS with on-demand certificates, host routing, compression and rate limits, configured by the runner through its admin API.
-- **Control UI** ([`apps/noite`](apps/noite)): a [Void](https://void.cloud) Worker (ilha UI via `@ilha/void`) served by its own celld node.
-- **Tenant apps**: one celld fleet per app, run as an unprivileged user, put to sleep when idle and woken by the next request.
+- **Control UI** ([`apps/noite`](apps/noite)): a [Void](https://void.cloud) Worker (ilha UI via `@ilha/void`) served by its own Cello node.
+- **Tenant apps**: one Cello fleet per app, run as an unprivileged user, put to sleep when idle and woken by the next request.
 
 More in [How it works](https://noite.now/how-it-works/) and [SPEC.md](SPEC.md).
 
@@ -220,4 +220,4 @@ portless alias test.noite 9080   # → https://test.noite.local
 
 ## License
 
-[Apache-2.0](LICENSE). Noite runs apps on [celld](https://celld.dev) by Deno, also Apache-2.0.
+[Apache-2.0](LICENSE). Noite runs apps on [Cello](https://cello.ryuz.eu), also Apache-2.0.

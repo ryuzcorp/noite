@@ -343,7 +343,7 @@ const DeployRow = Schema.Struct({
 });
 
 /** Poll the pushed revision's own deploy row (never a clock) until it
- * succeeds: a deploy takes minutes (bun install + celld deploy + fleet
+ * succeeds: a deploy takes minutes (bun install + cello deploy + fleet
  * boot). */
 export const waitForDeploySuccess = async (
   request: APIRequestContext,

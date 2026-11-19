@@ -173,7 +173,7 @@ export default defineConfig({
   ],
   shard,
   testDir: "./e2e",
-  // Deploys (bun install + celld deploy + fleet boot) take minutes.
+  // Deploys (bun install + cello deploy + fleet boot) take minutes.
   timeout: 10 * 60_000,
   use: {
     // Bounded, so a missing element fails at its locator instead of waiting

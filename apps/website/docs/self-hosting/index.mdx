@@ -3,7 +3,7 @@ title: Self-hosting
 description: Run Noite on your own server with Docker Compose — install, storage, tenancy, platforms, and operations.
 ---
 
-Noite ships as one image, `ghcr.io/ryuzcorp/noite`. Its runner is PID 1 and supervises everything else in the container: Caddy (the edge), the control UI (a celld node, fleet #0, bundle baked into the image), and one celld fleet per tenant app. `compose.yaml` runs it next to the bundled RustFS store; there is no host-side build or deploy step.
+Noite ships as one image, `ghcr.io/ryuzcorp/noite`. Its runner is PID 1 and supervises everything else in the container: Caddy (the edge), the control UI (a Cello node, fleet #0, bundle baked into the image), and one Cello fleet per tenant app. `compose.yaml` runs it next to the bundled RustFS store; there is no host-side build or deploy step.
 
 On a fresh Ubuntu or Debian server the whole install is one command:
 

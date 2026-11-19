@@ -4,7 +4,7 @@
  *
  * One instance per fleet, bound as `__VOID_SANDBOX_ADMISSION` and never
  * exposed to the app, addressed by the runner-minted secret name in
- * `__VOID_SANDBOX_ADMISSION_NAME` (celld named ids are computable from a
+ * `__VOID_SANDBOX_ADMISSION_NAME` (Cello named ids are computable from a
  * public name, so a fixed name would be a public address). The interface and
  * the fencing semantics follow Void's `sandbox-concurrency-counter.ts` (MIT
  * License, Copyright Cloudflare — see NOTICE): a stopped generation is never

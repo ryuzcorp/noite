@@ -2,15 +2,15 @@
 // source for its Worker: bindings, assets, defaults. `voidPlugin()` reads it
 // (edits need a dev server restart) and the build emits
 // `dist/ssr/wrangler.json`, from which `scripts/emit-celld-config.ts`
-// derives the deploy-root `dist/wrangler.json` the runner deploys with celld.
+// derives the deploy-root `dist/wrangler.json` the runner deploys with Cello.
 //
-// Serving contract (runner `ensure_deployed`, celld `CELLD_KEYS`): name
+// Serving contract (runner `ensure_deployed`, Cello `CELLO_KEYS`): name
 // `noite-control`, compat date `2026-09-01`, worker-first routing with
 // `not_found_handling "none"` (a missing hashed chunk 404s instead of
 // serving the document), the D1 `DB` keyed by name (no `database_id`), the
-// `ASSETS` binding declared (celld does not inject it), and `vars` defaults
+// `ASSETS` binding declared (Cello does not inject it), and `vars` defaults
 // the runner overwrites at deploy time. The asset cache header mirrors
-// `public/_headers` (celld reads that file too); Void applies
+// `public/_headers` (Cello reads that file too); Void applies
 // `routing.headers` to assets, SSR pages and API responses.
 import { defineConfig } from "void/config";
 
@@ -24,11 +24,11 @@ import { defineConfig } from "void/config";
  * outlives the bound is answered with that middleware's JSON 504 instead of
  * the file, which is a hydration failure with no retry: the island bundle
  * never executes. Excluding the fingerprinted bundle from worker-first makes
- * celld serve it from its own asset resolver (same `_headers` policy: the
+ * Cello serve it from its own asset resolver (same `_headers` policy: the
  * `/assets/*` immutable cache rule and the isolation headers) without
  * invoking the Worker at all, so no action timeout, session read or D1 read
  * can ever stand between the browser and its chunks. A *missing* file still
- * falls through to the Worker (celld answers only hits at the edge of this
+ * falls through to the Worker (Cello answers only hits at the edge of this
  * rule), so the app's 404 handling is unchanged.
  *
  * `vite.config.ts` (`emitCelldConfig`) writes this same list into the deploy

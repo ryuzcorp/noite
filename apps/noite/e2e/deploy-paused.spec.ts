@@ -40,7 +40,7 @@ interface DeployRow {
 }
 
 /** A revision whose build fails: the noite sample with a `build` script that
- * exits non-zero. The runner runs `bun run build` before celld, so the deploy
+ * exits non-zero. The runner runs `bun run build` before Cello, so the deploy
  * row closes `failed` without ever reaching a fleet. */
 const breakBuild = (dir: string): void => {
   const file = nodePath.join(dir, "package.json");

@@ -15,7 +15,7 @@ Every push to `main` builds on the Noite host, in the build sandbox. You do not 
 | convert | `cloudflare.config.ts` and no Wrangler config | `cloudflare.config.ts` → `wrangler.json` |
 | generate | no Wrangler config anywhere | `wrangler.json` from the build output or `package.json` `main` ([below](#no-config-at-all)) |
 | release | the Wrangler config has `release` | `sh -c "<release>"` |
-| deploy | always | `celld deploy` |
+| deploy | always | `cello deploy` |
 
 Tools whose launcher asks for Node (`vite`, `rsbuild`) get the image's Node 24. The build sees your app's environment variables plus `CI=1`, `NODE_ENV=production` and `NO_COLOR=1`. The runner also sets its own `NODE_OPTIONS=--max-old-space-size=N` on every install, build, convert and release step — three quarters of the leaf's RAM-plus-swap budget — because Node otherwise sizes its heap at about half the leaf and a large install aborts with `FATAL ERROR: Reached heap limit` after `added …, done`; a workload larger than RAM needs the swap share too (Ember's `tsc` needs ~630 MB on a 613 MiB leaf, and passes with a 1227 MB ceiling from 1023 MiB of swap). A bigger ceiling is not a bigger allocation: V8 only faults what the build touches, spilling the excess into swap. Your own `NODE_OPTIONS` is reserved and never reaches the build — except inside your own `noite.ci.yaml` steps, whose step/job env applies over the runner default within that memory-capped container; raise `RUNNER_BUILD_MEMORY_MB` instead. pnpm's tarball workers are likewise runner-sized (`PNPM_MAX_WORKERS`, from the same leaf budget — a tenant setting is dropped, though a `noite.ci.yaml` step may override it within its own container), because the pool defaults to one worker per host CPU minus one and dozens of workers OOM a small leaf in fetch. Linking still churns the store and the tree through the leaf transiently: an Ember-size install (~400 packages) needs on the order of half a GiB of build swap on a 613 MiB leaf at 2 CPUs (measured, warm store) — a swapless leaf dies post-`done`, in linking, no matter the ceiling, and the log then says to add host swap. Each install and build step is bounded by `RUNNER_BUILD_TIMEOUT_S` (300 s by default) and the worktree by `RUNNER_BUILD_MAX_MB`.
 
@@ -37,8 +37,8 @@ The **Deployments** tab logs each step as `▸ step: command`, followed by its o
 
 Either declares the Worker; pick one per app.
 
-- **`wrangler.jsonc`** (or `.json`, `.toml`) is the format celld deploys, so it is what the runner uses as is. Choose it for a plain Worker, a static site, or `@cloudflare/vite-plugin`. Besides Wrangler's own keys it accepts Noite's `release` ([Release command](/apps/deploy#release-command)).
-- **`cloudflare.config.ts`** is the [`cf` CLI](https://github.com/cloudflare/cf)'s typed config. With no Wrangler config in the tree, the runner converts it after the build into the `wrangler.json` celld deploys. Add `cf` to `package.json` `dependencies` (it provides `@cloudflare/config`); a missing `cf` fails the convert step with a line saying so.
+- **`wrangler.jsonc`** (or `.json`, `.toml`) is the format Cello deploys, so it is what the runner uses as is. Choose it for a plain Worker, a static site, or `@cloudflare/vite-plugin`. Besides Wrangler's own keys it accepts Noite's `release` ([Release command](/apps/deploy#release-command)).
+- **`cloudflare.config.ts`** is the [`cf` CLI](https://github.com/cloudflare/cf)'s typed config. With no Wrangler config in the tree, the runner converts it after the build into the `wrangler.json` Cello deploys. Add `cf` to `package.json` `dependencies` (it provides `@cloudflare/config`); a missing `cf` fails the convert step with a line saying so.
 
 ```ts title="cloudflare.config.ts"
 import { bindings, defineConfig, defineWorker } from "cf/config";
@@ -57,12 +57,12 @@ A Wrangler config in the tree wins over `cloudflare.config.ts`, and a build that
 
 ## Cloudflare-only keys
 
-celld refuses any config key it does not know, so the runner translates the Cloudflare-only ones away before `celld deploy` and names them in the deploy log (`config: ignoring Cloudflare-only keys …`):
+Cello refuses any config key it does not know, so the runner translates the Cloudflare-only ones away before `cello deploy` and names them in the deploy log (`config: ignoring Cloudflare-only keys …`):
 
 - Deployment-target metadata with no Noite equivalent: `observability`, `upload_source_maps`, `workers_dev`, `preview_urls`, `previews`. Dropping them changes nothing the app can observe.
-- Bindings Noite does not provide: `images` (Cloudflare Images) and `send_email` (Email Service). The Worker reads both as missing (`env.IMAGES`/`env.EMAIL` are `undefined`), so an app that needs them must degrade without them — Ember, for example, shows a picture as a file download without `IMAGES` and sends email through a `RESEND_API_KEY` secret instead of `EMAIL`. Anything else celld refuses still fails the deploy, so a typo'd key can never silently lose a binding.
+- Bindings Noite does not provide: `images` (Cloudflare Images) and `send_email` (Email Service). The Worker reads both as missing (`env.IMAGES`/`env.EMAIL` are `undefined`), so an app that needs them must degrade without them — Ember, for example, shows a picture as a file download without `IMAGES` and sends email through a `RESEND_API_KEY` secret instead of `EMAIL`. Anything else Cello refuses still fails the deploy, so a typo'd key can never silently lose a binding.
 
-celld also honors declared module `rules` but ships none of Wrangler's defaults, so the runner injects Wrangler's `DEFAULT_MODULE_RULES` (Text for `**/*.txt`, `**/*.html` and `**/*.sql`, Data for `**/*.bin`, CompiledWasm for `**/*.wasm`) when the config names no `rules` of its own, and says so in the deploy log. A config with its own `rules` is left alone.
+Cello also honors declared module `rules` but ships none of Wrangler's defaults, so the runner injects Wrangler's `DEFAULT_MODULE_RULES` (Text for `**/*.txt`, `**/*.html` and `**/*.sql`, Data for `**/*.bin`, CompiledWasm for `**/*.wasm`) when the config names no `rules` of its own, and says so in the deploy log. A config with its own `rules` is left alone.
 
 Every deploy applies each D1 binding's `migrations_dir` (`migrations` by default) with wrangler semantics: ordered `NNNN_name.sql` files, each in its own transaction, tracked in a `d1_migrations` table (or the binding's `migrations_table`) so each file applies once. A redeploy runs them before the new generation takes traffic — a failed migration fails the deploy and the previous generation keeps serving. A rollback never un-applies: already-applied rows are skipped, only pending files run. Preview environments have their own D1, so migrations apply per environment. The deploy log names each applied migration. Apps that migrate themselves on first open (Durable Objects do) are unaffected.
 
@@ -72,20 +72,20 @@ Noite runs the build, not a project's own deploy script, so anything that script
 
 After a build, the runner deploys what the build produced, in this order:
 
-1. Void's own output, `dist/ssr/wrangler.json`, with the assets in `dist/client/`. It outranks a `dist/wrangler.json` beside it: Void apps may derive that file for celld, and the derivation keeps only the keys it knows, so reading it would drop Void's sandbox `containers` and skip migrations, identity vars and the sandbox controller.
+1. Void's own output, `dist/ssr/wrangler.json`, with the assets in `dist/client/`. It outranks a `dist/wrangler.json` beside it: Void apps may derive that file for Cello, and the derivation keeps only the keys it knows, so reading it would drop Void's sandbox `containers` and skip migrations, identity vars and the sandbox controller.
 2. `dist/wrangler.json`, a deployable config the build wrote (Oxide writes one, on Vite or Rsbuild).
 3. Wrangler's deploy redirect, `.wrangler/deploy/config.json`, which `@cloudflare/vite-plugin` writes.
 4. Otherwise, the source config: `wrangler.jsonc`, `wrangler.json` or `wrangler.toml` at the root, then the first one found below it (`node_modules` excluded).
 5. With no config at all, one the runner generates ([below](#no-config-at-all)).
 
-For 1 and 3 the runner writes `dist/wrangler.json` from the config they point to: it keeps only the keys celld accepts, rewrites `main` and `assets.directory` relative to `dist/`, absolutizes container `dockerfile`/`build_context` paths (Void's default sandbox Dockerfile lives in `node_modules`), and applies `.assetsignore` (plain file names only: a glob, a path or a `!` negation fails the deploy). Without a build step, 1 to 3 do not apply. The deploy log names the config it used (`config: dist/wrangler.json (from dist/ssr/wrangler.json, Void)`, `config: generated: static site from dist/ …`).
+For 1 and 3 the runner writes `dist/wrangler.json` from the config they point to: it keeps only the keys Cello accepts, rewrites `main` and `assets.directory` relative to `dist/`, absolutizes container `dockerfile`/`build_context` paths (Void's default sandbox Dockerfile lives in `node_modules`), and applies `.assetsignore` (plain file names only: a glob, a path or a `!` negation fails the deploy). Without a build step, 1 to 3 do not apply. The deploy log names the config it used (`config: dist/wrangler.json (from dist/ssr/wrangler.json, Void)`, `config: generated: static site from dist/ …`).
 
 ## No config at all
 
 An app does not need a Wrangler config. When there is none, the runner writes one from what the build left:
 
 - **A static site.** The first of `dist/`, `build/` or `out/` that holds an `index.html` is deployed as static files: Vite, Rsbuild, Astro's static output, Create React App, a Next.js static export. Unknown paths get `404.html` when the build wrote one, and `index.html` otherwise, so a single-page app's client-side routes work.
-- **A Worker.** `package.json` `"main"` names a module whose default export has a `fetch` method: Hono, H3, Elysia, or `export default { fetch(request) { … } }`. The module may be TypeScript; celld bundles it. A static output from the list above is served first, and requests with no matching file reach the Worker, which can also read the files through `env.ASSETS`. The server entry must not sit inside that output, or its source would be public.
+- **A Worker.** `package.json` `"main"` names a module whose default export has a `fetch` method: Hono, H3, Elysia, or `export default { fetch(request) { … } }`. The module may be TypeScript; Cello bundles it. A static output from the list above is served first, and requests with no matching file reach the Worker, which can also read the files through `env.ASSETS`. The server entry must not sit inside that output, or its source would be public.
 
 ```json title="package.json (Hono)"
 {
@@ -140,11 +140,11 @@ A static site deploys without a config ([above](#no-config-at-all)). Write one t
 }
 ```
 
-With `"scripts": { "build": "rsbuild build" }` (or `vite build`), the runner builds `dist/` and celld serves it.
+With `"scripts": { "build": "rsbuild build" }` (or `vite build`), the runner builds `dist/` and Cello serves it.
 
 ## Rsbuild with a Worker
 
-Add `main` and an `ASSETS` binding to the same config. The Worker is bundled from source by celld's esbuild, and the client by Rsbuild:
+Add `main` and an `ASSETS` binding to the same config. The Worker is bundled from source by Cello's esbuild, and the client by Rsbuild:
 
 ```jsonc title="wrangler.jsonc"
 {
@@ -159,12 +159,12 @@ For a Worker that itself needs the bundler (Oxide, framework plugins), have the 
 
 ## Frameworks and Node servers
 
-Apps run on celld, which runs Cloudflare Workers. A framework deploys when it builds for Workers:
+Apps run on Cello, which runs Cloudflare Workers. A framework deploys when it builds for Workers:
 
 - **Built on `fetch`** (Hono, H3, Elysia): set `main` ([above](#no-config-at-all)) or write a `wrangler.jsonc`.
-- **With a Cloudflare target**: use the framework's own Workers build, which writes a Wrangler config or works through `@cloudflare/vite-plugin`. Examples: Nuxt and Nitro (`cloudflare_module` preset), SvelteKit (`@sveltejs/adapter-cloudflare`), Astro (`@astrojs/cloudflare`), React Router and TanStack Start (the Cloudflare Vite plugin). These targets are Cloudflare's; Noite has not tested each one, and a feature celld lacks fails at deploy or on the first request.
+- **With a Cloudflare target**: use the framework's own Workers build, which writes a Wrangler config or works through `@cloudflare/vite-plugin`. Examples: Nuxt and Nitro (`cloudflare_module` preset), SvelteKit (`@sveltejs/adapter-cloudflare`), Astro (`@astrojs/cloudflare`), React Router and TanStack Start (the Cloudflare Vite plugin). These targets are Cloudflare's; Noite has not tested each one, and a feature Cello lacks fails at deploy or on the first request.
 
-A **Node HTTP server** does not run: Express, Fastify, Koa, `http.createServer`, or anything that calls `app.listen()`. celld implements no `node:http` server and no `IncomingMessage`, so wrapping the app in a fetch adapter does not help either. When `main` looks like such a server, the deploy fails with a message saying so. Move the routes to a `fetch`-based framework (Hono's API is close to Express), or use your framework's Workers target.
+A **Node HTTP server** does not run: Express, Fastify, Koa, `http.createServer`, or anything that calls `app.listen()`. Cello implements no `node:http` server and no `IncomingMessage`, so wrapping the app in a fetch adapter does not help either. When `main` looks like such a server, the deploy fails with a message saying so. Move the routes to a `fetch`-based framework (Hono's API is close to Express), or use your framework's Workers target.
 
 ## `_headers` and `_redirects`
 
@@ -175,7 +175,7 @@ Static assets honour Cloudflare's `_headers` and `_redirects` files, with Cloudf
   Cache-Control: public, max-age=31536000, immutable
 ```
 
-celld serves assets with `Cache-Control: max-age=0, must-revalidate`, so mark content-hashed files immutable as above. The full syntax and limits are in [celld's assets documentation](https://celld.dev/docs/).
+Cello serves assets with `Cache-Control: max-age=0, must-revalidate`, so mark content-hashed files immutable as above. The full syntax and limits are in [Cello's static-assets documentation](https://cello.ryuz.eu/services/static-assets).
 
 ## Custom build command
 
@@ -187,4 +187,4 @@ Wrangler's `build` block replaces the `build` script, as it does for `wrangler d
 }
 ```
 
-`cwd` must stay inside the project. The runner strips `build` and `release` before `celld deploy`, which refuses keys it does not know.
+`cwd` must stay inside the project. The runner strips `build` and `release` before `cello deploy`, which refuses keys it does not know.

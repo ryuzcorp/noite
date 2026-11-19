@@ -25,7 +25,7 @@ import {
 import { resourceValue } from "../resource";
 import { adminStatus, session, updateStatus } from "../resources";
 //! Detail for the reserved control app (`_control`): the control plane as a
-//! tenant-shaped page AND the admin home. The control fleet emits celld
+//! tenant-shaped page AND the admin home. The control fleet emits Cello
 //! telemetry into the same ingest as every app (reserved key `_control`, no
 //! `app` row — see runner `host/control.rs`), so the Overview, Metrics,
 //! Analytics, Errors and Logs surfaces reuse the tenant panels unchanged.
@@ -46,7 +46,7 @@ import { adminStatus, session, updateStatus } from "../resources";
 //! not the gate.
 //!
 //! The dev image serves this UI from `vite dev` and supervises no control
-//! celld, so there is no control telemetry at all. The runner reports that on
+//! Cello, so there is no control telemetry at all. The runner reports that on
 //! `GET /v1/admin/stats` (`control_fleet`, read through `adminStatus()`), and
 //! this page then hides the telemetry tabs (see `NEEDS_FLEET`) and shows one
 //! notice instead. The Admin tab and the control D1 keep working — neither
@@ -73,7 +73,7 @@ type TabId = (typeof TABS)[number]["id"];
 export type ControlRoute = TabId | "account";
 
 /** Telemetry tabs need the control fleet: in `make dev` there is no control
- * celld to record requests, errors or logs, so they are hidden (and a stale
+ * Cello to record requests, errors or logs, so they are hidden (and a stale
  * `?t=` falls back to Overview) rather than charting data that cannot exist.
  * The Admin tab works either way. */
 const NEEDS_FLEET: Record<TabId, boolean> = {
@@ -245,7 +245,7 @@ const Header = () => (
 );
 
 /** Overview for an install that does not supervise the control fleet: the
- * dev image serves the UI from `vite dev`, so there is no control celld and
+ * dev image serves the UI from `vite dev`, so there is no control Cello and
  * therefore no telemetry to chart. The admin tabs and the control D1 still
  * work (the D1 lives in this worker's binding, not in the fleet). */
 const NoControlFleetNotice = () => (
@@ -255,7 +255,7 @@ const NoControlFleetNotice = () => (
         Control-plane telemetry needs the release image
       </h2>
       <p class="m-0 text-sm opacity-70">
-        In <code>make dev</code> the control UI runs under vite, not celld, so
+        In <code>make dev</code> the control UI runs under vite, not Cello, so
         there is no control fleet to record requests, errors or logs. Storage
         and the admin panels still work.
       </p>

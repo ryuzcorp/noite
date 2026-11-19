@@ -39,7 +39,7 @@ export default defineConfig({
     ],
   ],
   testDir: "./upgrade",
-  // A seed deploys the sample app (bun install + celld deploy + fleet boot).
+  // A seed deploys the sample app (bun install + cello deploy + fleet boot).
   timeout: 10 * 60_000,
   use: {
     baseURL: process.env.E2E_BASE_URL ?? "http://noite.localhost:8090",

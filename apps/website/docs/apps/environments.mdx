@@ -3,14 +3,14 @@ title: Environments
 description: Preview environments — one per branch, each on its own host with its own fresh storage.
 ---
 
-An **environment** is a real deployment of one app's branch on celld: its own fleet, its own host, its own storage, from the same build pipeline as production. `main` is the app itself, never an environment — an environment deploy never touches the app's bucket, ports or deploy state.
+An **environment** is a real deployment of one app's branch on Cello: its own fleet, its own host, its own storage, from the same build pipeline as production. `main` is the app itself, never an environment — an environment deploy never touches the app's bucket, ports or deploy state.
 
 On the app page's **Deployments** tab each environment is its own group, below **Production** (`/apps/<id>?t=deployments&env=<id>` deep-links to one): the group header shows its label, what it tracks, status, last deploy, URL and whether it is public, with the environment's own deploy history beneath it — deploy logs and live output plus the environment's ingested telemetry, never production's lines. The **Metrics** and **Errors** tabs scope to one environment the same way with a picker — **Production** first, then each environment (`?env=<id>` deep-links) — and a pull request's page shows its head branch's environment card (status, URL, last deploy, links to its Metrics and Errors).
 
 | | |
 | --- | --- |
 | Host | `<label>.<slug>.<base>` — e.g. `staging.my-app.noite.now` |
-| Storage | Fresh and empty: `s3://<bucket>/envs/<slug>/<label>`, so celld creates new D1 databases, Durable Object state and R2 buckets on the environment's first deploy |
+| Storage | Fresh and empty: `s3://<bucket>/envs/<slug>/<label>`, so Cello creates new D1 databases, Durable Object state and R2 buckets on the environment's first deploy |
 | Tracks | `refs/heads/<branch>` |
 | Label | Derived from the branch: lowercased, separators to `-`, trimmed to a DNS label (≤ 40 chars), with a suffix on collision |
 | Access | Members only by default; a per-environment **Public** switch |
@@ -23,7 +23,7 @@ Creating an environment counts against the caps in [Limits](/reference/limits#qu
 
 ## Storage starts empty
 
-An environment is its own celld fleet with its own bucket prefix, so its first deploy creates new D1 databases, Durable Object namespaces and R2 buckets, and the app's migrations run exactly as they do on a first production deploy. Production data can be neither read nor wiped from an environment, and there is deliberately no seeding step: Noite has no D1 dump/restore primitive to copy production into one.
+An environment is its own Cello fleet with its own bucket prefix, so its first deploy creates new D1 databases, Durable Object namespaces and R2 buckets, and the app's migrations run exactly as they do on a first production deploy. Production data can be neither read nor wiped from an environment, and there is deliberately no seeding step: Noite has no D1 dump/restore primitive to copy production into one.
 
 ## Variables
 

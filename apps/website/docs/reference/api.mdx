@@ -83,7 +83,7 @@ Public (no credential): `/health`, `/ready`, `/v1/git/*`, `/v1/edge/*`.
 
 Reads resolve against the push mirror, which carries every pushed branch; a branch create or delete publishes exactly like a push (tip bundle, manifest, deploy when `main` moves).
 
-Storage and source reads classify the backend failure: a missing object, a missing D1 table, or a not-yet-deployed source is `404`, an invalid path is `400`, and every other mirror/S3/celld failure is `500`. (These used to be folded into `409`.)
+Storage and source reads classify the backend failure: a missing object, a missing D1 table, or a not-yet-deployed source is `404`, an invalid path is `400`, and every other mirror/S3/Cello failure is `500`. (These used to be folded into `409`.)
 
 ## Pull requests
 
@@ -115,7 +115,7 @@ Counted approvals are the latest review per reviewer that is `approved`, not dis
 | `POST` | `/v1/apps/{id}/storage/d1/{database_id}/delete-rows` | Delete 1..100 rows by key in one atomic batch |
 | `GET` | `/v1/apps/{id}/storage/do/{class_name}` | Durable Object instances (`id`, `scope`, `?read=1` preview) |
 | `GET` | `/v1/apps/{id}/storage/r2/{bucket}?prefix=&cursor=` | One page of a bucket folder: folders, files (size, content type) and the continuation cursor |
-| `GET` / `PUT` / `DELETE` | `/v1/apps/{id}/storage/r2/{bucket}/object?key=` | Read a text preview / upload one object (streamed body; `celld r2 put`) / delete it |
+| `GET` / `PUT` / `DELETE` | `/v1/apps/{id}/storage/r2/{bucket}/object?key=` | Read a text preview / upload one object (streamed body; `cello r2 put`) / delete it |
 | `POST` | `/v1/apps/{id}/storage/r2/{bucket}/delete` | Delete 1..100 objects by key in one batch (body: `keys`) |
 | `GET` | `/v1/apps/{id}/storage/r2/{bucket}/raw?key=` | Raw object bytes with the object's own content type |
 

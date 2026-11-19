@@ -86,8 +86,8 @@ export default {
 
       worker[n10] = v10;
 
-      // The fleet's own celld must reach the object store, so the egress
-      // policy allows its address; the keys stay inside celld. Reaching it
+      // The fleet's own Cello must reach the object store, so the egress
+      // policy allows its address; the keys stay inside Cello. Reaching it
       // is expected: only a store that serves data without them is a leak.
       const [n4, v4] = await attempt("fetch:rustfs", async () => {
         const res = await fetch("http://rustfs:9000/noite-e2e/");
@@ -127,7 +127,7 @@ export default {
         "RUNNER_TOKEN",
         "AWS_SECRET_ACCESS_KEY",
         "BETTER_AUTH_SECRET",
-        "CELLD_OPERATOR_TOKEN",
+        "CELLO_OPERATOR_TOKEN",
       ]) {
         secrets[key] = env[key] ? "present" : "absent";
       }

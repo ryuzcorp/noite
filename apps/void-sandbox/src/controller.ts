@@ -5,10 +5,10 @@
  *
  * Adapted from Void's `platform/packages/api/src/sandbox-controller-runtime.ts`
  * (MIT License, Copyright Cloudflare — see NOTICE). The lease, admission,
- * activity and alarm structure is Void's; every Noite (celld) change is marked
+ * activity and alarm structure is Void's; every Noite (Cello) change is marked
  * `Noite:` below:
  *
- * - Noite: no `start({ instance })`. celld sizes containers from the
+ * - Noite: no `start({ instance })`. Cello sizes containers from the
  *   `containers[]` config, so the `container` wrapper strips the `instance`
  *   start arg the base class passes, and there is no
  *   `__VOID_SANDBOX_INSTANCE` var.
@@ -19,10 +19,10 @@
  * - Noite: the sandbox shim must be baked into the image. `initialize()`
  *   probes for `/usr/local/bin/sandbox-shim` and fails closed with a clear
  *   error when a custom image lacks it.
- * - Noite: `signal` flows to celld. celld `exec()` honors the AbortSignal
+ * - Noite: `signal` flows to Cello. Cello `exec()` honors the AbortSignal
  *   natively (0010/0015: abort sends SIGKILL through the exec kill path),
  *   so `execProcess()` forwards it untouched.
- * - Noite: PTY passthrough. celld `exec()` takes `pty` (`true` or
+ * - Noite: PTY passthrough. Cello `exec()` takes `pty` (`true` or
  *   `{ cols, rows }`, patch 0006), so `execProcess()` forwards it; the wire
  *   `isPty` reads the native value and `resize` is the native resize.
  * - Noite: `fetch()` carries the activity guard, so direct port fetches
@@ -92,7 +92,7 @@ const SHIM_PATH = "/usr/local/bin/sandbox-shim";
 const SHIM_PROBE_TIMEOUT_MS = 30_000;
 
 /**
- * Minimal celld container surface the controller relies on. celld `start()`
+ * Minimal Cello container surface the controller relies on. Cello `start()`
  * takes `{ image, enableInternet, labels, entrypoint, env }` and `exec()`
  * takes `{ env, cwd, user, stdout, stderr, stdin, pty, signal, combined }`
  * — only `start()`'s Cloudflare-only `instance` key is stripped.
@@ -127,7 +127,7 @@ interface NoiteExecProcess {
   readonly stdin: WritableStream | null;
   readonly stdout: ReadableStream | null;
   readonly stderr: ReadableStream | null;
-  /** celld patch 0006: set for `pty` execs, with the native resize. */
+  /** Cello patch 0006: set for `pty` execs, with the native resize. */
   readonly isPty: boolean;
   readonly kill: (signal?: number) => void;
   readonly resize: (cols: number, rows: number) => Promise<void>;
@@ -152,7 +152,7 @@ interface ProcessCompletion {
 const wrapCelldContainer = (
   native: SandboxNativeContainer
 ): SandboxNativeContainer => {
-  // At runtime this is celld's container, not Cloudflare's. The wrapper
+  // At runtime this is Cello's container, not Cloudflare's. The wrapper
   // forwards the members the base class touches (`running`, `images`,
   // `start`, `exec`, `destroy`, `setInactivityTimeout`, `getTcpPort` — the
   // full set in the pinned `void`; `controller.test.ts` drives every one
@@ -171,7 +171,7 @@ const wrapCelldContainer = (
         return noite.exec(argv);
       }
 
-      // Every exec option is portable now (`signal` since celld 0010, `pty`
+      // Every exec option is portable now (`signal` since Cello 0010, `pty`
       // since 0006): only `start()` strips anything.
       return noite.exec(argv, { ...options });
     },
@@ -543,10 +543,10 @@ export class SandboxController extends SandboxContainer<ControllerEnv> {
   }
 
   /**
-   * Noite: `signal` flows straight to the native exec (celld 0010/0015:
+   * Noite: `signal` flows straight to the native exec (Cello 0010/0015:
    * abort sends SIGKILL through the exec kill path, and an already-aborted
    * signal refuses with its reason before spawning — workerd semantics).
-   * `pty` flows straight too (celld 0006): the wire `isPty` reads the
+   * `pty` flows straight too (Cello 0006): the wire `isPty` reads the
    * native value and `resize` is the native resize, so a terminal session
    * just works.
    *
@@ -631,7 +631,7 @@ export class SandboxController extends SandboxContainer<ControllerEnv> {
   }
 
   #admission(): Control {
-    // A secret name, not a fixed one: celld derives a named id from the
+    // A secret name, not a fixed one: Cello derives a named id from the
     // name alone, so a guessable name would give the admission cell a
     // public address. Missing or short fails closed.
     const name = this.env.__VOID_SANDBOX_ADMISSION_NAME ?? "";
@@ -820,7 +820,7 @@ export class SandboxController extends SandboxContainer<ControllerEnv> {
 
   protected override async beforeStart(): Promise<void> {
     return await this.#serializeLease(async () => {
-      // Noite: no `instanceType` assignment — celld sizes from config, and the
+      // Noite: no `instanceType` assignment — Cello sizes from config, and the
       // `container` wrapper strips the `instance` start arg.
       const decision = stepLease(
         await this.#readLease(),

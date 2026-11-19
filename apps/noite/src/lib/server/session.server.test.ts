@@ -94,7 +94,7 @@ describe("getSessionOrNull", () => {
   test("a wedged session store fails fast instead of riding to the route timeout", async () => {
     const cookie = await mintSessionCookie("wedged@example.com");
 
-    // A store that never answers: models the celld-D1 stall behind flake
+    // A store that never answers: models the Cello-D1 stall behind flake
     // H's 15.01 s pair. Assigned in place (not rebound) so the binding keeps
     // its identity: the setup pass settled before the stall, exactly like a
     // mid-lane wedge on a warm isolate. Methods are snapshotted first — the

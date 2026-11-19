@@ -87,7 +87,7 @@ const proxyR2Object = async (
 };
 
 /** Browser upload for one R2 object: session + push gate, then stream the
- * body to the runner (which spools it and calls `celld r2 put`, so the
+ * body to the runner (which spools it and calls `cello r2 put`, so the
  * stored record is what a Worker's `env.BUCKET.put()` writes). Nothing
  * buffers the file — the browser's body is handed to fetch as it arrives. */
 export const handleR2Upload: RouteHandler = async (request, env, params) => {

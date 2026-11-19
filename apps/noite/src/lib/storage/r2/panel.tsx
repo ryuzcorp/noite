@@ -1,6 +1,6 @@
 //! The R2 object browser (Supabase Storage → Files → bucket): a breadcrumb
 //! header, then the folder view. Writes — upload and New folder — stream to
-//! the UI's proxy route, which hands the body to the runner's `celld r2 put`,
+//! the UI's proxy route, which hands the body to the runner's `cello r2 put`,
 //! so the stored record is exactly what a Worker's `env.BUCKET.put()` writes.
 
 import { searchParam } from "../../search-param";

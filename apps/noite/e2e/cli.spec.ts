@@ -251,7 +251,7 @@ test("noite deploy ships a prebuilt dist and the printed URL serves it", async (
     const deploy = await waitForDeploy(request, appId);
     expect(deploy.status, deploy.log).toBe("success");
 
-    // A first deploy spawns the fleet; the edge answers 503 until celld
+    // A first deploy spawns the fleet; the edge answers 503 until cello
     // listens, so poll the printed URL itself (not the raw port — the
     // point is the address the CLI hands out). The worker echoes the
     // setting, proving Settings reach Worker code as `env.NAME`.

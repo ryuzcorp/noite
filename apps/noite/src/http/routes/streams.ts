@@ -131,14 +131,14 @@ export const handleLogsStream: RouteHandler = (request, env, params) => {
 /** App list snapshot poll cadence: the same as the runner's own streams
  * (deploys, app state), so the sidebar's status dots move with the page's
  * badges. Unchanged cycles send nothing; `eventStream`'s keep-alive comments
- * hold celld's ~60s idle-stream expiry. */
+ * hold Cello's ~60s idle-stream expiry. */
 const APPS_STREAM_POLL_MS = 2000;
 
 /** App list over SSE (like DeployList). Unverified: whether a Void SSE
- * route's first frame arrives on celld — an earlier 0.5.x attempt hung with
+ * route's first frame arrives on Cello — an earlier 0.5.x attempt hung with
  * no frame at all (before the per-request runtime fix), and proving it now
- * needs a celld node, which only the release image runs. SSE is also what
- * makes the heartbeats possible: an idle HTTP stream dies on celld's ~60 s
+ * needs a Cello node, which only the release image runs. SSE is also what
+ * makes the heartbeats possible: an idle HTTP stream dies on Cello's ~60 s
  * expiry, so this polls D1 here and pushes diffs, with comment heartbeats
  * resetting the expiry and EventSource auto-reconnect covering the rest.
  * Session-gated like every other browser route. */
@@ -165,7 +165,7 @@ export const handleAppsStream: RouteHandler = async (request, env) => {
           json = JSON.stringify(apps);
         } catch (error) {
           // Transient failure: log it and keep the stream alive; the next
-          // poll heals. `eventStream`'s keep-alive comments hold celld's
+          // poll heals. `eventStream`'s keep-alive comments hold Cello's
           // ~60 s idle-stream expiry between polls.
           console.error("apps stream poll failed", errorLogText(error));
         }
@@ -219,7 +219,7 @@ interface MetricsStreamOptions extends MetricsPoll {
 /** The metrics stream's poll loop: every cycle checks the runner's change
  * counter, polls the full frame only when it moved, sends it when there is
  * one, then sleeps. Unchanged cycles send nothing — `eventStream`'s
- * keep-alive comments hold celld's ~60 s idle-stream expiry instead of
+ * keep-alive comments hold Cello's ~60 s idle-stream expiry instead of
  * per-cycle pings. Exported for the unit tests. */
 export const streamMetrics = async (
   options: MetricsStreamOptions
@@ -283,7 +283,7 @@ export const streamMetrics = async (
 /** Usage stats over SSE (like the apps stream): the runner exposes one
  * unary `/metrics` read over the hourly counters, so this polls it here
  * (behind the version gate) and pushes a frame only when the request total
- * moves. `eventStream`'s keep-alive comments hold celld's ~60 s idle-stream
+ * moves. `eventStream`'s keep-alive comments hold Cello's ~60 s idle-stream
  * expiry; EventSource auto-reconnect covers the rest.
  * Session + view-role gated. */
 export const handleMetricsStream: RouteHandler = async (

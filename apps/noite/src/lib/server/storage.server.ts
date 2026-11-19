@@ -183,7 +183,7 @@ const capsForRole = (role: AppRole): D1TableCaps =>
 
 /** Tables + row counts of an app D1 database (view role). The control
  * database is read IN-PROCESS from the worker's own binding (never via the
- * runner, never via `celld d1 execute` — see SPEC). */
+ * runner, never via `cello d1 execute` — see SPEC). */
 export const d1Tables = apiAction(
   D1TablesArgs,
   async ({ appId, databaseId }, { env, request }) => {
@@ -209,7 +209,7 @@ export const d1Tables = apiAction(
         tables: listed.tables.map((table) => ({ ...table, caps })),
       };
     } catch (error) {
-      // The runner's own message (celld's line) is the useful part; a bare
+      // The runner's own message (Cello's line) is the useful part; a bare
       // status line names an internal route, which the tenant cannot act on.
       fail(runnerFailureMessage(runnerFailureOf(error)));
     }

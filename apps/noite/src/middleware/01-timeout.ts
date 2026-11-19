@@ -17,7 +17,7 @@
  * a static file is worse than useless: the 504 is JSON, so a bundle that
  * outlives the bound never executes and the page never hydrates (the e2e
  * "flake wave": a chunk 504'd at exactly 15 s, then every locator on the
- * un-hydrated page timed out 30 s later). celld serves `/assets/*` itself
+ * un-hydrated page timed out 30 s later). Cello serves `/assets/*` itself
  * (`RUN_WORKER_FIRST` in `void.config.ts` excludes it), so this exemption
  * covers the paths that still reach the Worker: a missing file's fall
  * through, and a direct-to-worker request.

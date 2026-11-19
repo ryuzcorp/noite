@@ -5,10 +5,10 @@ description: Object-store backends, volumes, snapshots, and the telemetry pipeli
 
 ## Backend
 
-celld qualifies Amazon S3, Cloudflare R2, Google Cloud Storage, Tigris, and Azure Blob Storage; the store must provide conditional writes, read-after-write consistency, and ranged reads. celld runs a storage-contract check at node startup — a contract violation stops startup, an ambiguous transport error warns — so a store that fails the contract stops loudly instead of corrupting state later. MinIO community edition passes celld's storage test but is not qualified for production.
+Cello qualifies Amazon S3, Cloudflare R2, Google Cloud Storage, Tigris, and Azure Blob Storage; the store must provide conditional writes, read-after-write consistency, and ranged reads. Cello runs a storage-contract check at node startup — a contract violation stops startup, an ambiguous transport error warns — so a store that fails the contract stops loudly instead of corrupting state later. MinIO community edition passes Cello's storage test but is not qualified for production.
 
 :::note
-Noite's bundled default is RustFS 1.0.5, qualified by Noite for single-host installs at the pinned version: celld's own `diagnose` probe passes against it (`bucket conditional write: create, reject-create, update, reject-stale`), and [`docker/qualify-store.ts`](https://github.com/ryuzcorp/noite/blob/main/docker/qualify-store.ts) covers the rest of the contract — a 16-way racing conditional create with exactly one winner, read-after-write and immediate list-after-write, three ranged-read spellings, a multipart round-trip at celld's 5 MiB threshold plus abort, and delete-then-404. Re-run it against any S3 endpoint with `S3_ENDPOINT=... NOITE_S3_BUCKET=... bun docker/qualify-store.ts`; CI runs it against the pinned image on every PR, so a RustFS bump cannot silently regress. celld's own startup check still runs on every node boot. For multi-host production the recommended path is still your own bucket on a store celld qualifies. Bundled RustFS stays the zero-config default.
+Noite's bundled default is RustFS 1.0.5, qualified by Noite for single-host installs at the pinned version: Cello's own `diagnose` probe passes against it (`bucket conditional write: create, reject-create, update, reject-stale`), and [`docker/qualify-store.ts`](https://github.com/ryuzcorp/noite/blob/main/docker/qualify-store.ts) covers the rest of the contract — a 16-way racing conditional create with exactly one winner, read-after-write and immediate list-after-write, three ranged-read spellings, a multipart round-trip at Cello's 5 MiB threshold plus abort, and delete-then-404. Re-run it against any S3 endpoint with `S3_ENDPOINT=... NOITE_S3_BUCKET=... bun docker/qualify-store.ts`; CI runs it against the pinned image on every PR, so a RustFS bump cannot silently regress. Cello's own startup check still runs on every node boot. For multi-host production the recommended path is still your own bucket on a store Cello qualifies. Bundled RustFS stays the zero-config default.
 :::
 
 Store connection variables (`S3_ENDPOINT`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `NOITE_S3_BUCKET`) are documented in [Environment variables](/reference/environment-variables).
@@ -71,9 +71,9 @@ Fleets and release commands hold keys that reach only their own prefix (`fleets/
 | Volume | Holds |
 | --- | --- |
 | `noite-data` | runner SQLite (apps, deploys, env, domains, metrics), git mirrors, builds, fleet working dirs, Caddy config and certificates |
-| `rustfs-data` | the bundled bucket: `git/` tip bundles, `fleets/` tenant celld, `envs/` one prefix per [preview environment](/apps/environments), `control/` UI worker + its D1 (accounts, invites) + the control fleet's telemetry, `runner/state/` runner snapshots |
+| `rustfs-data` | the bundled bucket: `git/` tip bundles, `fleets/` tenant Cello, `envs/` one prefix per [preview environment](/apps/environments), `control/` UI worker + its D1 (accounts, invites) + the control fleet's telemetry, `runner/state/` runner snapshots |
 
-Bucket prefixes under the single `NOITE_S3_BUCKET`: `git/` (tip bundles), `fleets/` (tenant celld), `envs/<slug>/<label>/` (one [preview environment](/apps/environments)'s celld and storage), `control/` (UI worker, its D1 and the control fleet's telemetry), `runner/state/` (runner snapshots).
+Bucket prefixes under the single `NOITE_S3_BUCKET`: `git/` (tip bundles), `fleets/` (tenant Cello), `envs/<slug>/<label>/` (one [preview environment](/apps/environments)'s Cello and storage), `control/` (UI worker, its D1 and the control fleet's telemetry), `runner/state/` (runner snapshots).
 
 ## Snapshots
 
@@ -83,7 +83,7 @@ The loss window on an ungraceful crash is about 22 s of API mutations, as long a
 
 ## Telemetry
 
-Tenant fleets run `CELLD_OTEL=1` with celld's bucket sink: Parquet under `telemetry/traces/` and `telemetry/logs/` in the fleet bucket, no collector service. The flush interval comes from `RUNNER_OTEL_FLUSH_MS` (30 s by default) and retention from `RUNNER_TELEMETRY_RETENTION_DAYS` (30 days), which also bounds the runner's hourly-counter prune.
+Tenant fleets run `CELLO_OTEL=1` with Cello's bucket sink: Parquet under `telemetry/traces/` and `telemetry/logs/` in the fleet bucket, no collector service. The flush interval comes from `RUNNER_OTEL_FLUSH_MS` (30 s by default) and retention from `RUNNER_TELEMETRY_RETENTION_DAYS` (30 days), which also bounds the runner's hourly-counter prune.
 
 ### Hourly counters
 
@@ -93,25 +93,25 @@ Requests, errors and latency come from the Caddy access log — one JSON line pe
 
 ### The control fleet's own telemetry
 
-The control UI is a celld fleet too, and it runs the same telemetry environment as a tenant (`RUNNER_OTEL_FLUSH_MS`, `RUNNER_TELEMETRY_RETENTION_DAYS`) with its own bucket prefix, so celld writes under `s3://<bucket>/control/telemetry/{traces,logs}/<node>/<yyyy>/<mm>/<dd>/<hh>/`. It is ingested, compacted, pruned and error-grouped exactly like a tenant fleet, keyed on the reserved `_control` slug, and served on the same runner routes (`/v1/apps/_control/metrics|spans|logs|errors`) and the UI's SSE streams.
+The control UI is a Cello fleet too, and it runs the same telemetry environment as a tenant (`RUNNER_OTEL_FLUSH_MS`, `RUNNER_TELEMETRY_RETENTION_DAYS`) with its own bucket prefix, so Cello writes under `s3://<bucket>/control/telemetry/{traces,logs}/<node>/<yyyy>/<mm>/<dd>/<hh>/`. It is ingested, compacted, pruned and error-grouped exactly like a tenant fleet, keyed on the reserved `_control` slug, and served on the same runner routes (`/v1/apps/_control/metrics|spans|logs|errors`) and the UI's SSE streams.
 
 There is deliberately **no `app` row** for `_control` (`_control` is reserved at create): nothing that iterates apps — reconcile, the Caddyfile writer, scale-to-zero, purge, backup, `GET /v1/apps` — ever sees the control plane. The UI shows the surfaces only to a real instance admin, never an impersonated session. Control traffic includes the dashboard's own polling and event streams, so those numbers are real load, not a baseline to subtract.
 
 `--slug _control` is the way to replay just the control fleet's window (see below).
 
-Frequent flushes need a compaction job — queries grow slow within hours otherwise, and celld does not compact its own files. The runner runs it hourly via `host/metrics/compact.rs::compact_fleet`: for the hour that just ended, per node directory, the runner folds that directory's objects with its own Parquet writer into one zstd `compacted.parquet` — union by name, so an hour that spans a schema change (the docs call the schema `v0-unstable`) keeps both shapes and the unsigned column annotations — then the source files are deleted. Deletion happens only after `head-object` proves the compacted file exists, so a failed copy can never lose spans. An hour whose fold could not produce a file the ingest accepts (inputs past the 160 MiB fold budget, or an output past the 256 MiB object cap) is left **raw**: its sources stay readable, the ingest reads them, and later hours are not blocked. The current hour is never compacted.
+Frequent flushes need a compaction job — queries grow slow within hours otherwise, and Cello does not compact its own files. The runner runs it hourly via `host/metrics/compact.rs::compact_fleet`: for the hour that just ended, per node directory, the runner folds that directory's objects with its own Parquet writer into one zstd `compacted.parquet` — union by name, so an hour that spans a schema change (the docs call the schema `v0-unstable`) keeps both shapes and the unsigned column annotations — then the source files are deleted. Deletion happens only after `head-object` proves the compacted file exists, so a failed copy can never lose spans. An hour whose fold could not produce a file the ingest accepts (inputs past the 160 MiB fold budget, or an output past the 256 MiB object cap) is left **raw**: its sources stay readable, the ingest reads them, and later hours are not blocked. The current hour is never compacted.
 
 Runner queries are hour-scoped: the aggregation window stops 10 s behind the flush and names only the hour directories it spans, instead of globbing the whole retention.
 
 ### Ingest, re-reads and downtime
 
-The runner ingests telemetry into `metrics.sqlite` (next to the runner database, never snapshotted) by decoding celld's Parquet in-process, with no external process. Each pass processes **hour-aligned chunks**: the completed hours it still owes, then the partial current hour, and fills the log ring (`app_log`) and the error tables (`app_error_*`) — the only Parquet-derived tables left; requests, errors and latency come from the access log into the hourly counters. Every table it owns is written with **replace** semantics (`app_log`, `app_error_*`), so re-reading a window always yields the same aggregates instead of double counting. A single corrupt or foreign object is skipped with a warning instead of failing the fleet's chunk forever.
+The runner ingests telemetry into `metrics.sqlite` (next to the runner database, never snapshotted) by decoding Cello's Parquet in-process, with no external process. Each pass processes **hour-aligned chunks**: the completed hours it still owes, then the partial current hour, and fills the log ring (`app_log`) and the error tables (`app_error_*`) — the only Parquet-derived tables left; requests, errors and latency come from the access log into the hourly counters. Every table it owns is written with **replace** semantics (`app_log`, `app_error_*`), so re-reading a window always yields the same aggregates instead of double counting. A single corrupt or foreign object is skipped with a warning instead of failing the fleet's chunk forever.
 
 That is what makes failures and downtime safe:
 
 - A failed pass (an S3 or SQLite error) is distinguished from an idle one (the window listed no object). Idle completes the chunk; **a real error leaves the watermark where it was**, so the chunk is retried — and the retry is exact.
 - One broken fleet cannot hold the others. When a pass covering several fleets fails, the runner immediately retries it **per fleet**: healthy fleets commit and advance, and only the failing fleet keeps its watermark. A fleet that keeps failing is retried after a short backoff, so a persistent problem does not re-fail every tick.
-- After the runner is off for hours or days, the next ticks walk the gap **one hour-chunk at a time**, oldest first, advancing the watermark per committed chunk and bounded by `RUNNER_TELEMETRY_RETENTION_DAYS`. This includes fleets that have stopped, parked or crashed since: any fleet whose watermark is behind is drained through its last complete hour, so a scale-to-zero park does not strand the tail of its telemetry (it lands within the hour it stopped in). Data older than retention has been pruned by celld and cannot be recovered.
+- After the runner is off for hours or days, the next ticks walk the gap **one hour-chunk at a time**, oldest first, advancing the watermark per committed chunk and bounded by `RUNNER_TELEMETRY_RETENTION_DAYS`. This includes fleets that have stopped, parked or crashed since: any fleet whose watermark is behind is drained through its last complete hour, so a scale-to-zero park does not strand the tail of its telemetry (it lands within the hour it stopped in). Data older than retention has been pruned by Cello and cannot be recovered.
 - Compaction cannot change a re-read's counts: an hour directory that holds a `compacted.parquet` is read from that file alone, so the intermediate state of a compaction (compacted file written, sources not yet deleted) never counts twice, and a leftover from an interrupted source delete is cleaned up on the next compaction pass.
 
 ### Replaying a window
@@ -133,4 +133,4 @@ docker compose exec noite noite-runner telemetry reingest --slug blog --since 20
 Metrics, logs and errors ingested before this release are correct; the replay only fills in the rows the old ingest skipped.
 :::
 
-To read the raw telemetry yourself, point any Parquet reader at the fleet bucket: `s3://<bucket>/fleets/<slug>/telemetry/{traces,logs}/<node>/<yyyy>/<mm>/<dd>/<hh>/*.parquet` holds celld's spans and console lines (requests and latency live in the hourly counters instead, fed by the access log). A directory holding `compacted.parquet` must be read from that file alone.
+To read the raw telemetry yourself, point any Parquet reader at the fleet bucket: `s3://<bucket>/fleets/<slug>/telemetry/{traces,logs}/<node>/<yyyy>/<mm>/<dd>/<hh>/*.parquet` holds Cello's spans and console lines (requests and latency live in the hourly counters instead, fed by the access log). A directory holding `compacted.parquet` must be read from that file alone.

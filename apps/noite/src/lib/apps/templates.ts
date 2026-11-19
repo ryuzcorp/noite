@@ -18,7 +18,7 @@ export interface AppTemplate {
 
 export const TEMPLATES: readonly AppTemplate[] = [
   {
-    description: "Ilha pages on Void (Vite), served by celld.",
+    description: "Ilha pages on Void (Vite), served by Cello.",
     id: "ilha-void",
     name: "Ilha + Void",
     path: "templates/ilha-void",
@@ -33,7 +33,7 @@ export const TEMPLATES: readonly AppTemplate[] = [
     name: "Agent",
     path: "templates/agent",
     ref: "main",
-    stack: ["Pi Durable", "Sandbox", "celld"],
+    stack: ["Pi Durable", "Sandbox", "Cello"],
     url: "https://github.com/ryuzcorp/noite-templates",
   },
 ];
