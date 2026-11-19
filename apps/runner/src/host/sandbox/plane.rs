@@ -587,5 +587,4 @@ mod tests {
         assert_eq!(parse_own_container("", json), None);
         assert_eq!(parse_own_container("9f2c4b1a8e03", "bogus"), None);
     }
-
 }
