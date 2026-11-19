@@ -371,62 +371,14 @@ async fn reconcile_once(
         .map(|a| a.id.clone())
         .collect();
     let environments = db::list_all_environments(pool).await?;
-    // Stop phase: every fleet whose desired state is stopped — apps and
-    // previews together — concurrently. Each stop drains its own SIGTERM
-    // grace (up to 15 s) while holding no lock, but awaiting the stops one by
-    // one serialized the whole tick behind N slow drains: a start for an
-    // unrelated fleet waited behind stops it had nothing to do with
-    // (head-of-line) until its health-gate budget expired. All stops in this
-    // pass complete before any spawn in the loops below, and each key is
-    // stopped at most once per tick (one row per key), so the tick never
-    // starts a fleet while its own previous process is still draining, with
-    // no double stop or start. (A wake racing the stop phase can still spawn
-    // concurrently; that pre-existing race is settled by the spawn epoch.)
-    let mut stop_keys: Vec<String> = apps
-        .iter()
-        .filter(|a| a.desired() == DesiredState::Stopped)
-        .map(|a| a.slug.clone())
-        .collect();
-    stop_keys.extend(
-        environments
-            .iter()
-            .filter(|e| e.is_stopped() || stopped_apps.contains(&e.app_id))
-            .map(|e| supervisor::env_fleet_key(&e.app_slug, &e.label)),
-    );
-    supervisor::stop_fleets(procs, &stop_keys, supervisor::StopGrace::NORMAL).await;
-    for app in &apps {
-        if app.desired() == DesiredState::Stopped && app.status != AppStatus::Stopped {
-            db::write_app_status(
-                pool,
-                &app.id,
-                AppStatus::Stopped,
-                None,
-                None,
-                crate::models::WriteGuard::Table,
-            )
-            .await?;
-        }
-    }
-    for env in &environments {
-        if env.is_stopped() && env.status != AppStatus::Stopped {
-            db::write_environment_status(
-                pool,
-                &env.id,
-                AppStatus::Stopped,
-                None,
-                crate::models::WriteGuard::Table,
-            )
-            .await?;
-        }
-    }
     // Cold starts per pass (`RUNNER_FLEET_SPAWN_BATCH`): a boot or upgrade
     // must not stack every celld's initialization at once. Restarts of an
     // already-registered child are never batched — those wait on their own
     // backoff and deserve the next tick.
     let mut cold_starts: u32 = 0;
     for app in &apps {
-        // Stopped fleets left in the stop phase above: their drains all
-        // completed before this loop, so nothing here may start one again.
+        // Desired stopped rows never spawn: the stop phase below stops them
+        // in this same pass.
         if app.desired() == DesiredState::Stopped {
             continue;
         }
@@ -508,8 +460,8 @@ async fn reconcile_once(
     }
 
     // Preview environments are fleets of their own: same desired_state rule,
-    // same wake-aware parking, and their own ref drives their deploys. Stops
-    // ran in the stop phase above, so this loop only skips them.
+    // same wake-aware parking, and their own ref drives their deploys. The
+    // stop phase below stops the parked ones; this loop only skips them.
     for env in &environments {
         let fleet = format!("{}.{}", env.app_slug, env.label);
         if env.is_stopped() || stopped_apps.contains(&env.app_id) {
@@ -579,6 +531,55 @@ async fn reconcile_once(
             }
             Ok(None) => {}
             Err(e) => tracing::warn!(fleet = %fleet, error = %e, "list tip"),
+        }
+    }
+    // Stop phase, after the spawn loops above: every fleet whose desired
+    // state is stopped — apps and previews together — concurrently. Each
+    // stop drains its own SIGTERM grace (up to 15 s) while holding no lock.
+    // Spawns used to wait behind these drains in the same pass: a start for
+    // an unrelated fleet waited behind stops it had nothing to do with
+    // (head-of-line) until its health-gate budget expired (e2e
+    // deploy.spec.ts Stop→Start flake). Stops still complete within this
+    // pass before the next tick's spawns, and each key is stopped at most
+    // once per tick (one row per key), so the tick never starts a fleet
+    // while its own previous process is still draining, with no double
+    // stop or start. (A wake racing the stop phase can still spawn
+    // concurrently; that pre-existing race is settled by the spawn epoch.)
+    let mut stop_keys: Vec<String> = apps
+        .iter()
+        .filter(|a| a.desired() == DesiredState::Stopped)
+        .map(|a| a.slug.clone())
+        .collect();
+    stop_keys.extend(
+        environments
+            .iter()
+            .filter(|e| e.is_stopped() || stopped_apps.contains(&e.app_id))
+            .map(|e| supervisor::env_fleet_key(&e.app_slug, &e.label)),
+    );
+    supervisor::stop_fleets(procs, &stop_keys, supervisor::StopGrace::NORMAL).await;
+    for app in &apps {
+        if app.desired() == DesiredState::Stopped && app.status != AppStatus::Stopped {
+            db::write_app_status(
+                pool,
+                &app.id,
+                AppStatus::Stopped,
+                None,
+                None,
+                crate::models::WriteGuard::Table,
+            )
+            .await?;
+        }
+    }
+    for env in &environments {
+        if env.is_stopped() && env.status != AppStatus::Stopped {
+            db::write_environment_status(
+                pool,
+                &env.id,
+                AppStatus::Stopped,
+                None,
+                crate::models::WriteGuard::Table,
+            )
+            .await?;
         }
     }
 
@@ -1305,5 +1306,160 @@ mod tests {
         );
 
         pool.close().await;
+    }
+
+    /// A slow stop must not head-of-line-block an unrelated start. The stop
+    /// phase used to await every SIGTERM drain before any spawn in the same
+    /// pass, so a start waited behind stops it had nothing to do with until
+    /// its health-gate budget expired (e2e deploy.spec.ts Stop→Start flake:
+    /// the start spawned a full slow drain after the stop instead of on the
+    /// next tick). Park one fleet's stop mid-drain and require an unrelated
+    /// fleet's spawn claim in the same pass; fails on the old order via its
+    /// deadline.
+    #[tokio::test]
+    async fn an_unrelated_start_does_not_wait_behind_a_slow_stop() {
+        let cfg = crate::config::config_for_tests();
+        // A temp file, not `:memory:`: the pool holds five connections and
+        // every `:memory:` connection is its own empty database, so the
+        // spawned reconcile would see none of these rows.
+        let db_path =
+            std::env::temp_dir().join(format!("hol-start-order-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&db_path);
+        let db_url = format!("sqlite:{}?mode=rwc", db_path.to_string_lossy());
+        let pool = db::connect(&db_url).await.expect("temp db");
+        let procs = supervisor::new_procs();
+        // Fleet A is stopped: its stop parks mid-drain for the whole pass.
+        let stopped = db::create_app(
+            &pool,
+            &cfg,
+            db::NewApp {
+                name: "hol-stop",
+                slug: "hol-stop",
+                user_id: "local",
+                subdomain: "hol-stop.localhost",
+                listen: 30510,
+                internal: 30511,
+            },
+        )
+        .await
+        .expect("stopped app");
+        db::patch_app_desired(&pool, &stopped.id, DesiredState::Stopped)
+            .await
+            .expect("stop");
+        let stop_gate = supervisor::stop_gate_register("hol-stop");
+        // Fleet B wants to run and is deployed: its spawn claim must land
+        // while A's drain is still parked. B never leaves pre-claim here,
+        // so no fleet process is spawned and the test needs no celld.
+        let starting = db::create_app(
+            &pool,
+            &cfg,
+            db::NewApp {
+                name: "hol-start",
+                slug: "hol-start",
+                user_id: "local",
+                subdomain: "hol-start.localhost",
+                listen: 30512,
+                internal: 30513,
+            },
+        )
+        .await
+        .expect("starting app");
+        db::upsert_deploy(
+            &pool,
+            None,
+            &starting.id,
+            None,
+            DeployStatus::Success,
+            Some("sha1"),
+            "",
+        )
+        .await
+        .expect("success deploy");
+        let spawn_gate = supervisor::test_gate_register("hol-start");
+        // Order recording: a watcher per gate pushes as its gate fires and
+        // releases it at once, so the pass keeps moving and the test observes
+        // the true order. Waiters first: a `notify_one` before `notified()`
+        // is lost, so both watchers are armed before the pass is spawned.
+        let order = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let claimed_watcher = tokio::spawn({
+            let (gate, order) = (spawn_gate.clone(), order.clone());
+            async move {
+                gate.pre_claim_arrived.notified().await;
+                order
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push("claim");
+                gate.pre_claim_release.notify_one();
+            }
+        });
+        let entered_watcher = tokio::spawn({
+            let (gate, order) = (stop_gate.clone(), order.clone());
+            async move {
+                gate.entered.notified().await;
+                order
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push("enter");
+                gate.release.notify_one();
+            }
+        });
+        // The metrics tick runs at the end of a pass; it needs a store the
+        // test does not have, so hold a fake claim and skip it.
+        let deploying = crate::host::deploy::new_deploying();
+        deploying
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert("hol-block-metrics".to_string());
+        let recon = tokio::spawn({
+            let (pool, cfg, procs, deploying) =
+                (pool.clone(), cfg.clone(), procs.clone(), deploying.clone());
+            async move {
+                let (_tip_tx, mut tip_rx) = tokio::sync::mpsc::unbounded_channel();
+                let (log_tx, _log_rx) = tokio::sync::watch::channel(0u64);
+                let mut metrics = crate::host::metrics::new_state();
+                let mut last_sweep = Some(Instant::now());
+                reconcile_once(
+                    &pool,
+                    &cfg,
+                    &procs,
+                    0,
+                    &crate::host::logs::new_state(),
+                    &deploying,
+                    &mut metrics,
+                    &mut tip_rx,
+                    &mut last_sweep,
+                    &log_tx,
+                )
+                .await
+            }
+        });
+        // Both gates must fire: the pass must reach both the spawn and the
+        // stop. The releases above already unblocked the pass, so a timeout
+        // here means the pass never got there at all.
+        let fired = tokio::time::timeout(Duration::from_secs(10), async {
+            let _ = tokio::join!(claimed_watcher, entered_watcher);
+        })
+        .await;
+        // No parked task outlives the test, and a failure still cleans the
+        // static gate maps.
+        supervisor::stop_gate_remove("hol-stop");
+        supervisor::test_gate_remove("hol-start");
+        assert!(fired.is_ok(), "the pass never reached both gates");
+        // The releases already unblocked every park, so the pass must finish
+        // promptly now.
+        let recon_outcome = tokio::time::timeout(Duration::from_secs(30), recon).await;
+        assert!(
+            recon_outcome.is_ok(),
+            "the pass did not finish after the gates released"
+        );
+        assert_eq!(
+            *order
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            vec!["claim", "enter"],
+            "the unrelated start's spawn claim waited behind the parked stop's drain"
+        );
+        pool.close().await;
+        let _ = std::fs::remove_file(&db_path);
     }
 }
