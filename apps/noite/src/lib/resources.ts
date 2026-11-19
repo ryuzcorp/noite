@@ -182,7 +182,10 @@ const APP_STATE_RETRY: RetryPolicy = {
 export const appDetail = (id: string) =>
   tracked(
     keys.appDetail(id),
-    withRetry(() => api<AppDetail>("/api/apps/get", id), APP_STATE_RETRY)
+    withRetry(
+      ({ signal }) => api<AppDetail>("/api/apps/get", id, { signal }),
+      APP_STATE_RETRY
+    )
   );
 
 /** The Sync from GitHub status: the stored origin, the last synced sha, the
@@ -250,7 +253,10 @@ export const environments = (id: string) =>
   tracked(
     keys.environments(id),
     withRetry(
-      () => api<RunnerEnvironment[]>("/api/environments/listEnvironments", id),
+      ({ signal }) =>
+        api<RunnerEnvironment[]>("/api/environments/listEnvironments", id, {
+          signal,
+        }),
       APP_STATE_RETRY
     )
   );
@@ -290,12 +296,16 @@ export const errorDetail = (
   tracked(
     keys.errorDetail(appId, fingerprint, environmentId),
     withRetry(
-      () =>
-        api<RunnerErrorDetail>("/api/errors/errorDetail", {
-          appId,
-          environmentId: environmentId === "" ? undefined : environmentId,
-          fingerprint,
-        }),
+      ({ signal }) =>
+        api<RunnerErrorDetail>(
+          "/api/errors/errorDetail",
+          {
+            appId,
+            environmentId: environmentId === "" ? undefined : environmentId,
+            fingerprint,
+          },
+          { signal }
+        ),
       ERROR_DETAIL_RETRY
     )
   );

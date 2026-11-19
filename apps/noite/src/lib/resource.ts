@@ -21,6 +21,7 @@ import * as Atom from "effect/reactivity/Atom";
 import { atom, watch } from "ilha";
 import type { AtomHandle } from "ilha";
 
+import { ApiError } from "./api";
 import { readSwr, swrEpoch, writeSwr } from "./swr-store";
 
 /** What one resource reader paints: one closed type, no parallel
@@ -140,15 +141,66 @@ export interface RetryPolicy {
   sleep?: (ms: number) => Promise<void>;
 }
 
+/** HTTP statuses worth a second try: no answer at all, or an answer that
+ * asks for one (try later, slow down). Every other classified refusal —
+ * a revoked role, a missing row, a rejected form — is permanent. */
+const TRANSIENT_STATUS = new Set([0, 408, 429]);
+
+// oxlint-disable-next-line anti-slop/no-unknown-parameters -- catch-site classifier: a rejected fetch is unknown by construction; this narrows it onto the retry decision.
+const retryable = (error: unknown): boolean => {
+  const aborted =
+    error instanceof DOMException
+      ? error.name === "AbortError"
+      : error instanceof Error && error.name === "AbortError";
+
+  if (aborted) {
+    return false;
+  }
+
+  if (error instanceof ApiError) {
+    return TRANSIENT_STATUS.has(error.status) || error.status >= 500;
+  }
+
+  return true;
+};
+
+/** `sleep` that loses to `signal`: a supersede, unmount or sign-out during
+ * the backoff rejects with an `AbortError` instead of firing one more
+ * attempt under a stale (or another account's) session. */
+const sleepUnlessAborted = async (
+  ms: number,
+  signal: AbortSignal,
+  sleep: (ms: number) => Promise<void>
+): Promise<void> => {
+  if (signal.aborted) {
+    throw new DOMException("retry aborted", "AbortError");
+  }
+
+  const { promise: aborted, reject } = Promise.withResolvers<never>();
+
+  const onAbort = (): void => {
+    reject(new DOMException("retry aborted", "AbortError"));
+  };
+
+  signal.addEventListener("abort", onAbort, { once: true });
+
+  try {
+    await Promise.race([sleep(ms), aborted]);
+  } finally {
+    signal.removeEventListener("abort", onAbort);
+  }
+};
+
 /** Run `fetch` under a bounded backoff: a transient failure (dropped
  * connection, 504, read-time hiccup) retries instead of surfacing at once;
  * a lasting failure rejects with its last error after `attempts` tries.
- * One series per call — concurrent callers share nothing (dedup lives in
+ * Aborts and permanent refusals (401, 403, 404, 422) never retry. One
+ * series per call — concurrent callers share nothing (dedup lives in
  * `tracked`/the feed in-flight slots, not here). */
 export const withRetry = <T>(
-  fetch: () => Promise<T>,
+  fetch: (ctx: { signal: AbortSignal }) => Promise<T>,
   policy: RetryPolicy
-): (() => Promise<T>) => {
+): ResourceFetcher<T> => {
   const attempts = Math.max(1, Math.floor(policy.attempts));
 
   const sleep =
@@ -169,21 +221,31 @@ export const withRetry = <T>(
       policy.capMs ?? Number.POSITIVE_INFINITY
     );
 
-  return async (): Promise<T> => {
+  return async (key: string, ctx: { signal: AbortSignal }): Promise<T> => {
+    const { signal } = ctx;
+
     try {
-      return await fetch();
+      return await fetch({ signal });
     } catch (error_) {
       let error: unknown = error_;
 
+      if (!retryable(error)) {
+        throw error;
+      }
+
       for (let retry = 1; retry < attempts; retry += 1) {
         // oxlint-disable-next-line eslint/no-await-in-loop -- one sequential backoff per retry by design
-        await sleep(delayMs(retry));
+        await sleepUnlessAborted(delayMs(retry), signal, sleep);
 
         try {
           // oxlint-disable-next-line eslint/no-await-in-loop -- one sequential attempt per retry by design
-          return await fetch();
+          return await fetch({ signal });
         } catch (error__) {
           error = error__;
+
+          if (!retryable(error)) {
+            throw error;
+          }
         }
       }
 
@@ -218,6 +280,34 @@ const generations = new Map<string, number>();
 const memoryOnly = new Set<string>();
 const subs = new Map<string, Set<KeySub>>();
 
+/** Abort per key: a last-reader unmount or an auth reset ends the in-flight
+ * load (and its retry backoff) instead of letting it retry under a stale —
+ * possibly another account's — session. Supersedes never abort: concurrent
+ * readers share one lookup, so killing it would drop the generation that
+ * still wants it; the generation guard already neutralizes stale results. */
+const keyControllers = new Map<string, AbortController>();
+
+/** The signal the current load of `key` reads under, creating it on first
+ * use. Read at lookup start, so a load keeps the controller it began with
+ * even when a later load replaces it. */
+const keySignal = (key: string): AbortSignal => {
+  let ctrl = keyControllers.get(key);
+
+  if (ctrl === undefined) {
+    ctrl = new AbortController();
+    keyControllers.set(key, ctrl);
+  }
+
+  return ctrl.signal;
+};
+
+/** End the in-flight load of `key`, if any. The next load starts detached
+ * from whatever this one was waiting on. */
+const abortKey = (key: string): void => {
+  keyControllers.get(key)?.abort();
+  keyControllers.delete(key);
+};
+
 /** The Effect cache key for a resource key: the account epoch plus the key,
  * so a lookup that started before an auth change lands in a namespace no
  * reader asks for after the reset (the keys carry no account id). */
@@ -236,18 +326,20 @@ const cache = Effect.runSync(
       Effect.tryPromise({
         // oxlint-disable-next-line anti-slop/no-unknown-returns -- the cache is type-erased across keys; each key's readers own T and narrow on settle.
         catch: (cause: unknown): unknown => cause,
-        try: async (signal: AbortSignal) => {
+        try: async () => {
           const key = bareKey(effectKey);
           const run = fetchers.get(key);
 
           // The snapshot write lives in `settleKey`, guarded by the reload
           // generation: a superseded lookup resolves without overwriting the
-          // newer snapshot (or painting its atoms).
+          // newer snapshot (or painting its atoms). The load reads under the
+          // key's controller, so an unmount or auth reset aborts it (and its
+          // retry backoff) instead of answering under a stale session.
           return run === undefined
             ? await Promise.reject<unknown>(
                 new Error(`no fetcher registered for resource "${key}"`)
               )
-            : await run(key, { signal });
+            : await run(key, { signal: keySignal(key) });
         },
       }),
   })
@@ -364,6 +456,9 @@ const kick = (key: string): void => {
  * (an auth reset uses this; a mutation uses `invalidate`, which keeps the
  * value visible as `Reloading`). A key with no readers just evicts. */
 export const resetResource = (key: string): void => {
+  // An auth reset forgets every snapshot: the in-flight load must not answer
+  // (or retry) under the next session, so it ends before anything reloads.
+  abortKey(key);
   const readers = subs.get(key);
 
   if (readers === undefined || readers.size === 0) {
@@ -485,6 +580,9 @@ export const tracked = <T>(
 
       if (live.size === 0) {
         subs.delete(key);
+        // Nobody paints this key anymore: end its load (and any retry
+        // backoff) instead of answering after the page moved on.
+        abortKey(key);
       }
     };
   });

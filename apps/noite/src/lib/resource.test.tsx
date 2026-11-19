@@ -6,6 +6,7 @@ import * as Atom from "effect/reactivity/Atom";
 import { atom, watch } from "ilha";
 import { render } from "ilha/test";
 
+import { ApiError } from "./api";
 import {
   invalidate,
   nextResourceState,
@@ -580,8 +581,10 @@ describe("tracked mount failures", () => {
 
 /** Hand-fired sleep: delays are recorded, resolvers fire by hand, so no
  * test waits out a real backoff. Module scope: the factory captures
- * nothing, so every test shares one definition. */
+ * nothing, so every test shares one definition. The controller drives the
+ * abort half of the tests by hand, like the sleep. */
 const manualSleep = () => {
+  const controller = new AbortController();
   const delays: number[] = [];
   const queue: (() => void)[] = [];
 
@@ -606,12 +609,12 @@ const manualSleep = () => {
     next();
   };
 
-  return { delays, fire, sleep };
+  return { controller, delays, fire, signal: controller.signal, sleep };
 };
 
 describe("withRetry", () => {
   test("a first-try success fetches once and never sleeps", async () => {
-    const { delays, sleep } = manualSleep();
+    const { delays, signal, sleep } = manualSleep();
     let calls = 0;
 
     const value = await withRetry(
@@ -621,7 +624,7 @@ describe("withRetry", () => {
         return Promise.resolve("ok");
       },
       { attempts: 3, baseMs: 1000, sleep }
-    )();
+    )("retry:first-try", { signal });
 
     expect(value).toBe("ok");
     expect(calls).toBe(1);
@@ -629,7 +632,7 @@ describe("withRetry", () => {
   });
 
   test("transient failures retry with the exact backoff, then resolve", async () => {
-    const { delays, fire, sleep } = manualSleep();
+    const { delays, fire, signal, sleep } = manualSleep();
     let calls = 0;
 
     const done = withRetry(
@@ -641,7 +644,7 @@ describe("withRetry", () => {
           : Promise.resolve("ok");
       },
       { attempts: 3, baseMs: 1000, sleep }
-    )();
+    )("retry:backoff", { signal });
 
     await flush();
     expect(calls).toBe(1);
@@ -656,7 +659,7 @@ describe("withRetry", () => {
   });
 
   test("a lasting failure rejects with the last error after its attempts", async () => {
-    const { delays, fire, sleep } = manualSleep();
+    const { delays, fire, signal, sleep } = manualSleep();
     let calls = 0;
 
     const done = withRetry(
@@ -666,7 +669,7 @@ describe("withRetry", () => {
         return Promise.reject(new Error(`boom-${calls}`));
       },
       { attempts: 2, baseMs: 1000, sleep }
-    )();
+    )("retry:lasting", { signal });
 
     await flush();
     expect(calls).toBe(1);
@@ -689,7 +692,7 @@ describe("withRetry", () => {
           : Promise.resolve("ok");
       },
       { attempts: 4, baseMs: 1000, capMs: 1500, sleep: capped.sleep }
-    )();
+    )("retry:capped", { signal: capped.signal });
 
     await flush();
     capped.fire();
@@ -710,7 +713,7 @@ describe("withRetry", () => {
         return Promise.resolve("once");
       },
       { attempts: 0, baseMs: 1000, sleep: single.sleep }
-    )();
+    )("retry:single", { signal: single.signal });
 
     await expect(singleDone).resolves.toBe("once");
     expect(singleCalls).toBe(1);
@@ -760,6 +763,82 @@ describe("withRetry", () => {
       resetSignals();
       restoreDom();
     }
+  });
+
+  test("a permanent refusal never retries", async () => {
+    const { signal } = manualSleep();
+    let calls = 0;
+
+    const done = withRetry(
+      () => {
+        calls += 1;
+
+        return Promise.reject(new ApiError(403, "forbidden", null));
+      },
+      { attempts: 4, baseMs: 1000, sleep: () => Promise.resolve() }
+    )("retry:permanent", { signal });
+
+    await expect(done).rejects.toThrow("forbidden");
+    await flush();
+    expect(calls).toBe(1);
+  });
+
+  test("a rate limit retries with the same backoff as a transport blip", async () => {
+    const { delays, fire, signal, sleep } = manualSleep();
+    let calls = 0;
+
+    const done = withRetry(
+      () => {
+        calls += 1;
+
+        return calls === 1
+          ? Promise.reject(new ApiError(429, "slow down", null))
+          : Promise.resolve("ok");
+      },
+      { attempts: 3, baseMs: 1000, sleep }
+    )("retry:transient-status", { signal });
+
+    await flush();
+    expect(calls).toBe(1);
+    expect(delays).toEqual([1000]);
+    fire();
+    await expect(done).resolves.toBe("ok");
+    expect(calls).toBe(2);
+  });
+
+  test("aborting during the backoff makes no further call", async () => {
+    const { controller, delays, fire, signal, sleep } = manualSleep();
+    let calls = 0;
+
+    const done = withRetry(
+      () => {
+        calls += 1;
+
+        return Promise.reject(new Error("down"));
+      },
+      { attempts: 4, baseMs: 1000, sleep }
+    )("retry:abort", { signal });
+
+    await flush();
+    expect(calls).toBe(1);
+    expect(delays).toEqual([1000]);
+    controller.abort();
+    // Belt and braces: even a fired backoff must not refetch after an abort.
+    // The race below settles without waiting out a real backoff either way,
+    // so the test fails instead of hanging when the abort loses.
+    fire();
+
+    const outcome = await Promise.race([
+      done.then(() => "resolved" as const).catch(() => "rejected" as const),
+      flush().then(() => "unsettled" as const),
+    ]);
+
+    expect(outcome).toBe("rejected");
+    // Settled above, so awaiting the rejection directly cannot hang: it pins
+    // the abort (not the attempt's error) as the cause.
+    await expect(done).rejects.toThrow("retry aborted");
+    await flush();
+    expect(calls).toBe(1);
   });
 });
 
