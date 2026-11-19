@@ -402,11 +402,11 @@ env_secret() {
 }
 
 # Pre-reset installs (Noite 0.1.0 alpha/beta, any `CELLD_*` in .env) cannot be
-# upgraded: nothing reads or migrates their .env, volumes or bucket. Refuse
-# before anything is pulled or recreated — `--yes` must not bypass this —
-# with the reinstall steps. Fresh installs (no .env yet) have nothing to
-# refuse. The runner repeats this refusal at boot; this preflight keeps the
-# installer from pulling an image that will never serve the old data.
+# upgraded: nothing reads or migrates their .env, volumes or bucket. `main`
+# refuses right after the system check, before Docker, swap, the compose
+# files or .env are touched — `--yes` must not bypass this — with the
+# reinstall steps. Fresh installs (no .env yet) have nothing to refuse. The
+# runner repeats this refusal at boot.
 refuse_prereset_install() {
   [[ -f "$NOITE_DIR/.env" ]] || return 0
   local stale=""
@@ -476,7 +476,6 @@ write_config() {
     else
       info "keeping .env (BASE_DOMAIN=$DOMAIN)"
     fi
-    refuse_prereset_install
   else
     fresh=1
     choose_domain
@@ -689,6 +688,7 @@ parse_args() {
 main() {
   parse_args "$@"
   check_system
+  refuse_prereset_install
   install_docker
   ensure_swap
   check_ports

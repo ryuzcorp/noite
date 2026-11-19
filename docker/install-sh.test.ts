@@ -1,5 +1,11 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
@@ -59,6 +65,9 @@ curl() { local out="" prev=""; for a in "$@"; do if [[ "$prev" == "-o" ]]; then 
 `;
 
 const readEnv = (): string => readFileSync(path.join(dir, ".env"), "utf-8");
+
+/** Whether `main` reached any step after the pre-reset refusal (see below). */
+const stepsRan = (): boolean => existsSync(path.join(dir, "steps"));
 
 /** An uncommented `KEY=` line (the template comments mention several keys). */
 const hasActive = (env: string, key: string): boolean =>
@@ -298,21 +307,29 @@ compose() {
 });
 
 describe("install.sh pre-reset refusal", () => {
+  // `main` with every step after the refusal stubbed to record that it ran:
+  // a refused install must touch nothing on the host, not just the .env.
+  const MAIN = `${PRELUDE}
+check_system() { :; }
+for step in install_docker ensure_swap check_ports write_config open_firewall start_stack summary; do
+  eval "$step() { echo $step >>\\"\\$NOITE_DIR/steps\\"; }"
+done
+main`;
+
   test("a .env with any CELLD_* key is refused with reinstall steps, untouched", () => {
     const before =
       "BASE_DOMAIN=example.com\nCELLD_ADVERTISE=peer\nNOITE_IMAGE=ghcr.io/ryuzcorp/noite:alpha\n";
 
     writeFileSync(path.join(dir, ".env"), before);
 
-    const result = runBash(`${PRELUDE}\nwrite_config`, {
-      NOITE_DOMAIN: "example.com",
-    });
+    const result = runBash(MAIN, { NOITE_DOMAIN: "example.com" });
 
     expect(result.status).toBe(1);
     expect(result.stderr).toContain("cannot be upgraded");
     expect(result.stderr).toContain("down -v");
     expect(result.stderr).toContain("re-run");
     expect(readEnv()).toBe(before);
+    expect(stepsRan()).toBe(false);
   });
 
   test("a .env pinned to a 0.1.0 image is refused with reinstall steps, untouched", () => {
@@ -320,14 +337,13 @@ describe("install.sh pre-reset refusal", () => {
       const before = `BASE_DOMAIN=example.com\nNOITE_IMAGE=ghcr.io/ryuzcorp/noite:${pin}\n`;
       writeFileSync(path.join(dir, ".env"), before);
 
-      const result = runBash(`${PRELUDE}\nwrite_config`, {
-        NOITE_DOMAIN: "example.com",
-      });
+      const result = runBash(MAIN, { NOITE_DOMAIN: "example.com" });
 
       expect(result.status).toBe(1);
       expect(result.stderr).toContain("cannot be upgraded");
       expect(result.stderr).toContain("down -v");
       expect(readEnv()).toBe(before);
+      expect(stepsRan()).toBe(false);
     }
   });
 
@@ -337,13 +353,26 @@ describe("install.sh pre-reset refusal", () => {
       "BASE_DOMAIN=example.com\nCELLD_BIN=cello\n"
     );
 
-    const result = runBash(`${PRELUDE}\nwrite_config`, {
+    const result = runBash(`${MAIN} --yes`, {
       NOITE_DOMAIN: "example.com",
       NOITE_YES: "1",
     });
 
     expect(result.status).toBe(1);
     expect(result.stderr).toContain("cannot be upgraded");
+    expect(stepsRan()).toBe(false);
+  });
+
+  test("a current-generation .env passes the refusal and main runs every step", () => {
+    writeFileSync(
+      path.join(dir, ".env"),
+      "BASE_DOMAIN=example.com\nCELLO_BIN=cello\n"
+    );
+
+    const result = runBash(MAIN, { NOITE_DOMAIN: "example.com" });
+
+    expect(result.status).toBe(0);
+    expect(stepsRan()).toBe(true);
   });
 
   test("a current-generation .env still upgrades in place", () => {
