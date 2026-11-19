@@ -2749,8 +2749,7 @@ mod tests {
     #[test]
     fn stale_celld_settings_refuse_the_boot() {
         with_env(&[("CELLD_BIN", "/usr/local/bin/cello")], || {
-            let err =
-                Config::from_env().expect_err("a stale CELLD_* setting must refuse the boot");
+            let err = Config::from_env().expect_err("a stale CELLD_* setting must refuse the boot");
             assert!(
                 err.to_string().contains("CELLO_BIN"),
                 "refusal names the new spelling: {err:#}"

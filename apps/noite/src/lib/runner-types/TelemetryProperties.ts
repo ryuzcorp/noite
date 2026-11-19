@@ -3,7 +3,7 @@
 /**
  * The heartbeat facts. Property names are the contract's, exactly.
  */
-export type TelemetryProperties = { version: string, celld_version: string, arch: string, tenancy: string, storage: string, apps: number, apps_running: number, apps_sleeping: number, deploys_24h: number, deploys_failed_24h: number, 
+export type TelemetryProperties = { version: string, cello_version: string, arch: string, tenancy: string, storage: string, apps: number, apps_running: number, apps_sleeping: number, deploys_24h: number, deploys_failed_24h: number, 
 /**
  * Bucket string (`"1"`, `"2-5"`, `"6-20"`, `"21+"`), never the count;
  * `"unknown"` when the control worker could not be reached.
