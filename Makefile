@@ -111,7 +111,7 @@ help:
 	@echo "      E2E_SUITE=fast (tagged PR gate) or release (default, every spec)"
 	@echo "      E2E_SLOT=<n> (parallel lane, default 0 = today's lane) or auto"
 	@echo "      (first free slot); E2E_SLOT=<n> make e2e-down stops that slot"
-	@echo "  make e2e-upgrade  previous-release seed, tree restart, verify (PREV_TAG/E2E_IMAGE/E2E_SLOT)"
+	@echo "  make e2e-upgrade  refusal lane: old seed boots, tree refuses pre-reset data (PREV_TAG/E2E_IMAGE/E2E_SLOT)"
 	@echo "  make backup    consistent backup of both volumes (brief downtime)"
 	@echo "  make restore   restore a backup directory (FROM=<dir>; replaces volumes)"
 	@echo "  make down      stop (keeps volumes)"

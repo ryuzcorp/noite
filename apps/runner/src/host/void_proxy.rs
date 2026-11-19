@@ -6,14 +6,14 @@
 //! `__VOID_PROXY` service binding. The proxy is self-sufficient
 //! (fleet-local KV plus direct egress) and never calls the runner.
 //!
-//! Sources: `apps/void-proxy/worker.ts` (the celld `main` entry) plus the
+//! Sources: `apps/void-proxy/worker.ts` (the cello `main` entry) plus the
 //! whole `src/` tree it imports, embedded with `include_str!` — the same
 //! compile-time pattern as the `cf-config.mjs` converter
 //! ([`super::deploy`] embeds it; the control bundle instead ships on disk
 //! because it is built inside the image, while the proxy's dependency-free
 //! modules compile straight in). Tests, `test-helpers.ts` and
 //! `sockets.d.ts` never ship: the embedded set is an explicit list, pinned
-//! by test. celld bundles the `.ts` entry with esbuild at deploy, so
+//! by test. cello bundles the `.ts` entry with esbuild at deploy, so
 //! there is no build step. The image build copies the same files where the
 //! includes resolve (`docker/Dockerfile`, `compose.dev.yaml`).
 //!
@@ -44,7 +44,7 @@ use crate::config::VoidProxyConfig;
 use crate::host::void_cohost::{CohostSource, CohostedScript, RenderedCohost};
 use crate::host::void_deploy;
 
-/// The mail-idempotency KV namespace id. Fixed across apps: celld scopes
+/// The mail-idempotency KV namespace id. Fixed across apps: cello scopes
 /// the id to the fleet bucket, so each app and each preview gets its own.
 pub const MAIL_IDEMPOTENCY_BINDING: &str = "MAIL_IDEMPOTENCY";
 pub const MAIL_IDEMPOTENCY_NAMESPACE_ID: &str = "noite-void-proxy-mail";

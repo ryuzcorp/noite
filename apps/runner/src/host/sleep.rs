@@ -1678,8 +1678,8 @@ mod tests {
         std::fs::create_dir_all(&dir).expect("temp dir");
         // A stand-in Cello: the real binary is not in the test image, but the
         // spawn path only needs an executable that stays alive.
-        let fake = dir.join("celld");
-        std::fs::write(&fake, "#!/bin/sh\nsleep 60\n").expect("write fake celld");
+        let fake = dir.join("cello");
+        std::fs::write(&fake, "#!/bin/sh\nsleep 60\n").expect("write fake cello");
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;

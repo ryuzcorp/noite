@@ -150,7 +150,7 @@ pub async fn connect(database_url: &str) -> anyhow::Result<SqlitePool> {
         .execute(&pool)
         .await?;
     // One idempotent file (embedded at compile time) is the whole schema.
-    // Pre-compaction alphas are refused; a database at this baseline takes
+    // Pre-reset releases are refused; a database at this baseline takes
     // any future `MIGRATIONS` step first.
     let mut tx = pool.begin().await?;
     schema_version::apply(

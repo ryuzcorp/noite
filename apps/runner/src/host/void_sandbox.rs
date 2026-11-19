@@ -70,7 +70,7 @@ pub const MAX_CONCURRENT_VAR: &str = "__VOID_SANDBOX_MAX_CONCURRENT";
 pub const SOURCE_VAR: &str = "__VOID_SANDBOX_SOURCE";
 
 /// The moved entry's container name: stable per app, not per deploy —
-/// celld re-resolves the image on every controller deploy, so stability is
+/// cello re-resolves the image on every controller deploy, so stability is
 /// safe and avoids orphan container applications.
 pub const CONTAINER_NAME: &str = "noite-void-sandbox-v1";
 
@@ -144,7 +144,7 @@ pub fn assert_compatible_void_version(
 /// The app's `void` spec from the worktree `package.json`
 /// (`dependencies`, then `devDependencies`). `None` when the file is
 /// missing, unparseable, or names no `void` — the protocol check refuses
-/// all of those, before `celld deploy`.
+/// all of those, before `cello deploy`.
 pub fn app_void_spec(src_dir: &Path) -> Option<String> {
     let text = std::fs::read_to_string(src_dir.join("package.json")).ok()?;
     let value: Value = serde_json::from_str(&text).ok()?;
@@ -263,12 +263,12 @@ pub fn sandbox_entry_index(config: &Value) -> anyhow::Result<Option<usize>> {
 }
 
 /// Strip the managed sandbox entry from the deploy root's
-/// `wrangler.jsonc`/`wrangler.json` (`jsonc` first, as celld reads them),
+/// `wrangler.jsonc`/`wrangler.json` (`jsonc` first, as cello reads them),
 /// parsed and written back like the other merges (never following links).
 /// Returns the removed entry for the controller staging, or `None` when
 /// the root has no JSON config or no managed entry. An emptied
 /// `containers` key goes with the entry: the app must not carry a hollow
-/// one (celld would read it as declaring nothing either way).
+/// one (cello would read it as declaring nothing either way).
 pub fn take_sandbox_entry(deploy_root: &Path) -> anyhow::Result<Option<Value>> {
     let mut found = None;
     for name in ["wrangler.jsonc", "wrangler.json"] {
@@ -306,7 +306,7 @@ pub fn take_sandbox_entry(deploy_root: &Path) -> anyhow::Result<Option<Value>> {
 /// Map the app's managed entry onto the controller config: the controller
 /// class, the stable container name, and the admission cap as the
 /// `max_instances` backstop. `instance_type` is dropped — ignored in v1
-/// (celld default). Path-valued keys are absolutized against the app root
+/// (cello default). Path-valued keys are absolutized against the app root
 /// so the staging plan resolves exactly what an app-root plan would (Void
 /// emits absolute paths; anything else is rebased, never reinterpreted):
 /// `dockerfile`/`build_context` always, an `image` only when it names a
@@ -377,7 +377,7 @@ fn digest_pinned(image: &str) -> bool {
 /// Refuse a staged controller entry whose image is a direct registry ref
 /// without a digest pin. Dockerfile entries (a prepare request exists)
 /// pass: the vet pins their bases. A missing or non-string `image` passes
-/// too: celld refuses it at the controller deploy with its own error.
+/// too: cello refuses it at the controller deploy with its own error.
 pub fn check_registry_pin(plan: &crate::host::build_output::ContainersPlan) -> anyhow::Result<()> {
     let entries = plan
         .value()
@@ -536,7 +536,7 @@ impl StagedSandbox {
     /// protocol/major mismatch with Void's exact message, ensure the
     /// fleet's admission name, and write the mapped entry to a fresh
     /// staging dir for [`super::build_output::plan_containers`]. All
-    /// before any `celld deploy`: a failure here fails the deploy with the
+    /// before any `cello deploy`: a failure here fails the deploy with the
     /// fleet untouched.
     pub async fn stage(
         pool: &SqlitePool,
@@ -929,7 +929,7 @@ mod tests {
                 "untouched file rewritten"
             );
         }
-        // `jsonc` wins over `json`, as celld reads them.
+        // `jsonc` wins over `json`, as cello reads them.
         std::fs::write(
             dir.join("wrangler.jsonc"),
             r#"{"name": "a", /* c */ "containers": [{"class_name": "S", "scheduling_policy": "durable_object", "images": {"default": {"image": "i"}}}]}"#,
@@ -1058,7 +1058,7 @@ mod tests {
     /// The pin check runs on the planned staging value: a digest-pinned
     /// registry ref passes, an unpinned one refuses naming the rule, a
     /// Dockerfile entry passes (its bases pin at prepare), and a missing
-    /// `image` defers to celld's own error at the controller deploy.
+    /// `image` defers to cello's own error at the controller deploy.
     #[test]
     fn registry_pin_checked_on_the_planned_value() {
         let pinned = format!("registry.example/x@sha256:{}", "c3".repeat(32));
@@ -1657,7 +1657,7 @@ mod tests {
     /// The pinned Dockerfile path is per-deploy, not content: two renders
     /// of identical content in different build dirs hash equal, while an
     /// image-content change flips the hash. The deployed config still
-    /// carries its own real path — celld builds from it.
+    /// carries its own real path — cello builds from it.
     #[tokio::test]
     async fn dockerfile_path_is_not_a_hash_input() {
         let pool = crate::db::connect("sqlite::memory:").await.expect("boot");

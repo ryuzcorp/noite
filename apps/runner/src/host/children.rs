@@ -1,7 +1,7 @@
 //! Long-lived platform children (SPEC, Process tree):
 //! Caddy and the control fleet. The runner owns their whole lifecycle: a
 //! child that exits is restarted with backoff, and shutdown stops it with
-//! SIGTERM (Caddy drains, celld seals its node log) before SIGKILL.
+//! SIGTERM (Caddy drains, cello seals its node log) before SIGKILL.
 //!
 //! Tenant fleets keep their own supervision (`host::supervisor`, driven by
 //! the reconcile loop); these two are not apps and have no desired state.

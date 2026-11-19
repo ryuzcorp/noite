@@ -394,7 +394,10 @@ const latestRelease =
 if (!/^\d+\.\d+\.\d+(?<pre>-[0-9A-Za-z.-]+)?$/u.test(cliVersion)) {
   fail(`cli: packages/cli/package.json version is not semver (${cliVersion})`);
 } else if (latestRelease === "") {
-  fail("cli: CHANGELOG.md has no dated section to compare against");
+  // Fresh baseline (the 0.2.0 beta reset wiped the dated sections): nothing
+  // released yet, so valid semver is enough. The first dated section
+  // re-arms the monotonicity check below.
+  console.log(`cli: ${cliVersion} (fresh baseline, no dated section yet)`);
 } else if (compareVersions(cliVersion, latestRelease) < 0) {
   fail(
     `cli: ${cliVersion} is behind the latest CHANGELOG section [${latestRelease}] (bump packages/cli/package.json in the release commit)`

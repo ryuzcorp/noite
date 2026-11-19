@@ -4,7 +4,7 @@
 //! The ingest REPLACES a window's aggregates instead of adding to them, so a
 //! replay is exact — it recovers rows a failed pass skipped, wherever the
 //! bucket still holds them. Data older than
-//! `RUNNER_TELEMETRY_RETENTION_DAYS` has been pruned by celld and cannot be
+//! `RUNNER_TELEMETRY_RETENTION_DAYS` has been pruned by cello and cannot be
 //! recovered.
 //!
 //! This command does not read Parquet itself: it writes one request row and

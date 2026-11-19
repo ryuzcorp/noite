@@ -41,9 +41,9 @@ constant_time_eq = "0.6"
 regex = "1"
 base64 = "0.23"
 zstd = "0.14"
-# celld's telemetry objects are plain flat Parquet (zstd). The native
+# cello's telemetry objects are plain flat Parquet (zstd). The native
 # column/record API is enough — no `arrow` feature, which would pull the whole
-# arrow crate stack into the runner image. Pinned to celld's version so the
+# arrow crate stack into the runner image. Pinned to cello's version so the
 # format reader matches its writer exactly. Every codec the old SQL pass
 # could read stays enabled (snappy, gzip, lz4): an object from another writer
 # must not fail a fleet's chunk.

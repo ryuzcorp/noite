@@ -3,7 +3,7 @@
 // The runner loads `worker.js` + `meta.json` from `VOID_SANDBOX_BUNDLE_DIR` at
 // every deploy and only the release image bakes one, so `make dev` used to
 // defer the build to the developer's memory: a fresh checkout failed every
-// sandbox app's deploy at `celld deploy` with "sandbox controller bundle
+// sandbox app's deploy at `cello deploy` with "sandbox controller bundle
 // incomplete" until someone ran `bun run build` in `apps/void-sandbox` by
 // hand. These tests run the script for real against a stand-in package (a stub
 // bundler, so nothing is downloaded) and pin what `docker/dev.sh` relies on.

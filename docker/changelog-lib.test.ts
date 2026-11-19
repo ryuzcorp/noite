@@ -105,15 +105,24 @@ describe("checkChangelog", () => {
     ).toEqual([]);
   });
 
-  test("fails when Unreleased still has entries, pointing at changelog.d/", () => {
+  test("passes when Unreleased holds the pending notes directly", () => {
+    const pending = released.replace(
+      "## [Unreleased]\n",
+      "## [Unreleased]\n\n### Added\n\n- The reset.\n"
+    );
+
+    expect(checkChangelog(pending, [])).toEqual([]);
+  });
+
+  test("fails when Unreleased holds an unknown section", () => {
     const dirty = released.replace(
       "## [Unreleased]\n",
-      "## [Unreleased]\n\n### Added\n\n- Forgot fragments.\n"
+      "## [Unreleased]\n\n### Uh oh\n\n- Nope.\n"
     );
 
     const errors = checkChangelog(dirty, []);
     expect(errors.length).toBeGreaterThan(0);
-    expect(errors.join("\n")).toContain("changelog.d/");
+    expect(errors.join("\n")).toContain('unknown section "Uh oh"');
   });
 
   test("fails on a fragment with an unknown section", () => {

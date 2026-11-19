@@ -505,7 +505,7 @@ pub async fn resume_pending(
 /// new row; delete deletes the row first).
 ///
 /// Requires the caller to hold the slug's `push_guard` (see the module docs).
-/// Order matters inside, too: stop celld first so it cannot rewrite leases /
+/// Order matters inside, too: stop cello first so it cannot rewrite leases /
 /// D1 / telemetry into the prefix we are about to empty.
 ///
 /// `stop` is only for a background purge: `None` runs to completion, which is
@@ -592,8 +592,8 @@ pub async fn purge_slug(
     let local_ms = ms(local);
 
     // git/  — tip bundles + refs (source of truth for redeploy)
-    // fleets/ — celld durability: D1 sqlite, DO state, peer-auth, telemetry
-    // envs/ — every environment's own celld durability (its own D1/DO/R2)
+    // fleets/ — cello durability: D1 sqlite, DO state, peer-auth, telemetry
+    // envs/ — every environment's own cello durability (its own D1/DO/R2)
     let mut step = std::time::Instant::now();
     let mut s3_git_ms = 0;
     let mut s3_fleets_ms = 0;

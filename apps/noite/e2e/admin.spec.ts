@@ -301,8 +301,8 @@ test("the Admin tab finds the second account and refuses it admin surfaces", asy
   expect(denied.status).toBe(422);
   expect(denied.body.errors?.form).toContain("Admin only");
 
-  // A legacy admin `?t=` redirects the same way, and so does the action
-  // behind the instance switches.
+  // A retired admin `?t=` falls back to Overview (and so does the action
+  // behind the instance switches): non-admins still land on /account.
   await second.goto("/apps/_control?t=settings");
   await expect(second).toHaveURL(/\/account$/u);
   await expect(second.getByRole("heading", { name: "Profile" })).toBeVisible();

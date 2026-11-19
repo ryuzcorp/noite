@@ -3,7 +3,7 @@
 //! plain-text entry in the deployed config's `vars`, so Worker code reads it
 //! as `env.NAME`. A setting wins over the config's own value. The merge runs
 //! in the deploy pipeline after the deploy root is final (build output,
-//! source config or generated config) and before `celld deploy`, and a
+//! source config or generated config) and before `cello deploy`, and a
 //! settings change takes effect on the next deploy.
 //!
 //! Reserved names (shared contract): a setting or a config `vars` entry with
@@ -16,19 +16,19 @@
 //! `VOID_PROXY_*` proxy namespace on Void apps (the runner injects those
 //! bindings there, and the proxy render consumes those settings there —
 //! and only there, so only there are the names refused). The build/fleet
-//! process prefixes (`PORT`, `AWS_*`, `CELLD_*`, `BETTER_AUTH_*`, …) do NOT
+//! process prefixes (`PORT`, `AWS_*`, `CELLO_*`, `BETTER_AUTH_*`, …) do NOT
 //! apply here: they guard the process environment, and Worker `vars` are a
 //! separate namespace no platform component reads (SPEC documents the
 //! per-prefix decision). `BETTER_AUTH_*` in particular must stay allowed:
 //! Void auth needs `BETTER_AUTH_SECRET`/`BETTER_AUTH_URL` in Worker env.
 //!
 //! Void's `secrets.required` (its `dist/ssr/wrangler.json` carries one, which
-//! the build-output rewrite drops because celld refuses the key): every
+//! the build-output rewrite drops because cello refuses the key): every
 //! required name needs a setting or a runner-provisioned value, else the
-//! deploy fails before `celld deploy` listing the missing names.
+//! deploy fails before `cello deploy` listing the missing names.
 //!
-//! Values are plaintext in the deployed config (celld has no secret store):
-//! they land in `app.deployed_config` (never served) and in celld's
+//! Values are plaintext in the deployed config (cello has no secret store):
+//! they land in `app.deployed_config` (never served) and in cello's
 //! deployment manifest under the fleet bucket. The deploy log and every error
 //! below carry names only, never values.
 
@@ -185,7 +185,7 @@ fn var_name_valid(name: &str) -> bool {
 
 /// Every binding name the config declares outside `vars`: each `binding`
 /// string (assets, KV, D1, R2, services, queues, …) and each Durable Object
-/// binding's `name`. celld refuses a deploy where a var shares one of them.
+/// binding's `name`. cello refuses a deploy where a var shares one of them.
 fn binding_names(config: &serde_json::Map<String, Value>) -> HashSet<String> {
     fn walk(value: &Value, names: &mut HashSet<String>) {
         match value {
@@ -306,12 +306,12 @@ pub fn merge_settings(
 }
 
 /// Merge `settings` into the deploy root's `wrangler.jsonc`/`wrangler.json`
-/// (`jsonc` first, as celld reads them), parsed with
+/// (`jsonc` first, as cello reads them), parsed with
 /// [`crate::host::storage::parse_wrangler`] and written back as JSON through
 /// [`crate::host::build_output::write_fresh`] (never following links; plain
 /// JSON is valid JSONC, so a `.jsonc` target stays parseable).
 /// `Ok(None)` when the root has neither file — a TOML-only root, which
-/// `celld deploy` itself refuses with a clear error. With no settings the
+/// `cello deploy` itself refuses with a clear error. With no settings the
 /// file is still checked (reserved config names fail) but left untouched.
 pub fn merge_deploy_root(
     deploy_root: &Path,
@@ -683,7 +683,7 @@ mod tests {
             .expect("jsonc found");
         assert_eq!(stats.merged, 1);
         let text = std::fs::read_to_string(dir.join("wrangler.jsonc")).unwrap();
-        // Plain JSON is valid JSONC: celld still parses the rewritten file.
+        // Plain JSON is valid JSONC: cello still parses the rewritten file.
         let value = crate::host::storage::parse_wrangler(&text).unwrap();
         assert_eq!(value["name"], "a");
         assert_eq!(value["vars"]["FROM_CONFIG"], "c");
@@ -691,7 +691,7 @@ mod tests {
     }
 
     #[test]
-    fn jsonc_wins_over_json_like_celld() {
+    fn jsonc_wins_over_json_like_cello() {
         let guard_both = scratch("both");
         let dir = guard_both.path().canonicalize().unwrap();
         std::fs::write(dir.join("wrangler.jsonc"), r#"{"name":"a"}"#).unwrap();
@@ -724,7 +724,7 @@ mod tests {
     }
 
     #[test]
-    fn toml_only_roots_are_left_for_celld_to_refuse() {
+    fn toml_only_roots_are_left_for_cello_to_refuse() {
         let guard_toml = scratch("toml");
         let dir = guard_toml.path().canonicalize().unwrap();
         std::fs::write(dir.join("wrangler.toml"), "name = \"a\"\n").unwrap();

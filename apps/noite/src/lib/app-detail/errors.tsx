@@ -14,7 +14,7 @@ import {
   liveFeed,
 } from "../feeds";
 import { resourceValue, resourceError } from "../resource";
-//! Errors tab: exceptions from celld telemetry grouped into issues by the
+//! Errors tab: exceptions from cello telemetry grouped into issues by the
 //! runner (`host/errors.rs`) — no SDK in the app. List by status, detail
 //! with stack, request and the failing trace's logs; anyone who can push
 //! resolves, ignores or reopens.

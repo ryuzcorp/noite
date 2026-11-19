@@ -1,7 +1,7 @@
 //! Preview environment rows: the model the deploy pipeline, the fleet
 //! supervisor, the edge and the Caddyfile writer all read.
 //!
-//! An environment is a second deploy target beside production: its own celld
+//! An environment is a second deploy target beside production: its own cello
 //! fleet, its own bucket prefix (`envs/<slug>/<label>`) and its own ports, so
 //! nothing here ever writes `app.fleet_bucket`, `app.*_port` or
 //! `app.last_deploy_sha`.

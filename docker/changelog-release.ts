@@ -39,9 +39,22 @@ const date = dateArg ?? new Date().toISOString().slice(0, 10);
 
 const dir = path.join(root, "changelog.d");
 
-const entries = readdirSync(dir)
-  .filter((name) => name.endsWith(".md"))
-  .toSorted();
+let entries: string[] = [];
+
+try {
+  entries = readdirSync(dir)
+    .filter((name) => name.endsWith(".md"))
+    .toSorted();
+} catch (error) {
+  // No changelog.d/ yet (the reset deleted the fragments): the pending
+  // notes in ## [Unreleased] release on their own. Any other read failure
+  // would silently drop fragment notes from the release, so it stops here.
+  if (!(error instanceof Error && "code" in error && error.code === "ENOENT")) {
+    throw error;
+  }
+
+  entries = [];
+}
 
 const changelogPath = path.join(root, "CHANGELOG.md");
 const changelog = readFileSync(changelogPath, "utf-8");
