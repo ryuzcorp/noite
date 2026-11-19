@@ -39,7 +39,7 @@ pub const VOID_OUTPUT: &str = "dist/ssr/wrangler.json";
 /// cello would then load split chunks it cannot resolve.
 /// `containers` holds the celld 0.6 container classes Sandbox templates
 /// (the agent template) deploy into.
-const CELLD_KEYS: &[&str] = &[
+const CELLO_KEYS: &[&str] = &[
     "$schema",
     "name",
     "main",
@@ -482,7 +482,7 @@ fn cello_config_from(src: &Path, config: &Path) -> anyhow::Result<(PathBuf, Vec<
     }
     relocate_migrations(obj, &config_dir, &root);
     relocate_container_paths(obj, &config_dir, src)?;
-    obj.retain(|k, _| CELLD_KEYS.contains(&k.as_str()));
+    obj.retain(|k, _| CELLO_KEYS.contains(&k.as_str()));
 
     write_fresh(&target, &serde_json::to_string_pretty(&value)?)
         .with_context(|| format!("write {}", display_rel(src, &target)))?;
