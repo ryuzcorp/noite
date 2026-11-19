@@ -47,7 +47,7 @@ const SHA_CHARS = 7;
 
 const usToDate = (us: number): Date => new Date(us / US_PER_MS);
 
-/** celld span name (minus `celld.`) → what an app author calls it. */
+/** Cello span name (minus `cello.`) → what an app author calls it. */
 const HANDLER_LABELS = new Map([
   ["alarm", "Alarm"],
   ["cell_fetch", "Durable Object"],

@@ -2,7 +2,7 @@
  * Stamp the Worker D1 binding and every declared env key, then run the admin
  * bootstrap before routes / pages. Runs on every request that reaches the
  * Worker (`src/middleware/` = Void global middleware, in numeric order after
- * the timeout and the rate limit) — static bundles do not: celld serves
+ * the timeout and the rate limit) — static bundles do not: Cello serves
  * `/assets/*` itself, see `RUN_WORKER_FIRST` in `void.config.ts`. The full
  * stamp (not just the runner credentials) is what the plain-route fetch path
  * needs too (what `handleHttp` did before the Void routes slice): a partial

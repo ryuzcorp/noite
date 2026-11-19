@@ -139,7 +139,7 @@ pub async fn app_r2_object(
         .map(Json)
 }
 
-/// Largest upload the runner spools to disk before `celld r2 put`; the UI
+/// Largest upload the runner spools to disk before `cello r2 put`; the UI
 /// enforces the same cap, so the stream only ever refuses a rogue client.
 const R2_UPLOAD_CAP: usize = 67_108_864;
 
@@ -187,7 +187,7 @@ async fn spool_body(body: Body, dest: &std::path::Path, cap: usize) -> Result<us
 }
 
 /// Write one object (or a folder marker: a key ending in `/` with an empty
-/// body). The body streams to a spool file and then through `celld r2 put`,
+/// body). The body streams to a spool file and then through `cello r2 put`,
 /// so neither the browser nor the runner holds a whole upload in memory and
 /// the stored record is the one a Worker's `env.BUCKET.put()` writes.
 pub async fn app_r2_put(

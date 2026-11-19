@@ -1,6 +1,6 @@
 //! Parquet primitives shared by the telemetry ingest and compaction.
 //!
-//! celld's telemetry schema is flat primitives (see `celld`'s
+//! Cello's telemetry schema is flat primitives (see `cello`'s
 //! `telemetry.rs`), so the native record API is enough: the `arrow` feature
 //! would pull the whole arrow stack into the runner image for no benefit.
 //! Every read projects only the columns its caller uses, which keeps a row
@@ -17,7 +17,7 @@ use crate::config::Config;
 use crate::host::s3;
 
 /// Largest telemetry object the ingest will decode. A flush is one object per
-/// signal per node (`CELLD_OTEL_FLUSH_MS`, 30 s by default); even a firehose
+/// signal per node (`CELLO_OTEL_FLUSH_MS`, 30 s by default); even a firehose
 /// node's 30 s of spans sits far below this, so a bigger object means a
 /// corrupt or foreign file, and buffering it whole would be the only way to
 /// read it. Skipping it with a warning keeps the tick bounded; the skip is
@@ -100,7 +100,7 @@ pub(super) fn long(field: &Field) -> Option<i64> {
         Field::Int(value) => Some(i64::from(*value)),
         Field::Short(value) => Some(i64::from(*value)),
         Field::Byte(value) => Some(i64::from(*value)),
-        // A column annotated `UTINYINT`/`USMALLINT` (celld's `kind`,
+        // A column annotated `UTINYINT`/`USMALLINT` (Cello's `kind`,
         // `http_status`) comes back unsigned; a compacted file preserves the
         // annotation, so the helper accepts both shapes.
         Field::UByte(value) => Some(i64::from(*value)),

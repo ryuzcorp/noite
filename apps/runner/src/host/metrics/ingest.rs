@@ -1,5 +1,5 @@
 //! One ingest chunk: the replace-only writers and the per-fleet fault
-//! isolation around a shared read. The read itself (celld's Parquet, decoded
+//! isolation around a shared read. The read itself (Cello's Parquet, decoded
 //! in-process) lives in [`super::otel`].
 
 use std::collections::{HashMap, HashSet};

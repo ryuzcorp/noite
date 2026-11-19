@@ -13,7 +13,7 @@ import {
 
 // The sample app (apps/noite/test) binds R2 `uploads`, the `Counter` Durable
 // Object and D1 `demo`, so this spec proves the storage views against a real
-// Worker: the runner's listing/upload/delete go through `celld r2 put|delete`,
+// Worker: the runner's listing/upload/delete go through `cello r2 put|delete`,
 // the D1 editor writes go through the runner's D1 endpoints, and the app's
 // own `env.FILES.get` is the referee for every R2 write while the runner's
 // D1 rows endpoint referees every D1 write.
@@ -95,10 +95,10 @@ test("the D1 tables view lists a database past five tables", async ({
   const appId = storageApp();
   const port = await appListenPort(request, appId);
 
-  // Six tables: celld applies workerd's SQLite budget to every cell, where
+  // Six tables: Cello applies workerd's SQLite budget to every cell, where
   // `SQLITE_LIMIT_COMPOUND_SELECT` is 5. The row counts used to be one
   // `SELECT … UNION ALL …` over the whole list, so a sixth table broke the
-  // listing (and the incomplete-looking SQL was reported as a raw celld
+  // listing (and the incomplete-looking SQL was reported as a raw Cello
   // error instead of a table list).
   const created = await request.get(`${tenant(port)}/d1-many-tables`);
   expect(created.ok()).toBe(true);
@@ -148,7 +148,7 @@ test("uploading and deleting round-trips through the Worker", async ({
 
   await page.goto(R2_ROOT(appId));
 
-  // New folder, with a space in the name: the key celld has to encode.
+  // New folder, with a space in the name: the key Cello has to encode.
   await page
     .locator("details", { hasText: "New folder" })
     .locator("summary")
@@ -257,7 +257,7 @@ test("the Durable Object view reads the instance's stored state", async ({
 
   await expect(valueRow).toBeVisible();
   await expect(valueRow).toContainText(String(n));
-  await expect(panel).toContainText("Read-only. celld keeps an instance's");
+  await expect(panel).toContainText("Read-only. Cello keeps an instance's");
 
   // The read probe never advances the count: the stored value is unchanged.
   const after = await readSampleApp(request, port);

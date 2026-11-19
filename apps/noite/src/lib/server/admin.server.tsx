@@ -209,7 +209,7 @@ const asUserRow = (row: DbUser, actorId: string): AdminUserRow => ({
 /** Probe for the admin UI: resolves instead of throwing, so the panel
  * works regardless of framework error mapping. `controlFleet` tells the
  * control app whether this install supervises the control fleet (false on the
- * dev image, where `vite dev` serves the UI and there is no control celld). */
+ * dev image, where `vite dev` serves the UI and there is no control Cello). */
 export const adminOverview = apiActionNoInput(async ({ env, request }) => {
   const admin = await requireAdmin(request, env);
 

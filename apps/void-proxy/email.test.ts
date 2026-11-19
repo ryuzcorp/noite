@@ -1394,7 +1394,7 @@ describe("SMTP submission (canned sockets)", () => {
 
     expect(json).toMatchObject({ ok: true });
     // `starttls` transport at connect (required for the upgrade below), then
-    // an explicit upgrade (celld `startTls()` shape).
+    // an explicit upgrade (Cello `startTls()` shape).
     expect(seen).toEqual([
       { hostname: "smtp.example.com", port: 587, secureTransport: "starttls" },
     ]);

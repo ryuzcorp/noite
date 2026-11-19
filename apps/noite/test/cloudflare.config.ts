@@ -1,5 +1,5 @@
 // Worker config for the `cf` CLI (https://github.com/cloudflare/cf). Noite
-// converts it to the wrangler.json celld deploys (runner, host/deploy.rs).
+// converts it to the wrangler.json Cello deploys (runner, host/deploy.rs).
 import type { InferEnv, UnwrapConfig } from "cf/config";
 import { bindings, defineConfig, defineWorker, exports } from "cf/config";
 

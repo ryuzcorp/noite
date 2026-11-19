@@ -3,7 +3,7 @@
 export type DoInstance = { id: string, scope: string, 
 /**
  * JSON the object's own handler returned for a `?read=1` probe on the
- * fleet's /do/ route (the read contract is the app's, not celld's —
+ * fleet's /do/ route (the read contract is the app's, not Cello's —
  * there is no generic storage read route for a Durable Object).
  */
 preview: string | null, };

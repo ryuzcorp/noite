@@ -1,7 +1,7 @@
 //! The Durable Object viewer: a breadcrumb header, an instance search over
 //! id/scope, the instance list, and a detail panel that renders the object's
 //! own `?read=1` response as a key/value table with copy buttons. Read-only:
-//! celld exposes no generic storage read for a DO instance, so the app's
+//! Cello exposes no generic storage read for a DO instance, so the app's
 //! handler decides what a preview shows — the UI only presents it.
 
 import { atom } from "ilha";
@@ -37,7 +37,7 @@ const DoInstancePanel = ({ instance }: { instance: DoInstance }) => {
         <p class="m-0 text-sm opacity-60">
           The object reported no storage preview. That happens when it is not
           running, when it has no <code>?read=1</code> handler, or when the
-          probe failed — celld does not tell the UI which.
+          probe failed — Cello does not tell the UI which.
         </p>
       </DetailPanel>
     );
@@ -100,7 +100,7 @@ const DoInstancePanel = ({ instance }: { instance: DoInstance }) => {
         </>
       ) : null}
       <p class="m-0 mt-auto text-xs opacity-60">
-        Read-only. celld keeps an instance's storage in its cell; this preview
+        Read-only. Cello keeps an instance's storage in its cell; this preview
         is the app's own <code>?read=1</code> response.
       </p>
     </DetailPanel>

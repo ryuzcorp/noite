@@ -117,12 +117,12 @@ const findIssue = async (
  * the thrown message at push time, so the run's issue is unambiguous even
  * on a reused lane.
  *
- * The hook handler is `async`: celld's bucket OTel sink does not export a
+ * The hook handler is `async`: Cello's bucket OTel sink does not export a
  * span when a non-async `fetch` throws (verified on 0.6.0–0.6.2 with a
  * standalone node; an async handler's `rejected: …` span records fine), so
  * a sync hook could never reach the ingest no matter what the runner does.
  * The sync-throw gap is reported upstream; this spec pins the runner side
- * of the path with the shape celld exports. */
+ * of the path with the shape Cello exports. */
 const pushBoomRevision = (apiKey: string, token: string): string =>
   pushAppDir(
     apiKey,
@@ -158,7 +158,7 @@ const pushBoomRevision = (apiKey: string, token: string): string =>
     }
   );
 
-// Phase 1: a Worker throw travels celld OTel flush → bucket parquet →
+// Phase 1: a Worker throw travels Cello OTel flush → bucket parquet →
 // runner ingest → Errors tab as an `uncaught` issue with its request.
 test("a worker throw becomes an errors-tab issue", async ({
   page,
@@ -200,7 +200,7 @@ test("a worker throw becomes an errors-tab issue", async ({
   ).host;
 
   const base = `http://${WORKER_ERRORS_SLUG}.${edgeHost}`;
-  // A first deploy spawns the fleet; the site answers 502/503 until celld
+  // A first deploy spawns the fleet; the site answers 502/503 until cello
   // listens.
   await expect
     .poll(
@@ -219,7 +219,7 @@ test("a worker throw becomes an errors-tab issue", async ({
   expect(boom.status()).toBe(500);
 
   // End-to-end latency bound, derived from the lane's telemetry config:
-  // celld flushes OTel to the bucket every RUNNER_OTEL_FLUSH_MS (30 s by
+  // Cello flushes OTel to the bucket every RUNNER_OTEL_FLUSH_MS (30 s by
   // default), the runner ingests at most once per flush interval, and the
   // ingest window stops agg_lag (flush + 10 s = 40 s) behind now — so a
   // throw surfaces after ~100 s in the steady state. 300 s is 3x headroom

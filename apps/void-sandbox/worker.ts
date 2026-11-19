@@ -1,8 +1,8 @@
 /**
- * Noite Void-sandbox controller entry (celld `main`).
+ * Noite Void-sandbox controller entry (Cello `main`).
  *
  * One runner-owned script, `noite-void-sandbox`, cohosted in each Void app's
- * fleet next to the tenant app (celld `services` resolve within the fleet
+ * fleet next to the tenant app (Cello `services` resolve within the fleet
  * bucket only, so one fleet's controller is unreachable from any other fleet
  * or from the public internet). The tenant app reaches it solely through its
  * in-fleet `__VOID_SANDBOX` service binding.

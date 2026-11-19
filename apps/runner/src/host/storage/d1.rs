@@ -1,9 +1,9 @@
 //! D1 table editor: table list, schema introspection, and server-side
-//! paging/sort/filter via `celld d1 execute --json`, plus curated writes.
+//! paging/sort/filter via `cello d1 execute --json`, plus curated writes.
 //!
-//! Reads go through `celld d1 execute`, one subprocess per statement, except
+//! Reads go through `cello d1 execute`, one subprocess per statement, except
 //! where one action needs several independent statements: those share one
-//! `celld d1 execute --batch --json` call (one subprocess, one transaction).
+//! `cello d1 execute --batch --json` call (one subprocess, one transaction).
 //! Only JSON output is ever parsed (the CLI's table output is not). Identifiers
 //! only ever come from the `PRAGMA` allowlist; values go through the
 //! escaped-literal helper. The editor contract lives in `local://d1-contract.md`.
@@ -540,7 +540,7 @@ pub fn build_delete(
 }
 
 /// One atomic batch of DELETEs, each followed by `changes()` so the caller can
-/// total the rows actually removed. `celld d1 execute` brackets several
+/// total the rows actually removed. `cello d1 execute` brackets several
 /// statements in one transaction, so a failure rolls the whole batch back.
 pub fn build_delete_keys(
     schema: &TableSchema,
@@ -567,7 +567,7 @@ pub fn build_delete_keys(
 
 /// One count statement per table, run as one `--batch` exec.
 ///
-/// Never `SELECT … UNION ALL …`: celld applies workerd's SQLite budgets to
+/// Never `SELECT … UNION ALL …`: Cello applies workerd's SQLite budgets to
 /// every cell, and `SQLITE_LIMIT_COMPOUND_SELECT` is 5 there, so a database
 /// with a sixth table failed the whole listing ("too many terms in compound
 /// SELECT", which the unterminated SQL then reported as "incomplete").
@@ -579,10 +579,10 @@ pub fn build_table_counts(tables: &[String]) -> Vec<String> {
 }
 
 // ---------------------------------------------------------------------------
-// celld plumbing
+// Cello plumbing
 // ---------------------------------------------------------------------------
 
-/// `celld d1 execute` against one app's fleet. Holds the materialized project
+/// `cello d1 execute` against one app's fleet. Holds the materialized project
 /// so a multi-exec operation pays the checkout once.
 struct D1<'a> {
     cfg: &'a Config,
@@ -591,8 +591,8 @@ struct D1<'a> {
     proj: PathBuf,
 }
 
-/// A D1 database name bound for a `celld d1` positional: nonempty and never
-/// leading with `-`. celld's parser has no `--` terminator, so a dash-led
+/// A D1 database name bound for a `cello d1` positional: nonempty and never
+/// leading with `-`. Cello's parser has no `--` terminator, so a dash-led
 /// name either refuses as a missing database or parses as an option. The
 /// name itself resolves against the deployed project's declared databases
 /// downstream; this only keeps option-shaped input off the argv.
@@ -614,7 +614,7 @@ impl<'a> D1<'a> {
         })
     }
 
-    /// One `celld d1 execute` statement (or several) against the app's fleet.
+    /// One `cello d1 execute` statement (or several) against the app's fleet.
     /// Single place where tenant-DB SQL meets the shell: callers pass
     /// validated SQL only — never raw browser input.
     async fn exec(&self, sql: &str, json: bool) -> anyhow::Result<String> {
@@ -628,7 +628,7 @@ impl<'a> D1<'a> {
         Ok(String::from_utf8_lossy(&out).into_owned())
     }
 
-    /// Several independent statements in one `celld d1 execute --batch --json`
+    /// Several independent statements in one `cello d1 execute --batch --json`
     /// call: one subprocess and one transaction instead of one subprocess per
     /// statement. Returns one row-set per statement, in order. Every element
     /// must be a single statement (the batch path prepares each one).
@@ -652,7 +652,7 @@ impl<'a> D1<'a> {
         parse_batch_output(&String::from_utf8_lossy(&out), stmts.len())
     }
 
-    /// Run one `celld d1` subprocess, turning a refused exit into celld's own
+    /// Run one `cello d1` subprocess, turning a refused exit into Cello's own
     /// message. The argv names the bucket and the generated SQL, and stderr
     /// can carry paths: both go to the runner log only, never to the client.
     async fn celld(&self, args: &[&str], stdin: Option<&[u8]>) -> anyhow::Result<Vec<u8>> {
@@ -697,7 +697,7 @@ impl<'a> D1<'a> {
     }
 }
 
-/// The tenant-facing text of a failed celld run: its first error line without
+/// The tenant-facing text of a failed Cello run: its first error line without
 /// the `Error:` prefix. The rest of the chain (the argv, the bucket and the
 /// generated SQL) stays in the runner log.
 fn celld_failure(stderr: &str) -> String {
@@ -714,7 +714,7 @@ fn celld_failure(stderr: &str) -> String {
     }
 }
 
-/// A celld error line with the app's bucket path removed: a store refusal can
+/// A Cello error line with the app's bucket path removed: a store refusal can
 /// name it, and the install's object layout is not the tenant's to read.
 fn scrub_bucket(message: String, fleet_bucket: &str) -> String {
     if fleet_bucket.is_empty() {
@@ -723,13 +723,13 @@ fn scrub_bucket(message: String, fleet_bucket: &str) -> String {
     message.replace(fleet_bucket, "<app bucket>")
 }
 
-/// Whether celld refused because the D1 cell has never been opened. The cell
+/// Whether Cello refused because the D1 cell has never been opened. The cell
 /// is created empty on first use, so this is "no tables yet", not a failure.
 fn unopened_database(error: &anyhow::Error) -> bool {
     format!("{error:#}").contains("no db for ")
 }
 
-/// Materialize the deployed source into a persistent project dir so celld's
+/// Materialize the deployed source into a persistent project dir so Cello's
 /// `d1` can find wrangler.jsonc (resolve_config reads it from the cwd).
 async fn ensure_project(cfg: &Config, app: &App) -> anyhow::Result<PathBuf> {
     let bare = forge::read_mirror_cfg(cfg, &app.slug).await?;
@@ -740,7 +740,7 @@ async fn ensure_project(cfg: &Config, app: &App) -> anyhow::Result<PathBuf> {
     source::checkout_worktree(cfg, &app.slug, &rev, &proj).await?;
     // Configs generated at deploy time (cloudflare.config.ts, a built
     // dist/wrangler.json) are not in the source tree; write what the last
-    // deploy uploaded so celld can resolve the database bindings.
+    // deploy uploaded so Cello can resolve the database bindings.
     let has_config = ["wrangler.jsonc", "wrangler.json"]
         .iter()
         .any(|name| proj.join(name).exists());
@@ -766,7 +766,7 @@ fn parse_json_rows(out: &str) -> Vec<serde_json::Map<String, Value>> {
         .collect()
 }
 
-/// Stdin document for `celld d1 execute --batch --json`: a JSON array of
+/// Stdin document for `cello d1 execute --batch --json`: a JSON array of
 /// `{"sql"}` objects (`params` defaults to `[]`, and the editor never binds).
 fn build_batch_input(stmts: &[String]) -> String {
     let items: Vec<Value> = stmts
@@ -1002,7 +1002,7 @@ async fn load_schema(d1: &D1<'_>, table: &str) -> anyhow::Result<D1TableSchemaRa
 pub async fn d1_tables(cfg: &Config, app: &App, database_id: &str) -> anyhow::Result<D1Tables> {
     let d1 = D1::connect(cfg, app, database_id).await?;
     // A declared database whose cell has never been opened has no tables
-    // yet, and celld says so as `no db for <scope>`. That is the same empty
+    // yet, and Cello says so as `no db for <scope>`. That is the same empty
     // view as a created-but-empty database, not a failed listing.
     let names = match table_names(&d1).await {
         Ok(names) => names,
@@ -1440,7 +1440,7 @@ mod tests {
             "jwks".to_string(),
             "b'b".to_string(),
         ]);
-        // One statement per table: celld's workerd SQLite budget allows only
+        // One statement per table: Cello's workerd SQLite budget allows only
         // five `UNION ALL` terms, so a compound count broke every database
         // with more than five tables.
         assert_eq!(counts.len(), 6);
@@ -1496,7 +1496,7 @@ mod tests {
 
     #[test]
     fn batch_output_parses_one_row_set_per_statement() {
-        // Shaped like the Worker's `batch()` result, as celld prints it.
+        // Shaped like the Worker's `batch()` result, as Cello prints it.
         let out = r#"[{"success":true,"meta":{"duration":1.5},"results":[{"id":7,"name":"ada","note":null}]},{"success":true,"meta":{"duration":0.5},"results":[{"n":42}]},{"success":true,"meta":{},"results":[]}]"#;
         let sets = parse_batch_output(out, 3).unwrap();
         assert_eq!(sets.len(), 3);
@@ -1600,7 +1600,7 @@ mod tests {
         );
     }
 
-    /// The database name rides as `celld d1`'s positional, and celld has
+    /// The database name rides as `cello d1`'s positional, and Cello has
     /// no `--` terminator: a dash-led name must never reach the argv.
     #[test]
     fn database_names_reject_option_spelling() {

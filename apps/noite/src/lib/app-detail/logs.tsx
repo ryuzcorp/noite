@@ -27,7 +27,7 @@ const newPane = (): Pane => ({
 });
 
 /**
- * Live tail of the running celld fleet's stdout/stderr (bounded buffer on the
+ * Live tail of the running Cello fleet's stdout/stderr (bounded buffer on the
  * runner). Streams SSE and follows the tail while pinned to the bottom;
  * scrolled-up stays put. The buffer resets on runner restart, so this is
  * recent activity only. `environmentId` tails one preview environment's own

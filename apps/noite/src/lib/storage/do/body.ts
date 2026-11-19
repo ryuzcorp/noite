@@ -8,7 +8,7 @@
 //! rendered identically. One decode yields one closed value; the panel and
 //! the list both switch on it.
 //!
-//! `null` is deliberately *one* state ("the probe returned nothing"): celld
+//! `null` is deliberately *one* state ("the probe returned nothing"): Cello
 //! does not tell the UI why, so the UI must not claim a reason it cannot
 //! know. The copy says what is true — the object did not report a preview.
 //!

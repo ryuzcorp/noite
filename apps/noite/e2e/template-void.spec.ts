@@ -24,7 +24,7 @@ test.afterAll(async ({ request }) => {
 
 // The Ilha + Void template (`ryuzcorp/noite-templates`, `templates/ilha-void`):
 // picked in the creator, deployed like any other app, serving SSR plus a
-// server action on celld. A broken template fails this spec, which fails the
+// server action on Cello. A broken template fails this spec, which fails the
 // release gate.
 test(
   "the Ilha + Void template deploys and serves",
@@ -59,7 +59,7 @@ test(
 
     const base = `http://localhost:${await appListenPort(request, id)}`;
     // A first deploy spawns the fleet; its port resets connections until
-    // celld listens.
+    // cello listens.
     await expect
       .poll(
         async () => {

@@ -17,7 +17,7 @@ test("control serves the UI", async ({ page }) => {
 });
 
 test("control UI still serves its own bundle", async ({ request }) => {
-  // `/assets/*` must reach celld's own resolver, never the Worker: the pages
+  // `/assets/*` must reach Cello's own resolver, never the Worker: the pages
   // fallback would fetch them inside the app and its 15 s action bound.
   const response = await request.get("/login", {
     headers: { accept: "text/html" },

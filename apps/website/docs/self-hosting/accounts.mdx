@@ -39,11 +39,11 @@ An instance admin sees the control plane itself in `/apps`: the **Noite** card, 
 
 Pending accounts show with a badge plus **Approve** and **Reject**. Approving flips the account active (an approval notice is emailed when delivery is configured); rejecting deletes the account, its passkeys and its sessions. A pending account holds no access until approval: no page data, no API calls, no key use. Pending rows can never be made admin before approval, and an admin cannot approve or reject their own account.
 
-In `make dev` the control UI runs under vite and supervises no celld, so Metrics, Analytics, Errors and Logs are hidden — there is no control fleet to record them — while the Admin tab and the control database still work.
+In `make dev` the control UI runs under vite and supervises no Cello, so Metrics, Analytics, Errors and Logs are hidden — there is no control fleet to record them — while the Admin tab and the control database still work.
 
 ## Browsing the control database
 
-The Overview tab lists the control database; it opens on its own page (`/storage/_control/d1:noite-control`) in the same D1 grid tenant apps use, served **in-process** from the control node's own database — the worker already owns that binding, so nothing shells out to the `celld d1` CLI (which once hung every later page load; see SPEC.md). Each row also links to the proper admin action: a `user` row and an `email_invite` row both offer **Manage in Users**, pre-filling the tab's search with the row's email.
+The Overview tab lists the control database; it opens on its own page (`/storage/_control/d1:noite-control`) in the same D1 grid tenant apps use, served **in-process** from the control node's own database — the worker already owns that binding, so nothing shells out to the `cello d1` CLI (which once hung every later page load; see SPEC.md). Each row also links to the proper admin action: a `user` row and an `email_invite` row both offer **Manage in Users**, pre-filling the tab's search with the row's email.
 
 The browser is deliberately narrow:
 

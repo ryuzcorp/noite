@@ -8,7 +8,7 @@
 #   noite-data   the runner SQLite (apps, deploys, env, domains, metrics; also
 #                snapshotted into the bucket every minute), git mirrors,
 #                builds, fleet working dirs, Caddy config + certificates
-#   rustfs-data  the bundled bucket: `git/` bundles, `fleets/` tenant celld,
+#   rustfs-data  the bundled bucket: `git/` bundles, `fleets/` tenant Cello,
 #                `control/` UI worker + its D1, `runner/state/` snapshots
 #
 # With BYO S3 the bucket is not here: back it up at the provider (versioning)

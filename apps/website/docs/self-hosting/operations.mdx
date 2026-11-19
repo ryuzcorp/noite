@@ -94,8 +94,8 @@ With your own bucket, `rustfs-data` does not exist and only `noite-data` needs t
 | --- | --- |
 | `runner/state/` | runner snapshots (the SQLite restore source on an empty volume) |
 | `control/` | control UI worker, its D1 (accounts, invites) and its telemetry |
-| `fleets/` | every tenant app's celld state and storage |
-| `envs/` | every preview environment's celld state and storage |
+| `fleets/` | every tenant app's Cello state and storage |
+| `envs/` | every preview environment's Cello state and storage |
 | `git/` | every app's tip bundle (the push/deploy source of truth) |
 
 ### Backing up a bring-your-own-S3 install
@@ -185,7 +185,7 @@ In multi tenancy (`NOITE_TENANCY=multi`) the relay and every AI endpoint must be
 
 Void apps that declare a sandbox (`getSandbox()` in the Void runtime) run it through a runner-owned `noite-void-sandbox` script the deploy cohosts in each sandbox fleet beside the app — before the proxy, with the app deploying last. The controller is fleet-local: one fleet's sandboxes are unreachable from any other fleet or from the public internet, and previews get their own controller. Each fleet admits at most `NOITE_VOID_SANDBOX_MAX_CONCURRENT` live sandboxes (default `4`; `0` admits none); over the cap, `getSandbox()` throws Void's `SandboxLimitError`, exactly as on Void's own platform.
 
-What works is Void's sandbox surface: `invoke` (exec runs commands, files read and write, fetch reaches the sandbox's ports), PTY terminal sessions (`pty: true` or `{ cols, rows }`, with `isPty` and `resize`), the 30 s lease heartbeat with idle reaping, and direct port fetches refreshing the idle deadline. Abort follows Workers semantics: aborting an exec's signal sends SIGKILL to the process, delivered into the container by celld.
+What works is Void's sandbox surface: `invoke` (exec runs commands, files read and write, fetch reaches the sandbox's ports), PTY terminal sessions (`pty: true` or `{ cols, rows }`, with `isPty` and `resize`), the 30 s lease heartbeat with idle reaping, and direct port fetches refreshing the idle deadline. Abort follows Workers semantics: aborting an exec's signal sends SIGKILL to the process, delivered into the container by Cello.
 
 Image rules follow the platform's container rules, with two sandbox additions. A `Dockerfile` in the project must run nothing (`RUN` is refused; `FROM`/`COPY`/`WORKDIR` and friends are vetted and every base pinned by digest — Void's default sandbox image already qualifies), and the image must carry the sandbox shim (`/usr/local/bin/sandbox-shim`): custom images `FROM` — or `COPY --from` — a shim-carrying image, and a missing shim fails container start naming that contract. A registry image named directly must be digest-pinned (`@sha256:` plus 64 lowercase hex); an unpinned tag fails the deploy before anything builds. `instanceType` is ignored in v1: every sandbox runs the install's default. The controller speaks Void's sandbox protocol 2 only: a sandbox app whose `void` major differs from the bundle's fails the deploy with Void's own upgrade message, before anything deploys.
 
@@ -198,7 +198,7 @@ Image rules follow the platform's container rules, with two sandbox additions. A
 - **`isolation: …` in multi**: the container lacks a capability, `nft`, or the per-fleet cgroups (`per-fleet cgroups unavailable …` names the cgroup cause). Grant `NET_ADMIN`, `SETUID`, `SETGID` and `CHOWN` in compose, then layer the multi cgroup grant on top (`docker compose -f docker/compose.yaml -f docker/compose.multi.yaml up -d`), or run `NOITE_TENANCY=single`.
 - **Boot stops with `runner state restore failed`**: the volume is empty and the bucket did not answer. The runner refuses to start with an empty database (it would overwrite the good snapshot); fix the store and it retries on restart.
 - **Boot stops with `config invalid` naming an env var**: a numeric setting is malformed (a typo like `RUNNER_POLL_MS=5s`). The runner refuses to boot instead of silently using the default; fix the named variable to its expected form and restart. Unset (or empty) still means the default.
-- **A deploy fails with `celld deploy does not support these config keys`**: a Wrangler key celld does not accept. Noite strips the keys it consumes (`release`, `build`) before deploying; anything else must go.
+- **A deploy fails with `cello deploy does not support these config keys`**: a Wrangler key Cello does not accept. Noite strips the keys it consumes (`release`, `build`) before deploying; anything else must go.
 - **A deploy fails with `nothing to deploy`**: the tree has no Wrangler config, no `index.html` in `dist/`, `build/` or `out/`, and no `package.json` `main`. See [No config at all](/apps/build#no-config-at-all).
 - **A deploy fails with `starts a Node HTTP server`**: `package.json` `main` calls `.listen()`. Noite runs Workers; see [Frameworks and Node servers](/apps/build#frameworks-and-node-servers).
 - **Many `429` responses**: the edge rate limits. Behind a proxy, check `NOITE_TRUSTED_PROXIES`; otherwise raise `NOITE_EDGE_RPM` or the app's own limit ([Edge protection](/self-hosting/protection)).
@@ -221,4 +221,4 @@ Image rules follow the platform's container rules, with two sandbox additions. A
     "http://127.0.0.1:8080/v1/apps/<id>/metrics?hours=720"'   # hourly counters, 30 days
   ```
 
-  A missing hour shows as a gap in that list (or in the app's **Metrics** tab); compare it with the hour directories under `s3://<bucket>/fleets/<slug>/telemetry/` to see whether the source data still exists. Nothing older than `RUNNER_TELEMETRY_RETENTION_DAYS` is recoverable: celld has already pruned it from the bucket.
+  A missing hour shows as a gap in that list (or in the app's **Metrics** tab); compare it with the hour directories under `s3://<bucket>/fleets/<slug>/telemetry/` to see whether the source data still exists. Nothing older than `RUNNER_TELEMETRY_RETENTION_DAYS` is recoverable: Cello has already pruned it from the bucket.

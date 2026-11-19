@@ -134,7 +134,7 @@ docker compose exec noite curl -s http://127.0.0.1:8080/ready   # {"ok":true,...
 curl https://api.<domain>/health                                 # edge → runner
 ```
 
-`/ready` is the summary: 200 only when the first reconcile ran, the bucket answers, isolation holds (in `multi`), the control fleet is healthy and Caddy accepted its config, and its body names whatever is failing; it is also the container's healthcheck. celld's own view of the control node: `docker compose exec noite curl -s http://127.0.0.1:8090/.well-known/celld/health`.
+`/ready` is the summary: 200 only when the first reconcile ran, the bucket answers, isolation holds (in `multi`), the control fleet is healthy and Caddy accepted its config, and its body names whatever is failing; it is also the container's healthcheck. Cello's own view of the control node: `docker compose exec noite curl -s http://127.0.0.1:8090/.well-known/cello/health`.
 
 :::note
 Building Noite from source, the dev stack and the e2e lanes are for contributors: see the [repository README](https://github.com/ryuzcorp/noite#readme).

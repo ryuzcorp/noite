@@ -15,7 +15,7 @@ import {
 } from "./isr-keys.ts";
 
 /**
- * The fleet-shared `caches.default` (`CELLD_CACHE_SCOPE=deployment` puts every
+ * The fleet-shared `caches.default` (`CELLO_CACHE_SCOPE=deployment` puts every
  * script of the fleet's deployment in one cache, like a Cloudflare zone), or
  * null when the runtime has no Cache API. `ProxyDeps.edgeCache` overrides
  * this in tests.

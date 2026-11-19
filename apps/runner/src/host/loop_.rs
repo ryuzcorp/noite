@@ -377,7 +377,7 @@ async fn reconcile_once(
     // runs the stop phase, then propagates the first error.
     let spawn_result: anyhow::Result<()> = async {
     // Cold starts per pass (`RUNNER_FLEET_SPAWN_BATCH`): a boot or upgrade
-    // must not stack every celld's initialization at once. Restarts of an
+    // must not stack every Cello's initialization at once. Restarts of an
     // already-registered child are never batched — those wait on their own
     // backoff and deserve the next tick.
     let mut cold_starts: u32 = 0;
@@ -387,7 +387,7 @@ async fn reconcile_once(
         if app.desired() == DesiredState::Stopped {
             continue;
         }
-        // Spawn celld only after a successful deploy — a fleet whose bucket
+        // Spawn Cello only after a successful deploy — a fleet whose bucket
         // lacks deploy/current.json exits(1) immediately and would crash-loop.
         // Asleep apps stay parked: the next request wakes them through the
         // edge (host/sleep.rs), and respawning here would undo the sleep.
@@ -409,7 +409,7 @@ async fn reconcile_once(
             match supervisor::ensure_fleet(pool, cfg, procs, logs, app).await {
                 Ok(()) => {
                     // "Running" means the fleet answers its health gate, not
-                    // just that celld was spawned: confirm off the tick (the
+                    // just that Cello was spawned: confirm off the tick (the
                     // loop must never block behind one app's cold boot) and
                     // flip only while still wanted, so a stop in the window
                     // wins. Without any confirm, start/resume would leave the

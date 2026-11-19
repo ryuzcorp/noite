@@ -5,7 +5,7 @@
 //!
 //! S3 is stubbed with an in-process LIST-only server: purge, rename and
 //! source-rev resolution answer "nothing there" instead of dialing RustFS.
-//! Paths that shell out to celld (storage inventory/D1/R2) or Caddy
+//! Paths that shell out to Cello (storage inventory/D1/R2) or Caddy
 //! (`sleep`) are deliberately not exercised here.
 
 use std::sync::Arc;

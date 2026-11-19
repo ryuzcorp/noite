@@ -46,7 +46,7 @@ test("vite build output is what deploys", async ({ page, request }) => {
 
   const base = `http://localhost:${await appListenPort(request, appId)}`;
   // A first deploy spawns the fleet; its port resets connections until
-  // celld listens.
+  // cello listens.
   await expect
     .poll(
       async () => {

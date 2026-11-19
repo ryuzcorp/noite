@@ -1,12 +1,12 @@
 /**
  * The two halves of the asset-serving fix, asserted together: the deployed
- * `run_worker_first` list must keep `/assets/*` off the Worker (celld serves
+ * `run_worker_first` list must keep `/assets/*` off the Worker (Cello serves
  * the bundle itself), and the action timeout must never bound a static file.
  *
  * Why the pairing matters (the e2e "flake wave"): with worker-first assets,
  * Void's pages fallback serves a chunk from *inside* the Hono app, so the
  * request runs the whole middleware chain and awaits the isolate-level
- * manifest single-flight. celld drops a request's pending work when that
+ * manifest single-flight. Cello drops a request's pending work when that
  * request answers or its client leaves (CHANGELOG: "a dropped DB setup pass
  * no longer stalls the whole control plane"), so one aborted request can
  * leave that shared promise unsettled — every later `/assets/*` request in
@@ -20,7 +20,7 @@ import { RUN_WORKER_FIRST } from "../../void.config.ts";
 import { routeTimeout } from "../middleware/01-timeout";
 
 /**
- * celld's `run_worker_first` decision, as `docs/services/static-assets.md`
+ * Cello's `run_worker_first` decision, as `docs/services/static-assets.md`
  * states it: up to 100 route patterns, a `!` prefix excludes, `*` matches any
  * run of characters (a pattern not ending in `*` is exact), and an excluded
  * path never reaches the Worker even when `/**` also matches.
@@ -49,7 +49,7 @@ const startsWorker = (path: string): boolean => {
 };
 
 describe("control asset routing", () => {
-  test("celld answers the bundle without starting the Worker", () => {
+  test("cello answers the bundle without starting the Worker", () => {
     expect(RUN_WORKER_FIRST).toEqual(["/**", "!/assets/*"]);
 
     for (const path of [

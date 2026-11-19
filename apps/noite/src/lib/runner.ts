@@ -451,7 +451,7 @@ const pathTail = (value: string): string =>
 
 /** `GET /v1/admin/stats`: the operator counters, plus `control_fleet` —
  * whether this image supervises the control fleet at all (the dev image does
- * not: `vite dev` serves the UI, so there is no control celld and no control
+ * not: `vite dev` serves the UI, so there is no control Cello and no control
  * telemetry). The runner's JSON keys are snake_case. */
 export interface RunnerAdminStats {
   control_fleet: boolean;
@@ -1422,7 +1422,7 @@ export const r2DownloadUrl = (appId: string, bucket: string, key: string) =>
   `/storage/${encodeURIComponent(appId)}/r2/${encodeURIComponent(bucket)}/raw?key=${encodeURIComponent(key)}`;
 
 /** Browser upload URL for one R2 object: the UI proxy route streams the body
- * to the runner, which stores it with `celld r2 put` (session + push gate). */
+ * to the runner, which stores it with `cello r2 put` (session + push gate). */
 export const r2UploadUrl = (appId: string, bucket: string, key: string) =>
   `/storage/${encodeURIComponent(appId)}/r2/${encodeURIComponent(bucket)}/upload?key=${encodeURIComponent(key)}`;
 

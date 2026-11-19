@@ -1,7 +1,7 @@
 /**
  * App/controller protocol compatibility (see SPEC.md "Void sandbox
  * controller"). Void gates on the `controllerProtocol` its build stamps;
- * Noite has no deploy manifest to read, so the runner refuses before `celld
+ * Noite has no deploy manifest to read, so the runner refuses before `cello
  * deploy` unless the app's `void` major matches the embedded bundle's. Minor
  * and patch drift inside one protocol are wire-compatible by Void's own rule.
  *

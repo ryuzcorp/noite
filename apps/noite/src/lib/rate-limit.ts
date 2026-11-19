@@ -6,7 +6,7 @@
  * query behind the signup-policy route at all.
  *
  * The counter lives in the worker isolate: with one control node a request
- * lands on the same isolate most of the time, and celld already serialises a
+ * lands on the same isolate most of the time, and Cello already serialises a
  * cell's work. That makes this a practical abuse bound, not a
  * load-balancer-grade quota — the edge (`caddy`) has no rate limiter, and a
  * real deployment can add one in front.

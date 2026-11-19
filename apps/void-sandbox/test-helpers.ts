@@ -95,7 +95,7 @@ export class FakeProcess {
   stdin: WritableStream | null = null;
   stdout: ReadableStream | null = null;
   stderr: ReadableStream | null = null;
-  /** celld 0006: scripted per test — set for the `pty` exec under test. */
+  /** Cello 0006: scripted per test — set for the `pty` exec under test. */
   isPty = false;
   readonly resizes: { readonly cols: number; readonly rows: number }[] = [];
   killCode = 137;

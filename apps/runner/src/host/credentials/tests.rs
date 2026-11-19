@@ -1713,7 +1713,7 @@ fn unique_scope(prefix: &str) -> String {
     format!("{prefix}:{}", crate::models::new_id())
 }
 
-/// Minted tokens boot the node: non-empty, no surrounding whitespace (celld
+/// Minted tokens boot the node: non-empty, no surrounding whitespace (Cello
 /// refuses both), 32 random bytes in base64url.
 #[test]
 fn minted_tokens_are_boot_safe() {

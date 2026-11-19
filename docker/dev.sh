@@ -12,7 +12,7 @@
 #               mounted `apps/void-sandbox`, so a sandbox app deploys with no
 #               manual `bun run build`.
 #
-# `celld dev` cannot serve the control app: it bundles `main` with raw
+# `cello dev` cannot serve the control app: it bundles `main` with raw
 # esbuild, which cannot resolve the Void plugin's `virtual:void-routes`
 # entry. Only the Vite pipeline can (`vite build` for the image).
 set -eu

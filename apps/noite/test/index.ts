@@ -75,7 +75,7 @@ export default {
 
     // Visiting /d1-many-tables creates six tables. The storage e2e uses it
     // to prove the D1 editor lists a database past SQLite's five-term
-    // compound-SELECT budget, which celld applies to every cell.
+    // compound-SELECT budget, which Cello applies to every cell.
     if (url.pathname === "/d1-many-tables" && request.method === "GET") {
       const tables = [
         "extra_1",

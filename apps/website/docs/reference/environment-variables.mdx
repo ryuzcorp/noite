@@ -3,7 +3,7 @@ title: Environment variables
 description: Every runner env var with its default, effect, and owner.
 ---
 
-Defaults below are what `docker/compose.yaml` applies when the var is unset. The runner refuses dev secrets off a `localhost` base. A set-but-malformed numeric value refuses the boot instead of falling back: the runner exits naming each bad var, its value and the expected form — unset (or empty) still means the default.
+Defaults below are what `docker/compose.yaml` applies when the var is unset. The runner refuses dev secrets off a `localhost` base. A set-but-malformed numeric value refuses the boot instead of falling back: the runner exits naming each bad var, its value and the expected form — unset (or empty) still means the default. Pre-0.1.0 `CELLD_*` spellings are not read anymore: the runner refuses to boot with any of them set, naming the `CELLO_*` spelling (the installer rewrites them on upgrade).
 
 Ownership: **runner-owned** (read by the runner) vs **worker-passthrough** (handed to the control UI worker untouched).
 
@@ -33,10 +33,10 @@ These are install-level variables (Compose, the image environment). Per-app valu
 | `RUNNER_BIND` | `0.0.0.0:8080` | Runner listen address | runner-owned |
 | `RUNNER_WORK_DIR` | `/data/runner` | Fleet working dirs, mirrors, builds | runner-owned |
 | `RUNNER_POLL_MS` | `5000` | Reconcile tick interval | runner-owned |
-| `CELLD_BIN` | `celld` | Fleet binary path | runner-owned |
+| `CELLO_BIN` | `cello` | Fleet binary path | runner-owned |
 | `CONTROL_BUNDLE_DIR` | `/opt/noite/control/dist` | Baked control UI bundle (fleet #0) | runner-owned |
 | `RUST_LOG` | `noite_runner=info,tower_http=info` | Runner log filter | runner-owned |
-| `CELLD_ADVERTISE` | `RAILWAY_PRIVATE_DOMAIN`, else the container hostname | Address other control nodes dial during an overlapping redeploy (`:8091`); must be reachable from a peer | runner-owned |
+| `CELLO_ADVERTISE` | `RAILWAY_PRIVATE_DOMAIN`, else the container hostname | Address other control nodes dial during an overlapping redeploy (`:8091`); must be reachable from a peer | runner-owned |
 
 ## Auth
 
@@ -70,7 +70,7 @@ These are install-level variables (Compose, the image environment). Per-app valu
 | --- | --- | --- | --- |
 | `NOITE_TENANCY` | unset = `multi` off a `localhost` base, `single` on | `multi` sandboxes builds/fleets as users behind egress policy; `single` = operator pushes only | runner-owned |
 | `NOITE_CREDENTIAL_PROVIDER` | `auto` | Where tenant fleet keys come from: `auto` scopes the bundled RustFS, identifies other RustFS endpoints by the health endpoint, and probes the rest for the MinIO admin API; `minio` forces that provider (MinIO only — refused by RustFS), `rustfs` forces the RustFS policy variant on any endpoint, `aws` forces the AWS IAM provider (needs an IAM-capable key), `root` keeps the root keys explicitly | runner-owned |
-| `NOITE_SANDBOX` | unset = on when the engine socket answers | [Sandbox containers](/self-hosting/tenancy#sandbox-containers) (celld `containers` classes, e.g. the agent template); `0`, `false` or `off` disables them: no relay, no per-fleet engine sockets, fleets get no `DOCKER_HOST`, and deploys declaring `containers` fail | runner-owned |
+| `NOITE_SANDBOX` | unset = on when the engine socket answers | [Sandbox containers](/self-hosting/tenancy#sandbox-containers) (Cello `containers` classes, e.g. the agent template); `0`, `false` or `off` disables them: no relay, no per-fleet engine sockets, fleets get no `DOCKER_HOST`, and deploys declaring `containers` fail | runner-owned |
 | `RUNNER_BUILD_UID_BASE` / `RUNNER_BUILD_UID_RANGE` | `10030` / `1024` | Reserved per-app build uid range `[base, base + range)`; each app's builds and release commands run as their own uid from it | runner-owned |
 | `RUNNER_FLEET_UID` / `RUNNER_FLEET_GID` | `10020` | Tenant fleet user | runner-owned |
 | `NOITE_FLEET_PORTS` | `20000-29999` | Fleet port range, two ports per app | runner-owned |
@@ -90,29 +90,29 @@ These are install-level variables (Compose, the image environment). Per-app valu
 | `RUNNER_MAX_APPS_PER_USER` | `10` | Per-account app quota, enforced on create | runner-owned |
 | `RUNNER_MAX_ENVIRONMENTS_PER_APP` | `5` | [Preview environments](/apps/environments) per app, enforced at create | runner-owned |
 | `RUNNER_MAX_ENVIRONMENTS` | `25` | Preview environments per instance, enforced at create | runner-owned |
-| `RUNNER_FLEET_MAX_RSS_MB` | `0` | → `CELLD_MAX_RSS_MB` when non-zero; container-wide shed threshold by design (celld measures container-scale working set), never per-fleet; `0` = celld default (80% of container memory) | worker-passthrough (fleet) |
+| `RUNNER_FLEET_MAX_RSS_MB` | `0` | → `CELLO_MAX_RSS_MB` when non-zero; container-wide shed threshold by design (Cello measures container-scale working set), never per-fleet; `0` = Cello default (80% of container memory) | worker-passthrough (fleet) |
 | `RUNNER_FLEET_MEMORY_MB` | `512` | Per-fleet `memory.max` in MiB (own cgroup per fleet); per-app override in Settings → Limits; needs the multi-only cgroup grant (`docker/compose.multi.yaml`) — without it fleets share the container cgroup | runner-owned |
 | `RUNNER_FLEET_MEMORY_MAX_MB` | default cap | Ceiling for a per-app memory override in MiB; in `multi` a tenant can only lower its cap, never raise it past this. Single installs ignore it | runner-owned |
-| `RUNNER_FLEET_IDLE_EVICT_S` | `120` | → `CELLD_IDLE_EVICT_S`; idle seconds before a fleet hibernates cells | worker-passthrough (fleet) |
-| `RUNNER_FLEET_LEASE_TTL_MS` | `60000` | → `CELLD_TTL_MS` on every fleet and the control node; a storage or disk stall longer than two thirds of it restarts every app. Minimum `10000` | worker-passthrough (fleet) |
-| `RUNNER_FLEET_DEPLOY_POLL_S` | `300` | → `CELLD_DEPLOY_POLL_S`; covers missed `/reload` only | worker-passthrough (fleet) |
-| `RUNNER_FLEET_ASSET_CACHE_MB` | `64` | → `CELLD_ASSET_CACHE_BYTES`; per-fleet on-disk asset cache | worker-passthrough (fleet) |
-| `RUNNER_FLEET_LOCAL_CACHE_MB` | 1/16 of detected memory, clamped `64`–`512` | → `CELLD_LOCAL_CACHE_MAX_BYTES`; per-fleet hibernated-DB cache (celld's own default is 2 GiB per node) | worker-passthrough (fleet) |
+| `RUNNER_FLEET_IDLE_EVICT_S` | `120` | → `CELLO_IDLE_EVICT_S`; idle seconds before a fleet hibernates cells | worker-passthrough (fleet) |
+| `RUNNER_FLEET_LEASE_TTL_MS` | `60000` | → `CELLO_TTL_MS` on every fleet and the control node; a storage or disk stall longer than two thirds of it restarts every app. Minimum `10000` | worker-passthrough (fleet) |
+| `RUNNER_FLEET_DEPLOY_POLL_S` | `300` | → `CELLO_DEPLOY_POLL_S`; covers missed `/reload` only | worker-passthrough (fleet) |
+| `RUNNER_FLEET_ASSET_CACHE_MB` | `64` | → `CELLO_ASSET_CACHE_BYTES`; per-fleet on-disk asset cache | worker-passthrough (fleet) |
+| `RUNNER_FLEET_LOCAL_CACHE_MB` | 1/16 of detected memory, clamped `64`–`512` | → `CELLO_LOCAL_CACHE_MAX_BYTES`; per-fleet hibernated-DB cache (Cello's own default is 2 GiB per node) | worker-passthrough (fleet) |
 | `RUNNER_CONTROL_MEMORY_MB` | 1/4 of detected memory, clamped `256`–`1024` | Control fleet (`fleet #0`) cap in MiB; its own cgroup leaf when the install has writable cgroups, else the container-wide shed threshold | runner-owned |
-| `RUNNER_FLEET_SPAWN_BATCH` | `1` on ≤ 2 cores, else `2` | Cold fleets started per reconcile pass, so a boot or upgrade does not stack every celld at once; restarts are never batched | runner-owned |
-| `RUNNER_BUILD_CONCURRENCY` | `1` on ≤ 2 cores, else `2` | Concurrent tenant deploys; one slot covers install, build, release and the `celld deploy` | runner-owned |
+| `RUNNER_FLEET_SPAWN_BATCH` | `1` on ≤ 2 cores, else `2` | Cold fleets started per reconcile pass, so a boot or upgrade does not stack every cello at once; restarts are never batched | runner-owned |
+| `RUNNER_BUILD_CONCURRENCY` | `1` on ≤ 2 cores, else `2` | Concurrent tenant deploys; one slot covers install, build, release and the `cello deploy` | runner-owned |
 | `RUNNER_BUILD_MEMORY_MB` | detected memory minus a 1 GiB resident floor (a quarter of bigger boxes), split across build slots, clamped `512`–`4096` | `memory.max` of each deploy's `build` cgroup leaf, which runs install, build and release; `0` leaves builds uncapped. Over the cap the leaf may swap up to `RUNNER_BUILD_SWAP_MB`, then the step is killed alone with a log naming both budgets — fleets and the runner keep serving. Every step also gets the runner's own `NODE_OPTIONS=--max-old-space-size=N` (three quarters of the RAM-plus-swap budget), because Node otherwise sizes its heap at about half the leaf and a large install aborts with `FATAL ERROR: Reached heap limit`; a workload larger than RAM needs the swap share too (Ember's `tsc` needs ~630 MB on a 613 MiB leaf, and passes with a 1227 MB ceiling from 1023 MiB of swap). A heap abort names the ceiling and both budgets the same way. Tenant `NODE_OPTIONS` is reserved and never reaches the build — except inside the tenant's own `noite.ci.yaml` steps, whose step/job env applies over the runner default within that memory-capped container (CI containers get no swap, so their ceiling stays RAM-only). Build steps also get `PNPM_MAX_WORKERS` (leaf RAM per 512 MiB, capped by the leaf's CPU share, at least 1): pnpm's tarball pool defaults to host CPUs minus one, which OOMs a small leaf on a many-core box in fetch; a tenant setting is dropped, though a `noite.ci.yaml` step may override it within its own container. Linking still needs transient room: an Ember-size install (~400 packages) needs on the order of half a GiB of build swap on a 613 MiB leaf at 2 CPUs (measured, warm store) — with no swap the leaf dies post-`done`, in linking, and the log says to add host swap. A Vite 8/Rolldown build of a Void app peaks around 1.3–1.5 GiB: on a box that cannot spare that in RAM the swap carries the overflow, and a box with no swap or a build that fills both still fails with the budget named. The leaf also gets a hard CPU quota (one core less than the box, split across concurrent build slots) and a low I/O weight, so a build cannot starve the runner, RustFS or SSH | runner-owned |
 | `RUNNER_BUILD_SWAP_MB` | the host's swap split across the build slots, clamped `0`–`4096`; `0` when the host has none | `memory.swap.max` of each deploy's `build` leaf. The overflow past the RAM cap, so a build larger than the box's spare RAM finishes (slowly) instead of thrashing at the cap until the step timeout; the watchdog only fails it once RAM and swap are both full. Fleets keep zero swap. An explicit `0` restores the old zero-swap behavior | runner-owned |
 | `RUNNER_PRESSURE_PCT` | `85` | Container memory percentage that triggers pressure parking of idle apps; `0` disables | runner-owned |
 | `RUNNER_PRESSURE_IDLE_S` | `300` | How long an app must be idle before pressure may park it | runner-owned |
 | `RUNNER_PRESSURE_SWEEP_S` | `30` | Pressure check interval (minimum `10`) | runner-owned |
-| `RUNNER_OTEL_FLUSH_MS` | `30000` | → `CELLD_OTEL_FLUSH_MS`; bucket-flush + ingest tick cadence (min `1000`); dashboards lag ~40 s | worker-passthrough (fleet) |
+| `RUNNER_OTEL_FLUSH_MS` | `30000` | → `CELLO_OTEL_FLUSH_MS`; bucket-flush + ingest tick cadence (min `1000`); dashboards lag ~40 s | worker-passthrough (fleet) |
 | `RUNNER_BUILD_CACHE_MB` | `1024` | Per-app persistent build cache cap (package managers and their caches); `0` disables | runner-owned |
 | `RUNNER_TELEMETRY_RETENTION_DAYS` | `30` | Days kept in bucket prune, metric tables, glob floor (min `1`; a non-integer or `< 1` value fails boot validation) | runner-owned |
 | `RUNNER_TIP_SWEEP_S` | `60` | Fallback S3 tip sweep per app; covers out-of-band bundle writes | runner-owned |
-| `RUNNER_DEPLOY_PROBE_PATH` | `/` | Pre-activation canary: after staging, the deploy asks the staged generation for `HEAD <path>` through `celld invoke` before the one activate serves it; an answer below 500 moves the pointer, anything else fails the deploy with the old generation still serving. Empty disables the probe (a celld without `invoke`) | runner-owned |
+| `RUNNER_DEPLOY_PROBE_PATH` | `/` | Pre-activation canary: after staging, the deploy asks the staged generation for `HEAD <path>` through `cello invoke` before the one activate serves it; an answer below 500 moves the pointer, anything else fails the deploy with the old generation still serving. Empty disables the probe (a Cello without `invoke`) | runner-owned |
 | `RUNNER_DEPLOY_PROBE_TIMEOUT_S` | `30` | Seconds the canary waits for the staged generation | runner-owned |
-| `RUNNER_FLEET_LOG` | `error,celld=warn` | Fleet `RUST_LOG` (runner's own filter stays separate) | worker-passthrough (fleet) |
+| `RUNNER_FLEET_LOG` | `error,cello=warn` | Fleet `RUST_LOG` (runner's own filter stays separate) | worker-passthrough (fleet) |
 
 ## Sleep
 

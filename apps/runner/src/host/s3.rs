@@ -55,11 +55,11 @@ pub fn aws_env(cfg: &Config) -> Vec<(&'static str, String)> {
     ]
 }
 
-/// Env for one `celld` CLI subprocess against `scope_key`'s fleet: the
+/// Env for one `cello` CLI subprocess against `scope_key`'s fleet: the
 /// store credentials plus `S3_ENDPOINT`, plus the fleet's operator token
 /// when this process ensured it. The in-tree CLIs that dial the node read
 /// the token from their own env; bucket-only subcommands ignore it. Every
-/// `celld` subprocess builds its env here, so no call site can forget the
+/// `cello` subprocess builds its env here, so no call site can forget the
 /// token once the fleet it targets is guarded.
 pub fn celld_cli_env(cfg: &Config, scope_key: &str) -> Vec<(&'static str, String)> {
     let mut env = aws_env(cfg);
@@ -293,7 +293,7 @@ pub async fn ensure_buckets(cfg: &Config) -> anyhow::Result<()> {
         bail!("head-bucket {bucket}");
     }
     // Versioning is deliberately *suspended*, not enabled. It was meant to
-    // protect MANIFEST.json + fleet state from overwrites, but celld rewrites
+    // protect MANIFEST.json + fleet state from overwrites, but Cello rewrites
     // hot keys continuously and the accumulated history is what takes the
     // install down: this bucket reached 647 objects / 72,390 versions, after
     // which RustFS (rc.6 `ServiceUnavailable`, 1.0.0 `SlowDownRead`) refused
@@ -302,7 +302,7 @@ pub async fn ensure_buckets(cfg: &Config) -> anyhow::Result<()> {
     // `bucket unavailable or inaccessible`. The identical keys in a
     // version-free bucket list fine, which is how that was pinned down.
     // Suspending stops new versions while keeping the property that a delete
-    // really removes the key: celld's state is append-only per segment
+    // really removes the key: Cello's state is append-only per segment
     // (`ltx/<seq>-<seq>.ltx`) and revert is a sha redeploy, so overwrite
     // protection bought nothing here. Versions already written are expired by
     // the lifecycle rule below. Best-effort: BYOB keys are often scoped
@@ -313,7 +313,7 @@ pub async fn ensure_buckets(cfg: &Config) -> anyhow::Result<()> {
             tracing::warn!(bucket, error = %format!("{e:#}"), "s3 versioning not set (non-fatal)")
         }
     }
-    // Versioning on its own is unbounded: a celld node rewrites its keys
+    // Versioning on its own is unbounded: a Cello node rewrites its keys
     // continuously, and this fleet bucket reached 72,390 versions for 647
     // objects within a day. At that size RustFS 1.0.0-rc.6 answers a *flat*
     // listing of the prefixes a node validates at boot (`control/`, `fleets/`)
@@ -1040,7 +1040,7 @@ pub(crate) async fn s3_list_dir(
 
 /// Download one object's whole body into memory, refusing to buffer more than
 /// `max_bytes`. `Ok(None)` means the key vanished between the listing and the
-/// read (a concurrent compaction or celld's retention sweep): the caller
+/// read (a concurrent compaction or Cello's retention sweep): the caller
 /// treats that as an idle file, never as a failed pass.
 ///
 /// Unlike [`s3_get_bytes`], this never touches the disk: a telemetry object is
@@ -1219,7 +1219,7 @@ pub async fn s3_rm_dir_except(
 /// The smallest gap between two batches of a **background** wipe. A
 /// `DeleteObjects` is the heaviest request this process sends; back-to-back
 /// batches kept a bundled RustFS busy enough on a 2 GB host that a tenant
-/// deploy's own S3 client (celld's `object_store`) timed out sending requests
+/// deploy's own S3 client (Cello's `object_store`) timed out sending requests
 /// (owner report, 2026-11-12). Pacing a background wipe is cheap; a starved
 /// deploy is not.
 const WIPE_BATCH_GAP: Duration = Duration::from_millis(50);
@@ -1380,7 +1380,7 @@ pub async fn s3_list_prefix(cfg: &Config, bucket: &str, prefix: &str) -> anyhow:
 mod tests {
     use super::*;
 
-    /// Every `celld` subprocess env carries the store credentials, the
+    /// Every `cello` subprocess env carries the store credentials, the
     /// endpoint, and — once the fleet was ensured — its operator token.
     #[tokio::test]
     async fn celld_cli_env_carries_the_fleet_token() {

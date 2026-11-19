@@ -16,7 +16,7 @@ pub struct DoInstance {
     pub id: String,
     pub scope: String,
     /// JSON the object's own handler returned for a `?read=1` probe on the
-    /// fleet's /do/ route (the read contract is the app's, not celld's —
+    /// fleet's /do/ route (the read contract is the app's, not Cello's —
     /// there is no generic storage read route for a Durable Object).
     pub preview: Option<String>,
 }
@@ -31,17 +31,17 @@ pub struct DoPreview {
     pub instances: Vec<DoInstance>,
 }
 
-/// A DO class name bound for `celld cell list`'s positional: nonempty and
-/// never leading with `-`. celld's parser has no `--` terminator, so a
+/// A DO class name bound for `cello cell list`'s positional: nonempty and
+/// never leading with `-`. Cello's parser has no `--` terminator, so a
 /// dash-led name either refuses as `unknown option` or parses as an
 /// option; anything else resolves against the fleet's cells downstream.
 fn class_name_ok(class_name: &str) -> bool {
     !class_name.is_empty() && !class_name.starts_with('-')
 }
 
-/// Read-only Durable Object instance list for one class: `celld cell list`
+/// Read-only Durable Object instance list for one class: `cello cell list`
 /// walks the fleet bucket directly (no live node needed) and prints one
-/// JSON row per instance. celld exposes no generic storage read route for
+/// JSON row per instance. Cello exposes no generic storage read route for
 /// a DO instance, so each instance is also probed with `GET /do/{scope}
 /// ?read=1` — the object's own handler decides what its preview says.
 pub async fn do_instances(cfg: &Config, app: &App, class_name: &str) -> anyhow::Result<DoPreview> {
@@ -71,7 +71,7 @@ pub async fn do_instances(cfg: &Config, app: &App, class_name: &str) -> anyhow::
         let Ok(row) = serde_json::from_str::<serde_json::Value>(line) else {
             continue;
         };
-        // celld's own cells (D1, KV, queues...) carry reserved class names;
+        // Cello's own cells (D1, KV, queues...) carry reserved class names;
         // a user class never collides with one, but refuse them anyway.
         if row.get("reserved").and_then(|v| v.as_bool()) == Some(true) {
             continue;
@@ -182,7 +182,7 @@ async fn probe_instance(app: &App, scope: &str) -> DoProbe {
 mod tests {
     use super::*;
 
-    /// Minimal celld `/do/` stand-in: one canned status and body.
+    /// Minimal Cello `/do/` stand-in: one canned status and body.
     async fn serve_status(
         listener: tokio::net::TcpListener,
         status: &'static str,
@@ -273,7 +273,7 @@ mod tests {
         pool.close().await;
     }
 
-    /// The class name rides as `celld cell list`'s positional, and celld
+    /// The class name rides as `cello cell list`'s positional, and Cello
     /// has no `--` terminator: a dash-led name must never reach the argv.
     #[test]
     fn class_names_reject_option_spelling() {

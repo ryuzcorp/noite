@@ -85,7 +85,7 @@ describe("routeTimeout", () => {
     // The e2e flake wave: a chunk that outlived the bound was answered with
     // this middleware's JSON 504, so the module never executed and the page
     // never hydrated. A static file must never carry the action bound — not
-    // even the miss fall-through or a direct-to-worker request (celld serves
+    // even the miss fall-through or a direct-to-worker request (Cello serves
     // the bundle itself; see `RUN_WORKER_FIRST` in void.config.ts).
     for (const path of [
       "/assets/pages-client-CA3vIREc.js",

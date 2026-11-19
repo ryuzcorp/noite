@@ -1,7 +1,7 @@
 # Pull-request gate: the shared checks below (`check.yml`: lint, formatting,
 # version-pin drift, every compose variant, script parsing, schema idempotency,
 # the CLI bundle), the Rust crate warning-free with its tests, the worker
-# bundle for celld, and a build of the release image (pushed nowhere).
+# bundle for Cello, and a build of the release image (pushed nowhere).
 # Release images are a separate workflow (`images.yml`).
 #
 # The end-to-end lanes (`make e2e`, `make e2e-isolation`) need a container
@@ -62,7 +62,7 @@ concurrency:
 jobs:
   check:
     uses: ./.github/workflows/check.yml
-    # check.yml verifies the celld pin's provenance attestation and filters a
+    # check.yml verifies the Cello pin's provenance attestation and filters a
     # PR's changed pin files through the API (pull-requests: read).
     permissions:
       attestations: read
@@ -105,7 +105,7 @@ jobs:
       - run: cargo check --locked --all-targets
       - run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo test --locked
-      # The storage contract the runner depends on: celld fences cells with
+      # The storage contract the runner depends on: Cello fences cells with
       # conditional writes and restores from listings and ranges, so the
       # pinned store is re-qualified here on every PR — a RustFS bump that
       # breaks the contract fails the gate instead of shipping it.

@@ -11,7 +11,7 @@ import { CloudUpload, Folder } from "../../ui/icons";
 import { folderNameOf } from "./state";
 
 /** Stream one object through the UI's upload proxy (the runner spools it and
- * calls `celld r2 put`); throws the server's message when it refuses. */
+ * calls `cello r2 put`); throws the server's message when it refuses. */
 export const putObject = async (
   appId: string,
   bucket: string,

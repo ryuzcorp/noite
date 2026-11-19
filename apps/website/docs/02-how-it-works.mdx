@@ -1,6 +1,6 @@
 ---
 title: How it works
-description: The runner supervises Caddy, the control UI, and one celld fleet per app over a single S3 bucket.
+description: The runner supervises Caddy, the control UI, and one Cello fleet per app over a single S3 bucket.
 ---
 
 Noite is one image, `ghcr.io/ryuzcorp/noite`. The runner is PID 1 (under `tini`) and supervises every other process. State lives in one S3 bucket; the `/data` volume is a rebuildable cache.
@@ -11,8 +11,8 @@ Noite is one image, `ghcr.io/ryuzcorp/noite`. The runner is PID 1 (under `tini`)
 tini (PID 1: reaps zombies, forwards signals)
 └── noite-runner                      root; API on :8080
     ├── caddy run                      :80/:443, admin 127.0.0.1:2019
-    ├── celld  control fleet #0       public 127.0.0.1:8090, internal 0.0.0.0:8091
-    ├── celld  tenant fleet × N       uid fleet (10020); public 0.0.0.0:{p}, internal 127.0.0.1:{p+1}
+    ├── cello  control fleet #0       public 127.0.0.1:8090, internal 0.0.0.0:8091
+    ├── cello  tenant fleet × N       uid fleet (10020); public 0.0.0.0:{p}, internal 127.0.0.1:{p+1}
     └── bun / node / sh               installs, builds and release, one uid per app (10030+), transient
 ```
 
@@ -31,8 +31,8 @@ Under `s3://<bucket>/`:
 | Prefix | Holds |
 | --- | --- |
 | `git/{slug}/` | Tip bundles from Git HTTP plus a `MANIFEST.json` linearization point (`{seq, refs}`) |
-| `fleets/{slug}/` | Tenant celld state, deploys, and telemetry |
-| `envs/{slug}/{label}/` | One [preview environment](/apps/environments)'s celld and storage (starts empty, never seeded from production) |
+| `fleets/{slug}/` | Tenant Cello state, deploys, and telemetry |
+| `envs/{slug}/{label}/` | One [preview environment](/apps/environments)'s Cello and storage (starts empty, never seeded from production) |
 | `control/` | UI worker bundle, its D1 (accounts, email invitations, the waitlist switch) and the control fleet's own telemetry |
 | `runner/state/` | Runner SQLite snapshots plus the `owner.json` fence |
 
@@ -43,8 +43,8 @@ The bundled RustFS store provides this bucket with zero config; production uses 
 1. `git push` hits smart-HTTP at `git.<domain>/<slug>` (Basic `git` plus a profile API key).
 2. receive-pack writes the tip as `refs/heads/main/<sha>.bundle` plus the `MANIFEST.json` linearization point, so half-written pushes stay invisible.
 3. The runner checks out a worktree and runs the sandboxed install and build with the project's package manager (Bun by default; npm, pnpm and Yarn through jup) when declared. It then picks the config to deploy: what the build wrote, else the source's Wrangler config, else a `cloudflare.config.ts` converted to one, else one it generates for a static site or a `package.json` `main` Worker ([Build](/apps/build#which-config-deploys)).
-4. The optional `release` command runs (migrations). Noite strips its own `release` key before deploying; celld rejects unknown keys.
-5. `celld deploy` uploads, then the runner spawns the fleet or calls `POST /reload` on its internal listener.
+4. The optional `release` command runs (migrations). Noite strips its own `release` key before deploying; Cello rejects unknown keys.
+5. `cello deploy` uploads, then the runner spawns the fleet or calls `POST /reload` on its internal listener.
 6. Caddy routes `{slug}.<domain>` to the fleet's port. Deploy logs keep a 64 KB tail; a past successful `<sha>` redeploys via rollback.
 
 ```mermaid
@@ -53,7 +53,7 @@ flowchart LR
   git --> bundle[tip bundle + MANIFEST]
   bundle --> build[install / build]
   build --> releaseCmd[release]
-  releaseCmd --> deploy[celld deploy]
+  releaseCmd --> deploy[cello deploy]
   deploy --> reload[fleet spawn / reload]
   reload --> edge[Caddy routes slug to fleet]
 ```

@@ -15,7 +15,7 @@ use crate::host::env_gate;
 /// dashes dropped (32 hex = a W3C trace id; the last 16 double as the span
 /// id). Not Caddy's `tracing` directive: that one always runs an OTLP
 /// exporter, and an always-off sampler would mark the trace unsampled, which
-/// celld's parent-based sampler honours by recording nothing.
+/// Cello's parent-based sampler honours by recording nothing.
 /// `request_header` replaces any client-sent `traceparent`, so a client
 /// cannot pick the id an error is filed under.
 pub(crate) const TRACE_MAP: &[&str] = &[
@@ -58,7 +58,7 @@ pub(crate) const EDGE_ERROR_LOG_APPEND: &str = "log_append noite_edge_error 1";
 /// Answer when a fleet stays unready past `lb_try_duration` (503) or refuses
 /// the connection while it restarts (502): a page that retries by itself,
 /// and `Retry-After` for API clients, instead of Caddy's empty error.
-/// celld's own 503s (load shedding) are responses, not errors, and pass
+/// Cello's own 503s (load shedding) are responses, not errors, and pass
 /// through unchanged (this lives in `handle_errors`, never `handle_response`).
 ///
 /// No status codes on the `handle_errors` block itself: `parseHandleErrors`
@@ -72,8 +72,8 @@ pub(crate) const STARTING_HEADERS: &[&str] = &[
 ];
 pub(crate) const STARTING_RESPOND: &str = "respond `<!doctype html><meta http-equiv=\"refresh\" content=\"5\"><title>Starting</title><p>This app is starting. The page reloads by itself.</p>` 503";
 
-/// Proxy options for a tenant fleet. celld answers its public
-/// `/.well-known/celld/health` 503 until its ready gate opens, and a request
+/// Proxy options for a tenant fleet. Cello answers its public
+/// `/.well-known/cello/health` 503 until its ready gate opens, and a request
 /// routed before that reaches cells it cannot place yet. The module holds
 /// such requests (same 20 s / 250 ms numbers); `lb_try_*` still retries a
 /// transient dial failure. POSTs are safe: a held request is never sent.
@@ -359,7 +359,7 @@ fn route_block(cfg: &Config) -> Vec<String> {
 }
 
 /// `handle_errors`, not `handle_response`: this catches only Caddy-generated
-/// errors (refused dial, no available upstream), while celld's own 503
+/// errors (refused dial, no available upstream), while Cello's own 503
 /// responses (load shedding) pass through unchanged. Fleet/env routes get
 /// the starting page; control/api keep Caddy's default 502.
 fn errors_block() -> Vec<String> {
