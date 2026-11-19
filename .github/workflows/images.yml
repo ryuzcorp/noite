@@ -15,10 +15,10 @@
 #                    `alpha` for a prerelease, `latest` for a final). No channel
 #                    moves: try it with `run.sh | bash -s install --pre`.
 #
-# A release tag is a gate, not a trigger: the e2e lanes (`make e2e`,
-# `make e2e-isolation`), the upgrade lane (`make e2e-upgrade`: the previous
-# release seeds data, the tree serves it back) and the CHANGELOG check must
-# pass before anything is pushed to GHCR.
+# A release tag is a gate, not a trigger: the e2e lanes (`make e2e`, `make
+# e2e-isolation`), the refusal lane (`make e2e-upgrade`: the last pre-reset
+# release seeds data, the tree must refuse it and leave it untouched) and the
+# CHANGELOG check must pass before anything is pushed to GHCR.
 name: images
 
 on:
@@ -82,10 +82,11 @@ jobs:
     with:
       suite: release
 
-  # Release tags only: the previous release seeds data, the tree image must
-  # serve it back in place. A tag never ships an image that refuses the
-  # previous release's data; the lane pulls the previous image from GHCR and
-  # builds the tree image itself.
+  # Release tags only: the last pre-reset release seeds data, the tree image
+  # must refuse it (never-ready plus the reset message in the logs) and leave
+  # it untouched — the old image reboots and serves it back. A tag never
+  # ships an image that boots pre-reset data; the lane pulls the pre-reset
+  # image from GHCR and builds the tree image itself.
   upgrade:
     if: startsWith(github.ref, 'refs/tags/v')
     needs: check

@@ -1,13 +1,18 @@
-# The upgrade lane: the previous release's published image seeds live data
-# (app + env var, deploy, custom domain, collaborator, worker-written D1/R2
-# state), then the tree image restarts on the SAME volumes and bucket and
-# proves the seed reads back and the app still serves
-# (`sh docker/e2e-upgrade.sh`, `make e2e-upgrade` locally).
+# The refusal lane: the last pre-reset release's published image
+# (`v0.1.0-beta.6`) seeds live data (app + env var, deploy, custom domain,
+# collaborator, worker-written D1/R2 state), then the tree image restarts on
+# the SAME volumes and bucket and must REFUSE to boot: the stack never
+# becomes ready and the container logs carry the reset message. A tree that
+# boots and serves the seed back FAILS the lane. The old image then reboots
+# on the untouched volumes and the seed is verified against it, proving the
+# refusal reshaped nothing (`sh docker/e2e-upgrade.sh`, `make e2e-upgrade`
+# locally).
 #
-# From `beta.1` on, every release upgrades a database written by any earlier
-# beta in place: this lane is the release gate that proves it (a tag cannot
-# ship an image that refuses the previous release's data), runs nightly on
-# main, and runs on pull requests that touch schema or migration paths.
+# This is the one-cycle shape across the 0.2.0 beta reset (which has no
+# upgrade path: pre-reset installs reinstall). After the first post-reset
+# release ships, this lane returns to proving previous-release -> tree
+# upgrades in place — and the nightly schedule below is what catches a slow
+# main-branch regression outside a release.
 # No retries anywhere: a failure is a finding.
 name: upgrade
 
@@ -19,21 +24,9 @@ on:
         description: Run-local artifact holding the tree image (docker save piped to zstd). When set, the lane loads it instead of building.
         required: false
         type: string
-      from_oldest:
-        default: "0"
-        description: Seed from the oldest supported release (the first beta) instead of the previous one.
-        required: false
-        type: string
   workflow_dispatch:
-    inputs:
-      from_oldest:
-        default: "0"
-        description: Seed from the oldest supported release (the first beta) instead of the previous one.
-        required: false
-        type: choice
-        options: ["0", "1"]
   # Nightly on main: the tag gate only runs on `v*`, so this is what catches
-  # a slow main-branch schema regression outside a release.
+  # a slow main-branch regression outside a release.
   schedule:
     - cron: "0 6 * * *"
 
@@ -42,7 +35,7 @@ permissions:
 
 jobs:
   upgrade:
-    name: upgrade lane (previous release -> tree)
+    name: refusal lane (pre-reset data -> tree refuses)
     runs-on: ubuntu-latest
     # The lane boots two stacks and a full sample deploy in sequence; ~3x the
     # e2e single-lane p95, rounded up.
@@ -51,7 +44,7 @@ jobs:
       contents: read
       actions: read
     steps:
-      # Tags, not just HEAD: the lane resolves the previous `v*` tag from git.
+      # Tags, not just HEAD: the lane resolves the pre-reset `v*` tag from git.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           fetch-depth: 0
@@ -82,7 +75,7 @@ jobs:
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
       - name: build tree image
         if: inputs.image_artifact == ''
-        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
+        uses: docker/build-push-action@c3c9e263c25d99ce02d59c2d027d91b0dc # v7
         with:
           cache-from: type=gha,scope=noite-linux/amd64
           cache-to: type=gha,mode=max,scope=noite-linux/amd64
@@ -93,20 +86,18 @@ jobs:
           target: noite
       - name: download tree image
         if: inputs.image_artifact != ''
-        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        uses: actions/download-artifact@90082cc7cba6db8433c8d7a8863646f # v8
         with:
           name: ${{ inputs.image_artifact }}
           path: /tmp/noite-image
       - name: load tree image
         if: inputs.image_artifact != ''
         run: zstd -d -c /tmp/noite-image/noite-ci.tar.zst | docker load
-      - name: upgrade lane
-        env:
-          E2E_FROM_OLDEST: ${{ inputs.from_oldest }}
+      - name: refusal lane
         run: E2E_IMAGE=${{ inputs.image_artifact == '' && 'noite:upgrade' || 'noite:ci' }} sh docker/e2e-upgrade.sh
-      - name: upload upgrade report
+      - name: upload refusal report
         if: always()
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        uses: actions/upload-artifact@cf430e030ddb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: playwright-upgrade-report
           path: apps/noite/upgrade-report/
