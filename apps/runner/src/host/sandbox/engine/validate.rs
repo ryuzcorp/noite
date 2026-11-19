@@ -9,7 +9,10 @@ use std::net::Ipv4Addr;
 use bytes::Bytes;
 use serde_json::Value;
 
-use super::super::{install, FLEET_LABEL, INSTALL_LABEL};
+use super::super::{
+    install, FLEET_LABEL, INSTALL_LABEL, INTERNAL_BRIDGE, INTERNAL_NETWORK, OPEN_BRIDGE,
+    OPEN_NETWORK,
+};
 
 /// Cello 0.1.0's fence ruleset, byte-identical to `FENCE_RULES` in
 /// `crates/cello/container.rs`. The fence installer is the one
@@ -188,9 +191,10 @@ pub fn valid_image_name(name: &str) -> bool {
     hex.len() == 64 && hex.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
-/// The two bridges Cello joins its containers to.
+/// The two bridges Cello joins its containers to (the sandbox plane, relay
+/// and gateway read the same constants).
 pub fn valid_network_name(name: &str) -> bool {
-    name == "cello" || name == "cello-internal"
+    name == OPEN_NETWORK || name == INTERNAL_NETWORK
 }
 
 /// Rewrite a `GET /containers/json` query so the list can only return this
@@ -392,7 +396,7 @@ fn validate_app_host_config(host: &serde_json::Map<String, Value>) -> Result<(),
         return Err(format!("HostConfig takes no {key:?}"));
     }
     match host.get("NetworkMode").and_then(Value::as_str) {
-        Some("cello" | "cello-internal") => {}
+        Some(OPEN_NETWORK | INTERNAL_NETWORK) => {}
         _ => return Err("HostConfig NetworkMode must be cello or cello-internal".to_string()),
     }
     if host.get("CapDrop") != Some(&Value::Array(vec![Value::String("ALL".to_string())])) {
@@ -658,11 +662,15 @@ pub fn validate_network_create(body: &Value) -> Result<(), String> {
     if object.get("Driver") != Some(&Value::String("bridge".to_string())) {
         return Err("network Driver must be bridge".to_string());
     }
-    let internal = name == "cello-internal";
+    let internal = name == INTERNAL_NETWORK;
     if object.get("Internal") != Some(&Value::Bool(internal)) {
         return Err("network Internal must match its bridge".to_string());
     }
-    let bridge = if internal { "cello1" } else { "cello0" };
+    let bridge = if internal {
+        INTERNAL_BRIDGE
+    } else {
+        OPEN_BRIDGE
+    };
     let options = object.get("Options").and_then(Value::as_object);
     let Some(options) = options else {
         return Err("network Options must be exactly Cello's bridge".to_string());
@@ -1423,9 +1431,7 @@ mod tests {
         assert!(inspect_is_fence(
             &json!({"Config": {"Labels": {"cello.fence": "1"}}})
         ));
-        assert!(inspect_is_fence(
-            &json!({"Labels": {"cello.fence": "0"}})
-        ));
+        assert!(inspect_is_fence(&json!({"Labels": {"cello.fence": "0"}})));
         // Pre-0.1.0 fence containers, reaped after the upgrade.
         assert!(inspect_is_fence(
             &json!({"Config": {"Labels": {"celld.fence": "1"}}})

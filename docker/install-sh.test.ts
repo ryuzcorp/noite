@@ -332,6 +332,19 @@ describe("install.sh cello env migration", () => {
     expect(result.status).toBe(0);
     expect(readEnv()).toBe(before);
   });
+
+  test("a bare CELLD_* line without `=` is left alone and not reported", () => {
+    writeFileSync(path.join(dir, ".env"), "CELLD_FOO\nCELLD_BIN=/old\n");
+    const result = runBash(`${PRELUDE}\nmigrate_cello_env`);
+
+    expect(result.status).toBe(0);
+    expect(result.stdout).not.toContain("CELLD_FOO");
+    expect(result.stdout).toContain("CELLD_BIN");
+    const env = readEnv();
+    expect(env).toContain("CELLD_FOO");
+    expect(env).toContain("CELLO_BIN=/old");
+    expect(hasActive(env, "CELLD_BIN")).toBe(false);
+  });
 });
 
 describe("install.sh entrypoint", () => {

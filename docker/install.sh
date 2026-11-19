@@ -405,9 +405,9 @@ env_secret() {
 migrate_cello_env() {
   local file="$NOITE_DIR/.env" tmp before had key suffix msg
   [[ -f "$file" ]] || return 0
-  before=$(grep -oE '^CELLD_[A-Za-z0-9_]+' "$file" | sort -u || true)
+  before=$(grep -oE '^CELLD_[A-Za-z0-9_]+=' "$file" | tr -d '=' | sort -u || true)
   [[ -z "$before" ]] && return 0
-  had=$(grep -oE '^CELLO_[A-Za-z0-9_]+' "$file" | sort -u || true)
+  had=$(grep -oE '^CELLO_[A-Za-z0-9_]+=' "$file" | tr -d '=' | sort -u || true)
   tmp=$(mktemp)
   awk '
     FNR == NR {

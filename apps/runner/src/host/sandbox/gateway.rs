@@ -1,20 +1,20 @@
-//! The sandbox gateway: fleet TCP toward celld's bridges is redirected
+//! The sandbox gateway: fleet TCP toward Cello's bridges is redirected
 //! here (nft `nat` output, this container's namespace), and the gateway
 //! splices it through the relay only when the connecting fleet owns the
 //! destination container.
 //!
 //! Per connection: `SO_ORIGINAL_DST` recovers the pre-redirect destination
-//! (it must lie in the current celld subnets); the client socket's cgroup v2
+//! (it must lie in the current Cello subnets); the client socket's cgroup v2
 //! id (netlink `sock_diag` with an `INET_DIAG_BC_CGROUP_COND` filter — the
 //! kernel reports it, so no ptrace and no `/proc/<pid>/fd`, and non-dumpable
 //! fleets attribute fine) names the live fleet whose cgroup holds the
 //! (peer, destination) pair. The pid-fd scan (`/proc/net/tcp` → inode →
 //! the pid holding `socket:[inode]`) remains as the fallback for dumpable
-//! celld and kernels without the cgroup filter. Unless the engine proxy's
+//! Cello and kernels without the cgroup filter. Unless the engine proxy's
 //! registry says that fleet owns the destination IP, the connection is
 //! refused. This closes the shared-fleet-uid hole: every tenant shares the
 //! uid, so the filter table cannot tell fleets apart, but cgroups (and, for
-//! dumpable celld, pids) can. Single tenancy without per-fleet cgroups
+//! dumpable Cello, pids) can. Single tenancy without per-fleet cgroups
 //! cannot attribute at all: an otherwise-valid dial to a known fleet's
 //! container is then allowed degraded (one trust domain; surfaced in
 //! `isolation::self_check`), anything else refused.
@@ -524,7 +524,7 @@ async fn handle(mut stream: tokio::net::TcpStream, fleet_ids: Option<(u32, u32)>
     }
     // Authoritative where per-fleet cgroups exist (multi always; single when
     // the grant is present): the client socket's cgroup. Then the
-    // dumpable-era pid-fd scan (dead on non-dumpable celld, where it just
+    // dumpable-era pid-fd scan (dead on non-dumpable Cello, where it just
     // yields nothing and falls through).
     let fleet = match fleet_of_cgroup(peer, dst).await {
         some @ Some(_) => some,
@@ -640,7 +640,7 @@ pub fn spawn(fleet_ids: Option<(u32, u32)>, single: bool) {
     tokio::spawn(accept_loop(fleet_ids, single));
 }
 
-/// The gateway nftables ruleset: fleet TCP toward the celld bridges is
+/// The gateway nftables ruleset: fleet TCP toward the Cello bridges is
 /// redirected to the gateway listener. A separate table from the egress
 /// policy, installed in both tenancies; the atomic `table` / `delete table`
 /// / `table {}` replace is the same shape `netisolation` uses. Only the fleet
@@ -810,7 +810,7 @@ mod tests {
     }
 
     #[test]
-    fn gateway_ruleset_redirects_celld_tcp_to_the_gateway() {
+    fn gateway_ruleset_redirects_cello_tcp_to_the_gateway() {
         let subnets = vec!["172.19.0.0/16".to_string(), "bogus".to_string()];
         let rules = gateway_ruleset(&subnets, Some(10020));
         assert!(
@@ -974,9 +974,9 @@ mod tests {
     fn cgroup_attribution_finds_a_nondumpable_dialer() {
         use std::time::Duration;
 
-        // The celld .10 regression in miniature: the dialer is non-dumpable
+        // The Cello .10 regression in miniature: the dialer is non-dumpable
         // (`prctl(PR_SET_DUMPABLE, 0)`, what .9's patch 0053 does to every
-        // serving celld), so the pid-fd scan cannot see it — only the
+        // serving Cello), so the pid-fd scan cannot see it — only the
         // kernel-reported cgroup id attributes it. Needs cgroup v2 and
         // sock_diag (CI and every supported install); anything else skips.
         let Some(cgroup) = own_cgroup_id() else {
@@ -994,7 +994,7 @@ mod tests {
         assert_eq!(
             unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) },
             0,
-            "prctl(PR_SET_DUMPABLE, 0) must work to simulate non-dumpable celld"
+            "prctl(PR_SET_DUMPABLE, 0) must work to simulate non-dumpable Cello"
         );
         let _dumpable = Dumpable;
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();

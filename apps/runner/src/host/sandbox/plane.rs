@@ -1,24 +1,20 @@
-//! The sandbox plane on the host engine: celld's bridges, this
+//! The sandbox plane on the host engine: Cello's bridges, this
 //! container's own identity, the one-time cleanup of the alpha.12–14 host
 //! legs, and the `/ready` sandbox status.
 //!
 //! Everything here goes through the `docker` CLI (argv only, bounded
 //! timeouts), never the Engine API: the runner holds the real socket and
-//! fleets must never see it. `ensure_networks` pre-creates celld's bridges
-//! exactly as celld 0.6.3 would (`container.rs`, `networks()`), so their
-//! subnets are known before any fleet dials — celld finds bridges with
+//! fleets must never see it. `ensure_networks` pre-creates Cello's bridges
+//! exactly as Cello 0.1.0 would (`container.rs`, `networks()`), so their
+//! subnets are known before any fleet dials — Cello finds bridges with
 //! matching options and keeps them, subnets included.
 
+use super::{LEGACY_NETWORKS, NETWORKS};
 use std::os::unix::fs::PermissionsExt;
 use std::sync::Mutex;
 use std::time::Duration;
 
-/// celld's container networks (fixed names; subnets are engine-assigned).
-const CELLD_NETWORKS: &[(&str, bool, &str)] = &[
-    ("celld", false, "celld0"),
-    ("celld-internal", true, "celld1"),
-];
-/// celld's bridge options (`container.rs`: `ICC_OPTION`, `BRIDGE_NAME_OPTION`).
+/// Cello's bridge options (`container.rs`: `ICC_OPTION`, `BRIDGE_NAME_OPTION`).
 const ICC_OPTION: &str = "com.docker.network.bridge.enable_icc";
 const BRIDGE_NAME_OPTION: &str = "com.docker.network.bridge.name";
 /// nft in this image (Debian path; the cleanup helper overrides its entrypoint).
@@ -102,6 +98,9 @@ struct NetworkInspect {
     #[serde(default)]
     #[serde(rename = "IPAM")]
     ipam: Ipam,
+    #[serde(default)]
+    #[serde(rename = "Containers")]
+    containers: std::collections::HashMap<String, serde_json::Value>,
 }
 
 #[derive(serde::Deserialize, Default)]
@@ -145,10 +144,10 @@ pub fn parse_network_inspect(json: &str) -> Vec<(String, Vec<String>)> {
     out
 }
 
-/// Whether an inspected bridge already matches what celld 0.6.3 creates
-/// (same check celld runs before keeping a bridge: `Internal` flag plus the
+/// Whether an inspected bridge already matches what Cello 0.1.0 creates
+/// (same check Cello runs before keeping a bridge: `Internal` flag plus the
 /// `enable_icc=false` and bridge-name options). A mismatch only warns: we
-/// never delete, and celld replaces a stale bridge itself once it is idle.
+/// never delete, and Cello replaces a stale bridge itself once it is idle.
 fn bridge_matches(json: &str, name: &str, internal: bool, bridge: &str) -> bool {
     let Ok(networks) = serde_json::from_str::<Vec<NetworkInspect>>(json) else {
         return false;
@@ -233,7 +232,7 @@ pub async fn own_container() -> Option<OwnContainer> {
 }
 
 /// This container's image id, once [`own_container`] read it: the trusted
-/// image the engine proxy runs celld's fence installer from.
+/// image the engine proxy runs Cello's fence installer from.
 static OWN_IMAGE: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 
 /// The runner's own image id, when known (see [`OWN_IMAGE`]).
@@ -242,7 +241,7 @@ pub fn own_image() -> Option<String> {
 }
 
 /// What `ensure_networks` found: whether the engine answered at all, and the
-/// validated celld bridge subnets (empty when the engine is down or a bridge
+/// validated Cello bridge subnets (empty when the engine is down or a bridge
 /// is still missing).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct PlaneNets {
@@ -250,7 +249,7 @@ pub struct PlaneNets {
     pub subnets: Vec<String>,
 }
 
-/// Inspect one celld bridge: its validated subnets when it exists.
+/// Inspect one Cello bridge: its validated subnets when it exists.
 async fn inspect_network(name: &str) -> Option<(String, Vec<String>)> {
     let out = docker(&["network", "inspect", name], Duration::from_secs(10)).await?;
     if !out.status.success() {
@@ -263,9 +262,9 @@ async fn inspect_network(name: &str) -> Option<(String, Vec<String>)> {
         .map(|(_, subnets)| (text, subnets))
 }
 
-/// Create one celld bridge exactly as celld 0.6.3 does (`container.rs`,
+/// Create one Cello bridge exactly as Cello 0.1.0 does (`container.rs`,
 /// `networks()`): bridge driver, `Internal` flag, `enable_icc=false`, the
-/// pinned bridge name. Engine-assigned subnet, like celld's.
+/// pinned bridge name. Engine-assigned subnet, like Cello's.
 fn create_args(name: &str, internal: bool, bridge: &str) -> Vec<String> {
     let mut args = vec![
         "network".to_string(),
@@ -290,19 +289,67 @@ fn create_args(name: &str, internal: bool, bridge: &str) -> Vec<String> {
     args
 }
 
-/// Make sure celld's bridges exist, creating only the missing ones (never
-/// deleting: a bridge with stale options keeps serving until celld itself
-/// replaces it idle). Returns the validated subnets, so the gateway table
-/// and `/ready` know the plane before any fleet dials.
+/// Whether a legacy (pre-Cello) network in a `docker network inspect`
+/// answer carries no containers and so may be removed. `None` when the
+/// network is absent or the answer is unparseable. Pure so the upgrade
+/// removal rule is pinned without an engine.
+pub fn legacy_network_orphaned(json: &str, name: &str) -> Option<bool> {
+    let Ok(networks) = serde_json::from_str::<Vec<NetworkInspect>>(json) else {
+        return None;
+    };
+    networks
+        .iter()
+        .find(|n| n.name == name)
+        .map(|n| n.containers.is_empty())
+}
+
+/// Remove the orphaned pre-Cello networks (`celld`, `celld-internal`) left
+/// by an upgrade: Cello never joins them, so an empty one only risks a
+/// fleet→container dial that bypasses the ownership-checking gateway. A
+/// network with containers still attached is logged and left: removing it
+/// would break those containers.
+async fn remove_legacy_networks() {
+    for name in LEGACY_NETWORKS {
+        let out = docker(&["network", "inspect", name], Duration::from_secs(10)).await;
+        let Some(out) = out else {
+            continue;
+        };
+        if !out.status.success() {
+            continue;
+        }
+        let text = stdout_text(&out).unwrap_or_default();
+        match legacy_network_orphaned(&text, name) {
+            Some(true) => {
+                let removed = docker(&["network", "rm", name], Duration::from_secs(30)).await;
+                if removed.is_some_and(|out| out.status.success()) {
+                    tracing::info!(network = name, "removed orphaned pre-Cello network");
+                }
+            }
+            Some(false) => {
+                tracing::warn!(
+                    network = name,
+                    "pre-Cello network still has containers attached; leaving it"
+                );
+            }
+            None => {}
+        }
+    }
+}
+
+/// Make sure Cello's bridges exist, creating only the missing ones (never
+/// deleting: a bridge with stale options keeps serving until Cello itself
+/// replaces it idle), and remove the orphaned pre-Cello networks. Returns
+/// the validated subnets, so the gateway table and `/ready` know the plane
+/// before any fleet dials.
 pub async fn ensure_networks() -> PlaneNets {
     let mut nets = PlaneNets::default();
-    for (name, internal, bridge) in CELLD_NETWORKS {
+    for (name, internal, bridge) in NETWORKS {
         if let Some((text, subnets)) = inspect_network(name).await {
             nets.engine = true;
             if !bridge_matches(&text, name, *internal, bridge) {
                 tracing::warn!(
                     network = name,
-                    "celld bridge predates container isolation; celld replaces it once idle"
+                    "cello bridge predates container isolation; cello replaces it once idle"
                 );
             }
             nets.subnets.extend(subnets);
@@ -318,13 +365,13 @@ pub async fn ensure_networks() -> PlaneNets {
         };
         if out.status.success() {
             nets.engine = true;
-            tracing::info!(network = name, "created celld bridge");
+            tracing::info!(network = name, "created cello bridge");
             if let Some((_, subnets)) = inspect_network(name).await {
                 nets.subnets.extend(subnets);
             }
             continue;
         }
-        // 409-style race: celld created it between our inspect and create.
+        // 409-style race: Cello created it between our inspect and create.
         if stderr_text(&out).contains("already exists") {
             nets.engine = true;
             if let Some((_, subnets)) = inspect_network(name).await {
@@ -340,6 +387,7 @@ pub async fn ensure_networks() -> PlaneNets {
     }
     nets.subnets.sort();
     nets.subnets.dedup();
+    remove_legacy_networks().await;
     nets
 }
 
@@ -393,7 +441,7 @@ pub fn sandbox_status(sandbox_disabled: bool) -> serde_json::Value {
     } else if !probe.engine {
         "engine unreachable"
     } else if probe.subnets.is_empty() {
-        "celld networks unavailable"
+        "cello networks unavailable"
     } else if !probe.relay {
         "relay not running"
     } else if !probe.gateway_table {
@@ -534,9 +582,12 @@ pub fn ensure_relay_dir() -> bool {
 
 #[cfg(test)]
 mod tests {
+    use super::super::{
+        BRIDGE_IFACES, INTERNAL_BRIDGE, INTERNAL_NETWORK, OPEN_BRIDGE, OPEN_NETWORK,
+    };
     use super::{
-        bridge_matches, create_args, legacy_rule_deletes, parse_network_inspect,
-        parse_own_container, stale_tables, valid_cidr, DataMount,
+        bridge_matches, create_args, legacy_network_orphaned, legacy_rule_deletes,
+        parse_network_inspect, parse_own_container, stale_tables, valid_cidr, DataMount,
     };
 
     #[test]
@@ -571,9 +622,57 @@ mod tests {
     }
 
     #[test]
+    fn network_names_match_cello_bridges() {
+        // Pinned against Cello 0.1.0 `crates/cello/container.rs`
+        // (`OPEN_BRIDGE`/`INTERNAL_BRIDGE`, `networks()`): Noite must create
+        // and inspect exactly the bridges Cello joins its containers to, or
+        // fleet→container dials bypass the ownership-checking gateway.
+        assert_eq!(OPEN_NETWORK, "cello");
+        assert_eq!(INTERNAL_NETWORK, "cello-internal");
+        assert_eq!(OPEN_BRIDGE, "cello0");
+        assert_eq!(INTERNAL_BRIDGE, "cello1");
+        assert_eq!(
+            super::super::NETWORKS,
+            &[
+                ("cello", false, "cello0"),
+                ("cello-internal", true, "cello1")
+            ]
+        );
+        // The relay dials exactly the same bridges the plane creates.
+        assert_eq!(BRIDGE_IFACES, &["cello0", "cello1"]);
+        // …and the engine proxy admits exactly those networks.
+        assert!(super::super::engine::validate::valid_network_name(
+            super::super::NETWORKS[0].0
+        ));
+        assert!(super::super::engine::validate::valid_network_name(
+            super::super::NETWORKS[1].0
+        ));
+        assert!(!super::super::engine::validate::valid_network_name("celld"));
+        assert!(!super::super::engine::validate::valid_network_name(
+            "celld-internal"
+        ));
+    }
+
+    #[test]
+    fn legacy_networks_are_removed_only_when_orphaned() {
+        let empty = r#"[{"Name": "celld", "Internal": false,
+          "Options": {"com.docker.network.bridge.enable_icc": "false",
+                      "com.docker.network.bridge.name": "celld0"},
+          "IPAM": {"Config": [{"Subnet": "172.19.0.0/16"}]}}]"#;
+        assert_eq!(legacy_network_orphaned(empty, "celld"), Some(true));
+        let attached = r#"[{"Name": "celld", "Internal": false,
+          "Options": {"com.docker.network.bridge.enable_icc": "false",
+                      "com.docker.network.bridge.name": "celld0"},
+          "Containers": {"abc123": {"Name": "old"}},
+          "IPAM": {"Config": [{"Subnet": "172.19.0.0/16"}]}}]"#;
+        assert_eq!(legacy_network_orphaned(attached, "celld"), Some(false));
+        assert_eq!(legacy_network_orphaned(empty, "celld-internal"), None);
+        assert_eq!(legacy_network_orphaned("bogus", "celld"), None);
+    }
+    #[test]
     fn network_inspect_parses_subnets_and_drops_garbage() {
         let json = r#"[
-          {"Name": "celld", "IPAM": {"Config": [{"Subnet": "172.19.0.0/16"}, {"Subnet": "bogus"}]}},
+          {"Name": "cello", "IPAM": {"Config": [{"Subnet": "172.19.0.0/16"}, {"Subnet": "bogus"}]}},
           {"Name": "noite_noite", "IPAM": {"Config": [{"Subnet": "172.18.0.0/16"}]}},
           {"Name": "", "IPAM": {"Config": [{"Subnet": "10.0.0.0/8"}]}},
           {"Name": "v6only", "IPAM": {"Config": [{"Subnet": "fd00::/64"}]}}
@@ -582,7 +681,7 @@ mod tests {
         assert_eq!(
             parsed,
             vec![
-                ("celld".to_string(), vec!["172.19.0.0/16".to_string()]),
+                ("cello".to_string(), vec!["172.19.0.0/16".to_string()]),
                 ("noite_noite".to_string(), vec!["172.18.0.0/16".to_string()]),
             ]
         );
@@ -592,25 +691,25 @@ mod tests {
     }
 
     #[test]
-    fn bridge_match_checks_celld_options() {
-        let matching = r#"[{"Name": "celld", "Internal": false,
+    fn bridge_match_checks_cello_options() {
+        let matching = r#"[{"Name": "cello", "Internal": false,
           "Options": {"com.docker.network.bridge.enable_icc": "false",
-                      "com.docker.network.bridge.name": "celld0"},
+                      "com.docker.network.bridge.name": "cello0"},
           "IPAM": {"Config": [{"Subnet": "172.19.0.0/16"}]}}]"#;
-        assert!(bridge_matches(matching, "celld", false, "celld0"));
-        assert!(!bridge_matches(matching, "celld", true, "celld0"));
-        assert!(!bridge_matches(matching, "celld", false, "celld1"));
-        let stale = r#"[{"Name": "celld", "Internal": false,
-          "Options": {"com.docker.network.bridge.name": "celld0"},
+        assert!(bridge_matches(matching, "cello", false, "cello0"));
+        assert!(!bridge_matches(matching, "cello", true, "cello0"));
+        assert!(!bridge_matches(matching, "cello", false, "cello1"));
+        let stale = r#"[{"Name": "cello", "Internal": false,
+          "Options": {"com.docker.network.bridge.name": "cello0"},
           "IPAM": {"Config": [{"Subnet": "172.19.0.0/16"}]}}]"#;
-        assert!(!bridge_matches(stale, "celld", false, "celld0"));
-        assert!(!bridge_matches("bogus", "celld", false, "celld0"));
+        assert!(!bridge_matches(stale, "cello", false, "cello0"));
+        assert!(!bridge_matches("bogus", "cello", false, "cello0"));
     }
 
     #[test]
-    fn create_args_match_celld_exactly() {
+    fn create_args_match_cello_exactly() {
         assert_eq!(
-            create_args("celld", false, "celld0"),
+            create_args("cello", false, "cello0"),
             vec![
                 "network",
                 "create",
@@ -619,16 +718,16 @@ mod tests {
                 "--opt",
                 "com.docker.network.bridge.enable_icc=false",
                 "--opt",
-                "com.docker.network.bridge.name=celld0",
-                "celld",
+                "com.docker.network.bridge.name=cello0",
+                "cello",
             ]
             .into_iter()
             .map(str::to_string)
             .collect::<Vec<_>>()
         );
-        let internal = create_args("celld-internal", true, "celld1");
+        let internal = create_args("cello-internal", true, "cello1");
         assert!(internal.contains(&"--internal".to_string()));
-        assert!(internal.contains(&"com.docker.network.bridge.name=celld1".to_string()));
+        assert!(internal.contains(&"com.docker.network.bridge.name=cello1".to_string()));
     }
 
     #[test]

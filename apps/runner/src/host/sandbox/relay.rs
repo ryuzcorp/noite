@@ -1,10 +1,10 @@
 //! The sandbox relay: one helper container in the host network
-//! namespace dialing celld's bridges from the host side, where celld's fence
+//! namespace dialing Cello's bridges from the host side, where Cello's fence
 //! admits the replies.
 //!
 //! The relay listens on a unix socket in the shared data volume and, per
 //! connection, reads one `CONNECT <ipv4>:<port>` header, dials it only when
-//! the address is a container address on `celld0`/`celld1` (never the
+//! the address is a container address on `cello0`/`cello1` (never the
 //! host side of a bridge; getifaddrs at connect time — nothing else is ever dialable), answers
 //! `OK`/`ERR`, then splices. It runs as uid 65534 with no capabilities, a
 //! read-only rootfs, and only the relay directory mounted.
@@ -12,13 +12,13 @@
 //! `noite-runner sandbox-relay <socket-path>` is the relay entrypoint (no
 //! runner env needed); `ensure` is the runner-side lifecycle.
 
+use super::BRIDGE_IFACES;
 use std::net::{Ipv4Addr, SocketAddrV4};
 use std::os::unix::fs::PermissionsExt;
 use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::io::AsyncWriteExt;
-
 /// Max header line (`CONNECT 255.255.255.255:65535\n` is 30 bytes; 64 leaves
 /// no room for smuggling while accepting every valid line).
 const MAX_HEADER: usize = 64;
@@ -28,8 +28,6 @@ const HEADER_TIMEOUT: Duration = Duration::from_secs(5);
 const DIAL_TIMEOUT: Duration = Duration::from_secs(10);
 /// Concurrent relayed connections (fd-exhaustion guard).
 const MAX_CONNS: usize = 512;
-/// Host interfaces whose subnets are dialable.
-const CELLD_IFACES: &[&str] = &["celld0", "celld1"];
 /// Entrypoint override for the relay container (the runner binary's path in
 /// the image; the image boots it under tini, the relay runs it directly).
 const RUNNER_BIN: &str = "/usr/local/bin/noite-runner";
@@ -71,10 +69,9 @@ pub fn allowed(ip: Ipv4Addr, addrs: &[(Ipv4Addr, u32)]) -> bool {
     })
 }
 
-/// The host's addresses on `celld0`/`celld1` with their prefixes, from
-/// getifaddrs, evaluated per connection so a bridge re-creation takes effect
+/// The host's addresses on `cello0`/`cello1` with their prefixes, from
 /// on the next dial. Non-contiguous masks are dropped, never trusted.
-fn local_celld_addrs() -> Vec<(Ipv4Addr, u32)> {
+fn local_bridge_addrs() -> Vec<(Ipv4Addr, u32)> {
     let mut subnets = Vec::new();
     // SAFETY: getifaddrs/freeifaddrs pairing; the list is only read.
     unsafe {
@@ -88,7 +85,7 @@ fn local_celld_addrs() -> Vec<(Ipv4Addr, u32)> {
             let name = std::ffi::CStr::from_ptr(ifa.ifa_name)
                 .to_string_lossy()
                 .into_owned();
-            if CELLD_IFACES.contains(&name.as_str())
+            if BRIDGE_IFACES.contains(&name.as_str())
                 && !ifa.ifa_addr.is_null()
                 && !ifa.ifa_netmask.is_null()
                 && (*ifa.ifa_addr).sa_family as i32 == libc::AF_INET
@@ -165,7 +162,7 @@ async fn handle(mut stream: tokio::net::UnixStream) {
         let _ = stream.write_all(b"ERR bad header\n").await;
         return;
     };
-    if !allowed(*target.ip(), &local_celld_addrs()) {
+    if !allowed(*target.ip(), &local_bridge_addrs()) {
         let _ = stream.write_all(b"ERR forbidden\n").await;
         return;
     }

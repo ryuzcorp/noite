@@ -1,25 +1,26 @@
-//! Sandbox containers (celld `containers` classes, e.g. the agent template)
+//! Sandbox containers (Cello `containers` classes, e.g. the agent template)
 //! on the host's container engine, without handing tenants the engine or
 //! touching the host firewall.
 //!
-//! celld assumes it runs in the host network namespace: it dials a container
-//! at its bridge address, and its own host fence (`table inet celld`) rejects
-//! anything a container sends toward a private address unless it is a reply
-//! arriving on the host's INPUT path. Noite runs celld inside a container on
-//! a private compose bridge, so a direct dial's replies are forwarded toward
-//! a private address and rejected. Three pieces route around that:
+//! Cello assumes it runs in the host network namespace: it dials a container
+//! at its bridge address, and its own host fence (`table inet cello`)
+//! rejects anything a container sends toward a private address unless it is
+//! a reply arriving on the host's INPUT path. Noite runs Cello inside a
+//! container on a private compose bridge, so a direct dial's replies are
+//! forwarded toward a private address and rejected. Three pieces route
+//! around that:
 //!
 //! - **relay**: one helper container in the host network namespace, no
 //!   capabilities, listening on a unix socket in the shared data volume. It
-//!   dials only addresses on celld's bridges, from the host side, where
-//!   celld's fence admits the replies.
-//! - **gateway**: fleet TCP toward celld's bridges is redirected (nft `nat`
+//!   dials only addresses on Cello's bridges, from the host side, where
+//!   Cello's fence admits the replies.
+//! - **gateway**: fleet TCP toward Cello's bridges is redirected (nft `nat`
 //!   output, this container's namespace) to a runner listener, which checks
 //!   the connecting fleet owns the destination container and splices the
 //!   connection through the relay.
 //! - **engine**: fleets never see the engine socket. Each fleet gets its own
 //!   unix socket served by the runner, which forwards only the Engine API
-//!   calls celld makes, validated (no privilege, no host paths, no foreign
+//!   calls Cello makes, validated (no privilege, no host paths, no foreign
 //!   containers), and labels every container with its fleet for cleanup.
 //!
 //! [`registry`] is the shared ownership state between them.
@@ -30,7 +31,7 @@ pub mod plane;
 pub mod registry;
 pub mod relay;
 
-/// Loopback port of the gateway listener; fleet dials to celld's bridges are
+/// Loopback port of the gateway listener; fleet dials to Cello's bridges are
 /// redirected here. Below the fleet port range (`db::alloc`, 20000+).
 pub const GATEWAY_PORT: u16 = 8071;
 
@@ -55,6 +56,25 @@ pub const FLEET_LABEL: &str = "noite.fleet";
 /// and never another install's on a shared engine.
 pub const INSTALL_LABEL: &str = "noite.install";
 
+/// Cello 0.1.0's container networks (fixed names; subnets are
+/// engine-assigned), exactly as `crates/cello/container.rs`
+/// (`OPEN_BRIDGE`/`INTERNAL_BRIDGE`, `networks()`) creates them. Every
+/// sandbox surface (plane, relay, gateway subnets, engine-proxy validation)
+/// reads these, so the names cannot drift apart again.
+pub const OPEN_NETWORK: &str = "cello";
+pub const INTERNAL_NETWORK: &str = "cello-internal";
+pub const OPEN_BRIDGE: &str = "cello0";
+pub const INTERNAL_BRIDGE: &str = "cello1";
+/// `(network name, internal, bridge interface)` for both Cello bridges.
+pub const NETWORKS: &[(&str, bool, &str)] = &[
+    (OPEN_NETWORK, false, OPEN_BRIDGE),
+    (INTERNAL_NETWORK, true, INTERNAL_BRIDGE),
+];
+/// Host interfaces the relay may dial (the bridges' host sides).
+pub const BRIDGE_IFACES: &[&str] = &[OPEN_BRIDGE, INTERNAL_BRIDGE];
+/// Pre-Cello network names, removed on upgrade once no container is
+/// attached to them.
+pub const LEGACY_NETWORKS: &[&str] = &["celld", "celld-internal"];
 static INSTALL: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
 /// Record this install's id (the store-derived install tag,
