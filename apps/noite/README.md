@@ -15,7 +15,7 @@ The Void app behind the Noite UI (`void` + `@ilha/void`): sign-in, app managemen
 - `src/lib/` (root) — the shared data/pure layer: `resources.ts` and `feeds.ts` (SWR + SSE), `swr-store.ts`, `live-ref.ts`, `runner.ts`, `auth.ts`/`auth-client.ts`/`db.ts`, `roles.ts`, `collaborators.ts`, `control-app.ts`/`control-env.ts`, `dates.ts`, `errors.ts`, `sleep.ts`, `rate-limit.ts`, `shiki-langs.ts`.
 - `src/lib/ui/` — shared primitives: `dialog.tsx`, `icons.tsx`, `skeletons.tsx`, `load-error.tsx`, `copy-button.tsx`, `avatar.tsx`.
 - `src/lib/{admin,account,auth,apps,source,app-detail,storage}/` — feature components: `admin/` (the instance-admin Users/Apps/Invites tabs), `account/panel.tsx`, `auth/` (login, onboarding, the `Authed` gate, client session helpers), `apps/` (list + create form, `identity.ts` helpers, control-plane panel), `source/browser.tsx`, `app-detail/` (Overview/Metrics/Errors/Logs/Deploys tabs and `settings/` panels), `storage/` (D1 editor, R2 browser, DO viewer).
-- `void.config.ts` / `vite.config.ts` — Void owns the worker entry (`voidPlugin()` builds middleware → routes → pages → assets from `src/`; `voidIlha()` renders pages with ilha) and the post-build `emitCelldConfig` writes the deploy-root `dist/wrangler.json` the runner deploys with Cello.
+- `void.config.ts` / `vite.config.ts` — Void owns the worker entry (`voidPlugin()` builds middleware → routes → pages → assets from `src/`; `voidIlha()` renders pages with ilha) and the post-build `emitCelloConfig` writes the deploy-root `dist/wrangler.json` the runner deploys with Cello.
 - `src/lib/auth.ts` — better-auth wiring: passkeys, email-code recovery (sign-in only, never creates accounts), API keys, admin plugin. Registration is invite-only after the first account.
 
 ## Access model

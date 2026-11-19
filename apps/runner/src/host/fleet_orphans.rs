@@ -6,7 +6,7 @@
 //! killing the runner's own group never reaches them, and they reparent to
 //! init (or the subreaper) while the new runner's `ProcMap` knows nothing
 //! about them. Every new spawn on their ports then crash-loops on
-//! `EADDRINUSE` behind `celld exited; restarting` in the fleet log.
+//! `EADDRINUSE` behind `cello exited; restarting` in the fleet log.
 //!
 //! Boot therefore reaps them before the first fleet spawn (see `main.rs`, next
 //! to the sandbox-container orphan sweep), by the identity every fleet of this
@@ -20,7 +20,7 @@
 //!    store-derived install tag that already scopes the sandbox labels and
 //!    the credential sweep, so no other install's fleet shares it. The tag
 //!    rides argv[0] rather than the environment because fleet nodes are
-//!    non-dumpable (celld `0053`): `/proc/<pid>/environ` answers `EACCES`
+//!    non-dumpable (cello `0053`): `/proc/<pid>/environ` answers `EACCES`
 //!    even as root, while cmdline stays readable — and clap ignores argv[0]
 //!    (verified against celld 0.6.3), whereas an unknown flag would fail the
 //!    spawn. Ports are never matched: two installs never share a tag even
@@ -47,12 +47,12 @@ use std::time::{Duration, Instant};
 
 use crate::config::Config;
 
-/// `argv[0]` of every fleet of the install: still greppable as celld
-/// (`pgrep -f celld` keeps matching), with the install tag appended so the
+/// `argv[0]` of every fleet of the install: still greppable as cello
+/// (`pgrep -f cello` keeps matching), with the install tag appended so the
 /// boot sweep can tell this install's previous-run fleets from any other
 /// install's live ones sharing the same `/proc`.
 pub fn fleet_argv0(install_tag: &str) -> String {
-    format!("celld-noite-{}", install_tag)
+    format!("cello-noite-{}", install_tag)
 }
 
 /// This install's tag for fleet identity: the store-derived install tag that
@@ -92,7 +92,7 @@ pub fn argv0(cmdline: &str) -> &str {
 /// runner's pid.
 ///
 /// A process is reaped only when its title is exactly the marker — another
-/// install's fleet (different tag), a non-celld process, and a zombie (empty
+/// install's fleet (different tag), a non-cello process, and a zombie (empty
 /// cmdline) all read as keep — and never when it is the runner itself or a
 /// live child of the runner.
 pub fn should_reap(own_pid: u32, marker: &str, proc: &ScannedProc) -> bool {
@@ -311,7 +311,7 @@ mod tests {
     }
 
     /// Marker-shaped cmdlines the tests build: title first, then the real
-    /// celld flags, NUL-separated like `/proc/<pid>/cmdline`.
+    /// cello flags, NUL-separated like `/proc/<pid>/cmdline`.
     fn fleet_cmdline(marker: &str, bucket: &str, listen: &str, internal: &str) -> String {
         [
             marker,
@@ -332,13 +332,13 @@ mod tests {
     }
 
     #[test]
-    fn marker_names_the_install_in_a_celld_title() {
-        assert_eq!(fleet_argv0("a1b2c3d4"), "celld-noite-a1b2c3d4");
+    fn marker_names_the_install_in_a_cello_title() {
+        assert_eq!(fleet_argv0("a1b2c3d4"), "cello-noite-a1b2c3d4");
     }
 
     #[test]
     fn own_previous_run_fleet_reaps() {
-        let marker = "celld-noite-a1b2c3d4";
+        let marker = "cello-noite-a1b2c3d4";
         let proc = scanned(
             444,
             1,
@@ -358,27 +358,27 @@ mod tests {
             445,
             1,
             &fleet_cmdline(
-                "celld-noite-e5f6a7b8",
+                "cello-noite-e5f6a7b8",
                 "s3://noite/fleets/shop",
                 "0.0.0.0:20000",
                 "127.0.0.1:20001",
             ),
         );
-        assert!(!should_reap(7, "celld-noite-a1b2c3d4", &proc));
+        assert!(!should_reap(7, "cello-noite-a1b2c3d4", &proc));
     }
 
     #[test]
-    fn non_celld_process_keeps() {
+    fn non_cello_process_keeps() {
         // The marker as a mere argument is not the title: argv[0] decides.
-        let argued = scanned(446, 1, "sleep\0celld-noite-a1b2c3d4\0");
-        assert!(!should_reap(7, "celld-noite-a1b2c3d4", &argued));
+        let argued = scanned(446, 1, "sleep\0cello-noite-a1b2c3d4\0");
+        assert!(!should_reap(7, "cello-noite-a1b2c3d4", &argued));
         let plain = scanned(447, 1, &("sleep\0".to_string() + "60\0"));
-        assert!(!should_reap(7, "celld-noite-a1b2c3d4", &plain));
+        assert!(!should_reap(7, "cello-noite-a1b2c3d4", &plain));
     }
 
     #[test]
     fn own_child_keeps() {
-        let marker = "celld-noite-a1b2c3d4";
+        let marker = "cello-noite-a1b2c3d4";
         let proc = scanned(
             448,
             7,
@@ -395,10 +395,10 @@ mod tests {
     #[test]
     fn zombie_and_empty_marker_keep() {
         let zombie = scanned(449, 1, "");
-        assert!(!should_reap(7, "celld-noite-a1b2c3d4", &zombie));
-        let proc = scanned(450, 1, "celld-noite-a1b2c3d4\0");
+        assert!(!should_reap(7, "cello-noite-a1b2c3d4", &zombie));
+        let proc = scanned(450, 1, "cello-noite-a1b2c3d4\0");
         assert!(!should_reap(7, "", &proc));
-        assert!(!should_reap(450, "celld-noite-a1b2c3d4", &proc));
+        assert!(!should_reap(450, "cello-noite-a1b2c3d4", &proc));
     }
 
     #[test]
@@ -443,7 +443,7 @@ mod tests {
     }
 
     /// Boot reap end to end: a stand-in fleet carrying this install's marker
-    /// in argv[0] — the way a real celld spawn holds it — in its own process
+    /// in argv[0] — the way a real cello spawn holds it — in its own process
     /// group is gone after the reap, while a stand-in with another install's
     /// marker survives. Both stand-ins are true orphans (reparented, like a
     /// real previous-run fleet — a live child would be spared by the

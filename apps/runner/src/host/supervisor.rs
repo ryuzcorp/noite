@@ -1657,7 +1657,7 @@ async fn ensure_spawned(
             }
             Some(why) => {
                 let note = collect_possible_oom(&key, spec.memory_mb);
-                tracing::warn!(fleet = %key, status = %why, "celld exited; restarting");
+                tracing::warn!(fleet = %key, status = %why, "cello exited; restarting");
                 entry.child = None;
                 entry.state = entry.state.on(FleetEvent::Exited {
                     oom: note.is_some(),
@@ -1854,7 +1854,7 @@ async fn spawn_fleet_inner(
     // readable — and clap ignores argv[0], while an unknown flag would fail
     // the spawn. This install's tag names no other install's fleet.
     let install_tag = crate::host::fleet_orphans::install_tag_for(cfg);
-    let mut cmd = Command::new(&cfg.celld_bin);
+    let mut cmd = Command::new(&cfg.cello_bin);
     cmd.arg0(crate::host::fleet_orphans::fleet_argv0(&install_tag));
     cmd.args([
         "--bucket",
@@ -2105,7 +2105,7 @@ async fn spawn_fleet_inner(
         cleanup_scaffolding(procs, &key, epoch, SideEffects::Exit).await;
         return Ok(());
     }
-    tracing::info!(fleet = %key, listen = spec.listen, internal = spec.internal, memory_mb = spec.memory_mb, cgroup = fleet_cgroup.is_some(), "started celld");
+    tracing::info!(fleet = %key, listen = spec.listen, internal = spec.internal, memory_mb = spec.memory_mb, cgroup = fleet_cgroup.is_some(), "started cello");
     Ok(())
 }
 
@@ -2143,7 +2143,7 @@ pub async fn stop_all(procs: &ProcMap, budget: Duration) {
     tokio::select! {
         done = futures::future::join_all(waits) => {
             for (slug, _) in done {
-                tracing::info!(slug, "stopped celld");
+                tracing::info!(slug, "stopped cello");
             }
         }
         _ = &mut deadline => {
@@ -2194,7 +2194,7 @@ impl ReloadOutcome {
         match self {
             ReloadOutcome::Failed { error } => {
                 anyhow::bail!(
-                    "celld refused the new deployment for {}: {}",
+                    "cello refused the new deployment for {}: {}",
                     fleet,
                     sanitize_reload_error(&error)
                 )
@@ -2247,7 +2247,7 @@ pub fn parse_reload_response(body: &str) -> ReloadOutcome {
                         .map(str::to_string)
                 })
                 .filter(|error| !error.is_empty())
-                .unwrap_or_else(|| "celld reported a failed reload".to_string());
+                .unwrap_or_else(|| "cello reported a failed reload".to_string());
             ReloadOutcome::Failed { error }
         }
         _ => ReloadOutcome::Unreachable,

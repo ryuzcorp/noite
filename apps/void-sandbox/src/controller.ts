@@ -149,7 +149,7 @@ interface ProcessCompletion {
  * wrapper (no cached state, so no construction-order hazard with the base
  * constructor, which touches `container` behind `blockConcurrencyWhile`).
  */
-const wrapCelldContainer = (
+const wrapCelloContainer = (
   native: SandboxNativeContainer
 ): SandboxNativeContainer => {
   // At runtime this is Cello's container, not Cloudflare's. The wrapper
@@ -185,9 +185,9 @@ const wrapCelldContainer = (
     setInactivityTimeout: (ms: number): Promise<void> =>
       noite.setInactivityTimeout(ms),
     start: (options: BaseStartOptions): void => {
-      const { instance: _droppedInstance, ...celldOptions } = options;
+      const { instance: _droppedInstance, ...celloOptions } = options;
       void _droppedInstance;
-      noite.start(celldOptions);
+      noite.start(celloOptions);
     },
   };
 
@@ -228,9 +228,9 @@ export class SandboxController extends SandboxContainer<ControllerEnv> {
   #generation: ProcessCompletion = {};
   #startTail: Promise<void> = Promise.resolve();
 
-  /** Noite: strip the Cloudflare-only `instance` start arg (see `wrapCelldContainer`). */
+  /** Noite: strip the Cloudflare-only `instance` start arg (see `wrapCelloContainer`). */
   protected override get container(): SandboxNativeContainer {
-    return wrapCelldContainer(super.container);
+    return wrapCelloContainer(super.container);
   }
 
   protected override processContext(

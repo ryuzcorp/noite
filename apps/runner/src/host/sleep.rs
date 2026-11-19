@@ -1395,7 +1395,7 @@ mod tests {
         let mut cfg = crate::config::config_for_tests();
         cfg.wake_timeout_s = 1;
         // The spawn cannot succeed: no Cello binary at this path.
-        cfg.celld_bin = "/nonexistent/cello".into();
+        cfg.cello_bin = "/nonexistent/cello".into();
         let pool = crate::db::connect("sqlite::memory:")
             .await
             .expect("memory db");
@@ -1687,7 +1687,7 @@ mod tests {
         }
         let mut cfg = crate::config::config_for_tests();
         cfg.wake_timeout_s = 5;
-        cfg.celld_bin = fake.to_string_lossy().into_owned();
+        cfg.cello_bin = fake.to_string_lossy().into_owned();
         cfg.work_dir = dir.join("work").to_string_lossy().into_owned();
         // Root keys: the spawn needs credentials, and this test is about the
         // wake → spawn path, not about the store's IAM.

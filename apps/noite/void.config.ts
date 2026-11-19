@@ -1,7 +1,7 @@
 // Worker config for Void (https://void.cloud) — the control UI's single
 // source for its Worker: bindings, assets, defaults. `voidPlugin()` reads it
 // (edits need a dev server restart) and the build emits
-// `dist/ssr/wrangler.json`, from which `scripts/emit-celld-config.ts`
+// `dist/ssr/wrangler.json`, from which `scripts/emit-cello-config.ts`
 // derives the deploy-root `dist/wrangler.json` the runner deploys with Cello.
 //
 // Serving contract (runner `ensure_deployed`, Cello `CELLO_KEYS`): name
@@ -31,7 +31,7 @@ import { defineConfig } from "void/config";
  * falls through to the Worker (Cello answers only hits at the edge of this
  * rule), so the app's 404 handling is unchanged.
  *
- * `vite.config.ts` (`emitCelldConfig`) writes this same list into the deploy
+ * `vite.config.ts` (`emitCelloConfig`) writes this same list into the deploy
  * config; Void's own build rewrites `dist/ssr/wrangler.json` to `["/**"]`. */
 export const RUN_WORKER_FIRST: string[] = ["/**", "!/assets/*"];
 

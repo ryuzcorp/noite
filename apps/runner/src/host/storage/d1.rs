@@ -624,7 +624,7 @@ impl<'a> D1<'a> {
             args.push("--json");
         }
         args.extend(["--bucket", bucket.as_str()]);
-        let out = self.celld(&args, None).await?;
+        let out = self.cello(&args, None).await?;
         Ok(String::from_utf8_lossy(&out).into_owned())
     }
 
@@ -647,7 +647,7 @@ impl<'a> D1<'a> {
             bucket.as_str(),
         ];
         let out = self
-            .celld(&args, Some(build_batch_input(stmts).as_bytes()))
+            .cello(&args, Some(build_batch_input(stmts).as_bytes()))
             .await?;
         parse_batch_output(&String::from_utf8_lossy(&out), stmts.len())
     }
@@ -655,15 +655,15 @@ impl<'a> D1<'a> {
     /// Run one `cello d1` subprocess, turning a refused exit into Cello's own
     /// message. The argv names the bucket and the generated SQL, and stderr
     /// can carry paths: both go to the runner log only, never to the client.
-    async fn celld(&self, args: &[&str], stdin: Option<&[u8]>) -> anyhow::Result<Vec<u8>> {
+    async fn cello(&self, args: &[&str], stdin: Option<&[u8]>) -> anyhow::Result<Vec<u8>> {
         let scope_key = crate::host::credentials::Scope::app(self.app).key();
-        let env_owned = s3::celld_cli_env(self.cfg, &scope_key);
+        let env_owned = s3::cello_cli_env(self.cfg, &scope_key);
         let env: Vec<(&str, &str)> = env_owned.iter().map(|(k, v)| (*k, v.as_str())).collect();
         let timeout = Duration::from_secs(30);
         let output = match stdin {
             Some(input) => {
                 exec::run_cmd_output_stdin(
-                    &self.cfg.celld_bin,
+                    &self.cfg.cello_bin,
                     args,
                     Some(input),
                     Some(&self.proj),
@@ -673,11 +673,11 @@ impl<'a> D1<'a> {
                 .await
             }
             None => {
-                exec::run_cmd_output(&self.cfg.celld_bin, args, Some(&self.proj), &env, timeout)
+                exec::run_cmd_output(&self.cfg.cello_bin, args, Some(&self.proj), &env, timeout)
                     .await
             }
         }
-        .with_context(|| format!("spawn celld for {}", self.database_id))?;
+        .with_context(|| format!("spawn cello for {}", self.database_id))?;
         if output.status.success() {
             return Ok(output.stdout);
         }
@@ -688,11 +688,11 @@ impl<'a> D1<'a> {
             exit = ?output.status.code(),
             stderr = %stderr.trim(),
             stdout = %String::from_utf8_lossy(&output.stdout).trim(),
-            "celld d1 failed"
+            "cello d1 failed"
         );
         bail!(
             "{}",
-            scrub_bucket(celld_failure(&stderr), &self.app.fleet_bucket)
+            scrub_bucket(cello_failure(&stderr), &self.app.fleet_bucket)
         )
     }
 }
@@ -700,7 +700,7 @@ impl<'a> D1<'a> {
 /// The tenant-facing text of a failed Cello run: its first error line without
 /// the `Error:` prefix. The rest of the chain (the argv, the bucket and the
 /// generated SQL) stays in the runner log.
-fn celld_failure(stderr: &str) -> String {
+fn cello_failure(stderr: &str) -> String {
     let line = stderr
         .lines()
         .map(str::trim)
@@ -708,7 +708,7 @@ fn celld_failure(stderr: &str) -> String {
         .unwrap_or_default();
     let message = line.strip_prefix("Error: ").unwrap_or(line).trim();
     if message.is_empty() {
-        "celld exited without a message".to_string()
+        "cello exited without a message".to_string()
     } else {
         message.to_string()
     }
@@ -1454,7 +1454,7 @@ mod tests {
     }
 
     #[test]
-    fn celld_failures_hide_the_bucket_path() {
+    fn cello_failures_hide_the_bucket_path() {
         let message = "read s3://noite/fleets/x/data.sqlite: access denied".to_string();
         assert_eq!(
             scrub_bucket(message, "s3://noite/fleets/x"),
@@ -1468,13 +1468,13 @@ mod tests {
     }
 
     #[test]
-    fn celld_failure_keeps_only_the_first_error_line() {
+    fn cello_failure_keeps_only_the_first_error_line() {
         let stderr = "Error: D1_EXEC_ERROR: too many terms in compound SELECT\nsecond line\n";
         assert_eq!(
-            celld_failure(stderr),
+            cello_failure(stderr),
             "D1_EXEC_ERROR: too many terms in compound SELECT"
         );
-        assert_eq!(celld_failure("\n\n"), "celld exited without a message");
+        assert_eq!(cello_failure("\n\n"), "cello exited without a message");
     }
 
     #[test]

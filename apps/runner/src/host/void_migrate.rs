@@ -30,14 +30,14 @@
 //!
 //! Ordering has two deliveries. On a redeploy (a previous generation is
 //! serving) the runner migrates against the *staged* generation before
-//! `activate`, through one `celld invoke` per exchange (needs celld
+//! `activate`, through one `cello invoke` per exchange (needs cello
 //! 0.6.3-ryuzcorp.7+): the fleet pointer moves only after the migrations
 //! succeed, so the old version keeps serving and a failed migration fails
 //! the deploy with nothing activated. On a first deploy — or when the prior
 //! fleet is unreachable so no staged invoke is possible — the step runs
 //! after activation against the fleet's own listen port, as before: between
 //! adoption and this step the new code serves the old schema (Void migrates
-//! the uploaded worker *before* traffic switches to it; celld has no
+//! the uploaded worker *before* traffic switches to it; cello has no
 //! version-pinned invocation outside `invoke`, so Noite otherwise cannot):
 //! keep migrations backward-compatible (expand before contract). Either
 //! way, applied migrations are never rolled back (forward-only: redeploying
@@ -1134,7 +1134,7 @@ fn preview(text: &str, len: usize) -> String {
 /// The deploy-side migration caller: the platform's timeouts (10 s probes,
 /// 300 s executions, 30 s reconciles) over one of two deliveries — the
 /// fleet's own listen port after activation, or a staged generation through
-/// `celld invoke` before it. The endpoints, headers and every decision
+/// `cello invoke` before it. The endpoints, headers and every decision
 /// above the exchange (capability negotiation, attempt reconciliation, the
 /// legacy retry shape) are shared, so both deliveries carry identical
 /// semantics and only the transport differs.
@@ -1158,9 +1158,9 @@ enum MigrateTransport {
         client: reqwest::Client,
         base: String,
     },
-    /// One `celld invoke` per exchange against the staged generation: same
+    /// One `cello invoke` per exchange against the staged generation: same
     /// endpoints and headers, the operator token and bucket credentials
-    /// riding `CELLD_*` exactly as for `celld d1 execute`.
+    /// riding `CELLO_*` exactly as for `cello d1 execute`.
     Staged { target: StagedTarget },
 }
 
@@ -1172,7 +1172,7 @@ enum MigrateTransport {
 /// carries the operator token and bucket credentials.
 #[derive(Clone)]
 pub struct StagedTarget {
-    pub celld_bin: String,
+    pub cello_bin: String,
     pub env: Vec<(String, String)>,
     pub bucket: String,
     pub endpoint: String,
@@ -1274,7 +1274,7 @@ impl MigrationClient {
     }
 
     /// The platform's per-call timeout, with headroom for the staged
-    /// delivery: every `celld invoke` builds a fresh isolate pool for the
+    /// delivery: every `cello invoke` builds a fresh isolate pool for the
     /// staged generation, so the sub-minute probes budget a cold build.
     /// Fast failures (no live node, a shed load) answer at once either way.
     /// Executions (300 s) keep the platform's timeout on both deliveries.
@@ -1538,7 +1538,7 @@ impl MigrationClient {
     }
 
     /// Pre-activation canary: `HEAD <path>` against the staged generation
-    /// through `celld invoke` — the staged pins plus the app as `--target`,
+    /// through `cello invoke` — the staged pins plus the app as `--target`,
     /// the same transport [`invoke_exchange`] the migrations ride. An
     /// answered status below 500 passes (returned, so the deploy log can
     /// name it); a 5xx or a missing answer (transport failure, over-cap
@@ -1560,7 +1560,7 @@ impl MigrationClient {
     }
 }
 
-/// One migration exchange over the staged generation: `celld invoke` with
+/// One migration exchange over the staged generation: `cello invoke` with
 /// the staged pins plus the app as `--target`, the fleet's proxy token on
 /// `x-void-internal`, and `--json` so the worker's status and body come
 /// back however the answer reads. The CLI waits up to ten minutes; the
@@ -1568,7 +1568,7 @@ impl MigrationClient {
 /// timeout is unknown, never failed — the invoke runs to completion on the
 /// node, which is exactly what the reconcile path is for.
 /// The environment variable carrying the fleet's proxy token to
-/// `celld invoke --header-env`, never argv.
+/// `cello invoke --header-env`, never argv.
 const PROXY_TOKEN_ENV: &str = "NOITE_VOID_PROXY_TOKEN";
 
 async fn invoke_exchange(
@@ -1592,11 +1592,11 @@ async fn invoke_exchange(
     args.push(path.to_string());
     // Nothing secret or tenant-derived rides argv: every local user reads
     // `/proc/<pid>/cmdline`, including concurrent tenant builds. The proxy
-    // token travels in the child's environment (`--header-env`, celld
+    // token travels in the child's environment (`--header-env`, cello
     // 0049), which only the runner's own uid can read, beside the operator
     // token and bucket credentials; the body travels on stdin.
     // A non-Void fleet has no proxy token: omit the header entirely rather
-    // than hand celld `--header-env` for an unset variable (celld refuses
+    // than hand cello `--header-env` for an unset variable (cello refuses
     // that as "environment variable ... is not set"). Void migrations and
     // the Void probe always carry one.
     if !token.is_empty() {
@@ -1624,7 +1624,7 @@ async fn invoke_exchange(
         .chain((!token.is_empty()).then_some((PROXY_TOKEN_ENV, token)))
         .collect();
     let output = match crate::host::exec::run_cmd_output_stdin(
-        &target.celld_bin,
+        &target.cello_bin,
         &arg_refs,
         body,
         None,
@@ -1644,7 +1644,7 @@ async fn invoke_exchange(
     // so the status decides like the fleet path's; only a missing envelope
     // — no live node, a shed load, a killed caller — is a transport
     // failure with an unknown outcome. Stderr is preview-capped: it is
-    // celld's own error lines (tenant bytes arrive on stdout), and the
+    // cello's own error lines (tenant bytes arrive on stdout), and the
     // deploy error truncates it further downstream.
     match parse_invoke_answer(&output.stdout) {
         InvokeParse::Answered { status, body } => CallAnswer::Answered {
@@ -1652,12 +1652,12 @@ async fn invoke_exchange(
             body: String::from_utf8_lossy(&body).into_owned(),
         },
         InvokeParse::TooLarge { message } => CallAnswer::TooLarge { message },
-        // No envelope also covers a celld without `invoke` or
+        // No envelope also covers a cello without `invoke` or
         // `--header-env`: name the requirement rather than leave the
         // operator chasing the network.
         InvokeParse::NoEnvelope => CallAnswer::Transport {
             message: format!(
-                "celld invoke gave no answer (staged migrations need celld \
+                "cello invoke gave no answer (staged migrations need cello \
                  0.6.3-ryuzcorp.7 or newer): {}",
                 one_line(&preview(&String::from_utf8_lossy(&output.stderr), 500))
             ),
@@ -1665,7 +1665,7 @@ async fn invoke_exchange(
     }
 }
 
-/// What `celld invoke --json` stdout carried.
+/// What `cello invoke --json` stdout carried.
 #[derive(Debug)]
 enum InvokeParse {
     Answered { status: u16, body: Vec<u8> },
@@ -2882,9 +2882,9 @@ mod tests {
         }
     }
 
-    // --- staged transport (`celld invoke`) ----------------------------------
+    // --- staged transport (`cello invoke`) ----------------------------------
 
-    /// A fake `celld` for the staged transport: the committed cohost
+    /// A fake `cello` for the staged transport: the committed cohost
     /// fixture, fixture-driven per `invoke --path` like the deploy seam.
     /// A token no argv may ever contain.
     const SECRET_TOKEN: &str = "proxy-secret-7f3a";
@@ -2899,8 +2899,8 @@ mod tests {
             // A symlink to the committed script, never a fresh file: the
             // cohost seam's rule (ETXTBSY under parallel load).
             let fixture = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("tests/fixtures/fake-celld-cohost.sh");
-            std::os::unix::fs::symlink(&fixture, dir.path().join("celld")).unwrap();
+                .join("tests/fixtures/fake-cello-cohost.sh");
+            std::os::unix::fs::symlink(&fixture, dir.path().join("cello")).unwrap();
             Self { dir }
         }
 
@@ -2914,10 +2914,10 @@ mod tests {
             let dir = self.dir.path().to_string_lossy().into_owned();
             MigrationClient::staged(
                 StagedTarget {
-                    celld_bin: self.dir.path().join("celld").to_string_lossy().into_owned(),
+                    cello_bin: self.dir.path().join("cello").to_string_lossy().into_owned(),
                     env: vec![
-                        ("FAKE_CELLD_LOG".to_string(), log),
-                        ("FAKE_CELLD_DIR".to_string(), dir),
+                        ("FAKE_CELLO_LOG".to_string(), log),
+                        ("FAKE_CELLO_DIR".to_string(), dir),
                     ],
                     bucket: "s3://noite/fleets/staged".to_string(),
                     endpoint: "http://rustfs:9000".to_string(),
@@ -2953,7 +2953,7 @@ mod tests {
             std::fs::write(self.dir.path().join(format!("{name}.fail")), message).unwrap();
         }
 
-        /// One line per invoke: the proxy token celld got from its
+        /// One line per invoke: the proxy token cello got from its
         /// environment.
         fn tokens(&self) -> Vec<String> {
             std::fs::read_to_string(self.dir.path().join("invoke-token.log"))
@@ -2963,7 +2963,7 @@ mod tests {
                 .collect()
         }
 
-        /// The request bodies celld read from stdin, one per line.
+        /// The request bodies cello read from stdin, one per line.
         fn bodies(&self) -> Vec<String> {
             std::fs::read_to_string(self.dir.path().join("invoke-body.log"))
                 .unwrap_or_default()

@@ -1081,7 +1081,7 @@ pub(crate) struct WorkerMap {
 /// projects, and for a `no_bundle` entry without a sibling map it accepts —
 /// so those deploys store no worker map. Runs after a successful deploy; the
 /// bytes upload with the rest of the maps.
-pub(crate) async fn read_celld_worker_map(
+pub(crate) async fn read_cello_worker_map(
     deploy_root: &Path,
     map_path: &Path,
 ) -> anyhow::Result<Option<WorkerMap>> {
@@ -1502,7 +1502,7 @@ mod tests {
         let map_path = dir.join("worker.js.map");
         std::fs::write(&map_path, &outer_bytes).expect("celld map");
 
-        let built = read_celld_worker_map(&root, &map_path)
+        let built = read_cello_worker_map(&root, &map_path)
             .await
             .expect("readable")
             .expect("a map");
@@ -1542,7 +1542,7 @@ mod tests {
             std::env::temp_dir().join(format!("noite-sourcemap-test-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).expect("temp dir");
         std::fs::write(dir.join("wrangler.json"), "{\"main\": \"./worker.js\"}").expect("config");
-        let found = read_celld_worker_map(&dir, &dir.join("worker.js.map"))
+        let found = read_cello_worker_map(&dir, &dir.join("worker.js.map"))
             .await
             .expect("missing is not an error");
         assert!(found.is_none());
@@ -1576,7 +1576,7 @@ mod tests {
         let map_path = dir.join("worker.js.map");
         std::fs::write(&map_path, &sibling_bytes).expect("celld map");
 
-        let built = read_celld_worker_map(&root, &map_path)
+        let built = read_cello_worker_map(&root, &map_path)
             .await
             .expect("readable")
             .expect("a map");
@@ -1612,7 +1612,7 @@ mod tests {
         std::fs::create_dir_all(&dir).expect("temp dir");
         let map_path = dir.join("worker.js.map");
         std::fs::write(&map_path, "{ not a map").expect("corrupt map");
-        let err = read_celld_worker_map(&dir, &map_path)
+        let err = read_cello_worker_map(&dir, &map_path)
             .await
             .expect_err("a corrupt map fails the read");
         assert!(
@@ -1640,7 +1640,7 @@ mod tests {
         std::fs::write(&target, &outer_bytes).expect("planted map");
         let map_path = dir.join("worker.js.map");
         symlink(&target, &map_path).expect("planted link");
-        let err = read_celld_worker_map(&dir, &map_path)
+        let err = read_cello_worker_map(&dir, &map_path)
             .await
             .expect_err("a symlink map fails the read");
         assert!(
@@ -1676,7 +1676,7 @@ mod tests {
         let map_path = dir.join("worker.js.map");
         std::fs::write(&map_path, &outer_bytes).expect("celld map");
 
-        let built = read_celld_worker_map(&root, &map_path)
+        let built = read_cello_worker_map(&root, &map_path)
             .await
             .expect("readable")
             .expect("a map");

@@ -61,7 +61,7 @@ pub fn aws_env(cfg: &Config) -> Vec<(&'static str, String)> {
 /// the token from their own env; bucket-only subcommands ignore it. Every
 /// `cello` subprocess builds its env here, so no call site can forget the
 /// token once the fleet it targets is guarded.
-pub fn celld_cli_env(cfg: &Config, scope_key: &str) -> Vec<(&'static str, String)> {
+pub fn cello_cli_env(cfg: &Config, scope_key: &str) -> Vec<(&'static str, String)> {
     let mut env = aws_env(cfg);
     env.push(("S3_ENDPOINT", cfg.s3_endpoint.clone()));
     if let Some(token) = crate::host::credentials::cached_operator_token(scope_key) {
@@ -1383,7 +1383,7 @@ mod tests {
     /// Every `cello` subprocess env carries the store credentials, the
     /// endpoint, and — once the fleet was ensured — its operator token.
     #[tokio::test]
-    async fn celld_cli_env_carries_the_fleet_token() {
+    async fn cello_cli_env_carries_the_fleet_token() {
         let pool = crate::db::connect("sqlite::memory:")
             .await
             .expect("memory db");
@@ -1394,7 +1394,7 @@ mod tests {
         let cfg = crate::config::config_for_tests();
         let app_id = crate::models::new_id();
         let scope_key = format!("app:{app_id}");
-        let bare_owned = celld_cli_env(&cfg, &scope_key);
+        let bare_owned = cello_cli_env(&cfg, &scope_key);
         let bare: Vec<(&str, &str)> = bare_owned.iter().map(|(k, v)| (*k, v.as_str())).collect();
         assert!(
             bare.iter().any(|(k, _)| *k == "AWS_ACCESS_KEY_ID"),
@@ -1415,7 +1415,7 @@ mod tests {
             crate::host::credentials::operator_token(&pool, &cfg.runner_token, &scope_key, &app_id)
                 .await
                 .expect("mint");
-        let guarded_owned = celld_cli_env(&cfg, &scope_key);
+        let guarded_owned = cello_cli_env(&cfg, &scope_key);
         let guarded: Vec<(&str, &str)> = guarded_owned
             .iter()
             .map(|(k, v)| (*k, v.as_str()))
