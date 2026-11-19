@@ -1,17 +1,20 @@
 /* oxlint-disable eslint/require-await, anti-slop/no-unknown-returns, anti-slop/no-known-value-widening, anti-slop/no-chained-type-assertions, anti-slop/require-safety-comment-for-type-assertion -- test doubles: a fake session, runner fetch and env stand in for the platform */
 import {
+  afterAll,
   afterEach,
   beforeAll,
   beforeEach,
   describe,
   expect,
   mock,
+  spyOn,
   test,
 } from "bun:test";
 
 import { grantCollaborator } from "../../lib/collaborators";
 import { controlEnv, stampControlEnv } from "../../lib/control-env";
 import { ensureDb, setD1Binding } from "../../lib/db";
+import * as sessionServer from "../../lib/server/session.server";
 import type { TestD1 } from "../../testing/d1";
 import { createTestD1 } from "../../testing/d1";
 import { handleEnvAuth } from "./env-auth";
@@ -22,11 +25,8 @@ let sessionUser: { email: string; id: string; name: string } | null = null;
 // The route reads its session through session.server; replace that one read
 // (nothing else in that module is used here) so the test can drive both the
 // signed-out and signed-in paths without minting a real better-auth session.
-// Bun hoists `mock.module` above the imports.
-mock.module("../../lib/server/session.server", () => ({
-  getSessionOrNull: async () =>
-    sessionUser ? { impersonatedBy: null, user: sessionUser } : null,
-}));
+// A per-test spy, restored below: `mock.module` is process-wide, so a
+// file-level double leaked into every later file in a shared-process run.
 
 const ENV = {
   BASE_DOMAIN: "noite.localhost",
@@ -78,6 +78,10 @@ const answer = (method: string, path: string): unknown => {
   return null;
 };
 
+const realFetch = globalThis.fetch;
+const savedRunnerToken = controlEnv.RUNNER_TOKEN;
+const savedRunnerUrl = controlEnv.RUNNER_URL;
+
 beforeAll(async () => {
   db = createTestD1();
   setD1Binding(db.d1);
@@ -115,7 +119,26 @@ beforeAll(async () => {
   }) as unknown as typeof fetch;
 });
 
+afterAll(() => {
+  globalThis.fetch = realFetch;
+
+  if (savedRunnerToken === undefined) {
+    Reflect.deleteProperty(controlEnv, "RUNNER_TOKEN");
+  } else {
+    controlEnv.RUNNER_TOKEN = savedRunnerToken;
+  }
+
+  if (savedRunnerUrl === undefined) {
+    Reflect.deleteProperty(controlEnv, "RUNNER_URL");
+  } else {
+    controlEnv.RUNNER_URL = savedRunnerUrl;
+  }
+});
+
 beforeEach(() => {
+  spyOn(sessionServer, "getSessionOrNull").mockImplementation(async () =>
+    sessionUser ? { impersonatedBy: null, user: sessionUser } : null
+  );
   calls = [];
   sessionUser = null;
   db.raw.run(`DELETE FROM app_collaborator`);
@@ -132,11 +155,9 @@ beforeEach(() => {
   ]);
 });
 
-// The `mock.module` session double above leaks into later test files in a
-// full-suite run (one shared module registry): leave it signed out so a
-// signed-in case here cannot turn another file's 401 into a 403.
 afterEach(() => {
   sessionUser = null;
+  mock.restore();
 });
 
 const signIn = (id: string) => {

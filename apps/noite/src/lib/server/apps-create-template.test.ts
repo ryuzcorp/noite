@@ -4,21 +4,19 @@
 //! before any runner call, so a client can never point the import at
 //! another URL.
 
-import { afterAll, beforeAll, beforeEach, expect, mock, test } from "bun:test";
+import { afterAll, beforeAll, beforeEach, expect, test } from "bun:test";
 
 import * as Schema from "effect/Schema";
 
 import { createTestD1 } from "../../testing/d1";
+import type { TestD1 } from "../../testing/d1";
 import { installRunnerMock, makeApp } from "../../testing/runner-mock";
 import type { RunnerMock } from "../../testing/runner-mock";
 import { ensureDb, setD1Binding } from "../db";
 import { createAppForUser } from "./apps.server";
 
-// The grant hits tables the test D1 does not migrate; the rollback path owns
-// that coverage (apps-create.test.ts). Here it succeeds.
-mock.module("../collaborators", () => ({
-  grantCollaborator: () => Promise.resolve("applied" as const),
-}));
+// The grant writes a real row in the test D1 (the rollback path owns failure
+// coverage in apps-create.test.ts).
 
 /** The request body the create action sends for a template source. */
 const TemplateCreateParams = Schema.Struct({
@@ -32,10 +30,11 @@ const TemplateCreateParams = Schema.Struct({
   }),
 });
 
+let db: TestD1;
 let runner: RunnerMock;
 
 beforeAll(async () => {
-  const db = createTestD1();
+  db = createTestD1();
   setD1Binding(db.d1);
   await ensureDb();
 });
@@ -43,13 +42,18 @@ beforeAll(async () => {
 beforeEach(() => {
   runner?.restore();
   runner = installRunnerMock([]);
+  // The real grant below references the creator: the FK needs the row.
+  db.raw.run(`DELETE FROM app_collaborator`);
+  db.raw.run(`DELETE FROM "user"`);
+  db.raw.run(`INSERT INTO "user" (id, name, email) VALUES (?, ?, ?)`, [
+    "u-1",
+    "One",
+    "u-1@example.com",
+  ]);
 });
 
 afterAll(() => {
   runner.restore();
-  // The collaborator module is mocked for this file only: another test file
-  // that writes real grants must not inherit the double.
-  mock.restore();
 });
 
 test("a template create imports its folder from the templates repo", async () => {

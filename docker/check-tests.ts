@@ -14,7 +14,8 @@
  * - UI unit tests (`.test.ts` and `.test.tsx` files under `apps/noite/src`):
  *   `Bun.sleep`, `await sleep(`, and `setTimeout` waits — unless the file
  *   runs under fake timers (`useFakeTimers`, or it assigns
- *   `globalThis.setTimeout`).
+ *   `globalThis.setTimeout`) — and `mock.module`, which is process-wide in
+ *   a shared-process run, so a file-level double leaks into later files.
  * - Rust test code (`tests.rs` files, `tests/` dirs, `#[cfg(test)]`
  *   modules): `std::thread::sleep`, `tokio::time::sleep`,
  *   `tokio::time::sleep_until` — unless that test runs under paused time
@@ -29,6 +30,7 @@ import { readdirSync, readFileSync, statSync } from "node:fs";
 import path from "node:path";
 
 export type TestRule =
+  | "no-mock-module"
   | "no-retry-flag"
   | "no-test-retry"
   | "no-wall-clock-sleep";
@@ -48,6 +50,10 @@ interface TestFn {
 }
 
 const hintFor = (rule: TestRule): string => {
+  if (rule === "no-mock-module") {
+    return "mock.module is process-wide: use a per-test spyOn + restore, or a real collaborator — a file-level double leaks into later files in a shared-process run";
+  }
+
   if (rule === "no-retry-flag") {
     return "drop the flag — a flaky lane fails loudly instead";
   }
@@ -667,19 +673,35 @@ export const checkE2e = (file: string, source: string): TestViolation[] => {
   ];
 };
 
-/** UI unit tests: no wall-clock waits, unless the file runs under fake
- * timers. */
+/** UI unit tests: no wall-clock waits (unless the file runs under fake
+ * timers), and no `mock.module` (process-wide in a shared-process run: a
+ * file-level double leaks into later files). */
 export const checkUiTest = (file: string, source: string): TestViolation[] => {
   const stripped = stripTs(source);
+
+  const moduleViolations = scanPatterns(
+    file,
+    stripped,
+    [
+      {
+        hint: hintFor("no-mock-module"),
+        pattern: /\bmock\s*\.\s*module\s*\(/u,
+      },
+    ],
+    "no-mock-module"
+  );
 
   if (
     /useFakeTimers/u.test(stripped) ||
     /globalThis\s*\.\s*setTimeout\s*=/u.test(stripped)
   ) {
-    return [];
+    return moduleViolations;
   }
 
-  return scanPatterns(file, stripped, TS_SLEEPS, "no-wall-clock-sleep");
+  return [
+    ...moduleViolations,
+    ...scanPatterns(file, stripped, TS_SLEEPS, "no-wall-clock-sleep"),
+  ];
 };
 
 const RUST_SLEEPS: SleepPattern[] = [

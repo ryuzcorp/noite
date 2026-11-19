@@ -171,6 +171,41 @@ describe("UI unit tests", () => {
 
     expect(checkUiTest("src/lib/x.test.ts", source)).toEqual([]);
   });
+
+  test("mock.module fails: the double is process-wide", () => {
+    const source = [
+      'mock.module("../collaborators", () => ({',
+      "  grantCollaborator: () => Promise.resolve(null),",
+      "}));",
+      "",
+    ].join("\n");
+
+    const violations = checkUiTest("src/lib/x.test.ts", source);
+    expect(violations).toHaveLength(1);
+    expect(violations[0]?.rule).toBe("no-mock-module");
+  });
+
+  test("mock.module in a comment or a string is not code", () => {
+    const source = [
+      "// mock.module is process-wide, so do not use it here",
+      'const note = "use spyOn, not mock.module";',
+      "",
+    ].join("\n");
+
+    expect(checkUiTest("src/lib/x.test.ts", source)).toEqual([]);
+  });
+
+  test("mock.module fails even under fake timers", () => {
+    const source = [
+      "jest.useFakeTimers();",
+      'mock.module("../collaborators", () => ({}));',
+      "",
+    ].join("\n");
+
+    const violations = checkUiTest("src/lib/x.test.ts", source);
+    expect(violations).toHaveLength(1);
+    expect(violations[0]?.rule).toBe("no-mock-module");
+  });
 });
 
 describe("shell and workflow flags", () => {

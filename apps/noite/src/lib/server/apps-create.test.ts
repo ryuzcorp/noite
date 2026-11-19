@@ -5,11 +5,13 @@
 
 import {
   afterAll,
+  afterEach,
   beforeAll,
   beforeEach,
   describe,
   expect,
   mock,
+  spyOn,
   test,
 } from "bun:test";
 
@@ -17,8 +19,10 @@ import { TIMEOUT_MS } from "../../middleware/01-timeout";
 import { createTestD1 } from "../../testing/d1";
 import { installRunnerMock, makeApp } from "../../testing/runner-mock";
 import type { RunnerMock } from "../../testing/runner-mock";
+import * as collaborators from "../collaborators";
 import { ensureDb, setD1Binding } from "../db";
 import { errorMessage } from "../errors";
+import type { AppRole } from "../roles";
 import { CREATE_TIMEOUT_MS } from "../runner";
 import { ActionFailure, actionErrorResponse } from "./api";
 import { CREATE_RECOVERY_MS, createAppForUser } from "./apps.server";
@@ -41,31 +45,11 @@ let grantResult: "applied" | "last-admin" | "missing" = "applied";
 /** The rows `listCollaboratorRows` reports for the app under test: the
  * adoption rule reads them, so a test can say "removed", "push only" or
  * "still an admin". */
-let collaboratorRows: { role: string; userId: string }[] = [];
+let collaboratorRows: { role: AppRole; userId: string }[] = [];
 
-// Fail the grant the way a D1 outage would (nothing else in that module is
-// used here). Bun hoists `mock.module` above the imports.
-mock.module("../collaborators", () => ({
-  grantCollaborator: (appId: string, userId: string, role: string) => {
-    if (grantFails) {
-      return Promise.reject(grantFailure);
-    }
-
-    grants.push({ appId, role, userId });
-
-    return Promise.resolve(grantResult);
-  },
-  listCollaboratorRows: () =>
-    Promise.resolve(
-      collaboratorRows.map((row) => ({
-        createdAt: "2026-01-01T00:00:00Z",
-        email: `${row.userId}@example.com`,
-        name: row.userId,
-        role: row.role,
-        userId: row.userId,
-      }))
-    ),
-}));
+// Per-test doubles, restored in `afterEach` below: `mock.module` is
+// process-wide, so a file-level double leaked into every later file in a
+// shared-process run.
 
 let runner: RunnerMock;
 
@@ -83,13 +67,36 @@ beforeEach(() => {
   grantResult = "applied";
   runner?.restore();
   runner = installRunnerMock([]);
+  spyOn(collaborators, "grantCollaborator").mockImplementation(
+    (appId, userId, role) => {
+      if (grantFails) {
+        return Promise.reject(grantFailure);
+      }
+
+      grants.push({ appId, role, userId });
+
+      return Promise.resolve(grantResult);
+    }
+  );
+  spyOn(collaborators, "listCollaboratorRows").mockImplementation(() =>
+    Promise.resolve(
+      collaboratorRows.map((row) => ({
+        createdAt: "2026-01-01T00:00:00Z",
+        email: `${row.userId}@example.com`,
+        name: row.userId,
+        role: row.role,
+        userId: row.userId,
+      }))
+    )
+  );
+});
+
+afterEach(() => {
+  mock.restore();
 });
 
 afterAll(() => {
   runner.restore();
-  // The collaborator module is mocked for this file only: another test file
-  // that writes real grants must not inherit the double.
-  mock.restore();
 });
 
 describe("create recovery budget", () => {
