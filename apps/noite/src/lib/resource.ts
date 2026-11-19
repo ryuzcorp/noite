@@ -257,9 +257,48 @@ export const withRetry = <T>(
 };
 
 /** How a settled lookup lands: a fresh value, or the rejection to record. */
-type SettleOutcome =
+export type SettleOutcome =
   | { ok: true; value: unknown }
   | { ok: false; error: unknown };
+
+/** Followers of a key's loads: fired from `settleKey` when the newest
+ * generation lands, after the readers settle. Lets non-readers re-check
+ * their own truth — a frame sync, a badge — without mounting a reader and
+ * its fetch. */
+const settleFollowers = new Map<
+  string,
+  Set<(outcome: SettleOutcome) => void>
+>();
+
+/** Run `fn` with every landing of `key`'s newest load. Returns the
+ * unsubscribe. */
+export const onSettled = (
+  key: string,
+  fn: (outcome: SettleOutcome) => void
+): (() => void) => {
+  let followers = settleFollowers.get(key);
+
+  if (followers === undefined) {
+    followers = new Set();
+    settleFollowers.set(key, followers);
+  }
+
+  followers.add(fn);
+
+  return () => {
+    const live = settleFollowers.get(key);
+
+    if (live === undefined) {
+      return;
+    }
+
+    live.delete(fn);
+
+    if (live.size === 0) {
+      settleFollowers.delete(key);
+    }
+  };
+};
 
 /** One mounted reader of a key: blanked when a reload starts, settled when
  * the lookup lands. */
@@ -277,10 +316,6 @@ interface KeySub {
 const fetchers = new Map<string, ResourceFetcher<unknown>>();
 const generations = new Map<string, number>();
 
-/** Latest settled generation per key: a load is in flight while the newest
- * generation has not settled (success or failure both end it). */
-const settledGenerations = new Map<string, number>();
-
 /** Keys whose snapshots stay in memory only (`tracked(..., { persist: false
  * })`): bulky entries that would crowd the small sessionStorage quota. */
 const memoryOnly = new Set<string>();
@@ -288,9 +323,7 @@ const subs = new Map<string, Set<KeySub>>();
 
 /** Abort per key: a last-reader unmount or an auth reset ends the in-flight
  * load (and its retry backoff) instead of letting it retry under a stale —
- * possibly another account's — session. Supersedes never abort: concurrent
- * readers share one lookup, so killing it would drop the generation that
- * still wants it; the generation guard already neutralizes stale results. */
+ * possibly another account's — session. */
 const keyControllers = new Map<string, AbortController>();
 
 /** The signal the current load of `key` reads under, creating it on first
@@ -379,32 +412,17 @@ const settleKey = (
     return;
   }
 
-  settledGenerations.set(key, generation);
-
   const readers = subs.get(key);
 
-  if (readers === undefined) {
-    return;
+  if (readers !== undefined) {
+    for (const sub of readers) {
+      sub.settle(outcome);
+    }
   }
 
-  for (const sub of readers) {
-    sub.settle(outcome);
+  for (const follow of settleFollowers.get(key) ?? []) {
+    follow(outcome);
   }
-};
-
-/** Whether `key` has a load in flight: the newest generation started but
- * none settled since. A frame that lands while this is true is newer than
- * whatever the load will resolve with, so the sync supersedes the load
- * instead of letting its stale result settle. */
-export const isLoadInFlight = (key: string): boolean =>
-  (generations.get(key) ?? 0) > (settledGenerations.get(key) ?? 0);
-
-/** End the in-flight load for `key`, if any, and start a fresh one: a frame
- * that arrived mid-load carries newer truth than the load will resolve
- * with, so the load must not settle over it. */
-export const supersede = (key: string): void => {
-  abortKey(key);
-  invalidate(key);
 };
 
 /** Drop the cache entry and reload every mounted reader. The promise settles

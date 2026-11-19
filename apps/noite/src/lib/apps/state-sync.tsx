@@ -28,7 +28,7 @@ import { watch } from "ilha";
 
 import type { AppDetail } from "../api-types";
 import { appStateUrl, decodeAppState, feedKeys, liveFeed } from "../feeds";
-import { invalidate, isLoadInFlight, supersede } from "../resource";
+import { invalidate, onSettled } from "../resource";
 import { keys } from "../resources";
 import type { AppRole } from "../roles";
 import type { RunnerAppState, RunnerEnvironment } from "../runner";
@@ -132,6 +132,17 @@ export const syncPlan = (
   caches: SyncCaches
 ): string[] => staleKeys(appId, frame, caches.detail, caches.environments);
 
+/** The latest frame per resource key: the runner's truth, newer than any
+ * load that started before the frame arrived. A load that settles stale is
+ * re-driven against it (see below), so one stale settle cannot wedge the
+ * badge until the next change. */
+const latestFrames = new Map<string, RunnerAppState & FrameRole>();
+
+/** Frames already re-driven by a post-settle re-compare, per key: the store
+ * still disagrees with one of these only while its control-plane read lags,
+ * and refetching the same frame again would hot-loop instead of converging. */
+const revalidatedFrames = new Map<string, string>();
+
 /** Follow one app's state stream and invalidate whichever cache it proves
  * stale. Renders nothing, so its frames stay out of sessionStorage. */
 const AppStateSync = ({ appId }: { appId: string }) => {
@@ -141,6 +152,9 @@ const AppStateSync = ({ appId }: { appId: string }) => {
     decodeAppState,
     { persist: false }
   );
+
+  const detailKey = keys.appDetail(appId);
+  const environmentsKey = keys.environments(appId);
 
   watch(feed.state, (state) => {
     // Only a frame this stream delivered: `Cached` is a previous visit's
@@ -156,24 +170,69 @@ const AppStateSync = ({ appId }: { appId: string }) => {
     // additive runner field that may be absent until the runner sends it.
     const frame = state.value as RunnerAppState & FrameRole;
 
+    latestFrames.set(detailKey, frame);
+    latestFrames.set(environmentsKey, frame);
+
     const stale = syncPlan(appId, frame, {
       detail: readSwr<AppDetail>(keys.appDetail(appId)),
       environments: readSwr<RunnerEnvironment[]>(keys.environments(appId)),
     });
 
     for (const key of stale) {
+      revalidatedFrames.delete(key);
       invalidate(key);
     }
+  });
 
-    // A frame that agrees with the cache may still be newer than an
-    // in-flight load: that load read before this frame arrived, so whatever
-    // it resolves with is older truth. Supersede it — end it and refetch —
-    // so its stale result cannot settle over this frame.
-    for (const key of [keys.appDetail(appId), keys.environments(appId)]) {
-      if (!stale.includes(key) && isLoadInFlight(key)) {
-        supersede(key);
-      }
+  // After a load lands, re-check it against the latest frame: a fetch that
+  // read while the runner was converging resolves older truth than a frame
+  // that arrived mid-load, and nothing else would refetch it. At most one
+  // extra fetch per settle, and only on disagreement — an agreeing stream
+  // of frames never refetches. Watched through the settle hook, not a
+  // reader, so the check itself starts no fetch.
+  const recheck = (key: string): void => {
+    const frame = latestFrames.get(key);
+
+    if (frame === undefined) {
+      return;
     }
+
+    const stale = syncPlan(appId, frame, {
+      detail: readSwr<AppDetail>(keys.appDetail(appId)),
+      environments: readSwr<RunnerEnvironment[]>(keys.environments(appId)),
+    });
+
+    if (!stale.includes(key)) {
+      return;
+    }
+
+    const seen = JSON.stringify(frame);
+
+    if (revalidatedFrames.get(key) === seen) {
+      return;
+    }
+
+    revalidatedFrames.set(key, seen);
+    invalidate(key);
+  };
+
+  watch.once(() => {
+    const stopDetail = onSettled(detailKey, (outcome) => {
+      if (outcome.ok) {
+        recheck(detailKey);
+      }
+    });
+
+    const stopEnvironments = onSettled(environmentsKey, (outcome) => {
+      if (outcome.ok) {
+        recheck(environmentsKey);
+      }
+    });
+
+    return () => {
+      stopDetail();
+      stopEnvironments();
+    };
   });
 
   return null;

@@ -478,8 +478,8 @@ const installManualClock = () => {
   return { fire, queue };
 };
 
-describe("AppStateSync supersede", () => {
-  test("a frame that lands mid-load supersedes the stale load", async () => {
+describe("AppStateSync post-settle re-compare", () => {
+  test("a stale load that lands after a newer frame refetches against it", async () => {
     const testGlobals = globalThis as unknown as {
       Element?: unknown;
       EventSource?: unknown;
@@ -541,7 +541,6 @@ describe("AppStateSync supersede", () => {
       );
 
       let calls = 0;
-      let retryFired = false;
       // SAFETY: the test only needs the (url, init) call shape, like the
       // fetch doubles in http/recovery and routes/envelope.
       testGlobals.fetch = ((
@@ -560,11 +559,14 @@ describe("AppStateSync supersede", () => {
           );
         }
 
-        // The retry reads while the row is still stopped (stale read racing
-        // the runner); a superseding load reads after the frame.
-        return Promise.resolve(
-          Response.json(retryFired ? stopped : running, { status: 200 })
-        );
+        if (calls === 3) {
+          // The retry reads while the row is still stopped (stale read racing
+          // the runner).
+          return Promise.resolve(Response.json(stopped, { status: 200 }));
+        }
+
+        // A load that starts after the frame reads current truth.
+        return Promise.resolve(Response.json(running, { status: 200 }));
         // oxlint-disable-next-line anti-slop/no-chained-type-assertions -- test double for the global fetch, matching the repo's established stubs.
       }) as unknown as typeof fetch;
 
@@ -614,24 +616,200 @@ describe("AppStateSync supersede", () => {
       expect(painted()).toEqual(running);
 
       // The runner restarts while the retry backs off: the running frame
-      // agrees with the store, so only a supersede saves the badge.
+      // agrees with the store, so nothing refetches yet.
       source?.emit("message", `0:${runningFrame}`);
       await ui.settled();
       await flush();
-      expect(calls).toBe(3);
+      expect(calls).toBe(2);
+      expect(painted()).toEqual(running);
+
+      // The retry answers with its stale read — then the post-settle
+      // re-compare sees the store disagree with the latest frame and
+      // refetches once, converging back on running.
+      clock.fire();
+      await ui.settled();
+      await flush();
+      expect(calls).toBe(4);
       expect(painted()).toEqual(running);
       expect(resourceError(res.state())).toBeUndefined();
+      expect(readSwr<AppDetail>(keys.appDetail(id))).toEqual(running);
 
-      // Fire the orphaned backoff: the aborted retry must not answer, and a
-      // retry that does answer after the frame still loses to fresh truth.
-      retryFired = true;
-
+      // Fire any leftover backoff: nothing further may fetch.
       for (let i = 0; i < 5 && clock.queue.length > 0; i += 1) {
         clock.fire();
       }
 
+      await ui.settled();
       await flush();
-      expect(calls).toBe(3);
+      expect(calls).toBe(4);
+      expect(painted()).toEqual(running);
+      expect(resourceError(res.state())).toBeUndefined();
+      expect(readSwr<AppDetail>(keys.appDetail(id))).toEqual(running);
+      ui.unmount();
+    } finally {
+      resetStreamHub();
+      FakeSource.reset();
+      globalThis.fetch = realFetch;
+      globalThis.setTimeout = realSetTimeout;
+
+      if (realEventSource === undefined) {
+        delete testGlobals.EventSource;
+      } else {
+        testGlobals.EventSource = realEventSource;
+      }
+
+      delete testGlobals.document;
+    }
+  });
+
+  test("agreeing frames never fetch per-frame: one in-flight load costs at most one extra fetch", async () => {
+    const testGlobals = globalThis as unknown as {
+      Element?: unknown;
+      EventSource?: unknown;
+      HTMLElement?: unknown;
+      HTMLInputElement?: unknown;
+      HTMLSelectElement?: unknown;
+      HTMLTextAreaElement?: unknown;
+      Node?: unknown;
+      document?: unknown;
+      fetch?: unknown;
+      window?: unknown;
+    };
+
+    const realEventSource = testGlobals.EventSource;
+    const realFetch = globalThis.fetch;
+    const realSetTimeout = globalThis.setTimeout;
+    testGlobals.document = new FakeDocument();
+    testGlobals.window = {};
+    testGlobals.HTMLElement = FakeElement;
+    testGlobals.Element = FakeNode;
+    testGlobals.Node = FakeNode;
+    testGlobals.HTMLInputElement = FakeElement;
+    testGlobals.HTMLSelectElement = FakeElement;
+    testGlobals.HTMLTextAreaElement = FakeElement;
+    // SAFETY: the fake implements the EventSource surface connectStream reads.
+    testGlobals.EventSource = FakeSource as unknown as typeof EventSource;
+    const clock = installManualClock();
+
+    try {
+      FakeSource.reset();
+      const id = "app-sync-bound";
+
+      const running = detail({
+        desiredState: "running",
+        id,
+        slug: "sync-bound",
+        status: "running",
+      });
+
+      const stopped = detail({
+        desiredState: "stopped",
+        id,
+        slug: "sync-bound",
+        status: "stopped",
+      });
+
+      const frameFor = (status: "running" | "stopped"): string =>
+        JSON.stringify(
+          frame({ desiredState: status, id, slug: "sync-bound", status }, [
+            env({ appId: id, appSlug: "sync-bound" }),
+          ])
+        );
+
+      let calls = 0;
+      // SAFETY: the test only needs the (url, init) call shape, like the
+      // fetch doubles in http/recovery and routes/envelope.
+      testGlobals.fetch = ((
+        _url: string | URL | Request,
+        _init?: RequestInit
+      ): Promise<Response> => {
+        calls += 1;
+
+        if (calls === 1) {
+          return Promise.resolve(Response.json(running, { status: 200 }));
+        }
+
+        if (calls === 2) {
+          return Promise.resolve(
+            Response.json({ error: "boom" }, { status: 500 })
+          );
+        }
+
+        if (calls === 3) {
+          return Promise.resolve(Response.json(stopped, { status: 200 }));
+        }
+
+        return Promise.resolve(Response.json(running, { status: 200 }));
+        // oxlint-disable-next-line anti-slop/no-chained-type-assertions -- test double for the global fetch, matching the repo's established stubs.
+      }) as unknown as typeof fetch;
+
+      let capturedRes: Resource<AppDetail> | undefined;
+
+      const Probe = () => {
+        const res = appDetail(id);
+        capturedRes = res;
+
+        return <span />;
+      };
+
+      const Page = () => (
+        <>
+          <Probe />
+          <AppStateSyncSlot appId={id} />
+        </>
+      );
+
+      const ui = render(Page);
+      await ui.settled();
+      await flush();
+      expect(calls).toBe(1);
+
+      if (capturedRes === undefined) {
+        throw new Error("the probe captured no app row resource");
+      }
+
+      const res = capturedRes;
+
+      const painted = (): AppDetail | undefined => resourceValue(res.state());
+
+      clock.fire();
+      expect(FakeSource.instances).toHaveLength(1);
+      const [source] = FakeSource.instances;
+      source?.emit("open");
+      source?.emit("message", "0:+");
+
+      // An agreeing stream with no load in flight fetches nothing.
+      for (let i = 0; i < 5; i += 1) {
+        source?.emit("message", `0:${frameFor("running")}`);
+      }
+
+      await ui.settled();
+      await flush();
+      expect(calls).toBe(1);
+      expect(painted()).toEqual(running);
+
+      // One stopped frame starts the slow load; five agreeing frames arrive
+      // while it backs off, and none of them may start its own fetch.
+      source?.emit("message", `0:${frameFor("stopped")}`);
+      await ui.settled();
+      await flush();
+      expect(calls).toBe(2);
+
+      for (let i = 0; i < 5; i += 1) {
+        source?.emit("message", `0:${frameFor("running")}`);
+      }
+
+      await ui.settled();
+      await flush();
+      expect(calls).toBe(2);
+      expect(painted()).toEqual(running);
+
+      // The stale retry lands, the post-settle re-compare refetches once,
+      // and the badge converges: 4 calls total, however many frames flowed.
+      clock.fire();
+      await ui.settled();
+      await flush();
+      expect(calls).toBe(4);
       expect(painted()).toEqual(running);
       expect(resourceError(res.state())).toBeUndefined();
       expect(readSwr<AppDetail>(keys.appDetail(id))).toEqual(running);
