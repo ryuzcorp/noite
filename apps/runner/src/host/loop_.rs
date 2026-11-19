@@ -377,9 +377,11 @@ async fn reconcile_once(
     // one serialized the whole tick behind N slow drains: a start for an
     // unrelated fleet waited behind stops it had nothing to do with
     // (head-of-line) until its health-gate budget expired. All stops in this
-    // pass complete before any spawn below, and each key is stopped at most
-    // once per tick (one row per key), so a fleet is never started while its
-    // own previous process is still draining, with no double stop or start.
+    // pass complete before any spawn in the loops below, and each key is
+    // stopped at most once per tick (one row per key), so the tick never
+    // starts a fleet while its own previous process is still draining, with
+    // no double stop or start. (A wake racing the stop phase can still spawn
+    // concurrently; that pre-existing race is settled by the spawn epoch.)
     let mut stop_keys: Vec<String> = apps
         .iter()
         .filter(|a| a.desired() == DesiredState::Stopped)

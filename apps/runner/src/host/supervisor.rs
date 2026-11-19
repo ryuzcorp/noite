@@ -3,6 +3,7 @@ use std::process::Stdio;
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 
+use futures::stream::StreamExt;
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
@@ -1184,17 +1185,33 @@ pub async fn stop_environment_fleets(procs: &ProcMap, slug: &str, grace: StopGra
     }
 }
 
+/// How many fleet stops run at once in [`stop_fleets`]. Each stop's SIGTERM
+/// drain holds no lock, so stops overlap — but an unbounded fan-out over
+/// every desired-stopped row (including long-stopped ones with no `ProcMap`
+/// entry, whose engine and cgroup cleanup still runs) would spike N
+/// concurrent cleanups per tick, the same thundering herd the serial loop had
+/// in reverse. Eight keeps slow drains overlapped while bounding that spike.
+const STOP_CONCURRENCY: usize = 8;
+
 /// Stop many fleets at once, apps and previews together. One fleet's SIGTERM
 /// drain (up to 15 s grace plus the kill fallback) holds no lock, but
 /// awaiting the stops one by one still serializes the caller behind N slow
 /// drains: a start for an unrelated fleet waits behind stops it has nothing
 /// to do with (head-of-line). The future resolves only once every drain
-/// finished, so a caller that spawns afterwards never starts a fleet while
-/// its own previous process is still draining — and each key is stopped at
-/// most once per call (callers pass one row per key), so there is no double
-/// stop or start.
+/// finished, so the tick's own spawn loops below never start a fleet while
+/// its own previous process is still draining — a wake racing this call can
+/// still spawn concurrently (that pre-existing race is settled by the spawn
+/// epoch and a retry, as before). Each key is stopped at most once per call
+/// (callers pass one row per key), so there is no double stop or start.
 pub async fn stop_fleets(procs: &ProcMap, keys: &[String], grace: StopGrace) {
-    futures::future::join_all(keys.iter().map(|key| stop_fleet(procs, key, grace))).await;
+    // Each item owns its key: a future borrowing the `map` closure's
+    // parameter could not outlive the poll that created it.
+    futures::stream::iter(keys.iter().cloned().map(|key| async move {
+        stop_fleet(procs, &key, grace).await;
+    }))
+    .buffer_unordered(STOP_CONCURRENCY)
+    .for_each(|_| async {})
+    .await;
 }
 
 /// One celld fleet to (re)spawn: identity, bucket, ports, state dir, env.
@@ -2662,6 +2679,74 @@ mod tests {
         );
         stop_gate_remove("hol-stop-a");
         stop_gate_remove("hol-stop-b");
+    }
+
+    /// `stop_fleets` overlaps drains but bounds the fan-out: no more than
+    /// `STOP_CONCURRENCY` stops run at once, however many rows the tick
+    /// lists. Ten parked stops fill exactly eight slots; the ninth must not
+    /// start until a release frees one. An unbounded fan-out enters all ten,
+    /// so the ninth `entered` wait passes instead of missing its deadline.
+    /// Gate signals and an in-flight counter only; the timeouts are the
+    /// failure detector, not synchronization.
+    #[tokio::test]
+    async fn stop_fleets_never_exceeds_its_concurrency_bound() {
+        const EXTRA: usize = 2;
+        const TOTAL: usize = STOP_CONCURRENCY + EXTRA;
+        let procs = new_procs();
+        let started = std::sync::atomic::AtomicUsize::new(0);
+        let mut gates = Vec::with_capacity(TOTAL);
+        let mut keys = Vec::with_capacity(TOTAL);
+        for i in 0..TOTAL {
+            let key = format!("hol-bound-{i}");
+            gates.push(stop_gate_register(&key));
+            keys.push(key);
+        }
+        // Waiters first: a `notify_one` before `notified()` is lost. Owned
+        // futures, consumed in stream order: the bound fills the first
+        // `STOP_CONCURRENCY` slots, so those are the ones that must enter.
+        let mut entered = Vec::with_capacity(TOTAL);
+        for gate in &gates {
+            entered.push(gate.entered.notified());
+        }
+        let finishing = tokio::spawn({
+            let (procs, keys) = (procs.clone(), keys.clone());
+            async move { stop_fleets(&procs, &keys, StopGrace::NORMAL).await }
+        });
+        // The bound fills: every slot starts its drain.
+        tokio::time::timeout(Duration::from_secs(10), async {
+            for wait in entered.drain(..STOP_CONCURRENCY) {
+                wait.await;
+                started.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        })
+        .await
+        .expect("a full bound of stops starts");
+        assert_eq!(
+            started.load(std::sync::atomic::Ordering::SeqCst),
+            STOP_CONCURRENCY,
+            "exactly one bound of stops is in flight"
+        );
+        // The rest stay queued while every slot is parked: a stored release
+        // permit cannot leak in from anywhere, so the remainder never enter.
+        // `join_all` pins the `!Unpin` waiters itself; an unbounded fan-out
+        // completes it at once, failing the `expect_err` below.
+        tokio::time::timeout(
+            Duration::from_millis(500),
+            futures::future::join_all(entered),
+        )
+        .await
+        .expect_err("no stop starts past the bound while every slot is parked");
+        for gate in &gates {
+            gate.release.notify_one();
+        }
+        tokio::time::timeout(Duration::from_secs(10), finishing)
+            .await
+            .expect("the stops finish once released")
+            .expect("the stop task joins");
+        for key in &keys {
+            assert!(!has_process(&procs, key).await, "the entry is gone: {key}");
+            stop_gate_remove(key);
+        }
     }
 
     /// A probe is claimed once: the state machine itself is the dedup that the
