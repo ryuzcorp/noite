@@ -57,7 +57,7 @@ pub struct TelemetryEvent {
 #[ts(export)]
 pub struct TelemetryProperties {
     pub version: String,
-    pub celld_version: String,
+    pub cello_version: String,
     pub arch: String,
     pub tenancy: String,
     pub storage: String,
@@ -103,7 +103,7 @@ pub struct Facts {
     pub timestamp: String,
     pub install_id: String,
     pub version: String,
-    pub celld_version: String,
+    pub cello_version: String,
     pub arch: String,
     pub tenancy: String,
     pub storage: String,
@@ -271,10 +271,10 @@ pub fn build_version() -> String {
     non_empty_env("NOITE_BUILD_VERSION").unwrap_or_else(|| "dev".to_string())
 }
 
-/// The celld version the image ships (`CELLD_VERSION` ENV); `"unknown"` when
+/// The Cello version the image ships (`CELLO_VERSION` ENV); `"unknown"` when
 /// unset (a bare `cargo run`).
-pub fn celld_version() -> String {
-    non_empty_env("CELLD_VERSION").unwrap_or_else(|| "unknown".to_string())
+pub fn cello_version() -> String {
+    non_empty_env("CELLO_VERSION").unwrap_or_else(|| "unknown".to_string())
 }
 
 fn non_empty_env(key: &str) -> Option<String> {
@@ -293,7 +293,7 @@ pub fn build_event(facts: &Facts) -> TelemetryEvent {
         timestamp: facts.timestamp.clone(),
         properties: TelemetryProperties {
             version: facts.version.clone(),
-            celld_version: facts.celld_version.clone(),
+            cello_version: facts.cello_version.clone(),
             arch: facts.arch.clone(),
             tenancy: facts.tenancy.clone(),
             storage: facts.storage.clone(),
@@ -345,7 +345,7 @@ pub async fn gather(
         timestamp: now.to_rfc3339_opts(SecondsFormat::Millis, true),
         install_id,
         version: build_version(),
-        celld_version: celld_version(),
+        cello_version: cello_version(),
         arch: std::env::consts::ARCH.to_string(),
         tenancy: cfg.tenancy.as_str().to_string(),
         storage: storage_kind(&cfg.s3_endpoint).to_string(),
@@ -493,7 +493,7 @@ mod tests {
             timestamp: "2026-10-06T00:00:00.000Z".to_string(),
             install_id: "11111111-1111-4111-8111-111111111111".to_string(),
             version: "0.1.0-alpha.3".to_string(),
-            celld_version: "0.6.1".to_string(),
+            cello_version: "0.1.0".to_string(),
             arch: std::env::consts::ARCH.to_string(),
             tenancy: "single".to_string(),
             storage: "bundled".to_string(),
@@ -591,7 +591,7 @@ mod tests {
             "timestamp": "2026-10-06T00:00:00.000Z",
             "properties": {
                 "version": "0.1.0-alpha.3",
-                "celld_version": "0.6.1",
+                "cello_version": "0.1.0",
                 "arch": std::env::consts::ARCH,
                 "tenancy": "single",
                 "storage": "bundled",

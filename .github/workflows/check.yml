@@ -54,28 +54,28 @@ jobs:
         run: bun run check
       - name: version pins
         run: bun docker/check-versions.ts ${{ inputs.changelog && '--release' || '' }}
-      # check-versions.ts proves the celld tag names a fork release and the
+      # check-versions.ts proves the Cello tag names a release and the
       # image is pulled by digest; this proves the pinned digest is what
       # that tag resolves to, not a stale or rewritten one.
-      - name: celld pin is published
+      - name: cello pin is published
         run: |
-          tag=$(sed -n 's/^ARG CELLD_VERSION=//p' docker/Dockerfile)
-          pinned=$(sed -n 's/^ARG CELLD_DIGEST=//p' docker/Dockerfile)
-          published=$(docker buildx imagetools inspect "ghcr.io/ryuzcorp/celld:$tag" --format '{{json .Manifest.Digest}}' | tr -d '"')
+          tag=$(sed -n 's/^ARG CELLO_VERSION=//p' docker/Dockerfile)
+          pinned=$(sed -n 's/^ARG CELLO_DIGEST=//p' docker/Dockerfile)
+          published=$(docker buildx imagetools inspect "ghcr.io/ryuzcorp/cello:$tag" --format '{{json .Manifest.Digest}}' | tr -d '"')
           if [ "$published" != "$pinned" ]; then
-            echo "::error::docker/Dockerfile pins celld $tag at $pinned, but ghcr.io/ryuzcorp/celld:$tag is $published"
+            echo "::error::docker/Dockerfile pins cello $tag at $pinned, but ghcr.io/ryuzcorp/cello:$tag is $published"
             exit 1
           fi
-      # The fork attests every image it publishes (ryuzcorp/celld publish.yml,
-      # SLSA provenance on the multi-arch index): verify the pinned digest
-      # carries that attestation, so the pin can only name an image the fork
+      # Cello attests every image it publishes (SLSA provenance on the
+      # multi-arch index): verify the pinned digest carries that
+      # attestation, so the pin can only name an image Cello's release
       # built.
-      - name: celld pin attestation
+      - name: cello pin attestation
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          pinned=$(sed -n 's/^ARG CELLD_DIGEST=//p' docker/Dockerfile)
-          gh attestation verify "oci://ghcr.io/ryuzcorp/celld@$pinned" --repo ryuzcorp/celld
+          pinned=$(sed -n 's/^ARG CELLO_DIGEST=//p' docker/Dockerfile)
+          gh attestation verify "oci://ghcr.io/ryuzcorp/cello@$pinned" --repo ryuzcorp/cello
       # Every other image and tarball pin, against the publisher: Node's
       # signed SHASUMS256.txt, npm's dist.integrity and the GitHub release
       # asset digest are immutable for a version, so a bump that changes a

@@ -5,7 +5,7 @@
 //! boot, bundle from the image (`/opt/noite/control/dist`), cannot be
 //! deleted. At boot: build the worker vars from the runner's config and
 //! environment, revision-gate (`sha256(bundle REVISION ‖ canonical-json(vars))`
-//! against `ui/revision` in the bucket), and `celld deploy` when it changed.
+//! against `ui/revision` in the bucket), and `cello deploy` when it changed.
 //! The control D1 lives at `s3://{bucket}/control`; the worker reaches the
 //! runner at `http://127.0.0.1:8080`.
 
@@ -133,12 +133,12 @@ pub fn revision(bundle_rev: &str, vars: &serde_json::Value) -> String {
 /// True when this image carries the baked control bundle: the release image
 /// does (`docker/Dockerfile` target `noite` copies `dist`), the dev image does
 /// not (`vite dev` serves the UI on the same port). `main` then deploys and
-/// supervises no control fleet at all — no control celld, therefore no control
+/// supervises no control fleet at all — no control node, therefore no control
 /// telemetry — and surfaces that on `GET /v1/admin/stats` as `control_fleet` so
 /// the UI says so instead of showing empty charts.
 pub fn bundle_present(cfg: &Config) -> bool {
     // `dist/wrangler.json` (or `.jsonc`) at the bundle root is what
-    // `celld deploy` reads; a build that only emits `dist/ssr/wrangler.json`
+    // `cello deploy` reads; a build that only emits `dist/ssr/wrangler.json`
     // is not deployable, and `main` says so on `/ready` instead of skipping.
     // `apps/noite/scripts/emit-celld-config.ts` derives that root manifest
     // after `vite build` (it must run outside Vite: a `closeBundle` hook
@@ -148,7 +148,7 @@ pub fn bundle_present(cfg: &Config) -> bool {
 }
 
 /// Deploy the baked bundle when revision differs, then return the vars.
-/// Runner-owned tool path (`celld deploy` via run_cmd, env_clear + explicit).
+/// Runner-owned tool path (`cello deploy` via run_cmd, env_clear + explicit).
 pub async fn ensure_deployed(cfg: &Config) -> anyhow::Result<serde_json::Value> {
     let dist = PathBuf::from(&cfg.control_bundle_dir);
     if !bundle_present(cfg) {
@@ -234,7 +234,7 @@ pub async fn ensure_deployed(cfg: &Config) -> anyhow::Result<serde_json::Value> 
 /// Apply the control app's D1 migrations through the worker's Void endpoints
 /// (`/__void/migrate/app`, then `/auth` when advertised). Call it once the
 /// control fleet is supervised: the endpoint is the worker itself, so it only
-/// answers after celld has adopted the deployment pointer. The image's
+/// answers after Cello has adopted the deployment pointer. The image's
 /// `db/migrations` is hashed and compared with the worker's advertised list,
 /// exactly like a tenant deploy: a mismatch means the copied files and the
 /// built bundle disagree, and boot fails before the UI serves a wrong schema.
@@ -476,12 +476,12 @@ async fn copy_dir(src: &Path, dst: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Control fleet #0: celld with the public listener on loopback (Caddy is in
+/// Control fleet #0: Cello with the public listener on loopback (Caddy is in
 /// the same container) and the internal one on the private address (see
 /// `control_advertise`). Supervised: restarted on exit, stopped with the
 /// fleets on shutdown. It runs the same telemetry environment as a tenant
 /// fleet (`metrics::otel_env`), so its Parquet lands under
-/// `s3://<bucket>/control/telemetry/...` (celld writes `telemetry/` relative
+/// `s3://<bucket>/control/telemetry/...` (Cello writes `telemetry/` relative
 /// to `--bucket`) and the ingest, compaction, error grouping and prune treat
 /// it as one more source — keyed `_control`, with no `app` row. Its pid is
 /// mirrored into `control_pid` and its stdout+stderr into the shared log
@@ -501,8 +501,8 @@ pub fn supervise(
     let fleet_cfg = config.clone();
     // Fleet #0 is a resident like any tenant fleet: give it its own leaf and
     // cap when the install has writable cgroups. Created before the spawn so
-    // the env can say `CELLD_MEMORY_SCOPE=self`; the pid moves in right
-    // after the spawn (a celld node is one thread group, so the move takes
+    // the env can say `CELLO_MEMORY_SCOPE=self`; the pid moves in right
+    // after the spawn (a Cello node is one thread group, so the move takes
     // every thread). Without cgroups the control fleet shares the container
     // cgroup and the env carries the container-wide shed threshold instead.
     let control_leaf = crate::host::cgroups::anchor().and_then(|anchor| {
@@ -556,7 +556,7 @@ pub fn supervise(
         move || {
             let state_dir = "/data/control";
             let _ = std::fs::create_dir_all(state_dir);
-            // The control fleet's operator token for `make doctor`'s `celld
+            // The control fleet's operator token for `make doctor`'s `cello
             // diagnose` (an in-tree internal client that authenticates from
             // its own env): rewritten on every spawn so it never drifts from
             // the ensured row. Root-only: tenants must never read it. Empty
@@ -578,7 +578,7 @@ pub fn supervise(
                 // Its own process group, like a tenant fleet's: the boot
                 // sweep group-kills the previous run's control fleet, and a
                 // group signal can never reach the runner. Shutdown still
-                // signals the leader only; celld shuts its workers down on
+                // signals the leader only; Cello shuts its workers down on
                 // SIGTERM either way.
                 cmd.as_std_mut().process_group(0);
                 // Boot-reap identity, like a tenant fleet's
@@ -589,7 +589,7 @@ pub fn supervise(
             }
             // Explicit environment only (`host::fleet_env`): the spawn
             // inherits nothing — no `RUNNER_TOKEN`, no operator-global
-            // `CELLD_*` — and the store credentials the spawn used to
+            // `CELLO_*` — and the store credentials the spawn used to
             // inherit are passed explicitly. This `apply` call is
             // load-bearing (nothing here fails if it is dropped): the
             // builder and the spawn-path tests in `host::fleet_env` pin
@@ -612,8 +612,8 @@ pub fn supervise(
 }
 
 /// Where the runner publishes the control fleet's operator token for
-/// `make doctor`'s `celld diagnose`: under the runner work dir, not the
-/// node's `CELLD_WATCH` working dir (whose contents celld owns).
+/// `make doctor`'s `cello diagnose`: under the runner work dir, not the
+/// node's `CELLO_WATCH` working dir (whose contents Cello owns).
 fn operator_token_path(work_dir: &str) -> std::path::PathBuf {
     std::path::Path::new(work_dir).join("control-operator-token")
 }
@@ -634,7 +634,7 @@ fn write_operator_token_file(work_dir: &str, token: &str) {
         let _ = std::fs::create_dir_all(parent);
     }
     if let Err(e) = write_private_atomically(&path, token.as_bytes()) {
-        tracing::warn!(path = %path.display(), error = %e, "could not write the control operator token file; `make doctor`'s celld diagnose will fail its peer probes");
+        tracing::warn!(path = %path.display(), error = %e, "could not write the control operator token file; `make doctor`'s cello diagnose will fail its peer probes");
     }
 }
 
@@ -642,7 +642,7 @@ fn write_operator_token_file(work_dir: &str, token: &str) {
 /// else, not even while it is written: a fresh temp file is created with
 /// mode `0600` (no umask window), filled, synced, then renamed over `path`,
 /// so readers see the old file or the whole new one. Exact bytes, no
-/// trailing newline: celld refuses a token with surrounding whitespace, and
+/// trailing newline: Cello refuses a token with surrounding whitespace, and
 /// `$(cat …)` must reproduce it verbatim.
 fn write_private_atomically(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
@@ -692,7 +692,7 @@ pub fn spawn_args(cfg: &Config) -> Vec<String> {
 /// on this listener is closed to tenant code by the fleet egress policy
 /// (loopback and private ranges, IPv6 ULA included), not by the bind.
 pub fn control_advertise() -> String {
-    let host = std::env::var("CELLD_ADVERTISE")
+    let host = std::env::var("CELLO_ADVERTISE")
         .ok()
         .filter(|v| !v.trim().is_empty())
         .or_else(|| {
@@ -788,7 +788,7 @@ mod tests {
             std::env::temp_dir().join(format!("noite-control-bundle-{}", crate::models::new_id()));
         cfg.control_bundle_dir = dir.to_string_lossy().into_owned();
         // The dev image has the env var but no bundle: nothing to deploy, no
-        // control celld, no control telemetry.
+        // control node, no control telemetry.
         assert!(!bundle_present(&cfg));
         std::fs::create_dir_all(&dir).expect("temp dir");
         assert!(!bundle_present(&cfg));

@@ -3,11 +3,8 @@
 # install in one container. The runner is PID 1 (under tini) and owns every
 # other process:
 #
-#   runner (uid 0, tini)  deploy pipeline, API, git, reconcile, telemetry
-#   ├── caddy             edge: TLS, routing (admin 127.0.0.1:2019)
-#   ├── celld             control UI, fleet #0 (127.0.0.1:8090)
-#   ├── celld × N         tenant fleets (uid 10020)
-#   └── bun / node / sh   tenant builds and release commands (uid 10030+, one per app)
+#   ├── cello             control UI, fleet #0 (127.0.0.1:8090)
+#   ├── cello × N         tenant fleets (uid 10020)
 #
 # Targets:
 #   noite (default)  the published image
@@ -16,21 +13,20 @@
 #                    docker/dev.sh runs the runner (cargo watch) and the
 #                    control UI (vite dev) side by side.
 #
-# One celld, one Caddy, one Node, one jup, one npm, one pnpm, one bun and one
+# One Cello, one Caddy, one Node, one jup, one npm, one pnpm, one bun and one
 # docker CLI pin; docker/check-versions.ts asserts they appear exactly once.
 # The esbuild sidecar version lives in docker/install-sidecars.sh.
-# celld comes from the ryuzcorp/celld fork (SPEC, celld): upstream
-# denoland/celld at 0.6.3 plus the fork's patches, published as
-# `<version>-ryuzcorp.<level>` with SLSA provenance attestations. The two
+# Cello comes from ryuzcorp/cello 0.1.0 (docs https://cello.ryuz.eu; SPEC,
+# Cello), published with SLSA provenance attestations. The two
 # ARG lines below are the single source of the pin: a bump changes only
-# these values (the tag, then the digest from the fork's publish summary).
-# docker/check-versions.ts asserts the fork tag format and the digest pin,
+# these values (the tag, then the digest from the release's publish summary).
+# docker/check-versions.ts asserts the tag format and the digest pin,
 # and CI verifies the digest is what the tag resolves to plus its
-# attestation. A lab build of an unpublished fork tip overrides CELLD_IMAGE
+# attestation. A lab build of an unpublished tip overrides CELLO_IMAGE
 # with a local image.
-ARG CELLD_VERSION=0.6.3-ryuzcorp.12
-ARG CELLD_DIGEST=sha256:01c9da9e41e4db13c31b31a7a5815e07d03deb6f3557ce3d6f536ea6df4efc50
-ARG CELLD_IMAGE=ghcr.io/ryuzcorp/celld:${CELLD_VERSION}@${CELLD_DIGEST}
+ARG CELLO_VERSION=0.1.0
+ARG CELLO_DIGEST=sha256:3d6943b69b2201f8980f73178d3530c4b7f558c2bcb3cbb99badbc67deb87689
+ARG CELLO_IMAGE=ghcr.io/ryuzcorp/cello:${CELLO_VERSION}@${CELLO_DIGEST}
 # Noite's own release version, reported by the instance heartbeat
 # (`NOITE_BUILD_VERSION` ENV in the runtime stages): the tag without `v` on a
 # release build (images.yml passes it), `dev` otherwise.
@@ -57,8 +53,8 @@ ARG NODE_DIGEST=sha256:dc26ae92c9fb15cf6b1d63e20f0944b2efe0f115b20e00be48fb23fce
 ARG RUST_VERSION=1
 ARG RUST_DIGEST=sha256:ade39a710ef85f3506cffcfec3e8a24ba090badef1dff2fb798f71d878833fea
 ARG BUN_VERSION=1.4
-ARG BUN_DEBIAN_DIGEST=sha256:93d5032fe06d163427822dc1598f420363759bb18155c9cc90eb1be05a64a19e
-ARG BUN_SLIM_DIGEST=sha256:1846adf22496bd711036aae8be147e57bdebbaea2e5264e3e0b5af1db187d9a4
+ARG BUN_DEBIAN_DIGEST=sha256:3dddea58e1f8f2240eca906b023fedb944f9a8352515a35309fd0c879fe00aaa
+ARG BUN_SLIM_DIGEST=sha256:b780593f3e10918cbdaec3d5a08d52224b9198069a65eb47812085c2ec007643
 # jup (https://github.com/unjs/jup) runs the tenant's npm, pnpm or Yarn at
 # the version the project pins. The npm tarball's sha512, as hex.
 ARG JUP_VERSION=0.6.6
@@ -71,15 +67,15 @@ ARG NPM_VERSION=12.2.2
 ARG NPM_SHA512=2a09606d9c9a71fee31fe147b8d46a56e0b3422f15848d9aec9f3b231e3716c3d3b99a065a62175c6759b4150e03bf6fc0bf8825112a511573ba903b3ec41370
 ARG PNPM_VERSION=12.18.0
 ARG PNPM_SHA512=9d7882d5dc82147ecfc4e062aa34834e0ad0296710a1837a1115ae012127d36b7109e321ac1598a1dd0a65597681b1e99917e12ed0d749eae91187943363beb3
-# docker CLI: celld drives tenant Sandbox containers through the host's
-# engine (`celld deploy` pulls images, the fence installs its nftables
+# docker CLI: Cello drives tenant Sandbox containers through the host's
+# engine (`cello deploy` pulls images, the fence installs its nftables
 # rules), so the image needs the CLI and the compose file mounts the host
 # socket. Pinned against the signed apt repo (docker/check-versions.ts
 # asserts it); the revision carries the base's Debian release, so a base
 # move needs a repin.
 ARG DOCKER_VERSION=5:29.9.3-1~debian.13~trixie
 
-FROM ${CELLD_IMAGE} AS celld
+FROM ${CELLO_IMAGE} AS cello
 
  # --- Caddy with the edge route-table module ----------------------------------
  # Built on the build host's platform and cross-compiled for the target, so an
@@ -182,7 +178,7 @@ ARG PNPM_VERSION
 ARG PNPM_SHA512
 # Re-declared so they can be read after FROM: the global defaults (or the
 # --build-arg values) are what the ENV block below bakes in.
-ARG CELLD_VERSION
+ARG CELLO_VERSION
 ARG DOCKER_VERSION
 # bun: tenant `bun install` / builds. node: real Node (not bun's shim) for
 # tenant steps that need it, e.g. loading `cloudflare.config.ts` (the `cf`
@@ -268,7 +264,7 @@ RUN useradd -u 10020 -m -s /bin/sh fleet \
        echo "noite-build-${uid}:x:${uid}:" >> /etc/group; \
      done \
   && mkdir -p /data /opt/noite/control
-COPY --from=celld /usr/local/bin/celld /usr/local/bin/celld
+COPY --from=cello /usr/local/bin/cello /usr/local/bin/cello
 COPY --from=caddy-build /out/caddy /usr/local/bin/caddy
 RUN caddy version && caddy list-modules | grep -qx 'http.handlers.edge_routes'
 # Apache-2.0 §4(a): a distributed image carries a copy of the License, and
@@ -280,9 +276,9 @@ WORKDIR /data
 # hardcodes those upstreams. These are the paths it reads and writes.
 ENV RUNNER_BIND=0.0.0.0:8080 \
     PATH="/usr/local/bin:${PATH}" \
-    CELLD_ESBUILD=/usr/local/bin/esbuild \
+    CELLO_ESBUILD=/usr/local/bin/esbuild \
     NOITE_BUILD_VERSION="${NOITE_BUILD_VERSION}" \
-    CELLD_VERSION="${CELLD_VERSION}" \
+    CELLO_VERSION="${CELLO_VERSION}" \
     NOITE_DB=/data/noite.sqlite \
     RUNNER_WORK_DIR=/data/runner \
     CONTROL_BUNDLE_DIR=/opt/noite/control/dist \

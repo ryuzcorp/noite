@@ -66,7 +66,7 @@ test(
 
     const streamed = await pageStream;
     expect(streamed.status()).toBe(200);
-    await expect(page.getByText("celld listening")).toBeVisible({
+    await expect(page.getByText("cello listening")).toBeVisible({
       timeout: 60_000,
     });
     await expect(page.getByText("Log stream disconnected")).toBeHidden();
@@ -86,7 +86,7 @@ test(
       timeout: 60_000,
     });
     // "Running" means the fleet is spawned, not yet listening: a read in that
-    // gap is reset on the raw port, so give celld its boot before failing.
+    // gap is reset on the raw port, so give cello its boot before failing.
     await expect(async () => {
       const restarted = await readSampleApp(request, port);
       expect(Number.isInteger(restarted.n)).toBe(true);

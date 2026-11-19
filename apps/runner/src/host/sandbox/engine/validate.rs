@@ -1,6 +1,6 @@
-//! What a fleet may ask the engine: the exact Engine API surface celld
-//! 0.6.3 uses (`/tmp/celld-src/crates/celld/container.rs`, `docker.rs`), no
-//! more. Pure functions over method/path/query/JSON so tests pin every
+//! What a fleet may ask the engine: the exact Engine API surface Cello
+//! 0.1.0 uses (`crates/cello/container.rs`, `docker.rs` in ryuzcorp/cello),
+//! no more. Pure functions over method/path/query/JSON so tests pin every
 //! accept and every refusal without a socket; [`super`] wires them to the
 //! proxy loop.
 
@@ -9,35 +9,38 @@ use std::net::Ipv4Addr;
 use bytes::Bytes;
 use serde_json::Value;
 
-use super::super::{install, FLEET_LABEL, INSTALL_LABEL};
+use super::super::{
+    install, FLEET_LABEL, INSTALL_LABEL, INTERNAL_BRIDGE, INTERNAL_NETWORK, OPEN_BRIDGE,
+    OPEN_NETWORK,
+};
 
-/// celld 0.6.3's fence ruleset, byte-identical to `FENCE_RULES` in
-/// `crates/celld/container.rs:146-160`. The fence installer is the one
+/// Cello 0.1.0's fence ruleset, byte-identical to `FENCE_RULES` in
+/// `crates/cello/container.rs`. The fence installer is the one
 /// create a fleet may make outside the locked-down app shape, and its only
-/// authority is that these rules are exactly celld's own: a celld bump must
+/// authority is that these rules are exactly Cello's own: a Cello bump must
 /// re-verify this constant before the proxy accepts the new version's
 /// installer.
-pub const FENCE_RULES: &str = r#"table inet celld
-delete table inet celld
-table inet celld {
+pub const FENCE_RULES: &str = r#"table inet cello
+delete table inet cello
+table inet cello {
   chain input {
     type filter hook input priority -10; policy accept;
-    iifname { "celld0", "celld1" } ct state established,related accept
-    iifname { "celld0", "celld1" } reject
+    iifname { "cello0", "cello1" } ct state established,related accept
+    iifname { "cello0", "cello1" } reject
   }
   chain forward {
     type filter hook forward priority -10; policy accept;
-    iifname { "celld0", "celld1" } ip daddr { 169.254.0.0/16, 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 100.64.0.0/10 } reject
-    iifname { "celld0", "celld1" } ip6 daddr { fe80::/10, fc00::/7 } reject
+    iifname { "cello0", "cello1" } ip daddr { 169.254.0.0/16, 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 100.64.0.0/10 } reject
+    iifname { "cello0", "cello1" } ip6 daddr { fe80::/10, fc00::/7 } reject
   }
 }
 "#;
 
-/// The fence installer's command, exactly as celld 0.6.3 builds it
-/// (`container.rs:697`).
-const FENCE_CMD: &str = "printf '%s' \"$CELLD_NFT\" | nft -f -";
+/// The fence installer's command, exactly as Cello 0.1.0 builds it
+/// (`container.rs`).
+const FENCE_CMD: &str = "printf '%s' \"$CELLO_NFT\" | nft -f -";
 
-/// Strip an optional `/v1.NN` API prefix for matching. celld sends
+/// Strip an optional `/v1.NN` API prefix for matching. Cello sends
 /// unversioned paths; a versioned caller is matched (and forwarded) on the
 /// unversioned remainder.
 pub fn strip_api_version(path: &str) -> &str {
@@ -55,7 +58,7 @@ pub fn strip_api_version(path: &str) -> &str {
     }
 }
 
-/// A per-container operation celld performs on its own containers.
+/// A per-container operation Cello performs on its own containers.
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum ContainerOp {
     Start,
@@ -87,15 +90,16 @@ pub enum Route<'a> {
     /// `POST /exec/{id}/resize` for a remembered exec id, with its query
     /// rebuilt by [`validate_exec_resize_query`].
     ExecResize { id: &'a str },
-    /// `GET /images/{name}/json` for a celld content tag.
+    /// `GET /images/{name}/json` for a `celld-image:` content tag (the prefix
+    /// is frozen across the rename).
     ImageInspect { name: &'a str },
     /// `POST /images/load`: always refused (the runner deployed the images).
     ImageLoad,
-    /// `GET /networks/{name}` for a celld bridge.
+    /// `GET /networks/{name}` for a Cello bridge.
     NetworkInspect { name: &'a str },
-    /// `POST /networks/create` with celld's exact bridge body.
+    /// `POST /networks/create` with Cello's exact bridge body.
     NetworkCreate,
-    /// Anything else: refused, with the reason celld sees after `noite: `.
+    /// Anything else: refused, with the reason Cello sees after `noite: `.
     Refused(&'static str),
 }
 
@@ -169,17 +173,17 @@ pub fn create_name(query: Option<&str>) -> Result<Option<String>, String> {
     Ok(Some(value.to_string()))
 }
 
-/// celld's container names: `celld-` plus 24 hex digits (96 bits of
-/// `sha256("node\nscope")`, `container.rs:1584-1587`).
+/// Cello's container names: `cello-` plus 24 hex digits (96 bits of
+/// `sha256("node\nscope")`, `container.rs`).
 fn valid_container_name(name: &str) -> bool {
-    let Some(hex) = name.strip_prefix("celld-") else {
+    let Some(hex) = name.strip_prefix("cello-") else {
         return false;
     };
     hex.len() == 24 && hex.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
-/// A celld content tag: `celld-image:` plus the 64 hex digits of the layer +
-/// config hash (`deploy.rs:790-843`).
+/// A Cello content tag: `celld-image:` plus the 64 hex digits of the layer +
+/// config hash (`deploy.rs`). The tag prefix is frozen across the rename.
 pub fn valid_image_name(name: &str) -> bool {
     let Some(hex) = name.strip_prefix("celld-image:") else {
         return false;
@@ -187,9 +191,10 @@ pub fn valid_image_name(name: &str) -> bool {
     hex.len() == 64 && hex.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
-/// The two bridges celld joins its containers to.
+/// The two bridges Cello joins its containers to (the sandbox plane, relay
+/// and gateway read the same constants).
 pub fn valid_network_name(name: &str) -> bool {
-    name == "celld" || name == "celld-internal"
+    name == OPEN_NETWORK || name == INTERNAL_NETWORK
 }
 
 /// Rewrite a `GET /containers/json` query so the list can only return this
@@ -258,7 +263,7 @@ pub fn rewrite_list_query(query: Option<&str>, fleet: &str) -> String {
     kept.join("&")
 }
 
-/// Decode `%XX` sequences. `+` stays literal: celld encodes with
+/// Decode `%XX` sequences. `+` stays literal: Cello encodes with
 /// `NON_ALPHANUMERIC`, which never emits a bare `+`.
 fn percent_decode(raw: &str) -> Result<String, ()> {
     let bytes = raw.as_bytes();
@@ -278,7 +283,7 @@ fn percent_decode(raw: &str) -> Result<String, ()> {
     String::from_utf8(out).map_err(|_| ())
 }
 
-/// Encode like celld's `NON_ALPHANUMERIC`: alphanumerics stay, every other
+/// Encode like Cello's `NON_ALPHANUMERIC`: alphanumerics stay, every other
 /// byte becomes `%XX`.
 pub(crate) fn percent_encode(raw: &str) -> String {
     let mut out = String::with_capacity(raw.len());
@@ -308,9 +313,9 @@ fn is_string_array(value: &Value) -> bool {
         .is_some_and(|items| items.iter().all(|item| item.is_string()))
 }
 
-/// Validate an app-container create body (celld `container.rs:1040-1098`),
+/// Validate an app-container create body (`container.rs` in ryuzcorp/cello),
 /// returning it with the fleet label injected. The shape is exactly what
-/// celld 0.6.3 sends: anything else — privilege, host namespaces, mounts,
+/// Cello 0.1.0 sends: anything else — privilege, host namespaces, mounts,
 /// devices, port bindings, a caller-supplied runtime or resolv.conf bind —
 /// is refused.
 pub fn validate_app_create(body: &Value, fleet: &str) -> Result<Value, String> {
@@ -366,12 +371,12 @@ pub fn validate_app_create(body: &Value, fleet: &str) -> Result<Value, String> {
     Ok(body)
 }
 
-/// The locked-down app-container `HostConfig` (celld `container.rs:1040-1051`
-/// plus the instance-type limits at `1085-1089`). The security boundary —
+/// The locked-down app-container `HostConfig` (`container.rs` in
+/// ryuzcorp/cello, plus the instance-type limits). The security boundary —
 /// bridge, dropped capabilities, no-new-privileges, pid ceiling — is
 /// required; the harmless scheduling keys are validated when present.
 /// `Runtime` and `Binds` are refused outright: Noite sets no container
-/// runtime or DNS, so celld 0.6.3 never sends them, and either would hand a
+/// runtime or DNS, so Cello 0.1.0 never sends them, and either would hand a
 /// fleet host paths or a weaker runtime.
 fn validate_app_host_config(host: &serde_json::Map<String, Value>) -> Result<(), String> {
     if let Some(key) = keys_subset(
@@ -391,8 +396,8 @@ fn validate_app_host_config(host: &serde_json::Map<String, Value>) -> Result<(),
         return Err(format!("HostConfig takes no {key:?}"));
     }
     match host.get("NetworkMode").and_then(Value::as_str) {
-        Some("celld" | "celld-internal") => {}
-        _ => return Err("HostConfig NetworkMode must be celld or celld-internal".to_string()),
+        Some(OPEN_NETWORK | INTERNAL_NETWORK) => {}
+        _ => return Err("HostConfig NetworkMode must be cello or cello-internal".to_string()),
     }
     if host.get("CapDrop") != Some(&Value::Array(vec![Value::String("ALL".to_string())])) {
         return Err("HostConfig CapDrop must be [\"ALL\"]".to_string());
@@ -419,7 +424,7 @@ fn validate_app_host_config(host: &serde_json::Map<String, Value>) -> Result<(),
         }
     }
     // Every container has limits, never above the largest instance type
-    // celld knows (`standard-4`: 4 vCPU, 12 GiB; `container.rs:77-88`):
+    // Cello knows (`standard-4`: 4 vCPU, 12 GiB; `container.rs`):
     // absent or zero would mean unlimited on the daemon, and a huge value
     // the same in practice. Swap is never extended beyond memory.
     let cpus = host.get("NanoCpus").and_then(Value::as_u64);
@@ -436,20 +441,21 @@ fn validate_app_host_config(host: &serde_json::Map<String, Value>) -> Result<(),
     Ok(())
 }
 
-/// The largest instance type celld knows (`standard-4`), as the daemon's
+/// The largest instance type Cello knows (`standard-4`), as the daemon's
 /// `NanoCpus` and `Memory` values.
 const MAX_NANO_CPUS: u64 = 4_000_000_000;
 const MAX_MEMORY_BYTES: u64 = 12 * 1024 * 1024 * 1024;
 
-/// Validate the fence installer's create body (celld `container.rs:694-700`)
-/// and return the body Noite actually creates. This is the one host-network,
-/// `NET_ADMIN` container a fleet may ask for, so only celld's installer
-/// verbatim passes (node label aside, every byte is pinned, above all the
-/// ruleset) and its image is replaced by `trusted_image`, the runner's own:
-/// a `celld-image:` tag is whatever image a tenant deployed, and its `sh`
-/// or `nft` would otherwise run in the host netns with `NET_ADMIN`. The
-/// runner image carries `sh` and `nft`; the entrypoint is set explicitly
-/// because that image's own entrypoint is the runner.
+/// Validate the fence installer's create body (`container.rs` in
+/// ryuzcorp/cello) and return the body Noite actually creates. This is the
+/// one host-network, `NET_ADMIN` container a fleet may ask for, so only
+/// Cello's installer verbatim passes (node label aside, every byte is pinned,
+/// above all the ruleset) and its image is replaced by `trusted_image`, the
+/// runner's own: a `celld-image:` tag is whatever image a tenant deployed
+/// (the prefix is frozen across the rename), and its `sh` or `nft` would
+/// otherwise run in the host netns with `NET_ADMIN`. The runner image
+/// carries `sh` and `nft`; the entrypoint is set explicitly because that
+/// image's own entrypoint is the runner.
 pub fn validate_fence_create(
     body: &Value,
     fleet: &str,
@@ -461,51 +467,51 @@ pub fn validate_fence_create(
     if object.len() != 5
         || keys_subset(object, &["Image", "Env", "Cmd", "Labels", "HostConfig"]).is_some()
     {
-        return Err("fence body must be exactly celld's installer".to_string());
+        return Err("fence body must be exactly Cello's installer".to_string());
     }
     let image = object.get("Image").and_then(Value::as_str).unwrap_or("");
     if !image.starts_with("celld-image:") {
         return Err("fence Image must be a celld-image: tag".to_string());
     }
-    let env = [format!("CELLD_NFT={FENCE_RULES}")];
+    let env = [format!("CELLO_NFT={FENCE_RULES}")];
     if object.get("Env") != Some(&Value::Array(env.map(Value::String).to_vec())) {
-        return Err("fence Env must be exactly celld's ruleset".to_string());
+        return Err("fence Env must be exactly Cello's ruleset".to_string());
     }
     let cmd = ["sh", "-c", FENCE_CMD]
         .map(String::from)
         .map(Value::String)
         .to_vec();
     if object.get("Cmd") != Some(&Value::Array(cmd)) {
-        return Err("fence Cmd must be exactly celld's installer".to_string());
+        return Err("fence Cmd must be exactly Cello's installer".to_string());
     }
     let labels = object.get("Labels").and_then(Value::as_object);
     let Some(labels) = labels else {
-        return Err("fence Labels must be exactly celld's installer".to_string());
+        return Err("fence Labels must be exactly Cello's installer".to_string());
     };
     if labels.len() != 2
-        || !labels.get("celld.node").is_some_and(Value::is_string)
-        || labels.get("celld.fence") != Some(&Value::String("1".to_string()))
+        || !labels.get("cello.node").is_some_and(Value::is_string)
+        || labels.get("cello.fence") != Some(&Value::String("1".to_string()))
     {
-        return Err("fence Labels must be exactly celld's installer".to_string());
+        return Err("fence Labels must be exactly Cello's installer".to_string());
     }
     let host = object.get("HostConfig").and_then(Value::as_object);
     let Some(host) = host else {
-        return Err("fence HostConfig must be exactly celld's installer".to_string());
+        return Err("fence HostConfig must be exactly Cello's installer".to_string());
     };
     if host.len() != 2
         || host.get("NetworkMode") != Some(&Value::String("host".to_string()))
         || host.get("CapAdd") != Some(&Value::Array(vec![Value::String("NET_ADMIN".to_string())]))
     {
-        return Err("fence HostConfig must be exactly celld's installer".to_string());
+        return Err("fence HostConfig must be exactly Cello's installer".to_string());
     }
-    let node = labels.get("celld.node").cloned().unwrap_or(Value::Null);
+    let node = labels.get("cello.node").cloned().unwrap_or(Value::Null);
     Ok(serde_json::json!({
         "Image": trusted_image,
         "Entrypoint": ["sh", "-c", FENCE_CMD],
-        "Env": [format!("CELLD_NFT={FENCE_RULES}")],
+        "Env": [format!("CELLO_NFT={FENCE_RULES}")],
         "Labels": {
-            "celld.node": node,
-            "celld.fence": "1",
+            "cello.node": node,
+            "cello.fence": "1",
             FLEET_LABEL: fleet,
             INSTALL_LABEL: install(),
         },
@@ -513,12 +519,12 @@ pub fn validate_fence_create(
     }))
 }
 
-/// Validate an exec-create body (celld `exec_create_body`,
-/// `container.rs:1925`, plus the attachless kill form at `1973`): the stdio
+/// Validate an exec-create body (Cello `exec_create_body`,
+/// `container.rs`, plus the attachless kill form): the stdio
 /// wiring, command, environment, directory and user — no privilege bit, no
 /// detach extras. The kill form is `sh -c` over a `/proc` scan for the
-/// exec's `CELLD_EXEC_ID` marker, run as the exec's user when it had one.
-/// `Tty` may be true (a PTY exec, whose attach flags celld sends exactly as
+/// exec's `CELLO_EXEC_ID` marker, run as the exec's user when it had one.
+/// `Tty` may be true (a PTY exec, whose attach flags Cello sends exactly as
 /// for a plain one) or false.
 pub fn validate_exec_create(body: &Value) -> Result<(), String> {
     let Some(object) = body.as_object() else {
@@ -573,10 +579,9 @@ pub fn validate_exec_create(body: &Value) -> Result<(), String> {
     Ok(())
 }
 
-/// Validate an exec-start body: celld's hijacked form
-/// (`{"Detach": false, "Tty": false}`, `container.rs:1793`, or `"Tty": true`
-/// for a PTY exec) and its kill-via-exec form (`{"Detach": true}`,
-/// `container.rs:2020`).
+/// Validate an exec-start body: Cello's hijacked form
+/// (`{"Detach": false, "Tty": false}`, `container.rs`, or `"Tty": true`
+/// for a PTY exec) and its kill-via-exec form (`{"Detach": true}`).
 pub fn validate_exec_start(body: &Value) -> Result<(), String> {
     let Some(object) = body.as_object() else {
         return Err("exec start body must be an object".to_string());
@@ -598,7 +603,7 @@ pub fn validate_exec_start(body: &Value) -> Result<(), String> {
 }
 
 /// Validate a `POST /exec/{id}/resize` query and rebuild it canonically:
-/// exactly one `h` (rows) and one `w` (cols), each `1..=65535`, as celld
+/// exactly one `h` (rows) and one `w` (cols), each `1..=65535`, as Cello
 /// sends them (`/exec/{id}/resize?h={rows}&w={cols}`). Missing, extra or
 /// duplicate parameters, and non-numeric or out-of-range dimensions, are
 /// refused; the proxy forwards only the rebuilt query, so nothing unseen
@@ -638,7 +643,7 @@ pub fn validate_exec_resize_query(query: Option<&str>) -> Result<String, String>
     }
 }
 
-/// Validate a bridge create body: exactly celld's (`container.rs:650-658`)
+/// Validate a bridge create body: exactly Cello's (`container.rs`)
 /// for one of the two bridges, with the matching isolation flag and host
 /// interface name. The runner owns the bridges; anything else is refused.
 pub fn validate_network_create(body: &Value) -> Result<(), String> {
@@ -648,30 +653,34 @@ pub fn validate_network_create(body: &Value) -> Result<(), String> {
     if object.len() != 4
         || keys_subset(object, &["Name", "Driver", "Internal", "Options"]).is_some()
     {
-        return Err("network body must be exactly celld's bridge".to_string());
+        return Err("network body must be exactly Cello's bridge".to_string());
     }
     let name = object.get("Name").and_then(Value::as_str).unwrap_or("");
     if !valid_network_name(name) {
-        return Err("network Name must be celld or celld-internal".to_string());
+        return Err("network Name must be cello or cello-internal".to_string());
     }
     if object.get("Driver") != Some(&Value::String("bridge".to_string())) {
         return Err("network Driver must be bridge".to_string());
     }
-    let internal = name == "celld-internal";
+    let internal = name == INTERNAL_NETWORK;
     if object.get("Internal") != Some(&Value::Bool(internal)) {
         return Err("network Internal must match its bridge".to_string());
     }
-    let bridge = if internal { "celld1" } else { "celld0" };
+    let bridge = if internal {
+        INTERNAL_BRIDGE
+    } else {
+        OPEN_BRIDGE
+    };
     let options = object.get("Options").and_then(Value::as_object);
     let Some(options) = options else {
-        return Err("network Options must be exactly celld's bridge".to_string());
+        return Err("network Options must be exactly Cello's bridge".to_string());
     };
     if options.len() != 2
         || options.get("com.docker.network.bridge.enable_icc")
             != Some(&Value::String("false".to_string()))
         || options.get("com.docker.network.bridge.name") != Some(&Value::String(bridge.to_string()))
     {
-        return Err("network Options must be exactly celld's bridge".to_string());
+        return Err("network Options must be exactly Cello's bridge".to_string());
     }
     Ok(())
 }
@@ -694,12 +703,18 @@ pub fn without_network_members(body: &[u8]) -> Bytes {
     Bytes::from(value.to_string())
 }
 
-/// Whether an inspected container is celld's fence installer: its label, or
+/// Whether an inspected container is a fence installer: its label, or
 /// host networking (no app container is ever created with it).
 pub fn inspect_is_fence(info: &Value) -> bool {
-    let labelled = ["/Config/Labels/celld.fence", "/Labels/celld.fence"]
-        .iter()
-        .any(|pointer| info.pointer(pointer).is_some());
+    let labelled = [
+        "/Config/Labels/cello.fence",
+        "/Labels/cello.fence",
+        // Pre-0.1.0 fence containers, reaped after the upgrade.
+        "/Config/Labels/celld.fence",
+        "/Labels/celld.fence",
+    ]
+    .iter()
+    .any(|pointer| info.pointer(pointer).is_some());
     labelled || info.pointer("/HostConfig/NetworkMode") == Some(&Value::String("host".into()))
 }
 
@@ -753,7 +768,7 @@ mod tests {
         "celld-image:6a76000000000000000000000000000000000000000000000000000000000000";
     const NODE: &str = "node-test-1";
 
-    /// celld 0.6.3's app-container create body (`container.rs:1040-1098`) for
+    /// Cello 0.1.0's app-container create body (`container.rs`) for
     /// the default `dev` instance type, with a tenant entrypoint.
     fn app_create_body() -> Value {
         json!({
@@ -768,13 +783,13 @@ mod tests {
                 "MODEL=faux",
             ],
             "Labels": {
-                "celld.node": NODE,
-                "celld.cell": "cell-scope-1",
-                "celld.class": "Sandbox",
-                "celld.user.owner": "tenant",
+                "cello.node": NODE,
+                "cello.cell": "cell-scope-1",
+                "cello.class": "Sandbox",
+                "cello.user.owner": "tenant",
             },
             "HostConfig": {
-                "NetworkMode": "celld",
+                "NetworkMode": "cello",
                 "PublishAllPorts": false,
                 "CapDrop": ["ALL"],
                 "SecurityOpt": ["no-new-privileges"],
@@ -788,26 +803,26 @@ mod tests {
         })
     }
 
-    /// celld 0.6.3's fence installer body (`container.rs:694-700`).
+    /// Cello 0.1.0's fence installer body (`container.rs`).
     fn fence_create_body() -> Value {
         json!({
             "Image": IMAGE,
-            "Env": [format!("CELLD_NFT={FENCE_RULES}")],
+            "Env": [format!("CELLO_NFT={FENCE_RULES}")],
             "Cmd": ["sh", "-c", FENCE_CMD],
-            "Labels": { "celld.node": NODE, "celld.fence": "1" },
+            "Labels": { "cello.node": NODE, "cello.fence": "1" },
             "HostConfig": { "NetworkMode": "host", "CapAdd": ["NET_ADMIN"] },
         })
     }
 
-    /// celld's kill scan (`kill_scan_script`, `container.rs:1964`) for one
+    /// Cello's kill scan (`kill_scan_script`, `container.rs`) for one
     /// exec id and signal, byte-identical to what the daemon receives.
     fn kill_scan(id: u64, signal: u32) -> String {
         format!(
-            "for d in /proc/[0-9]*;do grep -qa \"CELLD_EXEC_ID={id};\" \"$d/environ\" 2>/dev/null&&kill -{signal} \"${{d#/proc/}}\";done"
+            "for d in /proc/[0-9]*;do grep -qa \"CELLO_EXEC_ID={id};\" \"$d/environ\" 2>/dev/null&&kill -{signal} \"${{d#/proc/}}\";done"
         )
     }
 
-    /// celld's kill exec create (`kill_exec_body`, `container.rs:1973`):
+    /// Cello's kill exec create (`kill_exec_body`, `container.rs`):
     /// the attachless `sh -c` scan, run as the exec's user when it had one.
     fn kill_exec_body(id: u64, signal: u32, user: Option<&str>) -> Value {
         let mut body = json!({
@@ -848,7 +863,7 @@ mod tests {
     }
 
     #[test]
-    fn routes_match_cellds_calls_and_refuse_the_rest() {
+    fn routes_match_cellos_calls_and_refuse_the_rest() {
         use ContainerOp::*;
         assert_eq!(classify("GET", "/containers/json"), Route::List);
         assert_eq!(classify("POST", "/containers/create"), Route::Create);
@@ -887,11 +902,11 @@ mod tests {
         );
         assert_eq!(classify("POST", "/images/load"), Route::ImageLoad);
         assert_eq!(
-            classify("GET", "/networks/celld"),
-            Route::NetworkInspect { name: "celld" }
+            classify("GET", "/networks/cello"),
+            Route::NetworkInspect { name: "cello" }
         );
         assert_eq!(classify("POST", "/networks/create"), Route::NetworkCreate);
-        // celld never calls these: no ping/version handshake, no daemon
+        // Cello never calls these: no ping/version handshake, no daemon
         // introspection, no runner-owned network deletes, no container
         // management beyond its own lifecycle.
         for (method, path) in [
@@ -917,8 +932,8 @@ mod tests {
             ("POST", "/images/prune"),
             ("GET", "/images/json"),
             ("GET", "/networks"),
-            ("DELETE", "/networks/celld"),
-            ("POST", "/networks/celld/connect"),
+            ("DELETE", "/networks/cello"),
+            ("POST", "/networks/cello/connect"),
             ("GET", "/volumes"),
             ("POST", "/volumes/create"),
             ("GET", "/plugins"),
@@ -960,24 +975,24 @@ mod tests {
     }
 
     #[test]
-    fn create_names_are_celld_shaped_or_absent() {
+    fn create_names_are_cello_shaped_or_absent() {
         assert_eq!(create_name(None), Ok(None));
         assert_eq!(create_name(Some("")), Ok(None));
-        let name = "celld-0123456789abcdef01234567";
+        let name = "cello-0123456789abcdef01234567";
         assert_eq!(
             create_name(Some(&format!("name={name}"))),
             Ok(Some(name.to_string()))
         );
         for bad in [
             "name=",
-            "name=celld-xyz",
-            "name=celld-0123456789abcdef0123456",
-            "name=celld-0123456789abcdef012345678",
-            "name=celld-0123456789abcdef0123456g",
+            "name=cello-xyz",
+            "name=cello-0123456789abcdef0123456",
+            "name=cello-0123456789abcdef012345678",
+            "name=cello-0123456789abcdef0123456g",
             "name=other-0123456789abcdef01234567",
-            "name=celld-0123456789abcdef01234567&force=true",
+            "name=cello-0123456789abcdef01234567&force=true",
             "force=true",
-            "Name=celld-0123456789abcdef01234567",
+            "Name=cello-0123456789abcdef01234567",
         ] {
             assert!(create_name(Some(bad)).is_err(), "{bad} refused");
         }
@@ -1003,17 +1018,17 @@ mod tests {
     }
 
     #[test]
-    fn list_filters_gain_the_fleet_label_and_keep_cellds() {
-        // celld's real reap query shape: all=true plus one percent-encoded
-        // {"label":["celld.node=N"]} filters object.
-        let filters = percent_encode(&format!(r#"{{"label":["celld.node={NODE}"]}}"#));
+    fn list_filters_gain_the_fleet_label_and_keep_cellos() {
+        // Cello's real reap query shape: all=true plus one percent-encoded
+        // {"label":["cello.node=N"]} filters object.
+        let filters = percent_encode(&format!(r#"{{"label":["cello.node={NODE}"]}}"#));
         let rewritten = rewrite_list_query(Some(&format!("all=true&filters={filters}")), "shop");
         assert!(rewritten.starts_with("all=true&filters="), "{rewritten}");
         let encoded = rewritten.strip_prefix("all=true&filters=").unwrap();
         let object: Value = serde_json::from_str(&percent_decode(encoded).unwrap()).unwrap();
         let labels = object.pointer("/label").unwrap().as_array().unwrap();
         assert!(
-            labels.contains(&json!(format!("celld.node={NODE}"))),
+            labels.contains(&json!(format!("cello.node={NODE}"))),
             "{labels:?}"
         );
         assert!(labels.contains(&json!("noite.fleet=shop")), "{labels:?}");
@@ -1027,7 +1042,7 @@ mod tests {
             Some("all=true&filters=%7B%7D"),
             Some("all=true&filters=%5B%5D"),
             Some("all=true&filters=%%%"),
-            Some("all=true&filters=%7B%22label%22%3A%22celld%2Enode%3Dx%22%7D"),
+            Some("all=true&filters=%7B%22label%22%3A%22cello%2Enode%3Dx%22%7D"),
         ] {
             let rewritten = rewrite_list_query(query, "shop");
             let encoded = rewritten.rsplit("filters=").next().unwrap();
@@ -1037,7 +1052,7 @@ mod tests {
         }
         // A second filters parameter cannot smuggle a wider list past the
         // rewrite: only one survives, and it carries the fleet.
-        let encoded = percent_encode(r#"{"label":["celld.node=x"]}"#);
+        let encoded = percent_encode(r#"{"label":["cello.node=x"]}"#);
         let open = percent_encode(r#"{}"#);
         let rewritten = rewrite_list_query(
             Some(&format!("all=true&filters={encoded}&filters={open}")),
@@ -1064,18 +1079,18 @@ mod tests {
     }
 
     #[test]
-    fn app_create_accepts_cellds_body_and_injects_the_fleet() {
-        let checked = validate_app_create(&app_create_body(), "shop").expect("celld's body");
+    fn app_create_accepts_cellos_body_and_injects_the_fleet() {
+        let checked = validate_app_create(&app_create_body(), "shop").expect("cello's body");
         assert_eq!(checked.pointer("/Labels/noite.fleet"), Some(&json!("shop")));
         assert_eq!(
-            checked.pointer("/Labels/celld.node"),
+            checked.pointer("/Labels/cello.node"),
             Some(&json!(NODE)),
-            "celld's own labels survive"
+            "cello's own labels survive"
         );
         // The offline bridge and a body without Cmd (no tenant entrypoint)
-        // are celld's too.
+        // are Cello's too.
         let mut offline = app_create_body();
-        offline["HostConfig"]["NetworkMode"] = json!("celld-internal");
+        offline["HostConfig"]["NetworkMode"] = json!("cello-internal");
         offline.as_object_mut().unwrap().remove("Cmd");
         validate_app_create(&offline, "shop").expect("offline body");
     }
@@ -1146,7 +1161,7 @@ mod tests {
         cases.push(("foreign noite.* label", foreign_prefix));
         let mut other_image = base.clone();
         other_image["Image"] = json!("alpine:3.20");
-        cases.push(("non-celld image", other_image));
+        cases.push(("non-Cello image", other_image));
         for loose in [
             "celld-image:evil",
             "celld-image:foo/bar",
@@ -1165,12 +1180,12 @@ mod tests {
     }
 
     #[test]
-    fn fence_create_runs_cellds_rules_from_the_runner_image() {
+    fn fence_create_runs_cellos_rules_from_the_runner_image() {
         const TRUSTED: &str = "sha256:runner-image";
         let checked =
-            validate_fence_create(&fence_create_body(), "shop", TRUSTED).expect("celld's fence");
-        // Whatever celld-image tag celld named, the host-network container
-        // runs the runner's image with celld's exact ruleset and command.
+            validate_fence_create(&fence_create_body(), "shop", TRUSTED).expect("cello's fence");
+        // Whatever celld-image tag Cello named, the host-network container
+        // runs the runner's image with Cello's exact ruleset and command.
         assert_eq!(checked.pointer("/Image"), Some(&json!(TRUSTED)));
         assert_eq!(
             checked.pointer("/Entrypoint"),
@@ -1179,10 +1194,10 @@ mod tests {
         assert_eq!(checked.get("Cmd"), None);
         assert_eq!(
             checked.pointer("/Env"),
-            Some(&json!([format!("CELLD_NFT={FENCE_RULES}")]))
+            Some(&json!([format!("CELLO_NFT={FENCE_RULES}")]))
         );
         assert_eq!(checked.pointer("/Labels/noite.fleet"), Some(&json!("shop")));
-        assert_eq!(checked.pointer("/Labels/celld.node"), Some(&json!(NODE)));
+        assert_eq!(checked.pointer("/Labels/cello.node"), Some(&json!(NODE)));
         assert_eq!(
             checked.pointer("/HostConfig"),
             Some(&json!({ "NetworkMode": "host", "CapAdd": ["NET_ADMIN"] }))
@@ -1190,15 +1205,15 @@ mod tests {
     }
 
     #[test]
-    fn fence_create_refuses_anything_but_cellds_installer() {
+    fn fence_create_refuses_anything_but_cellos_installer() {
         let base = fence_create_body();
         let mut altered_rules = base.clone();
         altered_rules["Env"] = json!([format!(
-            "CELLD_NFT={}",
+            "CELLO_NFT={}",
             FENCE_RULES.replace("reject", "accept")
         )]);
         let mut extra_env = base.clone();
-        extra_env["Env"] = json!([format!("CELLD_NFT={FENCE_RULES}"), "EXTRA=1"]);
+        extra_env["Env"] = json!([format!("CELLO_NFT={FENCE_RULES}"), "EXTRA=1"]);
         let mut altered_cmd = base.clone();
         altered_cmd["Cmd"] = json!(["sh", "-c", "nft -f /etc/evil.nft"]);
         let mut extra_key = base.clone();
@@ -1210,7 +1225,7 @@ mod tests {
         let mut other_image = base.clone();
         other_image["Image"] = json!("alpine:3.20");
         let mut fence_zero = base.clone();
-        fence_zero["Labels"]["celld.fence"] = json!("0");
+        fence_zero["Labels"]["cello.fence"] = json!("0");
         for (name, body) in [
             ("altered rules", altered_rules),
             ("extra env", extra_env),
@@ -1218,7 +1233,7 @@ mod tests {
             ("extra top-level key", extra_key),
             ("privileged fence", privileged_host),
             ("extra capability", extra_cap),
-            ("non-celld image", other_image),
+            ("non-Cello image", other_image),
             ("fence label off", fence_zero),
         ] {
             assert!(
@@ -1232,16 +1247,16 @@ mod tests {
     }
 
     #[test]
-    fn exec_bodies_match_cellds_two_forms() {
+    fn exec_bodies_match_cellos_two_forms() {
         validate_exec_create(&json!({
             "AttachStdin": true, "AttachStdout": true, "AttachStderr": true,
             "Tty": false, "Cmd": ["bun", "x", "lint"],
             "Env": ["MODEL=faux"], "WorkingDir": "/work", "User": "1000",
         }))
-        .expect("celld's exec");
-        // The kill-via-exec form (celld 0015): no stdio, no Tty key at
+        .expect("cello's exec");
+        // The kill-via-exec form: no stdio, no Tty key at
         // all, a `sh -c` scan for the exec's marker.
-        validate_exec_create(&kill_exec_body(12, 9, None)).expect("celld's kill exec");
+        validate_exec_create(&kill_exec_body(12, 9, None)).expect("cello's kill exec");
         validate_exec_start(&json!({ "Detach": false, "Tty": false })).expect("hijacked start");
         validate_exec_start(&json!({ "Detach": true })).expect("detached start");
         for (name, body) in [
@@ -1266,28 +1281,28 @@ mod tests {
     }
 
     #[test]
-    fn exec_accepts_cellds_pty_forms() {
-        // celld's PTY exec create: the same attach flags as a plain exec,
+    fn exec_accepts_cellos_pty_forms() {
+        // Cello's PTY exec create: the same attach flags as a plain exec,
         // with `Tty` true (`container.rs` `exec_create_body`).
         validate_exec_create(&json!({
             "AttachStdin": true, "AttachStdout": true, "AttachStderr": true,
             "Tty": true, "Cmd": ["sh"],
             "Env": ["MODEL=faux"], "WorkingDir": "/work", "User": "1000",
         }))
-        .expect("celld's pty exec");
+        .expect("cello's pty exec");
         validate_exec_start(&json!({ "Detach": false, "Tty": true })).expect("pty start");
     }
 
     #[test]
-    fn kill_exec_shape_matches_celld_0015_exactly() {
-        // The abort path (celld 0010) kills through this shape: the scan
+    fn kill_exec_shape_matches_cello_exactly() {
+        // The abort path kills through this shape: the scan
         // carries the target exec's marker and the signal, runs as the
         // exec's user when it had one, and starts detached.
         for (id, signal, user) in [(12, 9, None), (7, 15, Some("nobody"))] {
             let body = kill_exec_body(id, signal, user);
-            validate_exec_create(&body).expect("celld's kill exec");
+            validate_exec_create(&body).expect("cello's kill exec");
             let script = body["Cmd"][2].as_str().expect("scan script");
-            assert!(script.contains(&format!("CELLD_EXEC_ID={id};")), "{script}");
+            assert!(script.contains(&format!("CELLO_EXEC_ID={id};")), "{script}");
             assert!(script.contains(&format!("kill -{signal} ")), "{script}");
             assert_eq!(
                 body.get("User").and_then(Value::as_str),
@@ -1308,7 +1323,7 @@ mod tests {
         let mut empty_cmd = base.clone();
         empty_cmd["Cmd"] = json!([]);
         let mut object_env = base.clone();
-        object_env["Env"] = json!({"CELLD_EXEC_ID": "12;"});
+        object_env["Env"] = json!({"CELLO_EXEC_ID": "12;"});
         let mut string_tty = base.clone();
         string_tty["Tty"] = json!("no");
         let mut numeric_user = base.clone();
@@ -1414,38 +1429,40 @@ mod tests {
     #[test]
     fn fence_is_recognised_by_label_or_host_network() {
         assert!(inspect_is_fence(
-            &json!({"Config": {"Labels": {"celld.fence": "1"}}})
+            &json!({"Config": {"Labels": {"cello.fence": "1"}}})
         ));
+        assert!(inspect_is_fence(&json!({"Labels": {"cello.fence": "0"}})));
+        // Pre-0.1.0 fence containers, reaped after the upgrade.
         assert!(inspect_is_fence(
-            &json!({"Config": {"Labels": {"celld.fence": "0"}}})
+            &json!({"Config": {"Labels": {"celld.fence": "1"}}})
         ));
         assert!(inspect_is_fence(
             &json!({"HostConfig": {"NetworkMode": "host"}})
         ));
         assert!(!inspect_is_fence(&json!({
-            "Config": {"Labels": {"celld.cell": "c"}},
-            "HostConfig": {"NetworkMode": "celld"},
+            "Config": {"Labels": {"cello.cell": "c"}},
+            "HostConfig": {"NetworkMode": "cello"},
         })));
     }
 
     #[test]
     fn network_inspect_hides_every_member() {
         let upstream = json!({
-            "Name": "celld",
+            "Name": "cello",
             "Internal": false,
             "Options": {
                 "com.docker.network.bridge.enable_icc": "false",
-                "com.docker.network.bridge.name": "celld0",
+                "com.docker.network.bridge.name": "cello0",
             },
             "Containers": {
-                "abc": { "Name": "celld-0123456789abcdef01234567", "IPv4Address": "172.19.0.2/16" },
+                "abc": { "Name": "cello-0123456789abcdef01234567", "IPv4Address": "172.19.0.2/16" },
             },
         });
         let filtered: Value =
             serde_json::from_slice(&without_network_members(upstream.to_string().as_bytes()))
                 .unwrap();
         assert_eq!(filtered["Containers"], json!({}));
-        // What celld decides on survives.
+        // What Cello decides on survives.
         assert_eq!(filtered["Options"], upstream["Options"]);
         assert_eq!(filtered["Internal"], json!(false));
         // An engine error passes through untouched.
@@ -1453,10 +1470,10 @@ mod tests {
     }
 
     #[test]
-    fn network_create_accepts_only_cellds_two_bridges() {
+    fn network_create_accepts_only_cellos_two_bridges() {
         for (name, internal, bridge) in [
-            ("celld", false, "celld0"),
-            ("celld-internal", true, "celld1"),
+            ("cello", false, "cello0"),
+            ("cello-internal", true, "cello1"),
         ] {
             validate_network_create(&json!({
                 "Name": name, "Driver": "bridge", "Internal": internal,
@@ -1467,38 +1484,38 @@ mod tests {
             }))
             .expect(name);
         }
-        assert!(valid_network_name("celld"));
-        assert!(valid_network_name("celld-internal"));
+        assert!(valid_network_name("cello"));
+        assert!(valid_network_name("cello-internal"));
         assert!(!valid_network_name("bridge"));
         assert!(!valid_network_name("evil"));
         for (name, body) in [
             (
                 "icc on",
                 json!({
-                    "Name": "celld", "Driver": "bridge", "Internal": false,
+                    "Name": "cello", "Driver": "bridge", "Internal": false,
                     "Options": {
                         "com.docker.network.bridge.enable_icc": "true",
-                        "com.docker.network.bridge.name": "celld0",
+                        "com.docker.network.bridge.name": "cello0",
                     },
                 }),
             ),
             (
                 "wrong bridge iface",
                 json!({
-                    "Name": "celld", "Driver": "bridge", "Internal": false,
+                    "Name": "cello", "Driver": "bridge", "Internal": false,
                     "Options": {
                         "com.docker.network.bridge.enable_icc": "false",
-                        "com.docker.network.bridge.name": "celld9",
+                        "com.docker.network.bridge.name": "cello9",
                     },
                 }),
             ),
             (
                 "swapped isolation",
                 json!({
-                    "Name": "celld", "Driver": "bridge", "Internal": true,
+                    "Name": "cello", "Driver": "bridge", "Internal": true,
                     "Options": {
                         "com.docker.network.bridge.enable_icc": "false",
-                        "com.docker.network.bridge.name": "celld0",
+                        "com.docker.network.bridge.name": "cello0",
                     },
                 }),
             ),
@@ -1508,6 +1525,16 @@ mod tests {
                     "Name": "evil", "Driver": "bridge", "Internal": false,
                     "Options": {
                         "com.docker.network.bridge.enable_icc": "false",
+                        "com.docker.network.bridge.name": "cello0",
+                    },
+                }),
+            ),
+            (
+                "pre-rename bridge name",
+                json!({
+                    "Name": "celld", "Driver": "bridge", "Internal": false,
+                    "Options": {
+                        "com.docker.network.bridge.enable_icc": "false",
                         "com.docker.network.bridge.name": "celld0",
                     },
                 }),
@@ -1515,10 +1542,10 @@ mod tests {
             (
                 "overlay driver",
                 json!({
-                    "Name": "celld", "Driver": "overlay", "Internal": false,
+                    "Name": "cello", "Driver": "overlay", "Internal": false,
                     "Options": {
                         "com.docker.network.bridge.enable_icc": "false",
-                        "com.docker.network.bridge.name": "celld0",
+                        "com.docker.network.bridge.name": "cello0",
                     },
                 }),
             ),
@@ -1531,11 +1558,11 @@ mod tests {
     fn inspect_helpers_read_labels_identity_and_addresses() {
         let info = json!({
             "Id": "abc123",
-            "Name": "/celld-0123456789abcdef01234567",
-            "Config": { "Labels": { "celld.node": NODE, "noite.fleet": "shop" } },
+            "Name": "/cello-0123456789abcdef01234567",
+            "Config": { "Labels": { "cello.node": NODE, "noite.fleet": "shop" } },
             "NetworkSettings": { "Networks": {
-                "celld": { "IPAddress": "172.19.0.2" },
-                "celld-internal": { "IPAddress": "" },
+                "cello": { "IPAddress": "172.19.0.2" },
+                "cello-internal": { "IPAddress": "" },
             } },
         });
         assert_eq!(inspect_fleet_label(&info).as_deref(), Some("shop"));
@@ -1543,7 +1570,7 @@ mod tests {
             inspect_identity(&info),
             (
                 Some("abc123".to_string()),
-                Some("celld-0123456789abcdef01234567".to_string())
+                Some("cello-0123456789abcdef01234567".to_string())
             )
         );
         assert_eq!(inspect_ips(&info), vec![Ipv4Addr::new(172, 19, 0, 2)]);

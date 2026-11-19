@@ -465,7 +465,7 @@ async fn record_parked(pool: &SqlitePool, app_id: &str, current: u64, limit: u64
     .await;
 }
 
-/// Poll the fleet's public health route until celld's ready gate opens.
+/// Poll the fleet's public health route until Cello's ready gate opens.
 pub(crate) async fn wait_healthy(cfg: &Config, port: i64, timeout: Duration) -> bool {
     static CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
         reqwest::Client::builder()
@@ -475,7 +475,7 @@ pub(crate) async fn wait_healthy(cfg: &Config, port: i64, timeout: Duration) -> 
     });
     let client = &*CLIENT;
     let url = format!(
-        "http://{}:{}/.well-known/celld/health",
+        "http://{}:{}/.well-known/cello/health",
         cfg.caddy_upstream_host, port
     );
     let deadline = tokio::time::Instant::now() + timeout;
@@ -1253,7 +1253,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    /// Minimal celld health gate: 200 on `/.well-known/celld/health`.
+    /// Minimal Cello health gate: 200 on `/.well-known/cello/health`.
     async fn serve_health(listener: tokio::net::TcpListener) {
         while let Ok((mut stream, _)) = listener.accept().await {
             tokio::spawn(async move {
@@ -1394,8 +1394,8 @@ mod tests {
     async fn a_failed_wake_leaves_the_app_parked() {
         let mut cfg = crate::config::config_for_tests();
         cfg.wake_timeout_s = 1;
-        // The spawn cannot succeed: no celld binary at this path.
-        cfg.celld_bin = "/nonexistent/celld".into();
+        // The spawn cannot succeed: no Cello binary at this path.
+        cfg.celld_bin = "/nonexistent/cello".into();
         let pool = crate::db::connect("sqlite::memory:")
             .await
             .expect("memory db");
@@ -1499,7 +1499,7 @@ mod tests {
         );
     }
 
-    /// A failed wake stops the cold start it created gracefully, so celld can
+    /// A failed wake stops the cold start it created gracefully, so Cello can
     /// release the leases its cells hold. `FOR_DELETE` (SIGKILL) left the next
     /// wake waiting out the lease TTL and timing out again.
     #[tokio::test]
@@ -1676,7 +1676,7 @@ mod tests {
     async fn a_parked_app_wakes_and_spawns_its_fleet() {
         let dir = std::env::temp_dir().join(format!("noite-wake-{}", crate::models::new_id()));
         std::fs::create_dir_all(&dir).expect("temp dir");
-        // A stand-in celld: the real binary is not in the test image, but the
+        // A stand-in Cello: the real binary is not in the test image, but the
         // spawn path only needs an executable that stays alive.
         let fake = dir.join("celld");
         std::fs::write(&fake, "#!/bin/sh\nsleep 60\n").expect("write fake celld");

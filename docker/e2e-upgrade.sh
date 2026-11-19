@@ -9,6 +9,11 @@
 # a new migration file (every pending file applies exactly once) and once
 # more (nothing applies again).
 #
+# The old side boots and is probed with the previous release's own lane
+# files (compose + doctor, via `old_lane_files` in docker/lib.sh), never the
+# tree's: a rename between releases leaves the old stack failing the tree's
+# readiness probes for a healthy seed.
+#
 # Previous tag: the newest `v*` reachable before HEAD (a HEAD tag's
 # predecessor on a tag build), else `gh release list`. Override with
 # PREV_TAG=<tag> (the image is `ghcr.io/ryuzcorp/noite:<tag without v>`)
@@ -208,10 +213,27 @@ if [ -f "$KEEP_FILE" ]; then
   rm -f "$KEEP_FILE"
 fi
 
+# The old side boots and is probed with the previous release's own lane
+# files (never the tree's): the tree's compose defaults and doctor probes
+# follow renames the old image does not have. Extracted after the lock so
+# only the lane holder creates it; the EXIT trap removes it on every exit
+# path (the stack itself never needs it again after boot).
+OLD_LANE_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/noite-upg-old.XXXXXX")"
+trap 'rm -rf "$OLD_LANE_ROOT"' EXIT
+OLD_DOCKER="$(old_lane_files "$PREV_TAG_RESOLVED" "$OLD_LANE_ROOT")" || exit 1
+OLD_FILES="-f $OLD_DOCKER/compose.yaml -f $OLD_DOCKER/compose.e2e.yaml"
+if [ "$SLOT" != 0 ]; then
+  OLD_FILES="$OLD_FILES -f $OLD_DOCKER/compose.slot.yaml"
+fi
+OLD_CE2E="$COMPOSE -p $PROJECT $OLD_FILES"
+OLD_DOCTOR="$OLD_DOCKER/doctor.sh"
+echo "==> old side config: ${PREV_TAG_RESOLVED} lane files"
+
 wait_ready() {
+  _wait_doctor="${1:-docker/doctor.sh}"
   attempt=0
   while [ "$attempt" -lt 60 ]; do
-    if sh docker/doctor.sh >/dev/null 2>&1; then
+    if sh "$_wait_doctor" >/dev/null 2>&1; then
       return 0
     fi
     attempt=$((attempt + 1))
@@ -243,9 +265,9 @@ done
 export NOITE_IMAGE="$PREV_IMAGE"
 # The seed starts on a fresh bucket and fresh volumes.
 # shellcheck disable=SC2086
-$CE2E up -d $PREV_PULL || fail_down "old image failed to start"
+$OLD_CE2E up -d $PREV_PULL || fail_down "old image failed to start"
 echo "==> wait for the old stack (5 min)"
-wait_ready || fail_down "old stack never became ready"
+wait_ready "$OLD_DOCTOR" || fail_down "old stack never became ready"
 echo "==> seed through the old image"
 (
   cd apps/noite && UPGRADE_PHASE=seed npx playwright test -c upgrade.config.ts
@@ -276,7 +298,7 @@ else
   $CE2E -f docker/compose.build.yaml up -d --build || fail_down "tree image failed to start"
 fi
 echo "==> wait for the upgraded stack (5 min)"
-if ! wait_ready; then
+if ! wait_ready "docker/doctor.sh"; then
   # shellcheck disable=SC2086
   $CE2E logs --tail=200 noite 2>&1 | grep -i "refusing to start" || true
   fail_down "upgraded stack never became ready"

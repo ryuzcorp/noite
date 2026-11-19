@@ -4,10 +4,10 @@
 //! execution inside a fleet process was root on the host (`POST
 //! /containers/create` with `Privileged` or `Binds: ["/:/host"]`). Now each
 //! fleet gets `DOCKER_HOST=unix://<its own socket>` served here, and the
-//! proxy forwards to the real engine only the calls celld 0.6.3 makes,
+//! proxy forwards to the real engine only the calls Cello 0.1.0 makes,
 //! validated ([`validate`]): app creates in the locked-down shape, the fence
 //! installer verbatim, per-container calls on the fleet's own containers,
-//! remembered exec ids, celld's two bridges — everything else is refused.
+//! remembered exec ids, Cello's two bridges — everything else is refused.
 //!
 //! Two checks bind a socket to its fleet: the socket file is owned by the
 //! fleet user at 0600, and every request's `SO_PEERCRED` pid must be the
@@ -1205,7 +1205,7 @@ mod tests {
             "/containers/create?name=celld-0123456789abcdef01234567",
             Some(json!({
                 "Image": "celld-image:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-                "HostConfig": {"NetworkMode": "celld", "Privileged": true},
+                "HostConfig": {"NetworkMode": "cello", "Privileged": true},
             })),
         )
         .await;

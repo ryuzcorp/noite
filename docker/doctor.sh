@@ -4,7 +4,7 @@
 # /ready is the summary (reconcile, bucket, tenant isolation in multi, the
 # control fleet, Caddy's config); when it fails its body names the failing
 # gates, and this script prints it. The rest checks what /ready cannot see
-# from inside: the edge from the host, API auth, and celld's own fleet view.
+# from inside: the edge from the host, API auth, and Cello's own fleet view.
 #
 # E2E_RAW_PORTS=1 (the e2e lane): the lane publishes the runner on :8080 and
 # serves the UI through Caddy on :8090 under its own compose project.
@@ -176,13 +176,13 @@ fi
 check "edge serves the control UI" sh -c "curl -fs -H 'Host: ${BASE_HOST}' -H 'Accept: text/html' '${EDGE}/' | grep -qi '<html'"
 check "control auth routes" sh -c "curl -fs -H 'Host: ${BASE_HOST}' '${EDGE}/api/auth/ok' | grep -q ok"
 
-# celld's own view of the control fleet: leases, peers, advertised addresses.
+# Cello's own view of the control fleet: leases, peers, advertised addresses.
 # Skipped in the dev image (vite dev serves the UI; there is no control node).
 if "$ENGINE" exec "$CID" test -d /opt/noite/control/dist 2>/dev/null; then
   bucket="$("$ENGINE" exec "$CID" printenv NOITE_S3_BUCKET 2>/dev/null || echo noite)"
   endpoint="$("$ENGINE" exec "$CID" printenv S3_ENDPOINT 2>/dev/null || echo http://rustfs:9000)"
   region="$("$ENGINE" exec "$CID" printenv AWS_REGION 2>/dev/null || echo us-east-1)"
-  check "celld control node health" "$ENGINE" exec "$CID" curl -fs http://127.0.0.1:8090/.well-known/celld/health
+  check "cello control node health" "$ENGINE" exec "$CID" curl -fs http://127.0.0.1:8090/.well-known/cello/health
   # `diagnose` bind-checks a listener of its own; its default (:8080) is the
   # runner's port in this container, so give it an ephemeral one. It is an
   # in-tree internal client: the control node requires the operator token,
@@ -194,9 +194,9 @@ if "$ENGINE" exec "$CID" test -d /opt/noite/control/dist 2>/dev/null; then
   # file is non-empty — unset, diagnose sends no header and the peer probes
   # fail closed with 401s.
   workdir="$("$ENGINE" exec "$CID" printenv RUNNER_WORK_DIR 2>/dev/null || echo /data/runner)"
-  check "celld control fleet diagnose" "$ENGINE" exec "$CID" sh -c 'token="$(cat "$1/control-operator-token" 2>/dev/null)"; if [ -n "$token" ]; then export CELLD_OPERATOR_TOKEN="$token"; fi; exec celld diagnose --read-only --listen 127.0.0.1:0 --bucket "s3://$2/control" --endpoint "$3" --region "$4"' sh "$workdir" "$bucket" "$endpoint" "$region"
+  check "cello control fleet diagnose" "$ENGINE" exec "$CID" sh -c 'token="$(cat "$1/control-operator-token" 2>/dev/null)"; if [ -n "$token" ]; then export CELLO_OPERATOR_TOKEN="$token"; fi; exec cello diagnose --read-only --listen 127.0.0.1:0 --bucket "s3://$2/control" --endpoint "$3" --region "$4"' sh "$workdir" "$bucket" "$endpoint" "$region"
 else
-  echo "n/a  celld control node (dev image: vite dev serves the UI)"
+  echo "n/a  cello control node (dev image: vite dev serves the UI)"
 fi
 
 exit "$fail"

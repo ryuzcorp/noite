@@ -91,6 +91,31 @@ remove_project() {
   done
 }
 
+# old_lane_files <tag> <dest>: materialize a previous release's own lane
+# config for the upgrade lane's old side. The old stack must boot and be
+# probed with its own release's files, never the tree's: a rename between
+# releases (celld to Cello 0.1.0 moved the health path and the diagnose
+# binary) leaves the old stack failing the tree's readiness probes, so the
+# lane reports "old stack never became ready" for a healthy seed. Writes
+# docker/{compose.yaml,compose.e2e.yaml,compose.slot.yaml,doctor.sh,lib.sh}
+# under <dest> (the old doctor.sh sources its sibling lib.sh and treats its
+# parent as the repo root) and prints <dest>/docker. Refuses when the tag
+# is unreachable: silently falling back to the tree's files would repeat
+# the failure this function exists to prevent.
+old_lane_files() {
+  _olf_tag="$1"
+  _olf_dest="$2/docker"
+  mkdir -p "$_olf_dest" || return 1
+  for _olf_file in compose.yaml compose.e2e.yaml compose.slot.yaml doctor.sh lib.sh; do
+    if ! git show "${_olf_tag}:docker/${_olf_file}" > "${_olf_dest}/${_olf_file}" 2>/dev/null; then
+      echo "error: cannot read docker/${_olf_file} at ${_olf_tag}; fetch tags (git fetch --tags) or pass PREV_TAG=<reachable tag>" >&2
+      return 1
+    fi
+  done
+  chmod +x "${_olf_dest}/doctor.sh"
+  printf '%s\n' "$_olf_dest"
+}
+
 # require_private_dir <dir>: ensure <dir> exists with mode 0700. Backup
 # destinations hold plaintext secrets (the runner SQLite with env values,
 # every tenant's objects), so they must never land in a shared directory by

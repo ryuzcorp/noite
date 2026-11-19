@@ -6,9 +6,9 @@
 //! `noite-void-proxy` ([`super::void_proxy`]) and, for Void apps with a
 //! managed sandbox, `noite-void-sandbox` ([`super::void_sandbox`]) — each
 //! with its sources and a per-fleet rendered config. Every script of a
-//! generation is staged first with `celld deploy --no-activate` — the
+//! generation is staged first with `cello deploy --no-activate` — the
 //! cohosted scripts in [`CohostedScript::order`] (lowest first), the tenant
-//! app last — and one `celld activate SCRIPT=VERSION...` then serves the
+//! app last — and one `cello activate SCRIPT=VERSION...` then serves the
 //! whole generation with a single atomic fleet-pointer write, after which
 //! the one `/reload` (whose outcome the deploy already checks) adopts it.
 //! A later script only adds its [`CohostedScript`] and its render: the
@@ -29,7 +29,7 @@
 //! Failure handling: staged versions move no pointer and are invisible to
 //! serving, so a failed stage — cohosted or app, tenant or infra — runs no
 //! activate and the previous generation keeps serving. Tenant-code failures
-//! are pre-pointer (celld bundles before writing anything) and fail at
+//! are pre-pointer (Cello bundles before writing anything) and fail at
 //! once, with no retry; anything reading as infra (S3/CAS errors, timeouts,
 //! a lost pointer race) retries once ([`run_with_infra_retry`], idempotent
 //! both ways — content-versioned stages, an activate that reports unchanged
@@ -66,7 +66,7 @@ pub struct RuntimeSource {
     pub contents: Vec<u8>,
 }
 
-/// A runner-owned script: its celld identity, its embedded sources, and
+/// A runner-owned script: its Cello identity, its embedded sources, and
 /// its place in the deploy order (lowest first; the tenant app always
 /// deploys last, after every cohosted script).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -98,13 +98,13 @@ pub struct RenderedCohost {
     /// Whether the rendered config declares containers: such a script gets
     /// the container deploy timeout (a first image pull), like the app.
     pub declares_containers: bool,
-    /// The directory `celld deploy --read-root` admits beyond the staging
+    /// The directory `cello deploy --read-root` admits beyond the staging
     /// dir: the sandbox controller's vetted build context, which holds its
     /// pinned Dockerfile. `None` for scripts that read nothing outside.
     pub read_root: Option<PathBuf>,
 }
 
-/// The `celld deploy` timeout for a script whose config declares
+/// The `cello deploy` timeout for a script whose config declares
 /// containers: a first image pull dwarfs the 120 s default. The tenant app
 /// uses the same bound (see the ordered deploy in [`super::deploy`]).
 pub const CONTAINER_DEPLOY_TIMEOUT: Duration = Duration::from_secs(600);
@@ -125,7 +125,7 @@ fn sha256_hex(bytes: &[u8]) -> String {
 /// path (`/data/runner/builds/<slug>/<timestamp>/…`), which differs on
 /// every deploy while the content is identical — hashing it redeploys the
 /// script (and its fence image) every time and lets two concurrent
-/// deploys race celld's fence-image build. The stable content — pinned
+/// deploys race Cello's fence-image build. The stable content — pinned
 /// Dockerfile bytes plus build-context digest — rides `extra_hash_input`
 /// instead, so the path carries no signal. Digest-pinned registry refs
 /// are stable content and stay hashed, as does everything outside
@@ -259,7 +259,7 @@ impl RenderedCohost {
     }
 }
 
-/// What the fleet's `celld` invocations need: the binary, the fleet bucket
+/// What the fleet's `cello` invocations need: the binary, the fleet bucket
 /// and the env. One value serves the staged deploys and the one activate
 /// alike — same binary, same bucket, same invocation shape.
 #[derive(Clone, Copy)]
@@ -270,22 +270,22 @@ pub struct CelldDeploy<'a> {
     pub endpoint: &'a str,
     pub region: &'a str,
     pub timeout: Duration,
-    /// Where `celld deploy --sourcemap` writes the bundled Worker's external
+    /// Where `cello deploy --sourcemap` writes the bundled Worker's external
     /// map. Set for the tenant app only: cohosted scripts are runner-owned
     /// and need no symbolication, so their stage forces this to `None`.
     pub sourcemap: Option<&'a Path>,
 }
 
-/// One staged script version: celld's script name and deployment version,
-/// as `celld deploy --no-activate --json` printed them. The pair is what
-/// the one `celld activate` names as `SCRIPT=VERSION`.
+/// One staged script version: Cello's script name and deployment version,
+/// as `cello deploy --no-activate --json` printed them. The pair is what
+/// the one `cello activate` names as `SCRIPT=VERSION`.
 pub struct StagedVersion {
     pub worker: String,
     pub version: String,
 }
 
-/// celld's script-name rule (`deploy.rs` `valid_script_name`, pinned
-/// celld): at most 63 bytes of lowercase ASCII letters, digits and
+/// Cello's script-name rule (`deploy.rs` `valid_script_name`, pinned
+/// Cello): at most 63 bytes of lowercase ASCII letters, digits and
 /// internal hyphens.
 fn valid_worker_name(name: &str) -> bool {
     name.len() <= 63
@@ -302,11 +302,11 @@ fn valid_worker_name(name: &str) -> bool {
             .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
 }
 
-/// Parse `celld deploy --no-activate --json` stdout: one JSON object
+/// Parse `cello deploy --no-activate --json` stdout: one JSON object
 /// (`fleet.rs` `Deployed` — stdout carries the datum, the narrative goes to
 /// stderr). The version is validated — the 16-lowercase-hex deployment
 /// version `activate` expects (`deploy.rs` `parse_version_ref`) — and the
-/// worker against celld's script-name rule, so a malformed row fails the
+/// worker against Cello's script-name rule, so a malformed row fails the
 /// deploy here instead of reaching `activate` as a corrupt `SCRIPT=VERSION`
 /// (a leading-`-` name would otherwise parse as a flag there).
 fn parse_staged_version(stdout: &str) -> anyhow::Result<StagedVersion> {
@@ -332,7 +332,7 @@ fn parse_staged_version(stdout: &str) -> anyhow::Result<StagedVersion> {
         hex16,
         "staged deploy output carries no 16-hex version: {stdout:?}"
     );
-    // A celld that accepted `--no-activate` without staging would move the
+    // A Cello that accepted `--no-activate` without staging would move the
     // pointer here and silently reopen the window this sequence closes.
     anyhow::ensure!(
         row.get("staged").and_then(Value::as_bool) == Some(true)
@@ -345,7 +345,7 @@ fn parse_staged_version(stdout: &str) -> anyhow::Result<StagedVersion> {
     })
 }
 
-/// One `celld` invocation — a stage or the activate — retried once when the
+/// One `cello` invocation — a stage or the activate — retried once when the
 /// failure reads as infra (S3/CAS errors, timeouts, a lost pointer race
 /// whose error says to re-run: this retry IS the re-run —
 /// [`is_tenant_error`] decides). Both commands are idempotent
@@ -360,18 +360,18 @@ async fn run_with_infra_retry(
     args: &[&str],
     cwd: Option<&Path>,
 ) -> anyhow::Result<(u32, String)> {
-    let subcommand = args.first().copied().unwrap_or("celld");
+    let subcommand = args.first().copied().unwrap_or("cello");
     match exec::run_cmd(celld.celld_bin, args, cwd, celld.env, celld.timeout).await {
         Ok(stdout) => Ok((1, stdout)),
         Err(first) => {
             if is_tenant_error(&format!("{:#}", first)) {
                 return Err(first);
             }
-            tracing::warn!("celld {subcommand} failed (infra); retrying once");
+            tracing::warn!("cello {subcommand} failed (infra); retrying once");
             match exec::run_cmd(celld.celld_bin, args, cwd, celld.env, celld.timeout).await {
                 Ok(stdout) => Ok((2, stdout)),
                 Err(second) => Err(anyhow::anyhow!(
-                    "celld {subcommand} failed twice (one infra retry):\nfirst: {:#}\nsecond: {:#}",
+                    "cello {subcommand} failed twice (one infra retry):\nfirst: {:#}\nsecond: {:#}",
                     first,
                     second
                 )),
@@ -380,12 +380,12 @@ async fn run_with_infra_retry(
     }
 }
 
-/// Stage one project dir into the fleet bucket: `celld deploy --no-activate
+/// Stage one project dir into the fleet bucket: `cello deploy --no-activate
 /// --json` uploads and validates a version without moving any pointer — no
 /// queue attachment, no named pointer, no fleet pointer — so the staged
 /// version is invisible to serving until the one activate names it. Returns
 /// the attempt count and the staged version. `read_root` names the one
-/// directory beyond `project_dir` that build inputs may come from (celld's
+/// directory beyond `project_dir` that build inputs may come from (Cello's
 /// `--read-root`); every other project read stays inside `project_dir`.
 pub async fn celld_stage(
     celld: &CelldDeploy<'_>,
@@ -426,7 +426,7 @@ pub async fn celld_stage(
     Ok((attempts, parse_staged_version(&stdout)?))
 }
 
-/// Serve one generation: `celld activate SCRIPT=VERSION... --primary APP`
+/// Serve one generation: `cello activate SCRIPT=VERSION... --primary APP`
 /// replaces the fleet-wide pointer with one compare-and-swap write naming
 /// every script's version, so nodes adopt either the whole old generation
 /// or the whole new one — never a mix. Scripts the call does not name keep
@@ -434,7 +434,7 @@ pub async fn celld_stage(
 /// from the named pointers on a legacy fleet), so skipped cohosted scripts
 /// are simply not named. `--primary` is always the app: it is required on
 /// a first deploy naming several scripts, and it heals a legacy pointer a
-/// stranded cohosted deploy left behind. celld's own stdout is discarded —
+/// stranded cohosted deploy left behind. Cello's own stdout is discarded —
 /// the generation is known from the inputs — and the attempt count is
 /// returned for the log.
 pub async fn celld_activate(
@@ -464,11 +464,11 @@ pub async fn celld_activate(
     Ok(run_with_infra_retry(celld, &args, None).await?.0)
 }
 
-/// `celld deploy` failures that come from the project itself: bundling a
+/// `cello deploy` failures that come from the project itself: bundling a
 /// broken entry or a malformed config. All deterministic and pre-pointer
-/// (celld bundles before writing anything), so retrying cannot help and
-/// the deploy fails at once. The markers are celld's own error strings
-/// (pinned celld, `deploy.rs`), quoted narrowly enough that no S3, CAS or
+/// (Cello bundles before writing anything), so retrying cannot help and
+/// the deploy fails at once. The markers are Cello's own error strings
+/// (pinned Cello, `deploy.rs`), quoted narrowly enough that no S3, CAS or
 /// transport error matches them.
 const TENANT_ERROR_MARKERS: &[&str] = &[
     "esbuild failed:",
@@ -489,14 +489,14 @@ const TENANT_ERROR_MARKERS: &[&str] = &[
     "config has neither",
     "is a runtime class",
     "without `main`",
-    "which celld does not model",
+    "which cello does not model",
     "duplicate kv namespace id",
     "takes one project path",
     "unknown argument",
 ];
 
-/// True when a `celld` failure reads as tenant-caused (no retry).
-/// Everything else — S3/CAS answers, timeouts, a hung celld, a lost
+/// True when a Cello failure reads as tenant-caused (no retry).
+/// Everything else — S3/CAS answers, timeouts, a hung node, a lost
 /// pointer race — reads as infra and the command retries once. The one
 /// activate shares this classification: nothing it reports matches a
 /// tenant marker, so every activate failure retries once (a lost race's
@@ -515,7 +515,7 @@ pub struct CohostOutcome {
     /// The staged deployment version: `None` when skipped (the activated
     /// version carries into the generation unnamed).
     pub version: Option<String>,
-    /// `celld deploy --no-activate` attempts: 0 when skipped, else 1 — or
+    /// `cello deploy --no-activate` attempts: 0 when skipped, else 1 — or
     /// 2 when the first attempt failed on infra and the retry ran.
     pub attempts: u32,
 }
@@ -549,7 +549,7 @@ fn render_timeout(celld: &CelldDeploy<'_>, render: &RenderedCohost) -> Duration 
 }
 
 /// Stage the fleet's runner-owned scripts in order (lowest `order` first):
-/// each renders to a fresh temp project and stages with `celld deploy
+/// each renders to a fresh temp project and stages with `cello deploy
 /// --no-activate` into the fleet bucket — unless its content hash matches
 /// the stored one, in which case the script is skipped and its activated
 /// version carries into the generation unnamed. Each stage retries once on
@@ -618,7 +618,7 @@ pub async fn stage_cohosted(
                 }
             };
         let _ = std::fs::remove_dir_all(&dir);
-        // The staged version must identify the script just rendered: celld
+        // The staged version must identify the script just rendered: Cello
         // read its name from the same `wrangler.json`, so anything else is
         // a wiring bug, failed loudly before the activate names it.
         anyhow::ensure!(
@@ -655,10 +655,10 @@ pub struct FleetApp<'a> {
 #[derive(Debug)]
 pub struct FleetDeployStats {
     pub cohosted: Vec<CohostOutcome>,
-    /// `celld deploy --no-activate` attempts for the app: 1, or 2 when the
+    /// `cello deploy --no-activate` attempts for the app: 1, or 2 when the
     /// first attempt failed on infra and the retry ran.
     pub app_attempts: u32,
-    /// `celld activate` attempts: 1, or 2 when the first attempt failed on
+    /// `cello activate` attempts: 1, or 2 when the first attempt failed on
     /// infra and the retry ran.
     pub activate_attempts: u32,
     /// The generation the one activate named, deploy order (cohosted
@@ -710,7 +710,7 @@ impl FleetDeployStats {
 }
 
 /// What the ordered fleet stage produced: every script of the generation
-/// staged with `celld deploy --no-activate` — the cohosted scripts first
+/// staged with `cello deploy --no-activate` — the cohosted scripts first
 /// (each skipped when unchanged), the tenant app last — with no pointer
 /// moved yet. [`activate_staged`] serves exactly this generation; anything
 /// the deploy runs between the two (the staged Void migrations) sees these
@@ -763,7 +763,7 @@ pub async fn stage_fleet_in_order(
     })
 }
 
-/// Serve one staged generation: one `celld activate SCRIPT=VERSION...`
+/// Serve one staged generation: one `cello activate SCRIPT=VERSION...`
 /// with a single atomic pointer write, then store the cohost hashes — only
 /// after the activate commits, so a stored hash always names activated
 /// content. Staged versions a failed deploy leaves behind are inert — no
@@ -1095,19 +1095,19 @@ mod tests {
         assert_eq!(CONTAINER_DEPLOY_TIMEOUT, Duration::from_secs(600));
     }
 
-    /// celld's own project failures (bundling, config shape) read as
+    /// Cello's own project failures (bundling, config shape) read as
     /// tenant — no retry — while store, CAS and transport failures read
     /// as infra, including every activate failure (a lost pointer race's
     /// re-run error heals through the retry). Markers are quoted from the
-    /// pinned celld's `deploy.rs`.
+    /// pinned Cello's `deploy.rs`.
     #[test]
     fn tenant_and_infra_errors_classify() {
         for tenant in [
-            "celld [\"deploy\"] exit Some(1)\nesbuild failed:\nERROR: Could not resolve \"x\"",
+            "cello [\"deploy\"] exit Some(1)\nesbuild failed:\nERROR: Could not resolve \"x\"",
             "/w/wrangler.json is not a JSON object",
             "config has no `name`",
             "config `name` must contain 1 to 63 bytes of lowercase ASCII",
-            "`celld deploy` does not support these config keys: secrets.",
+            "`cello deploy` does not support these config keys: secrets.",
             "wrangler.toml is not supported; convert it to wrangler.jsonc",
             "invalid service binding name: \"x\"",
             "service binding __VOID_PROXY has no `service`",
@@ -1121,27 +1121,27 @@ mod tests {
             "config has neither `main` nor `assets`",
             "`room` is a runtime class; remove it from `migrations`",
             "config sets `triggers.crons` without `main`; a cron trigger needs a `scheduled` handler to call",
-            "config `queues` declares `x`, which celld does not model",
+            "config `queues` declares `x`, which cello does not model",
             "duplicate kv namespace id: \"a\"",
-            "`celld deploy` takes one project path, and already has one: x",
-            "unknown argument for `celld deploy`: --nope",
+            "`cello deploy` takes one project path, and already has one: x",
+            "unknown argument for `cello deploy`: --nope",
         ] {
             assert!(is_tenant_error(tenant), "tenant not recognized: {}", tenant);
         }
         for infra in [
             "Error communicating with S3: service error: SlowDown: Please reduce your request rate",
             "put deploy/current.json: connection refused (os error 111)",
-            "command timeout: celld [\"deploy\", \"/w\"] timed out after 120s",
+            "command timeout: cello [\"deploy\", \"/w\"] timed out after 120s",
             "500 Internal Server Error",
             "If-Match precondition failed: 412",
             "failed to lookup address information",
             "TLS handshake failed",
-            "esbuild not found (esbuild). `celld deploy` bundles with esbuild; install it and retry",
+            "esbuild not found (esbuild).\n`cello deploy` bundles with esbuild; install it and retry,\nor set CELLO_ESBUILD to its path.",
             "save container image failed:\nError: daemon not running",
-            "thread 'main' panicked at crates/celld/deploy.rs:973",
-            "write s3://noite/fleets/x/deploy/current.json lost a race\nAnother deploy or activate landed first; re-run `celld activate`.",
-            "no staged version \"0123456789abcdef\" of script \"test-app\"; run `celld deploy --no-activate` first",
-            "the generation committed, but its named pointers did not converge: put deploy/test-app/current.json: connection refused; re-run `celld activate` to converge them",
+            "thread 'main' panicked at crates/cello/deploy.rs:973",
+            "write s3://noite/fleets/x/deploy/current.json lost a race\nAnother deploy or activate landed first; re-run `cello activate`.",
+            "no staged version \"0123456789abcdef\" of script \"test-app\"; run `cello deploy --no-activate` first",
+            "the generation committed, but its named pointers did not converge: put deploy/test-app/current.json: connection refused; re-run `cello activate` to converge them",
         ] {
             assert!(!is_tenant_error(infra), "infra misread as tenant: {}", infra);
         }
@@ -1149,7 +1149,7 @@ mod tests {
 
     /// The staged row parses to its worker and version — and anything else
     /// (garbage, a missing field, a non-16-hex version, a worker outside
-    /// celld's script-name rule) fails the deploy here instead of reaching
+    /// Cello's script-name rule) fails the deploy here instead of reaching
     /// `activate` as a corrupt `SCRIPT=VERSION`.
     #[test]
     fn staged_output_parses_or_fails_loudly() {
@@ -1178,7 +1178,7 @@ mod tests {
             "{\"worker\": \"test-app\", \"version\": \"abc\"}",
             "{\"worker\": \"test-app\", \"version\": 42}",
             // Outside the script-name rule: a leading `-` would parse as
-            // an `activate` flag, the rest never survives celld either.
+            // an `activate` flag, the rest never survives Cello either.
             "{\"worker\": \"--bucket\", \"version\": \"0123456789abcdef\"}",
             "{\"worker\": \"-app\", \"version\": \"0123456789abcdef\"}",
             "{\"worker\": \"app-\", \"version\": \"0123456789abcdef\"}",
@@ -1186,7 +1186,7 @@ mod tests {
             "{\"worker\": \"app_name\", \"version\": \"0123456789abcdef\"}",
             "{\"worker\": \"a b\", \"version\": \"0123456789abcdef\"}",
             "{\"worker\": \"app=1\", \"version\": \"0123456789abcdef\"}",
-            // A version celld did not stage (pointer moved, or a dry run).
+            // A version Cello did not stage (pointer moved, or a dry run).
             "{\"worker\": \"test-app\", \"version\": \"0123456789abcdef\", \"staged\": false, \"dry_run\": false}",
             "{\"worker\": \"test-app\", \"version\": \"0123456789abcdef\", \"staged\": true, \"dry_run\": true}",
         ] {
@@ -1205,10 +1205,10 @@ mod tests {
         .is_err());
     }
 
-    /// A fake `celld` (`tests/fixtures/fake-celld-cohost.sh`): appends its
+    /// A fake `cello` (`tests/fixtures/fake-celld-cohost.sh`): appends its
     /// argv to `$FAKE_CELLD_LOG`, then fails invocation `n` (zero-based)
     /// when `$FAKE_CELLD_DIR/fail-<n>` exists (file content to stderr, exit
-    /// 1). A `deploy` answers like `celld deploy --no-activate --json` — one
+    /// 1). A `deploy` answers like `cello deploy --no-activate --json` — one
     /// JSON object whose worker is the project dir's `wrangler.json` name
     /// and whose version is the invocation index as 16-hex, deterministic
     /// per invocation — and an `activate` answers a text line the caller
@@ -1304,8 +1304,8 @@ mod tests {
     }
 
     /// Proxy first, app last, one activate: the ordered deploy stages the
-    /// cohosted project before the app's with `celld deploy --no-activate`
-    /// into the same bucket, then serves both with a single `celld
+    /// cohosted project before the app's with `cello deploy --no-activate`
+    /// into the same bucket, then serves both with a single `cello
     /// activate` naming each staged version — and the cohosted temp project
     /// is removed afterwards.
     #[tokio::test]

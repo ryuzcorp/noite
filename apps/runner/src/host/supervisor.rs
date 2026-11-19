@@ -677,7 +677,7 @@ impl FleetEntry {
 pub enum FleetFate {
     /// Gone from the map: a stop or a teardown took it on purpose.
     Removed,
-    /// celld exited on its own (still in the map until the next ensure).
+    /// Cello exited on its own (still in the map until the next ensure).
     Exited(String),
 }
 
@@ -881,7 +881,7 @@ impl StopGrace {
         kill_first: false,
     };
     /// A cold start that never answered its health gate, stopped because the
-    /// wake that started it failed. It still gets SIGTERM — celld releases its
+    /// wake that started it failed. It still gets SIGTERM — Cello releases its
     /// leases and seals its log on the way out, and a SIGKILL would leave the
     /// next wake waiting out the lease TTL — but the budget is short enough to
     /// stay inside Caddy's wake response margin (`wake_timeout_s` + 15 s),
@@ -893,7 +893,7 @@ impl StopGrace {
     };
 }
 
-/// Stop one tenant fleet. The docs are explicit: celld shuts down gracefully
+/// Stop one tenant fleet. The docs are explicit: Cello shuts down gracefully
 /// on SIGTERM/SIGINT (cancel work, prove durability, release leases, seal
 /// the node log). SIGKILL only as a bounded fallback — delivered to the whole
 /// process group, so an orphaned worker can never keep the fleet's port into
@@ -990,7 +990,7 @@ pub async fn stop_child(
         // fleet's data right after the stop, so durability work is pure
         // delay — and every second here runs against the API caller's own
         // timeout. SIGKILL the group at once instead.
-        tracing::info!(slug, "stopping celld for delete (SIGKILL first)");
+        tracing::info!(slug, "stopping cello for delete (SIGKILL first)");
         match pid {
             Some(pid) => sigkill_tree(pid),
             None => {
@@ -1004,7 +1004,7 @@ pub async fn stop_child(
             .await
             .is_err()
         {
-            tracing::warn!(slug, "celld did not stop in time; killing");
+            tracing::warn!(slug, "cello did not stop in time; killing");
             sigkill_tree(pid);
             let _ = tokio::time::timeout(grace.kill, child.wait()).await;
         }
@@ -1018,7 +1018,7 @@ pub async fn stop_child(
     // cleanup: a spawn that started during the drain must keep its leaf,
     // baseline and proxy.
     cleanup_scaffolding(procs, slug, epoch, SideEffects::Stop).await;
-    tracing::info!(slug, "stopped celld");
+    tracing::info!(slug, "stopped cello");
 }
 
 /// Why the key-scoped scaffolding is being released: a deliberate stop or
@@ -1214,7 +1214,7 @@ pub async fn stop_fleets(procs: &ProcMap, keys: &[String], grace: StopGrace) {
     .await;
 }
 
-/// One celld fleet to (re)spawn: identity, bucket, ports, state dir, env.
+/// One Cello fleet to (re)spawn: identity, bucket, ports, state dir, env.
 struct FleetSpec {
     /// `ProcMap` key and log-ring key (`slug`, or `slug.label`).
     key: String,
@@ -1233,7 +1233,7 @@ struct FleetSpec {
     env: Vec<(String, String)>,
     /// Effective per-fleet memory cap in MiB (per-app override, else
     /// `RUNNER_FLEET_MEMORY_MB`): the cgroup's `memory.max`, which the shed
-    /// threshold measures too once `CELLD_MEMORY_SCOPE=self` points celld
+    /// threshold measures too once `CELLO_MEMORY_SCOPE=self` points Cello
     /// at the fleet's own leaf.
     memory_mb: u32,
 }
@@ -1272,7 +1272,7 @@ fn clamp_memory_mb(stored_mb: Option<u32>, default_mb: u32, ceiling_mb: u32, mul
     }
 }
 
-/// App fleet: celld on the app's bucket and ports (SPEC, Fleet lifecycle).
+/// App fleet: Cello on the app's bucket and ports (SPEC, Fleet lifecycle).
 pub async fn ensure_fleet(
     pool: &SqlitePool,
     cfg: &Config,
@@ -1309,7 +1309,7 @@ pub async fn ensure_fleet(
     ensure_spawned(pool, cfg, procs, logs, spec).await
 }
 
-/// Environment fleet: its own celld on the environment's bucket and ports,
+/// Environment fleet: its own Cello on the environment's bucket and ports,
 /// with the app's variables plus the environment's overrides. Nothing here
 /// reads or writes the app's bucket, ports or `last_deploy_sha`.
 pub async fn ensure_environment_fleet(
@@ -1399,7 +1399,7 @@ pub async fn note_exit(procs: &ProcMap, key: &str, memory_mb: u32) -> Option<Fle
         },
     };
     let oom = collect_possible_oom(key, memory_mb);
-    tracing::warn!(fleet = %key, status = %exited, "celld exited");
+    tracing::warn!(fleet = %key, status = %exited, "cello exited");
     entry.child = None;
     entry.state = entry.state.on(FleetEvent::Exited {
         oom: oom.is_some(),
@@ -1574,7 +1574,7 @@ fn fleet_engine_socket(key: &str) -> Option<std::path::PathBuf> {
     }
 }
 
-/// Spawn (or confirm) one celld fleet, whoever owns it.
+/// Spawn (or confirm) one Cello fleet, whoever owns it.
 async fn ensure_spawned(
     pool: &SqlitePool,
     cfg: &Config,
@@ -1762,7 +1762,7 @@ enum Due {
     },
 }
 
-/// Spawn one celld for an [`FleetState::Absent`] fleet and record
+/// Spawn one Cello for an [`FleetState::Absent`] fleet and record
 /// [`FleetEvent::Spawned`]. Split from [`ensure_spawned`] so the decision half
 /// stays readable: the caller has already established that no child runs and no
 /// hold is pending.
@@ -1803,7 +1803,7 @@ async fn spawn_fleet_inner(
 
     let state_dir = spec.state_dir.to_string_lossy().into_owned();
     tokio::fs::create_dir_all(&state_dir).await?;
-    // celld runs as the fleet user: the whole state dir must be its own,
+    // Cello runs as the fleet user: the whole state dir must be its own,
     // including SQLite / replication files an earlier runner (root, or an
     // older build of this image) left there, or the fleet cannot open its
     // cells.
@@ -1825,9 +1825,9 @@ async fn spawn_fleet_inner(
     // The fleet's operator token, minted once per scope and stable across
     // restarts (SPEC, Tenant isolation): the node requires it as a Bearer
     // token on every internal route, and the runner sends it back on its
-    // own internal calls. Tenant settings cannot override it — `CELLD_*`
+    // own internal calls. Tenant settings cannot override it — `CELLO_*`
     // never reaches `spec.env` (`db::env_reserved`) — and Worker code
-    // cannot read the process env (celld builds the Worker env from
+    // cannot read the process env (Cello builds the Worker env from
     // declared vars only).
     let operator_token = credentials::operator_token(
         pool,
@@ -1839,9 +1839,9 @@ async fn spawn_fleet_inner(
     // Advertise on loopback: a tenant fleet is a single node, a child of the
     // runner in its own network namespace, and the runner already reaches it
     // at 127.0.0.1:{internal} (reload_fleet). A hostname advertise
-    // (fleet-{slug}) doesn't resolve inside the container, which breaks celld
+    // (fleet-{slug}) doesn't resolve inside the container, which breaks Cello
     // node discovery (d1/diagnose read the lease and dial `addr`). The
-    // internal listener binds loopback too: it carries celld's operator API,
+    // internal listener binds loopback too: it carries Cello's operator API,
     // token-guarded (SPEC, Tenant isolation) and closed to tenant code by
     // the Worker egress policy on top.
     let listen_addr = format!("0.0.0.0:{}", spec.listen);
@@ -1963,8 +1963,8 @@ async fn spawn_fleet_inner(
         }
     }
     // With sandboxing on the fleet gets its own proxy socket, otherwise no
-    // engine at all. celld's operator knobs for containers stay unsupported:
-    // a runtime or resolver makes celld send `Runtime`/`Binds`, which the
+    // engine at all. Cello's operator knobs for containers stay unsupported:
+    // a runtime or resolver makes Cello send `Runtime`/`Binds`, which the
     // engine proxy refuses (they would hand a fleet host paths or a weaker
     // runtime), so a value would only break every Sandbox start.
     let engine_socket = if cfg.sandbox_disabled {
@@ -1976,7 +1976,7 @@ async fn spawn_fleet_inner(
         .as_ref()
         .map(|socket| socket.to_string_lossy().into_owned());
     // Explicit environment only (`host::fleet_env`): the spawn inherits
-    // nothing — no `RUNNER_TOKEN`, no operator-global `CELLD_*`, no ambient
+    // nothing — no `RUNNER_TOKEN`, no operator-global `CELLO_*`, no ambient
     // credential chain — and tenant settings cannot override a platform
     // knob, since the builder applies them first. This `apply` call is
     // load-bearing (nothing here fails if it is dropped): the builder and
@@ -2170,7 +2170,7 @@ pub async fn stop_all(procs: &ProcMap, budget: Duration) {
     }
 }
 
-/// What celld's `POST /reload` concluded (celld 0.6.3 `internal_reload`):
+/// What Cello's `POST /reload` concluded (Cello 0.6.3 `internal_reload`):
 /// `{ok, outcome, ...}` with `outcome` one of `adopted`, `unchanged`,
 /// `failed` (422, with `error`), or `unavailable` (503, no pointer yet).
 /// Anything else — a transport error, an unparsable body — is
@@ -2187,7 +2187,7 @@ pub enum ReloadOutcome {
 }
 
 impl ReloadOutcome {
-    /// Fail the deploy when celld refused the new generation, with celld's
+    /// Fail the deploy when Cello refused the new generation, with Cello's
     /// own error; anything else (adopted, unchanged, unreachable) proceeds
     /// to the health gate.
     pub fn fail_deploy_on_failed(self, fleet: &str) -> anyhow::Result<()> {
@@ -2204,8 +2204,8 @@ impl ReloadOutcome {
     }
 }
 
-/// Celld's reload error, safe for the deploy log and `last_error`: the text
-/// can carry tenant-shaped input (celld formats an unvalidated
+/// Cello's reload error, safe for the deploy log and `last_error`: the text
+/// can carry tenant-shaped input (Cello formats an unvalidated
 /// `services[].service` target into it), so control characters flatten to
 /// spaces and the whole is capped — the same posture as `check_required`
 /// quoting required names, minus the quotes, so a genuine multi-line build
@@ -2223,7 +2223,7 @@ fn sanitize_reload_error(error: &str) -> String {
 const RELOAD_ERROR_CAP: usize = 2000;
 
 /// Parse one `POST /reload` response body into its outcome. `failed`
-/// carries celld's error; `adopted`/`unchanged` succeed; `unavailable` and
+/// carries Cello's error; `adopted`/`unchanged` succeed; `unavailable` and
 /// anything unparsable read as unreachable (warned by the caller).
 pub fn parse_reload_response(body: &str) -> ReloadOutcome {
     let outcome = serde_json::from_str::<serde_json::Value>(body)
@@ -2254,7 +2254,7 @@ pub fn parse_reload_response(body: &str) -> ReloadOutcome {
     }
 }
 
-/// POST /reload on the fleet and report what celld concluded. See
+/// POST /reload on the fleet and report what Cello concluded. See
 /// [`ReloadOutcome`]: only a failed adoption is returned as such — a
 /// transport error warns, as before, and reads as unreachable. The fleet's
 /// operator token rides as a Bearer token (the node requires it on every
@@ -2269,7 +2269,7 @@ pub async fn reload_fleet(app: &App) -> ReloadOutcome {
 }
 
 /// POST /reload on an environment fleet, so a preview deploy goes live
-/// without waiting for celld's own poll. Same outcome contract as
+/// without waiting for Cello's own poll. Same outcome contract as
 /// [`reload_fleet`].
 pub async fn reload_environment_fleet(env: &crate::models::Environment) -> ReloadOutcome {
     let Some(port) = env.internal_port else {
@@ -2295,7 +2295,7 @@ async fn reload_at(fleet: &str, port: i64, scope_key: &str) -> ReloadOutcome {
     let body = response.text().await.unwrap_or_default();
     let outcome = parse_reload_response(&body);
     if outcome == ReloadOutcome::Unreachable {
-        // Truncated: the body is celld's, not ours, and the deploy log
+        // Truncated: the body is Cello's, not ours, and the deploy log
         // below prints only what the deploy does with the outcome.
         let snippet: String = body.chars().take(200).collect();
         tracing::warn!(fleet = %fleet, body = %snippet, "reload outcome unparsable");
@@ -3476,7 +3476,7 @@ mod tests {
         );
     }
 
-    /// Deletes SIGKILL first: a fleet that ignores SIGTERM (young celld
+    /// Deletes SIGKILL first: a fleet that ignores SIGTERM (young Cello
     /// fleets did, every time in the slow-delete failures) must not hold a
     /// delete out for a grace period — the API caller gives up after 5 s and
     /// a dropped delete used to leave the app half-deleted.
@@ -3698,8 +3698,8 @@ mod tests {
         assert_eq!(clamp_memory_mb(None, 512, 256, false), 512);
     }
 
-    /// celld's `/reload` bodies (0.6.3 `internal_reload`) parse into their
-    /// outcomes: `failed` keeps celld's error, `unavailable` and anything
+    /// Cello's `/reload` bodies (0.6.3 `internal_reload`) parse into their
+    /// outcomes: `failed` keeps Cello's error, `unavailable` and anything
     /// unexpected read as unreachable.
     #[test]
     fn reload_bodies_parse_into_their_outcomes() {
@@ -3715,9 +3715,9 @@ mod tests {
             ),
             ReloadOutcome::Unchanged
         );
-        // The missing-service-target body, verbatim from a real celld
+        // The missing-service-target body, verbatim from a real Cello
         // `/reload` (a dangling `services` entry fails adoption this way):
-        // the deploy must fail with celld's error, never record Success.
+        // the deploy must fail with Cello's error, never record Success.
         assert_eq!(
             parse_reload_response(
                 r#"{"ok":false,"outcome":"failed","error":"load service binding target no-such-script: read s3://voidproxy/deploy/no-such-script/current.json: no such key"}"#
@@ -3749,7 +3749,7 @@ mod tests {
         }
     }
 
-    /// Minimal celld `/reload` stand-in: answers `adopted` and records the
+    /// Minimal Cello `/reload` stand-in: answers `adopted` and records the
     /// `Authorization` header it saw, so the test pins what the runner sent.
     async fn serve_reload(listener: tokio::net::TcpListener, seen: Arc<Mutex<Option<String>>>) {
         let Ok((mut stream, _)) = listener.accept().await else {
@@ -3848,7 +3848,7 @@ mod tests {
         pool.close().await;
     }
 
-    /// Only a failed adoption fails the deploy — with celld's error naming
+    /// Only a failed adoption fails the deploy — with Cello's error naming
     /// the cause — while adopted, unchanged and unreachable proceed to the
     /// health gate.
     #[test]
@@ -3879,7 +3879,7 @@ mod tests {
     fn forged_service_targets_cannot_inject_reload_lines() {
         let forged = "x\nERROR: forged lines\nerror: fake summary";
         let error = format!("load service binding target {}", forged);
-        // Through the real path: celld's body, parsed, then failed.
+        // Through the real path: Cello's body, parsed, then failed.
         let body = format!(
             "{{\"ok\":false,\"outcome\":\"failed\",\"version\":\"v\",\"prefix\":\"p\",\"error\":{:?}}}",
             error

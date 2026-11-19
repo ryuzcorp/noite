@@ -11,13 +11,13 @@
 //! range is policed. Replies on connections others opened always pass.
 //!
 //! Tenant fleets used to be policed here too (the same rejects, keyed on
-//! the fleet uid); their Worker egress is now enforced inside celld
-//! (`CELLD_EGRESS=public` plus the store exception, set at spawn), which
+//! the fleet uid); their Worker egress is now enforced inside Cello
+//! (`CELLO_EGRESS=public` plus the store exception, set at spawn), which
 //! sees Workers where nft sees only uids — and the operator API the
-//! loopback blocks protected is token-guarded on top. celld cannot police
+//! loopback blocks protected is token-guarded on top. Cello cannot police
 //! non-Worker processes, so the build/release half stays here (NO-15).
 //! Sandbox container dials cross no rule in this chain: fleet TCP toward
-//! celld's bridges is redirected (nft `nat` output, the `noite_gateway`
+//! Cello's bridges is redirected (nft `nat` output, the `noite_gateway`
 //! table) to the runner's gateway listener on 127.0.0.1:8071, which admits
 //! only dials to containers the connecting fleet owns
 //! (`host::sandbox::gateway`), and those flows pass on the chain's accept
@@ -48,8 +48,8 @@ static APPLIED_STORAGE: Mutex<Storage> = Mutex::new(Storage {
 /// The object store the policy lets policed uids reach: its resolved
 /// addresses and port. Builds hold no keys of their own, so the store's
 /// unauthenticated surface is all they can reach; release commands hold the
-/// scope's own key. (Tenant fleets reach the same store through celld's own
-/// exempt traffic plus the `CELLD_EGRESS_ALLOW` exception.)
+/// scope's own key. (Tenant fleets reach the same store through Cello's own
+/// exempt traffic plus the `CELLO_EGRESS_ALLOW` exception.)
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Storage {
     pub addrs: Vec<IpAddr>,
@@ -395,8 +395,8 @@ mod tests {
         );
     }
 
-    /// The fleet-uid half is gone: Worker egress is enforced inside celld
-    /// (`CELLD_EGRESS`), so no rule here may key on the fleet uid — neither
+    /// The fleet-uid half is gone: Worker egress is enforced inside Cello
+    /// (`CELLO_EGRESS`), so no rule here may key on the fleet uid — neither
     /// rejects nor the old gateway-redirect ACCEPT (redirected flows pass on
     /// the chain's accept policy now).
     #[test]

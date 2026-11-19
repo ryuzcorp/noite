@@ -577,9 +577,9 @@ describe("createStreamHub", () => {
     const [source] = liveSources();
     source?.emit("open");
     source?.emit("message", "0:+");
-    source?.emit("message", '0:["celld listening"]');
+    source?.emit("message", '0:["cello listening"]');
     source?.emit("message", "1:[]");
-    expect(logs.messages).toEqual(['["celld listening"]']);
+    expect(logs.messages).toEqual(['["cello listening"]']);
     expect(deploys.messages).toEqual(["[]"]);
     expect(logs.statuses.at(-1)).toBe("Open");
 
@@ -588,7 +588,7 @@ describe("createStreamHub", () => {
     const sidebar = collect();
     streams.subscribe(LOGS, sidebar.hooks);
     flush();
-    expect(sidebar.messages).toEqual(['["celld listening"]']);
+    expect(sidebar.messages).toEqual(['["cello listening"]']);
     expect(FakeSource.instances).toHaveLength(1);
   });
 
@@ -736,10 +736,10 @@ describe("createStreamHub", () => {
     const [source] = liveSources();
     source?.emit("open");
     source?.emit("message", "0:+");
-    source?.emit("message", '0:["celld listening"]');
+    source?.emit("message", '0:["cello listening"]');
     source?.emit("message", "1:+");
     source?.emit("message", "1:[]");
-    expect(logs.messages).toEqual(['["celld listening"]']);
+    expect(logs.messages).toEqual(['["cello listening"]']);
     expect(deploys.messages).toEqual(["[]"]);
 
     // Kill the connection the way an HTTP error kills a native source:
@@ -758,11 +758,11 @@ describe("createStreamHub", () => {
     replacement?.emit("open");
     replacement?.emit("message", "0:+");
     replacement?.emit("message", "1:+");
-    replacement?.emit("message", '0:["celld listening"]');
+    replacement?.emit("message", '0:["cello listening"]');
     replacement?.emit("message", "1:[]");
     expect(logs.messages).toEqual([
-      '["celld listening"]',
-      '["celld listening"]',
+      '["cello listening"]',
+      '["cello listening"]',
     ]);
     expect(deploys.messages).toEqual(["[]", "[]"]);
     expect(logs.statuses.at(-1)).toBe("Open");

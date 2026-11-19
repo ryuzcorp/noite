@@ -2,7 +2,7 @@
 /**
  * Pin guard for the one image (docker/Dockerfile) and its sidecars.
  *
- * - celld, Caddy, Node and jup (with its tarball digest) are pinned exactly once (an ARG default); a second pin in
+ * - cello, Caddy, Node and jup (with its tarball digest) are pinned exactly once (an ARG default); a second pin in
  *   the same file is how a stage silently builds against another version.
  * - Every external `FROM` is `image:tag@${DIGEST}` with one `<NAME>_DIGEST`
  *   ARG, every downloaded tarball carries the publisher's per-arch
@@ -90,15 +90,12 @@ const compareVersions = (a: string, b: string): number => {
 };
 
 for (const [name, pattern] of [
-  // celld comes from the ryuzcorp/celld fork (SPEC, celld): a
-  // `<version>-ryuzcorp.<level>` tag, so any other form pins zero times.
+  // Cello comes from ryuzcorp/cello (SPEC, Cello): a plain `<version>` tag,
+  // so any other form pins zero times.
+  ["cello", /ARG CELLO_VERSION=(?<version>\d+\.\d+\.\d+)(?=\s|$)/gu],
   [
-    "celld",
-    /ARG CELLD_VERSION=(?<version>\d+\.\d+\.\d+-ryuzcorp\.\d+)(?=\s|$)/gu,
-  ],
-  [
-    "celld digest",
-    /ARG CELLD_DIGEST=(?<version>sha256:[0-9a-f]{64})(?=\s|$)/gu,
+    "cello digest",
+    /ARG CELLO_DIGEST=(?<version>sha256:[0-9a-f]{64})(?=\s|$)/gu,
   ],
   ["caddy", /ARG CADDY_VERSION=(?<version>\d+\.\d+\.\d+)(?=\s|$)/gu],
   ["node", /ARG NODE_VERSION=(?<version>\d+\.\d+\.\d+)(?=\s|$)/gu],
@@ -123,33 +120,33 @@ for (const [name, pattern] of [
   }
 }
 
-// The stage must pull exactly that tag from the fork's package, by
+// The stage must pull exactly that tag from the release package, by
 // the pinned digest: the version and digest checks above mean nothing if
-// CELLD_IMAGE names another registry or the FROM line ignores it. (CI's
-// `celld pin is published` step checks the digest is that tag's.)
+// CELLO_IMAGE names another registry or the FROM line ignores it. (CI's
+// `cello pin is published` step checks the digest is that tag's.)
 // A Dockerfile `${NAME}` reference, spelled without tripping the
 // template-in-string lint.
 const arg = (name: string): string => `\${${name}}`;
 
-const celldImage = dockerfile.match(/ARG CELLD_IMAGE=(?<image>\S+)/u)?.groups
+const celloImage = dockerfile.match(/ARG CELLO_IMAGE=(?<image>\S+)/u)?.groups
   ?.image;
 
-const expectedCelldImage = `ghcr.io/ryuzcorp/celld:${arg("CELLD_VERSION")}@${arg("CELLD_DIGEST")}`;
+const expectedCelloImage = `ghcr.io/ryuzcorp/cello:${arg("CELLO_VERSION")}@${arg("CELLO_DIGEST")}`;
 
-if (celldImage !== expectedCelldImage) {
+if (celloImage !== expectedCelloImage) {
   fail(
-    `celld: CELLD_IMAGE must be ${expectedCelldImage} (found ${celldImage ?? "nothing"})`
+    `cello: CELLO_IMAGE must be ${expectedCelloImage} (found ${celloImage ?? "nothing"})`
   );
 }
 
-const celldFrom = [...dockerfile.matchAll(/^FROM (?<image>\S+) AS celld$/gmu)];
+const celloFrom = [...dockerfile.matchAll(/^FROM (?<image>\S+) AS cello$/gmu)];
 
 if (
-  celldFrom.length !== 1 ||
-  celldFrom[0]?.groups?.image !== arg("CELLD_IMAGE")
+  celloFrom.length !== 1 ||
+  celloFrom[0]?.groups?.image !== arg("CELLO_IMAGE")
 ) {
   fail(
-    `celld: docker/Dockerfile must have exactly one \`FROM ${arg("CELLD_IMAGE")} AS celld\``
+    `cello: docker/Dockerfile must have exactly one \`FROM ${arg("CELLO_IMAGE")} AS cello\``
   );
 }
 
