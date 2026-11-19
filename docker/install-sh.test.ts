@@ -297,6 +297,43 @@ compose() {
   });
 });
 
+describe("install.sh cello env migration", () => {
+  test("stale CELLD_* keys are renamed to CELLO_*, keeping values", () => {
+    writeFileSync(
+      path.join(dir, ".env"),
+      "BASE_DOMAIN=example.com\nCELLD_BIN=/usr/local/bin/cello\nCELLD_ADVERTISE=peer\n"
+    );
+    const result = runBash(`${PRELUDE}\nmigrate_cello_env`);
+
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain("CELLD_BIN");
+    expect(result.stdout).toContain("CELLO_BIN");
+    const env = readEnv();
+    expect(env).toContain("CELLO_BIN=/usr/local/bin/cello");
+    expect(env).toContain("CELLO_ADVERTISE=peer");
+    expect(env).not.toMatch(/^CELLD_/mu);
+  });
+
+  test("a pre-existing CELLO_* value wins and the stale line is dropped", () => {
+    writeFileSync(path.join(dir, ".env"), "CELLO_BIN=/new\nCELLD_BIN=/old\n");
+    const result = runBash(`${PRELUDE}\nmigrate_cello_env`);
+
+    expect(result.status).toBe(0);
+    const env = readEnv();
+    expect(env).toContain("CELLO_BIN=/new");
+    expect(env).not.toMatch(/^CELLD_/mu);
+  });
+
+  test("an env without stale keys is left byte-identical", () => {
+    const before = "BASE_DOMAIN=example.com\nCELLO_BIN=/new\n";
+    writeFileSync(path.join(dir, ".env"), before);
+    const result = runBash(`${PRELUDE}\nmigrate_cello_env`);
+
+    expect(result.status).toBe(0);
+    expect(readEnv()).toBe(before);
+  });
+});
+
 describe("install.sh entrypoint", () => {
   test("run.sh-style execution (bash -c, unset BASH_SOURCE) reaches main", () => {
     // run.sh invokes the installer as `bash -c "$script" install.sh`, where

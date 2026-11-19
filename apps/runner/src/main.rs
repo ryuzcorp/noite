@@ -226,17 +226,6 @@ async fn main() -> anyhow::Result<()> {
              AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY; remove them from the URL"
         );
     }
-    // Fleets get only the knobs the runner sets, so an operator-global
-    // `CELLD_*` here reaches no fleet.
-    let ignored = host::fleet_env::ignored_celld_vars(
-        std::env::vars_os().filter_map(|(key, _)| key.into_string().ok()),
-    );
-    if !ignored.is_empty() {
-        tracing::warn!(
-            vars = %ignored.join(","),
-            "CELLD_* in the runner env reaches no fleet; use the RUNNER_FLEET_* knobs"
-        );
-    }
 
     // Before anything writes to /data: private by default (SPEC, Data directory).
     host::isolation::harden_data_dir(&config);
@@ -346,7 +335,7 @@ async fn main() -> anyhow::Result<()> {
     // Isolation: nft egress policy first, then self-checks (SPEC, Egress policy + Tenancy mode).
     // Only in multi tenancy: the single tenant is trusted, and the policy
     // would also cut single-tenant release commands off from the bucket.
-    // The table covers the build range only (Worker egress lives in celld);
+    // The table covers the build range only (Worker egress lives in Cello);
     // with no range there is nothing to install (builds are refused
     // separately).
     let build_uids = config.build_uid_base.map(|b| (b, config.build_uid_range));
@@ -369,7 +358,7 @@ async fn main() -> anyhow::Result<()> {
         }
     };
     // The sandbox plane (both tenancies: single has no egress policy but the
-    // same relay/gateway path): celld bridges, relay container, gateway
+    // same relay/gateway path): Cello bridges, relay container, gateway
     // listener, gateway nft table, and the one-time cleanup of what
     // alpha.12–14 left on the host. Best-effort and never blocking: the
     // whole pass runs in a spawned task (sequential engine calls would
@@ -389,7 +378,7 @@ async fn main() -> anyhow::Result<()> {
     // their fleets died with the runner. Also with sandboxing switched off,
     // so turning it off leaves nothing running. Bounded, so a sick engine
     // delays boot by at most the bound. Reading this container's image here
-    // too lets the engine proxy run celld's fence from it from the start.
+    // too lets the engine proxy run Cello's fence from it from the start.
     let boot_pass = async {
         let swept = host::sandbox::engine::sweep_boot().await;
         if !config.sandbox_disabled {
@@ -772,7 +761,7 @@ async fn main() -> anyhow::Result<()> {
             // The migration endpoints are served by the control worker, so
             // the first attempt waits for the fleet to adopt the pointer. A
             // failure retries in the background with capped backoff (a slow
-            // celld start or a briefly unreachable store needs no operator
+            // Cello start or a briefly unreachable store needs no operator
             // restart); while it fails the control UI answers 503 and
             // /ready names the cause.
             match host::control::migrate(&config).await {

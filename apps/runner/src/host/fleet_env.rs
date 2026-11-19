@@ -391,30 +391,6 @@ pub fn control_fleet_env(input: &ControlFleetEnv<'_>) -> Vec<(String, String)> {
     env
 }
 
-/// `CELLD_*` names the boot warning leaves alone: the legacy spellings the
-/// runner itself still honors (`CELLD_BIN`, `CELLD_ADVERTISE`, and
-/// `CELLD_VERSION`, which telemetry reports). Every other `CELLD_*` in the
-/// runner's env reaches no fleet and is reported as stale.
-const NOT_WARNED_CELLD: &[&str] = &[
-    "CELLD_BIN",
-    "CELLD_ADVERTISE",
-    "CELLD_VERSION",
-];
-
-/// The stale `CELLD_*` names in `keys` that no fleet will see: fleets get only
-/// the knobs the runner sets (`RUNNER_FLEET_*` and friends), so an
-/// operator-global `CELLD_*` is ignored — and Cello refuses to start with
-/// any `CELLD_*` set, so `main` warns once at boot with these names, sorted,
-/// rather than ignoring them silently.
-pub fn ignored_celld_vars(keys: impl Iterator<Item = String>) -> Vec<String> {
-    let mut ignored: Vec<String> = keys
-        .filter(|key| key.starts_with("CELLD_") && !NOT_WARNED_CELLD.contains(&key.as_str()))
-        .collect();
-    ignored.sort();
-    ignored.dedup();
-    ignored
-}
-
 /// Apply a built fleet env to a spawn: nothing is inherited, so the child
 /// sees exactly `env` (later entries win on duplicate keys, which is how
 /// the platform knobs override tenant vars).
@@ -480,13 +456,13 @@ mod tests {
         "RUNNER_TOKEN",
         "BETTER_AUTH_SECRET",
         "NOITE_SMTP_FROM",
-        "CELLD_EGRESS",
-        "CELLD_EGRESS_ALLOW",
-        "CELLD_MEMORY_SCOPE",
-        "CELLD_CACHE_SCOPE",
-        "CELLD_MAX_RSS_MB",
-        "CELLD_CONTAINER_RUNTIME",
-        "CELLD_CONTAINER_DNS",
+        "CELLO_EGRESS",
+        "CELLO_EGRESS_ALLOW",
+        "CELLO_MEMORY_SCOPE",
+        "CELLO_CACHE_SCOPE",
+        "CELLO_MAX_RSS_MB",
+        "CELLO_CONTAINER_RUNTIME",
+        "CELLO_CONTAINER_DNS",
         "DOCKER_HOST",
         "AWS_SESSION_TOKEN",
         "AWS_CA_BUNDLE",
@@ -530,7 +506,7 @@ mod tests {
         cfg.tenancy = tenancy;
         cfg.s3_endpoint = "http://rustfs:9000".into();
         cfg.aws_region = "us-east-1".into();
-        cfg.fleet_log = "error,celld=warn".into();
+        cfg.fleet_log = "error,cello=warn".into();
         cfg.fleet_max_rss_mb = 0;
         cfg
     }
@@ -556,7 +532,7 @@ mod tests {
 
     /// The store exception is the endpoint's `host:port` — a hostname entry
     /// re-resolves on every check, an IPv6 literal takes brackets, and a
-    /// default port is spelled out (celld entries need one). Garbage yields
+    /// default port is spelled out (Cello entries need one). Garbage yields
     /// no entry rather than a value that would refuse the node its boot.
     #[test]
     fn egress_allow_names_the_store_host_and_port() {
@@ -896,31 +872,6 @@ mod tests {
         assert_eq!(flat["CELLO_MEMORY_SCOPE"], "self");
     }
 
-    /// Stale operator-global `CELLD_*` names are reported (sorted, once) so
-    /// `main` can warn that no fleet sees them; the legacy spellings the
-    /// runner honors itself, non-`CELLD_` names, and every `CELLO_*` are not.
-    #[test]
-    fn ignored_celld_vars_names_what_no_fleet_sees() {
-        let keys = [
-            "CELLD_TOKIO_THREADS",
-            "CELLD_VERSION",
-            "CELLD_ESBUILD",
-            "CELLD_BIN",
-            "PATH",
-            "CELLD_ADVERTISE",
-            "CELLD_MAX_RSS_MB",
-            "RUNNER_FLEET_MAX_RSS_MB",
-            "CELLO_BIN",
-            "CELLD_TOKIO_THREADS",
-        ]
-        .into_iter()
-        .map(str::to_string);
-        assert_eq!(
-            ignored_celld_vars(keys),
-            vec!["CELLD_ESBUILD", "CELLD_MAX_RSS_MB", "CELLD_TOKIO_THREADS"]
-        );
-    }
-
     /// The real spawn path, not just the builder: `apply` clears whatever
     /// the command would otherwise carry — here the hostile values preset on
     /// the command itself, on top of the test process's own env — so the
@@ -956,7 +907,7 @@ mod tests {
                 "spawned fleet sees {key}, outside the allowlist"
             );
         }
-        assert_eq!(seen["CELLD_EGRESS"], "public");
+        assert_eq!(seen["CELLO_EGRESS"], "public");
         assert_eq!(seen["AWS_ACCESS_KEY_ID"], "scoped-access");
     }
 }

@@ -194,7 +194,7 @@ impl DeployTarget {
         }
     }
 
-    /// The celld bucket this deploy writes durability into.
+    /// The Cello bucket this deploy writes durability into.
     pub fn bucket(&self, app: &App) -> String {
         match self {
             Self::Production => app.fleet_bucket.clone(),
@@ -1103,7 +1103,7 @@ async fn deploy_inner(
     }
 
     // `cf` CLI apps declare the Worker in cloudflare.config.ts; generate the
-    // wrangler.json celld deploys, unless the tree or the build has one.
+    // wrangler.json Cello deploys, unless the tree or the build has one.
     if tokio::fs::try_exists(src_dir.join(CF_CONFIG)).await?
         && !has_wrangler_config(&src_dir).await?
     {
@@ -1137,7 +1137,7 @@ async fn deploy_inner(
     // runner's again, below.
     let mut generated = None;
     // Void's required secrets, captured before the build-output rewrite
-    // dropped the key celld refuses: checked against settings below.
+    // dropped the key Cello refuses: checked against settings below.
     let required_secrets = built_root
         .as_ref()
         .map(|built| built.required_secrets.clone())
@@ -1187,7 +1187,7 @@ async fn deploy_inner(
     }
 
     // One-shot release command (`"release": "bun run db:migrate"` in the
-    // tenant wrangler config), run once after build, before `celld deploy`.
+    // tenant wrangler config), run once after build, before `cello deploy`.
     // Failure aborts: the old release keeps serving. 10 min hard timeout.
     // Release must not see root keys (SPEC, Build and release sandbox): in multi it gets the scoped
     // credential or is disabled with a clear log line; single keeps root.
@@ -1256,7 +1256,7 @@ async fn deploy_inner(
     }
 
     // Tenant steps are over: take the tree back from the build uid, so
-    // nothing it left behind can change the bundle `celld deploy` uploads.
+    // nothing it left behind can change the bundle `cello deploy` uploads.
     #[cfg(unix)]
     if sb.uid.is_some() {
         // SAFETY: geteuid/getegid cannot fail.
@@ -1268,7 +1268,7 @@ async fn deploy_inner(
         }
     }
     // Only now, with no tenant process left to swap it, is the deploy root
-    // final: `celld deploy` runs as the runner, so neither the root nor its
+    // final: `cello deploy` runs as the runner, so neither the root nor its
     // config may lead out of the worktree (a `dist` symlink into /data would
     // otherwise ship platform files into the tenant's bucket).
     let src_dir = src_dir.canonicalize()?;
@@ -1276,9 +1276,9 @@ async fn deploy_inner(
         generated_config::write(&src_dir, &app.slug, plan)?;
     }
     let deploy_root = contained_deploy_root(&src_dir, &deploy_root)?;
-    // `release` and `build` are keys the runner consumes: celld deploy
+    // `release` and `build` are keys the runner consumes: cello deploy
     // refuses any config key it does not know, so drop them once they ran.
-    // Cloudflare-only keys celld refuses are translated away too, and named
+    // Cloudflare-only keys Cello refuses are translated away too, and named
     // in the log: a Worker binding by the same name reads as missing.
     let (mut dropped, mut rules_added) = strip_runner_keys(&deploy_root).await?;
     if deploy_root != src_dir {
@@ -1334,7 +1334,7 @@ async fn deploy_inner(
     // environment's overrides over them, become the deployed config's `vars`
     // (a setting wins over the config's own value), so Worker code reads them
     // as `env.NAME`. Reserved platform names and required secrets with no
-    // value fail the deploy here, before `celld deploy`, naming the variables
+    // value fail the deploy here, before `cello deploy`, naming the variables
     // — never their values — in the log.
     let settings_label = match target.environment() {
         Some(_) => "Settings → Environment or this environment's Variable overrides",
@@ -1406,7 +1406,7 @@ async fn deploy_inner(
     // Runner-owned Void entries (SPEC, Deploy pipeline): identity vars,
     // runner-owned `services` and the `ISR_CACHE` namespace, merged into
     // the same config file the settings merge just wrote. Void apps only.
-    // A TOML-only root merges nothing (`celld deploy` itself refuses it):
+    // A TOML-only root merges nothing (`cello deploy` itself refuses it):
     // the `None` below keeps such a doomed deploy from running its
     // cohosted scripts first. The ensured token rides along so the proxy
     // render below reuses this deploy's value instead of re-reading the
@@ -1439,7 +1439,7 @@ async fn deploy_inner(
     // The sandbox controller stages after the merges (SPEC, Void sandbox
     // controller): protocol check, bundle load, admission name, and the
     // mapped entry written to a staging dir. Only for a merged root: a
-    // TOML-only root stages nothing (celld refuses it, as before).
+    // TOML-only root stages nothing (Cello refuses it, as before).
     let staged_sandbox = match (&void_proxy_token, sandbox_entry) {
         (Some(_), Some(entry)) => {
             let staged = void_sandbox::StagedSandbox::stage(
@@ -1463,12 +1463,12 @@ async fn deploy_inner(
         _ => None,
     };
 
-    // celld pulls container images for linux/amd64 unless told otherwise;
+    // Cello pulls container images for linux/amd64 unless told otherwise;
     // pin the pull to the nodes' own arch so arm64 installs pull native
-    // images. Without containers celld never reads it.
+    // images. Without containers Cello never reads it.
     let container_platform = format!("linux/{}", go_arch(std::env::consts::ARCH));
     // Sandbox containers (SPEC, Tenant isolation): refuse what tenants must
-    // not deploy before celld sees it, normalize Void's shape, and prepare
+    // not deploy before Cello sees it, normalize Void's shape, and prepare
     // each Dockerfile (checked to run nothing, its images vetted and
     // pinned). A config that declares containers also stretches the
     // timeout over a first image pull. The staged controller entry plans
@@ -1538,12 +1538,12 @@ async fn deploy_inner(
     };
     let env_owned = s3::celld_cli_env(cfg, &scope_key);
     let mut env: Vec<(&str, &str)> = env_owned.iter().map(|(k, v)| (*k, v.as_str())).collect();
-    env.push(("CELLD_CONTAINER_PLATFORM", container_platform.as_str()));
+    env.push(("CELLO_CONTAINER_PLATFORM", container_platform.as_str()));
     // The ordered fleet deploy (SPEC, Void platform proxy): every script
-    // staged with `celld deploy --no-activate` — the cohosted scripts first
+    // staged with `cello deploy --no-activate` — the cohosted scripts first
     // (each skipped when unchanged), the tenant app last — the Void
     // migrations of a redeploy running against that staged generation
-    // through `celld invoke`, then one `celld activate` serving the
+    // through `cello invoke`, then one `cello activate` serving the
     // generation. A Void app with a merged root renders its proxy here —
     // with the token the merge above ensured, read once for the whole
     // deploy — plus its sandbox controller when one staged (the
@@ -1573,7 +1573,7 @@ async fn deploy_inner(
             };
             let mut rendered = staged.render(planned.value(), image_digest)?;
             // The controller deploys from a staging dir while its pinned
-            // Dockerfile sits in the vetted build context: celld builds it
+            // Dockerfile sits in the vetted build context: Cello builds it
             // only with that context named as a read root.
             rendered.read_root = sandbox_pinned
                 .as_ref()
@@ -1601,19 +1601,19 @@ async fn deploy_inner(
         timeout: Duration::from_secs(120),
         sourcemap: None,
     };
-    // The Worker map celld writes for the Errors tab: in the work dir beside
-    // the checkout, never inside the deploy root. celld warns and writes
+    // The Worker map Cello writes for the Errors tab: in the work dir beside
+    // the checkout, never inside the deploy root. Cello warns and writes
     // nothing for asset-only and Python projects, and for a `no_bundle`
     // entry without a sibling map it accepts; a missing file below then
     // means no worker map.
     let worker_map_path = work.join("worker.js.map");
     // A tenant build script runs with the whole work dir writable, so it may
-    // have planted this path — a decoy file celld would leave in place for
-    // unmapped projects, or a symlink celld's runner-owned write would
+    // have planted this path — a decoy file Cello would leave in place for
+    // unmapped projects, or a symlink Cello's runner-owned write would
     // follow. The tree is runner-owned again by now and no tenant process
-    // runs past this point, so drop whatever sits there: whatever celld
+    // runs past this point, so drop whatever sits there: whatever Cello
     // writes afterwards is its own. If anything survives, refuse to deploy:
-    // celld's write would follow a surviving symlink.
+    // Cello's write would follow a surviving symlink.
     let _ = tokio::fs::remove_file(&worker_map_path).await;
     let _ = tokio::fs::remove_dir_all(&worker_map_path).await;
     match tokio::fs::symlink_metadata(&worker_map_path).await {
@@ -1781,7 +1781,7 @@ async fn deploy_inner(
     for line in stats.log_lines() {
         progress.log(DeployStatus::Deploying, &line).await?;
     }
-    // The deploy succeeded, so celld's map (when it wrote one) is final:
+    // The deploy succeeded, so Cello's map (when it wrote one) is final:
     // read it now, chained through the build's own entry map when one
     // exists. The bytes upload with the rest of the maps below.
     let worker_map = crate::host::sourcemaps::read_celld_worker_map(&deploy_root, &worker_map_path)
@@ -1807,7 +1807,7 @@ async fn deploy_inner(
                 anyhow::bail!("environment deploy without its environment row");
             };
             supervisor::ensure_environment_fleet(pool, cfg, procs, logs, env).await?;
-            // A failed adoption fails the deploy with celld's error: without
+            // A failed adoption fails the deploy with Cello's error: without
             // this the old generation keeps serving and the row still says
             // Success.
             supervisor::reload_environment_fleet(env)
@@ -1823,8 +1823,8 @@ async fn deploy_inner(
     }
 
     // "Running" (and this row's success) means the fleet answers its
-    // health/ready gate — not just that celld was spawned. The reload above
-    // races a cold boot (`started celld` then `reload failed (connection
+    // health/ready gate — not just that Cello was spawned. The reload above
+    // races a cold boot (`started Cello` then `reload failed (connection
     // error)` within milliseconds), so confirm the gate before calling the
     // deploy live. This deploy holds the app's claim, so the wait ends the
     // moment the fleet is no longer a live child: a crash fails the deploy at
@@ -1887,7 +1887,7 @@ async fn deploy_inner(
     // prior fleet could not boot — runs them here, against the adopted fleet,
     // before the deploy is marked success. A stop in the window skips them
     // like it skips the gate (redeploy to run them); anything else failing
-    // fails the deploy. A rollback to an older sha never un-applies: celld
+    // fails the deploy. A rollback to an older sha never un-applies: Cello
     // skips already-applied rows and only applies what is pending.
     if !void_app && !migrated_tenant_staged && !fleet_stopped_early {
         migrate_tenant_d1(cfg, &celld, &scope_key, &deploy_root, &mut *progress).await?;
@@ -1910,7 +1910,7 @@ async fn deploy_inner(
     route_live(pool, cfg, &app.id, target.environment_id(), &commit_sha).await?;
 
     // Per-deploy source maps for the Errors tab (symbolication at read
-    // time): the Worker map `celld deploy --sourcemap` wrote, plus every
+    // time): the Worker map `cello deploy --sourcemap` wrote, plus every
     // client map the build emitted. Best-effort — the deploy already
     // succeeded — so a failure is a log line, never a failed deploy.
     match crate::host::sourcemaps::store_deploy_maps(
@@ -2160,8 +2160,8 @@ async fn drive_migration_protocol(
 
 /// Run a Void app's D1 migrations through the staged generation's in-worker
 /// endpoints, before the activate serves them: the same protocol as
-/// [`migrate_void_app`], delivered by `celld invoke` (operator token and
-/// fleet HMAC over `CELLD_*`, like `celld d1 execute`) with the cohosted
+/// [`migrate_void_app`], delivered by `cello invoke` (operator token and
+/// fleet HMAC over `CELLO_*`, like `cello d1 execute`) with the cohosted
 /// pins plus the app as `--target`. Runs against this target's own fleet,
 /// so a preview migrates its own D1 and never production's. A failure
 /// fails the deploy with nothing activated, so the old version keeps
@@ -2195,9 +2195,9 @@ async fn migrate_void_app_staged(
 }
 
 /// The staged-generation invoke target the staged migrations and the
-/// pre-activation canary share: the `celld` invocation's bucket, endpoint,
-/// region and env (operator token and bucket credentials ride `CELLD_*`,
-/// like `celld d1 execute`), the staged pins, and the app as `--target`.
+/// pre-activation canary share: the `cello` invocation's bucket, endpoint,
+/// region and env (operator token and bucket credentials ride `CELLO_*`,
+/// like `cello d1 execute`), the staged pins, and the app as `--target`.
 /// One constructor, so the probe's `--target`/pins/bucket shape cannot
 /// drift from the migrate's.
 fn staged_invoke_target(
@@ -2221,14 +2221,14 @@ fn staged_invoke_target(
 }
 
 /// Pre-activation canary (SPEC, Deploy pipeline): `HEAD <probe path>`
-/// against the staged generation through `celld invoke` — the staged pins
+/// against the staged generation through `cello invoke` — the staged pins
 /// plus the app as `--target`, like the staged migrations — before the one
 /// activate serves it. An answered status below 500 passes; a 5xx or a
 /// missing answer (transport failure, over-cap body) fails the deploy here,
 /// so the pointer never moves and the previous generation keeps serving. A
 /// non-Void app has no proxy token, so none rides along — only the empty
 /// string the staged invoke always carries. An empty
-/// `RUNNER_DEPLOY_PROBE_PATH` disables the probe (a celld without `invoke`)
+/// `RUNNER_DEPLOY_PROBE_PATH` disables the probe (a Cello without `invoke`)
 /// and the deploy activates unprobed, as before.
 async fn probe_staged_generation(
     cfg: &Config,
@@ -2270,7 +2270,7 @@ async fn probe_staged_generation(
         }
         // No live fleet means no old version is serving (a first deploy, a
         // stopped or an asleep app): there is nothing to protect, and
-        // `celld invoke` cannot reach a node that does not exist. Activate.
+        // `cello invoke` cannot reach a node that does not exist. Activate.
         // Every other transport failure still fails closed.
         Err(void_migrate::ProbeError::Transport { message })
             if message.contains("no node leases") =>
@@ -2375,8 +2375,8 @@ async fn migrate_void_app(inputs: MigrateInputs<'_, '_, '_>) -> anyhow::Result<(
     .await
 }
 
-/// Run a non-Void app's D1 `migrations_dir` through celld's own migrator
-/// (`celld d1 migrations apply`, wrangler semantics: ordered `NNNN_name.sql`
+/// Run a non-Void app's D1 `migrations_dir` through Cello's own migrator
+/// (`cello d1 migrations apply`, wrangler semantics: ordered `NNNN_name.sql`
 /// files from `migrations_dir` — default `migrations` — tracked in a
 /// `d1_migrations` table so each file applies once, each file in its own
 /// transaction), once per D1 binding in the deploy root's config. Runs
@@ -2384,7 +2384,7 @@ async fn migrate_void_app(inputs: MigrateInputs<'_, '_, '_>) -> anyhow::Result<(
 /// own bucket for a preview, the app's for production) with the target's
 /// scoped store credentials — so a preview migrates its own D1 and never
 /// production's, and never another tenant's or the control D1. Migration SQL
-/// comes from the pushed tree only, and only `celld d1` ever runs it.
+/// comes from the pushed tree only, and only `cello d1` ever runs it.
 /// Every failure fails the deploy: call this between stage and activate on a
 /// redeploy (nothing activates, so the previous generation keeps serving),
 /// or after adoption on a first deploy (no previous generation to protect).
@@ -2400,7 +2400,7 @@ async fn migrate_tenant_d1(
 ) -> anyhow::Result<()> {
     // Fresh store env at migration time, not the deploy's pre-stage one: the
     // fleet's operator token is minted while the fleet starts (after the
-    // stage), and `celld d1` authenticates to the node with it — a pre-stage
+    // stage), and `cello d1` authenticates to the node with it — a pre-stage
     // env has no token and the node refuses with "operator authentication
     // required". Extras the stage carries (the container platform) ride
     // along; the fresh token wins over the stale one. The
@@ -2429,12 +2429,12 @@ async fn migrate_tenant_d1(
         .await?;
     let mut any_dir = false;
     for binding in &bindings {
-        // Vetted before celld ever reads it: the canonical dir stays under
-        // the deploy root and no entry is a symlink, so celld cannot be
+        // Vetted before Cello ever reads it: the canonical dir stays under
+        // the deploy root and no entry is a symlink, so Cello cannot be
         // aimed at host or other-tenant SQL. The tree is runner-owned and
         // immutable from stage through activate (tenant sandboxes are done,
         // the uid reclaimed, and the deploy holds the per-app claim), so the
-        // vetted target cannot be swapped between this check and celld's own
+        // vetted target cannot be swapped between this check and Cello's own
         // re-resolution of `PROJECT/migrations_dir`.
         let Some(dir) = tenant_d1::resolve_migrations_dir(deploy_root, binding)? else {
             continue;
@@ -2493,14 +2493,14 @@ async fn migrate_tenant_d1(
     Ok(())
 }
 
-/// One `celld d1 migrations apply DATABASE PROJECT` against this target's own
-/// fleet. The project is the deploy root celld just staged (its config
+/// One `cello d1 migrations apply DATABASE PROJECT` against this target's own
+/// fleet. The project is the deploy root Cello just staged (its config
 /// carries the binding's `migrations_dir`); the bucket/endpoint/region and
 /// store credentials ride the same invocation shape as the stage, so the SQL
 /// lands in the tenant's own D1 only. A missing migrations directory is the
-/// caller's to skip (never invoked); anything celld refuses — bad SQL, a
+/// caller's to skip (never invoked); anything Cello refuses — bad SQL, a
 /// numeric-prefix violation, an escaping `migrations_dir` — fails the deploy
-/// here with celld's own message.
+/// here with Cello's own message.
 async fn tenant_d1_apply(
     celld: &void_cohost::CelldDeploy<'_>,
     env: &[(&str, &str)],
@@ -2933,10 +2933,10 @@ fn has_build_script(package: &serde_json::Value) -> bool {
 }
 
 /// Config keys the runner consumes from the tenant's Wrangler file that
-/// celld does not accept: Noite's `release` and Wrangler's `build`.
+/// Cello does not accept: Noite's `release` and Wrangler's `build`.
 const RUNNER_WRANGLER_KEYS: &[&str] = &["release", "build"];
 
-/// Cloudflare-only config keys `celld deploy` refuses that the runner
+/// Cloudflare-only config keys `cello deploy` refuses that the runner
 /// translates away instead of failing the deploy:
 /// - deployment-target metadata with no Noite equivalent: `observability`,
 ///   `upload_source_maps`, `workers_dev`, `preview_urls`, `previews`;
@@ -2947,9 +2947,9 @@ const RUNNER_WRANGLER_KEYS: &[&str] = &["release", "build"];
 ///   deploys and serves; anything else fails at runtime, named in the deploy
 ///   log — never silently.
 ///
-/// Anything else celld refuses still fails the deploy, so a typo'd key can
+/// Anything else Cello refuses still fails the deploy, so a typo'd key can
 /// never silently lose a binding.
-const CELLD_UNSUPPORTED_KEYS: &[&str] = &[
+const CELLO_UNSUPPORTED_KEYS: &[&str] = &[
     "images",
     "send_email",
     "observability",
@@ -2960,10 +2960,10 @@ const CELLD_UNSUPPORTED_KEYS: &[&str] = &[
 ];
 
 /// Wrangler's default module rules (`DEFAULT_MODULE_RULES` in its bundle),
-/// minus what celld cannot express: Text for `**/*.txt`, `**/*.html` and
+/// minus what Cello cannot express: Text for `**/*.txt`, `**/*.html` and
 /// `**/*.sql`, Data for `**/*.bin`, CompiledWasm for `**/*.wasm`. Wrangler's
-/// `**/*.wasm?module` is left out: celld takes `**/*.<ext>` globs only and
-/// refuses the whole deploy on any other shape. celld honors declared `rules`
+/// `**/*.wasm?module` is left out: Cello takes `**/*.<ext>` globs only and
+/// refuses the whole deploy on any other shape. Cello honors declared `rules`
 /// but ships no defaults, so a worker importing a text file would fail its
 /// build; the runner injects these when the config names no `rules` of its
 /// own.
@@ -2975,7 +2975,7 @@ fn wrangler_default_module_rules() -> serde_json::Value {
     ])
 }
 
-/// Translate `dir`'s wrangler.json(c) for `celld deploy`: drop
+/// Translate `dir`'s wrangler.json(c) for `cello deploy`: drop
 /// runner-consumed and Cloudflare-only keys (answering the translated
 /// Cloudflare-only keys for the deploy log), and inject Wrangler's default
 /// module rules when the config names none. A file is rewritten only when it
@@ -3015,7 +3015,7 @@ async fn strip_runner_keys(dir: &Path) -> anyhow::Result<(Vec<String>, bool)> {
 }
 
 /// The runner's arch as a container platform suffix for
-/// `CELLD_CONTAINER_PLATFORM`. Unknown arches pass through (Go names most
+/// `CELLO_CONTAINER_PLATFORM`. Unknown arches pass through (Go names most
 /// like Rust does).
 fn go_arch(arch: &str) -> &str {
     match arch {
@@ -3025,7 +3025,7 @@ fn go_arch(arch: &str) -> &str {
     }
 }
 
-/// The config translated for `celld deploy`: runner-consumed and
+/// The config translated for `cello deploy`: runner-consumed and
 /// Cloudflare-only keys removed (the latter answered for the deploy log),
 /// plus Wrangler's default module rules when the config names none (answered
 /// alongside) — or `None` when the config needs no translation at all.
@@ -3039,13 +3039,13 @@ fn translate_wrangler_config(text: &str) -> anyhow::Result<Option<(String, Vec<S
         changed |= obj.remove(*key).is_some();
     }
     let mut dropped = Vec::new();
-    for key in CELLD_UNSUPPORTED_KEYS {
+    for key in CELLO_UNSUPPORTED_KEYS {
         if obj.remove(*key).is_some() {
             dropped.push((*key).to_string());
             changed = true;
         }
     }
-    // celld refuses `rules` next to `no_bundle` (the files deploy as-is, so
+    // Cello refuses `rules` next to `no_bundle` (the files deploy as-is, so
     // there is nothing to apply them to): inject only for bundled configs.
     let no_bundle = obj.get("no_bundle").and_then(serde_json::Value::as_bool) == Some(true);
     let mut rules_added = false;
@@ -3084,7 +3084,7 @@ async fn has_wrangler_config(dir: &Path) -> anyhow::Result<bool> {
     Ok(false)
 }
 
-/// The config `celld deploy` uploads, as JSON, for the storage views: a
+/// The config `cello deploy` uploads, as JSON, for the storage views: a
 /// generated or built config is not in the pushed source they otherwise read.
 async fn effective_config(deploy_root: &Path) -> Option<String> {
     for name in ["wrangler.jsonc", "wrangler.json"] {
@@ -3542,7 +3542,7 @@ mod tests {
     #[test]
     fn cloudflare_only_keys_are_translated_away_before_celld_deploy() {
         // Ember's shape: deployment-target metadata plus bindings Noite does
-        // not provide. celld refuses every one, so the runner translates them
+        // not provide. Cello refuses every one, so the runner translates them
         // away and the deploy succeeds with the bindings reading as missing.
         let jsonc = "{\n  \"name\": \"ember\",\n  \"main\": \"apps/worker/src/index.ts\",\n  \"compatibility_flags\": [\"nodejs_compat\"],\n  \"observability\": { \"enabled\": true },\n  \"upload_source_maps\": true,\n  \"workers_dev\": true,\n  \"preview_urls\": false,\n  \"previews\": {},\n  \"images\": { \"binding\": \"IMAGES\" },\n  \"send_email\": [{ \"name\": \"EMAIL\" }],\n  \"vars\": { \"STORAGE_BACKEND\": \"do-sqlite\" },\n  \"d1_databases\": [{ \"binding\": \"DB\" }]\n}";
         let (out, mut dropped, _) = translate_wrangler_config(jsonc)
@@ -3574,7 +3574,7 @@ mod tests {
     #[test]
     fn wrangler_default_module_rules_are_added_when_absent() {
         // Wrangler bundles Text (.txt, .html, .sql), Data (.bin) and
-        // CompiledWasm (.wasm) without a `rules` key; celld only honors
+        // CompiledWasm (.wasm) without a `rules` key; Cello only honors
         // declared rules, so the runner injects the same defaults instead of
         // failing the build on the first text import.
         let (out, _, rules_added) =
@@ -3621,8 +3621,8 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&target).unwrap(), original);
     }
 
-    /// celld refuses the whole deploy on one rule glob it cannot read as an
-    /// extension match (`rule_extension` in celld's `deploy.rs`: `**/*.`
+    /// Cello refuses the whole deploy on one rule glob it cannot read as an
+    /// extension match (`rule_extension` in Cello's `deploy.rs`: `**/*.`
     /// then a name with none of `* ? . / \ [ {`). The injected defaults land
     /// in every rule-less config, so one bad glob fails every such deploy.
     #[test]
@@ -3647,7 +3647,7 @@ mod tests {
         }
     }
 
-    /// celld refuses `rules` next to `no_bundle`, so a no-bundle config gets
+    /// Cello refuses `rules` next to `no_bundle`, so a no-bundle config gets
     /// none injected (and is not rewritten for them).
     #[test]
     fn no_bundle_configs_get_no_injected_rules() {
@@ -3831,7 +3831,7 @@ mod tests {
 
     // --- tenant D1 migrations -------------------------------------------------
 
-    /// One tenant `migrate` step against the fake celld: a deploy root with
+    /// One tenant `migrate` step against the fake Cello: a deploy root with
     /// the config and migration files, canned `execute` rows before/after,
     /// and an optional `apply.fail`. Returns the step outcome, the deploy
     /// log, and the fake's argv log.
@@ -3924,9 +3924,9 @@ mod tests {
         (outcome, log, argv)
     }
 
-    /// A deploy with a `migrations_dir` applies it through celld and names
+    /// A deploy with a `migrations_dir` applies it through Cello and names
     /// the migration in the log. Before this step existed the same deploy
-    /// left the table missing (celld recorded the declaration but nothing
+    /// left the table missing (Cello recorded the declaration but nothing
     /// applied it).
     #[tokio::test]
     async fn tenant_d1_apply_runs_per_binding_and_names_each() {
@@ -4018,7 +4018,7 @@ mod tests {
     }
 
     /// The staged-migrate seam: a memory pool, a test app, a pushed tree
-    /// with one migration, a deploy root, and the fake celld answering
+    /// with one migration, a deploy root, and the fake Cello answering
     /// `deploy` plus fixture-driven `invoke`. Every guard cleans up on
     /// drop, including on a failing assert.
     struct StagedSeam {
@@ -4088,9 +4088,9 @@ mod tests {
             }
         }
 
-        /// The `celld` invocation shape the stage and the staged migrate
+        /// The `cello` invocation shape the stage and the staged migrate
         /// share: the fake's log and dir ride the env, like the operator
-        /// token and bucket credentials ride `CELLD_*` in production.
+        /// token and bucket credentials ride `CELLO_*` in production.
         fn celld<'x>(
             &'x self,
             env: &'x [(&'x str, &'x str)],
@@ -4147,7 +4147,7 @@ mod tests {
         }
 
         /// The fake's env, owned: the log and dir paths the fake reads, like
-        /// the operator token and bucket credentials ride `CELLD_*`.
+        /// the operator token and bucket credentials ride `CELLO_*`.
         fn fake_env(&self) -> (String, String) {
             (
                 self.dir
@@ -4444,7 +4444,7 @@ mod tests {
         .await
         .expect("staged migrate");
         assert_eq!(progress.step, "migrate");
-        // Fail the activate: the next celld call, plus one more for the
+        // Fail the activate: the next Cello call, plus one more for the
         // infra retry a loud failure earns.
         let n = seam.invocations().len();
         for i in [n, n + 1] {
@@ -4552,7 +4552,7 @@ mod tests {
     }
 
     /// Stage proxy + app through the fake and run the pre-activation canary,
-    /// like `deploy_inner` does between stage and activate: the `celld`
+    /// like `deploy_inner` does between stage and activate: the `cello`
     /// shape rides `env` (owned by the caller), the proxy token rides the
     /// staged client when the seam has one — `None` for a plain worker.
     /// Returns the staged generation and the probe outcome.
@@ -4598,7 +4598,7 @@ mod tests {
 
     /// The full pre-activation sequence: the staged generation answers the
     /// canary, so the deploy activates the staged pins with the app as
-    /// primary. The probe rides `celld invoke` with the staged pins,
+    /// primary. The probe rides `cello invoke` with the staged pins,
     /// `--target` the app, `HEAD` and the configured path; the proxy token
     /// travels in the environment, never argv.
     #[tokio::test]
@@ -4731,7 +4731,7 @@ mod tests {
         );
     }
 
-    /// A first deploy (no node lease yet) cannot run `celld invoke`: the
+    /// A first deploy (no node lease yet) cannot run `cello invoke`: the
     /// probe skips and the deploy activates, because no old version is
     /// serving to protect.
     #[tokio::test]

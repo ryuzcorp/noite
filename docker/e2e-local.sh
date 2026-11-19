@@ -460,13 +460,13 @@ while [ "$attempt" -lt 100 ]; do
     # greps kept working): strip them before parsing `fleet=`/`peak_bytes=`.
     sed -e 's/\x1b\[[0-9;]*m//g' "$peak_log" 2>/dev/null >"$peak_stripped" || true
     grep -a "peak_bytes=" "$peak_stripped" 2>/dev/null | sed -n 's/.*fleet="\{0,1\}\([^" ]*\)"\{0,1\} peak_bytes=\([0-9][0-9]*\).*/\1 \2/p' > "$E2E_REPORT_DIR/fleet-peak-lines.txt" || true
-    grep -a "stopped celld" "$peak_stripped" 2>/dev/null > "$E2E_REPORT_DIR/fleet-stop-lines.txt" || true
+    grep -a "stopped cello" "$peak_stripped" 2>/dev/null > "$E2E_REPORT_DIR/fleet-stop-lines.txt" || true
     {
       cat "$E2E_REPORT_DIR/fleet-peak-lines.txt" 2>/dev/null || true
       # shellcheck disable=SC2016
       $CE2E exec -T noite sh -c 'for d in /sys/fs/cgroup/noite/*/; do n=$(basename "$d"); if [ "$n" = runner ] || [ ! -f "$d/memory.peak" ]; then continue; fi; echo "$n $(cat "$d/memory.peak")"; done' 2>/dev/null || true
     } | awk '$2 ~ /^[0-9]+$/ { if ($2 + 0 > peak[$1]) peak[$1] = $2 + 0 } END { printf "{\n  \"fleet_peaks\": {"; sep = "\n"; for (f in peak) { printf "%s    \"%s\": %d", sep, f, peak[f]; sep = ",\n" } printf "\n  }\n}\n" }' > "$E2E_REPORT_DIR/fleet-peaks.json" || true
-    echo "fleet stops: $(grep -ac "stopped celld" "$peak_stripped" 2>/dev/null || echo 0) stop lines, $(wc -l < "$E2E_REPORT_DIR/fleet-peak-lines.txt" 2>/dev/null || echo 0) with peaks in the container log"
+    echo "fleet stops: $(grep -ac "stopped cello" "$peak_stripped" 2>/dev/null || echo 0) stop lines, $(wc -l < "$E2E_REPORT_DIR/fleet-peak-lines.txt" 2>/dev/null || echo 0) with peaks in the container log"
     rm -f "$peak_log" "$peak_stripped"
     if [ "${E2E_KEEP:-0}" = 1 ]; then
       # A kept session holds the slot until `down` frees it: the stack stays

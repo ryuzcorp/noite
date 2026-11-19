@@ -1453,7 +1453,7 @@ impl Config {
                 .unwrap_or_else(|_| "/data/caddy/routes.json".into()),
             caddy_access_log: env::var("CADDY_ACCESS_LOG")
                 .unwrap_or_else(|_| "/data/caddy/access.log".into()),
-            celld_bin: env_or(&["CELLO_BIN", "CELLD_BIN"], "cello"),
+            celld_bin: env_or(&["CELLO_BIN"], "cello"),
             fleet_port_min,
             fleet_port_max,
             poll_ms: env_num(
@@ -1725,6 +1725,21 @@ impl Config {
         // records each one (var, value, expected form) and the boot fails
         // here naming them all, before any range complaint below.
         let mut problems: Vec<String> = self.env_problems.clone();
+        // Cello 0.1.0 renamed every `CELLD_*` setting and refuses to start
+        // with one set: a stale name would otherwise silently fall back to
+        // its default, so the boot fails here naming the `CELLO_*` spelling.
+        let mut stale: Vec<String> = std::env::vars_os()
+            .filter_map(|(key, _)| key.into_string().ok())
+            .filter(|key| key.starts_with("CELLD_"))
+            .map(|key| {
+                format!(
+                    "{key} was renamed to {renamed} and is no longer read",
+                    renamed = key.replacen("CELLD_", "CELLO_", 1)
+                )
+            })
+            .collect();
+        stale.sort();
+        problems.extend(stale);
         let dev_token = self.runner_token == "dev-runner-token";
         let dev_auth = std::env::var("BETTER_AUTH_SECRET")
             .map(|v| v.trim().is_empty() || v.starts_with("dev-"))
@@ -2398,6 +2413,18 @@ mod tests {
             env::remove_var(key);
         }
         env::set_var("BASE_DOMAIN", "noite.localhost");
+        // Cello refuses any `CELLD_*` setting: a test-set one must not leak
+        // into a parallel `from_env`, so snapshot and clear the whole family
+        // here (owned keys — the fixed chain above is `&'static str`).
+        let stale: Vec<(String, Option<String>)> = std::env::vars_os()
+            .filter_map(|(key, _)| key.into_string().ok())
+            .filter(|key| key.starts_with("CELLD_"))
+            .map(|key| {
+                let old = env::var(&key).ok();
+                env::remove_var(&key);
+                (key, old)
+            })
+            .collect();
         for (key, value) in set {
             env::set_var(key, value);
         }
@@ -2406,6 +2433,12 @@ mod tests {
             match old {
                 Some(v) => env::set_var(key, v),
                 None => env::remove_var(key),
+            }
+        }
+        for (key, old) in stale {
+            match old {
+                Some(v) => env::set_var(&key, v),
+                None => env::remove_var(&key),
             }
         }
     }
@@ -2708,6 +2741,24 @@ mod tests {
         with_env(&[("RUNNER_DEPLOY_PROBE_PATH", "")], || {
             let cfg = Config::from_env().expect("empty probe path must boot");
             assert!(cfg.deploy_probe_path.is_empty());
+        });
+    }
+    /// A stale pre-0.1.0 `CELLD_*` setting refuses the boot and names its
+    /// `CELLO_*` spelling: warn-and-ignore would let a renamed knob silently
+    /// fall back to its default.
+    #[test]
+    fn stale_celld_settings_refuse_the_boot() {
+        with_env(&[("CELLD_BIN", "/usr/local/bin/cello")], || {
+            let err =
+                Config::from_env().expect_err("a stale CELLD_* setting must refuse the boot");
+            assert!(
+                err.to_string().contains("CELLO_BIN"),
+                "refusal names the new spelling: {err:#}"
+            );
+            std::env::remove_var("CELLD_BIN");
+        });
+        with_env(&[], || {
+            Config::from_env().expect("no stale settings must boot");
         });
     }
 

@@ -271,12 +271,10 @@ pub fn build_version() -> String {
     non_empty_env("NOITE_BUILD_VERSION").unwrap_or_else(|| "dev".to_string())
 }
 
-/// The Cello version the image ships (`CELLO_VERSION` ENV, `CELLD_VERSION` as
-/// a legacy alias); `"unknown"` when unset (a bare `cargo run`).
+/// The Cello version the image ships (`CELLO_VERSION` ENV); `"unknown"` when
+/// unset (a bare `cargo run`).
 pub fn cello_version() -> String {
-    non_empty_env("CELLO_VERSION")
-        .or_else(|| non_empty_env("CELLD_VERSION"))
-        .unwrap_or_else(|| "unknown".to_string())
+    non_empty_env("CELLO_VERSION").unwrap_or_else(|| "unknown".to_string())
 }
 
 fn non_empty_env(key: &str) -> Option<String> {

@@ -397,6 +397,50 @@ env_secret() {
   env_default "$key" "$value"
 }
 
+# Cello 0.1.0 renamed every `CELLD_*` setting to `CELLO_*`, and the runner
+# refuses to boot with a stale `CELLD_*` still set. An upgrade re-run
+# renames the keys an older install may carry so the new image boots: a
+# `CELLO_*` value the operator already set wins, and the stale line is
+# dropped then.
+migrate_cello_env() {
+  local file="$NOITE_DIR/.env" tmp before had key suffix msg
+  [[ -f "$file" ]] || return 0
+  before=$(grep -oE '^CELLD_[A-Za-z0-9_]+' "$file" | sort -u || true)
+  [[ -z "$before" ]] && return 0
+  had=$(grep -oE '^CELLO_[A-Za-z0-9_]+' "$file" | sort -u || true)
+  tmp=$(mktemp)
+  awk '
+    FNR == NR {
+      if ($0 ~ /^CELLO_[A-Za-z0-9_]+=/) {
+        key = $0; sub(/=.*/, "", key); new[key] = 1
+      }
+      next
+    }
+    /^CELLD_[A-Za-z0-9_]+=/ {
+      old = $0; sub(/=.*/, "", old)
+      cello = old; sub(/^CELLD_/, "CELLO_", cello)
+      if (!(cello in new)) {
+        sub(/^CELLD_/, "CELLO_"); new[cello] = 1
+        print
+      }
+      next
+    }
+    { print }
+  ' "$file" "$file" >"$tmp"
+  cat "$tmp" >"$file"
+  rm -f "$tmp"
+  msg=""
+  for key in $before; do
+    suffix=${key#CELLD_}
+    if printf '%s\n' "$had" | grep -qx "CELLO_${suffix}"; then
+      msg="${msg}kept CELLO_${suffix} (dropped stale ${key}); "
+    else
+      msg="${msg}renamed ${key} to CELLO_${suffix}; "
+    fi
+  done
+  info "Cello 0.1.0 renamed every CELLD_* setting to CELLO_*: ${msg}"
+}
+
 # Everything the runner needs to boot on a real domain, with the defaults a
 # first install writes. A re-run fills in what an older or hand-edited .env
 # lacks instead of leaving the runner to refuse its config; a value that is
@@ -453,6 +497,7 @@ write_config() {
     else
       info "keeping .env (BASE_DOMAIN=$DOMAIN)"
     fi
+    migrate_cello_env
   else
     fresh=1
     choose_domain

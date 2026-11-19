@@ -117,6 +117,10 @@ pub(crate) fn env_reserved(name: &str) -> bool {
         || name == "HOST"
         || name.starts_with("AWS_")
         || name.starts_with("S3_")
+        || name.starts_with("CELLO_")
+        // Pre-0.1.0 names stay reserved: a `CELLD_*` row would land
+        // verbatim in fleet process env, and Cello refuses to start with
+        // any `CELLD_*` set — so the fleet would never boot.
         || name.starts_with("CELLD_")
         || name.starts_with("RUNNER_")
         || name.starts_with("NOITE_")
@@ -132,7 +136,7 @@ pub(crate) fn env_reserved(name: &str) -> bool {
         || name == "PNPM_MAX_WORKERS"
         || (name.starts_with("BUN_") && name != "BUN_INSTALL_CACHE_DIR")
         // Engine selection is per-fleet proxy plumbing: a tenant override
-        // would steer fleet celld at another engine than its own proxy
+        // would steer a fleet at another engine than its own proxy
         // socket (or at the host socket directly).
         || name == "DOCKER_HOST"
         // Fleet TLS trust and proxy routing: the platform passes these
@@ -388,22 +392,23 @@ mod tests {
             "HOST",
             "AWS_REGION",
             "S3_ENDPOINT",
-            "CELLD_WATCH",
+            "CELLO_WATCH",
             // The fleet's auth token and network/memory fence: tenant rows
             // under these names must never reach fleet process env (the
             // spawn also applies tenant vars before platform knobs, so
             // platform wins by construction even so).
+            "CELLO_OPERATOR_TOKEN",
+            "CELLO_EGRESS",
+            "CELLO_EGRESS_ALLOW",
+            "CELLO_MEMORY_SCOPE",
+            "CELLO_CACHE_SCOPE",
+            // Pre-0.1.0 spellings stay reserved: a `CELLD_*` row would land
+            // verbatim in fleet process env, and Cello refuses to start
+            // with any `CELLD_*` set.
+            "CELLD_WATCH",
             "CELLD_OPERATOR_TOKEN",
-            "CELLD_EGRESS",
-            "CELLD_EGRESS_ALLOW",
-            "CELLD_MEMORY_SCOPE",
-            "CELLD_CACHE_SCOPE",
             "RUNNER_TOKEN",
             "NOITE_IMAGE",
-            // The boot sweep's install identity: a tenant row under this name
-            // must never reach fleet process env (the `NOITE_` prefix already
-            // refuses it; pinned by name here).
-            "NOITE_FLEET_INSTALL",
             "BETTER_AUTH_URL",
             "CADDY_ADMIN",
             "LD_PRELOAD",
@@ -414,7 +419,7 @@ mod tests {
             "PNPM_MAX_WORKERS",
             "BUN_BEACON",
             // Engine selection is per-fleet proxy plumbing: a tenant override
-            // would steer fleet celld at another engine than its own proxy
+            // would steer a fleet at another engine than its own proxy
             // socket (or at the host socket directly).
             "DOCKER_HOST",
             // Fleet TLS trust and proxy routing (see `env_reserved`): the

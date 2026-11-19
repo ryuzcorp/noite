@@ -2,7 +2,7 @@
 //
 // Active health checks don't apply to dynamic upstreams, so the module
 // probes fleet upstreams itself: one background goroutine per live fleet
-// upstream, GETing /.well-known/celld/health every second with a 2 s
+// upstream, GETing /.well-known/cello/health every second with a 2 s
 // timeout — the same numbers as the old TENANT_PROXY. Requests for a route
 // whose upstream is down hold until the prober sees it up (or a table swap
 // drops it), re-checking on a short interval as a backstop and giving up
@@ -17,9 +17,9 @@ import (
 	"time"
 )
 
-// HealthPath is what celld answers 200 on once its ready gate opens (503
-// before that, up to CELLD_READY_FLEET_GATE_MS).
-const HealthPath = "/.well-known/celld/health"
+// HealthPath is what Cello answers 200 on once its ready gate opens (503
+// before that, up to CELLO_READY_FLEET_GATE_MS).
+const HealthPath = "/.well-known/cello/health"
 
 // Health is one upstream's readiness.
 //

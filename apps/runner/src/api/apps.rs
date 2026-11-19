@@ -92,7 +92,7 @@ pub async fn ready(State(state): State<AppState>) -> impl IntoResponse {
                     .unwrap_or_default()
             });
         let healthy = CONTROL_HEALTH
-            .get("http://127.0.0.1:8090/.well-known/celld/health")
+            .get("http://127.0.0.1:8090/.well-known/cello/health")
             .send()
             .await
             .is_ok_and(|r| r.status().is_success());
