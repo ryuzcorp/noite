@@ -11,6 +11,8 @@
 # and waits for /ready. Re-running it is the upgrade: compose.yaml and the
 # image are refreshed to the channel's newest release, .env (domain, secrets)
 # is kept, and any required setting it lacks gets the first-install default.
+# Across the 0.2.0 beta reset there is no upgrade: an install from Noite
+# 0.1.0 (alpha/beta, any `CELLD_*` in .env) is refused with reinstall steps.
 #
 # On a host under 4 GB the installer also creates a 1-2 GB /noite.swap
 # swapfile (swappiness 10) as a safety net for a transient peak and as the
@@ -32,9 +34,11 @@
 #   NOITE_UPDATE_CHECK=0  turn off the daily release check (on by default).
 #                      https://noite.now/self-hosting/operations#updating
 #   NOITE_VERSION      release channel or version (default: alpha; `stable`
-#                      follows final releases only, `0.1.0-alpha.5` or a short
-#                      SHA holds an install in place; `run.sh … install --pre`
-#                      pins the newest release, pre-releases included)
+#                      follows final releases only, a version or a short SHA
+#                      holds an install in place — except a pre-reset 0.1.0
+#                      pin, which the installer refuses (reinstall instead);
+#                      `run.sh … install --pre` pins the newest release,
+#                      pre-releases included)
 #   NOITE_REF          git ref the installer and compose.yaml come from (default: main)
 #   NOITE_DIR          install directory (default: /opt/noite)
 #   NOITE_YES=1        skip the upgrade confirmation (`bash -s install --yes`
@@ -397,77 +401,23 @@ env_secret() {
   env_default "$key" "$value"
 }
 
-# Cello 0.1.0 renamed every `CELLD_*` setting to `CELLO_*`, and the runner
-# refuses to boot with a stale `CELLD_*` still set. An upgrade re-run
-# renames the keys an older install may carry so the new image boots: a
-# `CELLO_*` value the operator already set wins, and the stale line is
-# dropped then. Every legacy assignment is renamed in order (never folded),
-# so with duplicate keys the last value still wins, exactly as `env_get`
-# reads it. A migrated `CELLD_BIN` pointing at a `celld` binary becomes its
-# `cello` sibling (that name is gone from the image); any other migrated or
-# kept binary path is left alone, with a warning to verify it.
-migrate_cello_env() {
-  local file="$NOITE_DIR/.env" tmp before had key suffix msg old_bin new_bin bin_now bin_base
-  [[ -f "$file" ]] || return 0
-  before=$(grep -oE '^CELLD_[A-Za-z0-9_]+=' "$file" | tr -d '=' | sort -u || true)
-  [[ -z "$before" ]] && return 0
-  had=$(grep -oE '^CELLO_[A-Za-z0-9_]+=' "$file" | tr -d '=' | sort -u || true)
-  # The last pre-migration value, for the rename report below. Captured now:
-  # the rewrite below turns every legacy line into its `CELLO_*` spelling.
-  old_bin=""
-  if printf '%s\n' "$before" | grep -qx CELLD_BIN; then
-    old_bin=$(grep -E '^CELLD_BIN=' "$file" | tail -n 1 | cut -d= -f2-)
+# Pre-reset installs (Noite 0.1.0 alpha/beta, any `CELLD_*` in .env) cannot be
+# upgraded: nothing reads or migrates their .env, volumes or bucket. Refuse
+# before anything is pulled or recreated — `--yes` must not bypass this —
+# with the reinstall steps. Fresh installs (no .env yet) have nothing to
+# refuse. The runner repeats this refusal at boot; this preflight keeps the
+# installer from pulling an image that will never serve the old data.
+refuse_prereset_install() {
+  [[ -f "$NOITE_DIR/.env" ]] || return 0
+  local stale=""
+  if grep -qE '^CELLD_[A-Za-z0-9_]+=' "$NOITE_DIR/.env" 2>/dev/null; then
+    stale="stale CELLD_* settings"
   fi
-  tmp=$(mktemp)
-  awk '
-    FNR == NR {
-      if ($0 ~ /^CELLO_[A-Za-z0-9_]+=/) {
-        key = $0; sub(/=.*/, "", key); orig[key] = 1
-      }
-      next
-    }
-    /^CELLD_[A-Za-z0-9_]+=/ {
-      line = $0; eq = index(line, "=")
-      old = substr(line, 1, eq - 1); val = substr(line, eq + 1)
-      cello = old; sub(/^CELLD_/, "CELLO_", cello)
-      if (!(cello in orig)) {
-        if (old == "CELLD_BIN" && (val == "celld" || val ~ /\/celld$/)) {
-          sub(/celld$/, "cello", val)
-        }
-        print cello "=" val
-      }
-      next
-    }
-    { print }
-  ' "$file" "$file" >"$tmp"
-  cat "$tmp" >"$file"
-  rm -f "$tmp"
-  msg=""
-  for key in $before; do
-    suffix=${key#CELLD_}
-    if printf '%s\n' "$had" | grep -qx "CELLO_${suffix}"; then
-      msg="${msg}kept CELLO_${suffix} (dropped stale ${key}); "
-    elif [[ "$key" == "CELLD_BIN" && ("$old_bin" == "celld" || "$old_bin" == */celld) ]]; then
-      new_bin=$(env_get CELLO_BIN)
-      msg="${msg}renamed ${key} to CELLO_${suffix} (${old_bin} -> ${new_bin}); "
-    else
-      msg="${msg}renamed ${key} to CELLO_${suffix}; "
-    fi
-  done
-  info "Cello 0.1.0 renamed every CELLD_* setting to CELLO_*: ${msg}"
-  # A binary path that does not end in `cello` stays exactly as migrated or
-  # kept: flag it so the operator verifies it before the next fleet launch.
-  bin_now=$(env_get CELLO_BIN)
-  if [[ -n "$bin_now" ]]; then
-    bin_base="$bin_now"
-    if [[ "$bin_base" == \"*\" || "$bin_base" == \'*\' ]]; then
-      bin_base="${bin_base:1:${#bin_base}-2}"
-    fi
-    bin_base="${bin_base##*/}"
-    if [[ "$bin_base" != "cello" ]]; then
-      warn "CELLO_BIN=${bin_now} kept as-is; verify it points at the cello binary"
-    fi
+  if grep -qE '^NOITE_IMAGE=.*:0\.1\.0-' "$NOITE_DIR/.env" 2>/dev/null; then
+    stale="${stale:+$stale and }a pre-reset 0.1.0 image pin"
   fi
+  [[ -n "$stale" ]] || return 0
+  die "pre-reset install ($stale): this install was written by Noite 0.1.0 (alpha/beta) and cannot be upgraded. Across the 0.2.0 beta reset: reinstall, no upgrade. To start fresh: (1) optionally back up first (https://noite.now/self-hosting/operations#backups); (2) cd $NOITE_DIR && docker compose down -v (multi installs add -f compose.yaml -f compose.multi.yaml); (3) empty the bucket, or point the fresh install at an empty bucket or prefix; (4) re-run this installer."
 }
 
 # Everything the runner needs to boot on a real domain, with the defaults a
@@ -526,7 +476,7 @@ write_config() {
     else
       info "keeping .env (BASE_DOMAIN=$DOMAIN)"
     fi
-    migrate_cello_env
+    refuse_prereset_install
   else
     fresh=1
     choose_domain

@@ -30,6 +30,21 @@ pre=0
 for arg in "$@"; do
   if [[ "$name" == install && "$arg" == --pre ]]; then pre=1; else args+=("$arg"); fi
 done
+
+# Pre-reset installs (Noite 0.1.0 alpha/beta, any `CELLD_*` in .env) cannot be
+# upgraded: refuse before fetching anything, with the reinstall steps. The
+# fetched installer repeats this check itself; this early refusal keeps a
+# stale local checkout from pulling an image that will never serve the old
+# data. `--yes` must not bypass this.
+if [[ "$name" == install ]]; then
+  reset_env="${NOITE_DIR:-/opt/noite}/.env"
+  if [[ -f "$reset_env" ]] && { grep -qE '^CELLD_[A-Za-z0-9_]+=' "$reset_env" 2>/dev/null || grep -qE '^NOITE_IMAGE=.*:0\.1\.0-' "$reset_env" 2>/dev/null; }; then
+    cat >&2 <<EOF
+error pre-reset install: this install was written by Noite 0.1.0 (alpha/beta) and cannot be upgraded. Across the 0.2.0 beta reset: reinstall, no upgrade. To start fresh: (1) optionally back up first (https://noite.now/self-hosting/operations#backups); (2) cd ${NOITE_DIR:-/opt/noite} && docker compose down -v (multi installs add -f compose.yaml -f compose.multi.yaml); (3) empty the bucket, or point the fresh install at an empty bucket or prefix; (4) re-run this installer.
+EOF
+    exit 1
+  fi
+fi
 if ((pre)); then
   # The newest published release, pre-releases included. GitHub's list order
   # is not "newest first": a release marked Latest comes ahead of newer
