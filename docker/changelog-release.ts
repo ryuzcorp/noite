@@ -45,9 +45,14 @@ try {
   entries = readdirSync(dir)
     .filter((name) => name.endsWith(".md"))
     .toSorted();
-} catch {
+} catch (error) {
   // No changelog.d/ yet (the reset deleted the fragments): the pending
-  // notes in ## [Unreleased] release on their own.
+  // notes in ## [Unreleased] release on their own. Any other read failure
+  // would silently drop fragment notes from the release, so it stops here.
+  if (!(error instanceof Error && "code" in error && error.code === "ENOENT")) {
+    throw error;
+  }
+
   entries = [];
 }
 
