@@ -1,0 +1,9 @@
+### Operator action required
+
+- The tenant runtime moves from celld to **Cello 0.1.0**. Re-running the installer rewrites stale `CELLD_*` keys in `/opt/noite/.env` to their `CELLO_*` spellings automatically (a pre-existing `CELLO_*` value wins). The runner now **refuses to boot** with any `CELLD_*` still set, naming the `CELLO_*` spelling — remove leftovers instead of leaving them.
+- `RUNNER_FLEET_LOG`'s default is now `error,cello=warn`. An explicit override keeps working; one pinned to `error,celld=warn` still boots but matches nothing — update it to see fleet warnings.
+- The instance heartbeat payload field `celld_version` is now `cello_version`. Dashboards or alerts keyed on the old field name need the new spelling.
+
+### Changed
+
+- Tenant fleets, the control fleet and every `cello` CLI call now run Cello 0.1.0 (image `ghcr.io/ryuzcorp/cello:0.1.0`, pinned by digest with the same attestation gate). Fleet health moves to `/.well-known/cello/health`; error grouping unwraps both `cello.*` and legacy `celld.*` span names, so telemetry from before the upgrade keeps working and old buckets still load.

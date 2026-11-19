@@ -8,7 +8,7 @@
 # The runner loads `worker.js` + `meta.json` from `VOID_SANDBOX_BUNDLE_DIR` at
 # every deploy (`host/void_sandbox.rs`), and only the release image bakes that
 # bundle. Leaving the build to the developer meant a fresh (or updated)
-# checkout failed every sandbox app's deploy at `celld deploy` with "sandbox
+# checkout failed every sandbox app's deploy at `cello deploy` with "sandbox
 # controller bundle incomplete", so the dev stack owns it: `--once` builds
 # before the runner starts, `--watch` rebuilds whenever the mounted package
 # changes, and the next deploy picks the new bundle up with no manual step.
