@@ -238,41 +238,45 @@ const cache = Effect.runSync(
         catch: (cause: unknown): unknown => cause,
         try: async (signal: AbortSignal) => {
           const key = bareKey(effectKey);
-          // The epoch this lookup was requested under (see `cacheKey`).
-          const epoch = Number(effectKey.slice(0, effectKey.indexOf(":")));
           const run = fetchers.get(key);
 
-          const value: unknown =
-            run === undefined
-              ? await Promise.reject<unknown>(
-                  new Error(`no fetcher registered for resource "${key}"`)
-                )
-              : await run(key, { signal });
-
-          // An auth change while the fetch was in flight makes this value the
-          // previous account's; resource keys carry no account id, so only a
-          // lookup still in the current epoch may write the snapshot.
-          if (epoch === swrEpoch()) {
-            writeSwr(
-              key,
-              value,
-              memoryOnly.has(key) ? { persist: false } : undefined
-            );
-          }
-
-          return value;
+          // The snapshot write lives in `settleKey`, guarded by the reload
+          // generation: a superseded lookup resolves without overwriting the
+          // newer snapshot (or painting its atoms).
+          return run === undefined
+            ? await Promise.reject<unknown>(
+                new Error(`no fetcher registered for resource "${key}"`)
+              )
+            : await run(key, { signal });
         },
       }),
   })
 );
 
 /** Fan one settled lookup out to every mounted reader of `key`, unless a
- * newer reload started since. */
+ * newer reload started since. The shared snapshot is written on the same
+ * guard: the paint and the store move together, so a frame the sync compares
+ * against the store can never disagree with what the readers show. A lookup
+ * that started under an earlier auth epoch writes nothing even when it is
+ * still the latest generation (its account's store was forgotten). */
 const settleKey = (
   key: string,
   generation: number,
+  epoch: number,
   outcome: SettleOutcome
 ): void => {
+  if (
+    outcome.ok &&
+    epoch === swrEpoch() &&
+    generations.get(key) === generation
+  ) {
+    writeSwr(
+      key,
+      outcome.value,
+      memoryOnly.has(key) ? { persist: false } : undefined
+    );
+  }
+
   if (generations.get(key) !== generation) {
     return;
   }
@@ -295,6 +299,9 @@ const settleKey = (
 const reload = async (key: string, clear = false): Promise<unknown> => {
   const generation = (generations.get(key) ?? 0) + 1;
   generations.set(key, generation);
+  // The auth epoch this reload reads under: a reset while the fetch is in
+  // flight forgets the store, so the late value must not repopulate it.
+  const epoch = swrEpoch();
   const readers = subs.get(key);
 
   if (readers !== undefined) {
@@ -311,11 +318,11 @@ const reload = async (key: string, clear = false): Promise<unknown> => {
 
   try {
     const value = await Effect.runPromise(Cache.get(cache, cacheKey(key)));
-    settleKey(key, generation, { ok: true, value });
+    settleKey(key, generation, epoch, { ok: true, value });
 
     return value;
   } catch (error) {
-    settleKey(key, generation, { error, ok: false });
+    settleKey(key, generation, epoch, { error, ok: false });
     throw error;
   }
 };
@@ -324,12 +331,16 @@ const reload = async (key: string, clear = false): Promise<unknown> => {
  * fan the landing out to every mounted reader. A failure is evicted, never
  * cached: the entry is dropped when the failure lands so a later mount (or
  * an explicit refetch) starts a fresh lookup instead of re-serving it. */
-const settleGet = async (key: string, generation: number): Promise<void> => {
+const settleGet = async (
+  key: string,
+  generation: number,
+  epoch: number
+): Promise<void> => {
   try {
     const value = await Effect.runPromise(Cache.get(cache, cacheKey(key)));
-    settleKey(key, generation, { ok: true, value });
+    settleKey(key, generation, epoch, { ok: true, value });
   } catch (error) {
-    settleKey(key, generation, { error, ok: false });
+    settleKey(key, generation, epoch, { error, ok: false });
 
     if (generations.get(key) === generation) {
       await Effect.runPromise(Cache.invalidate(cache, cacheKey(key)));
@@ -345,7 +356,7 @@ const settleGet = async (key: string, generation: number): Promise<void> => {
 const kick = (key: string): void => {
   const generation = (generations.get(key) ?? 0) + 1;
   generations.set(key, generation);
-  void settleGet(key, generation);
+  void settleGet(key, generation, swrEpoch());
 };
 
 /** Drop the cached entry for `key` and reload every mounted reader, cold: the

@@ -16,7 +16,7 @@ import {
   withRetry,
 } from "./resource";
 import type { Resource, ResourceState } from "./resource";
-import { errorDetail } from "./resources";
+import { appDetail, environments, errorDetail } from "./resources";
 import type { RunnerErrorDetail } from "./runner";
 import { clearSwrStore, readSwr, writeSwr } from "./swr-store";
 
@@ -297,6 +297,68 @@ describe("account epoch", () => {
       await flush();
 
       expect(readSwr<string[]>(key)).toBeUndefined();
+    } finally {
+      resetSignals();
+      restoreDom();
+    }
+  });
+});
+
+describe("reload generations", () => {
+  test("a superseded reload never overwrites the newer snapshot", async () => {
+    const restoreDom = installDomFixture();
+
+    try {
+      const key = nextKey();
+      const kickGate = Promise.withResolvers<string[]>();
+      const staleGate = Promise.withResolvers<string[]>();
+      const freshGate = Promise.withResolvers<string[]>();
+      let calls = 0;
+      probeKey = key;
+      probeFetch = () => {
+        calls += 1;
+
+        if (calls === 1) {
+          return kickGate.promise;
+        }
+
+        if (calls === 2) {
+          return staleGate.promise;
+        }
+
+        return freshGate.promise;
+      };
+
+      const ui = render(ResourceProbe);
+      await ui.settled();
+      const paintedV0 = nextPainted();
+      kickGate.resolve(["v0"]);
+      expect(await paintedV0).toEqual(["v0"]);
+      expect(readSwr<string[]>(key)).toEqual(["v0"]);
+
+      // Two overlapping reloads, e.g. two disagreeing state-stream frames
+      // while a fetch is still in flight: each starts its own lookup.
+      invalidate(key);
+      await flush();
+      invalidate(key);
+      await flush();
+      expect(calls).toBe(3);
+
+      // The newer fetch lands first: paint and snapshot move together.
+      const paintedV2 = nextPainted();
+      freshGate.resolve(["v2"]);
+      expect(await paintedV2).toEqual(["v2"]);
+      expect(readSwr<string[]>(key)).toEqual(["v2"]);
+
+      // The superseded fetch lands late: its atom update is dropped, and its
+      // snapshot must be dropped too — otherwise the store disagrees with
+      // the paint, and a later frame matching the stale store invalidates
+      // nothing while the badge shows older data.
+      staleGate.resolve(["v1-stale"]);
+      await flush();
+      expect(resourceValue(capturedState())).toEqual(["v2"]);
+      expect(readSwr<string[]>(key)).toEqual(["v2"]);
+      ui.unmount();
     } finally {
       resetSignals();
       restoreDom();
@@ -785,6 +847,153 @@ describe("errorDetail recovery", () => {
 
         expect(resourceValue(capturedDetail.state())).toEqual(body);
         expect(resourceError(capturedDetail.state())).toBeUndefined();
+      } finally {
+        ui.unmount();
+      }
+    } finally {
+      globalThis.fetch = realFetch;
+      resetSignals();
+      restoreDom();
+    }
+  });
+});
+
+describe("app state recovery", () => {
+  test("the real app row fetcher retries a failed first read", async () => {
+    const restoreDom = installDomFixture();
+    const realFetch = globalThis.fetch;
+
+    try {
+      const id = `app-retry-row-${Date.now()}`;
+
+      const body = {
+        app: { desiredState: "running", id, status: "running" },
+        myRole: "admin",
+      };
+
+      let calls = 0;
+
+      globalThis.fetch = (() => {
+        calls += 1;
+
+        if (calls === 1) {
+          return Promise.resolve(
+            Response.json({ error: "away" }, { status: 500 })
+          );
+        }
+
+        return Promise.resolve(Response.json(body, { status: 200 }));
+      }) as typeof fetch;
+
+      let capturedDetail:
+        | Resource<{ app: unknown; myRole: string }>
+        | undefined;
+
+      const AppRowProbe = () => {
+        const res = appDetail(id);
+        capturedDetail = res as unknown as Resource<{
+          app: unknown;
+          myRole: string;
+        }>;
+
+        const settled = atom(
+          Atom.readable((get) => get(res.state.atom)._tag !== "Loading")
+        );
+
+        watch(settled, (done) => {
+          if (done) {
+            signalSettled?.();
+          }
+        });
+
+        return <span />;
+      };
+
+      const done = nextSettled();
+      const ui = render(AppRowProbe);
+
+      try {
+        await ui.settled();
+        // The first read fails; the bounded backoff below is the product's
+        // own (1 s), awaited here as the resource settling — a real signal,
+        // not a sleep.
+        await done;
+        await ui.settled();
+        expect(calls).toBe(2);
+
+        if (capturedDetail === undefined) {
+          throw new Error("the probe captured no app row resource");
+        }
+
+        expect(resourceValue(capturedDetail.state())).toEqual(body);
+        expect(resourceError(capturedDetail.state())).toBeUndefined();
+      } finally {
+        ui.unmount();
+      }
+    } finally {
+      globalThis.fetch = realFetch;
+      resetSignals();
+      restoreDom();
+    }
+  });
+
+  test("the real environments fetcher retries a failed first read", async () => {
+    const restoreDom = installDomFixture();
+    const realFetch = globalThis.fetch;
+
+    try {
+      const id = `app-retry-env-${Date.now()}`;
+      const body = [{ appId: id, id: "env-retry", status: "running" }];
+      let calls = 0;
+
+      globalThis.fetch = (() => {
+        calls += 1;
+
+        if (calls === 1) {
+          return Promise.resolve(
+            Response.json({ error: "away" }, { status: 500 })
+          );
+        }
+
+        return Promise.resolve(Response.json(body, { status: 200 }));
+      }) as typeof fetch;
+
+      let capturedList: Resource<{ appId: string; id: string }[]> | undefined;
+
+      const EnvListProbe = () => {
+        const res = environments(id);
+        capturedList = res as unknown as Resource<
+          { appId: string; id: string }[]
+        >;
+
+        const settled = atom(
+          Atom.readable((get) => get(res.state.atom)._tag !== "Loading")
+        );
+
+        watch(settled, (done) => {
+          if (done) {
+            signalSettled?.();
+          }
+        });
+
+        return <span />;
+      };
+
+      const done = nextSettled();
+      const ui = render(EnvListProbe);
+
+      try {
+        await ui.settled();
+        await done;
+        await ui.settled();
+        expect(calls).toBe(2);
+
+        if (capturedList === undefined) {
+          throw new Error("the probe captured no environments resource");
+        }
+
+        expect(resourceValue(capturedList.state())).toEqual(body);
+        expect(resourceError(capturedList.state())).toBeUndefined();
       } finally {
         ui.unmount();
       }
