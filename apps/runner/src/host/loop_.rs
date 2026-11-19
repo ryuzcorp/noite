@@ -1316,16 +1316,32 @@ mod tests {
     /// next tick). Park one fleet's stop mid-drain and require an unrelated
     /// fleet's spawn claim in the same pass; fails on the old order via its
     /// deadline.
+    /// Removes its temp DB file on drop, so a failed assert cannot leak it.
+    struct TempDb {
+        path: std::path::PathBuf,
+    }
+
+    impl Drop for TempDb {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+
     #[tokio::test]
     async fn an_unrelated_start_does_not_wait_behind_a_slow_stop() {
-        let cfg = crate::config::config_for_tests();
+        let mut cfg = crate::config::config_for_tests();
+        // Hermetic spawn: the binary can never exec, so the released claim
+        // fails fast on the spawn-error path instead of parking (or, with
+        // celld installed, leaking) a fleet child.
+        cfg.celld_bin = "/nonexistent/noite-test-no-celld".into();
         // A temp file, not `:memory:`: the pool holds five connections and
         // every `:memory:` connection is its own empty database, so the
         // spawned reconcile would see none of these rows.
-        let db_path =
-            std::env::temp_dir().join(format!("hol-start-order-{}.db", std::process::id()));
-        let _ = std::fs::remove_file(&db_path);
-        let db_url = format!("sqlite:{}?mode=rwc", db_path.to_string_lossy());
+        let _temp_db = TempDb {
+            path: std::env::temp_dir().join(format!("hol-start-order-{}.db", std::process::id())),
+        };
+        let _ = std::fs::remove_file(&_temp_db.path);
+        let db_url = format!("sqlite:{}?mode=rwc", _temp_db.path.to_string_lossy());
         let pool = db::connect(&db_url).await.expect("temp db");
         let procs = supervisor::new_procs();
         // Fleet A is stopped: its stop parks mid-drain for the whole pass.
@@ -1348,8 +1364,9 @@ mod tests {
             .expect("stop");
         let stop_gate = supervisor::stop_gate_register("hol-stop");
         // Fleet B wants to run and is deployed: its spawn claim must land
-        // while A's drain is still parked. B never leaves pre-claim here,
-        // so no fleet process is spawned and the test needs no celld.
+        // while A's drain is still parked. The claim is released at once and
+        // the spawn then fails fast on the missing binary (asserted below),
+        // so no fleet process is ever spawned.
         let starting = db::create_app(
             &pool,
             &cfg,
@@ -1403,7 +1420,19 @@ mod tests {
                 gate.release.notify_one();
             }
         });
-        // The metrics tick runs at the end of a pass; it needs a store the
+
+        // Belt and suspenders for the hermetic spawn above: adoption parks
+        // only on a path the missing binary never reaches, but a park there
+        // must release rather than wedge the pass or leak a child. Never
+        // joined — it fires only on that unreachable path — and aborted in
+        // cleanup below.
+        let adopt_releaser = tokio::spawn({
+            let gate = spawn_gate.clone();
+            async move {
+                gate.pre_adopt_arrived.notified().await;
+                gate.pre_adopt_release.notify_one();
+            }
+        });
         // test does not have, so hold a fake claim and skip it.
         let deploying = crate::host::deploy::new_deploying();
         deploying
@@ -1441,7 +1470,8 @@ mod tests {
         })
         .await;
         // No parked task outlives the test, and a failure still cleans the
-        // static gate maps.
+        // static gate maps. `_temp_db` removes the temp file on drop.
+        adopt_releaser.abort();
         supervisor::stop_gate_remove("hol-stop");
         supervisor::test_gate_remove("hol-start");
         assert!(fired.is_ok(), "the pass never reached both gates");
@@ -1459,7 +1489,14 @@ mod tests {
             vec!["claim", "enter"],
             "the unrelated start's spawn claim waited behind the parked stop's drain"
         );
+        let b = db::get_app(&pool, &starting.id)
+            .await
+            .expect("reread")
+            .expect("row");
+        assert!(
+            b.last_error.is_some(),
+            "the unblocked spawn must fail fast on the missing binary instead of parking a child"
+        );
         pool.close().await;
-        let _ = std::fs::remove_file(&db_path);
     }
 }
