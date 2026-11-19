@@ -1,5 +1,5 @@
 //! What a fleet may ask the engine: the exact Engine API surface Cello
-//! 0.1.0 uses (`crates/cello/container.rs`, `docker.rs` in ryuzcorp/cello),
+//! 0.2.0 uses (`crates/cello/container.rs`, `docker.rs` in ryuzcorp/cello),
 //! no more. Pure functions over method/path/query/JSON so tests pin every
 //! accept and every refusal without a socket; [`super`] wires them to the
 //! proxy loop.
@@ -14,7 +14,7 @@ use super::super::{
     OPEN_NETWORK,
 };
 
-/// Cello 0.1.0's fence ruleset, byte-identical to `FENCE_RULES` in
+/// Cello 0.2.0's fence ruleset, byte-identical to `FENCE_RULES` in
 /// `crates/cello/container.rs`. The fence installer is the one
 /// create a fleet may make outside the locked-down app shape, and its only
 /// authority is that these rules are exactly Cello's own: a Cello bump must
@@ -36,7 +36,7 @@ table inet cello {
 }
 "#;
 
-/// The fence installer's command, exactly as Cello 0.1.0 builds it
+/// The fence installer's command, exactly as Cello 0.2.0 builds it
 /// (`container.rs`).
 const FENCE_CMD: &str = "printf '%s' \"$CELLO_NFT\" | nft -f -";
 
@@ -90,8 +90,7 @@ pub enum Route<'a> {
     /// `POST /exec/{id}/resize` for a remembered exec id, with its query
     /// rebuilt by [`validate_exec_resize_query`].
     ExecResize { id: &'a str },
-    /// `GET /images/{name}/json` for a `celld-image:` content tag (the prefix
-    /// is frozen across the rename).
+    /// `GET /images/{name}/json` for a `cello-image:` content tag.
     ImageInspect { name: &'a str },
     /// `POST /images/load`: always refused (the runner deployed the images).
     ImageLoad,
@@ -182,10 +181,10 @@ fn valid_container_name(name: &str) -> bool {
     hex.len() == 24 && hex.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
-/// A Cello content tag: `celld-image:` plus the 64 hex digits of the layer +
-/// config hash (`deploy.rs`). The tag prefix is frozen across the rename.
+/// A Cello content tag: `cello-image:` plus the 64 hex digits of the layer +
+/// config hash (`deploy.rs`).
 pub fn valid_image_name(name: &str) -> bool {
-    let Some(hex) = name.strip_prefix("celld-image:") else {
+    let Some(hex) = name.strip_prefix("cello-image:") else {
         return false;
     };
     hex.len() == 64 && hex.bytes().all(|b| b.is_ascii_hexdigit())
@@ -327,7 +326,7 @@ pub fn validate_app_create(body: &Value, fleet: &str) -> Result<Value, String> {
     }
     let image = object.get("Image").and_then(Value::as_str).unwrap_or("");
     if !valid_image_name(image) {
-        return Err("create Image must be a celld-image:<content key> tag".to_string());
+        return Err("create Image must be a cello-image:<content key> tag".to_string());
     }
     if let Some(env) = object.get("Env") {
         if !is_string_array(env) {
@@ -376,7 +375,7 @@ pub fn validate_app_create(body: &Value, fleet: &str) -> Result<Value, String> {
 /// bridge, dropped capabilities, no-new-privileges, pid ceiling — is
 /// required; the harmless scheduling keys are validated when present.
 /// `Runtime` and `Binds` are refused outright: Noite sets no container
-/// runtime or DNS, so Cello 0.1.0 never sends them, and either would hand a
+/// runtime or DNS, so Cello 0.2.0 never sends them, and either would hand a
 /// fleet host paths or a weaker runtime.
 fn validate_app_host_config(host: &serde_json::Map<String, Value>) -> Result<(), String> {
     if let Some(key) = keys_subset(
@@ -451,8 +450,8 @@ const MAX_MEMORY_BYTES: u64 = 12 * 1024 * 1024 * 1024;
 /// one host-network, `NET_ADMIN` container a fleet may ask for, so only
 /// Cello's installer verbatim passes (node label aside, every byte is pinned,
 /// above all the ruleset) and its image is replaced by `trusted_image`, the
-/// runner's own: a `celld-image:` tag is whatever image a tenant deployed
-/// (the prefix is frozen across the rename), and its `sh` or `nft` would
+/// runner's own: a `cello-image:` tag is whatever image a tenant deployed,
+/// and its `sh` or `nft` would
 /// otherwise run in the host netns with `NET_ADMIN`. The runner image
 /// carries `sh` and `nft`; the entrypoint is set explicitly because that
 /// image's own entrypoint is the runner.
@@ -470,8 +469,8 @@ pub fn validate_fence_create(
         return Err("fence body must be exactly Cello's installer".to_string());
     }
     let image = object.get("Image").and_then(Value::as_str).unwrap_or("");
-    if !image.starts_with("celld-image:") {
-        return Err("fence Image must be a celld-image: tag".to_string());
+    if !image.starts_with("cello-image:") {
+        return Err("fence Image must be a cello-image: tag".to_string());
     }
     let env = [format!("CELLO_NFT={FENCE_RULES}")];
     if object.get("Env") != Some(&Value::Array(env.map(Value::String).to_vec())) {
@@ -706,15 +705,9 @@ pub fn without_network_members(body: &[u8]) -> Bytes {
 /// Whether an inspected container is a fence installer: its label, or
 /// host networking (no app container is ever created with it).
 pub fn inspect_is_fence(info: &Value) -> bool {
-    let labelled = [
-        "/Config/Labels/cello.fence",
-        "/Labels/cello.fence",
-        // Pre-0.1.0 fence containers, reaped after the upgrade.
-        "/Config/Labels/celld.fence",
-        "/Labels/celld.fence",
-    ]
-    .iter()
-    .any(|pointer| info.pointer(pointer).is_some());
+    let labelled = ["/Config/Labels/cello.fence", "/Labels/cello.fence"]
+        .iter()
+        .any(|pointer| info.pointer(pointer).is_some());
     labelled || info.pointer("/HostConfig/NetworkMode") == Some(&Value::String("host".into()))
 }
 
@@ -765,10 +758,10 @@ mod tests {
     use serde_json::json;
 
     const IMAGE: &str =
-        "celld-image:6a76000000000000000000000000000000000000000000000000000000000000";
+        "cello-image:6a76000000000000000000000000000000000000000000000000000000000000";
     const NODE: &str = "node-test-1";
 
-    /// Cello 0.1.0's app-container create body (`container.rs`) for
+    /// Cello 0.2.0's app-container create body (`container.rs`) for
     /// the default `dev` instance type, with a tenant entrypoint.
     fn app_create_body() -> Value {
         json!({
@@ -803,7 +796,7 @@ mod tests {
         })
     }
 
-    /// Cello 0.1.0's fence installer body (`container.rs`).
+    /// Cello 0.2.0's fence installer body (`container.rs`).
     fn fence_create_body() -> Value {
         json!({
             "Image": IMAGE,
@@ -1002,13 +995,13 @@ mod tests {
     fn image_names_are_content_tags() {
         assert!(valid_image_name(IMAGE));
         assert!(valid_image_name(&format!(
-            "celld-image:{}",
+            "cello-image:{}",
             "ab".repeat(32)
         )));
         for bad in [
-            "celld-image:short",
-            "celld-image:",
-            "celld-image:zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz",
+            "cello-image:short",
+            "cello-image:",
+            "cello-image:zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz",
             "alpine:3.20",
             "noite:latest",
             "",
@@ -1163,13 +1156,13 @@ mod tests {
         other_image["Image"] = json!("alpine:3.20");
         cases.push(("non-Cello image", other_image));
         for loose in [
-            "celld-image:evil",
-            "celld-image:foo/bar",
-            "celld-image:abc@sha256:00",
+            "cello-image:evil",
+            "cello-image:foo/bar",
+            "cello-image:abc@sha256:00",
         ] {
             let mut body = base.clone();
             body["Image"] = json!(loose);
-            cases.push(("loose celld-image tag", body));
+            cases.push(("loose cello-image tag", body));
         }
         for (name, body) in cases {
             assert!(
@@ -1184,7 +1177,7 @@ mod tests {
         const TRUSTED: &str = "sha256:runner-image";
         let checked =
             validate_fence_create(&fence_create_body(), "shop", TRUSTED).expect("cello's fence");
-        // Whatever celld-image tag Cello named, the host-network container
+        // Whatever cello-image tag Cello named, the host-network container
         // runs the runner's image with Cello's exact ruleset and command.
         assert_eq!(checked.pointer("/Image"), Some(&json!(TRUSTED)));
         assert_eq!(
@@ -1432,10 +1425,6 @@ mod tests {
             &json!({"Config": {"Labels": {"cello.fence": "1"}}})
         ));
         assert!(inspect_is_fence(&json!({"Labels": {"cello.fence": "0"}})));
-        // Pre-0.1.0 fence containers, reaped after the upgrade.
-        assert!(inspect_is_fence(
-            &json!({"Config": {"Labels": {"celld.fence": "1"}}})
-        ));
         assert!(inspect_is_fence(
             &json!({"HostConfig": {"NetworkMode": "host"}})
         ));
@@ -1530,12 +1519,12 @@ mod tests {
                 }),
             ),
             (
-                "pre-rename bridge name",
+                "uppercase near-miss bridge name",
                 json!({
-                    "Name": "celld", "Driver": "bridge", "Internal": false,
+                    "Name": "Cello", "Driver": "bridge", "Internal": false,
                     "Options": {
                         "com.docker.network.bridge.enable_icc": "false",
-                        "com.docker.network.bridge.name": "celld0",
+                        "com.docker.network.bridge.name": "cello0",
                     },
                 }),
             ),

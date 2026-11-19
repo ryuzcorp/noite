@@ -3,7 +3,7 @@
 //! Cello serves an `r2_buckets` binding out of the fleet bucket under the
 //! reserved `r2/<bucket_name>/` prefix: the body is a plain object, the five
 //! content headers are real headers, and the rest of the record travels in
-//! the `celld-r2` user-metadata entry (`docs/services/r2`). Every read and
+//! the `cello-r2` user-metadata entry (`docs/services/r2`). Every read and
 //! write here goes through the `cello r2` CLI, which owns both the stored
 //! key form and the record — the runner never encodes a key or touches the
 //! store directly, so a folder listing is one `list --page` call with the
@@ -469,7 +469,7 @@ pub async fn r2_get(cfg: &Config, app: &App, bucket: &str, key: &str) -> anyhow:
 }
 
 /// Write one object with the full Cello record (the five content headers and
-/// the `celld-r2` metadata), exactly as a Worker's `env.BUCKET.put()` would.
+/// the `cello-r2` metadata), exactly as a Worker's `env.BUCKET.put()` would.
 /// A folder marker is the same call with an empty body and a `/` key.
 pub async fn r2_put(
     cfg: &Config,

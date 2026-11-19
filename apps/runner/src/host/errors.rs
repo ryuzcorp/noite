@@ -7,8 +7,8 @@
 //! 1. A failed span's `error` column for anything a handler throws or
 //!    rejects — `rejected: PaymentError: declined [at chargeCard
 //!    (worker.js:21:27) <- at fetch (worker.js:34:9)]`. A Durable Object
-//!    failure shows on both the `celld.cell_fetch` span and, wrapped as
-//!    `rejected: Error: rejected: …`, on its parent `celld.fetch`; the
+//!    failure shows on both the `cello.cell_fetch` span and, wrapped as
+//!    `rejected: Error: rejected: …`, on its parent `cello.fetch`; the
 //!    ingest groups them per trace so one request counts once.
 //! 2. A log record for `console.error(err)` and for rejected `waitUntil`
 //!    work — `ERROR <context> <Name>: <message>\n    at …` with a full V8
@@ -431,14 +431,10 @@ pub struct Occurrence<'a> {
     pub environment: String,
 }
 
-/// `cello.cell_fetch` → `cell_fetch`: the handler that failed. Buckets
-/// written before the 0.1.0 upgrade still carry the `celld.` prefix, so the
-/// legacy spelling unwraps the same way instead of leaking the prefix into
-/// the Errors tab.
+/// `cello.cell_fetch` → `cell_fetch`: the handler that failed.
 fn handler_of(span_name: &str) -> String {
     span_name
         .strip_prefix("cello.")
-        .or_else(|| span_name.strip_prefix("celld."))
         .unwrap_or(span_name)
         .to_string()
 }
@@ -831,6 +827,13 @@ mod tests {
         assert_eq!(p.frames[0].location, "worker.js:21:27");
         assert!(p.frames[0].in_app);
         assert_eq!(culprit(&p), "chargeCard (worker.js:21)");
+    }
+
+    #[test]
+    fn handler_names_unwrap_the_cello_prefix() {
+        assert_eq!(handler_of("cello.fetch"), "fetch");
+        assert_eq!(handler_of("cello.cell_fetch"), "cell_fetch");
+        assert_eq!(handler_of("other.fetch"), "other.fetch");
     }
 
     #[test]

@@ -963,7 +963,7 @@ mod tests {
 
     /// One trace object from `(error, trace_id)` rows; a `None` trace id is a
     /// NULL, which Cello never writes but the old SQL handled. The schema is
-    /// the subset of Cello's `celld_span` the failed-span read projects, so
+    /// the subset of Cello's `cello_span` the failed-span read projects, so
     /// `project()` sees exactly what a real object carries.
     fn trace_object_rows(start_us: i64, rows: &[(String, Option<String>)]) -> Bytes {
         use parquet::basic::Compression;
@@ -974,7 +974,7 @@ mod tests {
         use std::sync::Arc;
 
         const SCHEMA: &str = "
-        message celld_span {
+        message cello_span {
           required binary name (STRING);
           required int64 start_unix_us;
           required boolean ok;
@@ -997,7 +997,7 @@ mod tests {
         column
             .typed::<ByteArrayType>()
             .write_batch(
-                &(0..count).map(|_| text("celld.fetch")).collect::<Vec<_>>(),
+                &(0..count).map(|_| text("cello.fetch")).collect::<Vec<_>>(),
                 None,
                 None,
             )
@@ -1195,7 +1195,7 @@ mod tests {
             top.offer(errors::SpanErrorRow {
                 slug: "app".to_string(),
                 error: error.to_string(),
-                name: "celld.fetch".to_string(),
+                name: "cello.fetch".to_string(),
                 cell: String::new(),
                 trace_id: String::new(),
                 count,
@@ -1299,11 +1299,10 @@ mod tests {
     /// schema bump that breaks the decode fails here before it reaches a
     /// dashboard. `folded` is the compaction output this crate writes
     /// (`compact::fold_files`), so the new writer's union-by-name file is read
-    /// back against the old query — the other compacted case was written by
-    /// that query engine.
+    /// back against the same reference rows.
     #[test]
-    fn real_celld_fixtures_match_the_reference_rows() {
-        for case in ["prod", "env", "compacted", "folded"] {
+    fn real_cello_fixtures_match_the_reference_rows() {
+        for case in ["prod", "env", "folded"] {
             let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join("tests/fixtures/otel")
                 .join(case);
@@ -1352,23 +1351,6 @@ mod tests {
                 "{case}: failed-span groups"
             );
         }
-    }
-
-    /// A compacted hour is read from `compacted.parquet` alone: the fixture
-    /// case keeps a leftover source beside it, and decoding the source
-    /// directly yields a row the compacted canonical file does not.
-    #[test]
-    fn a_compacted_fixture_shadows_its_leftover_source() {
-        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/fixtures/otel/compacted/logs");
-        let files = parquet_files(&dir);
-        assert_eq!(files.len(), 1, "{files:?}");
-        assert!(
-            files[0]
-                .file_name()
-                .is_some_and(|name| name == "compacted.parquet"),
-            "{files:?}"
-        );
     }
 
     #[test]

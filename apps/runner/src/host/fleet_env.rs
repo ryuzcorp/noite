@@ -7,7 +7,7 @@
 //! a fleet: each spawn passes only what Cello and the fleet need, so the old
 //! `env_remove` denylists are gone.
 //!
-//! What Cello reads (ryuzcorp/cello 0.1.0, `docs/` env table and
+//! What Cello reads (ryuzcorp/cello 0.2.0, `docs/` env table and
 //! `crates/cello`): the `CELLO_*` knobs below plus `CELLO_OPERATOR_TOKEN`,
 //! the store credentials (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`,
 //! `AWS_REGION`/`AWS_DEFAULT_REGION`, `S3_ENDPOINT`; the SDK-standard

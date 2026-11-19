@@ -21,8 +21,8 @@
 //!    the credential sweep, so no other install's fleet shares it. The tag
 //!    rides argv[0] rather than the environment because fleet nodes are
 //!    non-dumpable (cello `0053`): `/proc/<pid>/environ` answers `EACCES`
-//!    even as root, while cmdline stays readable — and clap ignores argv[0]
-//!    (verified against celld 0.6.3), whereas an unknown flag would fail the
+//!    even as root, while cmdline stays readable — argv[0] names the program
+//!    and is never parsed as a flag, whereas an unknown flag would fail the
 //!    spawn. Ports are never matched: two installs never share a tag even
 //!    when their port ranges overlap. `NOITE_FLEET_INSTALL` carries the same
 //!    tag in the fleet environment for debuggability, but the sweep never

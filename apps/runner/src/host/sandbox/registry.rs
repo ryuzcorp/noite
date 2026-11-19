@@ -13,9 +13,9 @@ use std::sync::{Mutex, MutexGuard};
 
 #[derive(Default)]
 struct Registry {
-    /// Fleet key → main pid of its celld process.
+    /// Fleet key → main pid of its Cello process.
     pids: HashMap<String, u32>,
-    /// Container name (`celld-…`) → owning fleet key.
+    /// Container name (`cello-` plus 24 hex) → owning fleet key.
     containers: HashMap<String, String>,
     /// Container bridge address → container name.
     addresses: HashMap<Ipv4Addr, String>,
@@ -30,7 +30,7 @@ fn with<T>(f: impl FnOnce(&mut Registry) -> T) -> T {
     f(guard.get_or_insert_with(Registry::default))
 }
 
-/// A fleet's celld process started (supervisor, right after spawn).
+/// A fleet's Cello process started (supervisor, right after spawn).
 pub fn register_fleet(key: &str, pid: u32) {
     with(|r| {
         r.pids.insert(key.to_string(), pid);
@@ -45,7 +45,7 @@ pub fn unregister_fleet(key: &str) {
     });
 }
 
-/// The pid of a fleet's celld process.
+/// The pid of a fleet's Cello process.
 pub fn pid_of_fleet(key: &str) -> Option<u32> {
     with(|r| r.pids.get(key).copied())
 }
@@ -57,7 +57,7 @@ pub fn fleet_pids() -> Vec<(String, u32)> {
 
 /// A fleet created (or inspected) one of its containers; `ip` is its bridge
 /// address once the engine reports one. A name moving to another fleet is
-/// impossible (names hash the celld node), but the latest writer wins.
+/// impossible (names hash the Cello node), but the latest writer wins.
 pub fn record_container(fleet: &str, name: &str, ip: Option<Ipv4Addr>) {
     with(|r| {
         r.containers.insert(name.to_string(), fleet.to_string());
@@ -110,18 +110,18 @@ mod tests {
     #[test]
     fn addresses_resolve_to_the_creating_fleet_until_forgotten() {
         let ip = Ipv4Addr::new(172, 31, 250, 7);
-        record_container("reg-a", "celld-reg-a-1", None);
+        record_container("reg-a", "cello-aaaaaaaaaaaaaaaaaaaaaaaa", None);
         assert_eq!(owner_of_ip(ip), None, "no address yet");
-        record_container("reg-a", "celld-reg-a-1", Some(ip));
+        record_container("reg-a", "cello-aaaaaaaaaaaaaaaaaaaaaaaa", Some(ip));
         assert_eq!(owner_of_ip(ip).as_deref(), Some("reg-a"));
         // The engine reuses a freed address for another fleet's container.
-        forget_container("celld-reg-a-1");
+        forget_container("cello-aaaaaaaaaaaaaaaaaaaaaaaa");
         assert_eq!(owner_of_ip(ip), None);
-        record_container("reg-b", "celld-reg-b-1", Some(ip));
+        record_container("reg-b", "cello-bbbbbbbbbbbbbbbbbbbbbbbb", Some(ip));
         assert_eq!(owner_of_ip(ip).as_deref(), Some("reg-b"));
         assert_eq!(
             forget_fleet_containers("reg-b"),
-            vec!["celld-reg-b-1".to_string()]
+            vec!["cello-bbbbbbbbbbbbbbbbbbbbbbbb".to_string()]
         );
         assert_eq!(owner_of_ip(ip), None);
     }

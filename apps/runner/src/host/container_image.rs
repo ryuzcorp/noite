@@ -478,7 +478,7 @@ pub fn context_digest(src: &Path, request: &Request) -> anyhow::Result<[u8; 32]>
 /// Pull `image` for the nodes' platform, refuse it when it carries `ONBUILD`
 /// triggers (a `FROM` would run them during the build), and return it
 /// pinned by digest. An image that only exists on this engine (another
-/// app's `celld-image:` tag, say) does not pull, and is refused.
+/// app's `cello-image:` tag, say) does not pull, and is refused.
 async fn vet(image: &str, platform: &str) -> anyhow::Result<String> {
     let pulled = docker(
         &["pull", "--quiet", "--platform", platform, image],
@@ -743,8 +743,8 @@ mod tests {
         let triggered = pinned_reference("evil:1", "[\"RUN curl x | sh\"]\t[\"evil@sha256:abc\"]");
         assert!(format!("{:#}", triggered.unwrap_err()).contains("ONBUILD"));
         // An image built on this engine has no registry digest.
-        assert!(pinned_reference("celld-image:abc", "null\t[]").is_err());
-        assert!(pinned_reference("celld-image:abc", "null\tnull").is_err());
+        assert!(pinned_reference("cello-image:abc", "null\t[]").is_err());
+        assert!(pinned_reference("cello-image:abc", "null\tnull").is_err());
     }
 
     #[cfg(unix)]

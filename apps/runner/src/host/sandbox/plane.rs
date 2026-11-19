@@ -478,9 +478,9 @@ mod tests {
         assert!(super::super::engine::validate::valid_network_name(
             super::super::NETWORKS[1].0
         ));
-        assert!(!super::super::engine::validate::valid_network_name("celld"));
+        assert!(!super::super::engine::validate::valid_network_name("Cello"));
         assert!(!super::super::engine::validate::valid_network_name(
-            "celld-internal"
+            "cello0"
         ));
     }
 

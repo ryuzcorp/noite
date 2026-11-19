@@ -533,7 +533,7 @@ fn output_schema(fields: &[OutField]) -> anyhow::Result<Type> {
             builder.with_repetition(Repetition::OPTIONAL).build()?,
         ));
     }
-    Ok(Type::group_type_builder("celld_telemetry")
+    Ok(Type::group_type_builder("cello_telemetry")
         .with_fields(children)
         .build()?)
 }
@@ -1269,11 +1269,10 @@ mod tests {
     }
 
     /// Regenerate the `folded` differential fixture consumed by
-    /// `otel::tests::real_celld_fixtures_match_the_reference_rows`: the union
+    /// `otel::tests::real_cello_fixtures_match_the_reference_rows`: the union
     /// of the two committed real Cello objects per signal, written by
-    /// `fold_files`. The expected rows beside it come from the old tag-3/tag-4
-    /// query over exactly this output (see the fixture's
-    /// `expected.json`). Run:
+    /// `fold_files`. The expected rows beside it are the decoded reference
+    /// rows (see the fixture's `expected.json`). Run:
     /// `cargo test --locked write_folded_fixture -- --ignored`.
     #[test]
     #[ignore = "regenerates the committed folded differential fixture"]
@@ -1307,7 +1306,7 @@ mod tests {
     /// "unsupported telemetry cell type: UByte(1)" and was retried forever,
     /// so no trace hour could ever be compacted.
     #[test]
-    fn folding_real_celld_traces_accepts_the_unsigned_columns() {
+    fn folding_real_cello_traces_accepts_the_unsigned_columns() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/otel");
         let inputs = vec![
             root.join("prod/traces/1794577873683359-c06bd8cf.parquet"),
@@ -1315,7 +1314,7 @@ mod tests {
         ];
         let guard = crate::testutil::TempDir::new("noite-fold-unsigned");
         let out = guard.path().join("folded.parquet");
-        fold_files(&inputs, &out).expect("fold two real celld trace objects");
+        fold_files(&inputs, &out).expect("fold two real Cello trace objects");
         let reader = SerializedFileReader::new(File::open(&out).expect("open folded"))
             .expect("parsed folded");
         // The unsigned annotations survive: Cello's `kind` stays UTINYINT and

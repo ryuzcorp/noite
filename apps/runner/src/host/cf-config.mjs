@@ -43,7 +43,7 @@ if (wrangler.main && path.isAbsolute(wrangler.main)) {
   wrangler.main = path.relative(process.cwd(), wrangler.main);
 }
 
-// celld 0.6 rejects the new `exports` key: created Durable Objects become one
+// Cello 0.2.0 rejects the new `exports` key: created Durable Objects become one
 // classic migration. Deleting, renaming and transferring classes have no
 // cello equivalent.
 if (wrangler.exports) {

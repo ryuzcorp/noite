@@ -52,7 +52,7 @@ fn rows_hour2() -> IngestRows {
         errors: vec![errors::SpanErrorRow {
             slug: "blog".to_string(),
             error: "rejected: TypeError: boom [at f (worker.js:1:1)]".to_string(),
-            name: "celld.fetch".to_string(),
+            name: "cello.fetch".to_string(),
             cell: String::new(),
             trace_id: "t-err".to_string(),
             count: 1,
@@ -77,7 +77,7 @@ fn rows_control_hour() -> IngestRows {
         errors: vec![errors::SpanErrorRow {
             slug: control,
             error: "rejected: TypeError: boom [at handler (worker.js:3:1)]".to_string(),
-            name: "celld.fetch".to_string(),
+            name: "cello.fetch".to_string(),
             cell: String::new(),
             trace_id: "ct-err".to_string(),
             count: 2,
@@ -646,7 +646,7 @@ fn error_rows(trace: &str) -> IngestRows {
         errors: vec![errors::SpanErrorRow {
             slug: "blog".to_string(),
             error: "rejected: TypeError: boom [at f (worker.js:1:1)]".to_string(),
-            name: "celld.fetch".to_string(),
+            name: "cello.fetch".to_string(),
             cell: String::new(),
             trace_id: trace.to_string(),
             count: 1,

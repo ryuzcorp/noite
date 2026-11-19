@@ -37,7 +37,7 @@ pub const VOID_OUTPUT: &str = "dist/ssr/wrangler.json";
 /// (the cello key allowlist). cello also accepts `no_bundle`, but it is
 /// dropped on purpose: the Vite plugin sets it so Wrangler skips esbuild, and
 /// cello would then load split chunks it cannot resolve.
-/// `containers` holds the celld 0.6 container classes Sandbox templates
+/// `containers` holds the 0.6 container classes Sandbox templates
 /// (the agent template) deploy into.
 const CELLO_KEYS: &[&str] = &[
     "$schema",
@@ -61,7 +61,7 @@ const CELLO_KEYS: &[&str] = &[
 
 const WRANGLER_NAMES: &[&str] = &["wrangler.jsonc", "wrangler.json", "wrangler.toml"];
 
-/// The deploy root's `containers[]`, normalized for celld 0.6.3 and with
+/// The deploy root's `containers[]`, normalized for Cello 0.2.0 and with
 /// every Dockerfile it names still to prepare ([`ContainersPlan`]).
 /// `Ok(None)` when the config declares no containers.
 ///
@@ -284,7 +284,7 @@ pub(crate) fn write_fresh(path: &Path, text: &str) -> anyhow::Result<()> {
 }
 
 /// Whether `image` names a Dockerfile in the project rather than an image
-/// reference. Mirrors celld 0.6.3's `is_dockerfile` (`deploy.rs`) exactly:
+/// reference. Mirrors Cello 0.2.0's `dockerfile_path` (`deploy.rs`) exactly:
 /// the joined path exists and is a file, via `symlink_metadata` (which
 /// does not follow symlinks, so a symlink never counts — as in cello).
 /// Shared with the sandbox slice, which absolutizes file-named images when
@@ -720,7 +720,7 @@ mod tests {
         ] {
             assert!(v.get(dropped).is_none(), "{dropped} kept");
         }
-        // celld 0.6 container classes (Sandbox templates) survive the filter.
+        // 0.6 container classes (Sandbox templates) survive the filter.
         assert_eq!(v["containers"][0]["class_name"], "Sandbox");
         // Outside the new root: dropped rather than written with `..`.
         assert!(v["d1_databases"][0].get("migrations_dir").is_none());

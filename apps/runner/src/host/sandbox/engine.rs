@@ -11,7 +11,7 @@
 //!
 //! Two checks bind a socket to its fleet: the socket file is owned by the
 //! fleet user at 0600, and every request's `SO_PEERCRED` pid must be the
-//! fleet's registered celld pid (uids alone don't separate fleets: they
+//! fleet's registered Cello pid (uids alone don't separate fleets: they
 //! share one install-wide fleet user).
 
 pub mod validate;
@@ -36,11 +36,11 @@ use super::registry;
 use super::{ENGINE_SOCKET_DIR, FLEET_LABEL, INSTALL_LABEL};
 use validate::{ContainerOp, Route};
 
-/// The engine socket celld dials when the operator names none (compose
+/// The engine socket Cello dials when the operator names none (compose
 /// mounts the host daemon here).
 const ENGINE_SOCKET_DEFAULT: &str = "/var/run/docker.sock";
 
-/// Cap on any request body the proxy buffers (1 MiB): celld's bodies are
+/// Cap on any request body the proxy buffers (1 MiB): Cello's bodies are
 /// small JSON documents, and a tar must never be buffered here.
 const MAX_BODY: usize = 1024 * 1024;
 
@@ -71,7 +71,7 @@ fn full(bytes: Bytes) -> ProxyBody {
     Full::new(bytes).map_err(|never| match never {}).boxed()
 }
 
-/// A Docker-shaped refusal: celld surfaces `message`, so the reason rides
+/// A Docker-shaped refusal: Cello surfaces `message`, so the reason rides
 /// there after the `noite: ` mark. The connection closes with it: refusals
 /// don't drain the request body (a refused tar is never read), so the
 /// connection cannot serve a further request.
@@ -139,7 +139,7 @@ fn sanitize(key: &str) -> String {
 }
 
 /// The operator's engine socket: `DOCKER_HOST` when it names a `unix://`
-/// socket (mirroring celld's own discovery), else the default path. `None`
+/// socket (mirroring Cello's own discovery), else the default path. `None`
 /// when there is no engine to proxy to — or when the path is not a socket
 /// (compose materializes a directory when the host socket is absent, and a
 /// fleet must never be served that).
@@ -287,7 +287,7 @@ fn peer_pid(stream: &UnixStream) -> Option<u32> {
     }
 }
 
-/// Concurrent connections per fleet socket: celld holds a handful (one per
+/// Concurrent connections per fleet socket: Cello holds a handful (one per
 /// call, plus exec streams and long-polled waits); the cap keeps a flood from
 /// exhausting the runner's tasks and fds.
 /// Connections from any other process share a separate, small pool: they
@@ -340,7 +340,7 @@ async fn handle_request(
     peer: Option<u32>,
 ) -> Result<Response<ProxyBody>, std::convert::Infallible> {
     // The socket is the fleet user's, but the fleet user is install-wide:
-    // only the fleet's own celld pid may ask. Looked up per request so a
+    // only the fleet's own Cello pid may ask. Looked up per request so a
     // pid re-registration lands on live connections too.
     if peer.is_none() || registry::pid_of_fleet(&fleet) != peer {
         return Ok(refuse("unknown fleet process"));
@@ -438,7 +438,7 @@ async fn forward(
                 return refuse("unknown network");
             }
             // The daemon lists every container on the bridge — every app's,
-            // with names and addresses. celld only reads the options, so the
+            // with names and addresses. Cello only reads the options, so the
             // list never leaves the proxy.
             let response = match engine_call(
                 upstream,
@@ -499,7 +499,7 @@ async fn read_body(body: Incoming) -> Result<Bytes, String> {
 }
 
 /// One upstream call over a fresh unix connection: small request, whole or
-/// hijacked response. Enough for every forward (celld itself dials one
+/// hijacked response. Enough for every forward (Cello itself dials one
 /// connection per call).
 async fn engine_call(
     upstream: &Path,
@@ -511,7 +511,7 @@ async fn engine_call(
     let stream = UnixStream::connect(upstream).await?;
     let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(stream)).await?;
     // `with_upgrades`: a plain drive would drop an exec stream's upgrade
-    // instead of fulfilling it (celld's `drive` does the same).
+    // instead of fulfilling it (Cello's `drive` does the same).
     tokio::spawn(async move {
         let _ = conn.with_upgrades().await;
     });
@@ -571,7 +571,7 @@ async fn inspect(upstream: &Path, id: &str) -> anyhow::Result<Option<Value>> {
 }
 
 /// Whether the fleet owns this container. Missing containers answer like
-/// the daemon would (404, which celld handles), foreign ones are refused.
+/// the daemon would (404, which Cello handles), foreign ones are refused.
 /// The upstream inspect is authoritative; the registry only caches.
 async fn owned(upstream: &Path, fleet: &str, id: &str) -> Result<Value, Box<Response<ProxyBody>>> {
     match inspect(upstream, id).await {
@@ -696,7 +696,7 @@ async fn container(
             registry::record_container(fleet, alias, None);
         }
     }
-    // The fence installer runs host-network with `NET_ADMIN`: celld only
+    // The fence installer runs host-network with `NET_ADMIN`: Cello only
     // starts it, waits for it, reads its logs and removes it. An exec into
     // it, or a signal that freezes it before `nft` exits, would be a root
     // shell in the host netns.
@@ -843,7 +843,7 @@ async fn exec_start(
         .is_some_and(|value| value.as_bytes().eq_ignore_ascii_case(b"tcp"));
     let mut req = req;
     // The downstream upgrade latch is taken before the body is read:
-    // answering 101 below resolves it into celld's stream.
+    // answering 101 below resolves it into Cello's stream.
     let downstream = hijacked.then(|| hyper::upgrade::on(&mut req));
     let raw = match read_body(req.into_body()).await {
         Ok(raw) => raw,
@@ -871,7 +871,7 @@ async fn exec_start(
     if !hijacked || response.status() != StatusCode::SWITCHING_PROTOCOLS {
         return forward_response(response);
     }
-    // 101: from here the connection is the process's stdio. Answer celld
+    // 101: from here the connection is the process's stdio. Answer Cello
     // first, then splice the two upgraded streams behind the response.
     let upstream_io = match hyper::upgrade::on(&mut response).await {
         Ok(io) => io,
@@ -995,7 +995,7 @@ mod tests {
         format!("{name}-{}-{n}", std::process::id() % 100000)
     }
 
-    /// One plain call against a fleet socket, like celld's own client: one
+    /// One plain call against a fleet socket, like Cello's own client: one
     /// connection, whole body.
     async fn fleet_call(
         socket: &Path,
@@ -1161,8 +1161,8 @@ mod tests {
         );
         registry::register_fleet(&key, std::process::id());
 
-        // celld's reap list arrives upstream with the fleet label added.
-        let filters = validate::percent_encode(r#"{"label":["celld.node=n1"]}"#);
+        // Cello's reap list arrives upstream with the fleet label added.
+        let filters = validate::percent_encode(r#"{"label":["cello.node=n1"]}"#);
         let (status, body) = fleet_call(
             &socket,
             "GET",
@@ -1179,7 +1179,7 @@ mod tests {
             "{}",
             paths[0]
         );
-        assert!(paths[0].contains("celld%2Enode%3Dn1"), "{}", paths[0]);
+        assert!(paths[0].contains("cello%2Enode%3Dn1"), "{}", paths[0]);
         assert!(paths[0].contains("noite%2Efleet%3D"), "{}", paths[0]);
 
         // A privileged create is refused before any upstream contact: the
@@ -1188,9 +1188,9 @@ mod tests {
         let (status, body) = fleet_call(
             &socket,
             "POST",
-            "/containers/create?name=celld-0123456789abcdef01234567",
+            "/containers/create?name=cello-0123456789abcdef01234567",
             Some(json!({
-                "Image": "celld-image:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "Image": "cello-image:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
                 "HostConfig": {"NetworkMode": "cello", "Privileged": true},
             })),
         )
@@ -1248,7 +1248,7 @@ mod tests {
                             json!({
                                 "Id": "fence1",
                                 "Name": "/fence1",
-                                "Config": {"Labels": {"celld.fence": "1", "noite.fleet": owner}},
+                                "Config": {"Labels": {"cello.fence": "1", "noite.fleet": owner}},
                                 "HostConfig": {"NetworkMode": "host"},
                             })
                         } else {
@@ -1305,7 +1305,7 @@ mod tests {
             vec!["/containers/fence1/json", "/containers/fence1/json"],
             "only the ownership inspects went upstream"
         );
-        // celld's own lifecycle still passes.
+        // Cello's own lifecycle still passes.
         let (status, _) = fleet_call(&socket, "POST", "/containers/fence1/start", None).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(
@@ -1459,7 +1459,7 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(*seen.lock().unwrap(), vec!["/exec/mine/resize?h=24&w=80"]);
 
-        // A bad query, or a body celld never sends, is refused before any
+        // A bad query, or a body Cello never sends, is refused before any
         // further upstream contact.
         let (status, _) = fleet_call(&socket, "POST", "/exec/mine/resize?h=24", None).await;
         assert_eq!(status, StatusCode::FORBIDDEN);
