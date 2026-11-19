@@ -108,10 +108,14 @@ pub async fn apply(
     let versions = match plan(stored, populated > 0, latest, steps) {
         Plan::Legacy { .. } => bail!("{PRE_RESET_REFUSAL}"),
         Plan::TooNew { found } => bail!(
+            // Never wipe advice here: this database is newer good data, not
+            // pre-reset lineage (that is `PRE_RESET_REFUSAL` above). The fix
+            // is the matching newer image, or a pre-upgrade backup —
+            // downgrading across a schema change is not supported.
             "refusing to start: this database was written by a newer Noite release (schema version \
-             {found}; this image only understands up to {latest}) and cannot be upgraded or \
-             downgraded across releases. Back it up if you need it, wipe the data volume and the \
-             bucket prefix (or use an empty bucket), then install fresh."
+             {found}; this image only understands up to {latest}). Install the image matching that \
+             schema version, or restore a backup taken before the upgrade. Downgrading across a \
+             schema change is not supported."
         ),
         Plan::Apply(versions) => versions,
     };
@@ -305,10 +309,14 @@ mod tests {
             .expect_err("refused");
         let text = format!("{err:#}");
         assert!(text.contains("newer Noite release"), "{text}");
+        // Newer good data must never be told to wipe: the fix is the matching
+        // image or a pre-upgrade backup (wipe advice lives only in the
+        // pre-reset refusal). Fails on the old text, which wiped.
         assert!(
-            text.contains("wipe the data volume and the bucket prefix"),
+            !text.contains("wipe the data volume and the bucket prefix"),
             "{text}"
         );
+        assert!(text.contains("Install the image matching"), "{text}");
         assert_eq!(version(&mut conn).await, 201);
     }
 
