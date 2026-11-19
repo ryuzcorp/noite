@@ -8,8 +8,8 @@
 //! has, and sizing from the host on an unbounded container is the same number
 //! anyway.
 //!
-//! Mirrors celld's own detection (`crates/celld/memory.rs`,
-//! `crates/celld/machine.rs`): cgroup v2 `memory.max`, then v1's
+//! Mirrors Cello's own detection (`crates/cello/memory.rs`,
+//! `crates/cello/machine.rs`): cgroup v2 `memory.max`, then v1's
 //! `memory.limit_in_bytes`, then `/proc/meminfo`.
 
 /// The cgroup memory limit that applies to this process, if one is set:

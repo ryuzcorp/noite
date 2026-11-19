@@ -17,7 +17,7 @@
   "errors": [
     {
       "error": "Error: async otelfixmwf1b375 [at fetch (worker.js:21:76) <- at <anonymous>:7173:36 <- at __ctxRun (<anonymous>:4029:12)]",
-      "name": "celld.fetch",
+      "name": "cello.fetch",
       "cell": "",
       "trace": "838e7cd9c211479b91d97e79025a839d",
       "count": 1,
@@ -26,7 +26,7 @@
     },
     {
       "error": "Error: sync otelfixmwf1b375 [at fetch (worker.js:19:11) <- at <anonymous>:7173:36 <- at __ctxRun (<anonymous>:4029:12)]",
-      "name": "celld.fetch",
+      "name": "cello.fetch",
       "cell": "",
       "trace": "5b4ccc84979548c7aa0720aeb958403e",
       "count": 1,
