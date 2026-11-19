@@ -1,7 +1,7 @@
 // Runtime fleet logs.
 //
 // Fleets previously inherited the runner's stdout (Stdio::inherit), so their
-// output was lost. We now capture each celld's stdout+stderr into an
+// output was lost. We now capture each Cello's stdout+stderr into an
 // in-memory ring buffer (per slug) and expose it via /v1/apps/{id}/logs.
 // In-memory and bounded — a runner restart clears the buffer (unlike the
 // persisted metrics watermark), so logs are recent activity only.

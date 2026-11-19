@@ -1700,7 +1700,7 @@ mod tests {
     /// before moving its own objects in. The row is dropped before the wipe
     /// now, so "slug free" no longer implies "prefix empty" — without the
     /// target wipe the renamed app would inherit the deleted tenant's git
-    /// history and celld durability (review finding, 2026-11-12).
+    /// history and Cello durability (review finding, 2026-11-12).
     #[tokio::test]
     async fn rename_onto_a_freed_slug_wipes_its_leftover_prefixes() {
         let store = spawn_object_store().await;

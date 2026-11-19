@@ -1,10 +1,10 @@
 //! R2 bucket browsing: prefix/delimiter listing, download, upload, delete.
 //!
-//! celld serves an `r2_buckets` binding out of the fleet bucket under the
+//! Cello serves an `r2_buckets` binding out of the fleet bucket under the
 //! reserved `r2/<bucket_name>/` prefix: the body is a plain object, the five
 //! content headers are real headers, and the rest of the record travels in
 //! the `celld-r2` user-metadata entry (`docs/services/r2`). Every read and
-//! write here goes through the `celld r2` CLI, which owns both the stored
+//! write here goes through the `cello r2` CLI, which owns both the stored
 //! key form and the record — the runner never encodes a key or touches the
 //! store directly, so a folder listing is one `list --page` call with the
 //! keys already decoded and the content types in-band.
@@ -92,15 +92,15 @@ pub struct R2Raw {
 /// and no `..` segment, no control character, and never a leading `-`. A
 /// trailing `/` is legal — it is the folder marker.
 ///
-/// The leading dash is refused because celld's parser has no `--`
-/// end-of-options terminator (pinned fork, `crates/celld/r2_cli.rs`): a
+/// The leading dash is refused because Cello's parser has no `--`
+/// end-of-options terminator (pinned fork, `crates/cello/r2_cli.rs`): a
 /// dash-led positional either refuses as `unknown option` or — when it
 /// exactly matches a flag — is consumed as that flag, taking the next key
 /// as its value. A `--bucket`/`--endpoint` key would redirect the call
 /// onto another fleet bucket or S3 endpoint with the runner's full store
 /// credentials, so the effect is not confined to the caller's bucket.
 /// R2 itself allows leading dashes, so such keys fail closed with
-/// `invalid key` here until celld learns `--`.
+/// `invalid key` here until Cello learns `--`.
 pub fn r2_key_ok(key: &str) -> bool {
     !key.is_empty()
         && !key.starts_with('-')
@@ -116,12 +116,12 @@ pub fn r2_prefix_ok(prefix: &str) -> bool {
     prefix.is_empty() || r2_key_ok(prefix)
 }
 
-/// An R2 bucket (binding) name bound for celld's first positional, mirroring
-/// celld's own `valid_resource_name` (`crates/celld/deploy.rs`): at most 64
+/// An R2 bucket (binding) name bound for Cello's first positional, mirroring
+/// Cello's own `valid_resource_name` (`crates/cello/deploy.rs`): at most 64
 /// characters, first `_` or ASCII alphanumeric, the rest those plus `-`.
 /// The runner refuses a bad name with `invalid bucket` instead of spawning
-/// celld to refuse it — in particular a leading `-` must never reach the
-/// argv, where celld would read it as an option rather than the bucket.
+/// Cello to refuse it — in particular a leading `-` must never reach the
+/// argv, where Cello would read it as an option rather than the bucket.
 pub fn r2_bucket_ok(bucket: &str) -> bool {
     !bucket.is_empty()
         && bucket.len() <= 64
@@ -151,7 +151,7 @@ fn normalize_prefix(prefix: &str) -> String {
     }
 }
 
-/// Run one `celld` subcommand against the fleet's own bucket.
+/// Run one `cello` subcommand against the fleet's own bucket.
 async fn run_celld(
     cfg: &Config,
     app: &App,
@@ -167,11 +167,11 @@ async fn run_celld(
     exec::run_cmd(&cfg.celld_bin, args, None, &env, timeout).await
 }
 
-/// Run one `celld` subcommand and return its output however it exited. An
+/// Run one `cello` subcommand and return its output however it exited. An
 /// absent key prints its verdict on stdout with exit 1, so the reads —
 /// not the spawn — decide what the status means. `stdin` feeds the child's
 /// input when present (`r2 get` passes an empty one to close the pipe —
-/// `celld r2 get` never reads stdin, so the closed pipe is never observed);
+/// `cello r2 get` never reads stdin, so the closed pipe is never observed);
 /// `None` leaves stdin inherited.
 async fn run_celld_output(
     cfg: &Config,
@@ -189,7 +189,7 @@ async fn run_celld_output(
     exec::run_cmd_output_stdin(&cfg.celld_bin, args, stdin, None, &env, timeout).await
 }
 
-/// The absent-key object `celld r2 head|get --json` prints on stdout with
+/// The absent-key object `cello r2 head|get --json` prints on stdout with
 /// exit 1 (`{"error":"not_found","bucket":...,"key":...}`): match the
 /// error field, never the English stderr.
 fn is_not_found(stdout: &[u8]) -> bool {
@@ -202,7 +202,7 @@ fn is_not_found(stdout: &[u8]) -> bool {
         .is_some_and(|error| error == "not_found")
 }
 
-/// The fleet options every `celld r2` call carries.
+/// The fleet options every `cello r2` call carries.
 fn fleet_args<'a>(app: &'a App, cfg: &'a Config) -> [&'a str; 4] {
     [
         "--bucket",
@@ -212,11 +212,11 @@ fn fleet_args<'a>(app: &'a App, cfg: &'a Config) -> [&'a str; 4] {
     ]
 }
 
-/// One `celld r2 <verb>` argv: the verb, the bucket celld reads as the arg
+/// One `cello r2 <verb>` argv: the verb, the bucket Cello reads as the arg
 /// right after it, then every fleet/option arg, then the user keys last.
-/// The bucket must stay third — celld takes it positionally before its
+/// The bucket must stay third — Cello takes it positionally before its
 /// flag loop, so a flag placed ahead of it reads as the bucket going
-/// missing. celld accepts its flags anywhere and has no `--` terminator,
+/// missing. Cello accepts its flags anywhere and has no `--` terminator,
 /// so keys go last by construction but every one is still validated:
 /// a leading-dash positional parses as an option even in last place.
 fn r2_argv<'a>(
@@ -252,7 +252,7 @@ struct CelldHttp {
     content_type: Option<String>,
 }
 
-/// One object of a `celld r2 list --page` answer: the binding's `list()` row
+/// One object of a `cello r2 list --page` answer: the binding's `list()` row
 /// minus `version`, `checksums` and `storageClass`.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -266,7 +266,7 @@ struct CelldPageObject {
     http_metadata: CelldHttp,
 }
 
-/// One `celld r2 list --page` answer: the files in the folder, the prefixes
+/// One `cello r2 list --page` answer: the files in the folder, the prefixes
 /// the delimiter rolled up, and the in-band cursor that continues a
 /// truncated page (absent when the listing is complete).
 #[derive(Debug, Deserialize)]
@@ -367,7 +367,7 @@ pub async fn r2_list(
     shape_page(app, bucket, &prefix, page)
 }
 
-/// One object record as `celld r2 head --json` reports it: the size (a
+/// One object record as `cello r2 head --json` reports it: the size (a
 /// single-key lookup has no listing) and the real `content-type` header the
 /// record carries.
 struct R2Head {
@@ -468,7 +468,7 @@ pub async fn r2_get(cfg: &Config, app: &App, bucket: &str, key: &str) -> anyhow:
     })
 }
 
-/// Write one object with the full celld record (the five content headers and
+/// Write one object with the full Cello record (the five content headers and
 /// the `celld-r2` metadata), exactly as a Worker's `env.BUCKET.put()` would.
 /// A folder marker is the same call with an empty body and a `/` key.
 pub async fn r2_put(
@@ -498,7 +498,7 @@ pub async fn r2_put(
     Ok(())
 }
 
-/// Delete 1..=100 objects in one `celld r2 delete` call.
+/// Delete 1..=100 objects in one `cello r2 delete` call.
 pub async fn r2_delete_many(
     cfg: &Config,
     app: &App,
@@ -550,7 +550,7 @@ mod tests {
         }
     }
 
-    /// A fake `celld`: appends its argv to `invocations.log`, fails once
+    /// A fake `cello`: appends its argv to `invocations.log`, fails once
     /// when `fail-next` exists (file content to stderr, exit 1), and
     /// otherwise answers `list`/`head` from `<verb>.json` and `get` from
     /// `body.bin`. Fixtures live next to the script so no env injection is
@@ -935,7 +935,7 @@ mod tests {
         assert!(!r2_header_ok(""));
     }
 
-    /// celld's parser has no `--` terminator, so a dash-led key either
+    /// Cello's parser has no `--` terminator, so a dash-led key either
     /// refuses as `unknown option` or — when it exactly matches a flag —
     /// is consumed as that flag with the next key as its value. The
     /// validator must refuse them before they reach the argv.
@@ -949,7 +949,7 @@ mod tests {
     }
 
     /// An option-shaped key must fail closed with `invalid key` without
-    /// spawning celld: `delete` is the variadic verb where a `--bucket`
+    /// spawning Cello: `delete` is the variadic verb where a `--bucket`
     /// key would otherwise redirect the call onto another fleet bucket.
     #[tokio::test]
     async fn option_like_delete_keys_never_spawn() {
@@ -973,7 +973,7 @@ mod tests {
         assert!(fake.invocations().is_empty());
     }
 
-    /// The bucket rides as celld's first positional, so a dash-led bucket
+    /// The bucket rides as Cello's first positional, so a dash-led bucket
     /// must fail closed with `invalid bucket` without spawning — on the
     /// verbs that never validated it at all.
     #[tokio::test]
@@ -997,9 +997,9 @@ mod tests {
         assert_eq!(normalize_prefix("dir/"), "dir/");
     }
 
-    /// The bucket validator mirrors celld's `valid_resource_name`: real
+    /// The bucket validator mirrors Cello's `valid_resource_name`: real
     /// binding names pass, and anything that would parse as an option —
-    /// or that celld would refuse — fails here instead of at the spawn.
+    /// or that Cello would refuse — fails here instead of at the spawn.
     #[test]
     fn buckets_match_celld_resource_names() {
         assert!(r2_bucket_ok("uploads"));
@@ -1014,7 +1014,7 @@ mod tests {
         assert!(r2_bucket_ok(&"x".repeat(64)));
     }
 
-    /// The argv builder keeps the bucket third (celld reads it as the arg
+    /// The argv builder keeps the bucket third (Cello reads it as the arg
     /// right after the verb), fleet/option args next, and user keys last —
     /// and an option-shaped bucket or key is refused, never placed.
     #[test]
@@ -1040,7 +1040,7 @@ mod tests {
                 "b/c.txt",
             ]
         );
-        // The equals-form flag spelling has no meaning to celld's parser,
+        // The equals-form flag spelling has no meaning to Cello's parser,
         // but it still starts with a dash, so it must never reach the argv.
         for keys in [
             vec!["--endpoint=http://127.0.0.1:9"],

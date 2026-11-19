@@ -96,7 +96,7 @@ pub async fn tick(
 /// key. The second map carries each fleet's environment id (`''` for
 /// production and the control fleet).
 ///
-/// Only deployed fleets have telemetry and a running celld — never-deployed
+/// Only deployed fleets have telemetry and a running Cello — never-deployed
 /// apps are excluded so we don't sample CPU for every
 /// created-but-empty slug every cycle. The control fleet is a telemetry
 /// source with no `app` row, on purpose: nothing that iterates apps
@@ -105,7 +105,7 @@ pub async fn tick(
 /// the reserved slug (`host::control::SLUG`) and its Parquet lives under
 /// `control/telemetry/...` (see `plan::telemetry_prefix`). Always present:
 /// the access-log attribution and the error index read the same map, and a
-/// dev image without a control celld simply has nothing to ingest
+/// dev image without a control Cello simply has nothing to ingest
 /// (`ingest_after` sees it as not live).
 fn telemetry_fleets(
     apps: &[App],

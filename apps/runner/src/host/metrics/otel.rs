@@ -1,5 +1,5 @@
 //! The Parquet telemetry read: the two result sets the Errors and Logs
-//! tabs still need, decoded straight from celld's Parquet objects.
+//! tabs still need, decoded straight from Cello's Parquet objects.
 //!
 //! The old ingest was one query unioning four tagged sets. The minute
 //! counters (tag 1) and hourly span stats (tag 2) are gone with their API —
@@ -28,7 +28,7 @@
 //!
 //! - Groups are keyed by `(hour, error)` anyway, so one **event hour** is
 //!   aggregated at a time and finalized as soon as no later object can carry
-//!   a span of that hour. celld partitions objects by *flush* hour
+//!   a span of that hour. Cello partitions objects by *flush* hour
 //!   (`telemetry::object_key`), so an object in directory `H` only holds
 //!   events stamped at or before the flush instant; a flush that straddles
 //!   the boundary lands in `H + 1` with events still stamped in `H`. An event
@@ -292,12 +292,12 @@ fn decode_log_object(
         }
         // The old SQL applied its 5,000-row cap before dropping NULL bodies,
         // so a NULL body consumed a slot; skipping it here is unreachable with
-        // celld output (`body` is required) and is the intended difference.
+        // Cello output (`body` is required) and is the intended difference.
         let Some(body) = text else { continue };
         if ts_us < from_us || ts_us >= until_us {
             continue;
         }
-        // celld 0.6.1+ stores only the message and puts the level in
+        // Cello 0.6.1+ stores only the message and puts the level in
         // `severity_text`; the ring stores the console form, so the level goes
         // back in front — the text `errors::parse_log_error` reads.
         let body = match severity.as_deref() {
@@ -323,7 +323,7 @@ fn decode_log_object(
 
 /// The distinct trace ids of one group, bounded and compact.
 ///
-/// celld writes trace ids as 32 lowercase hex chars, so the common case is
+/// Cello writes trace ids as 32 lowercase hex chars, so the common case is
 /// `[u8; 16]`: the set stores the 16 bytes inline instead of a `String`
 /// (24-byte header + heap allocation + the 32 bytes of text). An id that is
 /// not 32 hex chars goes into `text` unchanged — the old query counted
@@ -819,7 +819,7 @@ fn hour_bucket(us: i64) -> String {
 }
 
 /// The old query's `regexp_replace(error, '^rejected: (Error: rejected: )*',
-/// '')`: celld wraps a rejected handler's error text, and the same failure
+/// '')`: Cello wraps a rejected handler's error text, and the same failure
 /// must land in one group whether it was reported on the cell span or its
 /// parent.
 fn rejected_prefix() -> &'static regex::Regex {
@@ -962,8 +962,8 @@ mod tests {
     }
 
     /// One trace object from `(error, trace_id)` rows; a `None` trace id is a
-    /// NULL, which celld never writes but the old SQL handled. The schema is
-    /// the subset of celld's `celld_span` the failed-span read projects, so
+    /// NULL, which Cello never writes but the old SQL handled. The schema is
+    /// the subset of Cello's `celld_span` the failed-span read projects, so
     /// `project()` sees exactly what a real object carries.
     fn trace_object_rows(start_us: i64, rows: &[(String, Option<String>)]) -> Bytes {
         use parquet::basic::Compression;
@@ -1116,7 +1116,7 @@ mod tests {
     /// `count(DISTINCT trace_id)` and `arg_max(trace_id, …)` ignore NULL, so
     /// a span without a trace id neither counts nor can win the latest-trace
     /// pick. The all-NULL group keeps the old row shape (count 0, empty
-    /// trace). celld never writes a NULL trace id, but the old SQL handled it
+    /// trace). Cello never writes a NULL trace id, but the old SQL handled it
     /// and the reader must not invent a distinct `""`.
     #[test]
     fn null_trace_ids_neither_count_nor_win_arg_max() {
@@ -1293,9 +1293,9 @@ mod tests {
         top.finish()
     }
 
-    /// The permanent differential: real celld objects with the rows the old
+    /// The permanent differential: real Cello objects with the rows the old
     /// tag-3 and tag-4 query produced over exactly those files. Every
-    /// case carries an `expected.json` generated from that query; a celld
+    /// case carries an `expected.json` generated from that query; a Cello
     /// schema bump that breaks the decode fails here before it reaches a
     /// dashboard. `folded` is the compaction output this crate writes
     /// (`compact::fold_files`), so the new writer's union-by-name file is read

@@ -1,6 +1,6 @@
-//! Error tracking from celld telemetry, no SDK required.
+//! Error tracking from Cello telemetry, no SDK required.
 //!
-//! Two signals carry an exception (verified against celld 0.6.0; since
+//! Two signals carry an exception (verified against Cello 0.6.0; since
 //! 0.6.1 the log level is a severity column, and the ingest puts the prefix
 //! back, host/metrics/ingest.rs `ingest_all`):
 //!
@@ -16,7 +16,7 @@
 //!    string is a log, not an error.
 //!
 //! Request context comes from the edge: tenant sites send a `traceparent`
-//! that celld adopts as the span's trace id and log the same `traceID` in
+//! that Cello adopts as the span's trace id and log the same `traceID` in
 //! the access log (host/caddy.rs `TENANT_TRACE`), so an error joins its
 //! method/path/status by trace id (`RequestIndex`).
 //!
@@ -83,7 +83,7 @@ pub struct ParsedError {
     pub context: String,
 }
 
-/// Drop celld's rejection wrappers: `rejected: ` on every failed span and
+/// Drop Cello's rejection wrappers: `rejected: ` on every failed span and
 /// `Error: rejected: ` where a parent span re-wraps a child's failure.
 pub fn strip_rejected(raw: &str) -> &str {
     let mut s = raw.trim();

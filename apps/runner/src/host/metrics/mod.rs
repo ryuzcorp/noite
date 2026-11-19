@@ -1,13 +1,13 @@
 //! App observability.
 //!
-//! Errors and logs come from celld's OpenTelemetry (CELLD_OTEL=1, bucket
+//! Errors and logs come from Cello's OpenTelemetry (CELLO_OTEL=1, bucket
 //! sink): each fleet writes Parquet spans and console lines into its fleet
 //! bucket under `telemetry/{traces,logs}/...`, and the runner decodes them
 //! itself (`otel`) — no collector service and no CLI subprocess.
 //!
-//! CPU time celld executes code: OTel has no metrics signal yet (spans carry
-//! durations), so CPU is sampled from `/proc/<celld-pid>/stat` (+ descendants)
-//! — visible because the runner spawns celld in its own PID namespace.
+//! CPU time Cello executes code: OTel has no metrics signal yet (spans carry
+//! durations), so CPU is sampled from `/proc/<cello-pid>/stat` (+ descendants)
+//! — visible because the runner spawns Cello in its own PID namespace.
 //!
 //! One ingest pass per tick, all live fleets (spec T3.1): the hour
 //! directories of every fleet in the chunk are listed through the S3 client

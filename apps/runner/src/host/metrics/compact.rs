@@ -69,7 +69,7 @@ fn compaction_inputs(keys: &[String], target: &str) -> Option<Vec<String>> {
     }
 }
 
-/// `yyyy/mm/dd/hh` for a timestamp, as celld partitions telemetry.
+/// `yyyy/mm/dd/hh` for a timestamp, as Cello partitions telemetry.
 pub(super) fn hour_dir(us: i64) -> String {
     chrono::DateTime::from_timestamp_micros(us.max(0))
         .map(|t| t.format("%Y/%m/%d/%H").to_string())
@@ -80,7 +80,7 @@ pub(super) fn hour_dir(us: i64) -> String {
 /// per node directory, exactly as the docs prescribe ("Run a compaction job on
 /// a maintenance node... Run the job once an hour, for the hour that just
 /// ended. Do not compact the current hour... Delete the source files after
-/// the copy lands"). celld never compacts its own files and we flush every
+/// the copy lands"). Cello never compacts its own files and we flush every
 /// `otel_flush_ms` (120 objects per hour per signal per node at the 30 s
 /// default), so without this job a fleet's bucket grows to thousands of tiny
 /// files per hour and every ingest listing and decode walks them all.
@@ -269,7 +269,7 @@ impl Drop for FoldWork {
 /// same operation on the Parquet writer, in-process.
 ///
 /// Every input column is preserved (union by name), so an hour that spans a
-/// celld upgrade keeps both shapes. Row order inside the file is not
+/// Cello upgrade keeps both shapes. Row order inside the file is not
 /// significant: every read filters on the event timestamp, never on position.
 ///
 /// When `target` is itself one of the inputs (a re-fold of late arrivals), the
@@ -423,7 +423,7 @@ struct OutField {
     name: String,
     kind: ColumnKind,
     /// The unsigned annotation every input agrees on (`UTINYINT`,
-    /// `USMALLINT`, …). celld's `kind` and `http_status` carry one, and the
+    /// `USMALLINT`, …). Cello's `kind` and `http_status` carry one, and the
     /// old `COPY` preserved it, so a compacted file keeps the same
     /// column types. Dropped when the inputs disagree or an `INT32` widens to
     /// `INT64`.
@@ -614,7 +614,7 @@ fn cell_from(field: &Field) -> anyhow::Result<Cell> {
         Field::Short(value) => Cell::Int(i32::from(*value)),
         Field::Byte(value) => Cell::Int(i32::from(*value)),
         Field::Long(value) => Cell::Long(*value),
-        // celld's `kind` and `http_status` are UTINYINT/USMALLINT: the
+        // Cello's `kind` and `http_status` are UTINYINT/USMALLINT: the
         // record API surfaces them as unsigned fields, and every real trace
         // object carries both. Without these arms an hour with one real
         // trace file could never fold.
@@ -1270,7 +1270,7 @@ mod tests {
 
     /// Regenerate the `folded` differential fixture consumed by
     /// `otel::tests::real_celld_fixtures_match_the_reference_rows`: the union
-    /// of the two committed real celld objects per signal, written by
+    /// of the two committed real Cello objects per signal, written by
     /// `fold_files`. The expected rows beside it come from the old tag-3/tag-4
     /// query over exactly this output (see the fixture's
     /// `expected.json`). Run:
@@ -1301,7 +1301,7 @@ mod tests {
         }
     }
 
-    /// celld writes `kind` as UTINYINT and `http_status` as USMALLINT; the
+    /// Cello writes `kind` as UTINYINT and `http_status` as USMALLINT; the
     /// record API hands those back as `UByte`/`UShort`, which a fold must
     /// accept. Before these arms every real trace hour failed with
     /// "unsupported telemetry cell type: UByte(1)" and was retried forever,
@@ -1318,7 +1318,7 @@ mod tests {
         fold_files(&inputs, &out).expect("fold two real celld trace objects");
         let reader = SerializedFileReader::new(File::open(&out).expect("open folded"))
             .expect("parsed folded");
-        // The unsigned annotations survive: celld's `kind` stays UTINYINT and
+        // The unsigned annotations survive: Cello's `kind` stays UTINYINT and
         // `http_status` stays USMALLINT, so the compacted file's types match
         // its inputs (as the old `COPY` did).
         let schema = reader.metadata().file_metadata().schema_descr();
@@ -1345,7 +1345,7 @@ mod tests {
         }));
     }
 
-    /// Every unsigned width celld (or a foreign writer) can produce folds into
+    /// Every unsigned width Cello (or a foreign writer) can produce folds into
     /// the signed cell the writer stores; a `ULong` past `i64::MAX` fails
     /// instead of silently wrapping.
     #[test]
@@ -1446,7 +1446,7 @@ mod tests {
         assert_eq!(state.done.as_deref(), Some(newer.as_str()));
     }
 
-    /// A UINT_32 column (a foreign or future writer; celld writes only
+    /// A UINT_32 column (a foreign or future writer; Cello writes only
     /// UTINYINT/USMALLINT) must fold: its values do not fit INT32, so the
     /// column widens to INT64 and the INT32 logical annotation is dropped.
     /// Before this the schema said INT32 while `cell_from` produced a `Long`,

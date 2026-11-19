@@ -1,4 +1,4 @@
-//! CPU sampling from `/proc` (UTIME + STIME, subtree-wise) and the celld
+//! CPU sampling from `/proc` (UTIME + STIME, subtree-wise) and the Cello
 //! telemetry environment every node runs with.
 
 use std::collections::HashMap;
@@ -31,7 +31,7 @@ fn proc_children(pid: u32) -> Vec<u32> {
         .unwrap_or_default()
 }
 
-/// celld may run isolates in descendants — sum the process subtree.
+/// Cello may run isolates in descendants — sum the process subtree.
 fn proc_cpu_recursive(pid: u32, depth: u32) -> (u64, u64) {
     let mut total = read_proc_stat(pid).unwrap_or((0, 0));
     if depth == 0 {
@@ -46,7 +46,7 @@ fn proc_cpu_recursive(pid: u32, depth: u32) -> (u64, u64) {
 }
 
 /// CPU samples for the tenant fleets plus the control node. The control
-/// celld is not in the `procs` map (it is a `children::Supervised`, not an
+/// Cello is not in the `procs` map (it is a `children::Supervised`, not an
 /// app), so its pid is handed in by the caller.
 pub(super) fn sample_cpu(procs: &ProcMap, control_pid: u32) -> HashMap<String, (u64, u64)> {
     let mut out = HashMap::new();
