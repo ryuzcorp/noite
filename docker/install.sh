@@ -417,7 +417,7 @@ refuse_prereset_install() {
     stale="${stale:+$stale and }a pre-reset 0.1.0 image pin"
   fi
   [[ -n "$stale" ]] || return 0
-  die "pre-reset install ($stale): this install was written by Noite 0.1.0 (alpha/beta) and cannot be upgraded. Across the 0.2.0 beta reset: reinstall, no upgrade. To start fresh: (1) optionally back up first (https://noite.now/self-hosting/operations#backups); (2) cd $NOITE_DIR && docker compose down -v (multi installs add -f compose.yaml -f compose.multi.yaml); (3) empty the bucket, or point the fresh install at an empty bucket or prefix; (4) re-run this installer."
+  die "pre-reset install ($stale): this install was written by Noite 0.1.0 (alpha/beta) before the 0.2.0 beta reset and cannot be upgraded. Across the 0.2.0 beta reset: reinstall, no upgrade. To start fresh: (1) optionally back up first (https://noite.now/self-hosting/operations#backups); (2) cd $NOITE_DIR && docker compose down -v (multi installs add -f compose.yaml -f compose.multi.yaml); (3) move the old .env aside (the installer refuses a .env with CELLD_* or a 0.1.0 image pin); (4) empty the bucket, or point the fresh install at an empty bucket or prefix; (5) re-run this installer."
 }
 
 # Everything the runner needs to boot on a real domain, with the defaults a

@@ -33,8 +33,10 @@ installer refuses them with the reinstall steps (and `--yes` does not
 bypass the refusal), and the runner refuses to boot their data, instead
 of migrating anything. To start fresh: [make a backup](#backups) first if
 you need anything it holds, `docker compose down -v` (multi installs add
-`-f compose.yaml -f compose.multi.yaml`), empty the bucket or point the
-fresh install at an empty bucket or prefix, re-run the installer, and
+`-f compose.yaml -f compose.multi.yaml`), move the old `.env` aside (the
+installer refuses a `.env` with `CELLD_*` or a `0.1.0` image pin, so
+re-running it against the old file refuses again), empty the bucket or point
+the fresh install at an empty bucket or prefix, re-run the installer, and
 re-create your apps.
 
 Once the first post-reset release ships, upgrades resume on the new

@@ -80,18 +80,25 @@ fi
 # Generation gate (the 0.2.0 beta reset): pre-reset data (Noite <= 0.1.0-beta.6)
 # is refused, never migrated. When /ready is red because the runner refused to
 # start on it, name the reset and the reinstall steps instead of leaving a
-# bare "no answer". The refusal wording is owned by
-# apps/runner/src/schema_version.rs; match it loosely on purpose ("refusing to
-# start" plus "cannot be upgraded"/reset) so a reword there degrades to the
-# plain /ready failure above, never to a false generation verdict.
+# bare "no answer". The refusal marker is the reset-specific
+# "before the 0.2.0 beta reset" shared by the runner
+# (apps/runner/src/schema_version.rs `PRE_RESET_REFUSAL`), the control guard
+# (`apps/noite/src/db/migrations/001_baseline.sql`) and the installer
+# (`docker/install.sh`, `apps/website/public/run.sh`): match it exactly. The
+# generic "refusing to start" + "cannot be upgraded" also matches a database
+# stamped by a *newer* release (`Plan::TooNew`), which must never read as
+# pre-reset — its fix is the matching image, never volume removal.
 if [ "$ready_ok" -eq 0 ]; then
-  reset_logs="$("$ENGINE" logs --tail=200 "$CID" 2>/dev/null || true)"
-  if printf '%s' "$reset_logs" | grep -qi "refusing to start" && printf '%s' "$reset_logs" | grep -qi "cannot be upgraded\|reset\|0\.1\.0-beta"; then
+  reset_logs="$("$ENGINE" logs --tail=200 "$CID" 2>&1 || true)"
+  if printf '%s' "$reset_logs" | grep -qi "before the 0.2.0 beta reset"; then
     echo "FAIL pre-reset data: the runner refused this database/volume set and it cannot be upgraded. Across the 0.2.0 beta reset: reinstall, no upgrade."
     echo "     1. optionally back up first (https://noite.now/self-hosting/operations#backups)"
     echo "     2. down the stack and drop its volumes: docker compose down -v (multi installs add -f compose.yaml -f compose.multi.yaml)"
-    echo "     3. empty the bucket, or point the fresh install at an empty bucket or prefix"
-    echo "     4. re-run the installer for a fresh install"
+    echo "     3. move the old .env aside (the installer refuses a .env with CELLD_* or a 0.1.0 image pin)"
+    echo "     4. empty the bucket, or point the fresh install at an empty bucket or prefix"
+    echo "     5. re-run the installer for a fresh install"
+  elif printf '%s' "$reset_logs" | grep -qi "newer Noite release"; then
+    echo "FAIL newer data: the runner refused a database written by a newer Noite release. Install the image matching that schema version; do not drop volumes or empty the bucket."
   fi
 fi
 # What tenant fleets hold (SPEC, Scoped credentials): `scoped (...)` is the
