@@ -74,10 +74,10 @@ fn env_or(keys: &[&str], default: &str) -> String {
     default.to_string()
 }
 
-/// `S3_ENDPOINT` without userinfo. Every store client here and in celld
+/// `S3_ENDPOINT` without userinfo. Every store client here and in Cello
 /// signs with the access keys (SigV4), so URL credentials never
 /// authenticated anything, but the endpoint travels on: fleet argv and env,
-/// celld CLI env, release-command env, the control Worker. Stripping once
+/// Cello CLI env, release-command env, the control Worker. Stripping once
 /// at load keeps credentials out of all of them; `main` warns when it did.
 /// An unparseable endpoint passes through verbatim so it fails loudly where
 /// it is used instead of as a rewritten URL. Apart from the userinfo the
@@ -241,7 +241,7 @@ fn sleep_after_setting_s(default_s: u64, problems: &mut Vec<String>) -> u64 {
 }
 
 /// A per-fleet local cache's derived cap: a sixteenth of the detected memory,
-/// clamped 64..512 MiB (128 when unreadable). celld's 2 GiB default is sized
+/// clamped 64..512 MiB (128 when unreadable). Cello's 2 GiB default is sized
 /// for one big node; four fleets sharing a 2 GB box are not.
 fn fleet_local_cache_default_mb(total_bytes: Option<u64>) -> u64 {
     let Some(total) = total_bytes else {
@@ -260,11 +260,11 @@ fn control_memory_default_mb(total_bytes: Option<u64>) -> u64 {
     (total / 4 / (1024 * 1024)).clamp(256, 1024)
 }
 
-/// The container-wide celld shed threshold for installs whose fleets share
-/// one cgroup: 75% of the detected memory, clamped 256..8192 MiB, 0 (celld's
+/// The container-wide Cello shed threshold for installs whose fleets share
+/// one cgroup: 75% of the detected memory, clamped 256..8192 MiB, 0 (Cello's
 /// own default) when memory is unreadable. Leaving the last quarter for the
 /// runner, Caddy, RustFS and the deploying app is what keeps the
-/// kernel OOM-killer out of it; over the threshold celld answers 503 instead.
+/// kernel OOM-killer out of it; over the threshold Cello answers 503 instead.
 fn container_shed_default_mb(total_bytes: Option<u64>) -> u64 {
     let Some(total) = total_bytes else {
         return 0;
@@ -1090,24 +1090,24 @@ pub struct Config {
     pub caddy_admin_url: String,
     /// Public base for Git smart-HTTP remotes (no trailing slash).
     pub git_public_base: String,
-    /// Per-account app quota. Every app is its own celld fleet, so this is the
+    /// Per-account app quota. Every app is its own Cello fleet, so this is the
     /// knob that bounds how much of the host one account can claim.
     pub max_apps_per_user: u32,
     /// Preview environments one app may have at once
     /// (`RUNNER_MAX_ENVIRONMENTS_PER_APP`, 5 — ROADMAP). Each environment is
-    /// its own celld process against the container-wide memory budget.
+    /// its own Cello process against the container-wide memory budget.
     pub max_environments_per_app: u32,
     /// Preview environments the whole install may have at once
     /// (`RUNNER_MAX_ENVIRONMENTS`, 25). The per-app cap bounds one busy app;
     /// this bounds the host, which is what keeps a crowd of previews from
     /// shedding production (SPEC, Limits).
     pub max_environments: u32,
-    /// celld's shedding threshold in MiB (`CELLD_MAX_RSS_MB`); 0 leaves
-    /// celld's default. Fleets in their own cgroup leaf measure the leaf
-    /// (`CELLD_MEMORY_SCOPE=self`), so the default is 80% of the fleet's own
+    /// Cello's shedding threshold in MiB (`CELLO_MAX_RSS_MB`); 0 leaves
+    /// Cello's default. Fleets in their own cgroup leaf measure the leaf
+    /// (`CELLO_MEMORY_SCOPE=self`), so the default is 80% of the fleet's own
     /// `memory.max` and an explicit value is a per-fleet-leaf threshold
     /// (SPEC, Tenant isolation). Without a leaf (no cgroup grant) the knob
-    /// keeps its container-wide meaning: celld compares it with the greater
+    /// keeps its container-wide meaning: Cello compares it with the greater
     /// of its own RSS and the container working set.
     pub fleet_max_rss_mb: u32,
     /// Per-fleet memory cap in MiB (`RUNNER_FLEET_MEMORY_MB`, 512): each
@@ -1116,7 +1116,7 @@ pub struct Config {
     /// and the supervisor restarts it — instead of pushing every fleet toward
     /// the shared shed threshold (SPEC, Tenant isolation). An app's
     /// `app_limit.memory_mb` overrides it. The shed threshold measures this
-    /// leaf too (`CELLD_MEMORY_SCOPE=self`), so an unset threshold sheds
+    /// leaf too (`CELLO_MEMORY_SCOPE=self`), so an unset threshold sheds
     /// gracefully at 80% of it before the kernel OOM-kills the fleet.
     pub fleet_memory_mb: u32,
     /// Ceiling for a tenant's per-app memory override in MiB
@@ -1129,19 +1129,19 @@ pub struct Config {
     /// fake; operators leave it alone unless the container mounts cgroupfs
     /// elsewhere.
     pub cgroup_root: std::path::PathBuf,
-    /// celld's own log filter for tenant fleets (`RUNNER_FLEET_LOG`). The
+    /// Cello's own log filter for tenant fleets (`RUNNER_FLEET_LOG`). The
     /// runner's RUST_LOG describes the runner's modules, so inheriting it left
     /// a fleet's runtime logs out of the per-app log view entirely.
     pub fleet_log: String,
     /// Idle seconds after which a fleet's cells hibernate
-    /// (`CELLD_IDLE_EVICT_S`). The docs' default evicts only under memory
+    /// (`CELLO_IDLE_EVICT_S`). The docs' default evicts only under memory
     /// pressure, which keeps idle fleets resident forever.
     pub fleet_idle_evict_s: u32,
-    /// Node lease lifetime for every celld this runner starts, control
-    /// included (`CELLD_TTL_MS`). celld renews at a third of it and halts
+    /// Node lease lifetime for every Cello node this runner starts, control
+    /// included (`CELLO_TTL_MS`). Cello renews at a third of it and halts
     /// (exit 3, "SELF-FENCE") once it passes, so a store or disk stall longer
-    /// than two thirds of it restarts every fleet at once and celld reaps
-    /// each fleet's Sandbox containers on start. celld's 10 s default suits
+    /// than two thirds of it restarts every fleet at once and Cello reaps
+    /// each fleet's Sandbox containers on start. Cello's 10 s default suits
     /// a multi-node fleet that hands cells over fast; Noite runs one node
     /// per app, so there is no peer to hand to, and 60 s rides out the
     /// stalls a small host shows when a container starts. The cost: a fleet
@@ -1149,8 +1149,7 @@ pub struct Config {
     /// long to own its cells again.
     pub fleet_lease_ttl_ms: u64,
     /// Seconds between a fleet's own polls for new deployments
-    /// (`CELLD_DEPLOY_POLL_S`). The runner POSTs /reload after every deploy,
-    /// so this only covers a missed reload — 300 keeps the fleet quiet.
+    /// (`CELLO_DEPLOY_POLL_S`). The runner POSTs /reload after every deploy,
     pub fleet_deploy_poll_s: u64,
     /// Scale to zero: park an app after this many seconds without a request
     /// (`RUNNER_SLEEP_AFTER_MIN` minutes or `RUNNER_SLEEP_AFTER_H` hours;
@@ -1161,14 +1160,14 @@ pub struct Config {
     /// unset: a quarter of the idle threshold, clamped 300..3600 s.
     pub sleep_sweep_s: u64,
     /// Upper bound a woken request waits for the fleet's health gate
-    /// (`RUNNER_WAKE_TIMEOUT_S`, 120: covers celld's ready gate).
+    /// (`RUNNER_WAKE_TIMEOUT_S`, 120: covers Cello's ready gate).
     pub wake_timeout_s: u64,
-    /// Per-fleet on-disk asset cache in MiB (`CELLD_ASSET_CACHE_BYTES`),
-    /// bounding the 512 MiB celld default per idle app.
+    /// Per-fleet on-disk asset cache in MiB (`CELLO_ASSET_CACHE_BYTES`),
+    /// bounding the 512 MiB Cello default per idle app.
     pub fleet_asset_cache_mb: u64,
-    /// Per-fleet celld hibernated-DB/SQLite cache in MiB
-    /// (`CELLD_LOCAL_CACHE_MAX_BYTES`). Derived when unset: a sixteenth of
-    /// the detected memory, clamped 64..512; celld's own default is 2 GiB per
+    /// Per-fleet Cello hibernated-DB/SQLite cache in MiB
+    /// (`CELLO_LOCAL_CACHE_MAX_BYTES`). Derived when unset: a sixteenth of
+    /// the detected memory, clamped 64..512; Cello's own default is 2 GiB per
     /// node, which four nodes on a 2 GB box can never hold.
     pub fleet_local_cache_mb: u64,
     /// Control-fleet memory cap in MiB (`RUNNER_CONTROL_MEMORY_MB`).
@@ -1177,15 +1176,15 @@ pub struct Config {
     /// (fleet #0 used to be the only uncapped resident), else the
     /// container-wide shed threshold.
     pub control_memory_mb: u64,
-    /// Container-wide celld shed threshold in MiB for fleets without their
-    /// own cgroup leaf, applied as `CELLD_MAX_RSS_MB` when the operator has
+    /// Container-wide Cello shed threshold in MiB for fleets without their
+    /// own cgroup leaf, applied as `CELLO_MAX_RSS_MB` when the operator has
     /// not set `RUNNER_FLEET_MAX_RSS_MB`: 75% of the detected memory, clamped
-    /// 256..8192; 0 leaves celld's own default. Internal, no env var.
+    /// 256..8192; 0 leaves Cello's own default. Internal, no env var.
     pub container_shed_mb: u64,
     /// Tenant fleets started per reconcile pass (`RUNNER_FLEET_SPAWN_BATCH`).
     /// Derived when unset: 1 on a box of two cores or fewer, else 2, so a
     /// cold boot spreads its starts across ticks instead of stacking every
-    /// celld at once.
+    /// Cello node at once.
     pub fleet_spawn_batch: u32,
     /// Concurrent tenant deploys (`RUNNER_BUILD_CONCURRENCY`). Derived when
     /// unset: 1 on two cores or fewer, else 2. Install, build and release
@@ -1226,7 +1225,7 @@ pub struct Config {
     /// unknown store once the bucket answers). `Detect` before that.
     pub credentials: Credentials,
     /// Graceful-stop budget in ms (SPEC, Shutdown). Fleets get
-    /// budget - 3000 as CELLD_SHUTDOWN_TOTAL_MS.
+    /// budget - 3000 as CELLO_SHUTDOWN_TOTAL_MS.
     pub stop_budget_ms: u64,
     /// Max worktree bytes before a build is refused (RUNNER_BUILD_MAX_MB).
     pub build_max_mb: u64,
@@ -1253,9 +1252,9 @@ pub struct Config {
     /// seam and a podman escape hatch.
     pub ci_docker_bin: String,
     /// Days of telemetry kept everywhere (RUNNER_TELEMETRY_RETENTION_DAYS):
-    /// celld's bucket prune, the metric table prune and the glob floor.
+    /// Cello's bucket prune, the metric table prune and the glob floor.
     pub telemetry_retention_days: i64,
-    /// celld OTel bucket-flush interval in ms (`CELLD_OTEL_FLUSH_MS`), and the
+    /// Cello OTel bucket-flush interval in ms (`CELLO_OTEL_FLUSH_MS`), and the
     /// ingest tick cadence (spec T3.4). 30 s means ~6x fewer Parquet PUTs and
     /// files than the old 5 s; dashboards lag live traffic by up to ~40 s.
     pub otel_flush_ms: u64,
@@ -1301,8 +1300,8 @@ pub struct Config {
     pub sandbox_disabled: bool,
     /// Pre-activation canary probe path (`RUNNER_DEPLOY_PROBE_PATH`, `/`):
     /// after staging, the deploy asks the staged generation for
-    /// `HEAD <path>` through `celld invoke` before the one activate serves
-    /// it. Empty disables the probe (a celld without `invoke`).
+    /// `HEAD <path>` through `cello invoke` before the one activate serves
+    /// it. Empty disables the probe.
     pub deploy_probe_path: String,
     /// Pre-activation canary probe timeout in seconds
     /// (`RUNNER_DEPLOY_PROBE_TIMEOUT_S`, 30).
@@ -1454,7 +1453,7 @@ impl Config {
                 .unwrap_or_else(|_| "/data/caddy/routes.json".into()),
             caddy_access_log: env::var("CADDY_ACCESS_LOG")
                 .unwrap_or_else(|_| "/data/caddy/access.log".into()),
-            celld_bin: env::var("CELLD_BIN").unwrap_or_else(|_| "celld".into()),
+            celld_bin: env_or(&["CELLO_BIN", "CELLD_BIN"], "cello"),
             fleet_port_min,
             fleet_port_max,
             poll_ms: env_num(
@@ -1514,7 +1513,7 @@ impl Config {
                 &["RUNNER_CGROUP_ROOT"],
                 "/sys/fs/cgroup",
             )),
-            fleet_log: env_or(&["RUNNER_FLEET_LOG"], "error,celld=warn"),
+            fleet_log: env_or(&["RUNNER_FLEET_LOG"], "error,cello=warn"),
             fleet_idle_evict_s: env_num(
                 "RUNNER_FLEET_IDLE_EVICT_S",
                 120,
@@ -1772,13 +1771,13 @@ impl Config {
         if self.telemetry_retention_days < 1 {
             problems.push("RUNNER_TELEMETRY_RETENTION_DAYS must be >= 1".into());
         }
-        // celld's own default is the floor: shorter only self-fences fleets
-        // sooner on a slow store, and 0 would stop every celld from booting.
+        // Cello's own default is the floor: shorter only self-fences fleets
+        // sooner on a slow store, and 0 would stop every Cello node from booting.
         if self.fleet_lease_ttl_ms < 10_000 {
             problems.push("RUNNER_FLEET_LEASE_TTL_MS must be >= 10000".into());
         }
         // The platform default shares the per-app override's floor: below it
-        // celld cannot boot, so a typo'd `1` refuses loudly instead of
+        // a Cello node cannot boot, so a typo'd `1` refuses loudly instead of
         // OOM-looping every fleet. In multi the default is the enforced cap,
         // so 0 there means "no containment at all" and refuses; single keeps
         // 0 as no cap.
@@ -1978,7 +1977,7 @@ impl Config {
             || !self.edge.trusted_proxies.is_empty()
     }
 
-    /// Fleet shutdown bound for one celld node (budget minus drain margin).
+    /// Fleet shutdown bound for one Cello node (budget minus drain margin).
     pub fn fleet_shutdown_ms(&self) -> u64 {
         self.stop_budget_ms.saturating_sub(3000)
     }
@@ -2020,12 +2019,12 @@ impl Config {
         }
     }
 
-    /// celld fleet bucket URI: `s3://{bucket}/fleets/{slug}`.
+    /// Cello fleet bucket URI: `s3://{bucket}/fleets/{slug}`.
     pub fn fleets_uri(&self, slug: &str) -> String {
         format!("s3://{}/fleets/{slug}", self.s3_bucket)
     }
 
-    /// celld bucket URI of one preview environment:
+    /// Cello bucket URI of one preview environment:
     /// `s3://{bucket}/envs/{slug}/{label}` (ROADMAP: a sibling prefix, never
     /// `fleets/{slug}--{label}` — a slug may itself contain `--`).
     pub fn envs_uri(&self, slug: &str, label: &str) -> String {
@@ -2094,7 +2093,7 @@ pub(crate) fn config_for_tests() -> Config {
         work_dir: "/tmp/noite-test".into(),
         caddyfile_path: "/tmp/noite-test-bases".into(),
         routes_path: "/tmp/noite-test-routes.json".into(),
-        celld_bin: "celld".into(),
+        celld_bin: "cello".into(),
         fleet_port_min: 20000,
         fleet_port_max: 29999,
         poll_ms: 5000,
@@ -2103,7 +2102,7 @@ pub(crate) fn config_for_tests() -> Config {
         http_port: 9080,
         https_port: 9443,
         auto_https: false,
-        fleet_log: "error,celld=warn".into(),
+        fleet_log: "error,cello=warn".into(),
         max_apps_per_user: 10,
         max_environments_per_app: 5,
         max_environments: 25,
@@ -2695,8 +2694,7 @@ mod tests {
     }
 
     /// The canary probe path: unset means `/`, an explicit empty disables
-    /// the probe (a celld without `invoke`) — empties must survive, unlike
-    /// every `env_or` knob.
+    /// the probe — empties must survive, unlike every `env_or` knob.
     #[test]
     fn deploy_probe_path_default_override_and_disable() {
         with_env(&[], || {
@@ -2877,7 +2875,7 @@ mod tests {
         assert_eq!(control_memory_default_mb(Some(256 * gb)), 1024);
         assert_eq!(container_shed_default_mb(Some(256 * 1024 * 1024)), 256);
         assert_eq!(container_shed_default_mb(Some(256 * gb)), 8192);
-        // Unreadable memory: no container-wide threshold, celld's default.
+        // Unreadable memory: no container-wide threshold, Cello's default.
         assert_eq!(fleet_local_cache_default_mb(None), 128);
         assert_eq!(control_memory_default_mb(None), 512);
         assert_eq!(container_shed_default_mb(None), 0);

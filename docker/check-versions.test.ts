@@ -371,9 +371,7 @@ describe("onlineProbes", () => {
     expect(hubTagUrl("docker.io/oven/bun:1.4-slim")).toBe(
       "https://hub.docker.com/v2/repositories/oven/bun/tags/1.4-slim"
     );
-    expect(
-      hubTagUrl("ghcr.io/ryuzcorp/celld:0.6.3-ryuzcorp.8")
-    ).toBeUndefined();
+    expect(hubTagUrl("ghcr.io/ryuzcorp/cello:0.1.0")).toBeUndefined();
   });
 
   test("the repository's pins probe every publisher source", () => {

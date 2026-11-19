@@ -1,35 +1,35 @@
-//! Explicit environment for fleet celld processes (SPEC, Tenant isolation).
+//! Explicit environment for fleet Cello processes (SPEC, Tenant isolation).
 //!
 //! Every fleet spawn — tenant fleets in `host::supervisor`, the control
 //! fleet in `host::control` — starts from `env_clear()` plus exactly the
 //! entries built here. The runner's own environment (`RUNNER_TOKEN`, cloud
-//! and store credentials, operator-global `CELLD_*`) never reaches a fleet:
-//! each spawn passes only what celld and the fleet need, so the old
+//! and store credentials, operator-global `CELLO_*`/`CELLD_*`) never reaches
+//! a fleet: each spawn passes only what Cello and the fleet need, so the old
 //! `env_remove` denylists are gone.
 //!
-//! What celld reads (fork `ryuzcorp/v0.6.3`, `docs/README.md` env table and
-//! `crates/celld`): the `CELLD_*` knobs below plus `CELLD_OPERATOR_TOKEN`,
+//! What Cello reads (ryuzcorp/cello 0.1.0, `docs/` env table and
+//! `crates/cello`): the `CELLO_*` knobs below plus `CELLO_OPERATOR_TOKEN`,
 //! the store credentials (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`,
 //! `AWS_REGION`/`AWS_DEFAULT_REGION`, `S3_ENDPOINT`; the SDK-standard
 //! `AWS_ENDPOINT_URL`/`AWS_ENDPOINT` fallback stays unset because the
 //! runner always passes `--endpoint`), `RUST_LOG`, `DOCKER_HOST` (the
-//! fleet's own proxy socket; unset means celld falls back to discovering a
+//! fleet's own proxy socket; unset means Cello falls back to discovering a
 //! daemon socket), `PATH` (the `esbuild`/`docker`/`hostname` lookups),
 //! `HOME` (the Python runtime cache and docker-socket fallbacks) and
 //! `TMPDIR` (the `temp_dir()` default; the hot paths use explicit
-//! `CELLD_*` dirs).
+//! `CELLO_*` dirs).
 //! `NOITE_FLEET_INSTALL` names this install (the store-derived install tag)
-//! for the boot orphan sweep (`host::fleet_orphans`); celld ignores it.
+//! for the boot orphan sweep (`host::fleet_orphans`); Cello ignores it.
 //!
 //! The only runner-env values a fleet inherits are [`INHERITED`]: TLS
 //! trust (`SSL_CERT_FILE`/`SSL_CERT_DIR`, so a BYO store behind a private
 //! CA keeps working) and the operator's proxy settings (`HTTP(S)_PROXY`,
-//! `ALL_PROXY`, `NO_PROXY`, both cases), which celld's store, peer and
+//! `ALL_PROXY`, `NO_PROXY`, both cases), which Cello's store, peer and
 //! control-plane clients honor, as they did when fleets inherited the whole
 //! runner env. Neither is a secret the fleet may not hold, and tenants
 //! cannot set either (`db::env_reserved`). In `multi` the policed
-//! Worker-fetch path bypasses proxies inside celld, so the operator's
-//! proxy never carries tenant Worker traffic there. celld pins its Worker
+//! Worker-fetch path bypasses proxies inside Cello, so the operator's
+//! proxy never carries tenant Worker traffic there. Cello pins its Worker
 //! TLS roots (webpki), so nothing else is passed.
 //!
 //! Tenant vars (`db::tenant_env`, already denylisted by
@@ -48,7 +48,7 @@ pub const FLEET_PATH: &str = "/usr/local/bin:/usr/bin:/bin";
 pub const FLEET_TMPDIR: &str = "/tmp";
 
 /// `DOCKER_HOST` for a fleet with no engine socket: a `unix://` value that
-/// answers nothing, so celld never falls back to probing well-known daemon
+/// answers nothing, so Cello never falls back to probing well-known daemon
 /// paths. Nothing ever listens here — no fleet, sandbox or test binds it.
 pub const DEAD_ENGINE_SOCKET: &str = "unix:///nonexistent/noite-no-engine.sock";
 
@@ -108,7 +108,7 @@ pub fn base_env(home: &str, inherited: &[(String, String)]) -> Vec<(String, Stri
     env
 }
 
-/// Store credentials celld opens its bucket with: explicit values only, so
+/// Store credentials Cello opens its bucket with: explicit values only, so
 /// a fleet never falls back to an ambient credential chain. The endpoint
 /// carries no userinfo: `Config::from_env` strips it once for every
 /// consumer.
@@ -127,23 +127,23 @@ pub fn store_env(
     ]
 }
 
-/// The `CELLD_EGRESS_ALLOW` entry a fleet needs: its object store as
+/// The `CELLO_EGRESS_ALLOW` entry a fleet needs: its object store as
 /// `host:port`, so Worker fetches keep reaching the store (which answers
 /// 401/403 without keys). A hostname entry re-resolves on every check, so
 /// a moved store stays allowed without a respawn. `None` when the endpoint
 /// is not a URL with a host — the fleet then runs with no exception rather
-/// than refusing to boot on an invalid entry (celld rejects a malformed
+/// than refusing to boot on an invalid entry (Cello rejects a malformed
 /// allowlist at startup).
 pub fn egress_allow(s3_endpoint: &str) -> Option<String> {
     let url = reqwest::Url::parse(s3_endpoint).ok()?;
     // `host_str` keeps an IPv6 literal's brackets, which is exactly the
-    // `host:port` spelling celld parses — and it excludes userinfo, so
+    // `host:port` spelling Cello parses — and it excludes userinfo, so
     // credentials in the endpoint cannot leak into the allowlist.
     let host = url.host_str()?;
     let port = url.port_or_known_default()?;
-    // Port 0 is not a dialable exception: celld refuses to boot on it, so
+    // Port 0 is not a dialable exception: Cello refuses to boot on it, so
     // a nonsense endpoint yields no entry instead. A comma would split into
-    // two entries in celld's comma-separated list (`1.2.3.4,x` allows the
+    // two entries in Cello's comma-separated list (`1.2.3.4,x` allows the
     // whole of 1.2.3.4 on any port), so it yields no entry either.
     if port == 0 || host.contains(',') {
         return None;
@@ -188,43 +188,43 @@ pub fn tenant_fleet_env(input: &TenantFleetEnv<'_>) -> Vec<(String, String)> {
         &cfg.s3_endpoint,
     ));
     let mut put = |key: &str, value: String| env.push((key.to_string(), value));
-    put("CELLD_WATCH", input.state_dir.to_string());
-    put("CELLD_DURABILITY", "bucket".to_string());
-    // Inside the runner's stop budget, so celld seals its node log before
+    put("CELLO_WATCH", input.state_dir.to_string());
+    put("CELLO_DURABILITY", "bucket".to_string());
+    // Inside the runner's stop budget, so Cello seals its node log before
     // the runner's own SIGKILL fallback (SPEC, Shutdown).
     put(
-        "CELLD_SHUTDOWN_TOTAL_MS",
+        "CELLO_SHUTDOWN_TOTAL_MS",
         cfg.fleet_shutdown_ms().to_string(),
     );
     // Bounds: idle eviction returns memory when an app goes quiet; the
     // shedding threshold (set below only when configured) is container-wide.
-    // celld's own logs are what an app owner reads when a deploy serves but
+    // Cello's own logs are what an app owner reads when a deploy serves but
     // misbehaves; the runner's own filter must never suppress them.
     put("RUST_LOG", cfg.fleet_log.clone());
-    put("CELLD_IDLE_EVICT_S", cfg.fleet_idle_evict_s.to_string());
+    put("CELLO_IDLE_EVICT_S", cfg.fleet_idle_evict_s.to_string());
     // See `Config::fleet_lease_ttl_ms`: a short store stall must not
     // self-fence every fleet at once.
-    put("CELLD_TTL_MS", cfg.fleet_lease_ttl_ms.to_string());
+    put("CELLO_TTL_MS", cfg.fleet_lease_ttl_ms.to_string());
     // T1.5: the runner POSTs /reload after every deploy path (push,
     // rollback, web commit, rename), so the fleet's own poll only covers a
     // missed reload — every 300 s instead of every 5 s.
-    put("CELLD_DEPLOY_POLL_S", cfg.fleet_deploy_poll_s.to_string());
-    // T1.8: bound the per-fleet on-disk asset cache (celld's 512 MiB
+    put("CELLO_DEPLOY_POLL_S", cfg.fleet_deploy_poll_s.to_string());
+    // T1.8: bound the per-fleet on-disk asset cache (Cello's 512 MiB
     // default, per idle app, is unbounded across fleets).
     put(
-        "CELLD_ASSET_CACHE_BYTES",
+        "CELLO_ASSET_CACHE_BYTES",
         (cfg.fleet_asset_cache_mb * 1024 * 1024).to_string(),
     );
-    // In the fleet's own state dir: celld's default, /tmp/celld/asset-cache,
+    // In the fleet's own state dir: Cello's default, /tmp/cello/asset-cache,
     // is one directory for every node in the container, created 0700 by
     // whichever starts first (the control node, as root), so a fleet serving
     // assets as the fleet uid crash-looped on EACCES, and tenants would share
     // one cache even when it opened.
     put(
-        "CELLD_ASSET_CACHE_DIR",
+        "CELLO_ASSET_CACHE_DIR",
         format!("{}/asset-cache", input.state_dir),
     );
-    put("CELLD_TRUST_FORWARDED_HEADERS", "1".to_string());
+    put("CELLO_TRUST_FORWARDED_HEADERS", "1".to_string());
     put(
         crate::host::credentials::OPERATOR_TOKEN_ENV,
         input.operator_token.to_string(),
@@ -234,21 +234,21 @@ pub fn tenant_fleet_env(input: &TenantFleetEnv<'_>) -> Vec<(String, String)> {
     // exception. `single` keeps no egress policy, as before (its one tenant
     // is trusted).
     if matches!(cfg.tenancy, crate::config::Tenancy::Multi) {
-        put("CELLD_EGRESS", "public".to_string());
+        put("CELLO_EGRESS", "public".to_string());
         if let Some(allow) = egress_allow(&cfg.s3_endpoint) {
-            put("CELLD_EGRESS_ALLOW", allow);
+            put("CELLO_EGRESS_ALLOW", allow);
         }
     }
-    // Fleet telemetry -> Parquet in the fleet bucket (celld OTel, bucket
+    // Fleet telemetry -> Parquet in the fleet bucket (Cello OTel, bucket
     // sink), the documented query path for request counts.
     for (key, value) in crate::host::metrics::otel_env(cfg) {
         put(key, value);
     }
-    // Per-fleet local caches: celld's hibernated-DB cache default is 2 GiB
+    // Per-fleet local caches: Cello's hibernated-DB cache default is 2 GiB
     // per node, sized for one big fleet; four nodes on a 2 GB box can never
     // hold it. The asset cache is bounded the same way.
     put(
-        "CELLD_LOCAL_CACHE_MAX_BYTES",
+        "CELLO_LOCAL_CACHE_MAX_BYTES",
         (cfg.fleet_local_cache_mb * 1024 * 1024).to_string(),
     );
     // With its own leaf the fleet also sheds against it: `self` measures
@@ -256,14 +256,14 @@ pub fn tenant_fleet_env(input: &TenantFleetEnv<'_>) -> Vec<(String, String)> {
     // threshold follows the per-fleet cap. Without a leaf (no cgroup grant)
     // the knob keeps its container-wide meaning, as before.
     if input.has_cgroup_leaf {
-        put("CELLD_MEMORY_SCOPE", "self".to_string());
+        put("CELLO_MEMORY_SCOPE", "self".to_string());
     }
     // The documented knob is `RUNNER_FLEET_MAX_RSS_MB`; a zero value sets
     // nothing instead of a container-wide threshold the operator never
     // configured per fleet. Without a leaf the fleets share the container
     // cgroup, so a derived container-wide threshold is the one graceful
     // shed available: it leaves the last quarter of the box for the runner,
-    // Caddy, RustFS and builds instead of letting celld sit at its
+    // Caddy, RustFS and builds instead of letting Cello sit at its
     // own 80% until the kernel OOM-killer acts.
     let shed_mb: Option<u64> = if cfg.fleet_max_rss_mb > 0 {
         Some(u64::from(cfg.fleet_max_rss_mb))
@@ -273,24 +273,24 @@ pub fn tenant_fleet_env(input: &TenantFleetEnv<'_>) -> Vec<(String, String)> {
         None
     };
     if let Some(mb) = shed_mb {
-        put("CELLD_MAX_RSS_MB", mb.to_string());
+        put("CELLO_MAX_RSS_MB", mb.to_string());
     }
     // Deployment-scoped Workers cache (SPEC, Void platform proxy): every
     // script of the fleet's deployment shares one `caches.default`, like a
     // Cloudflare zone, so the cohosted `noite-void-proxy` deletes the
     // tenant app's ISR L1 entries when `/revalidate` purges KV. Set on
     // every tenant fleet, Void or not: fleets are single-tenant (one app
-    // per fleet, its own celld process with a process-local store), and
+    // per fleet, its own Cello process with a process-local store), and
     // the cohosted scripts hold no cached state of their own — the proxy
     // only ever deletes edge entries, the sandbox controller never
     // touches `caches` — so the tenant app gains no read on runner-owned
     // state and the proxy gains only the delete path `/revalidate`
-    // already authorizes. Older celld ignores the unknown knob.
-    put("CELLD_CACHE_SCOPE", "deployment".to_string());
+    // already authorizes.
+    put("CELLO_CACHE_SCOPE", "deployment".to_string());
     // The fleet reaches the engine only through its own proxy socket.
     // Without one (sandboxing off, or the socket unservable) the spawn sets
     // a dead socket rather than leaving `DOCKER_HOST` unset: an unset
-    // `DOCKER_HOST` makes celld probe well-known daemon paths
+    // `DOCKER_HOST` makes Cello probe well-known daemon paths
     // (`/var/run/docker.sock`, …), while a `unix://` value that answers
     // nothing positively disables the engine.
     match input.engine_socket {
@@ -316,7 +316,7 @@ pub struct ControlFleetEnv<'a> {
     pub install_tag: &'a str,
     pub inherited: &'a [(String, String)],
     /// Whether this spawn runs in its own cgroup leaf (`host::control` creates
-    /// one when the install has cgroups): `CELLD_MEMORY_SCOPE=self` then sheds
+    /// one when the install has cgroups): `CELLO_MEMORY_SCOPE=self` then sheds
     /// against the control fleet's own cap instead of the container root.
     pub has_cgroup_leaf: bool,
 }
@@ -337,11 +337,11 @@ pub fn control_fleet_env(input: &ControlFleetEnv<'_>) -> Vec<(String, String)> {
         &cfg.s3_endpoint,
     ));
     let mut put = |key: &str, value: String| env.push((key.to_string(), value));
-    put("CELLD_TRUST_FORWARDED_HEADERS", "1".to_string());
-    put("CELLD_WATCH", "/data/control".to_string());
-    put("CELLD_READY_FLEET_GATE_MS", "15000".to_string());
-    put("CELLD_DURABILITY", "bucket".to_string());
-    // Verbatim, like a tenant fleet's: an empty token makes celld refuse
+    put("CELLO_TRUST_FORWARDED_HEADERS", "1".to_string());
+    put("CELLO_WATCH", "/data/control".to_string());
+    put("CELLO_READY_FLEET_GATE_MS", "15000".to_string());
+    put("CELLO_DURABILITY", "bucket".to_string());
+    // Verbatim, like a tenant fleet's: an empty token makes Cello refuse
     // to start, while an omitted one would boot the internal listener
     // open. `main` already refuses to supervise without a token; this
     // keeps any other caller fail-closed too.
@@ -350,34 +350,34 @@ pub fn control_fleet_env(input: &ControlFleetEnv<'_>) -> Vec<(String, String)> {
         input.operator_token.to_string(),
     );
     put(
-        "CELLD_SHUTDOWN_TOTAL_MS",
+        "CELLO_SHUTDOWN_TOTAL_MS",
         cfg.fleet_shutdown_ms().to_string(),
     );
     // The same lease as tenant fleets (`Config::fleet_lease_ttl_ms`), and
     // the same log filter: the runner's own filter must never suppress the
     // control node's logs either.
-    put("CELLD_TTL_MS", cfg.fleet_lease_ttl_ms.to_string());
+    put("CELLO_TTL_MS", cfg.fleet_lease_ttl_ms.to_string());
     put("RUST_LOG", cfg.fleet_log.clone());
     // Fleet #0 is a resident like any tenant fleet: bound its asset and
     // local caches, and shed against its own leaf when it has one. Without
     // a leaf, share the container-wide threshold so the control UI answers
     // 503 under pressure instead of the kernel killing the box.
     put(
-        "CELLD_ASSET_CACHE_BYTES",
+        "CELLO_ASSET_CACHE_BYTES",
         (cfg.fleet_asset_cache_mb * 1024 * 1024).to_string(),
     );
     put(
-        "CELLD_ASSET_CACHE_DIR",
+        "CELLO_ASSET_CACHE_DIR",
         "/data/control/asset-cache".to_string(),
     );
     put(
-        "CELLD_LOCAL_CACHE_MAX_BYTES",
+        "CELLO_LOCAL_CACHE_MAX_BYTES",
         (cfg.fleet_local_cache_mb * 1024 * 1024).to_string(),
     );
     if input.has_cgroup_leaf {
-        put("CELLD_MEMORY_SCOPE", "self".to_string());
+        put("CELLO_MEMORY_SCOPE", "self".to_string());
     } else if cfg.container_shed_mb > 0 {
-        put("CELLD_MAX_RSS_MB", cfg.container_shed_mb.to_string());
+        put("CELLO_MAX_RSS_MB", cfg.container_shed_mb.to_string());
     }
     for (key, value) in crate::host::metrics::otel_env(cfg) {
         put(key, value);
@@ -391,22 +391,21 @@ pub fn control_fleet_env(input: &ControlFleetEnv<'_>) -> Vec<(String, String)> {
     env
 }
 
-/// `CELLD_*` names the boot warning leaves alone: the ones the runner
-/// itself reads (`CELLD_BIN`, `CELLD_ADVERTISE`, and `CELLD_VERSION`,
-/// which telemetry reports), and `CELLD_ESBUILD`, which the image sets as a
-/// default nobody needs to act on (fleets and `celld` CLIs find esbuild on
-/// `PATH`). Every other `CELLD_*` in the runner's env reaches no fleet.
+/// `CELLD_*` names the boot warning leaves alone: the legacy spellings the
+/// runner itself still honors (`CELLD_BIN`, `CELLD_ADVERTISE`, and
+/// `CELLD_VERSION`, which telemetry reports). Every other `CELLD_*` in the
+/// runner's env reaches no fleet and is reported as stale.
 const NOT_WARNED_CELLD: &[&str] = &[
     "CELLD_BIN",
     "CELLD_ADVERTISE",
     "CELLD_VERSION",
-    "CELLD_ESBUILD",
 ];
 
-/// The `CELLD_*` names in `keys` that no fleet will see: fleets get only
+/// The stale `CELLD_*` names in `keys` that no fleet will see: fleets get only
 /// the knobs the runner sets (`RUNNER_FLEET_*` and friends), so an
-/// operator-global `CELLD_*` is ignored. `main` warns once at boot with
-/// these names, sorted, rather than ignoring them silently.
+/// operator-global `CELLD_*` is ignored — and Cello refuses to start with
+/// any `CELLD_*` set, so `main` warns once at boot with these names, sorted,
+/// rather than ignoring them silently.
 pub fn ignored_celld_vars(keys: impl Iterator<Item = String>) -> Vec<String> {
     let mut ignored: Vec<String> = keys
         .filter(|key| key.starts_with("CELLD_") && !NOT_WARNED_CELLD.contains(&key.as_str()))
@@ -433,7 +432,7 @@ mod tests {
     use std::collections::{HashMap, HashSet};
 
     /// Platform keys a tenant fleet spawn may set: the base, the store, the
-    /// celld knobs, the token, the conditional knobs, and the inherited
+    /// Cello knobs, the token, the conditional knobs, and the inherited
     /// names. Everything else in a child must be a tenant var the spawn was
     /// explicitly given.
     fn tenant_allowlist() -> HashSet<String> {
@@ -446,28 +445,28 @@ mod tests {
             "AWS_REGION",
             "AWS_EC2_METADATA_DISABLED",
             "S3_ENDPOINT",
-            "CELLD_WATCH",
-            "CELLD_DURABILITY",
-            "CELLD_SHUTDOWN_TOTAL_MS",
+            "CELLO_WATCH",
+            "CELLO_DURABILITY",
+            "CELLO_SHUTDOWN_TOTAL_MS",
             "RUST_LOG",
-            "CELLD_IDLE_EVICT_S",
-            "CELLD_TTL_MS",
-            "CELLD_DEPLOY_POLL_S",
-            "CELLD_ASSET_CACHE_BYTES",
-            "CELLD_ASSET_CACHE_DIR",
-            "CELLD_LOCAL_CACHE_MAX_BYTES",
-            "CELLD_TRUST_FORWARDED_HEADERS",
-            "CELLD_OPERATOR_TOKEN",
-            "CELLD_EGRESS",
-            "CELLD_EGRESS_ALLOW",
-            "CELLD_MEMORY_SCOPE",
-            "CELLD_CACHE_SCOPE",
-            "CELLD_MAX_RSS_MB",
+            "CELLO_IDLE_EVICT_S",
+            "CELLO_TTL_MS",
+            "CELLO_DEPLOY_POLL_S",
+            "CELLO_ASSET_CACHE_BYTES",
+            "CELLO_ASSET_CACHE_DIR",
+            "CELLO_LOCAL_CACHE_MAX_BYTES",
+            "CELLO_TRUST_FORWARDED_HEADERS",
+            "CELLO_OPERATOR_TOKEN",
+            "CELLO_EGRESS",
+            "CELLO_EGRESS_ALLOW",
+            "CELLO_MEMORY_SCOPE",
+            "CELLO_CACHE_SCOPE",
+            "CELLO_MAX_RSS_MB",
             "DOCKER_HOST",
             "NOITE_FLEET_INSTALL",
-            "CELLD_OTEL",
-            "CELLD_OTEL_FLUSH_MS",
-            "CELLD_OTEL_RETENTION",
+            "CELLO_OTEL",
+            "CELLO_OTEL_FLUSH_MS",
+            "CELLO_OTEL_RETENTION",
         ]
         .into_iter()
         .chain(INHERITED.iter().copied())
@@ -668,19 +667,19 @@ mod tests {
         assert_eq!(flat["PATH"], FLEET_PATH, "platform PATH wins");
         assert_eq!(flat["HOME"], "/data/fleets/app", "platform HOME wins");
         assert_eq!(flat["TMPDIR"], FLEET_TMPDIR);
-        assert_eq!(flat["RUST_LOG"], "error,celld=warn", "platform filter wins");
+        assert_eq!(flat["RUST_LOG"], "error,cello=warn", "platform filter wins");
         assert_eq!(flat["AWS_ACCESS_KEY_ID"], "scoped-access");
         assert_eq!(flat["AWS_SECRET_ACCESS_KEY"], "scoped-secret");
-        assert_eq!(flat["CELLD_OPERATOR_TOKEN"], "op-token");
+        assert_eq!(flat["CELLO_OPERATOR_TOKEN"], "op-token");
         assert_eq!(flat["NOITE_FLEET_INSTALL"], "a1b2c3d4");
         assert_eq!(flat["DATABASE_URL"], "postgres://app/db");
         assert_eq!(flat["HTTPS_PROXY"], "http://proxy.op:3128/HTTPS_PROXY");
         assert!(
-            !flat.contains_key("CELLD_EGRESS"),
+            !flat.contains_key("CELLO_EGRESS"),
             "single sets no egress policy"
         );
-        assert!(!flat.contains_key("CELLD_MEMORY_SCOPE"));
-        assert!(!flat.contains_key("CELLD_MAX_RSS_MB"));
+        assert!(!flat.contains_key("CELLO_MEMORY_SCOPE"));
+        assert!(!flat.contains_key("CELLO_MAX_RSS_MB"));
         assert_eq!(
             flat["DOCKER_HOST"], DEAD_ENGINE_SOCKET,
             "no socket means a dead engine, not an unset DOCKER_HOST"
@@ -697,16 +696,16 @@ mod tests {
         let mut cfg = test_cfg(Tenancy::Multi);
         cfg.fleet_max_rss_mb = 512;
         let tenant_env = vec![
-            ("CELLD_EGRESS".to_string(), "off".to_string()),
+            ("CELLO_EGRESS".to_string(), "off".to_string()),
             (
-                "CELLD_EGRESS_ALLOW".to_string(),
+                "CELLO_EGRESS_ALLOW".to_string(),
                 "evil.example:443".to_string(),
             ),
-            ("CELLD_MEMORY_SCOPE".to_string(), "container".to_string()),
-            ("CELLD_CACHE_SCOPE".to_string(), "container".to_string()),
-            ("CELLD_MAX_RSS_MB".to_string(), "1".to_string()),
+            ("CELLO_MEMORY_SCOPE".to_string(), "container".to_string()),
+            ("CELLO_CACHE_SCOPE".to_string(), "container".to_string()),
+            ("CELLO_MAX_RSS_MB".to_string(), "1".to_string()),
             (
-                "CELLD_OPERATOR_TOKEN".to_string(),
+                "CELLO_OPERATOR_TOKEN".to_string(),
                 "tenant-token".to_string(),
             ),
             (
@@ -733,12 +732,12 @@ mod tests {
         input.has_cgroup_leaf = true;
         input.engine_socket = Some("/run/noite/app.sock");
         let flat = flattened(&tenant_fleet_env(&input));
-        assert_eq!(flat["CELLD_EGRESS"], "public");
-        assert_eq!(flat["CELLD_EGRESS_ALLOW"], "rustfs:9000");
-        assert_eq!(flat["CELLD_MEMORY_SCOPE"], "self");
-        assert_eq!(flat["CELLD_CACHE_SCOPE"], "deployment");
-        assert_eq!(flat["CELLD_MAX_RSS_MB"], "512");
-        assert_eq!(flat["CELLD_OPERATOR_TOKEN"], "op-token");
+        assert_eq!(flat["CELLO_EGRESS"], "public");
+        assert_eq!(flat["CELLO_EGRESS_ALLOW"], "rustfs:9000");
+        assert_eq!(flat["CELLO_MEMORY_SCOPE"], "self");
+        assert_eq!(flat["CELLO_CACHE_SCOPE"], "deployment");
+        assert_eq!(flat["CELLO_MAX_RSS_MB"], "512");
+        assert_eq!(flat["CELLO_OPERATOR_TOKEN"], "op-token");
         assert_eq!(
             flat["NOITE_FLEET_INSTALL"], "a1b2c3d4",
             "platform install tag wins"
@@ -751,7 +750,7 @@ mod tests {
     }
 
     /// The token passes verbatim for both fleet kinds — including empty,
-    /// which celld refuses to boot on (fail-closed). Omitting the key
+    /// which Cello refuses to boot on (fail-closed). Omitting the key
     /// instead would boot the node with an open internal listener, which
     /// must never be the fallback.
     #[test]
@@ -771,7 +770,7 @@ mod tests {
         }));
         for flat in [tenant, control] {
             assert_eq!(
-                flat.get("CELLD_OPERATOR_TOKEN").map(String::as_str),
+                flat.get("CELLO_OPERATOR_TOKEN").map(String::as_str),
                 Some(""),
                 "empty stays present-but-empty, never omitted"
             );
@@ -799,15 +798,15 @@ mod tests {
         assert_eq!(flat["AWS_ACCESS_KEY_ID"], "platform-access");
         assert_eq!(flat["AWS_SECRET_ACCESS_KEY"], "platform-secret");
         assert_eq!(flat["S3_ENDPOINT"], "http://rustfs:9000");
-        assert_eq!(flat["RUST_LOG"], "error,celld=warn");
+        assert_eq!(flat["RUST_LOG"], "error,cello=warn");
         assert_eq!(flat["HOME"], "/root");
-        assert_eq!(flat["CELLD_WATCH"], "/data/control");
-        assert_eq!(flat["CELLD_OPERATOR_TOKEN"], "control-op");
+        assert_eq!(flat["CELLO_WATCH"], "/data/control");
+        assert_eq!(flat["CELLO_OPERATOR_TOKEN"], "control-op");
         assert_eq!(flat["NOITE_FLEET_INSTALL"], "a1b2c3d4");
         assert_eq!(flat["no_proxy"], "http://proxy.op:3128/no_proxy");
-        assert!(!flat.contains_key("CELLD_EGRESS"));
-        assert!(!flat.contains_key("CELLD_MEMORY_SCOPE"));
-        assert!(!flat.contains_key("CELLD_CACHE_SCOPE"));
+        assert!(!flat.contains_key("CELLO_EGRESS"));
+        assert!(!flat.contains_key("CELLO_MEMORY_SCOPE"));
+        assert!(!flat.contains_key("CELLO_CACHE_SCOPE"));
         assert_eq!(
             flat["DOCKER_HOST"], DEAD_ENGINE_SOCKET,
             "control declares no container classes"
@@ -841,18 +840,18 @@ mod tests {
             inherited: &inherited,
             has_cgroup_leaf: false,
         }));
-        assert_eq!(no_leaf["CELLD_MAX_RSS_MB"], "1536");
-        assert!(!no_leaf.contains_key("CELLD_MEMORY_SCOPE"));
+        assert_eq!(no_leaf["CELLO_MAX_RSS_MB"], "1536");
+        assert!(!no_leaf.contains_key("CELLO_MEMORY_SCOPE"));
         assert_eq!(
-            no_leaf["CELLD_LOCAL_CACHE_MAX_BYTES"],
+            no_leaf["CELLO_LOCAL_CACHE_MAX_BYTES"],
             (96 * 1024 * 1024).to_string()
         );
         assert_eq!(
-            no_leaf["CELLD_ASSET_CACHE_BYTES"],
+            no_leaf["CELLO_ASSET_CACHE_BYTES"],
             (48 * 1024 * 1024).to_string()
         );
         assert_eq!(
-            no_leaf["CELLD_ASSET_CACHE_DIR"],
+            no_leaf["CELLO_ASSET_CACHE_DIR"],
             "/data/control/asset-cache"
         );
         let leaf = flattened(&control_fleet_env(&ControlFleetEnv {
@@ -862,8 +861,8 @@ mod tests {
             inherited: &inherited,
             has_cgroup_leaf: true,
         }));
-        assert_eq!(leaf["CELLD_MEMORY_SCOPE"], "self");
-        assert!(!leaf.contains_key("CELLD_MAX_RSS_MB"));
+        assert_eq!(leaf["CELLO_MEMORY_SCOPE"], "self");
+        assert!(!leaf.contains_key("CELLO_MAX_RSS_MB"));
     }
 
     /// Without a cgroup leaf a tenant fleet shares the container cgroup, so
@@ -880,8 +879,8 @@ mod tests {
             &tenant_env,
             &inherited,
         )));
-        assert_eq!(flat["CELLD_MAX_RSS_MB"], "1536");
-        assert!(!flat.contains_key("CELLD_MEMORY_SCOPE"));
+        assert_eq!(flat["CELLO_MAX_RSS_MB"], "1536");
+        assert!(!flat.contains_key("CELLO_MEMORY_SCOPE"));
 
         cfg.fleet_max_rss_mb = 1024;
         let flat = flattened(&tenant_fleet_env(&tenant_input(
@@ -889,17 +888,17 @@ mod tests {
             &tenant_env,
             &inherited,
         )));
-        assert_eq!(flat["CELLD_MAX_RSS_MB"], "1024", "operator wins");
+        assert_eq!(flat["CELLO_MAX_RSS_MB"], "1024", "operator wins");
 
         let mut input = tenant_input(&cfg, &tenant_env, &inherited);
         input.has_cgroup_leaf = true;
         let flat = flattened(&tenant_fleet_env(&input));
-        assert_eq!(flat["CELLD_MEMORY_SCOPE"], "self");
+        assert_eq!(flat["CELLO_MEMORY_SCOPE"], "self");
     }
 
-    /// Operator-global `CELLD_*` names are reported (sorted, once) so `main`
-    /// can warn that no fleet sees them; the ones the runner reads itself
-    /// and non-`CELLD_` names are not.
+    /// Stale operator-global `CELLD_*` names are reported (sorted, once) so
+    /// `main` can warn that no fleet sees them; the legacy spellings the
+    /// runner honors itself, non-`CELLD_` names, and every `CELLO_*` are not.
     #[test]
     fn ignored_celld_vars_names_what_no_fleet_sees() {
         let keys = [
@@ -911,13 +910,14 @@ mod tests {
             "CELLD_ADVERTISE",
             "CELLD_MAX_RSS_MB",
             "RUNNER_FLEET_MAX_RSS_MB",
+            "CELLO_BIN",
             "CELLD_TOKIO_THREADS",
         ]
         .into_iter()
         .map(str::to_string);
         assert_eq!(
             ignored_celld_vars(keys),
-            vec!["CELLD_MAX_RSS_MB", "CELLD_TOKIO_THREADS"]
+            vec!["CELLD_ESBUILD", "CELLD_MAX_RSS_MB", "CELLD_TOKIO_THREADS"]
         );
     }
 

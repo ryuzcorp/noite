@@ -212,8 +212,8 @@ const checkImages = (dockerfile: string, failures: string[]): PinnedImage[] => {
       stages.add(stage);
     }
 
-    // The celld fork's pin has its own guard in check-versions.ts.
-    if (ref === `\${CELLD_IMAGE}`) {
+    // Cello's pin has its own guard in check-versions.ts.
+    if (ref === `\${CELLO_IMAGE}`) {
       continue;
     }
 

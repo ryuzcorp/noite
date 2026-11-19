@@ -692,11 +692,15 @@ pub fn spawn_args(cfg: &Config) -> Vec<String> {
 /// on this listener is closed to tenant code by the fleet egress policy
 /// (loopback and private ranges, IPv6 ULA included), not by the bind.
 pub fn control_advertise() -> String {
-    let host = std::env::var("CELLD_ADVERTISE")
+    // `CELLO_ADVERTISE` wins; `CELLD_ADVERTISE` is the pre-0.1.0 spelling an
+    // upgraded install may still carry (Cello itself refuses `CELLD_*`, but
+    // the runner only forwards this value, so honoring the old name cannot
+    // leak a refused variable into a fleet).
+    let host = std::env::var("CELLO_ADVERTISE")
         .ok()
         .filter(|v| !v.trim().is_empty())
         .or_else(|| {
-            std::env::var("RAILWAY_PRIVATE_DOMAIN")
+            std::env::var("CELLD_ADVERTISE")
                 .ok()
                 .filter(|v| !v.trim().is_empty())
         })

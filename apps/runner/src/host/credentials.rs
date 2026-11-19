@@ -948,13 +948,13 @@ pub async fn reconcile_orphans(pool: &sqlx::SqlitePool) -> anyhow::Result<Orphan
 /// fleets key on [`Scope::key`] (`app:<app_id>`, `env:<env_id>`).
 pub const CONTROL_OPERATOR_SCOPE: &str = "control";
 
-/// celld's operator-token variable: set on every fleet node, and sent back
-/// on every runner-to-celld internal call — the Bearer header for HTTP, the
+/// Cello's operator-token variable: set on every fleet node, and sent back
+/// on every runner-to-Cello internal call — the Bearer header for HTTP, the
 /// env for the in-tree CLIs that read it themselves. Probes use the public
 /// health endpoint, which the token does not guard.
-pub const OPERATOR_TOKEN_ENV: &str = "CELLD_OPERATOR_TOKEN";
+pub const OPERATOR_TOKEN_ENV: &str = "CELLO_OPERATOR_TOKEN";
 
-/// Mint a fresh operator token: 32 random bytes, base64url. celld refuses
+/// Mint a fresh operator token: 32 random bytes, base64url. Cello refuses
 /// to boot on an empty value or one with surrounding whitespace, and this
 /// spelling carries neither. Never logged: callers keep it in process env
 /// and request headers only.

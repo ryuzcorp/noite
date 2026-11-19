@@ -431,10 +431,14 @@ pub struct Occurrence<'a> {
     pub environment: String,
 }
 
-/// `celld.cell_fetch` → `cell_fetch`: the handler that failed.
+/// `cello.cell_fetch` → `cell_fetch`: the handler that failed. Buckets
+/// written before the 0.1.0 upgrade still carry the `celld.` prefix, so the
+/// legacy spelling unwraps the same way instead of leaking the prefix into
+/// the Errors tab.
 fn handler_of(span_name: &str) -> String {
     span_name
-        .strip_prefix("celld.")
+        .strip_prefix("cello.")
+        .or_else(|| span_name.strip_prefix("celld."))
         .unwrap_or(span_name)
         .to_string()
 }

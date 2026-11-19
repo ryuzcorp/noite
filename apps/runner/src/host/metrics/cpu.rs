@@ -67,7 +67,7 @@ pub(super) fn sample_cpu(procs: &ProcMap, control_pid: u32) -> HashMap<String, (
     out
 }
 
-/// Telemetry flush interval celld runs with (`CELLD_OTEL_FLUSH_MS`, from
+/// Telemetry flush interval Cello runs with (`CELLO_OTEL_FLUSH_MS`, from
 /// `RUNNER_OTEL_FLUSH_MS`, spec T3.4). 30 s by default: short enough for
 /// minute-bucket pricing, 6x fewer PUTs/files than the old 5 s, and only safe
 /// because the runner also runs the documented compaction job. Dashboards lag
@@ -76,19 +76,19 @@ pub(super) fn otel_flush_ms(cfg: &Config) -> u64 {
     cfg.otel_flush_ms.max(1000)
 }
 
-/// The celld telemetry environment every node runs with — tenant fleets
+/// The Cello telemetry environment every node runs with — tenant fleets
 /// (`host::supervisor::ensure_fleet`) and the control fleet
 /// (`host::control::supervise`) alike, so the bucket sink, the flush the ingest
 /// cadence assumes and the retention the prune uses can never drift between
-/// them. celld writes under `telemetry/` relative to its `--bucket`, so a
+/// them. Cello writes under `telemetry/` relative to its `--bucket`, so a
 /// fleet's files land at `<bucket>/telemetry/...` (see
 /// [`telemetry_prefix`] for what that prefix is per source).
 pub fn otel_env(cfg: &Config) -> [(&'static str, String); 3] {
     [
-        ("CELLD_OTEL", "1".to_string()),
-        ("CELLD_OTEL_FLUSH_MS", cfg.otel_flush_ms.to_string()),
+        ("CELLO_OTEL", "1".to_string()),
+        ("CELLO_OTEL_FLUSH_MS", cfg.otel_flush_ms.to_string()),
         (
-            "CELLD_OTEL_RETENTION",
+            "CELLO_OTEL_RETENTION",
             format!("{}d", cfg.telemetry_retention_days),
         ),
     ]
@@ -100,7 +100,7 @@ mod tests {
 
     #[test]
     fn cpu_sampling_includes_the_control_node_when_it_runs() {
-        // The control celld is not in the procs map; its pid slot is sampled
+        // The control node is not in the procs map; its pid slot is sampled
         // too, so its CPU lands in the same `app_hour` CPU accumulator.
         let procs = crate::host::supervisor::new_procs();
         assert!(
