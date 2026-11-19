@@ -1347,8 +1347,8 @@ mod tests {
         let mut cfg = crate::config::config_for_tests();
         // Hermetic spawn: the binary can never exec, so the released claim
         // fails fast on the spawn-error path instead of parking (or, with
-        // celld installed, leaking) a fleet child.
-        cfg.celld_bin = "/nonexistent/noite-test-no-celld".into();
+        // cello installed, leaking) a fleet child.
+        cfg.cello_bin = "/nonexistent/noite-test-no-cello".into();
         // A temp file, not `:memory:`: the pool holds five connections and
         // every `:memory:` connection is its own empty database, so the
         // spawned reconcile would see none of these rows.
@@ -1529,7 +1529,7 @@ mod tests {
         let mut cfg = crate::config::config_for_tests();
         // Hermetic spawn, as above: the claim fails fast instead of parking
         // (or leaking) a child.
-        cfg.celld_bin = "/nonexistent/noite-test-no-celld".into();
+        cfg.cello_bin = "/nonexistent/noite-test-no-cello".into();
         // Temp file, not `:memory:`: the pool holds five connections and
         // every `:memory:` connection is its own empty database.
         let _temp_db = TempDb {
