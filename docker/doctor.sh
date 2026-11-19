@@ -69,11 +69,30 @@ fi
 echo "ok   noite container running"
 
 ready="$("$ENGINE" exec "$CID" curl -s -m 10 http://127.0.0.1:8080/ready 2>/dev/null || true)"
+ready_ok=0
 if printf '%s' "$ready" | grep -q '"ok":true'; then
   echo "ok   runner /ready (reconcile, bucket, isolation, control, caddy)"
+  ready_ok=1
 else
   echo "FAIL runner /ready: ${ready:-no answer}"
   fail=1
+fi
+# Generation gate (the 0.2.0 beta reset): pre-reset data (Noite <= 0.1.0-beta.6)
+# is refused, never migrated. When /ready is red because the runner refused to
+# start on it, name the reset and the reinstall steps instead of leaving a
+# bare "no answer". The refusal wording is owned by
+# apps/runner/src/schema_version.rs; match it loosely on purpose ("refusing to
+# start" plus "cannot be upgraded"/reset) so a reword there degrades to the
+# plain /ready failure above, never to a false generation verdict.
+if [ "$ready_ok" -eq 0 ]; then
+  reset_logs="$("$ENGINE" logs --tail=200 "$CID" 2>/dev/null || true)"
+  if printf '%s' "$reset_logs" | grep -qi "refusing to start" && printf '%s' "$reset_logs" | grep -qi "cannot be upgraded\|reset\|0\.1\.0-beta"; then
+    echo "FAIL pre-reset data: the runner refused this database/volume set and it cannot be upgraded. Across the 0.2.0 beta reset: reinstall, no upgrade."
+    echo "     1. optionally back up first (https://noite.now/self-hosting/operations#backups)"
+    echo "     2. down the stack and drop its volumes: docker compose down -v (multi installs add -f compose.yaml -f compose.multi.yaml)"
+    echo "     3. empty the bucket, or point the fresh install at an empty bucket or prefix"
+    echo "     4. re-run the installer for a fresh install"
+  fi
 fi
 # What tenant fleets hold (SPEC, Scoped credentials): `scoped (...)` is the
 # goal; `root (...)` is explicit and loud, especially with multi tenancy.
@@ -135,7 +154,8 @@ else
 fi
 # Sandbox containers (SPEC, Tenant isolation): `/ready`'s `sandbox` object
 # (`enabled`/`engine`/`relay`/`subnets`/`detail`). Informational only —
-# this section never fails the check. Absent on runners that predate it.
+# this section never fails the check. Every runner reports the object; when
+# it is absent there is nothing to report.
 sandbox="$(printf '%s' "$ready" | sed -n 's/.*"sandbox":\({[^}]*}\).*/\1/p')"
 if [ -n "$sandbox" ]; then
   sandbox_enabled="$(printf '%s' "$sandbox" | sed -n 's/.*"enabled":\([^,}]*\).*/\1/p')"
