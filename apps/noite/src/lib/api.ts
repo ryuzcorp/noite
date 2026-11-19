@@ -116,9 +116,15 @@ const readJson = async (
 /* oxlint-enable anti-slop/no-unknown-returns */
 
 /** POST `input` as JSON to a JSON-action endpoint and read the value back.
- * Rejects with `ApiError` whose `message` is the user-facing text. */
-// oxlint-disable-next-line anti-slop/no-unknown-parameters -- the JSON-action client boundary: the input shape is the endpoint's contract, serialized here.
-export const api = async <T>(path: string, input: unknown): Promise<T> => {
+ * Rejects with `ApiError` whose `message` is the user-facing text. `signal`
+ * aborts the round trip alongside the client-side bound: whichever fires
+ * first wins, so a superseded load never answers under a stale session. */
+/* oxlint-disable anti-slop/no-unknown-parameters -- the JSON-action client boundary: the input shape is the endpoint's contract, serialized here. */
+export const api = async <T>(
+  path: string,
+  input: unknown,
+  opts?: { signal?: AbortSignal }
+): Promise<T> => {
   let response: Response;
 
   try {
@@ -127,7 +133,10 @@ export const api = async <T>(path: string, input: unknown): Promise<T> => {
       credentials: "same-origin",
       headers: { "content-type": "application/json" },
       method: "POST",
-      signal: AbortSignal.timeout(API_TIMEOUT_MS),
+      signal:
+        opts?.signal === undefined
+          ? AbortSignal.timeout(API_TIMEOUT_MS)
+          : AbortSignal.any([opts.signal, AbortSignal.timeout(API_TIMEOUT_MS)]),
     });
   } catch (error) {
     // Status 0: the request never got an answer, so there is no HTTP status.
@@ -157,3 +166,4 @@ export const api = async <T>(path: string, input: unknown): Promise<T> => {
 
   throw new ApiError(response.status, message, errors);
 };
+/* oxlint-enable anti-slop/no-unknown-parameters */

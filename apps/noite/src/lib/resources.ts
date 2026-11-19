@@ -168,8 +168,25 @@ export const keys = {
   waitlist: "admin:waitlist",
 } as const;
 
+/** A frame that disagrees with the cache invalidates these keys, and the
+ * badge wedges when that one refetch fails: a transient blip (a dropped
+ * connection, a locked database under load) retries in-chain instead of
+ * leaving the old value painted with no recovery. Same budget as the
+ * error-detail fetcher; a lasting failure still surfaces as before. */
+const APP_STATE_RETRY: RetryPolicy = {
+  attempts: 4,
+  baseMs: 1000,
+  capMs: 8000,
+};
+
 export const appDetail = (id: string) =>
-  tracked(keys.appDetail(id), () => api<AppDetail>("/api/apps/get", id));
+  tracked(
+    keys.appDetail(id),
+    withRetry(
+      ({ signal }) => api<AppDetail>("/api/apps/get", id, { signal }),
+      APP_STATE_RETRY
+    )
+  );
 
 /** The Sync from GitHub status: the stored origin, the last synced sha, the
  * current tip and how many Noite commits a sync would overwrite. Read by the
@@ -230,10 +247,18 @@ export const limits = (id: string) =>
 export const envVars = (id: string) =>
   tracked(keys.envVars(id), () => api<EnvVarView[]>("/api/env/listEnv", id));
 
-/** Every preview environment of one app (view-gated server side). */
+/** Every preview environment of one app (view-gated server side). Like the
+ * app row above, invalidated by disagreeing state-stream frames. */
 export const environments = (id: string) =>
-  tracked(keys.environments(id), () =>
-    api<RunnerEnvironment[]>("/api/environments/listEnvironments", id)
+  tracked(
+    keys.environments(id),
+    withRetry(
+      ({ signal }) =>
+        api<RunnerEnvironment[]>("/api/environments/listEnvironments", id, {
+          signal,
+        }),
+      APP_STATE_RETRY
+    )
   );
 
 /** Drop the cached environment rows of one app: a deploy created one, moved
@@ -271,12 +296,16 @@ export const errorDetail = (
   tracked(
     keys.errorDetail(appId, fingerprint, environmentId),
     withRetry(
-      () =>
-        api<RunnerErrorDetail>("/api/errors/errorDetail", {
-          appId,
-          environmentId: environmentId === "" ? undefined : environmentId,
-          fingerprint,
-        }),
+      ({ signal }) =>
+        api<RunnerErrorDetail>(
+          "/api/errors/errorDetail",
+          {
+            appId,
+            environmentId: environmentId === "" ? undefined : environmentId,
+            fingerprint,
+          },
+          { signal }
+        ),
       ERROR_DETAIL_RETRY
     )
   );

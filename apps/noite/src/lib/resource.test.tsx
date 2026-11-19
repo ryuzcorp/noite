@@ -6,6 +6,7 @@ import * as Atom from "effect/reactivity/Atom";
 import { atom, watch } from "ilha";
 import { render } from "ilha/test";
 
+import { ApiError } from "./api";
 import {
   invalidate,
   nextResourceState,
@@ -15,8 +16,8 @@ import {
   tracked,
   withRetry,
 } from "./resource";
-import type { Resource, ResourceState } from "./resource";
-import { errorDetail } from "./resources";
+import type { Resource, ResourceFetcher, ResourceState } from "./resource";
+import { appDetail, environments, errorDetail } from "./resources";
 import type { RunnerErrorDetail } from "./runner";
 import { clearSwrStore, readSwr, writeSwr } from "./swr-store";
 
@@ -175,7 +176,7 @@ let probeKey = "";
 let probeFetch: () => Promise<string[]> = () => Promise.resolve([]);
 
 let probeWrap:
-  | ((fetch: () => Promise<string[]>) => () => Promise<string[]>)
+  | ((fetch: () => Promise<string[]>) => ResourceFetcher<string[]>)
   | undefined;
 
 /** A mounted `tracked` reader reporting its paint and failure as signals. */
@@ -304,6 +305,68 @@ describe("account epoch", () => {
   });
 });
 
+describe("reload generations", () => {
+  test("a superseded reload never overwrites the newer snapshot", async () => {
+    const restoreDom = installDomFixture();
+
+    try {
+      const key = nextKey();
+      const kickGate = Promise.withResolvers<string[]>();
+      const staleGate = Promise.withResolvers<string[]>();
+      const freshGate = Promise.withResolvers<string[]>();
+      let calls = 0;
+      probeKey = key;
+      probeFetch = () => {
+        calls += 1;
+
+        if (calls === 1) {
+          return kickGate.promise;
+        }
+
+        if (calls === 2) {
+          return staleGate.promise;
+        }
+
+        return freshGate.promise;
+      };
+
+      const ui = render(ResourceProbe);
+      await ui.settled();
+      const paintedV0 = nextPainted();
+      kickGate.resolve(["v0"]);
+      expect(await paintedV0).toEqual(["v0"]);
+      expect(readSwr<string[]>(key)).toEqual(["v0"]);
+
+      // Two overlapping reloads, e.g. two disagreeing state-stream frames
+      // while a fetch is still in flight: each starts its own lookup.
+      invalidate(key);
+      await flush();
+      invalidate(key);
+      await flush();
+      expect(calls).toBe(3);
+
+      // The newer fetch lands first: paint and snapshot move together.
+      const paintedV2 = nextPainted();
+      freshGate.resolve(["v2"]);
+      expect(await paintedV2).toEqual(["v2"]);
+      expect(readSwr<string[]>(key)).toEqual(["v2"]);
+
+      // The superseded fetch lands late: its atom update is dropped, and its
+      // snapshot must be dropped too — otherwise the store disagrees with
+      // the paint, and a later frame matching the stale store invalidates
+      // nothing while the badge shows older data.
+      staleGate.resolve(["v1-stale"]);
+      await flush();
+      expect(resourceValue(capturedState())).toEqual(["v2"]);
+      expect(readSwr<string[]>(key)).toEqual(["v2"]);
+      ui.unmount();
+    } finally {
+      resetSignals();
+      restoreDom();
+    }
+  });
+});
+
 describe("auth reset", () => {
   test("a reset blanks the reader to cold instead of painting the old value", async () => {
     const restoreDom = installDomFixture();
@@ -337,6 +400,84 @@ describe("auth reset", () => {
       await settledAgain;
       expect(resourceValue(capturedState())).toEqual(["account-b"]);
       ui.unmount();
+    } finally {
+      resetSignals();
+      restoreDom();
+    }
+  });
+});
+
+describe("unmount race", () => {
+  test("a remount during an aborted load starts a fresh load instead of painting Failed", async () => {
+    const restoreDom = installDomFixture();
+
+    try {
+      const key = nextKey();
+      const gate = Promise.withResolvers<string[]>();
+      let calls = 0;
+
+      const AbortProbe = () => {
+        const res = tracked<string[]>(key, (_key, ctx) => {
+          calls += 1;
+
+          if (calls === 1) {
+            ctx.signal.addEventListener(
+              "abort",
+              () => {
+                gate.reject(new DOMException("aborted load", "AbortError"));
+              },
+              { once: true }
+            );
+
+            return gate.promise;
+          }
+
+          return Promise.resolve(["fresh"]);
+        });
+
+        captured = res;
+        watch(res.value, (value) => {
+          if (value !== undefined) {
+            signalPainted?.(value);
+          }
+        });
+
+        const settled = atom(
+          Atom.readable((get) => get(res.state.atom)._tag !== "Loading")
+        );
+
+        watch(settled, (done) => {
+          if (done) {
+            signalSettled?.();
+          }
+        });
+
+        return <span />;
+      };
+
+      const ui = render(AbortProbe);
+      await ui.settled();
+      await flush();
+      expect(calls).toBe(1);
+      ui.unmount();
+
+      // Remount synchronously: the aborted entry must already be gone, so
+      // this kick starts a fresh lookup instead of joining one that can
+      // only fail.
+      const paintedFresh = nextPainted();
+      const ui2 = render(AbortProbe);
+      await ui2.settled();
+
+      const outcome = await Promise.race([
+        paintedFresh,
+        flush().then(() => "unsettled" as const),
+      ]);
+
+      expect(outcome).toEqual(["fresh"]);
+      expect(calls).toBe(2);
+      expect(resourceError(capturedState())).toBeUndefined();
+      expect(resourceValue(capturedState())).toEqual(["fresh"]);
+      ui2.unmount();
     } finally {
       resetSignals();
       restoreDom();
@@ -518,8 +659,10 @@ describe("tracked mount failures", () => {
 
 /** Hand-fired sleep: delays are recorded, resolvers fire by hand, so no
  * test waits out a real backoff. Module scope: the factory captures
- * nothing, so every test shares one definition. */
+ * nothing, so every test shares one definition. The controller drives the
+ * abort half of the tests by hand, like the sleep. */
 const manualSleep = () => {
+  const controller = new AbortController();
   const delays: number[] = [];
   const queue: (() => void)[] = [];
 
@@ -544,12 +687,12 @@ const manualSleep = () => {
     next();
   };
 
-  return { delays, fire, sleep };
+  return { controller, delays, fire, signal: controller.signal, sleep };
 };
 
 describe("withRetry", () => {
   test("a first-try success fetches once and never sleeps", async () => {
-    const { delays, sleep } = manualSleep();
+    const { delays, signal, sleep } = manualSleep();
     let calls = 0;
 
     const value = await withRetry(
@@ -559,7 +702,7 @@ describe("withRetry", () => {
         return Promise.resolve("ok");
       },
       { attempts: 3, baseMs: 1000, sleep }
-    )();
+    )("retry:first-try", { signal });
 
     expect(value).toBe("ok");
     expect(calls).toBe(1);
@@ -567,7 +710,7 @@ describe("withRetry", () => {
   });
 
   test("transient failures retry with the exact backoff, then resolve", async () => {
-    const { delays, fire, sleep } = manualSleep();
+    const { delays, fire, signal, sleep } = manualSleep();
     let calls = 0;
 
     const done = withRetry(
@@ -579,7 +722,7 @@ describe("withRetry", () => {
           : Promise.resolve("ok");
       },
       { attempts: 3, baseMs: 1000, sleep }
-    )();
+    )("retry:backoff", { signal });
 
     await flush();
     expect(calls).toBe(1);
@@ -594,7 +737,7 @@ describe("withRetry", () => {
   });
 
   test("a lasting failure rejects with the last error after its attempts", async () => {
-    const { delays, fire, sleep } = manualSleep();
+    const { delays, fire, signal, sleep } = manualSleep();
     let calls = 0;
 
     const done = withRetry(
@@ -604,7 +747,7 @@ describe("withRetry", () => {
         return Promise.reject(new Error(`boom-${calls}`));
       },
       { attempts: 2, baseMs: 1000, sleep }
-    )();
+    )("retry:lasting", { signal });
 
     await flush();
     expect(calls).toBe(1);
@@ -627,7 +770,7 @@ describe("withRetry", () => {
           : Promise.resolve("ok");
       },
       { attempts: 4, baseMs: 1000, capMs: 1500, sleep: capped.sleep }
-    )();
+    )("retry:capped", { signal: capped.signal });
 
     await flush();
     capped.fire();
@@ -648,7 +791,7 @@ describe("withRetry", () => {
         return Promise.resolve("once");
       },
       { attempts: 0, baseMs: 1000, sleep: single.sleep }
-    )();
+    )("retry:single", { signal: single.signal });
 
     await expect(singleDone).resolves.toBe("once");
     expect(singleCalls).toBe(1);
@@ -698,6 +841,111 @@ describe("withRetry", () => {
       resetSignals();
       restoreDom();
     }
+  });
+
+  test("a permanent refusal never retries", async () => {
+    const { signal } = manualSleep();
+    let calls = 0;
+
+    const done = withRetry(
+      () => {
+        calls += 1;
+
+        return Promise.reject(new ApiError(403, "forbidden", null));
+      },
+      { attempts: 4, baseMs: 1000, sleep: () => Promise.resolve() }
+    )("retry:permanent", { signal });
+
+    await expect(done).rejects.toThrow("forbidden");
+    await flush();
+    expect(calls).toBe(1);
+  });
+
+  test("a rate limit retries with the same backoff as a transport blip", async () => {
+    const { delays, fire, signal, sleep } = manualSleep();
+    let calls = 0;
+
+    const done = withRetry(
+      () => {
+        calls += 1;
+
+        return calls === 1
+          ? Promise.reject(new ApiError(429, "slow down", null))
+          : Promise.resolve("ok");
+      },
+      { attempts: 3, baseMs: 1000, sleep }
+    )("retry:transient-status", { signal });
+
+    await flush();
+    expect(calls).toBe(1);
+    expect(delays).toEqual([1000]);
+    fire();
+    await expect(done).resolves.toBe("ok");
+    expect(calls).toBe(2);
+  });
+
+  test("aborting during the backoff makes no further call", async () => {
+    const { controller, delays, fire, signal, sleep } = manualSleep();
+    let calls = 0;
+
+    const done = withRetry(
+      () => {
+        calls += 1;
+
+        return Promise.reject(new Error("down"));
+      },
+      { attempts: 4, baseMs: 1000, sleep }
+    )("retry:abort", { signal });
+
+    await flush();
+    expect(calls).toBe(1);
+    expect(delays).toEqual([1000]);
+    controller.abort();
+    // Belt and braces: even a fired backoff must not refetch after an abort.
+    // The race below settles without waiting out a real backoff either way,
+    // so the test fails instead of hanging when the abort loses.
+    fire();
+
+    const outcome = await Promise.race([
+      done.then(() => "resolved" as const).catch(() => "rejected" as const),
+      flush().then(() => "unsettled" as const),
+    ]);
+
+    expect(outcome).toBe("rejected");
+    // Settled above, so awaiting the rejection directly cannot hang: it pins
+    // the abort (not the attempt's error) as the cause.
+    await expect(done).rejects.toThrow("retry aborted");
+    await flush();
+    expect(calls).toBe(1);
+  });
+
+  test("an aborted load that surfaces as ApiError(0) makes no further attempt", async () => {
+    const { controller, delays, signal, sleep } = manualSleep();
+    let calls = 0;
+    controller.abort();
+
+    const done = withRetry(
+      () => {
+        calls += 1;
+
+        return Promise.reject(
+          new ApiError(0, "the server didn't answer", null)
+        );
+      },
+      { attempts: 4, baseMs: 1000, sleep }
+    )("retry:aborted-zero", { signal });
+
+    const outcome = await Promise.race([
+      done.then(() => "resolved" as const).catch(() => "rejected" as const),
+      flush().then(() => "unsettled" as const),
+    ]);
+
+    // The shape is transient, but the signal says the load is dead: the
+    // attempt must not even sleep.
+    expect(outcome).toBe("rejected");
+    await expect(done).rejects.toThrow("the server didn't answer");
+    expect(calls).toBe(1);
+    expect(delays).toEqual([]);
   });
 });
 
@@ -785,6 +1033,165 @@ describe("errorDetail recovery", () => {
 
         expect(resourceValue(capturedDetail.state())).toEqual(body);
         expect(resourceError(capturedDetail.state())).toBeUndefined();
+      } finally {
+        ui.unmount();
+      }
+    } finally {
+      globalThis.fetch = realFetch;
+      resetSignals();
+      restoreDom();
+    }
+  });
+});
+
+describe("app state recovery", () => {
+  test("the real app row fetcher retries a failed first read", async () => {
+    const restoreDom = installDomFixture();
+    const realFetch = globalThis.fetch;
+
+    try {
+      const id = `app-retry-row-${Date.now()}`;
+
+      const body = {
+        app: { desiredState: "running", id, status: "running" },
+        myRole: "admin",
+      };
+
+      let calls = 0;
+
+      // SAFETY: the test only needs the (url, init) call shape, like the
+      // fetch doubles in http/recovery and routes/envelope.
+      globalThis.fetch = ((
+        _url: string | URL | Request,
+        _init?: RequestInit
+      ) => {
+        calls += 1;
+
+        if (calls === 1) {
+          return Promise.resolve(
+            Response.json({ error: "away" }, { status: 500 })
+          );
+        }
+
+        return Promise.resolve(Response.json(body, { status: 200 }));
+        // oxlint-disable-next-line anti-slop/no-chained-type-assertions -- test double for the global fetch, matching the repo's established stubs.
+      }) as unknown as typeof fetch;
+
+      let capturedDetail:
+        | Resource<{ app: unknown; myRole: string }>
+        | undefined;
+
+      const AppRowProbe = () => {
+        const res = appDetail(id);
+        capturedDetail = res as unknown as Resource<{
+          app: unknown;
+          myRole: string;
+        }>;
+
+        const settled = atom(
+          Atom.readable((get) => get(res.state.atom)._tag !== "Loading")
+        );
+
+        watch(settled, (done) => {
+          if (done) {
+            signalSettled?.();
+          }
+        });
+
+        return <span />;
+      };
+
+      const done = nextSettled();
+      const ui = render(AppRowProbe);
+
+      try {
+        await ui.settled();
+        // The first read fails; the bounded backoff below is the product's
+        // own (1 s), awaited here as the resource settling — a real signal,
+        // not a sleep.
+        await done;
+        await ui.settled();
+        expect(calls).toBe(2);
+
+        if (capturedDetail === undefined) {
+          throw new Error("the probe captured no app row resource");
+        }
+
+        expect(resourceValue(capturedDetail.state())).toEqual(body);
+        expect(resourceError(capturedDetail.state())).toBeUndefined();
+      } finally {
+        ui.unmount();
+      }
+    } finally {
+      globalThis.fetch = realFetch;
+      resetSignals();
+      restoreDom();
+    }
+  });
+
+  test("the real environments fetcher retries a failed first read", async () => {
+    const restoreDom = installDomFixture();
+    const realFetch = globalThis.fetch;
+
+    try {
+      const id = `app-retry-env-${Date.now()}`;
+      const body = [{ appId: id, id: "env-retry", status: "running" }];
+      let calls = 0;
+
+      // SAFETY: the test only needs the (url, init) call shape, like the
+      // fetch doubles in http/recovery and routes/envelope.
+      globalThis.fetch = ((
+        _url: string | URL | Request,
+        _init?: RequestInit
+      ) => {
+        calls += 1;
+
+        if (calls === 1) {
+          return Promise.resolve(
+            Response.json({ error: "away" }, { status: 500 })
+          );
+        }
+
+        return Promise.resolve(Response.json(body, { status: 200 }));
+        // oxlint-disable-next-line anti-slop/no-chained-type-assertions -- test double for the global fetch, matching the repo's established stubs.
+      }) as unknown as typeof fetch;
+
+      let capturedList: Resource<{ appId: string; id: string }[]> | undefined;
+
+      const EnvListProbe = () => {
+        const res = environments(id);
+        capturedList = res as unknown as Resource<
+          { appId: string; id: string }[]
+        >;
+
+        const settled = atom(
+          Atom.readable((get) => get(res.state.atom)._tag !== "Loading")
+        );
+
+        watch(settled, (done) => {
+          if (done) {
+            signalSettled?.();
+          }
+        });
+
+        return <span />;
+      };
+
+      const done = nextSettled();
+      const ui = render(EnvListProbe);
+
+      try {
+        await ui.settled();
+        await done;
+        await ui.settled();
+        expect(calls).toBe(2);
+
+        if (capturedList === undefined) {
+          throw new Error("the probe captured no environments resource");
+        }
+
+        expect(resourceValue(capturedList.state())).toEqual(body);
+        expect(resourceError(capturedList.state())).toBeUndefined();
       } finally {
         ui.unmount();
       }
