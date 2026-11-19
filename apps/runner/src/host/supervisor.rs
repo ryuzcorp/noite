@@ -279,6 +279,51 @@ pub(crate) fn test_gate_remove(key: &str) {
         .remove(key);
 }
 
+/// Deterministic barrier for the stop-concurrency test: park a fleet's stop
+/// once it owns the key (entry removed) but before the SIGTERM drain, instead
+/// of timing a shutdown window. Keyed by fleet key; tests use unique keys
+/// and remove their gate.
+#[cfg(test)]
+pub(crate) struct StopGate {
+    /// `stop_fleet` signals here, then waits for release before draining.
+    pub entered: tokio::sync::Notify,
+    pub release: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+static STOP_GATES: LazyLock<std::sync::Mutex<HashMap<String, std::sync::Arc<StopGate>>>> =
+    LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
+#[cfg(test)]
+pub(crate) fn stop_gate_register(key: &str) -> std::sync::Arc<StopGate> {
+    let gate = std::sync::Arc::new(StopGate {
+        entered: tokio::sync::Notify::new(),
+        release: tokio::sync::Notify::new(),
+    });
+    STOP_GATES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(key.to_string(), gate.clone());
+    gate
+}
+
+#[cfg(test)]
+fn stop_gate_for(key: &str) -> Option<std::sync::Arc<StopGate>> {
+    STOP_GATES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(key)
+        .cloned()
+}
+
+#[cfg(test)]
+pub(crate) fn stop_gate_remove(key: &str) {
+    STOP_GATES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(key);
+}
+
 /// One fleet's supervised lifecycle. See the module docs on
 /// [`FleetState::on`] for the transition table; every state change goes
 /// through that one function, so a caller never has to combine "child exists",
@@ -871,6 +916,15 @@ pub async fn stop_fleet(procs: &ProcMap, slug: &str, grace: StopGrace) {
             None => (None, 0),
         }
     };
+    // Test barrier only: park the stop once it owns the key but before the
+    // drain, so the concurrency test parks a stop mid-drain without timing a
+    // SIGTERM window. The entry is already gone, which is exactly the state a
+    // real drain runs in.
+    #[cfg(test)]
+    if let Some(gate) = stop_gate_for(slug) {
+        gate.entered.notify_one();
+        gate.release.notified().await;
+    }
     let Some(child) = child else {
         // No process — but a proxy may still be served (a spawn that never
         // completed, a crash the tick hasn't reaped), and the fleet's cgroup
@@ -1128,6 +1182,19 @@ pub async fn stop_environment_fleets(procs: &ProcMap, slug: &str, grace: StopGra
     for key in keys {
         stop_fleet(procs, &key, grace).await;
     }
+}
+
+/// Stop many fleets at once, apps and previews together. One fleet's SIGTERM
+/// drain (up to 15 s grace plus the kill fallback) holds no lock, but
+/// awaiting the stops one by one still serializes the caller behind N slow
+/// drains: a start for an unrelated fleet waits behind stops it has nothing
+/// to do with (head-of-line). The future resolves only once every drain
+/// finished, so a caller that spawns afterwards never starts a fleet while
+/// its own previous process is still draining — and each key is stopped at
+/// most once per call (callers pass one row per key), so there is no double
+/// stop or start.
+pub async fn stop_fleets(procs: &ProcMap, keys: &[String], grace: StopGrace) {
+    futures::future::join_all(keys.iter().map(|key| stop_fleet(procs, key, grace))).await;
 }
 
 /// One celld fleet to (re)spawn: identity, bucket, ports, state dir, env.
@@ -2546,6 +2613,55 @@ mod tests {
             hold_until(&procs, key).await.is_none(),
             "and so is the crash hold"
         );
+    }
+
+    /// One fleet's SIGTERM drain must not delay stopping unrelated fleets.
+    /// Two gated stops park mid-drain; both must be entered before either is
+    /// released. A serial loop parks the first and never reaches the second,
+    /// so the second `entered` wait misses its deadline instead of passing.
+    /// No wall-clock sleep synchronizes this: the gates are `Notify` signals
+    /// and the timeout is only the failure detector.
+    #[tokio::test]
+    async fn stopping_many_fleets_does_not_serialize_their_drains() {
+        let procs = new_procs();
+        let gate_a = stop_gate_register("hol-stop-a");
+        let gate_b = stop_gate_register("hol-stop-b");
+        // Waiters first: a `notify_one` before `notified()` is lost.
+        let entered_a = gate_a.entered.notified();
+        let entered_b = gate_b.entered.notified();
+        let finishing = tokio::spawn({
+            let procs = procs.clone();
+            async move {
+                stop_fleets(
+                    &procs,
+                    &["hol-stop-a".to_string(), "hol-stop-b".to_string()],
+                    StopGrace::NORMAL,
+                )
+                .await;
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(10), async {
+            entered_a.await;
+            entered_b.await;
+        })
+        .await
+        .expect("both stops start without waiting for either drain");
+        gate_a.release.notify_one();
+        gate_b.release.notify_one();
+        tokio::time::timeout(Duration::from_secs(10), finishing)
+            .await
+            .expect("the stops finish once released")
+            .expect("the stop task joins");
+        assert!(
+            !has_process(&procs, "hol-stop-a").await,
+            "the first entry is gone"
+        );
+        assert!(
+            !has_process(&procs, "hol-stop-b").await,
+            "and so is the second"
+        );
+        stop_gate_remove("hol-stop-a");
+        stop_gate_remove("hol-stop-b");
     }
 
     /// A probe is claimed once: the state machine itself is the dedup that the
