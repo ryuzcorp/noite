@@ -3,7 +3,7 @@ title: Environment variables
 description: Every runner env var with its default, effect, and owner.
 ---
 
-Defaults below are what `docker/compose.yaml` applies when the var is unset. The runner refuses dev secrets off a `localhost` base. A set-but-malformed numeric value refuses the boot instead of falling back: the runner exits naming each bad var, its value and the expected form — unset (or empty) still means the default. Pre-0.1.0 `CELLD_*` spellings are not read anymore: the runner refuses to boot with any of them set, naming the `CELLO_*` spelling (the installer rewrites them on upgrade).
+Defaults below are what `docker/compose.yaml` applies when the var is unset. The runner refuses dev secrets off a `localhost` base. A set-but-malformed numeric value refuses the boot instead of falling back: the runner exits naming each bad var, its value and the expected form — unset (or empty) still means the default. `CELLD_*` spellings are not read: the installer refuses a `.env` carrying any of them (pre-reset installs reinstall instead of upgrading; see [Across the 0.2.0 beta reset](/self-hosting/operations#across-the-020-beta-reset-reinstall-no-upgrade)), and the runner refuses to boot with any of them set.
 
 Ownership: **runner-owned** (read by the runner) vs **worker-passthrough** (handed to the control UI worker untouched).
 
