@@ -29,7 +29,7 @@
 //! - **Tenant processes** (release scripts run tenant code with the key in
 //!   their env): scoped keys; root keys only with `NOITE_TENANCY=single`.
 //!   See [`tenant_process_credentials`].
-//! - **Fleets** (celld holds the key in its own process; Worker code cannot
+//! - **Fleets** (cello holds the key in its own process; Worker code cannot
 //!   read the process env): the scope's own key, else root in `root` mode.
 //!   See [`fleet_credentials`].
 //!
@@ -598,7 +598,7 @@ fn unresolved() -> anyhow::Error {
     )
 }
 
-/// Keys for a tenant fleet's celld: the scope's own key, or the root keys
+/// Keys for a tenant fleet's cello: the scope's own key, or the root keys
 /// when the install runs the `root` provider.
 pub async fn fleet_credentials(
     pool: &sqlx::SqlitePool,
@@ -969,8 +969,8 @@ pub fn mint_operator_token() -> String {
 }
 
 /// Tokens this process ensured, by scope key: fleet spawn populates it (it
-/// holds the pool), and the runner-to-celld callers that run without one —
-/// the reload POST, the DO probe, the celld CLI env — read from it. A miss
+/// holds the pool), and the runner-to-cello callers that run without one —
+/// the reload POST, the DO probe, the cello CLI env — read from it. A miss
 /// means this runner never spawned the fleet, so no live node of ours can
 /// expect the token; those callers then proceed without it and fail safe (a
 /// 401 reads as unreachable, exactly as a dead fleet does).
@@ -1034,7 +1034,7 @@ fn operator_token_aad(scope_key: &str) -> String {
     format!("op:{scope_key}")
 }
 
-/// This fleet's celld operator token, minting and storing it on first use:
+/// This fleet's cello operator token, minting and storing it on first use:
 /// 32 random bytes per scope, AES-256-GCM under the RUNNER_TOKEN KEK with
 /// the namespaced scope as associated data — the same envelope as [`ensure`],
 /// so the bucket snapshot is not a token dump and a row copied onto another
@@ -1087,7 +1087,7 @@ async fn ensure_operator_token_row(
     // insert: the scope is the primary key, and two rows cannot share it.
     db::remove_operator_token_row(pool, scope_key).await?;
     db::insert_operator_token(pool, scope_key, app_id, &nonce, &ciphertext).await?;
-    tracing::info!(scope = %scope_key, "minted celld operator token");
+    tracing::info!(scope = %scope_key, "minted cello operator token");
     Ok(token)
 }
 

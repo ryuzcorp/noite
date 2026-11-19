@@ -58,7 +58,7 @@ const CPU_PERIOD_US: u64 = 100_000;
 const BUILD_IO_WEIGHT: u64 = 10;
 
 /// Cap on a fleet's tasks (processes and threads — the pids controller
-/// counts both). Generous on purpose: celld runs isolates in-process and a
+/// counts both). Generous on purpose: cello runs isolates in-process and a
 /// busy node holds hundreds of threads; the binding constraint is memory.
 pub const FLEET_PIDS_MAX: u64 = 4096;
 
@@ -933,7 +933,7 @@ fn set_swap_cap(dir: &Path, swap_mb: u64) -> anyhow::Result<bool> {
 }
 
 /// Move a fleet process into its cgroup; its children inherit it, so the
-/// whole fleet — celld and its workers — is contained together.
+/// whole fleet — cello and its workers — is contained together.
 pub fn enter_cgroup(dir: &Path, pid: u32) -> anyhow::Result<()> {
     write_file(dir, "cgroup.procs", &pid.to_string())
 }

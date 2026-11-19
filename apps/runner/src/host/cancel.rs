@@ -10,7 +10,7 @@
 //!
 //! The token reaches the exec helpers through a task-local: `deploy_app` runs
 //! the pipeline inside [`with`], so everything the pipeline spawns — including
-//! the celld and migrate helpers that never see a `Progress` — races the same
+//! the cello and migrate helpers that never see a `Progress` — races the same
 //! token without a parameter threaded through every signature.
 
 use std::collections::HashMap;

@@ -2,7 +2,7 @@
 //! before/after from the same harness, so all recurring work is counted here.
 //!
 //! What is tracked:
-//! - subprocess spawns by program (`aws`, `git`, `celld`, `bun`),
+//! - subprocess spawns by program (`aws`, `git`, `cello`, `bun`),
 //! - S3 operations by verb, with bytes up and down,
 //! - snapshot uploads with bytes,
 //! - live SSE loops by kind (gauge, not cumulative),

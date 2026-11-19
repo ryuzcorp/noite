@@ -1,5 +1,5 @@
 // Convert a tenant's `cloudflare.config.ts` (the `cf` CLI config) into the
-// `wrangler.json` celld deploys. Embedded in the runner (`deploy.rs`) and run
+// `wrangler.json` cello deploys. Embedded in the runner (`deploy.rs`) and run
 // as `node --input-type=module -e <this> <config>` inside the build sandbox,
 // with the worktree as cwd: `@cloudflare/config` resolves from the tenant's
 // own node_modules (a dependency of `cf`), so the schema matches the `cf`
@@ -37,7 +37,7 @@ if (!result.success) {
 
 const wrangler = cfConfig.convertToWranglerConfig(result.data);
 
-// The loader anchors `cf-worker` entrypoints as absolute paths; celld
+// The loader anchors `cf-worker` entrypoints as absolute paths; cello
 // bundles from the config's directory.
 if (wrangler.main && path.isAbsolute(wrangler.main)) {
   wrangler.main = path.relative(process.cwd(), wrangler.main);
@@ -45,7 +45,7 @@ if (wrangler.main && path.isAbsolute(wrangler.main)) {
 
 // celld 0.6 rejects the new `exports` key: created Durable Objects become one
 // classic migration. Deleting, renaming and transferring classes have no
-// celld equivalent.
+// cello equivalent.
 if (wrangler.exports) {
   const sqlite = [];
   const kv = [];
@@ -89,7 +89,7 @@ for (const db of wrangler.d1_databases ?? []) {
 }
 
 // `bindings.secret()` declares a required secret; Noite injects app env vars
-// (Settings → Environment) instead, and celld rejects the key.
+// (Settings → Environment) instead, and cello rejects the key.
 delete wrangler.secrets;
 
 writeFileSync("wrangler.json", `${JSON.stringify(wrangler, null, 2)}\n`);

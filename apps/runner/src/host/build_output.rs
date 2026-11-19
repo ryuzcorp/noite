@@ -1,19 +1,19 @@
-//! The config `celld deploy` takes after a build (SPEC, Deploy pipeline):
+//! The config `cello deploy` takes after a build (SPEC, Deploy pipeline):
 //! what the build produced, not the pushed source config.
 //!
 //! 1. Void's own `dist/ssr/wrangler.json` (`void` on Vite, assets in
 //!    `dist/client/`). It outranks a `dist/wrangler.json` beside it: a build
-//!    may derive that file from Void's for a celld deploy (the app
+//!    may derive that file from Void's for a cello deploy (the app
 //!    templates do), and the derivation copies only the keys its author
 //!    knew, so reading it as the deploy config would drop Void's sandbox
 //!    `containers` and classify the app as non-Void (no migrations,
 //!    identity vars or sandbox controller).
-//! 2. `dist/wrangler.json`, a celld-ready config the build wrote (on Vite or
+//! 2. `dist/wrangler.json`, a cello-ready config the build wrote (on Vite or
 //!    Rsbuild alike, with no Void output).
 //! 3. Wrangler's deploy redirect, `.wrangler/deploy/config.json`, which
 //!    `@cloudflare/vite-plugin` writes beside `dist/<worker>/wrangler.json`.
 //!
-//! celld refuses 2 and 3 as they are (Wrangler-only keys, an assets
+//! cello refuses 2 and 3 as they are (Wrangler-only keys, an assets
 //! directory at `../client`, `.assetsignore`), so each is rewritten into a
 //! `wrangler.json` at the nearest directory holding both the Worker and its
 //! assets.
@@ -33,10 +33,10 @@ pub const DEPLOY_REDIRECT: &str = ".wrangler/deploy/config.json";
 /// root.
 pub const VOID_OUTPUT: &str = "dist/ssr/wrangler.json";
 
-/// Top-level keys `celld deploy` 0.6 accepts; any other key fails the deploy
-/// (the celld key allowlist). celld also accepts `no_bundle`, but it is
+/// Top-level keys `cello deploy` 0.6 accepts; any other key fails the deploy
+/// (the cello key allowlist). cello also accepts `no_bundle`, but it is
 /// dropped on purpose: the Vite plugin sets it so Wrangler skips esbuild, and
-/// celld would then load split chunks it cannot resolve.
+/// cello would then load split chunks it cannot resolve.
 /// `containers` holds the celld 0.6 container classes Sandbox templates
 /// (the agent template) deploy into.
 const CELLD_KEYS: &[&str] = &[
@@ -67,14 +67,14 @@ const WRANGLER_NAMES: &[&str] = &["wrangler.jsonc", "wrangler.json", "wrangler.t
 ///
 /// Normalized: Void and Cloudflare's Sandbox SDK 1.0 shape
 /// (`scheduling_policy: "durable_object"`, `images.default.{dockerfile,
-/// build_context}` or `images.default.image`), which celld does not model,
-/// becomes celld's single `image`. Refused, each a deploy-log error: a
-/// `runtime` key (the OCI runtime is operator-owned; celld lets a class
+/// build_context}` or `images.default.image`), which cello does not model,
+/// becomes cello's single `image`. Refused, each a deploy-log error: a
+/// `runtime` key (the OCI runtime is operator-owned; cello lets a class
 /// override the node default), another scheduling policy, a malformed
 /// `images`, and any entry at all when `NOITE_SANDBOX` disabled Sandbox
 /// containers for the install. A Dockerfile is not refused here: it is
 /// built only after [`crate::host::container_image`] checked that it runs
-/// nothing. Anything else malformed is celld's to reject: it validates
+/// nothing. Anything else malformed is cello's to reject: it validates
 /// before it pulls, so a pass here never starts work a refusal would have
 /// stopped.
 pub fn plan_containers(
@@ -110,7 +110,7 @@ pub fn plan_containers(
             continue;
         };
         if entry.contains_key("runtime") {
-            bail!("containers[{index}].runtime is refused: the OCI runtime is operator-owned (celld lets a class override the node default); remove the key and the class runs under the install's runtime");
+            bail!("containers[{index}].runtime is refused: the OCI runtime is operator-owned (cello lets a class override the node default); remove the key and the class runs under the install's runtime");
         }
         if let Some(policy) = entry.remove("scheduling_policy") {
             if policy.as_str() != Some("durable_object") {
@@ -169,7 +169,7 @@ pub fn plan_containers(
                 _ => bail!("containers[{index}].images.default needs exactly one of `image` or `dockerfile` (+ optional `build_context`)"),
             }
         }
-        // celld builds any `image` naming a file (its `is_dockerfile`), so
+        // cello builds any `image` naming a file (its `is_dockerfile`), so
         // every such entry is prepared, whichever key it came from.
         let built = dockerfiles.last().is_some_and(|(at, _)| *at == index);
         if let (false, Some(image)) = (built, entry.get("image").and_then(Value::as_str)) {
@@ -199,7 +199,7 @@ pub fn plan_containers(
 }
 
 /// Containers entries one deploy may build from a Dockerfile: each one is
-/// pulled, vetted and built before celld starts.
+/// pulled, vetted and built before cello starts.
 const MAX_DOCKERFILE_ENTRIES: usize = 4;
 
 /// The deploy root's containers, normalized ([`plan_containers`]): set each
@@ -215,7 +215,7 @@ pub struct ContainersPlan {
 
 impl ContainersPlan {
     /// Point `containers[index].image` at the prepared Dockerfile, relative
-    /// to the deploy root as celld resolves it.
+    /// to the deploy root as cello resolves it.
     pub fn set_dockerfile(&mut self, index: usize, dockerfile: &Path) {
         let root = self.config.parent().unwrap_or(Path::new("."));
         let image = relative_up(root, dockerfile);
@@ -225,7 +225,7 @@ impl ContainersPlan {
     /// Point `containers[index].image` at the prepared Dockerfile by
     /// absolute path: for a config planned in a staging dir but deployed
     /// from elsewhere (the sandbox controller's cohosted project), where a
-    /// path relative to the staging dir would dangle. celld joins the
+    /// path relative to the staging dir would dangle. cello joins the
     /// project dir onto the value, and joining an absolute path is the
     /// path itself, so the build reads the pinned file with the vetted
     /// context as its build context.
@@ -286,7 +286,7 @@ pub(crate) fn write_fresh(path: &Path, text: &str) -> anyhow::Result<()> {
 /// Whether `image` names a Dockerfile in the project rather than an image
 /// reference. Mirrors celld 0.6.3's `is_dockerfile` (`deploy.rs`) exactly:
 /// the joined path exists and is a file, via `symlink_metadata` (which
-/// does not follow symlinks, so a symlink never counts — as in celld).
+/// does not follow symlinks, so a symlink never counts — as in cello).
 /// Shared with the sandbox slice, which absolutizes file-named images when
 /// it moves the managed entry out of the app config.
 pub(crate) fn is_dockerfile(root: &Path, image: &str) -> bool {
@@ -315,8 +315,8 @@ fn relative_up(from: &Path, path: &Path) -> String {
 }
 
 /// Where a built tree deploys from, what the deploy log should call it, and
-/// the `secrets.required` names the rewrite dropped (celld refuses the key):
-/// the deploy fails before `celld deploy` unless every one has a setting.
+/// the `secrets.required` names the rewrite dropped (cello refuses the key):
+/// the deploy fails before `cello deploy` unless every one has a setting.
 /// `void` marks Void's own build output (`dist/ssr/wrangler.json`): the one
 /// gate for every runner-owned Void injection (identity vars, provisioned
 /// secrets, `ISR_CACHE`), so anything else deploys exactly as before.
@@ -344,7 +344,7 @@ pub fn built_deploy_root(src_dir: &Path) -> anyhow::Result<Option<BuiltRoot>> {
         // it as root, and a link in it or in a parent would aim both
         // outside the worktree.
         let void_config = inside(&src, &void_config).context(VOID_OUTPUT)?;
-        let (dir, required_secrets) = celld_config_from(&src, &void_config)?;
+        let (dir, required_secrets) = cello_config_from(&src, &void_config)?;
         return Ok(Some(BuiltRoot {
             note: format!(
                 "{} (from {VOID_OUTPUT}, Void)",
@@ -369,7 +369,7 @@ pub fn built_deploy_root(src_dir: &Path) -> anyhow::Result<Option<BuiltRoot>> {
         return Ok(None);
     }
     let config = redirected_config(&src, &redirect)?;
-    let (dir, required_secrets) = celld_config_from(&src, &config)?;
+    let (dir, required_secrets) = cello_config_from(&src, &config)?;
     Ok(Some(BuiltRoot {
         note: format!(
             "{} (from {}, via {DEPLOY_REDIRECT})",
@@ -404,15 +404,15 @@ fn redirected_config(src: &Path, redirect: &Path) -> anyhow::Result<PathBuf> {
 }
 
 /// Rewrite the built Wrangler config at `config` into a `wrangler.json`
-/// celld accepts and return the directory it was written to, plus the
+/// cello accepts and return the directory it was written to, plus the
 /// `secrets.required` names the rewrite dropped (checked against settings
-/// before `celld deploy`).
-fn celld_config_from(src: &Path, config: &Path) -> anyhow::Result<(PathBuf, Vec<String>)> {
+/// before `cello deploy`).
+fn cello_config_from(src: &Path, config: &Path) -> anyhow::Result<(PathBuf, Vec<String>)> {
     let label = display_rel(src, config);
     let text = std::fs::read_to_string(config).with_context(|| format!("read {label}"))?;
     let value =
         crate::host::storage::parse_wrangler(&text).with_context(|| format!("parse {label}"))?;
-    // `secrets` goes below (celld refuses the key): capture Void's required
+    // `secrets` goes below (cello refuses the key): capture Void's required
     // list first, so the deploy fails naming them instead of the Worker
     // failing at runtime without them.
     let required_secrets = crate::host::worker_vars::required_secrets(&value);
@@ -441,7 +441,7 @@ fn celld_config_from(src: &Path, config: &Path) -> anyhow::Result<(PathBuf, Vec<
     };
 
     // The nearest directory holding the config, the Worker and its assets.
-    // celld wants the assets directory strictly below the root.
+    // cello wants the assets directory strictly below the root.
     let mut root = config_dir.clone();
     if let Some(main_dir) = main.as_deref().and_then(Path::parent) {
         root = common_ancestor(&root, main_dir);
@@ -498,7 +498,7 @@ fn celld_config_from(src: &Path, config: &Path) -> anyhow::Result<(PathBuf, Vec<
 }
 
 /// D1 `migrations_dir` values relative to the new root; one that is missing
-/// or outside it is dropped (celld refuses `..`).
+/// or outside it is dropped (cello refuses `..`).
 fn relocate_migrations(obj: &mut serde_json::Map<String, Value>, config_dir: &Path, root: &Path) {
     let Some(dbs) = obj.get_mut("d1_databases").and_then(Value::as_array_mut) else {
         return;
@@ -522,7 +522,7 @@ fn relocate_migrations(obj: &mut serde_json::Map<String, Value>, config_dir: &Pa
 /// for Void's output), and the rewrite moves the config up to the deploy
 /// root. Make every path absolute inside the worktree: the default Void
 /// sandbox Dockerfile lives in `node_modules`, outside the deploy root, and
-/// celld joins a project dir onto the value — joining an absolute path is
+/// cello joins a project dir onto the value — joining an absolute path is
 /// the path itself, while `../../../node_modules` would escape.
 fn relocate_container_paths(
     obj: &mut serde_json::Map<String, Value>,
@@ -577,7 +577,7 @@ fn relocate_container_paths(
     Ok(())
 }
 
-/// celld has no `.assetsignore`: remove the files it names (plain names only,
+/// cello has no `.assetsignore`: remove the files it names (plain names only,
 /// as Cloudflare's Vite plugin writes them), then the file itself.
 fn apply_assetsignore(assets: &Path) -> anyhow::Result<()> {
     let ignore = assets.join(".assetsignore");
@@ -691,7 +691,7 @@ mod tests {
     }
 
     #[test]
-    fn vite_plugin_output_becomes_a_celld_config_in_dist() {
+    fn vite_plugin_output_becomes_a_cello_config_in_dist() {
         let guard_vite = scratch("vite");
         let src = guard_vite.path().canonicalize().unwrap();
         vite_worker_tree(&src);
@@ -762,20 +762,20 @@ mod tests {
     }
 
     #[test]
-    fn celld_ready_dist_config_wins() {
+    fn cello_ready_dist_config_wins() {
         let guard_oxide = scratch("oxide");
         let src = guard_oxide.path().canonicalize().unwrap();
         vite_worker_tree(&src);
         write(
             &src.join("dist/wrangler.json"),
-            r#"{"name":"app","main":"celld/entry.js"}"#,
+            r#"{"name":"app","main":"cello/entry.js"}"#,
         );
         let built = built_deploy_root(&src).unwrap().unwrap();
         assert_eq!(built.dir, src.join("dist"));
-        // Untouched: already celld's shape.
+        // Untouched: already cello's shape.
         assert_eq!(
             read_json(&src.join("dist/wrangler.json"))["main"],
-            "celld/entry.js"
+            "cello/entry.js"
         );
     }
 
@@ -848,7 +848,7 @@ mod tests {
             .is_some()
     }
 
-    /// A per-class `runtime` overrides the node's default in celld, so the
+    /// A per-class `runtime` overrides the node's default in cello, so the
     /// install's runtime would be the tenant's choice. Refused: the OCI
     /// runtime is operator-owned.
     #[test]
@@ -867,11 +867,11 @@ mod tests {
         }
     }
 
-    /// Void's Sandbox entry (Sandbox SDK 1.0 shape) becomes celld's: the
+    /// Void's Sandbox entry (Sandbox SDK 1.0 shape) becomes cello's: the
     /// scheduling policy goes, a registry `images.default.image` becomes
     /// `image`, and a Dockerfile is left to prepare, with its context.
     #[test]
-    fn voids_container_shape_normalizes_for_celld() {
+    fn voids_container_shape_normalizes_for_cello() {
         let guard_void_shape = scratch("void-shape");
         let dir = guard_void_shape.path().canonicalize().unwrap();
         write(&dir.join("sandbox/Dockerfile"), "FROM scratch\n");
@@ -997,12 +997,12 @@ mod tests {
     }
 
     /// A plain `image` naming a file in the project is a Dockerfile to
-    /// prepare; the rule mirrors celld's `is_dockerfile` exactly: a missing
+    /// prepare; the rule mirrors cello's `is_dockerfile` exactly: a missing
     /// path is a registry reference, a directory is not a file, and a
     /// symlink never counts (`symlink_metadata` follows nothing).
     #[test]
     #[cfg(unix)]
-    fn container_dockerfile_rule_matches_celld() {
+    fn container_dockerfile_rule_matches_cello() {
         let guard_dockerfile_rule = scratch("dockerfile-rule");
         let dir = guard_dockerfile_rule.path().canonicalize().unwrap();
         write(&dir.join("images/app/Dockerfile"), "FROM scratch\n");
@@ -1030,7 +1030,7 @@ mod tests {
         }
     }
 
-    /// celld builds any `image` naming a file, so a Void-shaped
+    /// cello builds any `image` naming a file, so a Void-shaped
     /// `images.default.image` naming one must be prepared like a plain
     /// `image`, never passed through unchecked (it would build the tenant's
     /// `RUN` steps on the host engine).
@@ -1156,7 +1156,7 @@ mod tests {
     }
 
     /// A registry image with no `runtime` declares containers (the deploy
-    /// stretches its timeout); anything else malformed is celld's to
+    /// stretches its timeout); anything else malformed is cello's to
     /// reject, so the plan passes it through.
     #[test]
     fn container_plan_reports_and_defers() {
@@ -1166,11 +1166,11 @@ mod tests {
         );
         let dir = guard_registry.path().canonicalize().unwrap();
         assert!(declares(&dir, false));
-        // celld reads `wrangler.jsonc` first: a jsonc without containers
+        // cello reads `wrangler.jsonc` first: a jsonc without containers
         // wins over a json with a refused key.
         write(
             &dir.join("wrangler.jsonc"),
-            r#"{"name":"a", // celld's pick
+            r#"{"name":"a", // cello's pick
             }"#,
         );
         assert!(!declares(&dir, false));
@@ -1186,11 +1186,11 @@ mod tests {
             }
             assert!(
                 !declares(&dir, false),
-                "{name} must pass through undeclared for celld to reject"
+                "{name} must pass through undeclared for cello to reject"
             );
         }
         // A non-empty array declares containers even when its shape is
-        // celld's to reject (it fails before pulling, so the stretched
+        // cello's to reject (it fails before pulling, so the stretched
         // timeout costs nothing).
         let guard_not_entry = scratch("not-entry");
         let dir = guard_not_entry.path().canonicalize().unwrap();
@@ -1203,7 +1203,7 @@ mod tests {
 
     /// Void's own output deploys: `dist/ssr/wrangler.json` becomes
     /// `dist/wrangler.json` with the Worker and assets relative to `dist/`
-    /// and only the keys celld accepts.
+    /// and only the keys cello accepts.
     #[test]
     fn voids_own_output_becomes_the_deploy_root() {
         let guard_void_output = scratch("void-output");
@@ -1231,7 +1231,7 @@ mod tests {
     }
 
     /// A build may derive `dist/wrangler.json` from Void's own config for a
-    /// celld deploy (the app templates do). Void's output still wins: the
+    /// cello deploy (the app templates do). Void's output still wins: the
     /// derived file copies only the keys its author knew, so reading it as
     /// the deploy config drops `containers` and classifies the app as
     /// non-Void, skipping migrations and the sandbox controller.
@@ -1273,7 +1273,7 @@ mod tests {
                 .to_string(),
             "the moved config keeps the Dockerfile reachable (absolute)"
         );
-        // celld refuses `..`, so a migrations dir outside the deploy root is
+        // cello refuses `..`, so a migrations dir outside the deploy root is
         // dropped from the config; the migrate step reads the pushed tree's
         // `db/migrations` directly.
         assert!(v["d1_databases"][0].get("migrations_dir").is_none());
@@ -1299,7 +1299,7 @@ mod tests {
     }
 
     /// Void's `secrets.required` is captured before the rewrite drops the key
-    /// celld refuses, so the deploy can fail naming the missing settings.
+    /// cello refuses, so the deploy can fail naming the missing settings.
     #[test]
     fn void_required_secrets_survive_the_drop() {
         let guard_void_required = scratch("void-required");
@@ -1322,7 +1322,7 @@ mod tests {
     }
 
     /// Only Void's own output (`dist/ssr/wrangler.json`) marks the root a
-    /// Void app: the redirect and the celld-ready config are not Void's, so
+    /// Void app: the redirect and the cello-ready config are not Void's, so
     /// the runner's Void injections never touch them.
     #[test]
     fn only_voids_own_output_marks_a_void_app() {
@@ -1351,7 +1351,7 @@ mod tests {
         vite_worker_tree(&src);
         write(
             &src.join("dist/wrangler.json"),
-            r#"{"name":"app","main":"celld/entry.js"}"#,
+            r#"{"name":"app","main":"cello/entry.js"}"#,
         );
         let built = built_deploy_root(&src).unwrap().expect("dist config");
         assert!(!built.void);

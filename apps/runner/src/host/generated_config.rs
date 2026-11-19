@@ -12,7 +12,7 @@
 //!   beside it is served first, and the Worker answers the rest.
 //!
 //! A Node server (`app.listen(…)`, `createServer`) is refused with a message:
-//! celld implements neither `node:http` servers nor `IncomingMessage`.
+//! cello implements neither `node:http` servers nor `IncomingMessage`.
 
 use std::path::{Path, PathBuf};
 
@@ -146,7 +146,7 @@ fn contained(root: &Path, rel: &str) -> anyhow::Result<PathBuf> {
 
 /// Write `wrangler.json` for `plan` at `root`. Runs after every tenant
 /// process has finished (the tree is the runner's again), and re-resolves
-/// each path so a symlink cannot point celld at files outside the project.
+/// each path so a symlink cannot point cello at files outside the project.
 pub fn write(root: &Path, name: &str, plan: &Plan) -> anyhow::Result<()> {
     let mut config = json!({
         "name": name,

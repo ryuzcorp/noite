@@ -1,9 +1,9 @@
 //! Sandbox container images built from a Dockerfile (SPEC, Sandbox
 //! containers).
 //!
-//! `celld deploy` runs as the runner against the host engine, so a
+//! `cello deploy` runs as the runner against the host engine, so a
 //! Dockerfile it builds would run its `RUN` steps on the host daemon,
-//! outside celld's fence. Noite therefore builds only Dockerfiles that run
+//! outside cello's fence. Noite therefore builds only Dockerfiles that run
 //! nothing: file and metadata instructions over base images that are
 //! pulled from a registry, checked for `ONBUILD` triggers (which would run
 //! during the build) and pinned by digest. That covers Void's default
@@ -283,7 +283,7 @@ pub struct Request {
 
 /// Check `request`, pull and vet its registry images, and write the pinned
 /// Dockerfile into its build context. Returns the written Dockerfile's
-/// absolute path (`celld deploy` builds it with its directory as context).
+/// absolute path (`cello deploy` builds it with its directory as context).
 ///
 /// Both paths must resolve (symlinks included) inside `src`: the build
 /// reads the context as root, so a context outside the worktree would copy

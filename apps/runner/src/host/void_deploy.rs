@@ -23,13 +23,13 @@
 //!   collision with a runner-owned binding name fails the deploy naming
 //!   it);
 //! - the `ISR_CACHE` KV namespace (`binding: ISR_CACHE`, one fixed id):
-//!   celld scopes a namespace id to the fleet bucket, so the fixed id is a
+//!   cello scopes a namespace id to the fleet bucket, so the fixed id is a
 //!   distinct namespace per app and per environment — previews never share
 //!   production's ISR cache — and the proxy binds the same id in the same
 //!   bucket to purge it.
 //!
 //! The `__VOID_PROXY` entry is injected because the deploy runs the proxy
-//! first (see [`super::void_cohost`]): a dangling service would fail celld
+//! first (see [`super::void_cohost`]): a dangling service would fail cello
 //! adoption, so the binding and the script ship in the same deploy. The
 //! `__VOID_SANDBOX` entry rides [`runner_services`] the same way — the
 //! deploy runs the controller first, so it never dangles either.
@@ -48,7 +48,7 @@
 //!
 //! Values at rest are plaintext settings rows like any other (`app_env` /
 //! `environment_env`, plus the merged config in `app.deployed_config` and
-//! celld's manifest): served with values like any other setting
+//! cello's manifest): served with values like any other setting
 //! (single-operator premise; the control worker redacts values for the
 //! UI), the deploy log carries names only, never values.
 
@@ -82,7 +82,7 @@ pub const EMAIL_DOMAIN_VAR: &str = "__VOID_EMAIL_DOMAIN";
 /// The ISR KV namespace the runner injects for Void apps.
 pub const ISR_CACHE_BINDING: &str = "ISR_CACHE";
 
-/// The namespace id behind [`ISR_CACHE_BINDING`]. Fixed across apps: celld
+/// The namespace id behind [`ISR_CACHE_BINDING`]. Fixed across apps: cello
 /// takes the id verbatim and scopes it to the fleet bucket, so production
 /// (`fleets/<slug>/`) and each preview (`envs/<slug>/<label>/`) already get
 /// distinct namespaces. Stable across deploys, so the cache — and the
@@ -100,7 +100,7 @@ const RUNNER_BINDINGS: &[&str] = &[PROXY_BINDING, super::void_sandbox::SANDBOX_B
 
 /// Service targets the runner owns in `services`: a tenant entry pointing
 /// at one fails the deploy naming it. Resolving the same target twice is
-/// a hard celld adoption error, so the runner refuses the alias with a
+/// a hard cello adoption error, so the runner refuses the alias with a
 /// clear message instead of letting the deploy die there.
 const RUNNER_SERVICES: &[&str] = &[PROXY_SCRIPT_NAME, super::void_sandbox::SANDBOX_SCRIPT_NAME];
 
@@ -314,7 +314,7 @@ pub struct RunnerService {
 /// scripts first, so no entry dangles). The proxy binding always; the
 /// sandbox binding only when the app has a managed sandbox (only then
 /// does the controller deploy — an injected binding without its script
-/// would fail celld adoption).
+/// would fail cello adoption).
 pub fn runner_services(sandbox: bool) -> Vec<RunnerService> {
     let mut services = vec![RunnerService {
         binding: PROXY_BINDING,
@@ -522,7 +522,7 @@ pub fn merge_runner_owned(
                 ISR_CACHE_NAMESPACE_ID
             );
         }
-        // The proxy's mail-idempotency namespace, same rule: celld scopes
+        // The proxy's mail-idempotency namespace, same rule: cello scopes
         // a namespace id to the fleet bucket, so a tenant entry with this
         // binding or id would share the proxy's idempotency records.
         if entry.get("binding").and_then(Value::as_str)
@@ -566,10 +566,10 @@ pub struct VoidMergeCtx<'a> {
 }
 
 /// Merge the runner-owned entries into the deploy root's
-/// `wrangler.jsonc`/`wrangler.json` (`jsonc` first, as celld reads them),
+/// `wrangler.jsonc`/`wrangler.json` (`jsonc` first, as cello reads them),
 /// parsed and written back like the settings merge (never following links).
 /// `Ok(None)` when the root has neither file — a TOML-only root, which
-/// `celld deploy` itself refuses. The fleet's token is ensured (minted
+/// `cello deploy` itself refuses. The fleet's token is ensured (minted
 /// once, then reused), its mint recorded in the stats, and the value
 /// returned beside them — the deploy threads this value into the proxy
 /// render too, so a rotation landing mid-deploy cannot leave app and
@@ -1321,7 +1321,7 @@ mod tests {
     }
 
     /// The file wrapper parses, injects and rewrites through the same path
-    /// as the settings merge — and `jsonc` wins over `json`, as celld
+    /// as the settings merge — and `jsonc` wins over `json`, as cello
     /// reads them.
     #[tokio::test]
     async fn void_root_rewrites_and_records_the_mint() {

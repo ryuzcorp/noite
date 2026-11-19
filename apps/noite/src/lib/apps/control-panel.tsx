@@ -85,21 +85,12 @@ const NEEDS_FLEET: Record<TabId, boolean> = {
   overview: false,
 };
 
-/** Stale `?t=` values from before the Admin merge: each admin tab opens the
- * merged Admin tab (which keeps its sections' own searches — `uq`/`up` for
- * users, `aq` for apps). Unknown values still fall back to Overview. */
-const isLegacyAdminTab = (raw: string): boolean =>
-  raw === "users" || raw === "apps" || raw === "settings" || raw === "invites";
-
-/** Parse `?t=`: the merged Admin tab, the retired Account tab, or Overview
+/** Parse `?t=`: a tab, the retired Account tab (which lives at `/account`
+ * again — the page redirects there, old bookmarks included), or Overview
  * for anything unknown. Exported so the unit test pins the mapping. */
 export const toControlRoute = (raw: string): ControlRoute => {
   if (raw === "account") {
     return "account";
-  }
-
-  if (isLegacyAdminTab(raw)) {
-    return "admin";
   }
 
   return TABS.find((tab) => tab.id === raw)?.id ?? "overview";

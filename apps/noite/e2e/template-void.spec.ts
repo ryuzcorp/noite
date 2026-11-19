@@ -120,10 +120,10 @@ test(
     await expect(
       page.getByRole("heading", { name: "Ilha + Void on Noite" })
     ).toBeVisible();
-    await todoInput.fill("Serve on celld");
+    await todoInput.fill("Serve on cello");
     await addButton.click();
     await expect(
-      page.locator("li", { hasText: "Serve on celld" })
+      page.locator("li", { hasText: "Serve on cello" })
     ).toBeVisible();
 
     // The island page serves static HTML with a working counter island.

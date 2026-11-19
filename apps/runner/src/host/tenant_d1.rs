@@ -2,10 +2,10 @@
 //! declares a D1 binding with `migrations_dir` expects `wrangler d1 migrations
 //! apply` semantics — ordered `NNNN_name.sql` files from `migrations_dir`
 //! (default `migrations`), tracked in a `d1_migrations` table so each file
-//! applies once, each file in its own transaction. celld records the
+//! applies once, each file in its own transaction. cello records the
 //! declaration but only its manual CLI applies migrations, so a deploy that
 //! skipped this step left the Worker's tables missing. The deploy now runs
-//! `celld d1 migrations apply` once per D1 binding, reusing celld's own
+//! `cello d1 migrations apply` once per D1 binding, reusing cello's own
 //! migrator (same ordering, same bookkeeping table, same per-file
 //! transactions as wrangler) instead of a second implementation.
 //!
@@ -20,11 +20,11 @@
 //! only applies what is pending, and a `0002` added after `0001` applies just
 //! `0002` on the next deploy.
 //!
-/// The bookkeeping table celld tracks applied migrations in (`d1_migrations`
+/// The bookkeeping table cello tracks applied migrations in (`d1_migrations`
 /// by default, `migrations_table` when the binding sets it).
 pub const DEFAULT_MIGRATIONS_TABLE: &str = "d1_migrations";
 
-/// True when `name` is a plain SQLite identifier (what celld accepts for
+/// True when `name` is a plain SQLite identifier (what cello accepts for
 /// `migrations_table`): letters, digits and underscores, not starting with a
 /// digit. Anything else fails the deploy before it reaches SQL.
 pub fn is_plain_identifier(name: &str) -> bool {
@@ -40,7 +40,7 @@ use std::path::{Component, Path, PathBuf};
 
 use anyhow::Context;
 
-/// One D1 binding's migration source: the `database_name` celld's positional
+/// One D1 binding's migration source: the `database_name` cello's positional
 /// names, the declared `migrations_dir` (default `migrations`), and the
 /// bookkeeping table (default `d1_migrations`).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -50,8 +50,8 @@ pub struct TenantD1Binding {
     pub migrations_table: String,
 }
 
-/// Read the deploy root's `d1_databases` (the config `celld deploy` uploads).
-/// TOML-only roots have no JSON to read: celld refuses them at stage time, so
+/// Read the deploy root's `d1_databases` (the config `cello deploy` uploads).
+/// TOML-only roots have no JSON to read: cello refuses them at stage time, so
 /// there is nothing to migrate here.
 pub fn collect_d1_bindings(deploy_root: &Path) -> anyhow::Result<Vec<TenantD1Binding>> {
     for name in ["wrangler.jsonc", "wrangler.json"] {
@@ -144,7 +144,7 @@ pub fn collect_d1_bindings(deploy_root: &Path) -> anyhow::Result<Vec<TenantD1Bin
 /// a Worker with a D1 binding and no migration files deploys green with
 /// nothing to apply), then require the result to stay under the root. The dir
 /// itself may not be a symlink — not even one pointing inside the tree:
-/// celld follows it when reading, and the deploy must never execute SQL from
+/// cello follows it when reading, and the deploy must never execute SQL from
 /// outside the pushed tree (host paths, another tenant's checkout) with the
 /// results landing in the tenant-readable deploy log. A dir outside the root
 /// fails the deploy loudly, never a silent skip.
@@ -187,7 +187,7 @@ pub fn resolve_migrations_dir(
 /// wrangler applies them — a flat directory, ASCII case-insensitive `.sql`.
 /// Every `*.sql` entry must be a regular file and never a symlink (a
 /// symlinked, fifo, device or directory `*.sql` fails the deploy loudly
-/// instead of reaching celld, which would follow the link and execute
+/// instead of reaching cello, which would follow the link and execute
 /// out-of-tree SQL). Anything else in the directory is ignored.
 pub fn collect_migration_files(dir: &Path) -> anyhow::Result<Vec<String>> {
     let mut names: Vec<String> = Vec::new();

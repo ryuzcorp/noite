@@ -33,9 +33,9 @@ describe("visibleControlTabs", () => {
 });
 
 describe("toControlRoute", () => {
-  test("legacy admin tabs map onto the merged Admin tab", () => {
+  test("retired admin tabs fall back to overview", () => {
     for (const raw of ["users", "apps", "settings", "invites"]) {
-      expect(toControlRoute(raw)).toBe("admin");
+      expect(toControlRoute(raw)).toBe("overview");
     }
   });
 
@@ -66,7 +66,7 @@ describe("activeControlTab", () => {
   test("admins keep the requested tab when the fleet allows it", () => {
     expect(activeControlTab(true, "metrics", true)).toBe("metrics");
     expect(activeControlTab(true, "analytics", true)).toBe("analytics");
-    expect(activeControlTab(true, toControlRoute("users"), false)).toBe(
+    expect(activeControlTab(true, toControlRoute("admin"), false)).toBe(
       "admin"
     );
   });
@@ -79,7 +79,7 @@ describe("activeControlTab", () => {
 
 describe("versionLabel", () => {
   test("release tags render with the v prefix", () => {
-    expect(versionLabel("0.1.0-beta.2")).toBe("v0.1.0-beta.2");
+    expect(versionLabel("0.2.0-beta.1")).toBe("v0.2.0-beta.1");
   });
 
   test("a tag that already carries v and a dev checkout pass through", () => {

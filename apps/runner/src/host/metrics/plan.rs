@@ -8,7 +8,7 @@ use super::cpu::otel_flush_ms;
 use super::MetricsState;
 
 /// Bucket prefix one telemetry source writes under. The key is a fleet key:
-/// a production slug maps to its celld `--bucket` (`fleets/<slug>`), an
+/// a production slug maps to its cello `--bucket` (`fleets/<slug>`), an
 /// environment's `{slug}.{label}` fleet key to its own `--bucket`
 /// (`envs/<slug>/<label>`), and the control fleet's `--bucket` is `control`,
 /// so its traces and logs land at `control/telemetry/...` — the control
@@ -35,7 +35,7 @@ pub(super) fn agg_lag_us(cfg: &Config) -> i64 {
 }
 
 /// Microsecond timestamp floored to its hour — the granularity the ingest
-/// works in (celld partitions files by hour, and a chunk is whole hours plus
+/// works in (cello partitions files by hour, and a chunk is whole hours plus
 /// the partial hour the cutoff falls in).
 pub(super) fn floor_hour_us(us: i64) -> i64 {
     us.div_euclid(3_600_000_000) * 3_600_000_000
@@ -58,7 +58,7 @@ const INGEST_RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_secs
 /// The watermark a fleet's next chunk should start from, or `None` when the
 /// fleet has nothing to do this pass.
 ///
-/// A live fleet (a running celld) always runs, including the partial current
+/// A live fleet (a running cello) always runs, including the partial current
 /// hour. A stopped fleet is scanned only while a WHOLE hour before the cutoff
 /// is still unprocessed: that drains its tail once the hour it stopped in
 /// completes (within an hour), without re-reading a parked fleet's bucket
@@ -117,7 +117,7 @@ pub(super) fn plan_chunks(
     out
 }
 
-/// The hour directories one fleet's window touches, as celld partitions them
+/// The hour directories one fleet's window touches, as cello partitions them
 /// (`telemetry/{kind}/<node>/<yyyy>/<mm>/<dd>/<hh>/`). A tick names only the
 /// hours its window touches instead of the whole retention (a 30 s window
 /// names one or two hour directories); the node stays a wildcard so history
@@ -126,7 +126,7 @@ pub(super) fn plan_chunks(
 /// The walk and its clamps are the old glob expansion's, so a chunk covers
 /// exactly the files the old glob named: start floored to the hour (a
 /// window that starts mid-hour must still read its trailing partial hour),
-/// clamped to the retention floor (celld has already deleted older objects),
+/// clamped to the retention floor (cello has already deleted older objects),
 /// and bounded to `retention_days * 24 + 1` hours so a stale watermark after
 /// a long outage cannot name thousands of directories.
 pub(super) fn telemetry_hours(cfg: &Config, from_us: i64, to_us: i64) -> Vec<String> {
@@ -230,7 +230,7 @@ mod tests {
 
     #[test]
     fn telemetry_prefix_follows_the_source_bucket() {
-        // celld writes `telemetry/` relative to its `--bucket`: tenant fleets
+        // cello writes `telemetry/` relative to its `--bucket`: tenant fleets
         // are `fleets/<slug>`, the control node is `control` — never
         // `fleets/_control`, which no fleet writes and purge/rename own.
         assert_eq!(telemetry_prefix(crate::host::control::SLUG), "control");
@@ -275,7 +275,7 @@ mod tests {
             telemetry_hours(&cfg, ancient, now).len(),
             (30 * 24 + 1) as usize
         );
-        // A window wholly older than the floor names nothing: celld deleted
+        // A window wholly older than the floor names nothing: cello deleted
         // those objects already, and the old glob expansion returned no file
         // for the same reason.
         let old = now - 31 * 86_400_000_000;

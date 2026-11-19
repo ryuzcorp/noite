@@ -10,7 +10,7 @@
 **/out
 **/node_modules
 **/.wrangler
-**/.celld
+**/.cello
 **/.void
 **/.ilha
 **/e2e/.auth

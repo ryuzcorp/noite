@@ -701,7 +701,7 @@ mod tests {
         .expect("env")
     }
 
-    /// A state with a fake celld and root credentials for the teardown-race
+    /// A state with a fake cello and root credentials for the teardown-race
     /// tests: the spawn path mints credentials and forks the binary, so the
     /// harness points it at an executable that stays alive and skips the
     /// store's IAM (same reason as the sleep wake tests). The label is unique
@@ -712,8 +712,8 @@ mod tests {
         listen: i64,
     ) -> (crate::AppState, Config, App, Environment) {
         let (state, app) = ref_teardown_state(dir, &crate::testutil::spawn_s3_stub().await).await;
-        let fake = dir.join("celld");
-        std::fs::write(&fake, "#!/bin/sh\nsleep 60\n").expect("write fake celld");
+        let fake = dir.join("cello");
+        std::fs::write(&fake, "#!/bin/sh\nsleep 60\n").expect("write fake cello");
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -731,7 +731,7 @@ mod tests {
 
     /// The merge-queue flake: teardown stops the fleet first and deletes the
     /// row last, and a reconcile tick landing between the two respawned the
-    /// fleet (`started celld` 93 ms after the stop) onto ports the row delete
+    /// fleet (`started cello` 93 ms after the stop) onto ports the row delete
     /// then handed to another tenant's fleet — whose deploy died at its
     /// health gate on the bind conflict after its reload answered from the
     /// leaked fleet. Teardown marks the environment before its first stop
@@ -744,10 +744,10 @@ mod tests {
     async fn teardown_refuses_a_fleet_start_that_races_it() {
         let dir = std::env::temp_dir().join(format!("noite-env-race-{}", new_id()));
         std::fs::create_dir_all(&dir).expect("temp dir");
-        // A stand-in celld: the spawn path only needs an executable that
+        // A stand-in cello: the spawn path only needs an executable that
         // stays alive (the sleep wake tests use the same stand-in).
-        let fake = dir.join("celld");
-        std::fs::write(&fake, "#!/bin/sh\nsleep 60\n").expect("write fake celld");
+        let fake = dir.join("cello");
+        std::fs::write(&fake, "#!/bin/sh\nsleep 60\n").expect("write fake cello");
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;

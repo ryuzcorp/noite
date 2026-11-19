@@ -51,7 +51,7 @@ arm64 | aarch64)
   ;;
 esac
 
-# esbuild: celld shells out to it for every deploy (worker projects).
+# esbuild: cello shells out to it for every deploy (worker projects).
 if [ "$wanted_esbuild" = 1 ]; then
   curl -fsSL --retry 5 --retry-all-errors --connect-timeout 15 -o /tmp/esbuild.tgz "https://registry.npmjs.org/@esbuild/${ESBUILD_PKG}/-/${ESBUILD_PKG}-${ESBUILD_VERSION}.tgz"
   echo "${ESBUILD_SHA512}  /tmp/esbuild.tgz" | sha512sum -c -

@@ -1,6 +1,6 @@
 //! Tenant storage: inventory, D1 preview/write, DO, R2.
 //!
-//! Every host call here talks to celld or S3, which report both "the object /
+//! Every host call here talks to cello or S3, which report both "the object /
 //! table / source is missing" and "the backend broke" as `anyhow` strings.
 //! `error` classifies the missing cases as 404 and everything else as 500 —
 //! the transport-agnostic fix for the old blanket `conflict` (409).
@@ -19,7 +19,7 @@ use crate::AppState;
 
 use super::apps::app_or_404;
 
-/// Map a celld/S3 failure onto HTTP semantics. "Missing" is the only client
+/// Map a cello/S3 failure onto HTTP semantics. "Missing" is the only client
 /// distinction the messages carry: a missing object, a missing D1 table and a
 /// not-yet-deployed source all read as not-found; anything else is internal.
 pub fn error(e: anyhow::Error) -> ApiError {
@@ -50,7 +50,7 @@ pub async fn d1_tables(
     // Serialized per app: materializing the project runs `git checkout -f`
     // on the shared bare repo, and two concurrent checkouts race on its
     // index.lock (one fails with 32603). The same guard a purge holds, so a
-    // wipe cannot empty the project out from under a running `celld d1`.
+    // wipe cannot empty the project out from under a running `cello d1`.
     let _push = state.wal.sync().lock(&app.slug).await;
     storage::d1_tables(&state.config, &app, database_id)
         .await

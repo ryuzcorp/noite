@@ -3,7 +3,7 @@
 //!
 //! A Void fleet carries the tenant app plus runner-owned scripts (today
 //! `noite-void-proxy`, later `noite-void-sandbox`), each deployed with
-//! `celld deploy` before the app. The bundle and rendered config are the
+//! `cello deploy` before the app. The bundle and rendered config are the
 //! runner's own, so a deploy skips a script whose content hash matches the
 //! stored one — steady state is one app deploy, zero pointer flapping.
 //! Production keys on `environment_id = ''` (as telemetry does); each

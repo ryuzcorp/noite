@@ -10,16 +10,16 @@
  * that accepts a conditional header and ignores it fails loudly here
  * instead of losing a cell to two owners weeks later.
  *
- * What celld needs (docs/guarantees.md in the celld repo):
+ * What cello needs (docs/guarantees.md in the cello repo):
  * - conditional create: If-None-Match `*` fails when the object exists;
  * - conditional overwrite: If-Match fails on a stale token;
  * - exactly one winner when writers race a create (the fencing contract);
  * - read-after-write and list-after-write consistency (epoch GC lists);
  * - ranged reads with the right range and bytes;
- * - multipart upload at celld's 5 MiB threshold and plain deletes.
- * Versioning is informational only: celld fences on etags, not versions.
+ * - multipart upload at cello's 5 MiB threshold and plain deletes.
+ * Versioning is informational only: cello fences on etags, not versions.
  *
- * `celld diagnose --bucket s3://NAME --endpoint URL` runs celld's own
+ * `cello diagnose --bucket s3://NAME --endpoint URL` runs cello's own
  * four-write probe (create, reject-create, update, reject-stale); this
  * script is the rest of the contract an operator must re-run on a bump.
  */
@@ -168,7 +168,7 @@ const etagOf = (res: S3Response): string => {
   if (etag === null || etag === "") {
     fail(
       "conditional-write token",
-      "a successful PUT answered no ETag, so celld has no CAS token to fence the next write"
+      "a successful PUT answered no ETag, so cello has no CAS token to fence the next write"
     );
   }
 
@@ -428,7 +428,7 @@ ok("reject-stale", `stale If-Match answered ${stale.status}, not applied`);
   ok("ranged read", "bytes=6-11, bytes=0-0 and bytes=-8 all served exact");
 }
 
-/* 9. Multipart at celld's 5 MiB threshold, then abort of a second upload. */
+/* 9. Multipart at cello's 5 MiB threshold, then abort of a second upload. */
 {
   const partSize = 5 * 1024 * 1024;
   const partA = new Uint8Array(partSize).fill(0x61);
@@ -559,7 +559,7 @@ ok("reject-stale", `stale If-Match answered ${stale.status}, not applied`);
 
   ok("delete", "DELETE removed the key; HEAD and GET answer 404");
 }
-/* Informational only: celld fences on etags, never on versions. */
+/* Informational only: cello fences on etags, never on versions. */
 
 {
   const res = await request("GET", bucket, { versioning: "" });

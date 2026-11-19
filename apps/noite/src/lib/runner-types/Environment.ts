@@ -5,7 +5,7 @@ import type { DesiredState } from "./DesiredState";
 import type { EnvironmentKind } from "./EnvironmentKind";
 
 /**
- * One preview environment: its own celld fleet at `<label>.<slug>.<base>`,
+ * One preview environment: its own cello fleet at `<label>.<slug>.<base>`,
  * with its own bucket prefix (`envs/<slug>/<label>`) and its own storage.
  * `main` is the app itself, never an environment.
  */

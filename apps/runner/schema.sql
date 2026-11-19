@@ -50,7 +50,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_app_build_uid ON app(build_uid);
 CREATE INDEX IF NOT EXISTS idx_app_user ON app(user_id);
 
 -- Preview environments (ROADMAP, Preview environments): one row per branch or
--- workspace preview. An environment is its own celld fleet with its own bucket
+-- workspace preview. An environment is its own cello fleet with its own bucket
 -- prefix (`envs/<slug>/<label>`), so it can neither read nor wipe production's
 -- bucket, ports or `last_deploy_sha`; `main` is the app itself, never an
 -- environment. Hard DELETE is the only remove path, like `app`.
@@ -377,7 +377,7 @@ CREATE TABLE IF NOT EXISTS scoped_credential (
 );
 CREATE INDEX IF NOT EXISTS idx_scoped_credential_app ON scoped_credential(app_id);
 
--- Per-fleet celld operator tokens (SPEC, Tenant isolation): one row per
+-- Per-fleet cello operator tokens (SPEC, Tenant isolation): one row per
 -- fleet (`app:<app_id>`, `env:<env_id>`, `control` for the reserved control
 -- fleet). Nonce + AES-GCM ciphertext over the token; the KEK derives from
 -- RUNNER_TOKEN via HKDF with the scope as associated data, exactly like

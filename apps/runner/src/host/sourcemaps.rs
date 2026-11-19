@@ -4,7 +4,7 @@
 //! the Errors tab symbolicates stacks at read time — for Worker and browser
 //! errors alike, with no upload step:
 //!
-//! * Worker: the deploy passes `--sourcemap <path>` to `celld deploy`, which
+//! * Worker: the deploy passes `--sourcemap <path>` to `cello deploy`, which
 //!   writes the bundled Worker's external map with project-root-relative
 //!   sources (the deployed bytes are identical with or without the flag) —
 //!   and, for a `no_bundle` entry, collects the entry's sibling
@@ -12,9 +12,9 @@
 //!   through the build's own map when the entry carries one (a Vite worker
 //!   build already maps to the original sources; a collected `no_bundle`
 //!   map chains as a pass-through, its sources already original). A missing
-//!   map file means celld had nothing to map (asset-only or Python projects
+//!   map file means cello had nothing to map (asset-only or Python projects
 //!   warn and write nothing, as does a `no_bundle` entry without a sibling
-//!   map celld accepts), so those deploys store no worker map.
+//!   map cello accepts), so those deploys store no worker map.
 //! * Browser: only maps the app's build emitted are collected (e.g. Vite
 //!   `build.sourcemap: "hidden"`). Maps are never generated for client code,
 //!   and what the build serves publicly is unchanged.
@@ -79,9 +79,9 @@ const MAX_FRAMES_PER_GET: usize = 256;
 /// older than this still render — with their raw, unsymbolicated stacks.
 const KEEP_DEPLOY_SHAS: usize = 10;
 
-/// Worker entry extensions celld bundles (and maps with `--sourcemap`).
+/// Worker entry extensions cello bundles (and maps with `--sourcemap`).
 /// Anything else (a Python `main`, an asset-only app with no `main`) means
-/// no worker map: celld warns and writes nothing.
+/// no worker map: cello warns and writes nothing.
 const BUNDLEABLE_EXTENSIONS: &[&str] = &["js", "mjs", "cjs", "jsx", "ts", "mts", "cts", "tsx"];
 
 /// What `maps/<sha>/manifest.json` records: the Worker bundle's map (when
@@ -154,7 +154,7 @@ pub fn split_frame_location(location: &str) -> Option<(&str, u32, u32)> {
 }
 
 /// A frame file with no path and no scheme is the Worker bundle itself
-/// (`worker.js`, celld's `index.js` module name) — never a client asset.
+/// (`worker.js`, cello's `index.js` module name) — never a client asset.
 fn is_worker_bundle_file(file: &str) -> bool {
     !file.contains('/') && !file.contains("://")
 }
@@ -716,8 +716,8 @@ async fn fetch_map(
     }
 }
 
-/// The Worker's map input: the deploy root's entry (as celld resolves it),
-/// whose sibling map the celld map chains through when the build emitted one.
+/// The Worker's map input: the deploy root's entry (as cello resolves it),
+/// whose sibling map the cello map chains through when the build emitted one.
 struct WorkerEntry {
     /// Entry relative to the deploy root, as `main` names it.
     rel: PathBuf,
@@ -725,7 +725,7 @@ struct WorkerEntry {
     abs: PathBuf,
 }
 
-/// celld's entry resolution, minimally: `main` from the deploy root's Wrangler
+/// cello's entry resolution, minimally: `main` from the deploy root's Wrangler
 /// file (`main` is required — an asset-only app has no worker to map).
 fn worker_entry(deploy_root: &Path) -> anyhow::Result<Option<WorkerEntry>> {
     let config = read_worker_config(deploy_root)?;
@@ -825,7 +825,7 @@ fn toml_string(rest: &str) -> Option<&str> {
 }
 
 /// Fold the build's own map (when the entry carries a sibling `.map`) into
-/// the celld map: tokens the bundle read from the entry file resolve
+/// the cello map: tokens the bundle read from the entry file resolve
 /// through the entry's map to the original sources, everything else stays.
 /// Both maps are 0-based; the composed map names the build's sources.
 /// Token counts are capped ([`MAX_CHAIN_TOKENS`]): past that the outer map
@@ -911,7 +911,7 @@ pub fn chain_maps(
     builder.into_sourcemap()
 }
 
-/// The celld map's entry source, already project-root-relative; the
+/// The cello map's entry source, already project-root-relative; the
 /// config may prefix the entry with `./`, so compare without the dot. No
 /// basename fallback: an entry named `index.js` must not claim a
 /// dependency's same-named file.
@@ -1066,18 +1066,18 @@ async fn read_capped_map(path: &Path) -> Option<Vec<u8>> {
     read_regular_capped(path).await.ok().flatten()
 }
 
-/// The Worker map celld wrote for this deploy, ready to store.
+/// The Worker map cello wrote for this deploy, ready to store.
 #[derive(Debug)]
 pub(crate) struct WorkerMap {
     pub map: Vec<u8>,
     pub note: String,
 }
 
-/// Read the Worker map `celld deploy --sourcemap` wrote: chained through the
+/// Read the Worker map `cello deploy --sourcemap` wrote: chained through the
 /// entry's own map when the build emitted one (a Vite worker build already
 /// maps to the original sources; a collected `no_bundle` map chains as a
 /// pass-through), sanitized like any stored map. `None` when the map file is
-/// missing — celld warns and writes nothing for asset-only and Python
+/// missing — cello warns and writes nothing for asset-only and Python
 /// projects, and for a `no_bundle` entry without a sibling map it accepts —
 /// so those deploys store no worker map. Runs after a successful deploy; the
 /// bytes upload with the rest of the maps.
@@ -1086,18 +1086,18 @@ pub(crate) async fn read_cello_worker_map(
     map_path: &Path,
 ) -> anyhow::Result<Option<WorkerMap>> {
     // Never follow symlinks and never read past the cap into memory: the
-    // deploy removes this path before celld runs, but a planted link that
+    // deploy removes this path before cello runs, but a planted link that
     // survived (or a rerun against a dirty work dir) must not become a
     // stored map or a memory spike.
     let Some(map_bytes) = read_regular_capped(map_path)
         .await
-        .context("read the celld source map")?
+        .context("read the cello source map")?
     else {
         return Ok(None);
     };
     let outer =
-        sourcemap::SourceMap::from_slice(&map_bytes).context("parse the celld source map")?;
-    // celld's sources are already project-root-relative, so the map chains
+        sourcemap::SourceMap::from_slice(&map_bytes).context("parse the cello source map")?;
+    // cello's sources are already project-root-relative, so the map chains
     // directly; without a bundleable entry there is no sibling to chain
     // through and the map stores as written.
     let Some(entry) = worker_entry(deploy_root)? else {
@@ -1105,7 +1105,7 @@ pub(crate) async fn read_cello_worker_map(
         sanitize_sources(&outer).to_writer(&mut out)?;
         return Ok(Some(WorkerMap {
             map: out,
-            note: "celld map".to_string(),
+            note: "cello map".to_string(),
         }));
     };
     let sibling_map = entry.abs.with_file_name(format!(
@@ -1118,19 +1118,19 @@ pub(crate) async fn read_cello_worker_map(
         Some(bytes) => match sourcemap::SourceMap::from_slice(&bytes) {
             Ok(inner) => {
                 let chained = chain_maps(&outer, &inner, &entry_source);
-                // Deploy-log diagnostics: the entry the celld map was chained
+                // Deploy-log diagnostics: the entry the cello map was chained
                 // through, plus both maps' source sets (first few), so a
                 // mismatch is diagnosable from the deploy log alone.
                 let note = format!(
-                    "celld map chained through the build map (entry {entry_source}; outer {:?}; inner {:?})",
+                    "cello map chained through the build map (entry {entry_source}; outer {:?}; inner {:?})",
                     distinct_sources(&outer, 3),
                     distinct_sources(&inner, 3),
                 );
                 (chained, note)
             }
-            Err(_) => (outer, "celld map (build map did not parse)".to_string()),
+            Err(_) => (outer, "cello map (build map did not parse)".to_string()),
         },
-        None => (outer, "celld map".to_string()),
+        None => (outer, "cello map".to_string()),
     };
     let mut out = Vec::new();
     sanitize_sources(&composed).to_writer(&mut out)?;
@@ -1322,7 +1322,7 @@ pub async fn store_deploy_maps(
             notes.push(format!("{} ({})", WORKER_MAP_FILE, built.note));
         }
         Ok(None) => notes.push(
-            "no worker map (celld wrote no map: asset-only, Python, or no_bundle without a sibling map)"
+            "no worker map (cello wrote no map: asset-only, Python, or no_bundle without a sibling map)"
                 .to_string(),
         ),
         Err(note) => notes.push(format!("no worker map ({note})")),
@@ -1470,13 +1470,13 @@ async fn put_bytes(cfg: &Config, key: &str, bytes: &[u8]) -> anyhow::Result<()> 
 mod tests {
     use super::*;
 
-    /// The deploy layout the read sees: the map celld wrote (sources already
+    /// The deploy layout the read sees: the map cello wrote (sources already
     /// project-root-relative) beside a deploy root whose built entry carries
     /// its own sibling map. The stored map chains through the sibling to the
     /// original sources — assert exact composed positions, the composition
     /// the Errors tab reads at `errors.get` time.
     #[tokio::test]
-    async fn celld_map_chains_through_the_build_map() {
+    async fn cello_map_chains_through_the_build_map() {
         let dir =
             std::env::temp_dir().join(format!("noite-sourcemap-test-{}", uuid::Uuid::new_v4()));
         let root = dir.join("app");
@@ -1493,14 +1493,14 @@ mod tests {
             .to_writer(&mut inner_bytes)
             .expect("inner map");
         std::fs::write(root.join("dist").join("worker.js.map"), &inner_bytes).expect("sibling");
-        // celld's map: deployed bundle line 0 → built entry line 10, with
-        // the project-root-relative source celld writes.
+        // cello's map: deployed bundle line 0 → built entry line 10, with
+        // the project-root-relative source cello writes.
         let mut outer_bytes = Vec::new();
         built_map(&[((0, 5), ("dist/worker.js", 10, 3), Some("bundleFn"))])
             .to_writer(&mut outer_bytes)
             .expect("outer map");
         let map_path = dir.join("worker.js.map");
-        std::fs::write(&map_path, &outer_bytes).expect("celld map");
+        std::fs::write(&map_path, &outer_bytes).expect("cello map");
 
         let built = read_cello_worker_map(&root, &map_path)
             .await
@@ -1534,8 +1534,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn missing_celld_map_means_no_worker_map() {
-        // celld warns and writes nothing for asset-only and Python projects
+    async fn missing_cello_map_means_no_worker_map() {
+        // cello warns and writes nothing for asset-only and Python projects
         // (and for a `no_bundle` entry without a sibling map it accepts):
         // a missing file is `None`, never an error.
         let dir =
@@ -1549,7 +1549,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A `no_bundle` entry map stores again: celld collects the entry's
+    /// A `no_bundle` entry map stores again: cello collects the entry's
     /// sibling map (sources already project-root-relative), and the read
     /// keeps it — chaining passes through the tokens that never named the
     /// entry, so the stored map still resolves to the original sources.
@@ -1571,16 +1571,16 @@ mod tests {
             .to_writer(&mut sibling_bytes)
             .expect("sibling map");
         std::fs::write(root.join("dist").join("worker.js.map"), &sibling_bytes).expect("sibling");
-        // celld's collection: the sibling's mappings, sources rebased to
+        // cello's collection: the sibling's mappings, sources rebased to
         // project-root-relative — already the originals here.
         let map_path = dir.join("worker.js.map");
-        std::fs::write(&map_path, &sibling_bytes).expect("celld map");
+        std::fs::write(&map_path, &sibling_bytes).expect("cello map");
 
         let built = read_cello_worker_map(&root, &map_path)
             .await
             .expect("readable")
             .expect("a map");
-        assert!(built.note.contains("celld map"), "{}", built.note);
+        assert!(built.note.contains("cello map"), "{}", built.note);
         let stored = sourcemap::SourceMap::from_slice(&built.map).expect("stored map parses");
         let manifest = MapManifest {
             worker: Some("worker.js.map".to_string()),
@@ -1604,7 +1604,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unparseable_celld_map_fails_the_worker_map() {
+    async fn unparseable_cello_map_fails_the_worker_map() {
         // A corrupt map must not store: the deploy logs the note and keeps
         // serving raw stacks instead of shifting every mapping.
         let dir =
@@ -1616,7 +1616,7 @@ mod tests {
             .await
             .expect_err("a corrupt map fails the read");
         assert!(
-            format!("{err:#}").contains("parse the celld source map"),
+            format!("{err:#}").contains("parse the cello source map"),
             "unexpected error: {err:#}"
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -1625,7 +1625,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn planted_symlink_map_is_refused() {
-        // The deploy unlinks the map path before celld runs; a link that
+        // The deploy unlinks the map path before cello runs; a link that
         // survived (or a rerun against a dirty work dir) must not be
         // followed into a stored map.
         use std::os::unix::fs::symlink;
@@ -1674,7 +1674,7 @@ mod tests {
             .to_writer(&mut outer_bytes)
             .expect("outer map");
         let map_path = dir.join("worker.js.map");
-        std::fs::write(&map_path, &outer_bytes).expect("celld map");
+        std::fs::write(&map_path, &outer_bytes).expect("cello map");
 
         let built = read_cello_worker_map(&root, &map_path)
             .await
@@ -2162,7 +2162,7 @@ mod tests {
 
     #[test]
     fn chaining_resolves_through_the_build_map() {
-        // celld map: deployed bundle line 0 → built entry line 10.
+        // cello map: deployed bundle line 0 → built entry line 10.
         let outer = built_map(&[((0, 5), ("dist/app/index.js", 10, 3), Some("bundleFn"))]);
         // Build map: built entry line 10 → original source line 2.
         let inner = built_map(&[((10, 3), ("src/index.ts", 2, 0), Some("realFn"))]);

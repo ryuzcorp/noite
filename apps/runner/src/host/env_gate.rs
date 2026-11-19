@@ -1,6 +1,6 @@
 //! Preview-environment access gate (ROADMAP, Preview environments → Phase 2).
 //!
-//! A members-only environment (the default) is served by its own celld fleet on
+//! A members-only environment (the default) is served by its own cello fleet on
 //! `<label>.<slug>.<base>`, and the control UI's session cookie — host-only on
 //! the control origin — can never reach it. The gate therefore hands off:
 //!

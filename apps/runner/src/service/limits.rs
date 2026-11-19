@@ -32,7 +32,7 @@ fn require(role: Option<&str>, need: &str) -> Result<(), ApiError> {
 /// module's per-client ring buffer stops being small.
 const MAX_EDGE_RPM: i64 = 600_000;
 
-/// Bounds on a per-app fleet memory cap in MiB: below the floor celld cannot
+/// Bounds on a per-app fleet memory cap in MiB: below the floor cello cannot
 /// boot, so a typo'd `1` refuses loudly instead of OOM-looping the fleet.
 const MIN_FLEET_MEMORY_MB: i64 = 64;
 const MAX_FLEET_MEMORY_MB: i64 = 1_048_576;
