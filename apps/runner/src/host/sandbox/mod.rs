@@ -72,9 +72,6 @@ pub const NETWORKS: &[(&str, bool, &str)] = &[
 ];
 /// Host interfaces the relay may dial (the bridges' host sides).
 pub const BRIDGE_IFACES: &[&str] = &[OPEN_BRIDGE, INTERNAL_BRIDGE];
-/// Pre-Cello network names, removed on upgrade once no container is
-/// attached to them.
-pub const LEGACY_NETWORKS: &[&str] = &["celld", "celld-internal"];
 static INSTALL: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
 /// Record this install's id (the store-derived install tag,
