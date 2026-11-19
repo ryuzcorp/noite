@@ -1,5 +1,11 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
@@ -59,6 +65,9 @@ curl() { local out="" prev=""; for a in "$@"; do if [[ "$prev" == "-o" ]]; then 
 `;
 
 const readEnv = (): string => readFileSync(path.join(dir, ".env"), "utf-8");
+
+/** Whether `main` reached any step after the pre-reset refusal (see below). */
+const stepsRan = (): boolean => existsSync(path.join(dir, "steps"));
 
 /** An uncommented `KEY=` line (the template comments mention several keys). */
 const hasActive = (env: string, key: string): boolean =>
@@ -297,107 +306,101 @@ compose() {
   });
 });
 
-describe("install.sh cello env migration", () => {
-  test("stale CELLD_* keys are renamed to CELLO_*, keeping values", () => {
-    writeFileSync(
-      path.join(dir, ".env"),
-      "BASE_DOMAIN=example.com\nCELLD_BIN=/usr/local/bin/cello\nCELLD_ADVERTISE=peer\n"
-    );
-    const result = runBash(`${PRELUDE}\nmigrate_cello_env`);
+describe("install.sh pre-reset refusal", () => {
+  // `main` with every step after the refusal stubbed to record that it ran:
+  // a refused install must touch nothing on the host, not just the .env.
+  const MAIN = `${PRELUDE}
+check_system() { :; }
+for step in install_docker ensure_swap check_ports write_config open_firewall start_stack summary; do
+  eval "$step() { echo $step >>\\"\\$NOITE_DIR/steps\\"; }"
+done
+main`;
 
-    expect(result.status).toBe(0);
-    expect(result.stdout).toContain("CELLD_BIN");
-    expect(result.stdout).toContain("CELLO_BIN");
-    const env = readEnv();
-    expect(env).toContain("CELLO_BIN=/usr/local/bin/cello");
-    expect(env).toContain("CELLO_ADVERTISE=peer");
-    expect(env).not.toMatch(/^CELLD_/mu);
+  test("a .env with any CELLD_* key is refused with reinstall steps, untouched", () => {
+    const before =
+      "BASE_DOMAIN=example.com\nCELLD_ADVERTISE=peer\nNOITE_IMAGE=ghcr.io/ryuzcorp/noite:alpha\n";
+
+    writeFileSync(path.join(dir, ".env"), before);
+
+    const result = runBash(MAIN, { NOITE_DOMAIN: "example.com" });
+
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain("cannot be upgraded");
+    expect(result.stderr).toContain("before the 0.2.0 beta reset");
+    expect(result.stderr).toContain("down -v");
+    // The moved-aside file keeps working secrets until it is deleted.
+    expect(result.stderr).toContain("move the old .env aside");
+    expect(result.stderr).toContain("chmod 600");
+    expect(result.stderr).toContain("re-run");
+    expect(readEnv()).toBe(before);
+    expect(stepsRan()).toBe(false);
   });
 
-  test("a pre-existing CELLO_* value wins and the stale line is dropped", () => {
-    writeFileSync(path.join(dir, ".env"), "CELLO_BIN=/new\nCELLD_BIN=/old\n");
-    const result = runBash(`${PRELUDE}\nmigrate_cello_env`);
+  test("a .env pinned to a 0.1.0 image is refused with reinstall steps, untouched", () => {
+    for (const pin of ["0.1.0-beta.6", "0.1.0-alpha.5"]) {
+      const before = `BASE_DOMAIN=example.com\nNOITE_IMAGE=ghcr.io/ryuzcorp/noite:${pin}\n`;
+      writeFileSync(path.join(dir, ".env"), before);
 
-    expect(result.status).toBe(0);
-    const env = readEnv();
-    expect(env).toContain("CELLO_BIN=/new");
-    expect(env).not.toMatch(/^CELLD_/mu);
-  });
+      const result = runBash(MAIN, { NOITE_DOMAIN: "example.com" });
 
-  test("a celld binary path migrates to its cello sibling and is reported", () => {
-    for (const [old, next] of [
-      ["celld", "cello"],
-      ["/usr/local/bin/celld", "/usr/local/bin/cello"],
-    ] as const) {
-      writeFileSync(path.join(dir, ".env"), `CELLD_BIN=${old}\n`);
-      const result = runBash(`${PRELUDE}\nmigrate_cello_env`);
-
-      expect(result.status).toBe(0);
-      expect(readEnv()).toContain(`CELLO_BIN=${next}\n`);
-      expect(readEnv()).not.toMatch(/^CELLD_/mu);
-      expect(result.stdout).toContain(`${old} -> ${next}`);
-      expect(result.stderr).not.toContain("verify");
+      expect(result.status).toBe(1);
+      expect(result.stderr).toContain("cannot be upgraded");
+      expect(result.stderr).toContain("down -v");
+      expect(readEnv()).toBe(before);
+      expect(stepsRan()).toBe(false);
     }
   });
 
-  test("a custom binary path is kept with a warning to verify it", () => {
-    writeFileSync(path.join(dir, ".env"), "CELLD_BIN=/opt/fleet/bin\n");
-    const result = runBash(`${PRELUDE}\nmigrate_cello_env`);
-
-    expect(result.status).toBe(0);
-    expect(readEnv()).toContain("CELLO_BIN=/opt/fleet/bin\n");
-    expect(result.stderr).toContain("CELLO_BIN=/opt/fleet/bin");
-    expect(result.stderr).toContain("verify");
-  });
-
-  test("duplicate legacy keys migrate in order so the last value still wins", () => {
+  test("--yes does not bypass the refusal", () => {
     writeFileSync(
       path.join(dir, ".env"),
-      "CELLD_BIN=/obsolete\nCELLD_BIN=/working\n"
+      "BASE_DOMAIN=example.com\nCELLD_BIN=cello\n"
     );
-    const result = runBash(`${PRELUDE}\nmigrate_cello_env\nenv_get CELLO_BIN`);
 
-    expect(result.status).toBe(0);
-    expect(readEnv()).not.toMatch(/^CELLD_/mu);
-    expect(readEnv()).toContain("CELLO_BIN=/working\n");
-    expect(result.stdout.trim().endsWith("/working")).toBe(true);
+    const result = runBash(`${MAIN} --yes`, {
+      NOITE_DOMAIN: "example.com",
+      NOITE_YES: "1",
+    });
+
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain("cannot be upgraded");
+    expect(stepsRan()).toBe(false);
   });
 
-  test("a pre-existing CELLO_* value wins over every duplicate legacy line", () => {
+  test("a current-generation .env passes the refusal and main runs every step", () => {
     writeFileSync(
       path.join(dir, ".env"),
-      "CELLO_BIN=/new\nCELLD_BIN=/old1\nCELLD_BIN=/old2\n"
+      "BASE_DOMAIN=example.com\nCELLO_BIN=cello\n"
     );
-    const result = runBash(`${PRELUDE}\nmigrate_cello_env`);
+
+    const result = runBash(MAIN, { NOITE_DOMAIN: "example.com" });
 
     expect(result.status).toBe(0);
-    const env = readEnv();
-    expect(env).toContain("CELLO_BIN=/new\n");
-    expect(env).not.toContain("/old1");
-    expect(env).not.toContain("/old2");
-    expect(env).not.toMatch(/^CELLD_/mu);
+    expect(stepsRan()).toBe(true);
   });
 
-  test("an env without stale keys is left byte-identical", () => {
-    const before = "BASE_DOMAIN=example.com\nCELLO_BIN=/new\n";
-    writeFileSync(path.join(dir, ".env"), before);
-    const result = runBash(`${PRELUDE}\nmigrate_cello_env`);
+  test("a current-generation .env still upgrades in place", () => {
+    writeFileSync(
+      path.join(dir, ".env"),
+      "BASE_DOMAIN=example.com\nCELLO_BIN=cello\n"
+    );
+
+    const result = runBash(
+      `${PRELUDE}\ncan_ask() { return 1; }\nwrite_config`,
+      { NOITE_DOMAIN: "example.com" }
+    );
 
     expect(result.status).toBe(0);
-    expect(readEnv()).toBe(before);
+    expect(readEnv()).toContain("CELLO_BIN=cello");
   });
 
-  test("a bare CELLD_* line without `=` is left alone and not reported", () => {
-    writeFileSync(path.join(dir, ".env"), "CELLD_FOO\nCELLD_BIN=/old\n");
-    const result = runBash(`${PRELUDE}\nmigrate_cello_env`);
+  test("a fresh install without a .env proceeds", () => {
+    const result = runBash(
+      `${PRELUDE}\ncan_ask() { return 1; }\nwrite_config`,
+      { NOITE_DOMAIN: "example.com" }
+    );
 
     expect(result.status).toBe(0);
-    expect(result.stdout).not.toContain("CELLD_FOO");
-    expect(result.stdout).toContain("CELLD_BIN");
-    const env = readEnv();
-    expect(env).toContain("CELLD_FOO");
-    expect(env).toContain("CELLO_BIN=/old");
-    expect(hasActive(env, "CELLD_BIN")).toBe(false);
   });
 });
 
