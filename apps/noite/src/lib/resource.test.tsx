@@ -407,6 +407,84 @@ describe("auth reset", () => {
   });
 });
 
+describe("unmount race", () => {
+  test("a remount during an aborted load starts a fresh load instead of painting Failed", async () => {
+    const restoreDom = installDomFixture();
+
+    try {
+      const key = nextKey();
+      const gate = Promise.withResolvers<string[]>();
+      let calls = 0;
+
+      const AbortProbe = () => {
+        const res = tracked<string[]>(key, (_key, ctx) => {
+          calls += 1;
+
+          if (calls === 1) {
+            ctx.signal.addEventListener(
+              "abort",
+              () => {
+                gate.reject(new DOMException("aborted load", "AbortError"));
+              },
+              { once: true }
+            );
+
+            return gate.promise;
+          }
+
+          return Promise.resolve(["fresh"]);
+        });
+
+        captured = res;
+        watch(res.value, (value) => {
+          if (value !== undefined) {
+            signalPainted?.(value);
+          }
+        });
+
+        const settled = atom(
+          Atom.readable((get) => get(res.state.atom)._tag !== "Loading")
+        );
+
+        watch(settled, (done) => {
+          if (done) {
+            signalSettled?.();
+          }
+        });
+
+        return <span />;
+      };
+
+      const ui = render(AbortProbe);
+      await ui.settled();
+      await flush();
+      expect(calls).toBe(1);
+      ui.unmount();
+
+      // Remount synchronously: the aborted entry must already be gone, so
+      // this kick starts a fresh lookup instead of joining one that can
+      // only fail.
+      const paintedFresh = nextPainted();
+      const ui2 = render(AbortProbe);
+      await ui2.settled();
+
+      const outcome = await Promise.race([
+        paintedFresh,
+        flush().then(() => "unsettled" as const),
+      ]);
+
+      expect(outcome).toEqual(["fresh"]);
+      expect(calls).toBe(2);
+      expect(resourceError(capturedState())).toBeUndefined();
+      expect(resourceValue(capturedState())).toEqual(["fresh"]);
+      ui2.unmount();
+    } finally {
+      resetSignals();
+      restoreDom();
+    }
+  });
+});
+
 describe("resource state machine", () => {
   test("a reload and a failure keep the last value; only a cold load is Loading", () => {
     const loaded = nextResourceState<string[]>(
@@ -839,6 +917,35 @@ describe("withRetry", () => {
     await expect(done).rejects.toThrow("retry aborted");
     await flush();
     expect(calls).toBe(1);
+  });
+
+  test("an aborted load that surfaces as ApiError(0) makes no further attempt", async () => {
+    const { controller, delays, signal, sleep } = manualSleep();
+    let calls = 0;
+    controller.abort();
+
+    const done = withRetry(
+      () => {
+        calls += 1;
+
+        return Promise.reject(
+          new ApiError(0, "the server didn't answer", null)
+        );
+      },
+      { attempts: 4, baseMs: 1000, sleep }
+    )("retry:aborted-zero", { signal });
+
+    const outcome = await Promise.race([
+      done.then(() => "resolved" as const).catch(() => "rejected" as const),
+      flush().then(() => "unsettled" as const),
+    ]);
+
+    // The shape is transient, but the signal says the load is dead: the
+    // attempt must not even sleep.
+    expect(outcome).toBe("rejected");
+    await expect(done).rejects.toThrow("the server didn't answer");
+    expect(calls).toBe(1);
+    expect(delays).toEqual([]);
   });
 });
 

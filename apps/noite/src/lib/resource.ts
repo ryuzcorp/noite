@@ -229,7 +229,9 @@ export const withRetry = <T>(
     } catch (error_) {
       let error: unknown = error_;
 
-      if (!retryable(error)) {
+      // An aborted load surfaces from `api()` as a transient `ApiError(0)`;
+      // the signal, not the error shape, says it must not try again.
+      if (signal.aborted || !retryable(error)) {
         throw error;
       }
 
@@ -243,7 +245,7 @@ export const withRetry = <T>(
         } catch (error__) {
           error = error__;
 
-          if (!retryable(error)) {
+          if (signal.aborted || !retryable(error)) {
             throw error;
           }
         }
@@ -581,8 +583,11 @@ export const tracked = <T>(
       if (live.size === 0) {
         subs.delete(key);
         // Nobody paints this key anymore: end its load (and any retry
-        // backoff) instead of answering after the page moved on.
+        // backoff) instead of answering after the page moved on, and drop
+        // the aborted entry so a quick remount starts a fresh load instead
+        // of joining one that can only fail.
         abortKey(key);
+        void Effect.runPromise(Cache.invalidate(cache, cacheKey(key)));
       }
     };
   });
