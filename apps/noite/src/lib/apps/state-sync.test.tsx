@@ -445,6 +445,65 @@ class FakeDocument extends FakeNode {
   }
 }
 
+/** The browser members a fixture installs and puts back by value. */
+interface BrowserGlobals {
+  document?: unknown;
+  Element?: unknown;
+  HTMLElement?: unknown;
+  HTMLInputElement?: unknown;
+  HTMLSelectElement?: unknown;
+  HTMLTextAreaElement?: unknown;
+  Node?: unknown;
+  window?: unknown;
+}
+
+/** The browser globals the slot and its reader touch: the DOM ilha mounts
+ * into. The undo restores what was there *by value* instead of deleting the
+ * names — one `bun test` run shares one global object, so a fixture that left
+ * `window` behind made the next file's SSR render take the browser branch and
+ * throw in `appUrl()` (`window.location` was absent) instead of painting the
+ * header. `src/testing/leaked-globals.ts` fails the leaking test instead. */
+const BROWSER_GLOBALS = [
+  "Element",
+  "HTMLElement",
+  "HTMLInputElement",
+  "HTMLSelectElement",
+  "HTMLTextAreaElement",
+  "Node",
+  "document",
+  "window",
+] as const satisfies readonly (keyof BrowserGlobals)[];
+
+const installBrowserGlobals = (): (() => void) => {
+  // SAFETY: the process global object's optional browser members; only the documented fixture keys are read and set.
+  const globals = globalThis as unknown as BrowserGlobals;
+
+  const saved = BROWSER_GLOBALS.map(
+    (name) => [name, name in globals, globals[name]] as const
+  );
+
+  Object.assign(globalThis, {
+    document: new FakeDocument(),
+    Element: FakeNode,
+    HTMLInputElement: FakeElement,
+    HTMLSelectElement: FakeElement,
+    HTMLTextAreaElement: FakeElement,
+    HTMLElement: FakeElement,
+    Node: FakeNode,
+    window: {},
+  });
+
+  return () => {
+    for (const [name, had, value] of saved) {
+      if (had) {
+        globals[name] = value;
+      } else {
+        Reflect.deleteProperty(globals, name);
+      }
+    }
+  };
+};
+
 /** Drain the Effect runtime's promises (microtasks, not a wall clock). */
 const flush = async (): Promise<void> => {
   for (let i = 0; i < 50; i += 1) {
@@ -480,30 +539,16 @@ const installManualClock = () => {
 
 describe("AppStateSync post-settle re-compare", () => {
   test("a stale load that lands after a newer frame refetches against it", async () => {
+    // SAFETY: the process global object as a bag; only EventSource and fetch are read here.
     const testGlobals = globalThis as unknown as {
-      Element?: unknown;
       EventSource?: unknown;
-      HTMLElement?: unknown;
-      HTMLInputElement?: unknown;
-      HTMLSelectElement?: unknown;
-      HTMLTextAreaElement?: unknown;
-      Node?: unknown;
-      document?: unknown;
       fetch?: unknown;
-      window?: unknown;
     };
 
     const realEventSource = testGlobals.EventSource;
     const realFetch = globalThis.fetch;
     const realSetTimeout = globalThis.setTimeout;
-    testGlobals.document = new FakeDocument();
-    testGlobals.window = {};
-    testGlobals.HTMLElement = FakeElement;
-    testGlobals.Element = FakeNode;
-    testGlobals.Node = FakeNode;
-    testGlobals.HTMLInputElement = FakeElement;
-    testGlobals.HTMLSelectElement = FakeElement;
-    testGlobals.HTMLTextAreaElement = FakeElement;
+    const restoreBrowserGlobals = installBrowserGlobals();
     // SAFETY: the fake implements the EventSource surface connectStream reads.
     testGlobals.EventSource = FakeSource as unknown as typeof EventSource;
     const clock = installManualClock();
@@ -658,35 +703,21 @@ describe("AppStateSync post-settle re-compare", () => {
         testGlobals.EventSource = realEventSource;
       }
 
-      delete testGlobals.document;
+      restoreBrowserGlobals();
     }
   });
 
   test("agreeing frames never fetch per-frame: one in-flight load costs at most one extra fetch", async () => {
+    // SAFETY: the process global object as a bag; only EventSource and fetch are read here.
     const testGlobals = globalThis as unknown as {
-      Element?: unknown;
       EventSource?: unknown;
-      HTMLElement?: unknown;
-      HTMLInputElement?: unknown;
-      HTMLSelectElement?: unknown;
-      HTMLTextAreaElement?: unknown;
-      Node?: unknown;
-      document?: unknown;
       fetch?: unknown;
-      window?: unknown;
     };
 
     const realEventSource = testGlobals.EventSource;
     const realFetch = globalThis.fetch;
     const realSetTimeout = globalThis.setTimeout;
-    testGlobals.document = new FakeDocument();
-    testGlobals.window = {};
-    testGlobals.HTMLElement = FakeElement;
-    testGlobals.Element = FakeNode;
-    testGlobals.Node = FakeNode;
-    testGlobals.HTMLInputElement = FakeElement;
-    testGlobals.HTMLSelectElement = FakeElement;
-    testGlobals.HTMLTextAreaElement = FakeElement;
+    const restoreBrowserGlobals = installBrowserGlobals();
     // SAFETY: the fake implements the EventSource surface connectStream reads.
     testGlobals.EventSource = FakeSource as unknown as typeof EventSource;
     const clock = installManualClock();
@@ -826,7 +857,7 @@ describe("AppStateSync post-settle re-compare", () => {
         testGlobals.EventSource = realEventSource;
       }
 
-      delete testGlobals.document;
+      restoreBrowserGlobals();
     }
   });
 });

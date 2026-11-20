@@ -1,0 +1,4 @@
+[test]
+# Fail the test that leaves a browser global installed: every file in one run
+# shares the process's global object (see src/testing/leaked-globals.ts).
+preload = ["./src/testing/leaked-globals.ts"]
