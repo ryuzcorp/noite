@@ -16,7 +16,7 @@
 # One Cello, one Caddy, one Node, one jup, one npm, one pnpm, one bun and one
 # docker CLI pin; docker/check-versions.ts asserts they appear exactly once.
 # The esbuild sidecar version lives in docker/install-sidecars.sh.
-# Cello comes from ryuzcorp/cello 0.2.0 (docs https://cello.ryuz.eu; SPEC,
+# Cello comes from ryuzcorp/cello (docs https://cello.ryuz.eu; SPEC,
 # Cello), published with SLSA provenance attestations. The two
 # ARG lines below are the single source of the pin: a bump changes only
 # these values (the tag, then the digest from the release's publish summary).
