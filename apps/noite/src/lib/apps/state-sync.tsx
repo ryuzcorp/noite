@@ -24,7 +24,12 @@
 //! A frame is compared on every `Live` state, including a replayed last frame
 //! after the stream reopens: nothing is dropped because the link was still
 //! connecting when the frame landed.
-import { watch } from "ilha";
+//!
+//! A refetch that fails after its own bounded retry is re-driven against the
+//! same frame on a longer bounded backoff (see {@link FAILED_SETTLE_RETRY}):
+//! a control-plane blip longer than one refetch cannot leave a badge on its
+//! old value until the next frame or a reload.
+import { atom, watch } from "ilha";
 
 import type { AppDetail } from "../api-types";
 import { appStateUrl, decodeAppState, feedKeys, liveFeed } from "../feeds";
@@ -143,6 +148,20 @@ const latestFrames = new Map<string, RunnerAppState & FrameRole>();
  * and refetching the same frame again would hot-loop instead of converging. */
 const revalidatedFrames = new Map<string, string>();
 
+/** The backoff for a refetch that failed every attempt: the fetch already
+ * spent its own budget (four tries over about 7 s), so a longer blip is
+ * re-driven here — 5 s doubling to a 30 s cap. One timer per key, ended by
+ * an agreeing settle, a newer frame or unmount; a bad read that succeeds
+ * stays governed by {@link revalidatedFrames}, not this timer. */
+const FAILED_SETTLE_RETRY = { baseMs: 5000, capMs: 30_000 } as const;
+
+/** One key's pending failure re-drive: the delay it was scheduled with, so
+ * the next failure doubles it. */
+interface FailedSettleRetry {
+  readonly delayMs: number;
+  timer: number | undefined;
+}
+
 /** Follow one app's state stream and invalidate whichever cache it proves
  * stale. Renders nothing, so its frames stay out of sessionStorage. */
 const AppStateSync = ({ appId }: { appId: string }) => {
@@ -155,6 +174,85 @@ const AppStateSync = ({ appId }: { appId: string }) => {
 
   const detailKey = keys.appDetail(appId);
   const environmentsKey = keys.environments(appId);
+
+  // Per-instance, kept across ilha's re-renders (`atom.lazy` runs once): the
+  // timer belongs to this stream's lifetime, so moving to another app cannot
+  // leave one driving the previous app's keys.
+  const settleRetries = atom.lazy(() => new Map<string, FailedSettleRetry>())();
+
+  /** The frame `key` still disagrees with, or undefined once it agrees (or
+   * when no frame has arrived). */
+  const staleFrame = (
+    key: string
+  ): (RunnerAppState & FrameRole) | undefined => {
+    const frame = latestFrames.get(key);
+
+    if (frame === undefined) {
+      return undefined;
+    }
+
+    const stale = syncPlan(appId, frame, {
+      detail: readSwr<AppDetail>(keys.appDetail(appId)),
+      environments: readSwr<RunnerEnvironment[]>(keys.environments(appId)),
+    });
+
+    return stale.includes(key) ? frame : undefined;
+  };
+
+  const cancelRetry = (key: string): void => {
+    const retry = settleRetries.get(key);
+
+    if (retry === undefined) {
+      return;
+    }
+
+    window.clearTimeout(retry.timer);
+    settleRetries.delete(key);
+  };
+
+  /** Re-invalidate `key` after a failed settle, one timer per key: the
+   * refetch's own retry budget is spent, and a longer control-plane blip
+   * must still converge without a new frame. */
+  const scheduleRetry = (key: string): void => {
+    if (staleFrame(key) === undefined) {
+      cancelRetry(key);
+
+      return;
+    }
+
+    const previous = settleRetries.get(key);
+
+    if (previous !== undefined && previous.timer !== undefined) {
+      return;
+    }
+
+    const delayMs =
+      previous === undefined
+        ? FAILED_SETTLE_RETRY.baseMs
+        : Math.min(previous.delayMs * 2, FAILED_SETTLE_RETRY.capMs);
+
+    const retry: FailedSettleRetry = { delayMs, timer: undefined };
+
+    retry.timer = window.setTimeout(() => {
+      retry.timer = undefined;
+
+      // Unmounted, or a newer frame took over while this waited: the entry
+      // is gone (or replaced), so this timer must do nothing.
+      if (settleRetries.get(key) !== retry) {
+        return;
+      }
+
+      if (staleFrame(key) === undefined) {
+        settleRetries.delete(key);
+
+        return;
+      }
+
+      invalidate(key);
+    }, delayMs);
+
+    settleRetries.set(key, retry);
+  };
 
   watch(feed.state, (state) => {
     // Only a frame this stream delivered: `Cached` is a previous visit's
@@ -172,6 +270,12 @@ const AppStateSync = ({ appId }: { appId: string }) => {
 
     latestFrames.set(detailKey, frame);
     latestFrames.set(environmentsKey, frame);
+
+    // A newer frame is the newest truth: it takes over convergence below,
+    // so any failure re-drive for the previous frame ends. If this frame's
+    // own refetch also fails, its series restarts at the base delay.
+    cancelRetry(detailKey);
+    cancelRetry(environmentsKey);
 
     const stale = syncPlan(appId, frame, {
       detail: readSwr<AppDetail>(keys.appDetail(appId)),
@@ -191,18 +295,14 @@ const AppStateSync = ({ appId }: { appId: string }) => {
   // of frames never refetches. Watched through the settle hook, not a
   // reader, so the check itself starts no fetch.
   const recheck = (key: string): void => {
-    const frame = latestFrames.get(key);
+    // A settle that succeeded ends the failure series even when its read
+    // still lags: the re-compare below is the one refetch this frame may
+    // cost (see {@link revalidatedFrames}).
+    cancelRetry(key);
+
+    const frame = staleFrame(key);
 
     if (frame === undefined) {
-      return;
-    }
-
-    const stale = syncPlan(appId, frame, {
-      detail: readSwr<AppDetail>(keys.appDetail(appId)),
-      environments: readSwr<RunnerEnvironment[]>(keys.environments(appId)),
-    });
-
-    if (!stale.includes(key)) {
       return;
     }
 
@@ -220,18 +320,28 @@ const AppStateSync = ({ appId }: { appId: string }) => {
     const stopDetail = onSettled(detailKey, (outcome) => {
       if (outcome.ok) {
         recheck(detailKey);
+      } else {
+        scheduleRetry(detailKey);
       }
     });
 
     const stopEnvironments = onSettled(environmentsKey, (outcome) => {
       if (outcome.ok) {
         recheck(environmentsKey);
+      } else {
+        scheduleRetry(environmentsKey);
       }
     });
 
     return () => {
       stopDetail();
       stopEnvironments();
+
+      for (const retry of settleRetries.values()) {
+        window.clearTimeout(retry.timer);
+      }
+
+      settleRetries.clear();
     };
   });
 

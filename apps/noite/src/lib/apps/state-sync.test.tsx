@@ -2,6 +2,7 @@
 import { describe, expect, test } from "bun:test";
 
 import { render } from "ilha/test";
+import type { TestUi } from "ilha/test";
 
 import type { AppDetail } from "../api-types";
 import { resetStreamHub } from "../feeds";
@@ -490,7 +491,14 @@ const installBrowserGlobals = (): (() => void) => {
     HTMLTextAreaElement: FakeElement,
     HTMLElement: FakeElement,
     Node: FakeNode,
-    window: {},
+    // The sync schedules its failure re-drive through `window`; the wrappers
+    // read the global at call time, so a hand-fired clock installed after
+    // this fixture still owns them.
+    window: {
+      clearTimeout: (id?: number) => globalThis.clearTimeout(id),
+      setTimeout: (handler: () => void, ms?: number) =>
+        globalThis.setTimeout(handler, ms),
+    },
   });
 
   return () => {
@@ -512,17 +520,32 @@ const flush = async (): Promise<void> => {
   }
 };
 
-/** Hand-fired clock for the hub settle and the retry backoff: `setTimeout`
- * calls are captured, never run; the test fires them by hand, so no test
- * waits out a real delay. */
+/** Hand-fired clock for the hub settle, the retry backoff and the
+ * failed-settle re-drive: `setTimeout` calls are captured with their delay,
+ * never run; the test fires them by hand, so no test waits out a real
+ * delay. `clearTimeout` removes a captured timer, so a test can prove an
+ * unmount cancelled one. */
 const installManualClock = () => {
-  const queue: (() => void)[] = [];
-  // SAFETY: the test fires every captured timer by hand below.
-  globalThis.setTimeout = ((handler: () => void) => {
-    queue.push(handler);
+  const queue: { delayMs: number; handler: () => void; id: number }[] = [];
+  let nextId = 0;
 
-    return queue.length;
+  // SAFETY: the test fires every captured timer by hand below.
+  globalThis.setTimeout = ((handler: () => void, delayMs = 0) => {
+    nextId += 1;
+    const id = nextId;
+    queue.push({ delayMs, handler, id });
+
+    return id;
   }) as unknown as typeof setTimeout;
+  // SAFETY: removes an entry from the queue above; the id is the one
+  // `setTimeout` returned.
+  globalThis.clearTimeout = ((id?: number) => {
+    const at = queue.findIndex((timer) => timer.id === id);
+
+    if (at !== -1) {
+      queue.splice(at, 1);
+    }
+  }) as unknown as typeof clearTimeout;
 
   const fire = (): void => {
     const next = queue.shift();
@@ -531,10 +554,120 @@ const installManualClock = () => {
       throw new Error("no timer scheduled");
     }
 
-    next();
+    next.handler();
   };
 
   return { fire, queue };
+};
+
+/** Install the browser/EventSource/fetch doubles, mount one app page and
+ * fire the hub's settle so the stream is open. `respond` sees the 1-based
+ * fetch call number; the caller restores in a `finally`. */
+const mountAppSync = async (
+  id: string,
+  respond: (call: number) => Response
+) => {
+  // SAFETY: the process global object as a bag; only EventSource and fetch are read here.
+  const testGlobals = globalThis as unknown as {
+    EventSource?: unknown;
+    fetch?: unknown;
+  };
+
+  const realEventSource = testGlobals.EventSource;
+  const realFetch = globalThis.fetch;
+  const realSetTimeout = globalThis.setTimeout;
+  const realClearTimeout = globalThis.clearTimeout;
+  let restoreBrowserGlobals: (() => void) | undefined;
+  let ui: TestUi | undefined;
+
+  // Built before any setup step can throw: a failed render or a setup guard
+  // still closes the root (if one exists) and puts every double back, so the
+  // shared test process is never left with a fake global.
+  const restore = (): void => {
+    ui?.unmount();
+    ui = undefined;
+    resetStreamHub();
+    FakeSource.reset();
+    globalThis.fetch = realFetch;
+    globalThis.setTimeout = realSetTimeout;
+    globalThis.clearTimeout = realClearTimeout;
+
+    if (realEventSource === undefined) {
+      delete testGlobals.EventSource;
+    } else {
+      testGlobals.EventSource = realEventSource;
+    }
+
+    restoreBrowserGlobals?.();
+  };
+
+  try {
+    restoreBrowserGlobals = installBrowserGlobals();
+    // SAFETY: the fake implements the EventSource surface connectStream reads.
+    testGlobals.EventSource = FakeSource as unknown as typeof EventSource;
+    const clock = installManualClock();
+
+    FakeSource.reset();
+
+    const calls = { value: 0 };
+    // SAFETY: the test only needs the (url, init) call shape, like the fetch
+    // doubles in http/recovery and routes/envelope.
+    testGlobals.fetch = ((
+      _url: string | URL | Request,
+      _init?: RequestInit
+    ): Promise<Response> => {
+      calls.value += 1;
+
+      return Promise.resolve(respond(calls.value));
+      // oxlint-disable-next-line anti-slop/no-chained-type-assertions -- test double for the global fetch, matching the repo's established stubs.
+    }) as unknown as typeof fetch;
+
+    let capturedRes: Resource<AppDetail> | undefined;
+
+    const Probe = () => {
+      const res = appDetail(id);
+      capturedRes = res;
+
+      return <span />;
+    };
+
+    const Page = () => (
+      <>
+        <Probe />
+        <AppStateSyncSlot appId={id} />
+      </>
+    );
+
+    const mounted = render(Page);
+    ui = mounted;
+    await mounted.settled();
+    await flush();
+
+    if (capturedRes === undefined) {
+      throw new Error("the probe captured no app row resource");
+    }
+
+    clock.fire();
+    const [source] = FakeSource.instances;
+
+    if (source === undefined) {
+      throw new Error("the sync opened no state stream");
+    }
+
+    source.emit("open");
+
+    return {
+      calls,
+      clock,
+      res: capturedRes,
+      restore,
+      source,
+      ui: mounted,
+    };
+  } catch (error) {
+    restore();
+    throw error;
+  }
 };
 
 describe("AppStateSync post-settle re-compare", () => {
@@ -548,6 +681,7 @@ describe("AppStateSync post-settle re-compare", () => {
     const realEventSource = testGlobals.EventSource;
     const realFetch = globalThis.fetch;
     const realSetTimeout = globalThis.setTimeout;
+    const realClearTimeout = globalThis.clearTimeout;
     const restoreBrowserGlobals = installBrowserGlobals();
     // SAFETY: the fake implements the EventSource surface connectStream reads.
     testGlobals.EventSource = FakeSource as unknown as typeof EventSource;
@@ -696,6 +830,7 @@ describe("AppStateSync post-settle re-compare", () => {
       FakeSource.reset();
       globalThis.fetch = realFetch;
       globalThis.setTimeout = realSetTimeout;
+      globalThis.clearTimeout = realClearTimeout;
 
       if (realEventSource === undefined) {
         delete testGlobals.EventSource;
@@ -717,6 +852,7 @@ describe("AppStateSync post-settle re-compare", () => {
     const realEventSource = testGlobals.EventSource;
     const realFetch = globalThis.fetch;
     const realSetTimeout = globalThis.setTimeout;
+    const realClearTimeout = globalThis.clearTimeout;
     const restoreBrowserGlobals = installBrowserGlobals();
     // SAFETY: the fake implements the EventSource surface connectStream reads.
     testGlobals.EventSource = FakeSource as unknown as typeof EventSource;
@@ -850,6 +986,7 @@ describe("AppStateSync post-settle re-compare", () => {
       FakeSource.reset();
       globalThis.fetch = realFetch;
       globalThis.setTimeout = realSetTimeout;
+      globalThis.clearTimeout = realClearTimeout;
 
       if (realEventSource === undefined) {
         delete testGlobals.EventSource;
@@ -858,6 +995,147 @@ describe("AppStateSync post-settle re-compare", () => {
       }
 
       restoreBrowserGlobals();
+    }
+  });
+});
+
+describe("AppStateSync failed-settle re-drive", () => {
+  test("a refetch that fails every attempt is re-driven on a backoff until the frame's truth lands", async () => {
+    const id = "app-sync-failed";
+    const slug = "sync-failed";
+
+    const running = detail({
+      desiredState: "running",
+      id,
+      slug,
+      status: "running",
+    });
+
+    const stopped = detail({
+      desiredState: "stopped",
+      id,
+      slug,
+      status: "stopped",
+    });
+
+    const stoppedFrame = JSON.stringify(
+      frame({ desiredState: "stopped", id, slug, status: "stopped" }, [
+        env({ appId: id, appSlug: slug }),
+      ])
+    );
+
+    const harness = await mountAppSync(id, (call) => {
+      if (call === 1) {
+        return Response.json(running, { status: 200 });
+      }
+
+      if (call <= 5) {
+        return Response.json({ error: "boom" }, { status: 500 });
+      }
+
+      return Response.json(stopped, { status: 200 });
+    });
+
+    try {
+      const { clock, res, source, ui } = harness;
+      const painted = (): AppDetail | undefined => resourceValue(res.state());
+
+      expect(harness.calls.value).toBe(1);
+      expect(painted()).toEqual(running);
+
+      // One frame disagrees; its refetch spends all four attempts (1 s,
+      // 2 s and 4 s of backoff) against a failing control plane.
+      source.emit("message", "0:+");
+      source.emit("message", `0:${stoppedFrame}`);
+      await ui.settled();
+      await flush();
+      expect(harness.calls.value).toBe(2);
+
+      for (let retry = 0; retry < 3; retry += 1) {
+        clock.fire();
+        // oxlint-disable-next-line eslint/no-await-in-loop -- one retry attempt per fired backoff
+        await ui.settled();
+        // oxlint-disable-next-line eslint/no-await-in-loop -- one retry attempt per fired backoff
+        await flush();
+      }
+
+      expect(harness.calls.value).toBe(5);
+      expect(painted()).toEqual(running);
+      expect(resourceError(res.state())).toBeDefined();
+
+      // The settle failed after its own budget: one re-drive is scheduled
+      // at the base delay, and nothing polls before it.
+      expect(clock.queue).toHaveLength(1);
+      expect(clock.queue[0]?.delayMs).toBe(5000);
+
+      // No new frame arrives: the re-drive refetches against the frame,
+      // which now reads current truth, and the badge converges.
+      clock.fire();
+      await ui.settled();
+      await flush();
+      expect(harness.calls.value).toBe(6);
+      expect(painted()).toEqual(stopped);
+      expect(resourceError(res.state())).toBeUndefined();
+      expect(readSwr<AppDetail>(keys.appDetail(id))).toEqual(stopped);
+      // An agreeing settle ended the series: no timer is left behind.
+      expect(clock.queue).toHaveLength(0);
+    } finally {
+      harness.restore();
+    }
+  });
+
+  test("unmount clears the pending re-drive", async () => {
+    const id = "app-sync-unmount";
+    const slug = "sync-unmount";
+
+    const running = detail({
+      desiredState: "running",
+      id,
+      slug,
+      status: "running",
+    });
+
+    const stoppedFrame = JSON.stringify(
+      frame({ desiredState: "stopped", id, slug, status: "stopped" }, [
+        env({ appId: id, appSlug: slug }),
+      ])
+    );
+
+    const harness = await mountAppSync(id, (call) =>
+      call === 1
+        ? Response.json(running, { status: 200 })
+        : Response.json({ error: "boom" }, { status: 500 })
+    );
+
+    try {
+      const { clock, source, ui } = harness;
+
+      source.emit("message", "0:+");
+      source.emit("message", `0:${stoppedFrame}`);
+      await ui.settled();
+      await flush();
+
+      for (let retry = 0; retry < 3; retry += 1) {
+        clock.fire();
+        // oxlint-disable-next-line eslint/no-await-in-loop -- one retry attempt per fired backoff
+        await ui.settled();
+        // oxlint-disable-next-line eslint/no-await-in-loop -- one retry attempt per fired backoff
+        await flush();
+      }
+
+      expect(harness.calls.value).toBe(5);
+      expect(clock.queue).toHaveLength(1);
+      expect(clock.queue[0]?.delayMs).toBe(5000);
+
+      ui.unmount();
+      await flush();
+
+      // Teardown leaves the hub's own settle timer behind, never the
+      // re-drive: only `clearTimeout` removes an entry from this clock.
+      expect(clock.queue.some((timer) => timer.delayMs === 5000)).toBe(false);
+      expect(harness.calls.value).toBe(5);
+    } finally {
+      harness.restore();
     }
   });
 });
