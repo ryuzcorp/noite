@@ -19,10 +19,10 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
-- Tenant fleets, the control fleet and every `cello` CLI call run Cello 0.2.2 (image `ghcr.io/ryuzcorp/cello:0.2.2`, pinned by digest). Cello-owned identifiers follow the new spellings throughout (`cello-image:` tags, `cello.*` labels, `cello-r2` metadata, `cello.*` spans, `cello_span` telemetry): error grouping unwraps `cello.*` only, with no `celld.*` fallback. Fleet health stays at `/.well-known/cello/health`.
+- Tenant fleets, the control fleet and every `cello` CLI call run Cello 0.2.3 (image `ghcr.io/ryuzcorp/cello:0.2.3`, pinned by digest). Cello-owned identifiers follow the new spellings throughout (`cello-image:` tags, `cello.*` labels, `cello-r2` metadata, `cello.*` spans, `cello_span` telemetry): error grouping unwraps `cello.*` only, with no `celld.*` fallback. Fleet health stays at `/.well-known/cello/health`.
 - The sandbox plane, relay, gateway and engine proxy share one source of truth for Cello's `cello`/`cello-internal` bridges (`cello0`/`cello1`).
 - The instance heartbeat payload field is `cello_version`. Dashboards or alerts keyed on the old `celld_version` field name need the new spelling.
-- Cello 0.2.0 → 0.2.2 makes app WebSockets and streamed bodies memory-safe:
+- Cello 0.2.0 → 0.2.3 makes app WebSockets and streamed bodies memory-safe:
   - App WebSockets are now backpressure-safe. When a peer or app stops reading, the socket ends with close code 1011 at a 16 MiB backlog per direction, instead of growing host memory.
   - A WebSocket message is capped at 32 MiB, Cloudflare's limit. Past it, the socket closes with 1009. A single message up to the cap still passes.
   - A peer close that cuts a send short reports `wasClean: false`.
@@ -30,6 +30,7 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- Live views stay live: the app page's status badge, logs, events and every other streamed feed kept their connection open but stopped receiving updates about 30 seconds after the page loaded, so a Stop or Start only showed after a reload. Cello 0.2.3 no longer charges a streamed response to the post-response background budget. A stream that makes no progress for 60 seconds now ends instead of hanging; Noite's feeds send a keepalive every 15 seconds.
 - The app page's status badge no longer wedges on a stale Stop/Start transition. A superseded app-row fetch used to overwrite the shared snapshot while its paint was dropped, so the next state-stream frame matched the stale snapshot and invalidated nothing; and a failed row refetch kept the old value with no recovery. The snapshot now moves with its paint (only the latest reload writes it), and the app row and environments refetch with a bounded retry, so every delivered frame converges the badge without polling.
 - The runner's reconcile tick spawns due fleets before stopping parked ones in the same pass. Stops still complete within the pass, but a start no longer waits behind an unrelated fleet's full SIGTERM drain: under parallel Stop/Start churn the start spawned a whole slow drain late and its health gate never opened inside the UI's budget.
 - The runner's reconcile tick stops all desired-stopped fleets concurrently instead of awaiting each SIGTERM drain one by one. Under load, several draining fleets used to serialize the whole tick, so an unrelated fleet's start waited behind stops it had nothing to do with and its health gate never opened in time.
