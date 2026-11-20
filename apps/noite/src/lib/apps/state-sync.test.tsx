@@ -2,6 +2,7 @@
 import { describe, expect, test } from "bun:test";
 
 import { render } from "ilha/test";
+import type { TestUi } from "ilha/test";
 
 import type { AppDetail } from "../api-types";
 import { resetStreamHub } from "../feeds";
@@ -576,82 +577,97 @@ const mountAppSync = async (
   const realFetch = globalThis.fetch;
   const realSetTimeout = globalThis.setTimeout;
   const realClearTimeout = globalThis.clearTimeout;
-  const restoreBrowserGlobals = installBrowserGlobals();
-  // SAFETY: the fake implements the EventSource surface connectStream reads.
-  testGlobals.EventSource = FakeSource as unknown as typeof EventSource;
-  const clock = installManualClock();
+  let restoreBrowserGlobals: (() => void) | undefined;
+  let ui: TestUi | undefined;
 
-  FakeSource.reset();
+  // Built before any setup step can throw: a failed render or a setup guard
+  // still closes the root (if one exists) and puts every double back, so the
+  // shared test process is never left with a fake global.
+  const restore = (): void => {
+    ui?.unmount();
+    ui = undefined;
+    resetStreamHub();
+    FakeSource.reset();
+    globalThis.fetch = realFetch;
+    globalThis.setTimeout = realSetTimeout;
+    globalThis.clearTimeout = realClearTimeout;
 
-  const calls = { value: 0 };
-  // SAFETY: the test only needs the (url, init) call shape, like the fetch
-  // doubles in http/recovery and routes/envelope.
-  testGlobals.fetch = ((
-    _url: string | URL | Request,
-    _init?: RequestInit
-  ): Promise<Response> => {
-    calls.value += 1;
+    if (realEventSource === undefined) {
+      delete testGlobals.EventSource;
+    } else {
+      testGlobals.EventSource = realEventSource;
+    }
 
-    return Promise.resolve(respond(calls.value));
-    // oxlint-disable-next-line anti-slop/no-chained-type-assertions -- test double for the global fetch, matching the repo's established stubs.
-  }) as unknown as typeof fetch;
-
-  let capturedRes: Resource<AppDetail> | undefined;
-
-  const Probe = () => {
-    const res = appDetail(id);
-    capturedRes = res;
-
-    return <span />;
+    restoreBrowserGlobals?.();
   };
 
-  const Page = () => (
-    <>
-      <Probe />
-      <AppStateSyncSlot appId={id} />
-    </>
-  );
+  try {
+    restoreBrowserGlobals = installBrowserGlobals();
+    // SAFETY: the fake implements the EventSource surface connectStream reads.
+    testGlobals.EventSource = FakeSource as unknown as typeof EventSource;
+    const clock = installManualClock();
 
-  const ui = render(Page);
-  await ui.settled();
-  await flush();
+    FakeSource.reset();
 
-  if (capturedRes === undefined) {
-    throw new Error("the probe captured no app row resource");
+    const calls = { value: 0 };
+    // SAFETY: the test only needs the (url, init) call shape, like the fetch
+    // doubles in http/recovery and routes/envelope.
+    testGlobals.fetch = ((
+      _url: string | URL | Request,
+      _init?: RequestInit
+    ): Promise<Response> => {
+      calls.value += 1;
+
+      return Promise.resolve(respond(calls.value));
+      // oxlint-disable-next-line anti-slop/no-chained-type-assertions -- test double for the global fetch, matching the repo's established stubs.
+    }) as unknown as typeof fetch;
+
+    let capturedRes: Resource<AppDetail> | undefined;
+
+    const Probe = () => {
+      const res = appDetail(id);
+      capturedRes = res;
+
+      return <span />;
+    };
+
+    const Page = () => (
+      <>
+        <Probe />
+        <AppStateSyncSlot appId={id} />
+      </>
+    );
+
+    const mounted = render(Page);
+    ui = mounted;
+    await mounted.settled();
+    await flush();
+
+    if (capturedRes === undefined) {
+      throw new Error("the probe captured no app row resource");
+    }
+
+    clock.fire();
+    const [source] = FakeSource.instances;
+
+    if (source === undefined) {
+      throw new Error("the sync opened no state stream");
+    }
+
+    source.emit("open");
+
+    return {
+      calls,
+      clock,
+      res: capturedRes,
+      restore,
+      source,
+      ui: mounted,
+    };
+  } catch (error) {
+    restore();
+    throw error;
   }
-
-  clock.fire();
-  const [source] = FakeSource.instances;
-
-  if (source === undefined) {
-    throw new Error("the sync opened no state stream");
-  }
-
-  source.emit("open");
-
-  return {
-    calls,
-    clock,
-    res: capturedRes,
-    source,
-    ui,
-    restore: (): void => {
-      ui.unmount();
-      resetStreamHub();
-      FakeSource.reset();
-      globalThis.fetch = realFetch;
-      globalThis.setTimeout = realSetTimeout;
-      globalThis.clearTimeout = realClearTimeout;
-
-      if (realEventSource === undefined) {
-        delete testGlobals.EventSource;
-      } else {
-        testGlobals.EventSource = realEventSource;
-      }
-
-      restoreBrowserGlobals();
-    },
-  };
 };
 
 describe("AppStateSync post-settle re-compare", () => {
