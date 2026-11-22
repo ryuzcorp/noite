@@ -10,6 +10,21 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 <!-- Pending release notes live in ## [Unreleased] directly; new notes go in changelog.d/<topic>.md and the release PR assembles both with `bun docker/changelog-release.ts`. -->
 
+## [0.2.0-beta.2] - 2026-11-22
+
+### Operator action required
+
+- None.
+
+### Changed
+
+- The bundled Cello runtime is now **0.2.6** (`ghcr.io/ryuzcorp/cello:0.2.6@sha256:cbe5c6a9fb41712d901e82dd3b70cc736a04d2346567e4db9ac2d12a969f4f10`), the image published by `publish.yml` for tag `v0.2.6`.
+- The bundled Cello runtime is now **0.2.7** (`ghcr.io/ryuzcorp/cello:0.2.7@sha256:b3748f2644138b16e12ce8e8a831207a58ea76b4691a75973f4906fe71ea7bab`), the image published by `publish.yml` for tag `v0.2.7`.
+
+### Fixed
+
+- The app page's status badge now recovers from a control-plane blip on its own: when the refetch after a Stop or Start fails every attempt, the page re-checks against the newest streamed state on a bounded backoff (5 s doubling, at most 30 s apart) until they agree. The exception noted in `0.2.0-beta.1` — a badge stuck on its old value until the next state change or a reload — is gone.
+
 ## [0.2.0-beta.1] - 2026-11-20
 
 ### Operator action required
