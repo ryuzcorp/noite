@@ -171,7 +171,7 @@ The dev base is `noite.localhost`, never bare `localhost`: the control UI, every
 | [`packages/cli`](packages/cli) | `@noitenow/cli`, deploys from CI |
 | [`docker/`](docker) | the Dockerfile, Compose files and the installer |
 
-[AGENTS.md](AGENTS.md) holds the repo conventions, [SPEC.md](SPEC.md) the design record, and [ROADMAP.md](ROADMAP.md) the roadmap and design history. Run `bun x ultracite fix` before committing.
+[AGENTS.md](AGENTS.md) holds the conventions every change must follow and indexes the task-specific pages under [docs/agents/](docs/agents); [SPEC.md](SPEC.md) is the design record, and [ROADMAP.md](ROADMAP.md) the roadmap and design history. Run `bun x ultracite fix` before committing.
 
 <details>
 <summary><strong>Passkeys on a phone over the LAN</strong></summary>
