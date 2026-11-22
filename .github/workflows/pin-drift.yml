@@ -11,7 +11,7 @@
 #
 # `docker/check-versions.ts --online-images` prints one `now resolves to`
 # line per moved tag; the fix is to take the new digest deliberately
-# (AGENTS.md, "Updating a pin") and rebuild both platforms.
+# (`docs/agents/pins.md`, "Updating a pin") and rebuild both platforms.
 name: pin-drift
 
 on:
@@ -89,7 +89,7 @@ jobs:
             echo ""
             echo "An image tag moved upstream. Take the new digest deliberately in"
             echo "\`docker/Dockerfile\` (keep the tag next to it), then rebuild both"
-            echo "platforms — see AGENTS.md, \"Updating a pin\". A tarball checksum that"
+            echo "platforms — see docs/agents/pins.md, \"Updating a pin\". A tarball checksum that"
             echo "changed is not drift: it means the version was bumped without its"
             echo "checksum, and that fails every PR until it is fixed."
             echo ""
