@@ -355,6 +355,33 @@ where
     }
 }
 
+/// Strict `Option<u64>` env var for an optional positive bound: unset or
+/// blank means "leave the consumer's own default", anything else must parse
+/// and be greater than zero. A zero never means "unbounded": the consumers
+/// (Cello's `CELLO_*` knobs) refuse it, so accepting it here would boot the
+/// runner and then fail the child it configures.
+fn env_opt_positive(key: &str, problems: &mut Vec<String>) -> Option<u64> {
+    let raw = match env::var(key) {
+        Err(_) => return None,
+        Ok(v) if v.trim().is_empty() => return None,
+        Ok(v) => v,
+    };
+    match raw.trim().parse::<u64>() {
+        Ok(0) => {
+            problems.push(format!("{key} must be a positive integer, got 0"));
+            None
+        }
+        Ok(v) => Some(v),
+        Err(_) => {
+            problems.push(format!(
+                "{key} must be a positive integer, got {:?}",
+                raw.trim()
+            ));
+            None
+        }
+    }
+}
+
 /// Strict `Option<u32>` env var (`RUNNER_BUILD_UID_BASE`, `RUNNER_FLEET_UID`,
 /// `RUNNER_FLEET_GID`): unset/blank is the default, `none`/`disabled`/`-1`
 /// unsets it, anything else must be a user id.
@@ -1176,6 +1203,15 @@ pub struct Config {
     /// (fleet #0 used to be the only uncapped resident), else the
     /// container-wide shed threshold.
     pub control_memory_mb: u64,
+    /// Control-fleet outbound `fetch()` budget in seconds
+    /// (`RUNNER_CONTROL_FETCH_TIMEOUT_S`, passed to the control fleet as
+    /// `CELLO_FETCH_TIMEOUT_S`; unset leaves Cello's own 120). It bounds the
+    /// connect and the wait for a response head, never a response body: the
+    /// control UI streams every live feed (state, deploys, logs, events,
+    /// errors, metrics) through a Worker fetch to the runner, and a stream
+    /// must outlive this budget while it keeps sending. The e2e lane lowers
+    /// it so a stream that outlives it proves the body is not truncated.
+    pub control_fetch_timeout_s: Option<u64>,
     /// Container-wide Cello shed threshold in MiB for fleets without their
     /// own cgroup leaf, applied as `CELLO_MAX_RSS_MB` when the operator has
     /// not set `RUNNER_FLEET_MAX_RSS_MB`: 75% of the detected memory, clamped
@@ -1561,6 +1597,10 @@ impl Config {
                 "RUNNER_CONTROL_MEMORY_MB",
                 control_memory_default,
                 "an integer",
+                &mut env_problems,
+            ),
+            control_fetch_timeout_s: env_opt_positive(
+                "RUNNER_CONTROL_FETCH_TIMEOUT_S",
                 &mut env_problems,
             ),
             container_shed_mb: container_shed_default,
@@ -2119,6 +2159,7 @@ pub(crate) fn config_for_tests() -> Config {
         fleet_asset_cache_mb: 64,
         fleet_local_cache_mb: 128,
         control_memory_mb: 512,
+        control_fetch_timeout_s: None,
         container_shed_mb: 0,
         fleet_spawn_batch: 1,
         build_concurrency: 1,
@@ -2324,6 +2365,7 @@ mod tests {
         "RUNNER_FLEET_ASSET_CACHE_MB",
         "RUNNER_FLEET_LOCAL_CACHE_MB",
         "RUNNER_CONTROL_MEMORY_MB",
+        "RUNNER_CONTROL_FETCH_TIMEOUT_S",
         "RUNNER_FLEET_SPAWN_BATCH",
         "RUNNER_BUILD_CONCURRENCY",
         "RUNNER_BUILD_MEMORY_MB",
@@ -2511,6 +2553,34 @@ mod tests {
             assert!(msg.contains("RUNNER_POLL_MS"), "names the var: {msg}");
             assert!(msg.contains("abc"), "names the bad value: {msg}");
         });
+    }
+
+    /// The control fleet's fetch budget is optional and strictly positive: a
+    /// zero would disable the bound in Cello (which refuses it), so boot must
+    /// refuse it here instead of spawning a control fleet that cannot start.
+    #[test]
+    fn control_fetch_budget_is_optional_and_positive() {
+        with_env(&[], || {
+            let cfg = Config::from_env().expect("defaults boot");
+            assert_eq!(
+                cfg.control_fetch_timeout_s, None,
+                "unset leaves Cello's own fetch budget"
+            );
+        });
+        with_env(&[("RUNNER_CONTROL_FETCH_TIMEOUT_S", "5")], || {
+            let cfg = Config::from_env().expect("a positive budget boots");
+            assert_eq!(cfg.control_fetch_timeout_s, Some(5));
+        });
+        for bad in ["0", "-3", "soon"] {
+            with_env(&[("RUNNER_CONTROL_FETCH_TIMEOUT_S", bad)], || {
+                let err = Config::from_env().expect_err("a bad budget must fail boot");
+                let msg = format!("{err:#}");
+                assert!(
+                    msg.contains("RUNNER_CONTROL_FETCH_TIMEOUT_S"),
+                    "{bad}: {msg}"
+                );
+            });
+        }
     }
 
     #[test]
