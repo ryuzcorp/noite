@@ -45,8 +45,7 @@ test("control state stream outlives the control fetch budget", async ({
   const result = await page.evaluate(
     async ({ id, holdMs }): Promise<HoldResult> => {
       const started = performance.now();
-      const controller = new AbortController();
-      const abort = setTimeout(() => controller.abort(), holdMs);
+      const signal = AbortSignal.timeout(holdMs);
       let chunks = 0;
       let keepalives = 0;
       let bytes = 0;
@@ -65,7 +64,7 @@ test("control state stream outlives the control fetch budget", async ({
       try {
         const response = await fetch(`/api/apps/${id}/state/stream`, {
           headers: { accept: "text/event-stream" },
-          signal: controller.signal,
+          signal,
         });
 
         if (!(response.ok && response.body)) {
@@ -97,16 +96,14 @@ test("control state stream outlives the control fetch budget", async ({
           }
         }
       } catch (error) {
-        // Our own abort at the end of the hold is the expected exit; any
+        // Our own deadline at the end of the hold is the expected exit; any
         // other failure (a truncated chunked body reports a TypeError) is
         // the regression under test.
-        if (error instanceof DOMException && error.name === "AbortError") {
+        if (error instanceof DOMException && error.name === "TimeoutError") {
           return out(null);
         }
 
         return out(String(error));
-      } finally {
-        clearTimeout(abort);
       }
 
       return out(null);
