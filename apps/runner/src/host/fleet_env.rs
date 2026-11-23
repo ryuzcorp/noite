@@ -617,7 +617,10 @@ mod tests {
     /// previously kept a tenant-supplied value.
     #[test]
     fn tenant_fleet_env_holds_no_runner_secrets() {
-        let cfg = test_cfg(Tenancy::Single);
+        let mut cfg = test_cfg(Tenancy::Single);
+        // The knob is the CONTROL fleet's, even when configured: a tenant
+        // fleet must never inherit it.
+        cfg.control_fetch_timeout_s = Some(5);
         let tenant_env = vec![
             ("DATABASE_URL".to_string(), "postgres://app/db".to_string()),
             ("PATH".to_string(), "/tenant/bin".to_string()),
@@ -663,6 +666,10 @@ mod tests {
         );
         assert!(!flat.contains_key("CELLO_MEMORY_SCOPE"));
         assert!(!flat.contains_key("CELLO_MAX_RSS_MB"));
+        assert!(
+            !flat.contains_key("CELLO_FETCH_TIMEOUT_S"),
+            "the configured control fetch budget never reaches a tenant fleet"
+        );
         assert_eq!(
             flat["DOCKER_HOST"], DEAD_ENGINE_SOCKET,
             "no socket means a dead engine, not an unset DOCKER_HOST"

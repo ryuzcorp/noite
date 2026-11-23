@@ -355,26 +355,33 @@ where
     }
 }
 
+/// The longest outbound fetch budget the runner will forward to the control
+/// fleet. Cello refuses anything past a day (`env_vars::MAX_TIMEOUT_SECONDS`),
+/// and a larger value would not bound anything anyway, so the runner refuses
+/// it at boot instead of spawning a control fleet that cannot start.
+pub(crate) const MAX_CONTROL_FETCH_TIMEOUT_S: u64 = 86_400;
+
 /// Strict `Option<u64>` env var for an optional positive bound: unset or
 /// blank means "leave the consumer's own default", anything else must parse
-/// and be greater than zero. A zero never means "unbounded": the consumers
-/// (Cello's `CELLO_*` knobs) refuse it, so accepting it here would boot the
-/// runner and then fail the child it configures.
-fn env_opt_positive(key: &str, problems: &mut Vec<String>) -> Option<u64> {
+/// and be between 1 and `max` inclusive. A zero never means "unbounded", and
+/// a value over the ceiling is not a bound at all: the consumers (Cello's
+/// `CELLO_*` knobs) refuse both, so accepting them here would boot the runner
+/// and then crash-loop the child it configures.
+fn env_opt_positive(key: &str, max: u64, problems: &mut Vec<String>) -> Option<u64> {
     let raw = match env::var(key) {
         Err(_) => return None,
         Ok(v) if v.trim().is_empty() => return None,
         Ok(v) => v,
     };
     match raw.trim().parse::<u64>() {
-        Ok(0) => {
-            problems.push(format!("{key} must be a positive integer, got 0"));
+        Ok(v) if (1..=max).contains(&v) => Some(v),
+        Ok(v) => {
+            problems.push(format!("{key} must be between 1 and {max}, got {v}"));
             None
         }
-        Ok(v) => Some(v),
         Err(_) => {
             problems.push(format!(
-                "{key} must be a positive integer, got {:?}",
+                "{key} must be between 1 and {max}, got {:?}",
                 raw.trim()
             ));
             None
@@ -1601,6 +1608,7 @@ impl Config {
             ),
             control_fetch_timeout_s: env_opt_positive(
                 "RUNNER_CONTROL_FETCH_TIMEOUT_S",
+                MAX_CONTROL_FETCH_TIMEOUT_S,
                 &mut env_problems,
             ),
             container_shed_mb: container_shed_default,
@@ -2555,11 +2563,13 @@ mod tests {
         });
     }
 
-    /// The control fleet's fetch budget is optional and strictly positive: a
-    /// zero would disable the bound in Cello (which refuses it), so boot must
-    /// refuse it here instead of spawning a control fleet that cannot start.
+    /// The control fleet's fetch budget is optional and bounded: a zero would
+    /// disable the bound in Cello, and a value past a day is refused by Cello
+    /// (`MAX_TIMEOUT_SECONDS`) and would not bound anything, so the runner
+    /// must refuse both at boot instead of spawning a control fleet that
+    /// crash-loops with nothing in the boot log.
     #[test]
-    fn control_fetch_budget_is_optional_and_positive() {
+    fn control_fetch_budget_is_optional_and_bounded() {
         with_env(&[], || {
             let cfg = Config::from_env().expect("defaults boot");
             assert_eq!(
@@ -2567,11 +2577,13 @@ mod tests {
                 "unset leaves Cello's own fetch budget"
             );
         });
-        with_env(&[("RUNNER_CONTROL_FETCH_TIMEOUT_S", "5")], || {
-            let cfg = Config::from_env().expect("a positive budget boots");
-            assert_eq!(cfg.control_fetch_timeout_s, Some(5));
-        });
-        for bad in ["0", "-3", "soon"] {
+        for ok in ["5", "86400"] {
+            with_env(&[("RUNNER_CONTROL_FETCH_TIMEOUT_S", ok)], || {
+                let cfg = Config::from_env().expect("a positive budget boots");
+                assert_eq!(cfg.control_fetch_timeout_s, Some(ok.parse().unwrap()));
+            });
+        }
+        for bad in ["0", "-3", "86401", "soon"] {
             with_env(&[("RUNNER_CONTROL_FETCH_TIMEOUT_S", bad)], || {
                 let err = Config::from_env().expect_err("a bad budget must fail boot");
                 let msg = format!("{err:#}");
@@ -2581,6 +2593,7 @@ mod tests {
                 );
             });
         }
+        assert_eq!(MAX_CONTROL_FETCH_TIMEOUT_S, 86_400, "Cello's day ceiling");
     }
 
     #[test]
