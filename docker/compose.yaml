@@ -138,6 +138,11 @@ services:
       # own cgroup leaf when the install has writable cgroups.
       RUNNER_FLEET_LOCAL_CACHE_MB: ${RUNNER_FLEET_LOCAL_CACHE_MB:-}
       RUNNER_CONTROL_MEMORY_MB: ${RUNNER_CONTROL_MEMORY_MB:-}
+      # The control fleet's outbound fetch budget (`CELLO_FETCH_TIMEOUT_S`):
+      # connect and response head only, never a live body, so the control
+      # plane's own live feeds stay open. Whole seconds, 1-86400; unset keeps
+      # Cello's 120.
+      RUNNER_CONTROL_FETCH_TIMEOUT_S: ${RUNNER_CONTROL_FETCH_TIMEOUT_S:-}
       # Cold starts per reconcile pass and concurrent tenant deploys. Unset
       # derives 1 on two cores or fewer, else 2, so a 2 GB box ramps one
       # Cello node and one build at a time.

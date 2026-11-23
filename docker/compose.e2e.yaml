@@ -29,3 +29,8 @@ services:
       # source-tree each hold up to 6), far above the default quota of 10.
       # Lane-only: the bucket, volumes and apps are wiped on every reset.
       RUNNER_MAX_APPS_PER_USER: "32"
+      # Lane-only: the control fleet's outbound fetch budget is the head
+      # bound, never a live body (Cello's 120 s default would hide a
+      # total-deadline regression in the control-plane SSE test). 5 s is
+      # still orders of magnitude above every real control-to-runner fetch.
+      RUNNER_CONTROL_FETCH_TIMEOUT_S: "5"

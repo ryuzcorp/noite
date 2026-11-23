@@ -358,6 +358,13 @@ pub fn control_fleet_env(input: &ControlFleetEnv<'_>) -> Vec<(String, String)> {
     // control node's logs either.
     put("CELLO_TTL_MS", cfg.fleet_lease_ttl_ms.to_string());
     put("RUST_LOG", cfg.fleet_log.clone());
+    // The control UI's outbound fetch budget, when the operator set one: it
+    // bounds a fetch's connect and response head, never a live response
+    // body, so the control plane's own SSE feeds (all proxied through a
+    // Worker fetch to the runner) outlive it. Unset leaves Cello's default.
+    if let Some(seconds) = cfg.control_fetch_timeout_s {
+        put("CELLO_FETCH_TIMEOUT_S", seconds.to_string());
+    }
     // Fleet #0 is a resident like any tenant fleet: bound its asset and
     // local caches, and shed against its own leaf when it has one. Without
     // a leaf, share the container-wide threshold so the control UI answers
@@ -610,7 +617,10 @@ mod tests {
     /// previously kept a tenant-supplied value.
     #[test]
     fn tenant_fleet_env_holds_no_runner_secrets() {
-        let cfg = test_cfg(Tenancy::Single);
+        let mut cfg = test_cfg(Tenancy::Single);
+        // The knob is the CONTROL fleet's, even when configured: a tenant
+        // fleet must never inherit it.
+        cfg.control_fetch_timeout_s = Some(5);
         let tenant_env = vec![
             ("DATABASE_URL".to_string(), "postgres://app/db".to_string()),
             ("PATH".to_string(), "/tenant/bin".to_string()),
@@ -656,6 +666,10 @@ mod tests {
         );
         assert!(!flat.contains_key("CELLO_MEMORY_SCOPE"));
         assert!(!flat.contains_key("CELLO_MAX_RSS_MB"));
+        assert!(
+            !flat.contains_key("CELLO_FETCH_TIMEOUT_S"),
+            "the configured control fetch budget never reaches a tenant fleet"
+        );
         assert_eq!(
             flat["DOCKER_HOST"], DEAD_ENGINE_SOCKET,
             "no socket means a dead engine, not an unset DOCKER_HOST"
@@ -781,6 +795,10 @@ mod tests {
         assert_eq!(flat["NOITE_FLEET_INSTALL"], "a1b2c3d4");
         assert_eq!(flat["no_proxy"], "http://proxy.op:3128/no_proxy");
         assert!(!flat.contains_key("CELLO_EGRESS"));
+        assert!(
+            !flat.contains_key("CELLO_FETCH_TIMEOUT_S"),
+            "unset leaves Cello's own fetch budget"
+        );
         assert!(!flat.contains_key("CELLO_MEMORY_SCOPE"));
         assert!(!flat.contains_key("CELLO_CACHE_SCOPE"));
         assert_eq!(
@@ -839,6 +857,24 @@ mod tests {
         }));
         assert_eq!(leaf["CELLO_MEMORY_SCOPE"], "self");
         assert!(!leaf.contains_key("CELLO_MAX_RSS_MB"));
+    }
+
+    /// The control fleet's outbound fetch budget is forwarded verbatim when
+    /// the operator set one: the control UI proxies every live feed through a
+    /// Worker fetch to the runner, and the budget bounds that fetch's head,
+    /// not a live body.
+    #[test]
+    fn control_fleet_env_carries_the_fetch_budget() {
+        let mut cfg = test_cfg(Tenancy::Single);
+        cfg.control_fetch_timeout_s = Some(5);
+        let flat = flattened(&control_fleet_env(&ControlFleetEnv {
+            cfg: &cfg,
+            operator_token: "control-op",
+            install_tag: "a1b2c3d4",
+            inherited: &[],
+            has_cgroup_leaf: false,
+        }));
+        assert_eq!(flat["CELLO_FETCH_TIMEOUT_S"], "5");
     }
 
     /// Without a cgroup leaf a tenant fleet shares the container cgroup, so
