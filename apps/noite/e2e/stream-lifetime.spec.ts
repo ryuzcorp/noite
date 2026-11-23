@@ -32,90 +32,94 @@ test("control state stream outlives the control fetch budget", async ({
   request,
 }) => {
   const slug = `sse-lifetime-${Date.now().toString(36)}`;
-  const result = await (async () => {
-    await page.goto("/apps/new");
-    await page.locator("#create-name").fill("SSE Lifetime");
-    await page.locator("#create-slug").fill(slug);
-    await page.getByRole("button", { name: "Create app" }).click();
-    await waitForCreatedApp(page);
 
-    const appId = await findAppId(request, slug);
-    expect(appId, `app ${slug} was created`).not.toBeNull();
+  await page.goto("/apps/new");
+  await page.locator("#create-name").fill("SSE Lifetime");
+  await page.locator("#create-slug").fill(slug);
+  await page.getByRole("button", { name: "Create app" }).click();
+  await waitForCreatedApp(page);
 
-    return await page.evaluate(
-      async ({ id, holdMs }): Promise<HoldResult> => {
-        const started = performance.now();
-        const controller = new AbortController();
-        const abort = setTimeout(() => controller.abort(), holdMs);
-        let chunks = 0;
-        let keepalives = 0;
-        let bytes = 0;
-        let closed = false;
-        const out = (error: string | null): HoldResult => ({
-          ok: error === null,
-          ms: performance.now() - started,
-          chunks,
-          keepalives,
-          bytes,
-          closed,
-          error,
+  const appId = await findAppId(request, slug);
+  expect(appId, `app ${slug} was created`).not.toBeNull();
+
+  const result = await page.evaluate(
+    async ({ id, holdMs }): Promise<HoldResult> => {
+      const started = performance.now();
+      const controller = new AbortController();
+      const abort = setTimeout(() => controller.abort(), holdMs);
+      let chunks = 0;
+      let keepalives = 0;
+      let bytes = 0;
+      let closed = false;
+
+      const out = (error: string | null): HoldResult => ({
+        ok: error === null,
+        ms: performance.now() - started,
+        chunks,
+        keepalives,
+        bytes,
+        closed,
+        error,
+      });
+
+      try {
+        const response = await fetch(`/api/apps/${id}/state/stream`, {
+          headers: { accept: "text/event-stream" },
+          signal: controller.signal,
         });
 
-        try {
-          const response = await fetch(`/api/apps/${id}/state/stream`, {
-            headers: { accept: "text/event-stream" },
-            signal: controller.signal,
-          });
-
-          if (!(response.ok && response.body)) {
-            return out(`status ${response.status}`);
-          }
-
-          const reader = response.body.getReader();
-          const decoder = new TextDecoder();
-
-          for (;;) {
-            const { done, value } = await reader.read();
-
-            if (done) {
-              closed = true;
-              break;
-            }
-
-            chunks += 1;
-            bytes += value.length;
-
-            for (const line of decoder
-              .decode(value, { stream: true })
-              .split("\n")) {
-              // A bare `:` line is an SSE comment: the runner's keepalive.
-              if (line.trim() === ":") {
-                keepalives += 1;
-              }
-            }
-          }
-        } catch (error) {
-          // Our own abort at the end of the hold is the expected exit; any
-          // other failure (a truncated chunked body reports a TypeError) is
-          // the regression under test.
-          if (error instanceof DOMException && error.name === "AbortError") {
-            return out(null);
-          }
-
-          return out(String(error));
-        } finally {
-          clearTimeout(abort);
+        if (!(response.ok && response.body)) {
+          return out(`status ${response.status}`);
         }
 
-        return out(null);
-      },
-      { holdMs: HOLD_MS, id: appId ?? "" }
-    );
-  })();
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+
+        for (;;) {
+          // oxlint-disable-next-line eslint/no-await-in-loop -- SSE chunks arrive in order; each read must settle before the next
+          const { done, value } = await reader.read();
+
+          if (done) {
+            closed = true;
+            break;
+          }
+
+          chunks += 1;
+          bytes += value.length;
+
+          for (const line of decoder
+            .decode(value, { stream: true })
+            .split("\n")) {
+            // A bare `:` line is an SSE comment: the runner's keepalive.
+            if (line.trim() === ":") {
+              keepalives += 1;
+            }
+          }
+        }
+      } catch (error) {
+        // Our own abort at the end of the hold is the expected exit; any
+        // other failure (a truncated chunked body reports a TypeError) is
+        // the regression under test.
+        if (error instanceof DOMException && error.name === "AbortError") {
+          return out(null);
+        }
+
+        return out(String(error));
+      } finally {
+        clearTimeout(abort);
+      }
+
+      return out(null);
+    },
+    { holdMs: HOLD_MS, id: appId ?? "" }
+  );
 
   try {
     expect(result.error, JSON.stringify(result)).toBeNull();
-    expect(result.closed, `stream closed before the hold: ${JSON.stringify(result)}`).toBe(false);
+    expect(
+      result.closed,
+      `stream closed before the hold: ${JSON.stringify(result)}`
+    ).toBe(false);
     expect(result.ms).toBeGreaterThan(MIN_HOLD_MS);
     expect(
       result.keepalives,
