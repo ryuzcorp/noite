@@ -24,8 +24,8 @@
 # and CI verifies the digest is what the tag resolves to plus its
 # attestation. A lab build of an unpublished tip overrides CELLO_IMAGE
 # with a local image.
-ARG CELLO_VERSION=0.2.7
-ARG CELLO_DIGEST=sha256:b3748f2644138b16e12ce8e8a831207a58ea76b4691a75973f4906fe71ea7bab
+ARG CELLO_VERSION=0.2.8
+ARG CELLO_DIGEST=sha256:4e580a54e8853b8e666bd501d6165f69e9b5cac502db938e17b9fcd3d760e303
 ARG CELLO_IMAGE=ghcr.io/ryuzcorp/cello:${CELLO_VERSION}@${CELLO_DIGEST}
 # Noite's own release version, reported by the instance heartbeat
 # (`NOITE_BUILD_VERSION` ENV in the runtime stages): the tag without `v` on a
