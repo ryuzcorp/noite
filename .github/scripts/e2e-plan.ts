@@ -19,6 +19,8 @@
 //
 // Usage:
 //   bun .github/scripts/e2e-plan.ts --base <sha> [--head HEAD] [--suite fast]
+// `--suite ''` (a schedule event, which has no workflow inputs) plans the
+// nightly release suite; anything else outside fast|release fails.
 // Prints `suite=` and `extra-specs=` lines (GITHUB_OUTPUT-compatible) plus a
 // human summary on stderr. Deleted specs are never selected
 // (`--diff-filter=AMR`: added, modified, renamed — renames list the new path).
@@ -109,6 +111,23 @@ export const planE2E = (
   const extraSpecs = [...extra].toSorted();
 
   return { extraSpecs, runRelease, suite: runRelease ? "release" : "fast" };
+};
+
+// The suite a caller asked for, as the lanes will run it. A `schedule`
+// trigger carries no `workflow_dispatch`/`workflow_call` inputs, so
+// `e2e.yml`'s plan step hands `--suite ''`: the nightly means the release
+// suite (its own comment and the `|| 'release'` lane fallback say so), so an
+// empty request resolves to `release` instead of failing the plan. Anything
+// else must name one of the two suites, and the only way to get an empty
+// request is that event, so a typo still fails here.
+export const resolveSuite = (requested: string): "fast" | "release" => {
+  const suite = requested === "" ? "release" : requested;
+
+  if (suite !== "fast" && suite !== "release") {
+    throw new Error(`suite must be fast or release, not ${requested}`);
+  }
+
+  return suite;
 };
 
 export interface LaneShardCounts {
@@ -236,7 +255,7 @@ const listShardCount = (
 const main = (): void => {
   const base = flag("--base", "");
   const head = flag("--head", "HEAD");
-  const requestedSuite = flag("--suite", "fast");
+  const requestedSuite = resolveSuite(flag("--suite", "fast"));
   const roundsRaw = flag("--rounds", "[1]");
 
   // SAFETY: rounds cross the matrix cells below; anything else fails here
