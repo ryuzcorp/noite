@@ -1,0 +1,3 @@
+### Changed
+
+- The docs site builds on pull requests that touch it, not only after a merge. `website.yml` gains a `pull_request` trigger with the same `apps/website/**` path filter, and its `deploy` job is skipped for a pull request, so a PR run keeps the build job's `contents: read` and never reaches the `github-pages` environment, `pages: write` or the OIDC token. Concurrency is now per ref (`pages-${{ github.ref }}`), so a PR build cannot cancel an in-flight `main` deploy. Why: the site's own build is the only thing that catches a broken MDX page, and `create.mdx` stayed red on `main` for a week after #342 because nothing built it before merge.

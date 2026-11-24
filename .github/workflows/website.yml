@@ -2,6 +2,13 @@
 #
 # After the first run: repo Settings → Pages → Custom domain = noite.now
 # (plus the DNS A/AAAA records), then re-run to stamp the CNAME.
+#
+# A pull request that touches the site builds it too, and stops at the build:
+# the site's own build is the only thing that validates MDX, so without this a
+# broken page is only found on main, after merge (#342's create.mdx stayed red
+# for a week). `deploy` below is skipped for every non-push event, so a PR run
+# never holds the Pages environment, its token or its OIDC identity — it runs
+# with the build job's `contents: read` only.
 name: website
 
 on:
@@ -10,12 +17,18 @@ on:
     paths:
       - "apps/website/**"
       - ".github/workflows/website.yml"
+  pull_request:
+    paths:
+      - "apps/website/**"
+      - ".github/workflows/website.yml"
   workflow_dispatch:
 
 permissions: {}
 
+# One build/deploy at a time per ref: a pull request's build must not cancel an
+# in-flight main deploy, and each PR gets its own group (its own `ref`).
 concurrency:
-  group: pages
+  group: pages-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -51,6 +64,10 @@ jobs:
 
   deploy:
     needs: build
+    # Publish from a push to main (and a manual run), never from a pull
+    # request: the Pages environment, `pages: write` and the OIDC token stay
+    # on trusted refs. A PR run ends green at `build`.
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     # ~3x the 1.7 min p95 (50 runs, 2026-11-11), floor 10.
     timeout-minutes: 10
