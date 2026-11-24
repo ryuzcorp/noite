@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 
-import { planCells, planE2E } from "./e2e-plan";
+import { planCells, planE2E, resolveSuite } from "./e2e-plan";
 
 describe("planE2E", () => {
   test("a rewritten spec joins the fast run in full", () => {
@@ -85,6 +85,25 @@ describe("planE2E", () => {
     );
 
     expect(plan.extraSpecs).toEqual(["admin.spec.ts", "deploy.spec.ts"]);
+  });
+});
+
+describe("resolveSuite", () => {
+  test("a schedule's empty --suite plans the nightly release suite", () => {
+    // `schedule` has no workflow inputs, so e2e.yml hands `--suite ''`.
+    // Before this, the plan job died there every night (run 45191949490).
+    expect(resolveSuite("")).toBe("release");
+  });
+
+  test("an explicit suite passes through", () => {
+    expect(resolveSuite("fast")).toBe("fast");
+    expect(resolveSuite("release")).toBe("release");
+  });
+
+  test("anything else still fails closed", () => {
+    for (const bad of ["Fast", " nightly", "release "]) {
+      expect(() => resolveSuite(bad)).toThrow(/must be fast or release/u);
+    }
   });
 });
 
