@@ -46,12 +46,12 @@ ARG NODE_VERSION=24.22.3
 # below verifies the download before it unpacks it.
 ARG NODE_SHA256_X64=4f2b175a6d53a5c617a80dba2676238a0688cef28c6da4eba35c7d844e66fcfb
 ARG NODE_SHA256_ARM64=6e51a2ada00f0011cc266f65d98922b403d7ad88f809ca2aa615a5fe1ce6e86c
-ARG NODE_DIGEST=sha256:dc26ae92c9fb15cf6b1d63e20f0944b2efe0f115b20e00be48fb23fceb061c54
+ARG NODE_DIGEST=sha256:873f586f3794f52281bd039bf02c048a0be08fde619338f9941bad1eb6b34530
 # The build and dev toolchains, tag plus index digest. `RUST_VERSION` is a
 # major pin (`rust:1-bookworm`), `BUN_VERSION` a minor one (`1.4-debian` and
 # `1.4-slim` share it but not their digest). Keep the tags for readability.
 ARG RUST_VERSION=1
-ARG RUST_DIGEST=sha256:ade39a710ef85f3506cffcfec3e8a24ba090badef1dff2fb798f71d878833fea
+ARG RUST_DIGEST=sha256:75d26c23c24cc6ea1cdabf0714a6bff8fd7bf3248716043fd7ae86dac7f41b94
 ARG BUN_VERSION=1.4
 ARG BUN_DEBIAN_DIGEST=sha256:3dddea58e1f8f2240eca906b023fedb944f9a8352515a35309fd0c879fe00aaa
 ARG BUN_SLIM_DIGEST=sha256:b780593f3e10918cbdaec3d5a08d52224b9198069a65eb47812085c2ec007643
